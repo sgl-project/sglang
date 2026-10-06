@@ -5,17 +5,22 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.falcon_h1 import FalconH1Config
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.output import OutputTransform
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -33,7 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -70,8 +75,7 @@ class FalconH1MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
         self.layer_id = layer_id
@@ -85,22 +89,19 @@ class FalconH1MLP(nn.Module):
         self,
         x,
         forward_batch=None,
-        use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
         gate_up[:, : self.intermediate_size // self.tp_size] *= self.gate_multiplier
 
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x,
-            skip_all_reduce=use_reduce_scatter,
-        )
-        x = x * self.down_multiplier
+        x, _ = self.down_proj(x)
         return x
+
+    def scale_output(self, x):
+        return x * self.down_multiplier
 
 
 class FalconH1HybridAttentionDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: FalconH1Config,
@@ -194,21 +195,15 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             activation=config.hidden_act,
             use_rms_norm=config.mamba_rms_norm,
+            # Like the attention's o_proj: the FFN input completes the sum of the
+            # two mixers' partial outputs.
+            reduce_results=False,
             prefix=f"{prefix}.mixer",
         )
 
         # FalconH1 all layers are dense and have no nextn now
         self.is_layer_sparse = False
-        is_previous_layer_sparse = False
         is_next_layer_sparse = False
-
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
 
         self.feed_forward = FalconH1MLP(
             hidden_size=self.hidden_size,
@@ -218,6 +213,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             mlp_multipliers=config.mlp_multipliers,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            reduce_results=False,
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -226,11 +222,18 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.pre_ff_layernorm,
-            allow_reduce_scatter=True,
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    output_transform=OutputTransform(
+                        self.feed_forward.scale_output, before_reduce_scatter=True
+                    ),
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
+                ),
+                self.pre_ff_layernorm,
+            ),
         )
 
         self.alt_stream = alt_stream
@@ -279,16 +282,18 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         # B vector 2 * d_ssm -> 2 * d_ssm + (n_group * d_state)
         mup_vector[
             :,
-            (2 * self.d_ssm)
-            // self.tp_size : (2 * self.d_ssm + self.groups_time_state_size)
+            (2 * self.d_ssm) // self.tp_size : (
+                2 * self.d_ssm + self.groups_time_state_size
+            )
             // self.tp_size,
         ] *= self.zxbcdt_multipliers[2]
         # C vector 2 * d_ssm + (n_group * d_state)
         # -> 2 * d_ssm + 2 * (n_group * d_state)
         mup_vector[
             :,
-            (2 * self.d_ssm + self.groups_time_state_size)
-            // self.tp_size : (2 * self.d_ssm + 2 * self.groups_time_state_size)
+            (2 * self.d_ssm + self.groups_time_state_size) // self.tp_size : (
+                2 * self.d_ssm + 2 * self.groups_time_state_size
+            )
             // self.tp_size,
         ] *= self.zxbcdt_multipliers[3]
         # dt vector 2 * d_ssm + 2 * (n_group * d_state)
@@ -320,13 +325,10 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ):
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
 
         if not forward_batch.forward_mode.is_idle():
             # Attention block
@@ -355,21 +357,10 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             hidden_states = attention_hidden_states + mamba_hidden_states
 
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        hidden_states = self.feed_forward(
-            hidden_states, forward_batch, use_reduce_scatter
-        )
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
-
-        return hidden_states, residual
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        hidden_states = self.feed_forward(hidden_states, forward_batch)
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 ALL_DECODER_LAYER_TYPES = {
@@ -431,22 +422,22 @@ class FalconH1Model(nn.Module):
         else:
             hidden_states = self.embed_tokens(input_ids) * self.embedding_multiplier
 
-        residual = None
+        residual_batch.start(forward_batch)
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states, residual = layer(
+            hidden_states = layer(
                 layer_id=i,
                 positions=positions,
                 hidden_states=hidden_states,
-                residual=residual,
                 forward_batch=forward_batch,
             )
 
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
+
         if not forward_batch.forward_mode.is_idle():
-            if residual is None:
-                hidden_states = self.final_layernorm(hidden_states)
-            else:
-                hidden_states, _ = self.final_layernorm(hidden_states, residual)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.final_layernorm
+            )
 
         return hidden_states
 
@@ -462,7 +453,7 @@ class FalconH1ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         assert self.pp_group.is_first_rank and self.pp_group.is_last_rank
         self.quant_config = quant_config
         self.model = FalconH1Model(
@@ -477,7 +468,7 @@ class FalconH1ForCausalLM(nn.Module):
                 quant_config=quant_config,
                 org_num_embeddings=config.vocab_size,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         self.lm_head = self.lm_head.float()
         self.lm_head_multiplier = config.lm_head_multiplier
@@ -526,7 +517,6 @@ class FalconH1ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
-
             if "rotary_emb.inv_freq" in name:
                 continue
 

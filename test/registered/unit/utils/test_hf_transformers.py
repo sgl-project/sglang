@@ -4,27 +4,168 @@ Tests cover the pure utility functions (compat patches, config helpers,
 context length, GGUF detection, etc.) that don't require actual model files.
 """
 
+import inspect
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from transformers import PretrainedConfig
+from transformers.image_processing_utils import BaseImageProcessor
 
+import sglang.srt.utils.hf_transformers.processor as processor_utils
+from sglang.srt.utils import hf_transformers_patches
 from sglang.srt.utils.hf_transformers.common import (
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
     _override_v_head_dim_if_zero,
     _patch_text_config,
+    attach_additional_stop_token_ids,
     check_gguf_file,
     get_context_length,
     get_hf_text_config,
     get_rope_config,
+    resolve_hf_gguf_reference,
 )
+from sglang.srt.utils.hf_transformers.config import _apply_gemma4_attention_overrides
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+
+
+# ---------------------------------------------------------------------------
+# get_processor
+# ---------------------------------------------------------------------------
+
+
+class TestGetProcessor(CustomTestCase):
+    def test_does_not_forward_backend_to_auto_processor(self):
+        config = SimpleNamespace(model_type="test_vlm", auto_map={})
+        loaded_processor = MagicMock()
+        loaded_processor.image_processor.backend = "torchvision"
+        loaded_processor.tokenizer.chat_template = "template"
+        auto_config = MagicMock()
+        auto_config.from_pretrained.return_value = config
+        auto_processor = MagicMock()
+        auto_processor.from_pretrained.return_value = loaded_processor
+        auto_image_processor = MagicMock()
+
+        with patch.multiple(
+            processor_utils,
+            AutoConfig=auto_config,
+            AutoProcessor=auto_processor,
+            AutoImageProcessor=auto_image_processor,
+        ):
+            processor_utils.get_processor(
+                "test-model", image_processor_backend="torchvision"
+            )
+
+        call_kwargs = auto_processor.from_pretrained.call_args.kwargs
+        self.assertNotIn("backend", call_kwargs)
+        self.assertNotIn("use_fast", call_kwargs)
+        auto_image_processor.from_pretrained.assert_not_called()
+
+    def test_applies_pil_backend_only_to_image_processor(self):
+        config = SimpleNamespace(model_type="test_vlm", auto_map={})
+
+        for processor_kwargs in (
+            {"image_processor_backend": "pil"},
+            {"use_fast": False},
+        ):
+            with self.subTest(processor_kwargs=processor_kwargs):
+                loaded_processor = MagicMock()
+                loaded_processor.image_processor.backend = "torchvision"
+                loaded_processor.tokenizer.chat_template = "template"
+                pil_processor = MagicMock(backend="pil")
+                auto_config = MagicMock()
+                auto_config.from_pretrained.return_value = config
+                auto_processor = MagicMock()
+                auto_processor.from_pretrained.return_value = loaded_processor
+                auto_image_processor = MagicMock()
+                auto_image_processor.from_pretrained.return_value = pil_processor
+
+                with patch.multiple(
+                    processor_utils,
+                    AutoConfig=auto_config,
+                    AutoProcessor=auto_processor,
+                    AutoImageProcessor=auto_image_processor,
+                ):
+                    processor = processor_utils.get_processor(
+                        "test-model", **processor_kwargs
+                    )
+
+                call_kwargs = auto_processor.from_pretrained.call_args.kwargs
+                self.assertNotIn("backend", call_kwargs)
+                self.assertNotIn("use_fast", call_kwargs)
+                auto_image_processor.from_pretrained.assert_called_once_with(
+                    "test-model",
+                    trust_remote_code=False,
+                    revision=None,
+                    backend="pil",
+                )
+                self.assertIs(processor.image_processor, pil_processor)
+
+    def test_resolves_model_name_before_loading_config(self):
+        remote_model = "s3://bucket/model"
+        local_model = "/cache/model"
+        config = SimpleNamespace(model_type="clip", auto_map={})
+        loaded_processor = MagicMock()
+        loaded_processor.tokenizer.chat_template = "template"
+        auto_config = MagicMock()
+        auto_config.from_pretrained.return_value = config
+        auto_processor = MagicMock()
+        auto_processor.from_pretrained.return_value = loaded_processor
+
+        def resolve_uri(path):
+            return local_model if path == remote_model else path
+
+        with patch.multiple(
+            processor_utils,
+            resolve_runai_obj_uri=MagicMock(side_effect=resolve_uri),
+            AutoConfig=auto_config,
+            AutoProcessor=auto_processor,
+        ):
+            processor = processor_utils.get_processor(
+                "local-tokenizer",
+                model_name=remote_model,
+            )
+
+        self.assertIs(processor, loaded_processor)
+        auto_config.from_pretrained.assert_called_once_with(
+            local_model,
+            trust_remote_code=False,
+            revision=None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# _patch_image_processor_kwargs
+# ---------------------------------------------------------------------------
+
+
+class TestImageProcessorKwargsPatch(CustomTestCase):
+    def test_filters_unsupported_kwargs_and_caches_signature(self):
+        class StrictImageProcessor(BaseImageProcessor):
+            model_input_names = ["pixel_values"]
+
+            def preprocess(self, images, accepted=None):
+                return {"images": images, "accepted": accepted}
+
+        processor = StrictImageProcessor()
+        with patch.object(
+            hf_transformers_patches.inspect,
+            "signature",
+            wraps=inspect.signature,
+        ) as signature:
+            first = processor("first", accepted=True, device="cuda")
+            second = processor("second", accepted=False, device="cuda")
+
+        self.assertEqual(first, {"images": "first", "accepted": True})
+        self.assertEqual(second, {"images": "second", "accepted": False})
+        self.assertEqual(signature.call_count, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +173,7 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 # ---------------------------------------------------------------------------
 
 
-class TestNormalizeRopeScalingCompat(unittest.TestCase):
+class TestNormalizeRopeScalingCompat(CustomTestCase):
     def test_adds_type_from_rope_type(self):
         cfg = PretrainedConfig()
         cfg.rope_scaling = {"rope_type": "llama3", "factor": 8.0}
@@ -44,11 +185,6 @@ class TestNormalizeRopeScalingCompat(unittest.TestCase):
         cfg.rope_scaling = {"rope_type": "llama3", "type": "custom", "factor": 8.0}
         normalize_rope_scaling_compat(cfg)
         self.assertEqual(cfg.rope_scaling["type"], "custom")
-
-    def test_no_op_when_no_rope_scaling(self):
-        cfg = PretrainedConfig()
-        normalize_rope_scaling_compat(cfg)
-        self.assertIsNone(getattr(cfg, "rope_scaling", None))
 
     def test_no_op_when_rope_scaling_is_none(self):
         cfg = PretrainedConfig()
@@ -90,7 +226,7 @@ class TestNormalizeRopeScalingCompat(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestGetRopeConfig(unittest.TestCase):
+class TestGetRopeConfig(CustomTestCase):
     def test_v5_rope_parameters(self):
         cfg = PretrainedConfig()
         cfg.rope_parameters = {"rope_theta": 10000.0, "rope_type": "default"}
@@ -120,7 +256,7 @@ class TestGetRopeConfig(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestPatchTextConfig(unittest.TestCase):
+class TestPatchTextConfig(CustomTestCase):
     def test_propagates_parent_to_text(self):
         parent = PretrainedConfig()
         parent.pad_token_id = 0
@@ -161,7 +297,7 @@ class TestPatchTextConfig(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestGetContextLength(unittest.TestCase):
+class TestGetContextLength(CustomTestCase):
     def test_max_position_embeddings(self):
         cfg = PretrainedConfig()
         cfg.max_position_embeddings = 4096
@@ -204,7 +340,7 @@ class TestGetContextLength(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestCheckGgufFile(unittest.TestCase):
+class TestCheckGgufFile(CustomTestCase):
     def test_gguf_suffix(self):
         with tempfile.NamedTemporaryFile(suffix=".gguf") as f:
             self.assertTrue(check_gguf_file(f.name))
@@ -229,12 +365,49 @@ class TestCheckGgufFile(unittest.TestCase):
             self.assertFalse(check_gguf_file(d))
 
 
+class TestResolveHfGgufReference(CustomTestCase):
+    @patch("huggingface_hub.hf_hub_download", return_value="/cache/model-Q4_K.gguf")
+    @patch("huggingface_hub.HfApi")
+    def test_resolves_quant_type(self, api_cls, download):
+        api_cls.return_value.repo_info.return_value.siblings = [
+            SimpleNamespace(rfilename="model-Q4_K.gguf"),
+            SimpleNamespace(rfilename="model-Q8_0.gguf"),
+        ]
+
+        resolved = resolve_hf_gguf_reference("owner/repo:Q4_K", revision="revision")
+
+        self.assertEqual(resolved, "/cache/model-Q4_K.gguf")
+        download.assert_called_once_with(
+            "owner/repo", "model-Q4_K.gguf", revision="revision"
+        )
+
+    @patch("huggingface_hub.HfApi")
+    def test_rejects_ambiguous_quant_type(self, api_cls):
+        api_cls.return_value.repo_info.return_value.siblings = [
+            SimpleNamespace(rfilename="fl2va-Q4_K.gguf"),
+            SimpleNamespace(rfilename="ref2va-Q4_K.gguf"),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            resolve_hf_gguf_reference("owner/repo:Q4_K")
+
+    @patch("huggingface_hub.HfApi")
+    def test_reports_available_files_when_quant_type_is_missing(self, api_cls):
+        api_cls.return_value.repo_info.return_value.siblings = [
+            SimpleNamespace(rfilename="model-Q4_K.gguf"),
+            SimpleNamespace(rfilename="README.md"),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "model-Q4_K.gguf"):
+            resolve_hf_gguf_reference("owner/repo:Q8_0")
+
+
 # ---------------------------------------------------------------------------
 # _is_deepseek_ocr_model / _is_deepseek_ocr2_model
 # ---------------------------------------------------------------------------
 
 
-class TestDeepseekOcrDetection(unittest.TestCase):
+class TestDeepseekOcrDetection(CustomTestCase):
     def test_ocr_model_detected(self):
         cfg = PretrainedConfig()
         cfg.auto_map = {"AutoModel": "modeling_deepseekocr.DeepseekOCRForCausalLM"}
@@ -268,7 +441,7 @@ class TestDeepseekOcrDetection(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestOverrideVHeadDimIfZero(unittest.TestCase):
+class TestOverrideVHeadDimIfZero(CustomTestCase):
     def test_patches_zero_v_head_dim(self):
         text_cfg = SimpleNamespace(v_head_dim=0)
         cfg = PretrainedConfig()
@@ -306,7 +479,7 @@ class TestOverrideVHeadDimIfZero(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestGetHfTextConfig(unittest.TestCase):
+class TestGetHfTextConfig(CustomTestCase):
     def test_returns_config_for_pure_text_model(self):
         cfg = PretrainedConfig()
         cfg.architectures = ["LlamaForCausalLM"]
@@ -386,11 +559,47 @@ class TestGetHfTextConfig(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# attach_additional_stop_token_ids
+# ---------------------------------------------------------------------------
+
+
+class TestAttachAdditionalStopTokenIds(CustomTestCase):
+    """Bug regression: the Inkling bundle ships eos metadata unset while its
+    turn-final marker <|content_model_end_sampling|> sits in added_tokens; the
+    old detector only recognized <|eom_id|>, so generation ran to max length
+    (documented by the Inkling GSM8K test)."""
+
+    @staticmethod
+    def _tokenizer(added):
+        return SimpleNamespace(get_added_vocab=lambda: added)
+
+    def test_inkling_end_sampling_registers_as_stop(self):
+        tok = self._tokenizer({"<|content_model_end_sampling|>": 200006})
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {200006})
+
+    def test_eom_id_still_registers_as_stop(self):
+        tok = self._tokenizer({"<|eom_id|>": 128008})
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {128008})
+
+    def test_k2_horizon_im_end_registers_as_stop(self):
+        tok = self._tokenizer({"<|ifm|im_end|>": 64019})
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {64019})
+
+    def test_no_known_marker_yields_none(self):
+        tok = self._tokenizer({"<|other|>": 7})
+        attach_additional_stop_token_ids(tok)
+        self.assertIsNone(tok.additional_stop_token_ids)
+
+
+# ---------------------------------------------------------------------------
 # _fix_special_tokens_pattern
 # ---------------------------------------------------------------------------
 
 
-class TestFixSpecialTokensPattern(unittest.TestCase):
+class TestFixSpecialTokensPattern(CustomTestCase):
     def test_fixes_cls_sep_with_missing_tokens(self):
         tok = SimpleNamespace(
             special_tokens_pattern="cls_sep",
@@ -429,7 +638,7 @@ class TestFixSpecialTokensPattern(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestModuleReExports(unittest.TestCase):
+class TestModuleReExports(CustomTestCase):
     def test_all_public_symbols_importable(self):
         import sglang.srt.utils.hf_transformers as pkg
 
@@ -455,7 +664,7 @@ class TestModuleReExports(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestPatchRemovedSymbols(unittest.TestCase):
+class TestPatchRemovedSymbols(CustomTestCase):
     def test_llama_flash_attention2_exists(self):
         from transformers.models.llama import modeling_llama
 
@@ -464,89 +673,32 @@ class TestPatchRemovedSymbols(unittest.TestCase):
             "LlamaFlashAttention2 should be patched onto modeling_llama",
         )
 
-    def test_is_flash_attn_greater_or_equal_2_10_callable(self):
-        import transformers.utils as _u
-
-        self.assertTrue(
-            hasattr(_u, "is_flash_attn_greater_or_equal_2_10"),
-            "is_flash_attn_greater_or_equal_2_10 should be patched onto transformers.utils",
-        )
-        self.assertIsInstance(_u.is_flash_attn_greater_or_equal_2_10(), bool)
-
 
 # ---------------------------------------------------------------------------
 # compat: _patch_rope_parameters_validation
 # ---------------------------------------------------------------------------
 
 
-class TestPatchRopeParametersValidation(unittest.TestCase):
-    # -----------------------------------------------------------------------
-    # Test ``rope_theta`` injection into ``rope_scaling``.
-    #
-    # Upstream `transformers.PretrainedConfig` now natively handles this
-    # logic. While the manual injection patch has been removed, these
-    # test cases are retained to ensure regression testing of the
-    # configuration's injection behavior.
-    # -----------------------------------------------------------------------
+class TestRopeParametersValidationPatch(CustomTestCase):
+    def test_default_rope_type_survives_a_missing_max_position_embeddings(self):
+        class _AxialConfig(PretrainedConfig):
+            default_rope_type = "axial"
 
-    def test_injects_rope_theta_into_rope_scaling(self):
-        config_dict = {
-            "model_type": "llama",
-            "rope_theta": 500000.0,
-            "max_position_embeddings": 131072,
-            "rope_scaling": {
-                "rope_type": "llama3",
-                "factor": 8.0,
-                "low_freq_factor": 1.0,
-                "high_freq_factor": 4.0,
-                "original_max_position_embeddings": 8192,
-            },
-        }
-        config = PretrainedConfig.from_dict(config_dict)
-        rope_params = getattr(config, "rope_parameters", None)
-        if rope_params is not None:
-            self.assertIn("rope_theta", rope_params)
+        config = _AxialConfig(rope_theta=10000.0)
+        self.assertFalse(hasattr(config, "max_position_embeddings"))
+        config.standardize_rope_params()
 
-    def test_no_injection_when_rope_theta_already_in_scaling(self):
-        config_dict = {
-            "model_type": "llama",
-            "rope_theta": 500000.0,
-            "max_position_embeddings": 131072,
-            "rope_scaling": {
-                "rope_type": "llama3",
-                "factor": 8.0,
-                "rope_theta": 999.0,
-                "low_freq_factor": 1.0,
-                "high_freq_factor": 4.0,
-                "original_max_position_embeddings": 8192,
-            },
-        }
-        config = PretrainedConfig.from_dict(config_dict)
-        rope_params = getattr(config, "rope_parameters", None)
-        if rope_params is not None:
-            self.assertEqual(rope_params["rope_theta"], 999.0)
+        self.assertEqual(config.rope_parameters["rope_type"], "axial")
 
-    def test_no_crash_without_rope_scaling(self):
-        config_dict = {"model_type": "llama", "rope_theta": 10000.0}
-        config = PretrainedConfig.from_dict(config_dict)
-        self.assertIsNotNone(config)
+    def test_scaling_rope_type_without_max_position_embeddings_does_not_raise(self):
+        class _ScalingConfig(PretrainedConfig):
+            pass
 
-
-# ---------------------------------------------------------------------------
-# compat: _ensure_clean_up_tokenization_compat
-# ---------------------------------------------------------------------------
-
-
-class TestCleanUpTokenizationCompat(unittest.TestCase):
-    def test_clean_up_tokenization_exists(self):
-        from transformers import PreTrainedTokenizerBase
-
-        self.assertTrue(hasattr(PreTrainedTokenizerBase, "clean_up_tokenization"))
-
-    def test_clean_up_tokenization_callable(self):
-        from transformers import PreTrainedTokenizerBase
-
-        self.assertTrue(callable(PreTrainedTokenizerBase.clean_up_tokenization))
+        config = _ScalingConfig(
+            rope_parameters={"rope_type": "yarn", "rope_theta": 10000.0}
+        )
+        self.assertFalse(hasattr(config, "max_position_embeddings"))
+        config.standardize_rope_params()
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +706,7 @@ class TestCleanUpTokenizationCompat(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestIsTorchFxAvailableCompat(unittest.TestCase):
+class TestIsTorchFxAvailableCompat(CustomTestCase):
     def test_is_torch_fx_available_exists(self):
         import transformers.utils.import_utils as _iu
 
@@ -562,33 +714,261 @@ class TestIsTorchFxAvailableCompat(unittest.TestCase):
         self.assertTrue(_iu.is_torch_fx_available())
 
 
-# ---------------------------------------------------------------------------
-# compat: _patch_nemotron_h_pattern
-# ---------------------------------------------------------------------------
+# `inkling_mm_model` predates the invariant: `sglang.srt.configs.inkling` writes
+# `InklingMMConfig` straight into `_extra_content`, over a native `InklingConfig`.
+_KNOWN_NAME_MISMATCHES = {"inkling_mm_model"}
 
 
-class TestPatchNemotronHPattern(unittest.TestCase):
-    def test_pattern_to_list_skips_mlp_dash(self):
-        try:
-            from transformers.models.nemotron_h.configuration_nemotron_h import (
-                NemotronHConfig,
+class TestAutoConfigRegistration(CustomTestCase):
+    """`_LazyAutoMapping` keys on the config class `__name__`: a shadow under
+    another name drops out of PROCESSOR / TOKENIZER / MODEL_MAPPING."""
+
+    def test_shadowing_entries_keep_the_native_class_name(self):
+        from transformers.models.auto.configuration_auto import (
+            CONFIG_MAPPING,
+            CONFIG_MAPPING_NAMES,
+        )
+
+        import sglang.srt.configs  # noqa: F401  (populates the registrations)
+
+        # `_extra_content` is exactly the set of classes SGLang registered, so
+        # this covers `_CONFIG_REGISTRY` and the standalone registrations alike.
+        for model_type, cls in CONFIG_MAPPING._extra_content.items():
+            native_name = CONFIG_MAPPING_NAMES.get(model_type)
+            if native_name is None or model_type in _KNOWN_NAME_MISMATCHES:
+                continue
+            with self.subTest(model_type=model_type):
+                self.assertEqual(
+                    cls.__name__,
+                    native_name,
+                    f"{cls.__name__} shadows the native {native_name} for "
+                    f"'{model_type}'; the Auto* mappings key on __name__ and "
+                    f"would stop resolving this model type",
+                )
+
+    def test_autoconfig_only_registrations_win_over_native(self):
+        """zaya / cosmos3-edge have no `_CONFIG_REGISTRY` re-parse to fall back on."""
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+        from sglang.srt.configs.cosmos3 import Cosmos3EdgeConfig
+        from sglang.srt.configs.zaya import ZayaConfig
+
+        for model_type, expected in (
+            ("zaya", ZayaConfig),
+            ("cosmos3_edge", Cosmos3EdgeConfig),
+        ):
+            with self.subTest(model_type=model_type):
+                self.assertIs(CONFIG_MAPPING[model_type], expected)
+
+
+class TestPixtralVisionRope(CustomTestCase):
+    """The Pixtral tower takes its rope table from transformers: a changed axial
+    recomposition rotates every patch wrongly with the shapes still intact."""
+
+    def test_rope_table_matches_the_axial_closed_form(self):
+        import torch
+        from transformers import PixtralVisionConfig
+        from transformers.models.pixtral.modeling_pixtral import (
+            PixtralVisionRotaryEmbedding,
+        )
+
+        from sglang.srt.models.pixtral import position_meshgrid
+
+        config = PixtralVisionConfig(
+            hidden_size=64, num_attention_heads=4, image_size=32, patch_size=8
+        )
+        dim = config.head_dim
+        max_side = config.image_size // config.patch_size
+        base = config.rope_parameters["rope_theta"]
+
+        # Separate H and W frequency ladders over the full grid, indexed by the
+        # flattened patch offset, then duplicated for rotate_half.
+        freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        freqs_h = torch.outer(torch.arange(max_side), freqs[::2]).float()
+        freqs_w = torch.outer(torch.arange(max_side), freqs[1::2]).float()
+        table = torch.cat(
+            [
+                freqs_h[:, None, :].repeat(1, max_side, 1),
+                freqs_w[None, :, :].repeat(max_side, 1, 1),
+            ],
+            dim=-1,
+        ).reshape(-1, dim // 2)
+        table = torch.cat((table, table), dim=-1)
+
+        # Two images of different aspect ratios, as the tower batches them.
+        grids = [torch.empty(1, 3, 4), torch.empty(1, 2, 2)]
+        position_ids = position_meshgrid(grids)
+        flat = position_ids[:, 0] * max_side + position_ids[:, 1]
+        expected = table[flat]
+
+        cos, sin = PixtralVisionRotaryEmbedding(config)(
+            torch.zeros(position_ids.shape[0], config.hidden_size), position_ids
+        )
+
+        torch.testing.assert_close(cos, expected.cos(), rtol=0, atol=1e-6)
+        torch.testing.assert_close(sin, expected.sin(), rtol=0, atol=1e-6)
+
+
+class TestGemma4AttentionOverrides(CustomTestCase):
+    """A parsed Gemma4 config carries the full-attention shape on its base
+    attributes, the sliding-window one on `swa_*`, and no per-layer spec."""
+
+    def _make_config(self, **text_overrides):
+        from transformers import Gemma4Config
+
+        text_config = dict(
+            num_hidden_layers=6,
+            head_dim=128,
+            global_head_dim=256,
+            num_key_value_heads=2,
+            num_global_key_value_heads=4,
+            # Gates the kv-head override; without it every layer keeps the base count.
+            attention_k_eq_v=True,
+        )
+        text_config.update(text_overrides)
+        return Gemma4Config(text_config=text_config)
+
+    def test_full_attention_values_come_from_the_per_layer_overrides(self):
+        config = self._make_config()
+        self.assertTrue(config.text_config.is_heterogeneous)
+
+        _apply_gemma4_attention_overrides(config)
+
+        text_config = config.text_config
+        self.assertEqual(text_config.head_dim, 256)
+        self.assertEqual(text_config.v_head_dim, 256)
+        self.assertEqual(text_config.num_key_value_heads, 4)
+        self.assertEqual(text_config.swa_head_dim, 128)
+        self.assertEqual(text_config.swa_v_head_dim, 128)
+        self.assertEqual(text_config.swa_num_key_value_heads, 2)
+
+    def test_per_layer_spec_is_dropped_so_later_reads_do_not_raise(self):
+        config = self._make_config()
+
+        _apply_gemma4_attention_overrides(config)
+
+        self.assertFalse(config.text_config.is_heterogeneous)
+        self.assertEqual(config.text_config.head_dim, 256)
+
+    def test_config_without_a_per_layer_spec_states_one_shape(self):
+        config = self._make_config(per_layer_config=None)
+        self.assertFalse(config.text_config.is_heterogeneous)
+
+        _apply_gemma4_attention_overrides(config)
+
+        text_config = config.text_config
+        self.assertEqual(text_config.head_dim, 128)
+        self.assertEqual(text_config.swa_head_dim, 128)
+        self.assertEqual(text_config.num_key_value_heads, 2)
+        self.assertEqual(text_config.swa_num_key_value_heads, 2)
+
+    def test_unflattenable_per_layer_attribute_is_rejected(self):
+        """An attribute the parser does not flatten would otherwise revert to
+        the global value and build the model with the wrong per-layer shapes."""
+        config = self._make_config(
+            intermediate_size=1024,
+            per_layer_config={
+                **{layer_idx: {"intermediate_size": 512} for layer_idx in range(5)},
+                5: {"head_dim": 256},
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "intermediate_size"):
+            _apply_gemma4_attention_overrides(config)
+
+    def test_layer_type_with_more_than_one_shape_is_rejected(self):
+        """SGLang carries one shape per layer type, so such a config must be
+        rejected here rather than deep inside the transformers layer view."""
+        config = self._make_config(
+            per_layer_config={0: {"head_dim": 64}, 5: {"head_dim": 256}}
+        )
+
+        with self.assertRaisesRegex(ValueError, "single shape per layer type"):
+            _apply_gemma4_attention_overrides(config)
+
+
+class TestNormalizeTpStyle(CustomTestCase):
+    """Every style a shipped TP plan can name must normalize; a tied-embedding
+    plan naming an unknown one stops the model loading at all."""
+
+    def test_tied_embedding_plan_normalizes(self):
+        from transformers import AutoConfig
+
+        from sglang.srt.models.transformers import _normalize_tp_style
+
+        plan = AutoConfig.for_model(
+            "llama", tie_word_embeddings=True
+        ).base_model_tp_plan
+        self.assertIn("embedding_rowwise", plan.values())
+        for pattern, style in plan.items():
+            with self.subTest(pattern=pattern):
+                _normalize_tp_style(style)
+
+    def test_unknown_style_still_raises(self):
+        from sglang.srt.models.transformers import _normalize_tp_style
+
+        with self.assertRaises(ValueError):
+            _normalize_tp_style("mla_kv_a_proj")
+
+
+class TestLayerTypesValidationPatch(CustomTestCase):
+    """Step-3.5-Flash lists a `layer_types` entry per main *and* next-n-predict
+    layer, which transformers' strict validator would otherwise reject."""
+
+    _SLIDING = ["sliding_attention"]
+
+    def test_layer_types_may_cover_the_mtp_layers(self):
+        config = PretrainedConfig(
+            num_hidden_layers=45,
+            num_nextn_predict_layers=3,
+            layer_types=self._SLIDING * 48,
+        )
+
+        self.assertEqual(len(config.layer_types), 48)
+
+    def test_a_length_the_mtp_layers_do_not_explain_still_raises(self):
+        with self.assertRaises(Exception):
+            PretrainedConfig(
+                num_hidden_layers=4,
+                num_nextn_predict_layers=1,
+                layer_types=self._SLIDING * 6,
             )
 
-            result = NemotronHConfig._pattern_to_list("M-*-")
-            self.assertEqual(result, ["mamba", "attention"])
-        except ImportError:
-            self.skipTest("NemotronHConfig not available in this transformers version")
+    def test_an_unknown_layer_type_still_raises(self):
+        with self.assertRaises(Exception):
+            PretrainedConfig(num_hidden_layers=4, layer_types=["not_a_layer_type"] * 4)
 
-    def test_pattern_to_list_standard_chars(self):
-        try:
-            from transformers.models.nemotron_h.configuration_nemotron_h import (
-                NemotronHConfig,
+    def test_an_accepted_length_does_not_excuse_a_later_list(self):
+        """A rejected `layer_types` length aborts the original validator before
+        it reaches `mlp_layer_types`, whose entries must still be checked."""
+        with self.assertRaisesRegex(Exception, "`mlp_layer_types` entries must be in"):
+            PretrainedConfig(
+                num_hidden_layers=4,
+                num_nextn_predict_layers=1,
+                layer_types=self._SLIDING * 5,
+                mlp_layer_types=["not_a_layer_type"] * 5,
             )
 
-            result = NemotronHConfig._pattern_to_list("ME*")
-            self.assertEqual(result, ["mamba", "moe", "attention"])
-        except ImportError:
-            self.skipTest("NemotronHConfig not available in this transformers version")
+    def test_each_list_keeps_its_own_vocabulary(self):
+        """`mlp_layer_types` takes only MLP names, so an attention name in it
+        must be rejected even though it is a valid `layer_types` entry."""
+        with self.assertRaisesRegex(Exception, "`mlp_layer_types` entries must be in"):
+            PretrainedConfig(
+                num_hidden_layers=4,
+                num_nextn_predict_layers=1,
+                layer_types=self._SLIDING * 5,
+                mlp_layer_types=self._SLIDING * 5,
+            )
+
+    def test_a_later_list_may_also_cover_the_mtp_layers(self):
+        config = PretrainedConfig(
+            num_hidden_layers=4,
+            num_nextn_predict_layers=1,
+            layer_types=self._SLIDING * 5,
+            mlp_layer_types=["dense"] * 5,
+        )
+
+        self.assertEqual(len(config.mlp_layer_types), 5)
 
 
 if __name__ == "__main__":

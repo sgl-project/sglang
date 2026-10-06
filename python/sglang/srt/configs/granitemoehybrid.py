@@ -18,11 +18,18 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.get_logger(__name__)
 
 MAMBA = "mamba"
 ATTENTION = "attention"
+
+
+def _to_sglang_layer_types(layer_types: list[str]) -> list[str]:
+    # transformers >= 5.15 uses "linear_attention" / "full_attention"
+    aliases = {"linear_attention": MAMBA, "full_attention": ATTENTION}
+    return [aliases.get(t, t) for t in layer_types]
 
 
 class GraniteMoeHybridConfig(PretrainedConfig):
@@ -185,7 +192,7 @@ class GraniteMoeHybridConfig(PretrainedConfig):
                 else:
                     self.layer_types.append(MAMBA)
         else:
-            self.layer_types = layer_types
+            self.layer_types = _to_sglang_layer_types(layer_types)
 
         # Validate layer_types
         if len(self.layer_types) != self.num_hidden_layers:
@@ -265,6 +272,10 @@ class GraniteMoeHybridConfig(PretrainedConfig):
             **kwargs,
         )
 
+        # HF's `PreTrainedConfig.validate_layer_type` rewrites layer_types to
+        # transformers >= 5.15 schema, so map them back afterwards.
+        self.layer_types = _to_sglang_layer_types(self.layer_types)
+
     @property
     def mamba_layer_ids(self):
         """Returns the indices of layers that are Mamba layers."""
@@ -287,10 +298,9 @@ class GraniteMoeHybridConfig(PretrainedConfig):
     @property
     def mamba2_cache_params(self):
         """Returns the Mamba2 cache parameters for this configuration."""
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         shape = Mamba2StateShape.create(
-            tp_world_size=get_attention_tp_size(),
+            tp_world_size=get_parallel().attn_tp_size,
             intermediate_size=self.mamba_intermediate_size,
             n_groups=self.mamba_n_groups,
             num_heads=self.mamba_n_heads,

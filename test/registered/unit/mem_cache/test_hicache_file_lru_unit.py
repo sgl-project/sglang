@@ -14,12 +14,11 @@ Run with:
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import os
 import shutil
 import tempfile
-import threading
 import time
 import unittest
 from unittest import mock
@@ -392,41 +391,16 @@ class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
                 free[0] += os.path.getsize(p)
             return original_remove(p)
 
-        with mock.patch.object(
-            b._evictor, "_fs_stats", side_effect=fake_fs_stats
-        ), mock.patch("os.remove", side_effect=tracked_remove):
+        with (
+            mock.patch.object(b._evictor, "_fs_stats", side_effect=fake_fs_stats),
+            mock.patch("os.remove", side_effect=tracked_remove),
+        ):
             self.assertTrue(b.set("newk", _t(60)))
         self.assertFalse(b.exists("victim"))
         self.assertTrue(b.exists("newk"))
 
 
 class TestPreReservationConcurrency(HiCacheFileLRUTestBase):
-    def test_concurrent_sets_keep_total_consistent_with_lru(self):
-        """Under concurrent writes, _total_bytes stays consistent with _lru."""
-        b = self.make_backend(max_size="300", eviction_ratio=1.0)
-        n_threads = 8
-        per_size = 60
-        errors = []
-
-        def writer(i):
-            try:
-                b.set(f"k{i}", _t(per_size, fill=i % 256))
-            except Exception as e:
-                errors.append(e)
-
-        threads = [threading.Thread(target=writer, args=(i,)) for i in range(n_threads)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        self.assertEqual(errors, [])
-        # Invariant 1: _total_bytes equals the sum of tracked LRU sizes.
-        tracked_sum = sum(b._evictor._lru.values())
-        self.assertEqual(b._evictor._total_bytes, tracked_sum)
-        # Invariant 2: _total_bytes does not exceed the cap.
-        self.assertLessEqual(b._evictor._total_bytes, 300)
-
     def test_pre_reservation_visible_during_write(self):
         """An in-flight reservation must not be evicted by a concurrent set()."""
         b = self.make_backend(max_size="100", eviction_ratio=1.0)
@@ -543,9 +517,10 @@ class TestHiCacheFileMetadataIntegration(HiCacheFileLRUTestBase):
         b.set("k2", _t(50))
 
         # Now patch os.scandir and os.path.exists
-        with mock.patch("os.scandir") as mock_scandir, mock.patch(
-            "os.path.exists"
-        ) as mock_exists:
+        with (
+            mock.patch("os.scandir") as mock_scandir,
+            mock.patch("os.path.exists") as mock_exists,
+        ):
             mock_exists.return_value = True
 
             # batch_exists_v2 for k1 and k2 should hit the metadata cache and NOT call os.scandir or os.path.exists

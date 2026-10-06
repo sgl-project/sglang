@@ -7,9 +7,8 @@ from torch import nn
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
-from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm as MMGenRMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -25,6 +24,8 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layernorm import RMSNorm
 
 
 class Qwen3MLP(nn.Module):
@@ -131,8 +132,9 @@ class Qwen3Attention(nn.Module):
 
         # QK-Norm: Key difference from LLaMA
         rms_norm_eps = getattr(config, "rms_norm_eps", 1e-6)
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        # Keep the small-hidden one-pass kernel used by diffusion QK norm.
+        self.q_norm = MMGenRMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = MMGenRMSNorm(self.head_dim, eps=rms_norm_eps)
 
         # Rotary embeddings
         self.rotary_emb = get_rope(
@@ -212,6 +214,10 @@ class Qwen3Attention(nn.Module):
             q_item = q[batch_index : batch_index + 1]
             k_item = k[batch_index : batch_index + 1]
             v_item = v[batch_index : batch_index + 1]
+
+            if valid_len == 0:
+                outputs.append(torch.zeros_like(q_item))
+                continue
 
             real_output = self.attn(
                 q_item[:, :valid_len],
@@ -320,6 +326,8 @@ class Qwen3ForCausalLM(TextEncoder):
     - QK-Norm for better training stability
     - FSDP sharding for CPU offload
     """
+
+    _aliases = ["Qwen3Model"]
 
     def __init__(self, config: Qwen3TextConfig) -> None:
         super().__init__(config)

@@ -5,12 +5,7 @@ import re
 
 import torch
 
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-    get_moe_tensor_parallel_rank,
-    get_moe_tensor_parallel_world_size,
-)
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -66,15 +61,15 @@ def _load_gptoss_quark_expert_weights(model, weights, quark_expert_pat):
     loaded_params: set[str] = set()
     mxfp4_block = 32
 
-    moe_tp_rank = get_moe_tensor_parallel_rank()
-    moe_tp_size = get_moe_tensor_parallel_world_size()
-    moe_ep_rank = get_moe_expert_parallel_rank()
-    moe_ep_size = get_moe_expert_parallel_world_size()
+    moe_tp_rank = get_parallel().moe_tp_rank
+    moe_tp_size = get_parallel().moe_tp_size
+    moe_ep_rank = get_parallel().moe_ep_rank
+    moe_ep_size = get_parallel().moe_ep_size
 
     intermediate_size = model.config.intermediate_size
-    assert (
-        intermediate_size % mxfp4_block == 0
-    ), f"{intermediate_size=} must be divisible by {mxfp4_block=}"
+    assert intermediate_size % mxfp4_block == 0, (
+        f"{intermediate_size=} must be divisible by {mxfp4_block=}"
+    )
     intermediate_size_block = intermediate_size // mxfp4_block
 
     per_rank_intermediate_size_block = math.ceil(intermediate_size_block / moe_tp_size)

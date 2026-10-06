@@ -3,7 +3,7 @@
 Shared by KimiVLImageProcessor and KimiK2_5VLImageProcessor.
 """
 
-from typing import Union
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -37,6 +37,22 @@ class KimiGridMMDataMixin:
             int(media_tokens_calculator({"type": "image", "image": image}))
             for image in images
         ]
+
+    @staticmethod
+    def count_image_placeholders(input_ids, image_token_id: int) -> Optional[int]:
+        """Structural image tokens in a pre-tokenized prompt, None if it is text."""
+        if not isinstance(input_ids, (list, torch.Tensor)):
+            return None
+
+        token_ids = np.asarray(
+            (
+                input_ids.detach().flatten().cpu()
+                if isinstance(input_ids, torch.Tensor)
+                else input_ids
+            ),
+            dtype=np.int64,
+        )
+        return int(np.count_nonzero(token_ids == image_token_id))
 
     def _num_image_tokens_from_grid(
         self, grid_thw: Union[torch.Tensor, np.ndarray, list, tuple]

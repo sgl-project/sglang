@@ -22,20 +22,37 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Type
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+)
 
 import einops
 import torch
 import torch.distributed
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
     ExpertDispatchCollector,
     resolve_collector_class,
 )
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import get_device as get_device_namespace
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_platform,
+    get_schedule,
+    logs_expert_balancedness_to_server_log,
+    reports_expert_balancedness,
+)
 from sglang.srt.utils import Withable, get_device, get_int_env_var
 
 if TYPE_CHECKING:
@@ -43,19 +60,76 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+# AMD specific function
+def megamoe_prefill_only_recorder_enabled() -> bool:
+    # The prefill-only arm belongs to aiter MegaMoEv2, which only exists on ROCm.
+    # Read the backend through the resolved accessor, not off a supplied
+    # ServerArgs: test_supplied_instance_exposure_ratchet pins (file, field)
+    # pairs where a `server_args` parameter is read for a field that resolution
+    # fills in, and that surface may only shrink.
+    from sglang.srt.layers.moe import get_moe_a2a_backend
+
+    return (
+        get_platform().is_hip
+        and envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
+        and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
+        and get_moe_a2a_backend().is_megamoe()
+    )
+
+
+# non-hip platform always return True
+def should_record_forward_pass(forward_batch: ForwardBatch) -> bool:
+    if not megamoe_prefill_only_recorder_enabled():
+        return True
+    if _is_model_capture_mode():
+        return False
+    if forward_batch.forward_mode not in (
+        ForwardMode.EXTEND,
+        ForwardMode.SPLIT_PREFILL,
+    ):
+        return False
+    return int(forward_batch.extend_num_tokens or 0) > 0
+
+
+# non-hip platform always return True
+def should_advance_eplb_counter(forward_batch: ForwardBatch) -> bool:
+    """Whether a finished pass counts towards the EPLB rebalance interval.
+
+    Unlike `should_record_forward_pass`, which is local to this rank, the
+    counter has to advance in lockstep across ranks, so it keys off the globally
+    synchronized `is_extend_in_batch` rather than this rank's forward mode.
+    """
+    if not megamoe_prefill_only_recorder_enabled():
+        return True
+    return forward_batch.is_extend_in_batch
+
+
+def _is_model_capture_mode() -> bool:
+    from sglang.srt.model_executor.runner_utils.capture_mode import is_capture_mode
+
+    return is_capture_mode
+
+
 # --------------------------------------- Entrypoint -----------------------------------------
 
 _OutputMode = Literal["file", "object"]
+EPLB_BALANCEDNESS_WINDOW_SIZES = (10, 100, 1000)
 
 
 @dataclass
 class ExpertDistributionMetrics:
+    forward_pass_id: int
     eplb_balancedness: torch.Tensor
+    gpu_physical_count_sum: Optional[torch.Tensor]
+    reset_server_log_history: bool
 
     def map_device_tensors(self, fn):
         # Device-tensor fields only; caller injects the copy+safety primitive
         # (see GenerationBatchResult.copy_to_cpu).
         self.eplb_balancedness = fn(self.eplb_balancedness)
+        if self.gpu_physical_count_sum is not None:
+            self.gpu_physical_count_sum = fn(self.gpu_physical_count_sum)
 
 
 class ExpertDistributionRecorder(ABC):
@@ -63,19 +137,16 @@ class ExpertDistributionRecorder(ABC):
 
     @staticmethod
     def init_new(
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
-        if server_args.expert_distribution_recorder_mode is not None:
-            assert (
-                expert_location_metadata is not None
-            ), "ExpertLocationMetadata is required for expert distribution recording. One possible"
+        if get_exec().moe.expert_distribution_recorder_mode is not None:
+            assert expert_location_metadata is not None, (
+                "ExpertLocationMetadata is required for expert distribution recording. One possible"
+            )
             "reason is that you are using a model that does not support expert distribution"
             "recording. Try setting `get_model_config_for_expert_location` in your model."
-            return _ExpertDistributionRecorderReal(
-                server_args, expert_location_metadata, rank
-            )
+            return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
         else:
             return _ExpertDistributionRecorderNoop()
 
@@ -97,6 +168,9 @@ class ExpertDistributionRecorder(ABC):
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         pass
+
+    def get_current_pass_count_buffer(self, layer_idx: int):
+        return None
 
     def on_deepep_dispatch_normal(
         self,
@@ -138,29 +212,27 @@ class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
 class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def __init__(
         self,
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
-        self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
 
         self._recording = False
         self._disable_all = False
+        self._record_current_pass = False
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
-        self._accumulator = _Accumulator.init_new(
-            server_args, expert_location_metadata, rank
-        )
+        self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
         self._single_pass_gatherers = {
-            k: _SinglePassGatherer.init_new(server_args, expert_location_metadata, rank)
+            k: _SinglePassGatherer.init_new(expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
-        if server_args.enable_expert_distribution_metrics:
+        if reports_expert_balancedness():
             logger.info(
-                "ExpertDistributionRecorder auto start record since enable_expert_distribution_metrics"
+                "ExpertDistributionRecorder auto start record since "
+                f"expert_balancedness_report_mode={get_exec().moe.expert_balancedness_report_mode}"
             )
             self.start_record()
 
@@ -192,13 +264,17 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     def _on_forward_pass_start(self, forward_batch: ForwardBatch):
         if not self._recording:
+            self._record_current_pass = False
+            return
+        self._record_current_pass = should_record_forward_pass(forward_batch)
+        if not self._record_current_pass:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             gatherer.reset()
             gatherer.on_forward_pass_start(forward_batch)
 
     def _on_forward_pass_end(self, forward_pass_id: int, outputs: Dict[str, Any]):
-        if not self._recording:
+        if not self._recording or not self._record_current_pass:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             single_pass_data = gatherer.collect()
@@ -208,6 +284,14 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
+
+    def get_current_pass_count_buffer(self, layer_idx: int):
+        if not self._recording or not self._record_current_pass:
+            return None
+        gatherer = self._single_pass_gatherers.get(_SINGLE_PASS_GATHERER_KEY_PRIMARY)
+        if not isinstance(gatherer, _SelectExpertsSinglePassGatherer):
+            return None
+        return gatherer._data[layer_idx]
 
     def on_deepep_dispatch_normal(
         self,
@@ -235,6 +319,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def _on_hook(self, hook_name: str, **kwargs):
         if self._disable_all:
             return
+        if megamoe_prefill_only_recorder_enabled() and not self._record_current_pass:
+            return
         if not (
             self._recording or torch.get_device_module().is_current_stream_capturing()
         ):
@@ -249,9 +335,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def _reset(self):
         """Reset the expert distribution recorder."""
         logger.info("Resetting ExpertDistributionRecorder...")
-        assert (
-            self._current_layer_idx.value is None
-        ), f"{self._current_layer_idx.value=}"
+        assert self._current_layer_idx.value is None, (
+            f"{self._current_layer_idx.value=}"
+        )
         for gatherer in self._single_pass_gatherers.values():
             gatherer.reset()
         self._accumulator.reset()
@@ -306,36 +392,37 @@ def set_global_expert_distribution_recorder(value):
 class _SinglePassGatherer(ABC):
     @staticmethod
     def init_new(
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ) -> _SinglePassGatherer:
-        if server_args.expert_distribution_recorder_mode == "per_token":
-            return _DetailSinglePassGatherer(
-                server_args, expert_location_metadata, rank
-            )
+        if get_exec().moe.expert_distribution_recorder_mode == "per_token":
+            return _DetailSinglePassGatherer(expert_location_metadata, rank)
 
-        if server_args.moe_a2a_backend == "mori":
+        if get_exec().moe.moe_a2a_backend == "mori":
             return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
 
-        if server_args.expert_distribution_recorder_mode == "stat_approx":
-            if server_args.moe_a2a_backend != "none" and (
-                server_args.deepep_mode == "normal"
+        if get_exec().moe.expert_distribution_recorder_mode == "stat_approx":
+            if get_exec().moe.moe_a2a_backend != "none" and (
+                get_exec().moe.deepep_mode == "normal"
             ):
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
-        if server_args.moe_a2a_backend != "none":
-            if server_args.deepep_mode == "normal":
+        if get_exec().moe.moe_a2a_backend == "deepep":
+            if get_exec().moe.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
-            elif server_args.deepep_mode == "low_latency":
+            elif get_exec().moe.deepep_mode == "low_latency":
                 return _DeepepLowLatencySinglePassGatherer(
-                    expert_location_metadata, rank
+                    expert_location_metadata,
+                    rank,
+                    elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
                 )
             else:
                 raise NotImplementedError
 
+        # Non-DeepEP a2a backends (flashinfer / nixl / mooncake / megamoe) and
+        # no-a2a path dispatch through the standard topk select_experts.
         return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
 
     def __init__(self, expert_location_metadata: ExpertLocationMetadata, rank: int):
@@ -376,7 +463,6 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
 
     def __init__(
         self,
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
@@ -386,16 +472,16 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
             (
                 expert_location_metadata.num_layers,
                 # TODO determine the max number
-                server_args.chunked_prefill_size * 8,
+                get_schedule().chunked_prefill_size * 8,
                 self._TOP_K_NUM,
             ),
             dtype=torch.int32,
-            device=server_args.device,
+            device=get_device_namespace().device,
         )
         self._misc_objects: List[Dict[str, Any]] = []
-        assert (
-            not server_args.enable_two_batch_overlap
-        ), "DetailSinglePassGatherer does not support TBO yet"
+        assert not get_exec().overlap.enable_two_batch_overlap, (
+            "DetailSinglePassGatherer does not support TBO yet"
+        )
         # TODO assert shared experts fusion is disabled, o/w data is wrong
 
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
@@ -532,7 +618,9 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     # can optimize (e.g. fuse / compile)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         topk_ids = topk_ids.flatten()
-        mask = topk_ids != -1
+        mask = (topk_ids >= 0) & (
+            topk_ids < self._expert_location_metadata.num_physical_experts
+        )
         self._data[layer_idx, :].scatter_add_(
             dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
         )
@@ -572,13 +660,26 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
 
 
 class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, elastic_ep_enabled: bool = False, **kwargs):
         super().__init__(*args, **kwargs, enable_global_physical_experts=False)
+        self._elastic_ep_enabled = elastic_ep_enabled
 
     def on_deepep_dispatch_low_latency(
         self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
     ):
-        # Most naive implementation, can optimize later
+        if local_physical_count_of_layer.shape[0] != self._data.shape[1]:
+            if not self._elastic_ep_enabled:
+                self._data[layer_idx, :] += local_physical_count_of_layer
+                return
+
+            n = self._data.shape[1]
+            if local_physical_count_of_layer.shape[0] > n:
+                local_physical_count_of_layer = local_physical_count_of_layer[:n]
+            else:
+                local_physical_count_of_layer = torch.nn.functional.pad(
+                    local_physical_count_of_layer,
+                    (0, n - local_physical_count_of_layer.shape[0]),
+                )
         self._data[layer_idx, :] += local_physical_count_of_layer
 
 
@@ -628,30 +729,25 @@ _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
 class _Accumulator(ABC):
     @staticmethod
     def init_new(
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ) -> _Accumulator:
-        return _Accumulator.get_class(server_args)(
-            server_args, expert_location_metadata, rank
-        )
+        return _Accumulator.get_class()(expert_location_metadata, rank)
 
     @staticmethod
-    def get_class(server_args: ServerArgs) -> Type[_Accumulator]:
+    def get_class() -> Type[_Accumulator]:
         return {
             "stat": _StatAccumulator,
             "stat_approx": _StatAccumulator,
             "per_pass": _DetailAccumulator,
             "per_token": _DetailAccumulator,
-        }[server_args.expert_distribution_recorder_mode]
+        }[get_exec().moe.expert_distribution_recorder_mode]
 
     def __init__(
         self,
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
-        self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
 
@@ -681,14 +777,14 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self._enable = self._server_args.enable_expert_distribution_metrics
+        self._enable = reports_expert_balancedness()
 
         if self._enable:
-            self.window_sizes = [10, 100, 1000]
+            self.window_sizes = EPLB_BALANCEDNESS_WINDOW_SIZES
             self._history = _DequeCollection(maxlens=self.window_sizes)
+            self._reset_server_log_history = True
             self._rank = torch.distributed.get_rank()
             expert_dispatch_cls = resolve_collector_class(
-                self._server_args,
                 STAT_LOGGER_ROLE_EXPERT_DISPATCH,
                 ExpertDispatchCollector,
             )
@@ -714,6 +810,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         super().reset()
         if self._enable:
             self._history.clear()
+            self._reset_server_log_history = True
 
     def _append_utilization_rate(
         self,
@@ -725,7 +822,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             single_pass_global_physical_count,
             num_gpu=self._expert_location_metadata.ep_size,
         )
-        gpu_physical_count = gpu_physical_count.to(self._server_args.device)
+        gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
         torch.distributed.reduce(
             gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
         )
@@ -736,26 +833,23 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             utilization_rate_gpu = torch.mean(
                 compute_utilization_rate(gpu_physical_count)
             )
-            if envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
-                print(f"hi {self._rank=} {utilization_rate_gpu=}")
-                outputs["metrics"] = ExpertDistributionMetrics(
-                    eplb_balancedness=utilization_rate_gpu,
-                )
-            else:
-                # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
-                utilization_rate_cpu = utilization_rate_gpu.item()
-                self._history.append(utilization_rate_cpu)
+            should_track_history = not math.isclose(
+                get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
+            )
 
-                gpu_physical_count_sum = gpu_physical_count.sum().item()
+            should_log = logs_expert_balancedness_to_server_log()
+            outputs["metrics"] = ExpertDistributionMetrics(
+                forward_pass_id=forward_pass_id,
+                eplb_balancedness=utilization_rate_gpu,
+                gpu_physical_count_sum=(
+                    gpu_physical_count.sum() if should_log else None
+                ),
+                reset_server_log_history=self._reset_server_log_history,
+            )
+            self._reset_server_log_history = False
 
-                logger.info(
-                    f"[Expert Balancedness] "
-                    f"forward_pass_id={forward_pass_id} "
-                    f"current_pass_balancedness={utilization_rate_cpu:.03f} "
-                    f"{''.join(f'last_{size}_average_balancedness={value:.03f} ' for size, value in self._history.mean().items())} "
-                    f"gpu_physical_count_sum={gpu_physical_count_sum}"
-                    # f"current_pass_per_layer={[round(x, 2) for x in utilization_rate_tensor.cpu().tolist()]}"
-                )
+            if should_track_history:
+                self._history.append(utilization_rate_gpu.item())
 
     # TODO refactor
     def _handle_metric_eplb_heatmap(self, gpu_physical_count: torch.Tensor):
@@ -772,7 +866,9 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 assert (
                     self._expert_location_metadata.ep_size
                     == len(count_of_layer._buckets) - 1
-                ), f"{self._expert_location_metadata.ep_size=}, {len(count_of_layer._buckets)=}"
+                ), (
+                    f"{self._expert_location_metadata.ep_size=}, {len(count_of_layer._buckets)=}"
+                )
                 for gpu_rank in range(self._expert_location_metadata.ep_size):
                     count = gpu_physical_count[layer_idx, gpu_rank]
                     if count > 0:
@@ -782,7 +878,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
 
 
 class _DequeCollection:
-    def __init__(self, maxlens: List[int]):
+    def __init__(self, maxlens: Sequence[int]):
         self._dequeues = [deque(maxlen=maxlen) for maxlen in maxlens]
 
     def append(self, value):
@@ -794,7 +890,7 @@ class _DequeCollection:
             d.clear()
 
     def mean(self) -> Dict[int, float]:
-        return {d.maxlen: sum(d) / len(d) for d in self._dequeues}
+        return {d.maxlen: sum(d) / len(d) for d in self._dequeues if len(d) > 0}
 
 
 class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
@@ -860,9 +956,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
                 # Cannot use local_physical_count to support select_experts
                 self._expert_location_metadata.num_physical_experts,
             ),
-            buffer_size=self._server_args.expert_distribution_recorder_buffer_size,
+            buffer_size=get_exec().moe.expert_distribution_recorder_buffer_size,
             dtype=torch.int32,
-            device=self._server_args.device,
+            device=get_device_namespace().device,
         )
         self._first_dump = True
 
@@ -915,7 +1011,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
     def _get_global_average_utilization_rate(self):
         if not self._enable or math.isclose(
-            self._server_args.eplb_min_rebalancing_utilization_threshold, 1.0
+            get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
         ):
             return None
 

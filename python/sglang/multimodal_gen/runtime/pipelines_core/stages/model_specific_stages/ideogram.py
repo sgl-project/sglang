@@ -39,7 +39,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 
 SEQUENCE_PADDING_INDICATOR = -1
 OUTPUT_IMAGE_INDICATOR = 2
@@ -117,6 +117,7 @@ class Ideogram4Scheduler:
 
 
 class Ideogram4TextEncodingStage(TextEncodingStage):
+    deduplicated_output_fields = ("prompt_embeds", "prompt_embeds_mask")
     deduplicated_extra_tensor_tree_output_keys = ("ideogram4",)
 
     def __init__(self, text_encoder, tokenizer) -> None:
@@ -285,6 +286,8 @@ class Ideogram4DenoisingStage(DenoisingStage):
     def _dual_transformer_execution_mode(
         self,
     ) -> DualTransformerExecutionMode | None:
+        if self.unconditional_transformer is None:
+            return None
         return DualTransformerExecutionMode.PAIRED_PER_STEP
 
     def _cache_dit_secondary_uses_primary_config(self) -> bool:
@@ -461,7 +464,7 @@ class Ideogram4DenoisingStage(DenoisingStage):
         schedule_values = ctx.extra["ideogram4_schedule_values"]
         schedule_deltas = ctx.extra["ideogram4_schedule_deltas"]
         guidance_schedule = ctx.extra["ideogram4_guidance_schedule"]
-        skip_unconditional = ctx.extra["ideogram4_skip_unconditional"]
+        skip_unconditional = ctx.extra.get("ideogram4_skip_unconditional", False)
         i = step.t_int
 
         t_val = schedule_values[i + 1]
@@ -490,7 +493,8 @@ class Ideogram4DenoisingStage(DenoisingStage):
                 )
                 pos_v = pos_out[:, max_text_tokens : max_text_tokens + num_image_tokens]
 
-            if not skip_unconditional:
+            neg_v = None
+            if not skip_unconditional and self.unconditional_transformer is not None:
                 self._manage_unconditional_transformer_use_site(batch)
                 with set_forward_context(
                     current_timestep=i,
@@ -512,13 +516,11 @@ class Ideogram4DenoisingStage(DenoisingStage):
                     )
 
         with maybe_nvtx_range("scheduler_step", use_nvtx):
-            if skip_unconditional:
-                velocity = pos_v
-            else:
+            velocity = pos_v
+            if neg_v is not None:
                 velocity = (
                     guidance_schedule[i] * pos_v + (1.0 - guidance_schedule[i]) * neg_v
                 )
-
             ctx.latents = z + velocity * schedule_deltas[i]
 
 

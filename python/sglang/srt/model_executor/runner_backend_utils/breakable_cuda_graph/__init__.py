@@ -14,21 +14,8 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakab
     BreakableCUDAGraphCapture,
     break_graph,
     eager_on_graph,
-    get_current_replay_token,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (  # noqa: F401
-    BCG_FAILURE_HINT,
     enable_breakable_cuda_graph,
     is_in_breakable_cuda_graph,
 )
-
-__all__ = [
-    "BreakableCUDAGraph",
-    "BreakableCUDAGraphCapture",
-    "break_graph",
-    "eager_on_graph",
-    "get_current_replay_token",
-    "BCG_FAILURE_HINT",
-    "enable_breakable_cuda_graph",
-    "is_in_breakable_cuda_graph",
-]

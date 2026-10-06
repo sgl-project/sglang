@@ -12,7 +12,7 @@ non-NPU hosts.
 
 from __future__ import annotations
 
-import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -28,6 +28,7 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import empty_context, get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -53,7 +54,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
-        self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._device_id = self._device_module.current_device()
+        self._tp_group = get_parallel().tp_group
         self._capture_stream = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -62,6 +64,16 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._enable_torch_compile = getattr(
             cuda_graph_runner, "enable_torch_compile", False
         )
+        # Reuse one device-bound worker for graph input updates.
+        self._update_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="npu-graph-update",
+            initializer=self._device_module.set_device,
+            initargs=(self._device_id,),
+        )
+        # Event of the last replay; the next rebind waits on it so the device is
+        # done reading the host-side seq_lens array before we rewrite it.
+        self._rebind_fence = None
 
     @contextmanager
     def capture_session(self, stream):
@@ -78,7 +90,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self,
         shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
-        dummies: Optional[Any] = None,
+        capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         import torch_npu  # noqa: F401  (verifies NPU availability)
@@ -111,11 +123,14 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         else:
             graph_ctx = torch.npu.graph
 
-        with skip_guard_context, graph_ctx(
-            graph,
-            pool=self._pool,
-            stream=self._capture_stream,
-            auto_dispatch_capture=True,
+        with (
+            skip_guard_context,
+            graph_ctx(
+                graph,
+                pool=self._pool,
+                stream=self._capture_stream,
+                auto_dispatch_capture=True,
+            ),
         ):
             out = forward_fn()
 
@@ -146,8 +161,10 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         attr_type: Any = None,
         cpu_update_input: list = None,
     ) -> Any:
-        """Rebind seq_lens on the recorded NPU graph in a background
-        thread, then replay. Used when the model is not deepseek-nsa.
+        """Rebind seq_lens on the recorded NPU graph, then replay.
+
+        NPUGraph.update must complete before replay can consume the updated
+        KV lengths. Used when the model is not deepseek-nsa.
 
         Two calling conventions:
         1. (legacy) seq_lens + attr_name + attr_type:
@@ -162,16 +179,22 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
         graph = self._graphs[shape_key]
 
-        def _update():
-            graph.update(cpu_update_input=cpu_update_input)
+        if self._rebind_fence is not None:
+            self._rebind_fence.synchronize()
 
-        thread = threading.Thread(target=_update)
-        thread.start()
+        update_future = self._update_executor.submit(
+            graph.update, cpu_update_input=cpu_update_input
+        )
         graph.replay()
-        thread.join()
+        update_future.result()
+
+        fence = self._device_module.Event()
+        fence.record()
+        self._rebind_fence = fence
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        self._update_executor.shutdown(wait=True, cancel_futures=True)
         self._graphs.clear()
         self._outputs.clear()
         self._pool = None

@@ -1,0 +1,145 @@
+---
+title: "Evaluating New Models with SGLang"
+metatags:
+    description: "SGLang model evaluation: MMLU, GSM8K, GPQA, HumanEval, MMMU benchmarks. Latency and throughput testing commands."
+---
+This document provides commands for evaluating models' accuracy and performance. Before open-sourcing new models, we strongly suggest running these commands to verify whether the score matches your internal benchmark results.
+
+**For cross verification, please submit commands for installation, server launching, and benchmark running with all the scores and hardware requirements when open-sourcing your models.**
+
+[Reference: MiniMax M2](https://github.com/sgl-project/sglang/pull/12129)
+
+## Accuracy
+
+### LLMs
+
+SGLang provides built-in scripts to evaluate common benchmarks.
+
+**MMLU**
+
+```bash Command
+sgl-eval run mmlu \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 1000 \
+  --max-tokens 8192
+```
+
+**GSM8K**
+
+```bash Command
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 200
+```
+
+**HellaSwag**
+
+```bash Command
+python benchmark/hellaswag/bench_sglang.py \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --num-questions 200 \
+  --num-shots 20
+```
+
+**GPQA**
+
+```bash Command
+sgl-eval run gpqa \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 198 \
+  --max-tokens 120000 \
+  --n-repeats 8
+```
+
+<Tip>
+For reasoning models, add `--thinking` (DeepSeek-V3 / Kimi-K2 style `thinking` key) or `--chat-template-kwarg enable_thinking=true` (Qwen3 / GLM style). You may skip it if the model has forced thinking enabled.
+</Tip>
+
+**HumanEval**
+
+```bash Command
+pip install human_eval
+
+python -m sglang.test.run_eval \
+  --eval-name humaneval \
+  --num-examples 10 \
+  --port 30000
+```
+
+### VLMs
+
+**MMMU**
+
+```bash Command
+python benchmark/mmmu/bench_sglang.py \
+  --port 30000 \
+  --concurrency 64
+```
+
+<Tip>
+You can set max tokens by passing `--extra-request-body '{"max_tokens": 4096}'`.
+</Tip>
+
+For models capable of processing video, we recommend extending the evaluation to include `VideoMME`, `MVBench`, and other relevant benchmarks.
+
+## Performance
+
+Performance benchmarks measure **Latency** (Time To First Token - TTFT) and **Throughput** (tokens/second).
+
+### LLMs
+
+**Latency-Sensitive Benchmark**
+
+This simulates a scenario with low concurrency (e.g., single user) to measure latency.
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --dataset-name random \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+**Throughput-Sensitive Benchmark**
+
+This simulates a high-traffic scenario to measure maximum system throughput.
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --dataset-name random \
+  --num-prompts 1000 \
+  --max-concurrency 100
+```
+
+**Single Batch Performance**
+
+You can also benchmark the performance of processing a single batch offline.
+
+```bash Command
+python -m sglang.bench_one_batch_server \
+  --model <model-path> \
+  --batch-size 8 \
+  --input-len 1024 \
+  --output-len 1024
+```
+
+You can run more granular benchmarks:
+
+- **Low Concurrency**: `--num-prompts 10 --max-concurrency 1`
+- **Medium Concurrency**: `--num-prompts 80 --max-concurrency 16`
+- **High Concurrency**: `--num-prompts 500 --max-concurrency 100`
+
+## Reporting Results
+
+For each evaluation, please report:
+
+1.  **Metric Score**: Accuracy % (LLMs and VLMs); Latency (ms) and Throughput (tok/s) (LLMs only).
+2.  **Environment settings**: GPU type/count, SGLang commit hash.
+3.  **Launch configuration**: Model path, TP size, and any special flags.
+4.  **Evaluation parameters**: Number of shots, examples, max tokens.

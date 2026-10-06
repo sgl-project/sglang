@@ -2,16 +2,82 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
 
 import unittest
 from unittest.mock import MagicMock, call, patch
 
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.test_utils import CustomTestCase
 
 
 class TestRegisterToBootstrap(CustomTestCase):
     """Tests for CommonKVManager.register_to_bootstrap retry/backoff behavior."""
+
+    def setUp(self):
+        # register_to_bootstrap reads get_parallel().load_balance_method /
+        # .enable_dsa_cache_layer_split and get_serving().port from the
+        # published config.
+        override = get_context().override_server_args(
+            load_balance_method="follow_bootstrap_room", port=30000
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    def test_sender_dp_rank_registration(self):
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.disaggregation.common.conn import CommonKVSender
+
+        for force_query in (False, True):
+            for dp_rank in (0, 1):
+                with self.subTest(force_query=force_query, dp_rank=dp_rank):
+                    mgr = MagicMock(
+                        is_dummy_cp_rank=False,
+                        attn_dp_rank=dp_rank,
+                        deferred_bootstrap=None,
+                    )
+                    sender = MagicMock(spec=CommonKVSender)
+                    sender._register_prefill_dp_rank = (
+                        CommonKVSender._register_prefill_dp_rank.__get__(sender)
+                    )
+                    with (
+                        patch(
+                            "sglang.srt.disaggregation.common.conn.requests.post"
+                        ) as mock_post,
+                        get_context().override_server_args(
+                            dp_size=4, load_balance_method="follow_bootstrap_room"
+                        ),
+                        envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.override(
+                            force_query
+                        ),
+                    ):
+                        mock_post.return_value.status_code = 200
+                        CommonKVSender.__init__(
+                            sender,
+                            mgr=mgr,
+                            bootstrap_addr="127.0.0.1:8765",
+                            bootstrap_room=4,
+                        )
+
+                    self.assertEqual(
+                        mock_post.call_args_list,
+                        [
+                            call(
+                                "http://127.0.0.1:8765/register_dp_rank",
+                                json={"bootstrap_room": 4, "dp_rank": dp_rank},
+                                timeout=5,
+                            )
+                        ]
+                        if force_query
+                        else [],
+                    )
+                    conflict = not force_query and dp_rank != 0
+                    self.assertEqual(mgr.record_failure.call_count, int(conflict))
+                    mgr.update_status.assert_called_with(
+                        4, KVPoll.Failed if conflict else KVPoll.Bootstrapping
+                    )
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
@@ -165,9 +231,13 @@ class TestRegisterToBootstrap(CustomTestCase):
             "rank_port",
             "page_size",
             "kv_cache_dtype",
+            # Self-registered HTTP API port used to derive the PD retract
+            # rebootstrap /generate URL on the decode side.
+            "prefill_http_port",
         ]
         for field in required_fields:
             self.assertIn(field, payload)
+        self.assertEqual(payload["prefill_http_port"], 30000)
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
@@ -182,6 +252,89 @@ class TestRegisterToBootstrap(CustomTestCase):
 
         url_used = mock_put.call_args[0][0]
         self.assertIn("10.0.0.1", url_used)
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_rust_attention_dp_replicates_complete_topology_across_hosts(
+        self, mock_put
+    ):
+        mock_world_group = MagicMock()
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        mock_put.return_value = success_resp
+
+        schedulers = (
+            (0, 0, "10.0.0.1", 17000, 8765),
+            (0, 1, "10.0.0.1", 17001, None),
+            (1, 0, "10.0.0.2", 17002, 8766),
+            (1, 1, "10.0.0.2", 17003, None),
+        )
+
+        def gather_topology(payload):
+            return [
+                {
+                    **payload,
+                    "attn_dp_rank": dp_rank,
+                    "attn_tp_rank": tp_rank,
+                    "rank_ip": host,
+                    "rank_port": rank_port,
+                }
+                for dp_rank, tp_rank, host, rank_port, _ in schedulers
+            ]
+
+        mock_world_group.all_gather_object.side_effect = gather_topology
+
+        with (
+            get_parallel().override(world_group=mock_world_group),
+            envs.SGLANG_RUST_SERVER.override(True),
+        ):
+            for dp_rank, tp_rank, local_ip, _, rust_http_port in schedulers:
+                manager = self._make_manager()
+                manager.attn_dp_size = 2
+                manager.attn_dp_rank = dp_rank
+                manager.attn_tp_size = 2
+                manager.attn_tp_rank = tp_rank
+                manager.local_ip = local_ip
+                manager.bootstrap_host = local_ip
+                manager.kv_args.rust_http_port = rust_http_port
+                manager.register_to_bootstrap()
+
+        topology_by_registry = {}
+        for put_call in mock_put.call_args_list:
+            payload = put_call.kwargs["json"]
+            topology_by_registry.setdefault(put_call.args[0], {})[
+                (payload["attn_dp_rank"], payload["attn_tp_rank"])
+            ] = (payload["rank_ip"], payload["rank_port"])
+        complete_topology = {
+            (dp, tp): (host, rank_port) for dp, tp, host, rank_port, _ in schedulers
+        }
+        self.assertEqual(
+            topology_by_registry,
+            {
+                "http://10.0.0.1:8765/route": complete_topology,
+                "http://10.0.0.2:8766/route": complete_topology,
+            },
+        )
+        self.assertEqual(mock_put.call_count, 8)
+        self.assertEqual(
+            {
+                (put_call.args[0], put_call.kwargs["json"]["prefill_http_port"])
+                for put_call in mock_put.call_args_list
+            },
+            {
+                ("http://10.0.0.1:8765/route", 8765),
+                ("http://10.0.0.2:8766/route", 8766),
+            },
+        )
+        self.assertEqual(
+            [
+                (
+                    gather_call.args[0]["attn_dp_rank"],
+                    gather_call.args[0]["attn_tp_rank"],
+                )
+                for gather_call in mock_world_group.all_gather_object.call_args_list
+            ],
+            [(dp, tp) for dp, tp, _, _, _ in schedulers],
+        )
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
@@ -242,6 +395,9 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.register_to_bootstrap = CommonKVManager.register_to_bootstrap.__get__(
             mgr, CommonKVManager
         )
+        mgr._register_topology_row = CommonKVManager._register_topology_row.__get__(
+            mgr, CommonKVManager
+        )
 
         # Set attributes that register_to_bootstrap reads
         mgr.dist_init_addr = dist_init_addr
@@ -262,10 +418,9 @@ class TestRegisterToBootstrap(CustomTestCase):
 
         mgr.kv_args = MagicMock()
         mgr.kv_args.page_size = 16
-
-        mgr.server_args = MagicMock()
-        mgr.server_args.kv_cache_dtype = "auto"
-        mgr.server_args.load_balance_method = "follow_bootstrap_room"
+        mgr.kv_args.rust_http_port = None
+        # Resolved per-runner value threaded through KVArgs (the payload field).
+        mgr.kv_cache_dtype_str = "auto"
 
         return mgr
 

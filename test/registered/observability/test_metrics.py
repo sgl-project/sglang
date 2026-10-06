@@ -15,6 +15,9 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
     compute_routing_key_stats,
 )
+from sglang.srt.observability.scheduler_stage_metrics import (
+    FORWARD_OVERLAP_CATEGORIES,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -25,10 +28,18 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=74, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=144, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=32, suite="stage-b-test-1-gpu-small-amd")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
+_GRAPH_PHASES = {
+    "prefill",
+    "decode",
+    "target_verify",
+    "draft_prefill",
+    "draft_decode",
+    "draft_extend",
+}
 
 
 class TestEnableMetrics(CustomTestCase):
@@ -66,14 +77,6 @@ class TestEnableMetrics(CustomTestCase):
                     "sglang:dp_cooperation_realtime_tokens_total",
                     {"mode": "decode"},
                 ),
-                (
-                    "sglang:dp_cooperation_forward_execution_seconds_total",
-                    {"category": "extend"},
-                ),
-                (
-                    "sglang:dp_cooperation_forward_execution_seconds_total",
-                    {"category": "decode"},
-                ),
             ]
             _check_metrics_positive(self, metrics, metrics_to_check)
 
@@ -85,7 +88,7 @@ class TestEnableMetrics(CustomTestCase):
             self.assertIn("1", num_prefill_ranks_values)
 
         self._execute_core(
-            other_args=["--tp", "2", "--dp", "2", "--enable-dp-attention"],
+            other_args=["--tp", "2", "--attn-dp-size", "2"],
             verify_metrics_extra=_verify_metrics_extra,
             expect_mfu_metrics=True,
             enable_mfu_metrics=True,
@@ -139,8 +142,8 @@ class TestEnableMetrics(CustomTestCase):
             for _ in response.iter_lines(decode_unicode=False):
                 pass
 
-            for i in range(2):
-                # Send the request twice to trigger cached token metrics
+            for _ in range(3):
+                # The third request returns to the first rank under DP round-robin.
                 response = requests.post(
                     f"{DEFAULT_URL_FOR_TEST}/generate",
                     json={
@@ -187,6 +190,15 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:num_unique_running_routing_keys",
             "sglang:routing_key_running_req_count",
             "sglang:routing_key_all_req_count",
+            "sglang:weight_memory_usage_gb",
+            "sglang:kv_cache_memory_usage_gb",
+            "sglang:graph_memory_usage_gb",
+            "sglang:startup_available_gpu_memory_gb",
+            "sglang:startup_time_seconds",
+            "sglang:startup_cuda_graph_time_seconds",
+            "sglang:scheduler_idle_seconds_total",
+            "sglang:scheduler_process_cpu_seconds_total",
+            "sglang:scheduler_stage_seconds_total",
         ]
         mfu_metrics = [
             "sglang:estimated_flops_per_gpu_total",
@@ -223,9 +235,55 @@ class TestEnableMetrics(CustomTestCase):
             ("sglang:realtime_tokens_total", {"mode": "decode"}),
             ("sglang:forward_execution_seconds_total", {"category": "extend"}),
             ("sglang:forward_execution_seconds_total", {"category": "decode"}),
+            ("sglang:scheduler_process_cpu_seconds_total", {}),
             ("sglang:process_cpu_seconds_total", {"component": "tokenizer"}),
+            ("sglang:weight_memory_usage_gb", {"model_name": _MODEL_NAME}),
+            ("sglang:kv_cache_memory_usage_gb", {"model_name": _MODEL_NAME}),
+            (
+                "sglang:startup_available_gpu_memory_gb",
+                {"model_name": _MODEL_NAME},
+            ),
+            ("sglang:startup_time_seconds", {"phase": "load_weight"}),
+            ("sglang:startup_time_seconds", {"phase": "kv_cache_allocation"}),
+            ("sglang:startup_time_seconds", {"phase": "scheduler_e2e"}),
+            ("sglang:startup_time_seconds", {"phase": "tokenizer_e2e"}),
+            ("sglang:startup_cuda_graph_time_seconds", {"phase": "decode"}),
+            (
+                "sglang:request_time_per_output_token_seconds_count",
+                {"is_streaming": "true"},
+            ),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)
+
+        # Reuse this serving fixture; the overlap mix depends on the workload.
+        stage_samples = metrics["sglang:scheduler_stage_seconds_total"]
+        self.assertTrue(
+            all(
+                sample.labels.get("forward_overlap") in FORWARD_OVERLAP_CATEGORIES
+                for sample in stage_samples
+            )
+        )
+        self.assertGreater(
+            sum(
+                sample.value
+                for sample in stage_samples
+                if sample.labels["category"] == "other"
+            ),
+            0,
+        )
+        for metric_name in (
+            "sglang:graph_memory_usage_gb",
+            "sglang:startup_cuda_graph_time_seconds",
+        ):
+            phases = {
+                sample.labels.get("phase")
+                for sample in metrics[metric_name]
+                if sample.labels.get("model_name") == _MODEL_NAME
+            }
+            self.assertTrue(
+                _GRAPH_PHASES.issubset(phases),
+                f"{metric_name}: missing graph phases {_GRAPH_PHASES - phases}",
+            )
 
         if expect_mfu_metrics:
             # Estimated perf metrics may have multiple series (e.g., by rank). Ensure

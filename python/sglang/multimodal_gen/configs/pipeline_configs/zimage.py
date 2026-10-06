@@ -57,10 +57,6 @@ def zimage_postprocess_text(
     return pad_text_embeddings_with_mask(split_hidden_states)
 
 
-class TransformersModelConfig(EncoderConfig):
-    tokenizer_kwargs: dict = field(default_factory=lambda: {})
-
-
 @dataclass
 class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     should_use_guidance: bool = False
@@ -86,7 +82,10 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     F_PATCH_SIZE: int = 1
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig(fsdp_auto_min_available_memory_gb=40)
+        return ModelDeploymentConfig(
+            keep_resident_min_available_gb=30,
+            fsdp_auto_min_available_memory_gb=40,
+        )
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)
@@ -516,3 +515,30 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
                 dtype=torch.long,
             ),
         }
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.zimage import (
+        ZImageSamplingParams,
+        ZImageTurboSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=ZImageTurboSamplingParams,
+        pipeline_config_cls=ZImagePipelineConfig,
+        hf_model_paths=[
+            "Tongyi-MAI/Z-Image-Turbo",
+        ],
+        model_detectors=[lambda hf_id: "z-image-turbo" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=ZImageSamplingParams,
+        pipeline_config_cls=ZImagePipelineConfig,
+        hf_model_paths=[
+            "Tongyi-MAI/Z-Image",
+        ],
+        model_detectors=[
+            lambda hf_id: "z-image" in hf_id.lower() and "turbo" not in hf_id.lower()
+        ],
+    )

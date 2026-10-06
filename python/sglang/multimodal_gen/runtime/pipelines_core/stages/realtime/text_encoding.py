@@ -11,10 +11,15 @@ closer to the actual denoising step.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.cache.conditioning import conditioning_weights_epoch
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
@@ -105,8 +110,20 @@ class RealtimeTextState(BaseRealtimeState):
 class RealtimeTextEncodingStage(TextEncodingStage):
     """Cache text encoder outputs across realtime chunks by prompt identity."""
 
+    deduplicated_output_fields = ()
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        # Cache hits return before encode_text reaches the declared use site.
+        return [
+            replace(use, start_at_stage_entry=False)
+            for use in super().component_uses(server_args, stage_name)
+        ]
+
     def _make_cache_key(self, batch: Req) -> tuple[Any, ...]:
         return (
+            conditioning_weights_epoch(),
             _normalize_prompt_value(batch.prompt),
             bool(batch.do_classifier_free_guidance),
             (
@@ -134,7 +151,11 @@ class RealtimeTextEncodingStage(TextEncodingStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        if batch.session is None:
+        if (
+            batch.session is None
+            or server_args.disable_conditioning_cache
+            or server_args.conditioning_cache_max_size_mb == 0
+        ):
             return super().forward(batch, server_args)
 
         state = batch.session.get_or_create_state(RealtimeTextState)

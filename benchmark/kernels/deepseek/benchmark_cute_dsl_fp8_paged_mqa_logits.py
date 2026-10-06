@@ -8,8 +8,8 @@ import sys
 import numpy as np
 import torch
 
-import sglang.jit_kernel.dsa.cutedsl_paged_mqa_logits  # noqa: F401
-from sglang.jit_kernel.dsa import pick_dsl_expand
+import sglang.kernels.ops.attention.dsa.cutedsl_paged_mqa_logits  # noqa: F401
+from sglang.kernels.ops.attention.dsa import pick_dsl_expand
 from sglang.srt.layers.attention.dsa.utils import (
     fp8_mqa_logits_ceil_to_ue8m0,
     fp8_mqa_logits_make_fused_kv,
