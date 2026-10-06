@@ -326,8 +326,15 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
-            ("DP attention", attn_dp_enabled_of(cfg)),
+            # DP attention + TP MoE re-sizes the MoE gather to every rank's tail
+            # (deepseek_v4 _late_layer_dp_counts); other DP layouts do not.
+            (
+                "DP attention other than TP MoE with attention TP 1",
+                attn_dp_enabled_of(cfg)
+                and not (
+                    cfg.moe_a2a_backend == "none" and cfg.attn_dp_size == cfg.tp_size
+                ),
+            ),
         )
         for feature, enabled in incompatible:
             if enabled:
