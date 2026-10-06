@@ -271,6 +271,18 @@ def _flash_mla_sm120_prefill(
 def _flashinfer_dsv4_decode_capabilities() -> Tuple[int, FrozenSet[int]]:
     """Read the installed FlashInfer DSV4 decode capabilities once."""
     try:
+        from flashinfer.mla import supported_sparse_mla_sm120_configs
+    except ImportError:
+        pass
+    else:
+        # New FlashInfer dispatch envelopes are predicates, not iterable sets.
+        config = supported_sparse_mla_sm120_configs().get("dsv4")
+        if config is None:
+            return 0, frozenset()
+        return int(config.max_num_tokens), frozenset(config.supported_num_heads())
+
+    # Older FlashInfer builds expose only the enumerated private dispatch set.
+    try:
         from flashinfer.mla._sparse_mla_sm120 import (
             _DECODE_DSV4_DISPATCH,
             _DECODE_MAX_TOKENS,
@@ -278,9 +290,12 @@ def _flashinfer_dsv4_decode_capabilities() -> Tuple[int, FrozenSet[int]]:
     except (AttributeError, ImportError):
         return 0, frozenset()
 
-    return int(_DECODE_MAX_TOKENS), frozenset(
-        heads for heads, _ in _DECODE_DSV4_DISPATCH
-    )
+    try:
+        return int(_DECODE_MAX_TOKENS), frozenset(
+            heads for heads, _ in _DECODE_DSV4_DISPATCH
+        )
+    except TypeError:
+        return 0, frozenset()
 
 
 def flashinfer_dsv4_decode_supports_num_heads(num_heads: int, num_tokens: int) -> bool:
