@@ -969,6 +969,61 @@ class RMSNormScaleShift(_NormScaleShift):
     norm_type = "rms"
 
 
+class LayerNormScaleShift2Seg(CustomOp):
+    """LayerNormScaleShift whose shift/scale [b, 2, dim] switch rows at a token index:
+    row 0 for tokens [0, seg_idx), row 1 after. Math in fp32, output in x.dtype."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = False,
+        dtype: torch.dtype = torch.float32,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.eps = eps
+        self.norm = LayerNormScaleShift(
+            hidden_size, eps=eps, elementwise_affine=elementwise_affine, dtype=dtype
+        )
+
+    def forward_native(
+        self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, seg_idx: int
+    ) -> torch.Tensor:
+        # One call per segment, each through LayerNormScaleShift's platform kernel.
+        return torch.cat(
+            [
+                self.norm(x[:, :seg_idx], shift[:, :1], scale[:, :1]),
+                self.norm(x[:, seg_idx:], shift[:, 1:], scale[:, 1:]),
+            ],
+            dim=1,
+        )
+
+    def forward_cuda(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
+    @torch.compile
+    def forward_xpu(
+        self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, seg_idx: int
+    ) -> torch.Tensor:
+        # XPU has no fused norm-scale-shift kernel. Compiled, the norm, both segments
+        # and the cat are one kernel: no per-segment outputs and no cat copy.
+        n = F.layer_norm(
+            x.float(),
+            (x.size(-1),),
+            getattr(self.norm.norm, "weight", None),
+            getattr(self.norm.norm, "bias", None),
+            self.eps,
+        )
+        return torch.cat(
+            [
+                n[:, :seg_idx] * (1 + scale[:, :1]) + shift[:, :1],
+                n[:, seg_idx:] * (1 + scale[:, 1:]) + shift[:, 1:],
+            ],
+            dim=1,
+        ).to(x.dtype)
+
+
 def apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
