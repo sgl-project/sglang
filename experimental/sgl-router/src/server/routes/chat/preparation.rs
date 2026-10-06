@@ -44,7 +44,7 @@ pub(super) struct PreparedRequest {
     pub(super) sequence_token_count: usize,
     /// The longest prompt plus its own output budget.
     pub(super) expected_peak_sequence_tokens: Option<u64>,
-    caller_set_rid: bool,
+    pub(super) caller_set_rid: bool,
     pub(super) fans_out: bool,
     /// Whether chat forwards `tokens` as `input_ids`; `None` for `/generate`,
     /// embeddings, classify and rerank, which prepare their own body.

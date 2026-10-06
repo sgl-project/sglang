@@ -176,6 +176,10 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
     if req.skip_radix_cache_insert:
+        # Kept out of the tree; the next extend still resumes from prefix_indices.
+        req.prefix_indices = tree_cache.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, : req.extend_range.end
+        ].to(dtype=torch.int64, copy=True)
         return
 
     tree_cache.checkpoint(req, up_to=req.extend_range.end)
