@@ -54,6 +54,7 @@ class InklingOutputParser:
         separate_reasoning: bool,
         parse_tool_calls: bool,
         stream_reasoning: bool = True,
+        continues_text_block: bool = False,
     ):
         self._tml = load_tml_renderers()
         self._separate_reasoning = separate_reasoning
@@ -70,6 +71,15 @@ class InklingOutputParser:
         self._model_authored = True
         self._num_tool_calls = 0
         self.num_consumed_tokens = 0
+        if continues_text_block:
+            # The prompt ended inside an open model text block, so the sampled
+            # tokens carry no header; replay the opener so they parse as text.
+            self._message_ids = [
+                tokenizer.encode_special("message_model"),
+                tokenizer.encode_special("content_text"),
+            ]
+            for token_id in self._message_ids:
+                self._parser.parse_token(token_id)
 
     def feed(self, token_ids: Sequence[int]) -> InklingOutputDelta:
         delta = _DeltaBuilder()

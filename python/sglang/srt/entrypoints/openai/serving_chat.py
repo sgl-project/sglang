@@ -687,6 +687,13 @@ class OpenAIServingChat(OpenAIServingBase):
             and request.separate_reasoning,
             parse_tool_calls=self._tool_call_parsing_active(request),
             stream_reasoning=request.stream_reasoning,
+            continues_text_block=bool(
+                request.continue_final_message
+                and request.messages
+                and self._is_continuable_inkling_message(
+                    request.messages[-1].model_dump()
+                )
+            ),
         )
 
     def _parse_inkling_response(
@@ -837,16 +844,18 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if not request.continue_final_message or not messages:
             return None
-        last = messages[-1]
-        if (
-            last.get("role") != "assistant"
-            or not isinstance(last.get("content"), str)
-            or last.get("tool_calls")
-            or last.get("reasoning_content")
-        ):
+        if not OpenAIServingChat._is_continuable_inkling_message(messages[-1]):
             return None
-        messages.pop()
-        return last["content"]
+        return messages.pop()["content"]
+
+    @staticmethod
+    def _is_continuable_inkling_message(message: dict[str, Any]) -> bool:
+        return (
+            message.get("role") == "assistant"
+            and isinstance(message.get("content"), str)
+            and not message.get("tool_calls")
+            and not message.get("reasoning_content")
+        )
 
     @staticmethod
     def _parse_inkling_reasoning_effort(

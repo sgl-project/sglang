@@ -4918,6 +4918,32 @@ class InklingTokenOutputTest(CustomTestCase):
         self.assertEqual(json.loads(tool_calls[0].function.arguments), {"city": "SF"})
         self.assertTrue(tool_calls[0].id.startswith("call_"))
 
+    def test_continued_final_message_output_is_content(self):
+        """Bug regression: with continue_final_message the prompt ends inside
+        an open model text block, so the sampled tokens carry no header; they
+        were silently dropped and the response content came back empty."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "user", "content": "First five primes?"},
+                {"role": "assistant", "content": "2, 3,"},
+            ],
+            continue_final_message=True,
+        )
+        output_ids = [
+            *tokenizer.encode_ordinary(" 5, 7, 11"),
+            tokenizer.encode_special("end_message"),
+            tokenizer.encode_special("content_model_end_sampling"),
+        ]
+        _, content, tool_calls, _ = self.serving._parse_inkling_response(
+            request, output_ids, {"type": "stop", "matched": 200006}
+        )
+        self.assertEqual(content, " 5, 7, 11")
+        self.assertIsNone(tool_calls)
+
     def test_each_output_token_is_parsed_once(self):
         """Non-incremental chunks carry the cumulative ids and an incremental
         abort chunk re-sends streamed ids; either way a token parsed twice
