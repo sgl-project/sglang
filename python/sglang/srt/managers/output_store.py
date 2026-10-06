@@ -12,7 +12,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 import msgspec
 import numpy as np
@@ -54,13 +54,8 @@ class OutputStoreConfig(msgspec.Struct, frozen=True, kw_only=True):
     @classmethod
     def from_extra_config(cls, extra_config: Optional[str]) -> OutputStoreConfig:
         raw = json.loads(extra_config) if extra_config else {}
-        if not isinstance(raw, dict):
-            raise ValueError(
-                "--output-store-backend-extra-config must be a JSON object"
-            )
         struct_fields = msgspec.structs.fields(cls)
-        known = {field.name for field in struct_fields} | {"global_segment_size"}
-        unknown = sorted(set(raw) - known)
+        unknown = sorted(set(raw) - {field.name for field in struct_fields})
         if unknown:
             raise ValueError(f"Unknown output store config keys: {unknown}")
         missing = [
@@ -71,19 +66,8 @@ class OutputStoreConfig(msgspec.Struct, frozen=True, kw_only=True):
         if missing:
             raise ValueError(f"Output store config requires {missing}")
 
-        values = dict(raw)
-        if _parse_size(values.pop("global_segment_size", 0)):
-            raise ValueError(
-                "The output store never contributes a Mooncake segment; "
-                "global_segment_size must be omitted or 0"
-            )
-        values["local_buffer_size"] = _parse_size(values["local_buffer_size"])
-        config = msgspec.convert(values, type=cls)
-        if config.replica_num < 1:
-            raise ValueError("Output store replica_num must be >= 1")
-        if config.chunk_bytes is not None and config.chunk_bytes <= 0:
-            raise ValueError("Output store chunk_bytes must be > 0")
-        return config
+        values = {**raw, "local_buffer_size": _parse_size(raw["local_buffer_size"])}
+        return msgspec.convert(values, type=cls)
 
 
 class OutputStoreStash(msgspec.Struct):
@@ -119,19 +103,13 @@ class OutputStoreStash(msgspec.Struct):
 
 class OutputStore:
     def __init__(self, config: OutputStoreConfig) -> None:
-        try:
-            from mooncake.store import MooncakeDistributedStore, ReplicateConfig
-            from mooncake.structured_object_store import (
-                FieldSchema,
-                MooncakeBundleTransfer,
-                export_ref,
-                import_ref,
-            )
-        except ImportError as error:
-            raise ImportError(
-                "--output-store-backend mooncake requires the mooncake package "
-                "with mooncake.structured_object_store"
-            ) from error
+        from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+        from mooncake.structured_object_store import (
+            FieldSchema,
+            MooncakeBundleTransfer,
+            export_ref,
+            import_ref,
+        )
 
         store = MooncakeDistributedStore()
         setup_error = store.setup(
@@ -170,13 +148,6 @@ class OutputStore:
     def cleanup_after(self, future: concurrent.futures.Future[Dict[str, Any]]) -> None:
         """Remove the bundle once a put whose ref will never be delivered succeeds."""
         future.add_done_callback(self._cleanup_completed_put)
-
-    def cleanup_outputs(self, outputs: Iterable[Dict[str, Any]]) -> None:
-        """Remove the bundles referenced by responses that will not be delivered."""
-        for out in outputs:
-            output_store_ref = out["meta_info"].get(OUTPUT_STORE_REF_KEY)
-            if output_store_ref is not None:
-                self._executor.submit(self._cleanup, output_store_ref)
 
     def _put(self, stash: OutputStoreStash) -> Dict[str, Any]:
         fields = _bundle_fields(stash)

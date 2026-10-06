@@ -1891,10 +1891,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         stash = state.output_store_stash
         state.output_store_stash = None
         meta_info = out["meta_info"]
-        finish_reason = meta_info["finish_reason"]
-        if stash.is_empty() or (
-            isinstance(finish_reason, dict) and _is_failing_abort(finish_reason)
-        ):
+        if stash.is_empty() or _is_failing_abort(meta_info["finish_reason"]):
             return
 
         future = self.output_store.submit_put(stash)
@@ -1912,11 +1909,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ) from e
         meta_info[OUTPUT_STORE_REF_KEY] = output_store_ref
         meta_info.update(stash.inline_meta_info())
-
-    def cleanup_output_store_refs(self, outputs: List[dict]) -> None:
-        """Remove output store objects of responses that will not be delivered."""
-        if self.output_store is not None:
-            self.output_store.cleanup_outputs(outputs)
 
     def _release_lora_once(self, state: ReqState) -> Optional[asyncio.Task]:
         """Schedule at most one LoRA release per state, returning the new task if any."""
@@ -2187,24 +2179,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def _collect_batch_responses(self, generators):
         tasks = [asyncio.create_task(gen.__anext__()) for gen in generators]
-        delivered = False
         try:
-            results = await asyncio.gather(*tasks)
-            delivered = True
-            return results
+            return await asyncio.gather(*tasks)
         finally:
             for task in tasks:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            if not delivered:
-                self.cleanup_output_store_refs(
-                    [
-                        task.result()
-                        for task in tasks
-                        if not task.cancelled() and task.exception() is None
-                    ]
-                )
             await asyncio.gather(
                 *(gen.aclose() for gen in generators),
                 return_exceptions=True,
@@ -3765,11 +3746,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.output_store is not None
             and isinstance(obj, GenerateReqInput)
             and obj.return_outputs_via_store
-            and bool(
-                obj.return_routed_experts
-                or obj.return_indexer_topk
-                or obj.return_sampling_mask
-            )
         )
 
     def _init_req_state(
