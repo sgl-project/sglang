@@ -52,6 +52,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -225,6 +226,21 @@ class BeamMoE(nn.Module):
                 else TopKOutputFormat.STANDARD
             ),
         )
+        # An FP8 checkpoint may leave a layer's experts in BF16. They need the
+        # BF16 method above; the generic one drops the routed scale when
+        # compiled for a single token. A partial ignore is left to the
+        # quantization config, which rejects it.
+        bf16_experts = quant_config is None or (
+            quant_scheme == "fp8"
+            and all(
+                should_ignore_layer(
+                    add_prefix(f"experts.0.{proj}", prefix),
+                    ignore=quant_config.ignore,
+                    fused_mapping=quant_config.packed_modules_mapping,
+                )
+                for proj in ("gate_proj", "up_proj", "down_proj")
+            )
+        )
         # Keep normalized routing coefficients in FP32. The runner applies the
         # routed scale during combination, after weighting each expert output.
         self.experts = get_moe_impl_class(quant_config)(
@@ -237,9 +253,7 @@ class BeamMoE(nn.Module):
             routed_scaling_factor=config.routed_scaling_factor,
             routing_method_type=RoutingMethodType.DeepSeekV3,
             quant_config=quant_config,
-            quant_method=(
-                BeamUnquantizedFusedMoEMethod() if quant_config is None else None
-            ),
+            quant_method=BeamUnquantizedFusedMoEMethod() if bf16_experts else None,
             prefix=add_prefix("experts", prefix),
         )
         # Some expert methods consume routing weights with scale already applied.

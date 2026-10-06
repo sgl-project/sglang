@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
+from compressed_tensors.quantization import preset_name_to_scheme
 from torch._inductor import config as inductor_config
 
 import sglang as sgl
@@ -28,6 +29,9 @@ from sglang.kernels.fused_op import (
 from sglang.kernels.ops.attention.fused_qknorm_rope import fused_qk_norm_rope
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
 from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -404,8 +408,26 @@ class TestBeamNumerics(CustomTestCase):
         finally:
             set_fused_op_backend(previous_backend)
 
-    @torch.inference_mode()
     def test_single_token_compiled_moe_preserves_runner_scale(self):
+        self._check_single_token_compiled_moe(quant_config=None)
+
+    def test_single_token_compiled_bf16_experts_of_fp8_checkpoint(self):
+        # An FP8 recipe may leave a sparse layer's experts in BF16.
+        quant_config = CompressedTensorsConfig.from_config(
+            {
+                "format": "float-quantized",
+                "config_groups": {
+                    "group_0": preset_name_to_scheme(
+                        "FP8_DYNAMIC", targets=["Linear"]
+                    ).model_dump()
+                },
+                "ignore": [r"re:model\.layers\.1\.mlp\.experts\..*"],
+            }
+        )
+        self._check_single_token_compiled_moe(quant_config=quant_config)
+
+    @torch.inference_mode()
+    def _check_single_token_compiled_moe(self, quant_config):
         # No process group is needed at TP1; these lookups only feed the disabled
         # symmetric-memory context. All routing and expert kernels remain real.
         group = SimpleNamespace(world_size=1)
@@ -425,7 +447,12 @@ class TestBeamNumerics(CustomTestCase):
             set_default_torch_dtype(torch.bfloat16),
             torch.device("cuda"),
         ):
-            moe = BeamMoE(self.config, layer_id=1)
+            moe = BeamMoE(
+                self.config,
+                layer_id=1,
+                prefix="model.layers.1.mlp",
+                quant_config=quant_config,
+            )
             hidden = torch.ones(1, self.config.hidden_size, dtype=torch.bfloat16)
             # Every expert maps ones to gate=.75, up=1.5 and then uses identity
             # down weights. Its unweighted fused output is exactly BF16 .765625.

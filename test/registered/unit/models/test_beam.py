@@ -820,6 +820,24 @@ class TestBeamLoading(CustomTestCase):
         self.assertEqual(layer.self_attn.gate_proj.weight.dtype, torch.float8_e4m3fn)
         self.assertEqual(layer.mlp.down_proj.weight.dtype, torch.float8_e4m3fn)
 
+    def test_fp8_partially_ignored_experts_stay_rejected(self):
+        # Experts are BF16 only when all of their projections are ignored.
+        quant = fp8_config(
+            ignore=[r"re:model\.layers\.1\.mlp\.experts\.\d+\.gate_proj"]
+        )
+        with (
+            get_parallel().override(
+                tp_rank=0,
+                tp_size=1,
+                moe_tp_rank=0,
+                moe_tp_size=1,
+                moe_ep_rank=0,
+                moe_ep_size=1,
+            ),
+            self.assertRaisesRegex(ValueError, "same quantization scheme"),
+        ):
+            BeamMoE(tiny_config(), 1, prefix="model.layers.1.mlp", quant_config=quant)
+
     def test_non_last_pipeline_stage_skips_lm_head_scales(self):
         model = loader_model({})
         model.model.pp_group.is_last_rank = False
