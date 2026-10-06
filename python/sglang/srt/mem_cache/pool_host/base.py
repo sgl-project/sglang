@@ -542,11 +542,15 @@ class HostKVCache(abc.ABC):
         if need_size > len(self.free_slots):
             self._merge_release_slots()
 
+        head = self.free_slots[:need_size]
         select_index, self.free_slots = take_contiguous_run(self.free_slots, need_size)
 
-        assert not self.slot_used[select_index].any(), (
+        # take_contiguous_run can skip the head of free_slots, so check the head
+        # too, otherwise an in-use slot leaked there would never be caught
+        checked = torch.cat([head, select_index])
+        assert not self.slot_used[checked].any(), (
             f"Double-alloc detected: slots already allocated: "
-            f"{select_index[self.slot_used[select_index]].tolist()}."
+            f"{checked[self.slot_used[checked]].unique().tolist()}."
         )
         self.slot_used[select_index] = True
 
