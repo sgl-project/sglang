@@ -1,11 +1,13 @@
 import builtins
 import gc
+import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace as NS
-from unittest import TestCase, main, skipUnless
+from unittest import TestCase, skipUnless
 from unittest.mock import Mock, patch
 
 import torch
+
 from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -455,6 +457,7 @@ class VerifySamplingTest(TestCase):
         # Dispose previous fixtures' pinned buffers outside the CUDA callback thread.
         gc.collect()
         import xgrammar as xg
+
         from sglang.srt.constrained.xgrammar_backend import XGrammarGrammar
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
@@ -589,6 +592,7 @@ class VerifySamplingTest(TestCase):
     def test_batched_compact_host_callback(self):
         gc.collect()
         import xgrammar as xg
+
         from sglang.srt.constrained.grammar_graph import GrammarHostCallback
         from sglang.srt.constrained.xgrammar_backend import XGrammarGrammar
         from sglang.srt.speculative.spec_utils import traverse_tree
@@ -1539,6 +1543,7 @@ class VerifySamplingTest(TestCase):
         self, stride, vocab, top_k, commit_hidden=True
     ):
         import xgrammar as xgr
+
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
         from sglang.srt.model_executor.runner_utils.capture_owner import (
@@ -1744,4 +1749,4 @@ class VerifySamplingTest(TestCase):
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main()

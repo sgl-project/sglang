@@ -4,6 +4,7 @@ import time
 from typing import List, Optional
 
 import torch
+
 from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,

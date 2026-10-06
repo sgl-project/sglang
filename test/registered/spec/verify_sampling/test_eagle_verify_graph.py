@@ -1,12 +1,14 @@
 import gc
 import sys
+import unittest
 from contextlib import nullcontext
 from functools import partial
 from types import SimpleNamespace as NS
-from unittest import TestCase, main, skipUnless
+from unittest import TestCase, skipUnless
 from unittest.mock import DEFAULT, Mock, patch
 
 import torch
+
 from sglang.srt.sampling.verify_graph import VerifySamplingBuffers
 from sglang.srt.sampling.verify_probs import build_verify_target_probs
 from sglang.srt.speculative import eagle_verify_graph
@@ -334,8 +336,9 @@ class InstallationTest(TestCase):
                 target.model_runner.capture_tail_hooks, [ctor.return_value.capture_hook]
             )
             # Ordinary full-attention models require no recurrent-state commit.
-            from sglang.srt.configs.hybrid_arch import mambaish_config
             from transformers import LlamaConfig
+
+            from sglang.srt.configs.hybrid_arch import mambaish_config
 
             target.model_runner.model_config = NS(
                 hf_config=LlamaConfig(), linear_attn_registry_result=None
@@ -737,6 +740,7 @@ class EagleVerifyGraphTest(TestCase):
                 info.logit_bias
             ) = None
             import xgrammar as xg
+
             from sglang.kernels.ops.grammar.bitmask_ops import (
                 apply_token_bitmask_inplace_triton,
             )
@@ -926,6 +930,7 @@ class EagleVerifyGraphTest(TestCase):
 
     def test_batched_sampling_grammar_and_graph_padding(self):
         import xgrammar as xg
+
         from sglang.kernels.ops.grammar.bitmask_ops import (
             apply_token_bitmask_inplace_triton,
         )
@@ -1077,4 +1082,4 @@ class EagleVerifyGraphTest(TestCase):
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main()

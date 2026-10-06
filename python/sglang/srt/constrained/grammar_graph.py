@@ -3,6 +3,7 @@ import threading
 from functools import wraps
 
 import torch
+
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     scatter_compact_to_strided_into,
 )

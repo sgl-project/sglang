@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import SamplingMaskOutput, SamplingMaskStatus
 from sglang.srt.runtime_context import get_spec

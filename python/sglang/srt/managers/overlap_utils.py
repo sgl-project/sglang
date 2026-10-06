@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import msgspec
 import torch
+
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (

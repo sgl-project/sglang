@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import NamedTuple
 
 import torch
+
 from sglang.kernels.ops.grammar.bitmask_ops import apply_token_bitmask_inplace_triton
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
 from sglang.srt.arg_groups.overrides import resolved_view

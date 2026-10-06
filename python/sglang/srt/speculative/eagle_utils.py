@@ -7,6 +7,7 @@ from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,

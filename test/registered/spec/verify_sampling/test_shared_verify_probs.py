@@ -1,8 +1,10 @@
+import unittest
 from types import SimpleNamespace as NS
-from unittest import TestCase, main, skipUnless
+from unittest import TestCase, skipUnless
 from unittest.mock import Mock, patch
 
 import torch
+
 from sglang.srt.sampling.verify_probs import build_verify_target_probs
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -233,4 +235,4 @@ class SharedVerifyProbsTest(TestCase):
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main()

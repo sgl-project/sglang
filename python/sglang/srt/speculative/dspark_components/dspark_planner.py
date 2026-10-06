@@ -5,6 +5,7 @@ from typing import Optional, Union
 
 import msgspec
 import torch
+
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
     ScheduleVerifyLensTopk,

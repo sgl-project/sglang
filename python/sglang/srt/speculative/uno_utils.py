@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 from flashinfer import top_k as _flashinfer_top_k
+
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
 )

@@ -4,6 +4,7 @@ from typing import Any, Callable, Literal, Optional
 
 import torch
 import torch.nn.functional as F
+
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.srt.layers.sampler import top_p_normalize_probs_torch
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu

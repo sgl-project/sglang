@@ -1,8 +1,10 @@
+import unittest
 from types import SimpleNamespace as NS
-from unittest import TestCase, main
+from unittest import TestCase
 from unittest.mock import patch
 
 import torch
+
 from sglang.srt.managers import overlap_utils as overlap
 from sglang.srt.speculative import eagle_disaggregation as disagg
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -140,4 +142,4 @@ class EagleDisaggTest(TestCase):
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main()
