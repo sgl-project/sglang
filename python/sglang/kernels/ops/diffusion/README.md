@@ -151,6 +151,10 @@ Several norms look interchangeable and are not. Start here.
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
 | `residual_gate_add` | JIT CUDA (contiguous), Triton (transposed) | bit-exact `residual + update * gate` | contiguous tensors, or a transposed-dense `[B, tokens, hidden]` residual/output with contiguous update and row-broadcast gate (SANA-Video) |
+| `residual_gate_fp32` | Triton | separate FP32 multiply/add, then cast to input dtype | contiguous `[B,S,D]`, strided `[B or 1,1,D]` gate; Kandinsky6 |
+
+These contracts differ: `residual_gate_fp32` does not round the product to
+BF16/FP16, and disables FMA to preserve the eager FP32 rounding boundary.
 
 The transposed-dense path tiles along the physical stride-1 token dimension
 for coalesced residual reads and output writes. The contiguous layouts use
