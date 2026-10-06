@@ -212,9 +212,7 @@ class CompressorBackendMixin:
             # The pool's page format (V4, or the V4.1 fp8 / fp4 layouts).
             kv_layout = token_to_kv_pool.get_extra_key_layout(layer_id)
             if token_to_kv_pool.uniform_fp8:
-                # trtllm-gen's uniform-FP8 pool: the same fused epilogue, storing
-                # plain e4m3 rows (per-tensor scale 1.0) instead of the packed
-                # FlashMLA layout.
+                # Same fused epilogue, storing plain e4m3 rows (scale 1.0) for the uniform pool.
                 uniform_fp8_store = True
                 kv_cache = kv_cache.view(torch.uint8)
             if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):

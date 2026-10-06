@@ -404,29 +404,19 @@ class DSV4AttnMetadata:
     trtllm_c4_lens: Optional[torch.Tensor] = None
     trtllm_c128_indices: Optional[torch.Tensor] = None
     trtllm_c128_lens: Optional[torch.Tensor] = None
-    # trtllm prefill: per-chunk tables built once, before the indexer runs.
-    # qmeta remains lazy because it also needs ForwardBatch's host extend
-    # lengths. qmeta = (sum_q, per-token seq_lens_int32); c128 = (table,
-    # lens).
+    # trtllm prefill tables, built once per chunk before the indexer runs.
     trtllm_prefill_qmeta: Optional[tuple] = None
     trtllm_prefill_swa_indices: Optional[torch.Tensor] = None
     trtllm_prefill_swa_lens: Optional[torch.Tensor] = None
     trtllm_prefill_c4_indices: Optional[torch.Tensor] = None
     trtllm_prefill_c4_lens: Optional[torch.Tensor] = None
     trtllm_prefill_c128: Optional[tuple] = None
-    # Uniform target-verify / draft-extend query metadata. These are explicit
-    # tensor fields (rather than a lazily-created tuple) so CUDA-graph metadata
-    # refresh copies their contents without replacing captured tensor objects.
+    # Uniform verify / draft-extend query metadata; tensors so replay copies in place.
     trtllm_seq_lens_req: Optional[torch.Tensor] = None
     trtllm_cum_seq_lens_q: Optional[torch.Tensor] = None
-    # Backend-owned persistent storage backing the trtllm tables above
-    # (TrtllmSparseTablePool; duck-typed to avoid an import cycle). Shared by
-    # every metadata object the backend creates; never copied.
+    # Backend-owned TrtllmSparseTablePool (duck-typed: import cycle); shared, never copied.
     trtllm_table_pool: Optional[object] = None
-    # When True (trtllm decode/verify with the stride-capable topk_v2 path),
-    # init_trtllm_sparse_buffers rebinds c4_sparse_page_indices to the
-    # combined table's tail columns so the indexer's per-layer top-k writes
-    # land in the table directly (no per-layer copy).
+    # trtllm topk_v2 path: c4_sparse_page_indices aliases the combined table's tail.
     trtllm_topk_writes_table: bool = False
 
     c0_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
@@ -555,20 +545,11 @@ class DSV4AttnMetadata:
         assert self.swa_page_indices.shape[0] == num_tokens
         assert swa_width >= SWA_WINDOW
 
-        # Every per-token tensor the kernel reads lives in the backend's
-        # persistent table pool (TrtllmSparseTablePool): constant-address,
-        # 64-row-aligned (the VarSeq kernel reads rows to the tile boundary),
-        # inert-filled parents rewritten in place each step. Kernel-visible
-        # addresses are therefore independent of allocator state, and row
-        # over-reads (tile boundary / DP-padding overhang) land on inert or
-        # previously-written entries instead of unallocated memory.
+        # Kernel-read tables live in the pool: fixed addresses, 64-row tiles, inert pad rows.
         pool = self.trtllm_table_pool
         assert pool is not None, "trtllm metadata requires the table pool"
 
-        # seq_lens_casual and swa_page_indices are NOT pool-backed: they have
-        # readers outside this step (e.g. per-layer reads in the eager prefill
-        # forward), so pool storage rewritten by the next replay would give
-        # them a cross-step lifetime. Keep their per-step tile-aligned parents.
+        # Not pool-backed: both are read outside this step (eager prefill per-layer reads).
         n_pad = ceil_align(num_tokens, 64)
         if n_pad != num_tokens:
 
@@ -584,10 +565,7 @@ class DSV4AttnMetadata:
             )
         self.trtllm_swa_lens = pool.view("d_swa_lens", num_tokens, fill=SWA_WINDOW)
         if self.has_c4:
-            # Only the c4 index tail is a per-layer value (each layer's
-            # indexer picks its own top-k); the lens are metadata-level, so
-            # they are written once per step here. Between the inert re-fill
-            # and the per-layer index fill the rows are -1 / SWA-only.
+            # Lens are per step; the c4 index tail is filled per layer by the indexer.
             self.trtllm_c4_indices = pool.view(
                 "d_c4", num_tokens, fill=-1, width=SWA_WINDOW + self._c4_table_width()
             )
@@ -597,20 +575,14 @@ class DSV4AttnMetadata:
             )
             torch.add(self.c4_sparse_topk_lengths, SWA_WINDOW, out=self.trtllm_c4_lens)
             if self._c4_topk_writes_table():
-                # Aim the indexer's per-layer top-k output directly at the
-                # combined table's tail columns (topk_v2 handles the row
-                # stride); the decode forward skips its per-layer copy when it
-                # sees this alias.
+                # topk_v2 writes each layer's top-k into the table tail; the forward skips its copy.
                 self.c4_sparse_page_indices = self.trtllm_c4_indices[:, SWA_WINDOW:]
 
         if self.c128_page_indices is not None:
             assert swa_width == SWA_WINDOW
             w128 = self.c128_page_indices.shape[-1]
             assert w128 % 4 == 0, f"{w128=}"
-            # The pool's c128 parent is preallocated at full-context width;
-            # this step writes [:SWA_WINDOW + w128] and the per-row lens bound
-            # the kernel's reads to that, so only the tile-pad rows need
-            # re-inerting.
+            # Lens bound the reads to [:SWA_WINDOW + w128]; only pad rows need re-inerting.
             table = pool.view(
                 "d_c128",
                 num_tokens,
@@ -629,12 +601,8 @@ class DSV4AttnMetadata:
             )
 
     def init_trtllm_prefill_sparse_buffers(self, num_tokens: int) -> None:
-        """Build layer-invariant prefill tables before the indexer runs.
-
-        Besides removing the repeated SWA/c128/lens fills from every layer,
-        doing this before indexer execution lets topk_v2 write c4 indices
-        directly into the combined table's strided tail.
-        """
+        """Build layer-invariant prefill tables before the indexer runs, so topk_v2
+        can write c4 indices directly into the combined table's tail."""
 
         num_metadata_rows = self.seq_lens_casual.shape[0]
         assert 0 < num_tokens <= num_metadata_rows
@@ -991,9 +959,7 @@ class DSV4AttnMetadata:
         create_flashmla_metadata: bool = True,
         alloc_c4_raw_indices: Optional[bool] = None,
     ):
-        # The trtllm backend never launches FlashMLA, so it skips the per-ratio
-        # FlashMLA schedule metadata and the c4 raw-index buffer (FlashMLA's
-        # prefill needs raw indices; trtllm reads the paged table directly).
+        # trtllm never launches FlashMLA: no schedule metadata, no raw c4 indices.
         _mk = _create_flashmla_metadata if create_flashmla_metadata else (lambda: None)
         if alloc_c4_raw_indices is None:
             alloc_c4_raw_indices = is_prefill
@@ -1008,8 +974,7 @@ class DSV4AttnMetadata:
             )
             self.c4_sparse_raw_indices = None
             if self.trtllm_topk_writes_table and not alloc_c4_raw_indices:
-                # Rebound to the combined table's tail by
-                # init_trtllm_*_sparse_buffers; no separate buffer needed.
+                # Rebound to the combined table's tail by init_trtllm_*_sparse_buffers.
                 self.c4_sparse_page_indices = None
             else:
                 self.c4_sparse_page_indices = _pad_last_dim(
@@ -1258,9 +1223,7 @@ class DeepseekV4AttnBackend(
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
     trtllm_attn: bool = False
-    # Persistent combined-table storage (TrtllmSparseTablePool) and the
-    # indexer's direct top-k write into it; set by the trtllm backend, left
-    # at these defaults by the FlashMLA backend.
+    # Set by the trtllm backend; FlashMLA leaves the defaults.
     trtllm_table_pool: Optional[object] = None
     trtllm_topk_writes_table: bool = False
 
@@ -3563,8 +3526,7 @@ class DeepseekV4AttnBackend(
         **_,
     ) -> torch.Tensor:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
-            # Attention emits bf16 regardless of q's dtype (q may be e4m3 on
-            # the trtllm fused-q path); don't derive the output dtype from q.
+            # Attention emits bf16 even when q is e4m3 (trtllm fused-q path).
             return q.new_empty(
                 q.shape[0], q.shape[1], layer.v_head_dim, dtype=torch.bfloat16
             )
@@ -3587,10 +3549,7 @@ class DeepseekV4AttnBackend(
                 extra_indices = core_attn_metadata.sparse_page_indices(compress_ratio)
 
             if self.trtllm_attn:
-                # The uniform-FP8 pool is readable only by trtllm-gen, which
-                # takes its tables straight from the metadata (and trims them
-                # to the query rows itself), so none of the FlashMLA-shaped
-                # per-layer prep below is needed.
+                # trtllm-gen reads its tables from the metadata; skip the FlashMLA per-layer prep.
                 return self._forward_trtllm(
                     q=q,
                     layer=layer,

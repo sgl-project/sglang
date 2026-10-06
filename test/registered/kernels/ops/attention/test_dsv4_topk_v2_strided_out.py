@@ -45,9 +45,7 @@ def test_topk_v2_strided_out_matches_dense(bs, max_seq):
     strided = table[:, SWA:]
     topk_transform_paged_v2(scores, seq_lens, page_table, strided, PAGE_SIZE, plan)
 
-    # The selection order is nondeterministic beyond seq_len > topk (verified:
-    # two identical dense runs differ in order but not in the selected set),
-    # and the attention kernel consumes the row as a set -- compare sorted.
+    # Selection order is nondeterministic and the kernel consumes the row as a set.
     assert torch.equal(strided.sort(dim=1).values, dense.sort(dim=1).values), (
         "strided out selects a different top-k set than dense out"
     )

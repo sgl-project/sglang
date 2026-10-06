@@ -220,8 +220,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             "--dsv4-attn-backend trtllm does not support "
             "SGLANG_OPT_USE_ONLINE_COMPRESS yet."
         )
-        # The TRT sparse-table path has not been validated with CP's
-        # round-robin token/table reindexing.
         assert get_parallel().attn_cp_size == 1, (
             "--dsv4-attn-backend trtllm does not support "
             "context parallelism (attn_cp_size > 1) yet."
@@ -229,23 +227,15 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         self.trtllm_workspace_buffer = _get_trtllm_workspace_buffer(self.device)
         self.trtllm_graph_output_buffer: torch.Tensor | None = None
         self.trtllm_eager_output_buffer: torch.Tensor | None = None
-        # (buffer, rows, real rows) whose pad tail is known to be zero: the
-        # kernel writes only [:real rows], so the tail stays zero across the
-        # layers of a step and across replays of the same graph.
+        # (buffer, rows, real rows) whose pad tail is already zero (kernel writes [:real]).
         self._padded_output_zeroed: Optional[tuple[int, int, int]] = None
-        # Let the indexer's per-layer top-k write straight into the combined
-        # table tail (decode/verify) -- only when the stride-capable topk_v2
-        # kernel is the guaranteed writer (sgl-kernel backend, v2 enabled,
-        # no indexer-capture side channel that reroutes to the v1 kernel).
+        # Indexer top-k writes into the table tail only when strided topk_v2 is the writer.
         self.trtllm_topk_writes_table = (
             self.dsa_topk_backend.should_use_topk_v2()
             and not get_exec().features.enable_return_indexer_topk
         )
 
-        # Table roles are preallocated at their maxima so no table is
-        # allocated while serving: decode rows = query rows of the largest
-        # verify batch, prefill rows = the chunk bound; c128 width = the whole
-        # context in 128-token pages (per-row lens bound the kernel's reads).
+        # Preallocate every role at its maximum so nothing is allocated while serving.
         self.trtllm_table_pool = TrtllmSparseTablePool(self.cuda_int32_kwargs)
         max_decode_rows = self.req_to_token.shape[0] * (
             self.speculative_num_draft_tokens or 1
@@ -420,11 +410,8 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         bs, num_heads, head_dim = q.shape
         assert head_dim == 512
 
-        # Draft-extend plans its metadata before DP MAX_LEN padding (#27091),
-        # so q can carry more rows than the metadata. Run the kernel on the
-        # metadata-covered rows only and zero-fill the (discarded) tail, the
-        # same recipe as padded prefill; the kernel sizes its tables from
-        # q.shape[0], hence the slice.
+        # Draft-extend q may carry DP pad rows beyond the metadata: run on the
+        # covered rows and zero the discarded tail, as for padded prefill.
         n_meta_rows = core_attn_metadata.seq_lens_casual.shape[0]
         out_pad_tail = None
         if n_meta_rows < bs:
@@ -440,10 +427,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
 
         # Only the c4 tail and lens vary by layer; other table data is prebuilt.
         if compress_ratio == 0:
-            # swa_page_indices is itself a valid combined table (capacity
-            # 128, all-SWA); no fill needed. Use the metadata's stable [:n]
-            # view of a role-owned parent, not the match_num_queries-processed
-            # argument, whose allocation/lifetime is not capture-stable.
+            # swa_page_indices is itself a valid all-SWA combined table.
             sparse_indices = core_attn_metadata.swa_page_indices
             sparse_topk_lens = core_attn_metadata.trtllm_swa_lens
         elif compress_ratio == 128:
@@ -469,17 +453,14 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             assert SWA_WINDOW + width == sparse_indices.shape[1], (
                 f"{width=} {sparse_indices.shape=}"
             )
-            # Per-layer top-k into the table tail; a no-op when the indexer
-            # already wrote the tail in place (alias decision is capture-stable).
+            # No-op when the indexer already wrote the tail in place.
             copy_unless_aliased(sparse_indices[:, SWA_WINDOW:], extra_indices)
 
         swa_kv_cache, compressed_kv_cache = self._trtllm_kv_cache_views(
             layer.layer_id, compress_ratio
         )
 
-        # RoPE is already applied upstream; the fused q norm+rope kernel
-        # usually stores e4m3 directly (see _compute_q_b), otherwise the
-        # per-tensor-scale-1.0 FP8 quantization is a plain e4m3 cast.
+        # No-op when the fused q kernel already stored e4m3 (scale 1.0 cast otherwise).
         q_fp8 = q.to(torch.float8_e4m3fn)
 
         bmm1_scale, bmm2_scale = self._get_trtllm_bmm_scales(layer)
@@ -499,10 +480,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         assert self.trtllm_workspace_buffer is not None
         _check_trtllm_query_rows(bs)
 
-        # Uniform verify/draft metadata carries prebuilt per-request qmeta and
-        # uses VarSeq. Compact ragged verify deliberately omits that qmeta and
-        # falls back to the dense one-query-token-per-entry layout, whose
-        # per-token seq_lens/tables do not require uniform request groups.
+        # Uniform verify/draft-extend metadata uses VarSeq; ragged verify uses dense per-token.
         seq_lens_req = core_attn_metadata.trtllm_seq_lens_req
         cum_seq_lens_q = core_attn_metadata.trtllm_cum_seq_lens_q
         common = dict(
@@ -518,10 +496,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         )
         out_arg = None if out_pad_tail is None else out_pad_tail[:bs]
         if seq_lens_req is not None:
-            # Uniform multi-token metadata (verify / draft-extend): the
-            # builders use a fixed num_tokens_per_req via
-            # expand_extend_with_same_length, so ragged rows cannot reach
-            # this call; assert rather than fall back silently.
+            # Builders use a fixed num_tokens_per_req, so ragged rows cannot reach here.
             n_req = seq_lens_req.shape[0]
             assert n_req > 0 and bs % n_req == 0, (
                 f"non-uniform multi-token batch reached the trtllm decode "
@@ -569,27 +544,20 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         num_qo_padded, num_heads, head_dim = q.shape
         assert head_dim == 512
 
-        # Dense per-token query structure, from the same host-side extend lens that
-        # produced this metadata (init_forward_metadata_prefill /
-        # expand_prefill_casually).
+        # Dense per-token query layout from the host-side extend lens.
         core = self.forward_metadata.core_attn_metadata
         if core.trtllm_prefill_qmeta is None:
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             assert extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) > 0
             sum_q = sum(int(x) for x in extend_seq_lens_cpu)
-            # q (and the per-token metadata rows, via match_num_queries) may
-            # be padded past the real extend tokens; the pad rows sit at the
-            # end.
+            # q may be padded past the real extend tokens; pad rows sit at the end.
             assert 0 < sum_q <= num_qo_padded, f"{sum_q=} {num_qo_padded=}"
             seq_lens_i32 = core.seq_lens_casual[:sum_q].to(torch.int32)
             assert seq_lens_i32.shape == (sum_q,), f"{seq_lens_i32.shape=}"
             core.trtllm_prefill_qmeta = (sum_q, seq_lens_i32)
         sum_q, seq_lens = core.trtllm_prefill_qmeta
 
-        # The layer-invariant tables were built during metadata preparation,
-        # before the indexer. In the stride-capable topk_v2 configuration,
-        # c4_sparse_page_indices is already the c4 combined table's tail, so
-        # the indexer writes directly to the kernel input.
+        # Layer-invariant tables were built before the indexer ran.
         swa_indices = core.trtllm_prefill_swa_indices
         assert swa_indices is not None
         assert swa_indices.shape == (sum_q, SWA_WINDOW), f"{swa_indices.shape=}"
@@ -614,9 +582,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
 
         assert sparse_topk_lens is not None
 
-        # FP8 query: RoPE already applied upstream; the fused q norm+rope
-        # kernel usually stores e4m3 directly (see _compute_q_b), otherwise
-        # the per-tensor-scale-1.0 quantization is a plain e4m3 cast.
+        # No-op when the fused q kernel already stored e4m3 (scale 1.0 cast otherwise).
         q_fp8 = q[:sum_q].to(torch.float8_e4m3fn).view(sum_q, 1, num_heads, 512)
 
         swa_kv_cache, compressed_kv_cache = self._trtllm_kv_cache_views(
@@ -630,9 +596,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         out_padded = None
         out_arg = None
         if num_qo_padded != sum_q:
-            # Padded prefill: run the kernel over the real tokens only and
-            # zero the pad rows (their outputs are discarded downstream, but
-            # keep them finite so nothing NaN-propagates).
+            # Run over the real tokens only; keep the discarded pad rows finite.
             out_padded = self._padded_output_buffer(
                 num_rows=num_qo_padded,
                 num_real_rows=sum_q,

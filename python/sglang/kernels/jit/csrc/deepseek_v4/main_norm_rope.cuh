@@ -80,11 +80,8 @@ struct FusedQNormRopeParams {
   float eps;
 };
 
-// kFp8Out: store the normed+roped output as plain e4m3 (per-tensor scale
-// 1.0) instead of DType, bit-identical to a DType store followed by
-// `.to(float8_e4m3fn)` -- the trtllm-gen backend consumes q as fp8, so
-// this removes its separate per-layer cast pass. The caller passes
-// q_output as a uint8 view of the e4m3 tensor.
+// kFp8Out: store plain e4m3 (scale 1.0) into q_output, passed as a uint8 view;
+// bit-identical to a DType store followed by .to(float8_e4m3fn).
 template <
     typename DType,
     int64_t kHeadDim,
@@ -464,9 +461,7 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
   }
 
   if constexpr (kUniformStore) {
-    // Uniform pool: every warp stores its 2 elems as plain e4m3. BF16
-    // round-trip to match the unfused path (Triton norm+rope emits bf16,
-    // then the pool store casts bf16 -> e4m3 at per-tensor scale 1.0).
+    // Uniform pool: bf16 round-trip, then plain e4m3 (scale 1.0), matching the unfused path.
     const auto x = cast<float>(cast<bf16_t>(data[0]));
     const auto y = cast<float>(cast<bf16_t>(data[1]));
     reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = pack_fp8(x, y);

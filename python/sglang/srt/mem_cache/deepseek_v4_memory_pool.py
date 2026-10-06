@@ -2050,14 +2050,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         """q ([B, H, head_dim]): rope its query heads in the same launch."""
         if self.uniform_fp8:
             assert q is None, "uniform FP8 store does not fuse query RoPE"
-            # Uniform-FP8 (trtllm-gen) layout: one fused CUDA launch does
-            # norm + RoPE + bf16-roundtrip + plain e4m3 cast (per-tensor
-            # scale 1.0) + scatter into the 512-byte-per-token pool rows.
-            # Replaces the Triton norm+rope followed by the pool setter's
-            # cast (vectorized_elementwise) + index_put (index_elementwise),
-            # the dominant "Attn Prep" cost in the kernel-level profile.
-            # Negative swa_loc entries (out-of-window / padded rows) are
-            # skipped in-kernel.
+            # One launch: norm + RoPE + e4m3 cast (scale 1.0) + scatter into the
+            # uniform pool rows; negative swa_loc rows are skipped in-kernel.
             pool = self.swa_kv_pool
             fused_k_norm_rope_flashmla(
                 kv=kv,
