@@ -1079,6 +1079,33 @@ def test_sp_route_falls_back_when_the_backend_is_not_served(sp_env, caplog):
     assert "symmetric-memory backend check failed" in caplog.text
 
 
+def test_sp_check_compares_every_eager_cake_call_with_the_stock_path(sp_env, caplog):
+    """SGLANG_CAKE_SP_CHECK=1 recomputes the stock all-gather + matmul after each
+    eager Cake call and counts calls outside the BF16 tolerance; captured
+    calls are not checked (no collective inside a graph)."""
+    caplog.set_level(logging.INFO, logger=sp_mod.logger.name)
+    kernels, launchers = _sp_kernels()
+    linear = _linear(sp_env)
+    inp = torch.randn(ROWS, K).bfloat16()
+    with (
+        _routes(sp_mod, "sp_all_gather_matmul"),
+        _patch_sp_kernels(kernels),
+        mock.patch.object(sp_mod, "_CAKE_SP_CHECK", True),
+    ):
+        out = sp_mod.column_parallel_g_matmul(linear, inp, None)
+        with _capturing():
+            sp_mod.column_parallel_g_matmul(linear, inp, None)
+    # the fake launcher returns 2.0 where the fake stock path returns 1.0
+    assert torch.all(out == 2.0)
+    stats = sp_mod._cake_sp_check_stats
+    assert stats["calls"] == 1 and stats["bad_calls"] == 1
+    assert stats["bad_elems"] == stats["elems"] == NUM_TOKENS * N
+    assert stats["max_abs"] == 1.0
+    assert linear.quant_method.apply.call_count == 1  # the stock reference only
+    assert "sp check summary: calls=1 bad_calls=1" in caplog.text
+    assert "elements outside tol" in caplog.text
+
+
 def test_sp_route_captured_call_uses_the_eagerly_prepared_launcher(sp_env, caplog):
     """Prefill CUDA graphs: a shard captured after its eager warm-up runs the
     prepared launcher (no prepare inside capture); a larger shard, or a

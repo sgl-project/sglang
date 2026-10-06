@@ -38,6 +38,7 @@ from __future__ import annotations
 import functools
 import importlib
 import logging
+import os
 import re
 from collections import Counter
 from typing import Callable, Optional, Union
@@ -388,6 +389,9 @@ def reset_cake_sp_state_for_tests() -> None:
     _cake_sp_launchers.clear()
     _cake_sp_calls.clear()
     _cake_sp_symm_backend = None
+    _cake_sp_check_stats.update(
+        calls=0, bad_calls=0, bad_elems=0, elems=0, max_abs=0.0, dumps=0
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -521,6 +525,95 @@ def _cake_sp_captured_call(
     return output
 
 
+# Diagnostic (SGLANG_CAKE_SP_CHECK=1): after every Cake all-gather + matmul,
+# recompute the stock all-gather + matmul on the same inputs and compare within
+# the BF16 tolerance (atol 1e-2 + rtol 1e-2). Costs one extra collective + GEMM
+# per participant call; for A/B attribution runs only, never for serving. Eager
+# calls only: a captured call cannot run the stock collective inside the graph.
+_CAKE_SP_CHECK = os.environ.get("SGLANG_CAKE_SP_CHECK", "0") == "1"
+_CAKE_SP_DUMP_DIR = os.environ.get("SGLANG_CAKE_SP_DUMP_DIR", "")
+_CAKE_SP_CHECK_ATOL = 1e-2
+_CAKE_SP_CHECK_RTOL = 1e-2
+_cake_sp_check_stats = {
+    "calls": 0,
+    "bad_calls": 0,
+    "bad_elems": 0,
+    "elems": 0,
+    "max_abs": 0.0,
+    "dumps": 0,
+}
+
+
+def _cake_sp_check(linear, input_parallel, bias, output, num_tokens) -> None:
+    tp_group = get_parallel().tp_group
+    rank = int(getattr(tp_group, "rank_in_group", 0))
+    gathered = sp_exit_gather(input_parallel, num_tokens=num_tokens)
+    ref = linear.quant_method.apply(linear, gathered, bias)
+    st = _cake_sp_check_stats
+    st["calls"] += 1
+    if tuple(ref.shape) != tuple(output.shape):
+        logger.warning(
+            "%s sp check: shape mismatch cake=%s stock=%s (rank %d)",
+            _CAKE_LOG_PREFIX,
+            tuple(output.shape),
+            tuple(ref.shape),
+            rank,
+        )
+        st["bad_calls"] += 1
+        return
+    out32 = output.float()
+    ref32 = ref.float()
+    diff = (out32 - ref32).abs()
+    bad = int((diff > _CAKE_SP_CHECK_ATOL + _CAKE_SP_CHECK_RTOL * ref32.abs()).sum())
+    max_abs = float(diff.max())
+    st["elems"] += diff.numel()
+    st["bad_elems"] += bad
+    st["max_abs"] = max(st["max_abs"], max_abs)
+    if bad:
+        st["bad_calls"] += 1
+        if st["bad_calls"] <= 5:
+            logger.warning(
+                "%s sp check: %d/%d elements outside tol, max|d|=%.4g, |ref| max=%.4g "
+                "(inp=%s weight=%s rank %d call %d)",
+                _CAKE_LOG_PREFIX,
+                bad,
+                diff.numel(),
+                max_abs,
+                float(ref32.abs().max()),
+                tuple(input_parallel.shape),
+                tuple(linear.weight.shape),
+                rank,
+                st["calls"],
+            )
+        if _CAKE_SP_DUMP_DIR and st["dumps"] < 4:
+            dump_dir = os.path.join(_CAKE_SP_DUMP_DIR, f"rank{rank}")
+            os.makedirs(dump_dir, exist_ok=True)
+            torch.save(
+                {
+                    "input_parallel": input_parallel.detach().cpu(),
+                    "weight": linear.weight.detach().cpu(),
+                    "cake_output": output.detach().cpu(),
+                    "stock_output": ref.detach().cpu(),
+                    "num_tokens": num_tokens,
+                    "world_size": tp_group.world_size,
+                    "rank": rank,
+                },
+                os.path.join(dump_dir, f"sp_check_{st['dumps']}.pt"),
+            )
+            st["dumps"] += 1
+    if st["calls"] % 50 == 1:
+        logger.info(
+            "%s sp check summary: calls=%d bad_calls=%d bad_elems=%d/%d max|d|=%.4g (rank %d)",
+            _CAKE_LOG_PREFIX,
+            st["calls"],
+            st["bad_calls"],
+            st["bad_elems"],
+            st["elems"],
+            st["max_abs"],
+            rank,
+        )
+
+
 def cake_column_parallel_g_matmul(
     linear, input_parallel: torch.Tensor
 ) -> Optional[torch.Tensor]:
@@ -606,6 +699,10 @@ def column_parallel_g_matmul(
     ):
         output = cake_column_parallel_g_matmul(linear, input_parallel)
         if output is not None:
+            if _CAKE_SP_CHECK and not torch.cuda.is_current_stream_capturing():
+                _cake_sp_check(
+                    linear, input_parallel, bias, output[:num_tokens], num_tokens
+                )
             return output[:num_tokens]
     if sp_fused_matmul_eligible(linear):
         group_name = get_parallel().tp_group.device_group.group_name
