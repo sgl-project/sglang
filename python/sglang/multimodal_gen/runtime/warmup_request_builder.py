@@ -539,6 +539,9 @@ def should_include_warmup_image(
 
 def supports_synthetic_warmup(server_args: ServerArgs) -> bool:
     task_type = server_args.pipeline_config.task_type
+    # Synthetic warmups carry no audio, so speech-driven tasks cannot use them.
+    if task_type.requires_audio_input():
+        return False
     return task_type.is_visual_gen() or task_type.is_mesh_gen()
 
 
