@@ -149,6 +149,19 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = ProxyConfig::default().stream_idle_timeout_secs)]
     pub stream_idle_timeout_secs: u64,
 
+    /// Dispatch attempts per request, including the first. A request that fails
+    /// before any response reaches the client (transport error, 5xx, 429) is
+    /// retried on a worker it has not tried yet. 1 disables retries; 3 is typical.
+    #[arg(long, default_value_t = ProxyConfig::default().max_attempts)]
+    pub retry_max_attempts: NonZeroU32,
+    /// Backoff before the first retry, in milliseconds; doubles per retry, with
+    /// jitter. 0 retries immediately.
+    #[arg(long, default_value_t = ProxyConfig::default().initial_backoff_ms)]
+    pub retry_initial_backoff_ms: u64,
+    /// Upper bound on the backoff between retries, in milliseconds.
+    #[arg(long, default_value_t = ProxyConfig::default().max_backoff_ms)]
+    pub retry_max_backoff_ms: u64,
+
     /// Maximum in-flight request lifetime in seconds, including streaming responses.
     /// Expiry returns 504 `stale_request_expired` before response headers are sent;
     /// after streaming starts, it aborts the body without changing the HTTP status.
@@ -599,6 +612,9 @@ impl Cli {
             proxy: ProxyConfig {
                 request_timeout_secs: self.server.request_timeout_secs,
                 stream_idle_timeout_secs: self.server.stream_idle_timeout_secs,
+                max_attempts: self.server.retry_max_attempts,
+                initial_backoff_ms: self.server.retry_initial_backoff_ms,
+                max_backoff_ms: self.server.retry_max_backoff_ms,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,

@@ -33,7 +33,7 @@
 //!    available for a PD-mode model" (new `NoPrefillWorkersAvailable`)
 //!    — only the resolver has the cohort context to tell which is which.
 
-use crate::discovery::{ModelId, WorkerMode};
+use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::workers::{paired_prefills, Worker, WorkerRegistry};
 use std::sync::Arc;
 
@@ -87,11 +87,22 @@ pub enum PdResolveError {
 #[derive(Debug, Clone)]
 pub struct PdPoolResolver {
     workers: Arc<WorkerRegistry>,
+    /// Workers this request already failed on; never offered as candidates.
+    excluded: Vec<WorkerId>,
 }
 
 impl PdPoolResolver {
     pub fn new(workers: Arc<WorkerRegistry>) -> Self {
-        Self { workers }
+        Self {
+            workers,
+            excluded: Vec::new(),
+        }
+    }
+
+    /// Leave `excluded` out of every pool, so a retry lands on another worker.
+    pub fn excluding(mut self, excluded: &[WorkerId]) -> Self {
+        self.excluded = excluded.to_vec();
+        self
     }
 
     /// Classify a model and return its pool partition over healthy
@@ -109,7 +120,8 @@ impl PdPoolResolver {
     /// code whether the empty pool is empty by registration or by
     /// transient health state.
     pub fn resolve(&self, model: &ModelId) -> Result<PdPools, PdResolveError> {
-        let all = self.workers.healthy_workers_for(model);
+        let mut all = self.workers.healthy_workers_for(model);
+        all.retain(|w| !self.excluded.contains(&w.id));
         if all.is_empty() {
             // No healthy workers — distinguish "model never registered"
             // (true 404-ish, operator misconfiguration) from "PD model
@@ -561,6 +573,34 @@ mod tests {
         let v = resolver.prefill_candidates(&ModelId("m".into())).unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].mode(), WorkerMode::Plain);
+    }
+
+    #[test]
+    fn excluded_workers_leave_every_pool() {
+        let model = ModelId("m".into());
+        let plain = registry(&[
+            spec("w1", WorkerMode::Plain, "m"),
+            spec("w2", WorkerMode::Plain, "m"),
+        ]);
+        let resolver = PdPoolResolver::new(plain).excluding(&[WorkerId("w1".into())]);
+        assert_eq!(ids(&resolver.prefill_candidates(&model).unwrap()), ["w2"]);
+
+        let pd = registry(&[
+            spec("p1", WorkerMode::Prefill, "m"),
+            spec("d1", WorkerMode::Decode, "m"),
+            spec("d2", WorkerMode::Decode, "m"),
+        ]);
+        let resolver = PdPoolResolver::new(Arc::clone(&pd)).excluding(&[WorkerId("d1".into())]);
+        let prefill = resolver.prefill_candidates(&model).unwrap();
+        assert_eq!(
+            ids(&resolver.decode_peers(&model, &prefill[0]).unwrap()),
+            ["d2"]
+        );
+        let resolver = PdPoolResolver::new(pd).excluding(&[WorkerId("p1".into())]);
+        assert_eq!(
+            resolver.prefill_candidates(&model).unwrap_err(),
+            PdResolveError::NoPrefillWorkersAvailable,
+        );
     }
 
     // === Decoder affinity (Task C) ===
