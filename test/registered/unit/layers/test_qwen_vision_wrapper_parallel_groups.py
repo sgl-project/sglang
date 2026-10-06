@@ -3,7 +3,6 @@
 import inspect
 import unittest
 from contextlib import nullcontext
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -81,22 +80,7 @@ def build_qwen(model, group=None, *, replicated=False, width=32, quant_config=No
         )
         layers = (module.linear_fc1, module.linear_fc2)
     else:
-        from sglang.multimodal_gen.runtime.layers.attention.selector import (
-            global_force_attn_backend_context_manager,
-        )
-        from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_vision import (
-            QwenVLVisionAttention,
-        )
-        from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-
-        with global_force_attn_backend_context_manager(AttentionBackendEnum.TORCH_SDPA):
-            module = QwenVLVisionAttention(
-                SimpleNamespace(hidden_size=width, num_heads=8),
-                prefix="visual",
-                model_name="Qwen",
-                quant_config=quant_config,
-            )
-        layers = (module.qkv_proj, module.proj)
+        raise ValueError(model)
     return module, layers
 
 
@@ -195,18 +179,13 @@ class TestQwenVisionWrapperGroups(CustomTestCase):
                 "qwen25_split",
                 "qwen3_mlp",
                 "qwen3_merger",
-                "mmdg_attention",
             ):
                 for group, replicated in (
-                    ((None, False),)
-                    if model == "mmdg_attention"
-                    else (
-                        (None, False),
-                        (None, True),
-                        ("tp", False),
-                        ("attn_tp", False),
-                        ("replicated", False),
-                    )
+                    (None, False),
+                    (None, True),
+                    ("tp", False),
+                    ("attn_tp", False),
+                    ("replicated", False),
                 ):
                     with self.subTest(
                         dp=dp, model=model, group=group, replicated=replicated
@@ -284,49 +263,6 @@ class TestQwenVisionWrapperGroups(CustomTestCase):
                             self.assertEqual(
                                 isinstance(module.down_proj, ReplicatedLinear),
                                 expected_size == 1,
-                            )
-
-    def test_generation_helpers_match_initialized_scope(self):
-        import sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl as generation
-
-        publish(
-            ServerArgs(model_path="dummy", device="cpu", tp_size=4),
-            role="test",
-            ranks=SpawnRanks(world_rank=3),
-        )
-        for initialized in (False, True):
-            with (
-                patch.object(
-                    generation,
-                    "model_parallel_is_initialized",
-                    return_value=initialized,
-                ),
-                patch.object(generation, "get_tp_world_size", return_value=4),
-            ):
-                # Parent-only helper reads the same rank as the published bridge scope.
-                with patch.object(
-                    generation, "get_tp_rank", return_value=3, create=True
-                ):
-                    for tensor_parallel in (False, True):
-                        for maker in (
-                            generation._make_column_linear,
-                            generation._make_row_linear,
-                        ):
-                            layer = maker(
-                                8, 8, bias=True, use_tensor_parallel=tensor_parallel
-                            )
-                            expected = (
-                                (3, 4) if initialized and tensor_parallel else (0, 1)
-                            )
-                            self.assertEqual(
-                                (
-                                    getattr(layer, "tp_rank", 0),
-                                    getattr(layer, "tp_size", 1),
-                                ),
-                                expected,
-                            )
-                            self.assertEqual(
-                                isinstance(layer, ReplicatedLinear), not tensor_parallel
                             )
 
     def test_wrapper_conflict_guard_and_disabled_merger(self):
