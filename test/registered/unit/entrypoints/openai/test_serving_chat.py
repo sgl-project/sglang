@@ -1249,6 +1249,60 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertIsNone(processed.tool_call_constraint)
 
+    def _glm47_constraint_thinking_mode(self, reasoning_config):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.template_manager.reasoning_config = reasoning_config
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.tm.server_args.reasoning_parser = "glm45"
+        self.tm.server_args.tool_call_parser = "glm47"
+        self.chat.reasoning_parser = "glm45"
+        self.chat.tool_call_parser = "glm47"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "add",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"a": {"type": "integer"}},
+                        },
+                    },
+                }
+            ],
+            tool_choice="auto",
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as parser_cls:
+            parser = parser_cls.return_value
+            parser.get_structure_constraint.return_value = ("ebnf", "grammar")
+
+            self.chat._process_messages(req, is_multimodal=False)
+
+            parser.get_structure_constraint.assert_called_once()
+            return parser.get_structure_constraint.call_args.kwargs["thinking_mode"]
+
+    def test_glm47_constraint_follows_always_thinking_template(self):
+        """A template that always opens <think> ignores enable_thinking=False,
+        so the grammar must still allow the model to close the think block."""
+        thinking_mode = self._glm47_constraint_thinking_mode(
+            ReasoningToggleConfig(special_case="always")
+        )
+        self.assertTrue(thinking_mode)
+
+    def test_glm47_constraint_honors_toggle_template_disable(self):
+        thinking_mode = self._glm47_constraint_thinking_mode(
+            ReasoningToggleConfig(toggle_param="enable_thinking", default_enabled=True)
+        )
+        self.assertFalse(thinking_mode)
+
     def test_jinja_tool_schema_fallback_to_flat_function(self):
         """Fallback to function-only schema when template rejects OpenAI wrapper."""
         self.template_manager.chat_template_name = None
