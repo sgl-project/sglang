@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_token_shard import get_dsa_token_shard_plan
 from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
     cumulative,
     plan_dsa_token_shard,
@@ -77,8 +78,9 @@ def plan_indexer_query_shard(
 ):
     """One attention-TP rank's share of an extend batch's indexer queries.
 
-    Uses ``plan_dsa_token_shard``'s position cut, so a DSA token shard over
-    the same ranks would pick the same rows.
+    The token shard's partition, derived rather than recomputed: the token
+    shard skips this top-k's all-gather on the strength of both picking the
+    same rows (W2), so they must not be two implementations.
 
     Returns ``(start, rows, num_real, cum_query_lens, key_lens)``.
     """
@@ -122,6 +124,40 @@ class _IndexerQueryShard:
         out = topk_indices.new_empty((self.rows * self.tp_size, topk_indices.shape[-1]))
         attn_tp_all_gather_into_tensor(out, topk_indices.contiguous())
         return out[:num_tokens]
+
+    def resolve(
+        self, topk_indices: torch.Tensor, num_tokens: int, forward_batch
+    ) -> torch.Tensor:
+        """Full-width top-k, or this rank's own rows when the token shard will
+        slice the gathered tensor straight back to them anyway (W2).
+
+        Sets ``npu_indexer_topk_is_local`` so attention knows which it got. Rows
+        past ``num_real`` are zeroed to match ``dsa_token_shard_slice``'s
+        padding, keeping the result bitwise identical.
+        """
+        plan = get_dsa_token_shard_plan(forward_batch)
+        local = plan is not None
+        if local and (plan.rows != self.rows or plan.local_start != self.start):
+            # Same arithmetic, but the two sites read their inputs separately;
+            # if those ever drift, the gather stays correct where this would not.
+            print_info_once(
+                "DSA token-shard and indexer sharding disagree on the row range "
+                f"(plan {plan.local_start}+{plan.rows} against shard "
+                f"{self.start}+{self.rows}); keeping the top-k all-gather"
+            )
+            local = False
+        forward_batch.npu_indexer_topk_is_local = local
+        if not local:
+            return self.gather(topk_indices, num_tokens)
+        # Every rank logs, so a grep counts ranks: the output is identical either
+        # way, which makes this line the only evidence it ran.
+        print_info_once(
+            "DSA token-shard W2: skipping the indexer top-k all-gather; each rank "
+            "keeps the rows it scored"
+        )
+        if self.num_real < self.rows:
+            topk_indices[self.num_real :] = 0
+        return topk_indices
 
 
 def _build_indexer_query_shard(
@@ -546,7 +582,11 @@ class DSANPUIndexerMixin:
                     sparse_mode=3,
                 )[0].squeeze(1)
             if shard is not None:
-                topk_indices = shard.gather(topk_indices, num_query_tokens)
+                topk_indices = shard.resolve(
+                    topk_indices, num_query_tokens, forward_batch
+                )
+            else:
+                forward_batch.npu_indexer_topk_is_local = False
             # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
             return topk_indices
 
