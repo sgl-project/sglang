@@ -98,21 +98,44 @@ class Qwen3CoderDetector(BaseFormatDetector):
             return "string"
         return str(inferred_type).strip().lower()
 
+    def _schema_allows_null(self, schema: Any) -> bool:
+        """True when the parameter schema explicitly permits JSON null."""
+        if not isinstance(schema, dict):
+            return False
+        schema_type = schema.get("type")
+        if schema_type == "null":
+            return True
+        if isinstance(schema_type, list) and "null" in schema_type:
+            return True
+        for keyword in ("anyOf", "oneOf"):
+            branches = schema.get(keyword)
+            if isinstance(branches, list) and any(
+                self._schema_allows_null(branch) for branch in branches
+            ):
+                return True
+        return False
+
     def _convert_param_value(
         self, param_value: str, param_name: str, param_config: dict, func_name: str
     ) -> Any:
         """Convert parameter value based on its type in the schema."""
-        # Handle null value for any type
-        if param_value.lower() == "null":
-            return None
-
+        # No schema: keep the historical "null" -> None coercion.
         if param_name not in param_config:
+            if param_value.lower() == "null":
+                return None
             if param_config != {}:
                 logger.warning(
                     f"Parsed parameter '{param_name}' is not defined in the tool "
                     f"parameters for tool '{func_name}', directly returning the string value."
                 )
             return param_value
+
+        # A declared string (or other non-nullable type) wrote the token raw.
+        # Only schemas that include null should turn the text "null" into None.
+        if param_value.lower() == "null" and self._schema_allows_null(
+            param_config[param_name]
+        ):
+            return None
 
         param_type = self._get_param_type(param_config[param_name])
         if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
@@ -147,12 +170,13 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 )
             return param_value
         elif param_type in ["boolean", "bool", "binary"]:
-            param_value = param_value.lower()
-            if param_value not in ["true", "false"]:
+            lowered = param_value.lower()
+            if lowered not in ["true", "false"]:
                 logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a boolean (`true` of `false`) in tool '{func_name}', degenerating to false."
+                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a boolean (`true` or `false`) in tool '{func_name}', degenerating to string."
                 )
-            return param_value == "true"
+                return param_value
+            return lowered == "true"
         else:
             if (
                 param_type in ["object", "array", "arr"]

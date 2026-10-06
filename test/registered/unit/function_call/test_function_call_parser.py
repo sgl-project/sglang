@@ -2545,6 +2545,51 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertIsInstance(params["dry_run"], bool)
         self.assertEqual(params["dry_run"], True)
 
+    def test_string_null_and_invalid_boolean_stay_raw(self):
+        """
+        A string parameter whose text is the word null, and a boolean
+        parameter that is neither true nor false, must not be rewritten.
+
+        The Qwen chat template writes string values raw, so "null" is the
+        string null. Numeric conversion already keeps the raw text when it
+        fails; boolean used to collapse that case to false.
+        """
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="grep",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "pattern": {"type": "string"},
+                            "regex": {"type": "boolean"},
+                            "note": {"type": ["string", "null"]},
+                        },
+                    },
+                ),
+            )
+        ]
+        text = """<tool_call>
+<function=grep>
+<parameter=pattern>
+null
+</parameter>
+<parameter=regex>
+yes
+</parameter>
+<parameter=note>
+null
+</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, tools)
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["pattern"], "null")
+        self.assertEqual(params["regex"], "yes")
+        self.assertIsNone(params["note"])
+
     def test_complex_array_parameter(self):
         """
         Test parsing of complex array parameters.
