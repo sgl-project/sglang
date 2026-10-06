@@ -1315,7 +1315,6 @@ def test_linker_load_preserves_swa_boundaries(
     req = SimpleNamespace(
         rid="rid",
         kv=kv,
-        prefix_indices=torch.empty(0, dtype=torch.int64),
         prefix_len=0,
         last_node=0,
         priority=0,

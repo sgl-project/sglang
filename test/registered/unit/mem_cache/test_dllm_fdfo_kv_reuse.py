@@ -60,11 +60,14 @@ class _FakeTreeCache:
     def maybe_hand_to_session(self, req):
         pass
 
+    def prefix_device_indices(self, req):
+        return req.tree_prefix
+
 
 def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
     return SimpleNamespace(
         rid=rid,
-        prefix_indices=torch.tensor(prefix, dtype=torch.int32),
+        tree_prefix=torch.tensor(prefix, dtype=torch.int32),
         prefix_len=len(prefix),
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
@@ -86,10 +89,7 @@ def _remove_allocated_req_slots(pool, *reqs):
 
 def _make_batch(pool, allocator, reqs, extend_lens):
     seq_lens_cpu = torch.tensor(
-        [
-            len(req.prefix_indices) + extend_len
-            for req, extend_len in zip(reqs, extend_lens)
-        ],
+        [req.prefix_len + extend_len for req, extend_len in zip(reqs, extend_lens)],
         dtype=torch.int64,
     )
     return SimpleNamespace(
@@ -98,7 +98,7 @@ def _make_batch(pool, allocator, reqs, extend_lens):
         req_to_token_pool=pool,
         token_to_kv_pool_allocator=allocator,
         tree_cache=_FakeTreeCache(allocator),
-        prefix_lens=[len(req.prefix_indices) for req in reqs],
+        prefix_lens=[req.prefix_len for req in reqs],
         extend_lens=extend_lens,
         seq_lens=seq_lens_cpu,
         seq_lens_cpu=seq_lens_cpu,
@@ -109,8 +109,8 @@ def _make_batch(pool, allocator, reqs, extend_lens):
 
 
 def _seed_retained_block(pool, req, values):
-    prefix_len = len(req.prefix_indices)
-    pool.req_to_token[req.kv.req_pool_idx, :prefix_len] = req.prefix_indices
+    prefix_len = req.prefix_len
+    pool.req_to_token[req.kv.req_pool_idx, :prefix_len] = req.tree_prefix
     pool.req_to_token[req.kv.req_pool_idx, prefix_len : prefix_len + len(values)] = (
         torch.tensor(values, dtype=torch.int32)
     )

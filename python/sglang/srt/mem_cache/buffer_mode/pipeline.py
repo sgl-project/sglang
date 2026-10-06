@@ -1067,12 +1067,7 @@ class BufferModePipeline:
             )
             self._refetch_staged(f)
             return False
-        root_id = self._cache.tree_core.empty_match_result.last_device_node
-        full_indices = self._cache.tree_core.collect_full_device_indices(
-            node_id, root_id
-        )[:matched_len]
-        assert len(full_indices) == matched_len
-        req.set_prefix_indices(full_indices)
+        req.prefix_len = matched_len
         req.last_node = node_id
         req.kv.cache_protected_len = matched_len
         full_tokens = max(0, f.matched_len + f.num_tokens - matched_len)
@@ -1253,6 +1248,7 @@ class BufferModePipeline:
 
         splice_base = plan.device_prefix_len
         assert req.prefix_len == splice_base
+        prefix_indices = self._cache.prefix_device_indices(req)
         trim_tokens = splice_base - f.matched_len
         assert trim_tokens % cache.page_size == 0, (
             f"staged splice trim not page-aligned req={req.rid}: "
@@ -1309,7 +1305,7 @@ class BufferModePipeline:
             anchor_parts = []
             host_parts = []
             for repair_start, repair_end_ in repair_ranges:
-                anchor_parts.append(req.prefix_indices[repair_start:repair_end_])
+                anchor_parts.append(prefix_indices[repair_start:repair_end_])
                 host_parts.append(
                     slice(repair_start - window_start, repair_end_ - window_start)
                 )
@@ -1372,16 +1368,14 @@ class BufferModePipeline:
                     key,
                     repair_start,
                     repair_end_,
-                    req.prefix_indices[repair_start:repair_end_],
+                    prefix_indices[repair_start:repair_end_],
                 ):
                     cache._apply_cache_action(action)
         elif swa_dev is not None:
             # Register the window's FULL->SWA translation now (attention reads
             # through it). Keep SWA slots another request may still hold; their
             # redundant H2D destinations are reclaimed at the transfer ack.
-            full_window = torch.cat([req.prefix_indices, device_indices])[
-                -len(swa_dev) :
-            ]
+            full_window = torch.cat([prefix_indices, device_indices])[-len(swa_dev) :]
             allocator = cache.token_to_kv_pool_allocator
             old_swa = allocator.translate_swa_indices_for_transfer(full_window)
             missing = old_swa <= 0
@@ -1431,7 +1425,7 @@ class BufferModePipeline:
         insert_result = cache.insert(
             InsertParams(
                 key=key,
-                value=torch.cat([req.prefix_indices, device_indices]),
+                value=torch.cat([prefix_indices, device_indices]),
                 prev_prefix_len=splice_base,
                 component_evicted_seqlens={
                     ComponentType.SWA: (span_end - staged_swa) if staged_swa else 0

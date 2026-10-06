@@ -87,6 +87,16 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         # LMCache rebuilds lookup keys from tokens, so any L1 node is valid.
         return True
 
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        indices = super().prefix_device_indices(req)
+        missing = req.prefix_len - len(indices)
+        if missing > 0:
+            # match_prefix appended loaded slots not yet published to the tree.
+            load = self._external_flows[req.rid].load
+            skip = max(len(indices) - load.local_hit_tokens, 0)
+            indices = torch.cat([indices, load.device_indices[skip : skip + missing]])
+        return indices
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Report LMCache hits through host fields until GPU slots are ready."""
         requested_key_len = len(params.key)

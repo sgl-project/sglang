@@ -338,7 +338,7 @@ class UnifiedCacheLinkerWrapper:
 
         # Insert the newly loaded tail into the tree.
         prefix_indices = torch.cat(
-            [req.prefix_indices.to(torch.int64), full_transfer.device_indices]
+            [cache.prefix_device_indices(req), full_transfer.device_indices]
         )
         mamba_transfer = next(
             (

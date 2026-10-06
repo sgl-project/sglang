@@ -3722,6 +3722,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # Internal callers (and the session sentinel / None) pass a non-int through.
         return node_handle
 
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        root = self.root_node_handle(req.extra_key)
+        path = self.tree_core.collect_full_device_indices(req.last_node, root)
+        return path[: req.prefix_len]
+
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
         return self.tree_core.root_node_handle(extra_key)

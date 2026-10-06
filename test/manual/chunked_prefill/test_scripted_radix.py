@@ -303,7 +303,7 @@ class TestRadixNoTailChunked(ScriptedTestCase):
             req = s.chunked_req
             if req is not None and req.rid == r.rid:
                 observed_mid_chunk = True
-                prefix_len: int = len(req.prefix_indices)
+                prefix_len: int = req.prefix_len
                 protected_len: int = req.kv.cache_protected_len
                 assert prefix_len == protected_len, (
                     f"page_size=1 must take the no-tail else branch: "
@@ -459,7 +459,7 @@ class TestRadixPartialPage(ScriptedTestCase):
         for _ in range(800):
             req = s.chunked_req
             if req is not None and req.rid == r.rid:
-                prefix_len: int = len(req.prefix_indices)
+                prefix_len: int = req.prefix_len
                 protected_len: int = req.kv.cache_protected_len
                 assert prefix_len >= protected_len, (
                     f"len(prefix_indices)={prefix_len} dropped below "

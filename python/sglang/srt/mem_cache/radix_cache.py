@@ -624,6 +624,15 @@ class RadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        values = []
+        node = req.last_node
+        while node is not self.root_node:
+            values.append(node.value)
+            node = node.parent
+        values.reverse()
+        return torch.cat(values)[: req.prefix_len]
+
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         access_time = time.monotonic()
         node.last_access_time = access_time

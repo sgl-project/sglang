@@ -210,7 +210,7 @@ class DecodeHiCacheTransferMixin:
                 return False
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
 
-        # Re-match: req.last_node / prefix_indices updated to current device state.
+        # Re-match: req.last_node / prefix_len updated to current device state.
         rematch = dr.req.match_prefix(
             self.tree_cache,
             dr.req.origin_input_ids,
@@ -315,11 +315,7 @@ class DecodeHiCacheTransferMixin:
             ),
             decode_req.hicache_restored_kv_indices,
         )
-        req.set_prefix_indices(
-            torch.cat(
-                [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
-            )
-        )
+        req.prefix_len = prefix_match.decode_prefix_len
         req.last_node = restore_lock.node
         req.lock = restore_lock
         # Prevent abort cleanup from releasing the transferred lock.

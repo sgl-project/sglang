@@ -33,7 +33,6 @@ class _StubReq:
         self.output_ids = array("q")
         self.extra_key = None
         self.cache_salt = None
-        self.prefix_indices = None
         self.prefix_len = 0
         self.last_node = None
         self.last_host_node = None
@@ -43,7 +42,6 @@ class _StubReq:
         self.swa_branching_seqlen = None
         self.kv = SimpleNamespace(cache_protected_len=None)
 
-    set_prefix_indices = Req.set_prefix_indices
     match_prefix = Req.match_prefix
 
     def _compute_max_prefix_len(self, input_len):
@@ -118,14 +116,14 @@ class TestReqMatchPrefixForceMiss(unittest.TestCase):
         baseline_req = _StubReq([10, 11, 12, 13, 99, 100])
         with envs.SGLANG_RADIX_FORCE_MISS.override(False):
             baseline_req.match_prefix(tree)
-        self.assertGreater(int(baseline_req.prefix_indices.numel()), 0)
+        self.assertGreater(baseline_req.prefix_len, 0)
         self.assertIsNot(baseline_req.last_node, tree.root_node)
 
         # With the flag, the same lookup is forced to miss.
         forced_req = _StubReq([10, 11, 12, 13, 99, 100])
         with envs.SGLANG_RADIX_FORCE_MISS.override(True):
             forced_req.match_prefix(tree)
-        self.assertEqual(int(forced_req.prefix_indices.numel()), 0)
+        self.assertEqual(forced_req.prefix_len, 0)
         self.assertIs(forced_req.last_node, tree.root_node)
         self.assertIs(forced_req.last_host_node, tree.root_node)
         self.assertEqual(forced_req.host_hit_length, 0)
