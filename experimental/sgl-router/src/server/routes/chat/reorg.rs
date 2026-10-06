@@ -8,7 +8,7 @@ use super::{
     record_prefill_route, X_SGL_TPS_SLO, X_SGL_TTFT_SLO_MS,
 };
 use crate::buckets_reorg::{BucketRequest, BucketResolver, SloPreference};
-use crate::discovery::ModelId;
+use crate::discovery::{ModelId, WorkerId};
 use crate::policies_reorg::{PickError, Stage};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -20,6 +20,7 @@ pub(super) async fn select_workers(
     resolver: &BucketResolver,
     request: &PreparedRequest,
     headers: &HeaderMap,
+    excluded: &[WorkerId],
 ) -> Result<SelectedWorkers, ApiError> {
     let input_tokens = request.sequence_token_count as u64;
     if request
@@ -77,6 +78,7 @@ pub(super) async fn select_workers(
             .sticky
             .as_ref()
             .and_then(|config| nonempty_header(headers, &config.header_name)),
+        excluded,
     };
     let mut rejections: Option<Vec<_>> = None;
     let mut missing_stage = None;
