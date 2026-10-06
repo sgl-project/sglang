@@ -5660,11 +5660,14 @@ class Scheduler(
                 effective_ep_size=old_ep_size,
             )
         parallel = get_parallel()
-        allocation_rank_width = (
-            parallel.elastic_ep_allocation_width or parallel.tp_size // parallel.nnodes
-        )
+        # elastic_ep_allocation_width is set only by auto bootstrap.
+        # Explicit joiner width is validated in register_scale_cohort.
+        allocation_rank_width = parallel.elastic_ep_allocation_width
         requested_rank_count = new_ep_size - old_ep_size
-        if requested_rank_count != allocation_rank_width:
+        if (
+            allocation_rank_width is not None
+            and requested_rank_count != allocation_rank_width
+        ):
             return make_output(
                 success=False,
                 message=(

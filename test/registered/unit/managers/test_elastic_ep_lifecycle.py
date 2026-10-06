@@ -364,6 +364,22 @@ class TestElasticEPLifecycle(unittest.IsolatedAsyncioTestCase):
 
 
 class TestElasticEPCohortBinding(unittest.TestCase):
+    def test_explicit_cohort_rejects_a_mismatched_operation_target(self):
+        store = _Store()
+        with patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_global_tcp_store",
+            return_value=store,
+        ):
+            register_scale_operation(4, 5, "runtime-1", "grow-1")
+            # An explicit two-rank joiner at offset 4 targets EP6, not EP5.
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Joining cohort target 6 does not match operation target 5",
+            ):
+                register_scale_cohort(4, 6, 1, "pod-uid-5")
+
+            self.assertIsNone(get_scale_cohort(4, "runtime-1", "grow-1"))
+
     def test_cohort_inherits_operation_and_runtime_identity(self):
         store = _Store()
         with patch(
@@ -441,6 +457,61 @@ class TestElasticEPCohortBinding(unittest.TestCase):
 
 
 class TestElasticEPSchedulerIdempotency(unittest.TestCase):
+    def test_explicit_mode_accepts_a_different_joining_allocation_width(self):
+        # Keep the TP4 primary geometry to catch a primary-width fallback.
+        for new_ep_size in (5, 6):
+            with self.subTest(new_ep_size=new_ep_size):
+                state = ElasticEPState(
+                    active_ranks=None,
+                    last_active_ranks=None,
+                    active_ranks_cpu=None,
+                    effective_ep_size=4,
+                )
+                scheduler = Scheduler.__new__(Scheduler)
+                scheduler.tp_worker = MagicMock(
+                    model_runner=MagicMock(eplb_manager=None)
+                )
+                request = ScaleElasticEPReqInput(
+                    new_ep_size=new_ep_size,
+                    operation_id="grow-1",
+                    runtime_instance_id="runtime-1",
+                )
+
+                with (
+                    patch.object(ElasticEPStateManager, "_instance", state),
+                    patch.object(
+                        ElasticEPStateManager, "request_scale", return_value=True
+                    ) as request_scale,
+                    patch.object(
+                        ElasticEPStateManager,
+                        "get_pending_ep_size",
+                        return_value=new_ep_size,
+                    ),
+                    patch.object(
+                        ElasticEPStateManager,
+                        "get_scale_phase",
+                        return_value="waiting_for_cohort",
+                    ),
+                    patch(
+                        "sglang.srt.managers.scheduler.get_parallel",
+                        return_value=MagicMock(
+                            max_world_size=16,
+                            tp_size=4,
+                            nnodes=1,
+                            elastic_ep_allocation_width=None,
+                        ),
+                    ),
+                ):
+                    result = scheduler.handle_scale_elastic_ep(request)
+
+                self.assertTrue(result.success)
+                self.assertEqual(result.old_ep_size, 4)
+                self.assertEqual(result.new_ep_size, new_ep_size)
+                self.assertEqual(result.pending_ep_size, new_ep_size)
+                request_scale.assert_called_once_with(
+                    new_ep_size, "runtime-1", "grow-1", None
+                )
+
     def test_same_operation_is_reconciled_while_pending(self):
         state = ElasticEPState(
             active_ranks=None,
