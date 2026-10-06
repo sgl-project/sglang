@@ -99,7 +99,7 @@ impl ChatFormatter {
     pub fn render_request(&self, request: &Value) -> Result<(String, String), TemplateError> {
         let ChatFormatter::DeepSeekV4(profile) = self else {
             return Err(TemplateError::Renderer {
-                message: "render_request supports DeepSeek-V4 only".into(),
+                message: "this formatter renders through render_prompt".into(),
             });
         };
         render_deepseek_v4(*profile, request).map_err(|message| TemplateError::Renderer { message })

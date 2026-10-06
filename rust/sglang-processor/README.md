@@ -97,6 +97,13 @@ rebuilds the body from the trait. The SGLang additions hook in as follows:
 `stop_strs` returns the legacy template's stop strings; Jinja and native
 formatters have none, as in Python.
 
+**Parity.** Each `tests/fixtures/parity/<model>.json` holds requests that
+SGLang's Python serving path rendered and tokenized, written by
+`tests/scripts/generate_parity.py`. `tests/parity.rs` checks every fixture. To
+add a model, follow the
+[`processor-model-parity`](../../.claude/skills/processor-model-parity/SKILL.md)
+skill.
+
 ## parser
 
 ```rust
