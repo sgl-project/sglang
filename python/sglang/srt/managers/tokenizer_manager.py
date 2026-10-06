@@ -411,6 +411,26 @@ def _build_flat_input_top_logprobs_fields_from_arrays(
     return fields
 
 
+def _build_flat_output_top_logprobs_fields(
+    output_top_logprobs_val: List[Optional[List[float]]],
+    output_top_logprobs_idx: List[Optional[List[int]]],
+    top_logprobs_num: int,
+    return_b64: bool = False,
+) -> Dict[str, Any]:
+    """Build the flat raw output top logprob response fields.
+
+    Same layout as the prompt fields (see `_build_flat_input_top_logprobs_fields`),
+    under `output_top_logprobs_*` keys.
+    """
+    val_arr, idx_arr, null_prefix = build_flat_input_top_logprobs_arrays(
+        output_top_logprobs_val, output_top_logprobs_idx, top_logprobs_num
+    )
+    fields = _build_flat_input_top_logprobs_fields_from_arrays(
+        val_arr, idx_arr, null_prefix, return_b64=return_b64
+    )
+    return {"output" + key[len("input") :]: value for key, value in fields.items()}
+
+
 class InputFormat(Enum):
     """Input format types for tokenization handling."""
 
@@ -2485,6 +2505,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state.obj.return_text_in_logprobs and not self.skip_tokenizer_init,
                     recv_obj,
                     i,
+                    finished=recv_obj.finished_reasons[i] is not None,
                 )
             if (
                 isinstance(state.obj, GenerateReqInput)
@@ -2783,6 +2804,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         top_logprobs_num: int,
         token_ids_logprob: List[int],
         return_text_in_logprobs: bool,
+        finished: bool = False,
     ):
         # 1. Handle regular logprobs
         if len(state.input_token_logprobs_val) > len(state.input_token_logprobs):
@@ -2872,15 +2894,43 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
                 meta_info["input_top_logprobs"] = state.input_top_logprobs
-            if len(state.output_top_logprobs_val) > len(state.output_top_logprobs):
-                state.output_top_logprobs.extend(
-                    self.detokenize_top_logprobs_tokens(
-                        state.output_top_logprobs_val[len(state.output_top_logprobs) :],
-                        state.output_top_logprobs_idx[len(state.output_top_logprobs) :],
-                        return_text_in_logprobs,
+            # None selects the nested format below.
+            flat_output_fields = None
+            if state.obj.return_flat_raw_output_top_logprobs:
+                # Built once on the finished response; streaming is rejected and
+                # only that response reaches a non-streaming client.
+                flat_output_fields = {}
+                if finished:
+                    try:
+                        flat_output_fields = _build_flat_output_top_logprobs_fields(
+                            state.output_top_logprobs_val,
+                            state.output_top_logprobs_idx,
+                            top_logprobs_num,
+                            return_b64=state.obj.return_flat_raw_top_logprobs_b64,
+                        )
+                    except ValueError as e:
+                        flat_output_fields = None
+                        logger.error(
+                            "Falling back to nested output top logprobs for rid=%s: %s",
+                            meta_info.get("id"),
+                            e,
+                        )
+            if flat_output_fields is not None:
+                meta_info.update(flat_output_fields)
+            else:
+                if len(state.output_top_logprobs_val) > len(state.output_top_logprobs):
+                    state.output_top_logprobs.extend(
+                        self.detokenize_top_logprobs_tokens(
+                            state.output_top_logprobs_val[
+                                len(state.output_top_logprobs) :
+                            ],
+                            state.output_top_logprobs_idx[
+                                len(state.output_top_logprobs) :
+                            ],
+                            return_text_in_logprobs,
+                        )
                     )
-                )
-            meta_info["output_top_logprobs"] = state.output_top_logprobs
+                meta_info["output_top_logprobs"] = state.output_top_logprobs
 
         # 3. Handle token_ids_logprob
         if token_ids_logprob is not None:
@@ -2925,6 +2975,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return_text_in_logprobs: bool,
         recv_obj: BatchStrOutput,
         recv_obj_index: int,
+        finished: bool = False,
     ):
         if (
             recv_obj.input_token_logprobs_val is not None
@@ -3001,6 +3052,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             state.obj.top_logprobs_num,
             state.obj.token_ids_logprob,
             return_text_in_logprobs,
+            finished=finished,
         )
 
     def detokenize_logprob_tokens(
@@ -3510,6 +3562,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.obj.token_ids_logprob,
                 state.obj.return_text_in_logprobs
                 and not get_serving().skip_tokenizer_init,
+                finished=True,
             )
 
         output_ids = state.output_ids

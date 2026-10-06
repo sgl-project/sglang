@@ -896,6 +896,12 @@ class ChatCompletionRequest(BaseModel):
     return_output_ids_in_sglext: bool = False
     return_sampling_mask: bool = False
     sampling_logprobs_mode: Optional[Literal["selected", "support"]] = None
+    # Return output top logprobs only as flat arrays in choices[].meta_info
+    # (see GenerateReqInput.return_flat_raw_output_top_logprobs); the
+    # choices[].logprobs top_logprobs lists are then left empty. Requires
+    # return_meta_info.
+    return_flat_raw_output_top_logprobs: bool = False
+    return_flat_raw_top_logprobs_b64: bool = False
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
