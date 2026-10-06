@@ -42,10 +42,10 @@ _DECOMPRESS_OPTIONS = {
     "snappy-zstd": ("Snappy", _SnappyOptions),
     "lz4-zstd": ("LZ4", _Lz4Options),
 }
-_MAX_FRAME_BYTES = 1 << 20
+_MAX_FRAME_BYTES = 4 << 20
 
 
-def _require_hardware_device(device: torch.device, algorithm: str) -> None:
+def _require_hardware_device(device: torch.device, algorithm: str) -> int:
     from sglang.srt.weight_sync.gpu_delta_memory import _driver
 
     driver = _driver()
@@ -59,14 +59,9 @@ def _require_hardware_device(device: torch.device, algorithm: str) -> None:
     # CUDA's CUmemDecompressAlgorithm bits, not compute-capability inference.
     if not mask.value & {"Snappy": 1 << 1, "LZ4": 1 << 2}[algorithm]:
         raise RuntimeError(f"Device has no hardware {algorithm} decompressor")
-    # HARDWARE does not enforce its device limit inside nvCOMP. Admit both the
-    # output limit and the publication's conservative compressed-input bound.
-    required = 32 + _MAX_FRAME_BYTES + _MAX_FRAME_BYTES // 6
-    if maximum.value < required:
-        raise RuntimeError(
-            f"Hardware decompression limit {maximum.value} is below "
-            f"the GPU-delta frame envelope {required}"
-        )
+    if maximum.value <= 0:
+        raise RuntimeError("Device has no positive hardware decompression limit")
+    return maximum.value
 
 
 class _Alignments(ctypes.Structure):
@@ -148,7 +143,9 @@ class NvcompDecoder:
         if codec == "lz4-zstd":
             self._options.data_type = 0  # NVCOMP_TYPE_CHAR
             self._options.bitshuffle_mode = 0  # NVCOMP_BITSHUFFLE_NONE
-        _require_hardware_device(self.device, self._algorithm)
+        self.maximum_chunk_bytes = _require_hardware_device(
+            self.device, self._algorithm
+        )
         _require_hardware_allocator(self.device)
         self._library = ctypes.CDLL(
             str(distribution.locate_file("nvidia/libnvcomp/lib64/libnvcomp.so.5"))
@@ -316,12 +313,17 @@ class NvcompDecoder:
             slot = index % slot_count
             prior_output_end = 0
             for frame in frames:
+                # HARDWARE does not check oversized buffers in nvCOMP. Check
+                # actual lengths, not the compressor's worst-case allocation:
+                # a compressible 4 MiB frame can fit a 4 MiB device limit.
                 if (
                     not 0 < frame.decoded_bytes <= _MAX_FRAME_BYTES
-                    or frame.encoded_bytes <= 0
+                    or frame.decoded_bytes > self.maximum_chunk_bytes
+                    or not 0 < frame.encoded_bytes <= self.maximum_chunk_bytes
                 ):
                     raise ValueError(
-                        "Direct-delta frames require positive lengths and <=1 MiB output"
+                        "GPU-delta frames require positive lengths, <=4 MiB "
+                        f"output and both lengths <= device limit {self.maximum_chunk_bytes}"
                     )
                 if not 0 <= frame.input_offset <= input_bytes - frame.encoded_bytes:
                     raise ValueError("Encoded frame outside input allocation")

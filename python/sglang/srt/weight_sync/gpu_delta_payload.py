@@ -36,7 +36,7 @@ def validate_codec(manifest, expected):
         or expected not in {"snappy-zstd", "lz4-zstd"}
         or "codec_profile" in manifest
         or type(manifest.get("frame_bytes")) is not int
-        or manifest["frame_bytes"] not in {1 << 16, 1 << 20}
+        or manifest["frame_bytes"] not in {1 << 16, 1 << 20, 4 << 20}
     ):
         raise ValueError(
             "GPU delta requires protocol 4 with the negotiated snappy-zstd or lz4-zstd codec"

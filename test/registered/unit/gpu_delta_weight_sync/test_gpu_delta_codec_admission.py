@@ -121,6 +121,7 @@ def test_codec_abi_and_frozen_hardware_options(
     monkeypatch.setattr(codec, "_require_hardware_allocator", admissions.append)
     decoder = codec.NvcompDecoder(torch.device("cuda", 0), name)
     assert decoder.codec == name and decoder.backend == "hardware"
+    assert decoder.maximum_chunk_bytes == 4 << 20
     assert admissions == [decoder.device]
     assert decoder._options.backend == 1
     assert decoder._options.sort_before_hw_decompress == int(sorting)
@@ -160,14 +161,16 @@ def test_codec_abi_and_frozen_hardware_options(
     assert calls[0][1] == calls[1][1]
     assert decoder.temporary_bytes(frame) == 64
     assert device_queries == [(136, 0), (137, 0)]
-    # Allocation capability alone does not prove this codec exists. Also reject
-    # a limit that fits decoded output but not the allowed compressed input.
+    # Allocation capability alone does not prove this codec exists. Frame
+    # lengths are checked against the cached device limit during preparation.
     attributes[136] = 0
     with pytest.raises(RuntimeError, match="no hardware"):
         codec.NvcompDecoder(decoder.device, name)
     attributes[136] = {"Snappy": 2, "LZ4": 4}[algorithm]
     attributes[137] = 1 << 20
-    with pytest.raises(RuntimeError, match="frame envelope"):
+    assert codec.NvcompDecoder(decoder.device, name).maximum_chunk_bytes == 1 << 20
+    attributes[137] = 0
+    with pytest.raises(RuntimeError, match="positive hardware decompression limit"):
         codec.NvcompDecoder(decoder.device, name)
 
 
@@ -260,6 +263,7 @@ def test_host_input_plans_split_output_and_status_slots(monkeypatch, name, stage
     decoder.device = device
     decoder.backend = "hardware"
     decoder.codec = name
+    decoder.maximum_chunk_bytes = 4 << 20
     decoder._algorithm, options_type = codec._DECOMPRESS_OPTIONS[name]
     decoder._options = options_type()
     decoder.alignments = codec._Alignments(16, 16, 16)
@@ -358,6 +362,26 @@ def test_host_input_plans_split_output_and_status_slots(monkeypatch, name, stage
             [[codec.DecodeFrame(496, 32, 0, 64)]], host, workspace, stream
         )
     assert len(uploads) == 2 and len(launches) == 7 and len(admitted) == 4 + stages
+
+    # Compressible 4 MiB output is admitted without allocating output slots;
+    # both actual lengths must fit the device, including an expanded input.
+    maximum = decoder.maximum_chunk_bytes
+    large = decoder.prepare_batches(
+        [[codec.DecodeFrame(0, 20, 0, maximum)]], host, workspace, stream
+    )
+    assert large.output_bounds == [maximum] + [0] * (stages - 1)
+    assert not large.decoded_slots and len(launches) == 7
+    for encoded, decoded in ((maximum + 1, 64), (20, maximum + 1)):
+        with pytest.raises(ValueError, match="device limit"):
+            decoder.prepare_batches(
+                [[codec.DecodeFrame(0, encoded, 0, decoded)]], host, workspace, stream
+            )
+    decoder.maximum_chunk_bytes = 1 << 20
+    with pytest.raises(ValueError, match="device limit"):
+        decoder.prepare_batches(
+            [[codec.DecodeFrame(0, 20, 0, maximum)]], host, workspace, stream
+        )
+    assert len(uploads) == 3 and len(launches) == 7
 
 
 if __name__ == "__main__":

@@ -55,12 +55,14 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
     monkeypatch.setenv("GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS", sort_chunks)
     device = torch.device("cuda", 0)
     decoder = NvcompDecoder(device, codec)
-    # Partial final frame, many zero bytes, and valid nonzero XOR values.
+    # Full 4 MiB nonzero frame, 1 MiB zero frame, and a partial final frame.
     values = [
-        [bytes(1 << 20), bytes(range(256)) * 4096, bytes(range(253)) * 3],
+        [bytes(1 << 20), bytes(range(256)) * 16384, bytes(range(253)) * 3],
         [bytes([7]) * (64 << 10), bytes(range(251)) * 3],
     ]
     payload_a, frames_a = _encode(values[0], codec)
+    assert frames_a[1].decoded_bytes == 4 << 20
+    assert decoder.backend == "hardware" and decoder._options.backend == 1
     # A different frame count, partial final frame and sparse output offsets
     # exercise views whose row stride is the complete metadata slab's width.
     payload_b, frames_b = _encode(values[1], codec, [128, 128 + (64 << 10) + 256])

@@ -64,7 +64,7 @@ class TestOuterZstd(unittest.TestCase):
             for codec in ("snappy-zstd", "lz4-zstd"):
                 os.environ["GPU_DELTA_CODEC"] = codec
                 frozen = configured_codec()
-                for size in (1 << 16, 1 << 20):
+                for size in (1 << 16, 1 << 20, 4 << 20):
                     validate_codec(
                         admitted | {"codec": codec, "frame_bytes": size}, frozen
                     )

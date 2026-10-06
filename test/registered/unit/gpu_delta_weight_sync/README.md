@@ -169,8 +169,8 @@ and rejects any unsupported value. The sender and receiver must agree before a
 publication; manifest fields cannot override the launch constraint. Legacy codec
 values and removed encoder/outer selectors have no migration layer.
 
-Protocol 4 carries the selected `codec` and explicit `frame_bytes` (64 KiB or
-1 MiB; default 1 MiB). Matrix frames contain only input/output offsets and lengths, without
+Protocol 4 carries the selected `codec` and explicit `frame_bytes` (64 KiB, 1 MiB or
+4 MiB; default 1 MiB). Matrix frames contain only input/output offsets and lengths, without
 redundant codec/file fields. Each natural tensor's outer descriptor names one
 immutable owner file and independent Zstd chunks of at most 1 MiB output, exactly
 covering its aligned inner-codec arena. LZ4 uses raw byte blocks with bitshuffle
@@ -178,6 +178,10 @@ disabled. The sender computes both the inner codec and outer Zstd on GPU; the re
 then decodes model-layer batches
 directly from host for in-place apply. Natural tensor boundaries remain unchanged
 in the publication format.
+The decoder caches the device's hardware operation limit and rejects a frame if
+its actual compressed or decoded length exceeds that limit. A 4 MiB frame whose
+compressed representation expands beyond a 4 MiB device limit is rejected;
+there is no frame splitting or software fallback. Outer Zstd stays at 1 MiB.
 There is no GPU outer decoder, legacy protocol or automatic fallback.
 
 `GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS=0` (default) or `1` selects nvCOMP
