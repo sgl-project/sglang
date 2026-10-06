@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Native gRPC `ChatComplete`: routed like `/v1/chat/completions` and sent to
-//! the engine's own `ChatComplete`.
+//! Native gRPC: each RPC is routed like its HTTP route and sent to the
+//! engine's own RPC.
 
 use crate::common::cache_aware_fixture;
 use crate::common::mock_worker::MockWorker;
@@ -14,9 +14,11 @@ use serde_json::{json, Value};
 use sgl_router::config::PolicyKind;
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults;
+use sgl_router::policies_reorg::factory::build_resolver;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
-use sgl_router::server::app_context::AppContext;
+use sgl_router::server::app_context::{AppContext, ChatRouting};
+use sgl_router::state::kv_events::KvEventIndex;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
 use sglang_grpc_types::sglang::runtime::v1 as proto;
@@ -214,10 +216,15 @@ fn openai(body: Vec<u8>) -> proto::OpenAiRequest {
 
 /// A round-robin router over `(mode, url, engine gRPC port)` workers.
 fn router_ctx(workers: &[(WorkerMode, &str, Option<u16>)]) -> Arc<AppContext> {
-    router_ctx_with(workers, Proxy::new(Duration::from_secs(5)).unwrap())
+    router_ctx_with(workers, false, Proxy::new(Duration::from_secs(5)).unwrap())
 }
 
-fn router_ctx_with(workers: &[(WorkerMode, &str, Option<u16>)], proxy: Proxy) -> Arc<AppContext> {
+/// [`router_ctx`] on the bucket-first (reorg) selection path when `reorg`.
+fn router_ctx_with(
+    workers: &[(WorkerMode, &str, Option<u16>)],
+    reorg: bool,
+    proxy: Proxy,
+) -> Arc<AppContext> {
     let mut cfg = cache_aware_fixture::config();
     cfg.model.id = "tiny".into();
     cfg.model.policy = PolicyKind::RoundRobin;
@@ -239,13 +246,21 @@ fn router_ctx_with(workers: &[(WorkerMode, &str, Option<u16>)], proxy: Proxy) ->
         };
         registry.add_with_cb(spec, None, profile).unwrap();
     }
-    Arc::new(AppContext::new(
+    if reorg {
+        cfg.model.policy = PolicyKind::PowerOfTwo;
+    }
+    let mut ctx = AppContext::new(
         cfg.clone(),
         Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap()),
         Arc::new(proxy),
         Arc::new(registry),
         Arc::new(build_registry_with_defaults(&cfg).unwrap()),
-    ))
+    );
+    if reorg {
+        let (resolver, _) = build_resolver(&cfg.model, &KvEventIndex::new(), None).unwrap();
+        ctx.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
+    }
+    Arc::new(ctx)
 }
 
 async fn serve_grpc(ctx: Arc<AppContext>) -> SglangServiceClient<Channel> {
@@ -296,12 +311,13 @@ fn stalled_after_one_chunk(
 }
 
 #[tokio::test]
-async fn sends_the_http_body_and_relays_chunks_unchanged() {
+async fn openai_rpcs_send_the_http_body_and_relay_chunks_unchanged() {
     let http = MockWorker::start(vec![]).await;
     let reply = vec![chunk(r#"{"object":"error"}"#, true, Some(400))];
-    let chats = Seen::new();
+    let (chats, completions) = (Seen::new(), Seen::new());
     let port = MockEngine::default()
         .stream("ChatComplete", openai_rpc(&chats, reply.clone()))
+        .stream("Complete", openai_rpc(&completions, reply.clone()))
         .start()
         .await;
     let ctx = router_ctx(&[(WorkerMode::Plain, &http.url, Some(port))]);
@@ -321,35 +337,180 @@ async fn sends_the_http_body_and_relays_chunks_unchanged() {
         without_rid(body_of(&chats.last().await)),
         without_rid(http.captured_json().await)
     );
+
+    let prompt = json!({"model": "tiny", "prompt": "hi", "max_tokens": 4});
+    let chunks = collect(client.complete(openai(prompt.to_string().into())).await).await;
+    assert_eq!(chunks.unwrap(), reply);
+    let sent = without_rid(body_of(&completions.last().await));
+    assert_eq!(sent, prompt, "the prompt is forwarded as sent");
 }
 
 #[tokio::test]
 async fn pd_legs_share_one_bootstrap_room() {
     let done = vec![chunk("", true, None)];
-    let (prefill_chats, decode_chats) = (Seen::new(), Seen::new());
-    let prefill = MockEngine::default()
-        .stream("ChatComplete", openai_rpc(&prefill_chats, done.clone()))
+    let generated = || {
+        let reply = proto::GenerateResponse {
+            output_ids: vec![7],
+            finished: true,
+            ..Default::default()
+        };
+        stream::iter([Ok(reply)]).boxed()
+    };
+    let engine = |chats: &Seen<_>, generates: &Seen<proto::GenerateRequest>| {
+        let record = generates.record();
+        MockEngine::default()
+            .stream("ChatComplete", openai_rpc(chats, done.clone()))
+            .stream("Generate", move |request| {
+                record(request);
+                generated()
+            })
+    };
+    let (prefill_chats, prefill_generates) = (Seen::new(), Seen::new());
+    let (decode_chats, decode_generates) = (Seen::new(), Seen::new());
+    let prefill = engine(&prefill_chats, &prefill_generates).start().await;
+    let decode = engine(&decode_chats, &decode_generates).start().await;
+    // Legacy policies, then the reorg bucket path.
+    for reorg in [false, true] {
+        let workers = [
+            (WorkerMode::Prefill, "http://127.0.0.1:1", Some(prefill)),
+            (WorkerMode::Decode, "http://127.0.0.1:2", Some(decode)),
+        ];
+        let mut client = serve_grpc(router_ctx_with(
+            &workers,
+            reorg,
+            Proxy::new(Duration::from_secs(5)).unwrap(),
+        ))
+        .await;
+
+        collect(client.chat_complete(openai(chat(true))).await)
+            .await
+            .unwrap();
+        let (p, d) = (
+            body_of(&prefill_chats.last().await),
+            body_of(&decode_chats.last().await),
+        );
+        assert!(p["bootstrap_room"].is_u64());
+        assert_eq!(p["bootstrap_room"], d["bootstrap_room"]);
+
+        let request = proto::GenerateRequest {
+            input_ids: vec![1, 2, 3],
+            stream: Some(true),
+            ..Default::default()
+        };
+        let replies = collect(client.generate(request).await).await.unwrap();
+        assert_eq!(
+            replies[0].output_ids,
+            [7],
+            "decode's reply reaches the client"
+        );
+        let (p, d) = (
+            prefill_generates.last().await,
+            decode_generates.last().await,
+        );
+        let room = p.disaggregated_params.as_ref().unwrap();
+        assert_eq!(
+            (room.bootstrap_host.as_str(), room.bootstrap_port),
+            ("127.0.0.1", 8998)
+        );
+        assert_eq!(p.disaggregated_params, d.disaggregated_params);
+        assert!(
+            p.rid.is_some() && p.rid == d.rid,
+            "both legs carry the router's rid"
+        );
+    }
+}
+
+#[tokio::test]
+async fn typed_unary_rpc_returns_the_engine_reply() {
+    let embeds = Seen::new();
+    let record = embeds.record();
+    let port = MockEngine::default()
+        .unary("Embed", move |request: proto::EmbedRequest| {
+            record(request);
+            proto::EmbedResponse {
+                embedding: vec![0.5],
+                meta_info: Default::default(),
+            }
+        })
         .start()
         .await;
-    let decode = MockEngine::default()
-        .stream("ChatComplete", openai_rpc(&decode_chats, done))
-        .start()
-        .await;
-    let mut client = serve_grpc(router_ctx(&[
-        (WorkerMode::Prefill, "http://127.0.0.1:1", Some(prefill)),
-        (WorkerMode::Decode, "http://127.0.0.1:2", Some(decode)),
-    ]))
+    let mut client = serve_grpc(router_ctx(&[(
+        WorkerMode::Plain,
+        "http://127.0.0.1:1",
+        Some(port),
+    )]))
     .await;
 
-    collect(client.chat_complete(openai(chat(true))).await)
-        .await
-        .unwrap();
-    let (p, d) = (
-        body_of(&prefill_chats.last().await),
-        body_of(&decode_chats.last().await),
+    let request = proto::EmbedRequest {
+        input_ids: vec![4, 5],
+        ..Default::default()
+    };
+    let mut request = tonic::Request::new(request);
+    let traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    request
+        .metadata_mut()
+        .insert("traceparent", traceparent.parse().unwrap());
+    let reply = client.embed(request).await.unwrap().into_inner();
+    assert_eq!(reply.embedding, [0.5]);
+    let sent = embeds.last().await;
+    assert_eq!(sent.input_ids, [4, 5]);
+    assert!(sent.rid.is_some(), "the router mints an engine rid");
+    assert_eq!(
+        sent.trace_headers["traceparent"], traceparent,
+        "trace context reaches the engine"
     );
-    assert!(p["bootstrap_room"].is_u64());
-    assert_eq!(p["bootstrap_room"], d["bootstrap_room"]);
+}
+
+#[tokio::test]
+async fn text_rpcs_reach_the_engine_as_router_tokens() {
+    let (generates, embeds) = (Seen::new(), Seen::new());
+    let (record_generate, record_embed) = (generates.record(), embeds.record());
+    let port = MockEngine::default()
+        .stream("Generate", move |request: proto::GenerateRequest| {
+            record_generate(request);
+            let reply = proto::GenerateResponse {
+                text: Some("Paris".into()),
+                finished: true,
+                ..Default::default()
+            };
+            stream::iter([Ok(reply)]).boxed()
+        })
+        .unary("Embed", move |request: proto::EmbedRequest| {
+            record_embed(request);
+            proto::EmbedResponse {
+                embedding: vec![0.5],
+                meta_info: Default::default(),
+            }
+        })
+        .start()
+        .await;
+    let mut client = serve_grpc(router_ctx(&[(
+        WorkerMode::Plain,
+        "http://127.0.0.1:1",
+        Some(port),
+    )]))
+    .await;
+
+    let request = proto::TextGenerateRequest {
+        text: "hello world".into(),
+        ..Default::default()
+    };
+    let replies = collect(client.text_generate(request).await).await.unwrap();
+    assert_eq!(replies[0].text, "Paris");
+    let sent = generates.last().await;
+    assert!(!sent.input_ids.is_empty() && sent.return_text == Some(true));
+
+    let request = proto::TextEmbedRequest {
+        text: "hello world".into(),
+        ..Default::default()
+    };
+    let reply = client.text_embed(request).await.unwrap().into_inner();
+    assert_eq!(reply.embedding, [0.5]);
+    assert_eq!(
+        embeds.last().await.input_ids,
+        sent.input_ids,
+        "both tokenize alike"
+    );
 }
 
 #[tokio::test]
@@ -452,7 +613,7 @@ async fn router_stream_failures_keep_their_error_code() {
         .unwrap()
         .with_stream_idle_timeout(Duration::from_millis(100));
     let workers = [(WorkerMode::Plain, "http://127.0.0.1:1", Some(port))];
-    let mut client = serve_grpc(router_ctx_with(&workers, proxy)).await;
+    let mut client = serve_grpc(router_ctx_with(&workers, false, proxy)).await;
 
     for stream in [true, false] {
         let result = collect(client.chat_complete(openai(chat(stream))).await).await;

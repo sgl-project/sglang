@@ -118,7 +118,7 @@ serde_json = "1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1.42", features = ["test-util"] }
-# The hand-rolled mock engine in tests/proxy/grpc_chat.rs.
+# The hand-rolled mock engine in tests/proxy/grpc_routing.rs.
 prost = "0.14"
 tonic-prost = "0.14.6"
 # Low-level msgpack encoder used to hand-construct wire bytes in

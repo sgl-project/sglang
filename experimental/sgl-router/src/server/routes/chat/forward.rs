@@ -9,8 +9,8 @@ use super::preparation::{
 };
 use crate::discovery::WorkerMode;
 use crate::policies::dp_rank::select_dp_rank;
-use crate::proxy::grpc::GrpcResponse;
-use crate::proxy::sse::{self, StreamEnd, StreamEndReason};
+use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
+use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndReason};
 use crate::proxy::Proxy;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -25,6 +25,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures::StreamExt;
+use sglang_grpc_types::sglang::runtime::v1::DisaggregatedParams;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -67,16 +68,30 @@ pub(super) async fn forward_request(
     Ok(response)
 }
 
-/// [`forward_request`] for a gRPC client: the engines are called over gRPC too.
+/// [`forward_request`] for a gRPC client: the engines are called with `rpc`.
 /// The log context is `None` when the request failed before dispatch.
-pub(super) async fn forward_request_grpc(
+pub(super) async fn forward_request_grpc<R: EngineRpc>(
+    rpc: R,
     ctx: &AppContext,
     request: PreparedRequest,
     workers: SelectedWorkers,
     headers: HeaderMap,
     request_started_at: Instant,
-) -> (Result<GrpcResponse, ApiError>, Option<RequestLogContext>) {
-    match dispatch(Grpc, ctx, request, workers, headers, request_started_at).await {
+) -> (
+    Result<GrpcResponse<R::Reply>, ApiError>,
+    Option<RequestLogContext>,
+) {
+    let transport = Grpc(Arc::new(rpc));
+    match dispatch(
+        transport,
+        ctx,
+        request,
+        workers,
+        headers,
+        request_started_at,
+    )
+    .await
+    {
         Ok(dispatched) => (dispatched.result, Some(dispatched.log_context)),
         Err(error) => (Err(error), None),
     }
@@ -154,13 +169,22 @@ async fn dispatch<T: Transport>(
     });
     let path = request.path;
     let engine_rid = request.engine_rid();
+    let additions = Additions {
+        rid: engine_rid.clone(),
+        bootstrap: pd.as_ref().map(|(_, bootstrap)| DisaggregatedParams {
+            bootstrap_host: bootstrap.host.clone(),
+            bootstrap_port: bootstrap.port.map_or(0, i32::from),
+            bootstrap_room: bootstrap.room as i64,
+        }),
+        sampling_defaults: request.sampling_defaults(),
+        routed_dp_rank: None,
+    };
     let body = request.into_outgoing_body(
         ctx,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;
-    let (prefill_headers, prefill_body) =
-        with_dp_rank(dp_aware, headers.clone(), &body, prefill_rank);
+    let prefill_leg = Leg::new(dp_aware, headers.clone(), &body, &additions, prefill_rank);
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
@@ -169,16 +193,15 @@ async fn dispatch<T: Transport>(
 
     // In PD mode, prefill runs independently and decode supplies the client response.
     let stream_abort = CancellationToken::new();
-    let (response_worker, response_headers, response_body, response_load_guards, prefill_task) =
+    let (response_worker, response_leg, response_load_guards, prefill_task) =
         if let Some((decode, bootstrap)) = pd {
             let task = spawn_prefill_request(
-                transport,
+                transport.clone(),
                 ctx,
                 &metrics,
                 Arc::clone(&prefill),
                 path,
-                prefill_headers,
-                prefill_body,
+                prefill_leg,
                 prefill_load_guards,
                 bootstrap.room,
                 stream_abort.clone(),
@@ -189,22 +212,15 @@ async fn dispatch<T: Transport>(
                     .register(decode.id.clone(), decode.url.clone(), 0, 1),
                 decode_rank.map(|rank| decode.dp_rank_guard(rank)),
             );
-            let (decode_headers, decode_body) = with_dp_rank(dp_aware, headers, &body, decode_rank);
+            let decode_leg = Leg::new(dp_aware, headers, &body, &additions, decode_rank);
             (
                 decode,
-                decode_headers,
-                decode_body,
+                decode_leg,
                 decode_load_guards,
                 Some((task, prefill)),
             )
         } else {
-            (
-                prefill,
-                prefill_headers,
-                prefill_body,
-                prefill_load_guards,
-                None,
-            )
+            (prefill, prefill_leg, prefill_load_guards, None)
         };
 
     // In PD mode, prefill can finish before decode. Watch the registration
@@ -214,8 +230,7 @@ async fn dispatch<T: Transport>(
         ctx,
         &response_worker,
         path,
-        &response_headers,
-        response_body,
+        response_leg,
         engine_rid.as_deref(),
         response_load_guards,
         &metrics,
@@ -247,7 +262,7 @@ async fn dispatch<T: Transport>(
 }
 
 /// How the selected workers are reached: HTTP clients over HTTP, gRPC clients over gRPC.
-trait Transport: Copy + Send + 'static {
+trait Transport: Clone + Send + Sync + 'static {
     type Response: Send + 'static;
 
     fn status(response: &Self::Response) -> u16;
@@ -259,8 +274,7 @@ trait Transport: Copy + Send + 'static {
         ctx: &AppContext,
         worker: &Worker,
         path: &'static str,
-        headers: &HeaderMap,
-        body: Bytes,
+        leg: Leg,
         engine_rid: Option<&str>,
         load_guards: LoadGuards,
         metrics: &DispatchMetrics,
@@ -274,9 +288,37 @@ trait Transport: Copy + Send + 'static {
         proxy: Arc<Proxy>,
         worker: Arc<Worker>,
         path: &'static str,
-        headers: HeaderMap,
-        body: Bytes,
+        leg: Leg,
     ) -> impl Future<Output = PrefillFailure<Self::Response>> + Send;
+}
+
+/// One worker's request: the HTTP body, and the same additions as typed fields.
+struct Leg {
+    headers: HeaderMap,
+    body: Bytes,
+    additions: Additions,
+}
+
+impl Leg {
+    fn new(
+        dp_aware: bool,
+        headers: HeaderMap,
+        body: &Bytes,
+        additions: &Additions,
+        rank: Option<u32>,
+    ) -> Self {
+        let (headers, body) = with_dp_rank(dp_aware, headers, body, rank);
+        let routed_dp_rank = dp_aware.then_some(rank);
+        let additions = Additions {
+            routed_dp_rank,
+            ..additions.clone()
+        };
+        Self {
+            headers,
+            body,
+            additions,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -290,31 +332,31 @@ impl Transport for Http {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn send(
+    async fn send(
         self,
         ctx: &AppContext,
         worker: &Worker,
         path: &'static str,
-        headers: &HeaderMap,
-        body: Bytes,
+        leg: Leg,
         engine_rid: Option<&str>,
         load_guards: LoadGuards,
         metrics: &DispatchMetrics,
         expiration: CancellationToken,
         stream_abort: CancellationToken,
-    ) -> impl Future<Output = Result<Response<Body>, ApiError>> + Send {
+    ) -> Result<Response<Body>, ApiError> {
         forward_to_response_worker(
             ctx,
             worker,
             path,
-            headers,
-            body,
+            &leg.headers,
+            leg.body,
             engine_rid,
             load_guards,
             metrics,
             expiration,
             stream_abort,
         )
+        .await
     }
 
     async fn prefill(
@@ -322,8 +364,7 @@ impl Transport for Http {
         proxy: Arc<Proxy>,
         worker: Arc<Worker>,
         path: &'static str,
-        headers: HeaderMap,
-        body: Bytes,
+        leg: Leg,
     ) -> PrefillFailure {
         let result = proxy
             .forward_json_to(
@@ -331,8 +372,8 @@ impl Transport for Http {
                 worker.protocol(),
                 &worker.breaker,
                 path,
-                &headers,
-                body,
+                &leg.headers,
+                leg.body,
                 None,
             )
             .await;
@@ -340,14 +381,19 @@ impl Transport for Http {
     }
 }
 
-/// Reaches engines through their native `ChatComplete`, the only RPC routed so far.
-#[derive(Clone, Copy)]
-struct Grpc;
+/// Reaches engines through the native RPC the client called.
+struct Grpc<R>(Arc<R>);
 
-impl Transport for Grpc {
-    type Response = GrpcResponse;
+impl<R> Clone for Grpc<R> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
 
-    fn status(response: &GrpcResponse) -> u16 {
+impl<R: EngineRpc> Transport for Grpc<R> {
+    type Response = GrpcResponse<R::Reply>;
+
+    fn status(response: &Self::Response) -> u16 {
         response.status.as_u16()
     }
 
@@ -356,14 +402,13 @@ impl Transport for Grpc {
         ctx: &AppContext,
         worker: &Worker,
         _path: &'static str,
-        headers: &HeaderMap,
-        body: Bytes,
+        leg: Leg,
         engine_rid: Option<&str>,
         load_guards: LoadGuards,
         metrics: &DispatchMetrics,
         expiration: CancellationToken,
         stream_abort: CancellationToken,
-    ) -> Result<GrpcResponse, ApiError> {
+    ) -> Result<Self::Response, ApiError> {
         let (guards, on_first_byte, on_stream_end): (Box<dyn Send + 'static>, _, _) =
             if metrics.streaming {
                 (
@@ -375,10 +420,12 @@ impl Transport for Grpc {
                 (Box::new(load_guards), None, None)
             };
         ctx.proxy
-            .chat_complete_grpc(
+            .forward_grpc(
                 worker,
-                headers,
-                body,
+                &*self.0,
+                &leg.headers,
+                leg.body,
+                &leg.additions,
                 engine_rid,
                 metrics.streaming,
                 Some(guards),
@@ -395,21 +442,23 @@ impl Transport for Grpc {
         proxy: Arc<Proxy>,
         worker: Arc<Worker>,
         _path: &'static str,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> PrefillFailure<GrpcResponse> {
+        leg: Leg,
+    ) -> PrefillFailure<Self::Response> {
+        let (headers, body, additions) = (&leg.headers, leg.body, &leg.additions);
         let result = proxy
-            .chat_complete_grpc(
-                &worker, &headers, body, None, false, None, None, None, None, None,
+            .forward_grpc(
+                &worker, &*self.0, headers, body, additions, None, false, None, None, None, None,
+                None,
             )
             .await;
         let status = match result {
             Ok(response) if response.status.is_success() => {
-                let chunks: Vec<_> = response.chunks.collect().await;
-                let clean = chunks.iter().all(|chunk| {
-                    chunk
+                let replies: Vec<_> = response.replies.collect().await;
+                let mut scanner = ErrorEventScanner::default();
+                let clean = replies.iter().all(|reply| {
+                    reply
                         .as_ref()
-                        .is_ok_and(|chunk| !sse::is_error_payload(&chunk.json_chunk))
+                        .is_ok_and(|reply| !reply.is_error_event(&mut scanner))
                 });
                 if clean {
                     return None;
@@ -507,8 +556,7 @@ fn spawn_prefill_request<T: Transport>(
     metrics: &DispatchMetrics,
     prefill_worker: Arc<Worker>,
     path: &'static str,
-    headers: HeaderMap,
-    body: Bytes,
+    leg: Leg,
     load_guards: LoadGuards,
     bootstrap_room: u64,
     stream_abort: CancellationToken,
@@ -518,7 +566,7 @@ fn spawn_prefill_request<T: Transport>(
     tokio::spawn(async move {
         let _load_guards = load_guards;
         let failure = transport
-            .prefill(proxy, Arc::clone(&prefill_worker), path, headers, body)
+            .prefill(proxy, Arc::clone(&prefill_worker), path, leg)
             .await;
         let prefill_url = &prefill_worker.url;
         let outcome = failure
