@@ -332,6 +332,91 @@ class TestNpuMlaDcpRead(unittest.TestCase):
 
 
 class TestNpuDcpMetadata(unittest.TestCase):
+    def test_dense_graph_buffers_cover_each_rank_local_capacity(self):
+        from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
+            init_mla_dcp_graph_state,
+        )
+
+        for size in (2, 4):
+            for rank in range(size):
+                for context_len in (0, 1, 7, 128):
+                    for window in (None, 3):
+                        with (
+                            self.subTest(
+                                size=size, rank=rank, context=context_len, window=window
+                            ),
+                            rc.get_parallel().override(dcp_size=size, dcp_rank=rank),
+                        ):
+                            total = context_len + (window or 0)
+                            local_len = len(range(rank, total, size))
+                            pages = max(1, (local_len + 3) // 4)
+                            buffers = init_mla_dcp_graph_state(
+                                2, total, 4, window, "cpu"
+                            )
+                            self.assertEqual(buffers["block_tables"].shape, (2, pages))
+                            self.assertEqual(buffers["dcp_seq_lens"].tolist(), [0, 0])
+                            if window is None:
+                                self.assertNotIn("dcp_mtp_attn_mask", buffers)
+                            else:
+                                mask = buffers["dcp_mtp_attn_mask"]
+                                self.assertEqual(mask.shape, (2, window, pages * 4))
+                                self.assertTrue(mask.all())
+
+    def test_local_block_table_call_matches_shared_kernel_signature(self):
+        from sglang.srt.hardware_backend.npu.attention import dcp_metadata
+
+        # Validate the real JIT function signature without launching a device
+        # kernel; a plain MagicMock would silently accept stale arguments.
+        signature = inspect.signature(dcp_metadata.create_mla_kv_page_table_for_dcp.fn)
+        launch = MagicMock(
+            side_effect=lambda *args, **kwargs: signature.bind(*args, **kwargs)
+        )
+        kernel = MagicMock()
+        kernel.__getitem__.return_value = launch
+        with patch.object(dcp_metadata, "create_mla_kv_page_table_for_dcp", kernel):
+            for rank in (0, 1):
+                for num_pages in (None, 2):
+                    with self.subTest(rank=rank, num_pages=num_pages):
+                        dcp_metadata.build_mla_dcp_local_block_tables(
+                            torch.arange(32).reshape(2, 16),
+                            torch.tensor([0, 1]),
+                            torch.tensor([5, 9]),
+                            4,
+                            2,
+                            rank,
+                            num_pages=num_pages,
+                        )
+        self.assertEqual(launch.call_count, 4)
+
+    def test_dcp_dispatch_reads_live_context_and_preserves_worker_roles(self):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        for use_mla in (False, True):
+            for use_dsa in (False, True):
+                for draft in (False, True):
+                    backend.use_mla = use_mla
+                    backend.use_dsa = use_dsa
+                    backend.is_draft_worker = draft
+                    # Reuse one backend while toggling the runtime context:
+                    # the decision must not be cached at initialization.
+                    for enabled in (False, True, False):
+                        with (
+                            self.subTest(
+                                mla=use_mla, dsa=use_dsa, draft=draft, dcp=enabled
+                            ),
+                            rc.get_parallel().override(dcp_enabled=enabled),
+                        ):
+                            dense = use_mla and not use_dsa and enabled
+                            self.assertEqual(
+                                backend._use_dense_mla_dcp(), dense and not draft
+                            )
+                            self.assertEqual(
+                                backend._use_dense_mla_dcp(target_only=False), dense
+                            )
+                            self.assertEqual(
+                                backend._use_dsa_dcp(),
+                                use_dsa and enabled and not draft,
+                            )
+
     def test_dcp_graph_keeps_v1_update_when_draft_uses_v2(self):
         path = (
             Path(inspect.getsourcefile(AscendAttnBackend)).parents[1]
@@ -563,6 +648,7 @@ class TestForwardMetadata(unittest.TestCase):
 
     def test_dspark_target_verify_builds_local_dcp_metadata(self):
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.speculative_step_id = 0
         backend.use_dsa = False
         backend.use_mla = True
         backend.is_draft_worker = False
@@ -596,7 +682,7 @@ class TestForwardMetadata(unittest.TestCase):
         with (
             rc.get_parallel().override(dcp_enabled=True, dcp_size=2, dcp_rank=1),
             patch(
-                "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+                "sglang.srt.hardware_backend.npu.attention.dcp_metadata."
                 "build_mla_dcp_local_block_tables",
                 return_value=(
                     torch.tensor([[7]], dtype=torch.int32),
@@ -759,6 +845,7 @@ class TestForwardMetadata(unittest.TestCase):
 
     def test_dspark_graph_metadata_is_fixed_shape_and_rank_local(self):
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.speculative_step_id = 0
         backend.use_dsa = False
         backend.use_mla = True
         backend.is_draft_worker = False
@@ -778,7 +865,7 @@ class TestForwardMetadata(unittest.TestCase):
         with (
             rc.get_parallel().override(dcp_enabled=True, dcp_size=2, dcp_rank=1),
             patch(
-                "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+                "sglang.srt.hardware_backend.npu.attention.dcp_metadata."
                 "build_mla_dcp_local_block_tables",
                 return_value=(
                     torch.tensor([[7], [0]], dtype=torch.int32),
