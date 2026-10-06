@@ -214,6 +214,8 @@ Run either server command **inside that image**, with four B200 GPUs visible. Pl
 <Accordion title="TP4 / EP4 server (concurrency 1)">
 
 ```bash Command
+PYTHONNOUSERSITE=1 \
+PYTHONUNBUFFERED=1 \
 SGLANG_DEFAULT_THINKING=1 \
 SGLANG_DSV41_REASONING_EFFORT=high \
 SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
@@ -235,6 +237,7 @@ sglang serve \
     --cuda-graph-max-bs-decode 64 \
     --reasoning-parser auto --tool-call-parser auto \
     --watchdog-timeout 3600 \
+    --enable-metrics \
     --host 0.0.0.0 --port 30000
 ```
 
@@ -256,6 +259,8 @@ At concurrency 48 and 128, the same four GPUs instead use TP4 / EP4 / DP4 with D
 <Accordion title="TP4 / EP4 / DP4 server (concurrency 48)">
 
 ```bash Command
+PYTHONNOUSERSITE=1 \
+PYTHONUNBUFFERED=1 \
 SGLANG_DEFAULT_THINKING=1 \
 SGLANG_DSV41_REASONING_EFFORT=high \
 SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
@@ -281,6 +286,7 @@ sglang serve \
     --cuda-graph-max-bs-decode 64 \
     --reasoning-parser auto --tool-call-parser auto \
     --watchdog-timeout 3600 \
+    --enable-metrics \
     --host 0.0.0.0 --port 30000
 ```
 
