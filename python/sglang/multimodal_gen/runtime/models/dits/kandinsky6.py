@@ -339,30 +339,22 @@ class Kandinsky6Attention(nn.Module):
         tp_size = get_tp_world_size()
         self.local_num_heads = divide(self.num_heads, tp_size)
 
-        self.to_query = ColumnParallelLinear(
-            num_channels,
-            num_channels,
-            bias=True,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_query", prefix),
-        )
-        self.to_key = ColumnParallelLinear(
-            kv_dim,
-            num_channels,
-            bias=True,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_key", prefix),
-        )
-        self.to_value = ColumnParallelLinear(
-            kv_dim,
-            num_channels,
-            bias=True,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_value", prefix),
-        )
+        for name, width in (
+            ("to_query", num_channels),
+            ("to_key", kv_dim),
+            ("to_value", kv_dim),
+        ):
+            self.add_module(
+                name,
+                ColumnParallelLinear(
+                    width,
+                    num_channels,
+                    bias=True,
+                    gather_output=False,
+                    quant_config=quant_config,
+                    prefix=add_prefix(name, prefix),
+                ),
+            )
         self.query_norm = Kandinsky6QKNorm(head_dim)
         self.key_norm = Kandinsky6QKNorm(head_dim)
         self.out_layer = RowParallelLinear(
@@ -432,48 +424,20 @@ class Kandinsky6Attention(nn.Module):
             key = gather_seq(key, context_seq_len)
             value = gather_seq(value, context_seq_len)
 
-        try:
-            hidden_states = self.attention(
-                query,
-                key,
-                value,
-                attn_mask_meta=attn_mask_meta,
-                skip_sequence_parallel_override=skip_sequence_parallel,
-            )
-        except AssertionError as exc:
-            # standalone single-rank parity uses SDPA without a pipeline forward context
-            if "Forward context is not set" not in str(exc):
-                raise
-
-            query_shape = query.shape[:-2]
-            key_shape = key.shape[:-2]
-            query = query.reshape(
-                query_shape[0], -1, self.local_num_heads, query.shape[-1]
-            ).transpose(1, 2)
-            key = key.reshape(
-                key_shape[0], -1, self.local_num_heads, key.shape[-1]
-            ).transpose(1, 2)
-            value = value.reshape(
-                key_shape[0], -1, self.local_num_heads, value.shape[-1]
-            ).transpose(1, 2)
-            hidden_states = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=None,
-                is_causal=False,
-            )
-            hidden_states = hidden_states.transpose(1, 2).reshape(
-                *query_shape, self.local_num_heads, -1
-            )
-
+        hidden_states = self.attention(
+            query,
+            key,
+            value,
+            attn_mask_meta=attn_mask_meta,
+            skip_sequence_parallel_override=skip_sequence_parallel,
+        )
         hidden_states = hidden_states.flatten(-2, -1)
         hidden_states, _ = self.out_layer(hidden_states)
         return hidden_states
 
 
-class _Kandinsky6MLP(nn.Module):
-    """Bias-free TP MLP with checkpoint-mapped fc_in/fc_out names.
+class Kandinsky6FeedForward(nn.Module):
+    """Bias-free TP MLP with checkpoint-mapped mlp.fc_in/fc_out names.
 
     The shared MLP currently hardcodes bias=True, so it cannot be used here."""
 
@@ -485,7 +449,9 @@ class _Kandinsky6MLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
-        self.fc_in = ColumnParallelLinear(
+        prefix = add_prefix("mlp", prefix)
+        self.mlp = nn.Module()
+        self.mlp.fc_in = ColumnParallelLinear(
             dim,
             ff_dim,
             bias=False,
@@ -493,8 +459,8 @@ class _Kandinsky6MLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("fc_in", prefix),
         )
-        self.act = get_act_fn("gelu")
-        self.fc_out = RowParallelLinear(
+        self.mlp.act = get_act_fn("gelu")
+        self.mlp.fc_out = RowParallelLinear(
             ff_dim,
             dim,
             bias=False,
@@ -504,27 +470,10 @@ class _Kandinsky6MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, _ = self.fc_in(x)
-        x = self.act(x)
-        x, _ = self.fc_out(x)
+        x, _ = self.mlp.fc_in(x)
+        x = self.mlp.act(x)
+        x, _ = self.mlp.fc_out(x)
         return x
-
-
-class Kandinsky6FeedForward(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        ff_dim: int,
-        prefix: str = "",
-        quant_config: QuantizationConfig | None = None,
-    ):
-        super().__init__()
-        self.mlp = _Kandinsky6MLP(
-            dim, ff_dim, prefix=add_prefix("mlp", prefix), quant_config=quant_config
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(x)
 
 
 def _norm_scale_shift(
@@ -737,12 +686,6 @@ class Kandinsky6TransformerDecoderBlock(Kandinsky6TransformerBlock):
         return visual_embed
 
 
-def _apply_gate_sum(
-    x: torch.Tensor, out: torch.Tensor, gate: torch.Tensor
-) -> torch.Tensor:
-    return residual_gate_fp32(x, out, gate)
-
-
 def _apply_scale_shift(
     norm: nn.LayerNorm, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
 ) -> torch.Tensor:
@@ -844,7 +787,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             self.videoT.visual_modulation(t_v).unsqueeze(dim=1), 3, dim=-1
         )
         shift, scale, gate = torch.chunk(sa_p, 3, dim=-1)
-        vis = _apply_gate_sum(
+        vis = residual_gate_fp32(
             vis,
             self.videoT.self_attention(
                 _norm_scale_shift(self.videoT.self_attention_norm, vis, shift, scale),
@@ -865,7 +808,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             self.audioT.visual_modulation(t_a).unsqueeze(dim=1), 3, dim=-1
         )
         shift, scale, gate = torch.chunk(sa_p, 3, dim=-1)
-        aud = _apply_gate_sum(
+        aud = residual_gate_fp32(
             aud,
             self.audioT.self_attention(
                 _norm_scale_shift(self.audioT.self_attention_norm, aud, shift, scale),
@@ -881,7 +824,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
         aud_out_t = self.audioT.cross_attention(
             aud_pre_ca, encoder_hidden_states=text_a
         )
-        aud = _apply_gate_sum(aud, aud_out_t, gate_a)
+        aud = residual_gate_fp32(aud, aud_out_t, gate_a)
 
         t_va_mod = t_a if not self.fix_modulation else t_v
         t_av_mod = t_v if not self.fix_modulation else t_a
@@ -898,7 +841,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             va_shift, va_scale, va_gate = torch.chunk(va_params, 3, dim=-1)
             av_shift, av_scale, av_gate = torch.chunk(av_params, 3, dim=-1)
 
-        vis = _apply_gate_sum(vis, vis_out_t, gate_v)
+        vis = residual_gate_fp32(vis, vis_out_t, gate_v)
         vis_for_va = _apply_scale_shift(self.va_normalization, vis, va_scale, va_shift)
         aud_for_av = _apply_scale_shift(self.av_normalization, aud, av_scale, av_shift)
         rq_v = vis_rope if self.ca_rope else None
@@ -916,19 +859,19 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             rotary_emb_kv=rq_v,
             context_seq_len=video_seq_len,
         )
-        vis = _apply_gate_sum(
+        vis = residual_gate_fp32(
             vis,
             vis_from_aud,
             (va_gate if not self.cross_gates else av_gate) * va_gate_scale,
         )
-        aud = _apply_gate_sum(
+        aud = residual_gate_fp32(
             aud,
             aud_from_vis,
             (av_gate if not self.cross_gates else va_gate) * av_gate_scale,
         )
 
         shift, scale, gate = torch.chunk(ff_p, 3, dim=-1)
-        vis = _apply_gate_sum(
+        vis = residual_gate_fp32(
             vis,
             self.videoT.feed_forward(
                 _norm_scale_shift(self.videoT.feed_forward_norm, vis, shift, scale)
@@ -936,7 +879,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             gate,
         )
         shift, scale, gate = torch.chunk(ff_p_a, 3, dim=-1)
-        aud = _apply_gate_sum(
+        aud = residual_gate_fp32(
             aud,
             self.audioT.feed_forward(
                 _norm_scale_shift(self.audioT.feed_forward_norm, aud, shift, scale)

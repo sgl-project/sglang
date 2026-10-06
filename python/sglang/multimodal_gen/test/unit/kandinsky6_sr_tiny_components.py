@@ -22,6 +22,7 @@ from sglang.multimodal_gen.configs.sample.kandinsky6_sr import (
     Kandinsky6SRSamplingParams,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.kandinsky6_sr import (
     Kandinsky6SRTransformer3DModel,
 )
@@ -259,7 +260,15 @@ def super_resolve(
         spatial_factor=spatial_factor,
     )
     denoised = denoise_chunks(
-        chunks, dit, scheduler, dit_spec=dit_spec, spec=spec, device=device
+        chunks,
+        dit,
+        scheduler,
+        dit_spec=dit_spec,
+        spec=spec,
+        device=device,
+        step_context=lambda step: set_forward_context(
+            current_timestep=step, attn_metadata=None
+        ),
     )
     tiles = decode_chunks(denoised, vae, scaling_factor=scaling_factor, device=device)
     return stitch_tiles(tiles, plan)

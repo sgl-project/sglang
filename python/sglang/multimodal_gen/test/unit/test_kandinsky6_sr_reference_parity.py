@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
     hf_to_custom_state_dict,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.kandinsky6_sr import (
     Kandinsky6SRTransformer3DModel,
 )
@@ -278,13 +279,14 @@ def _port_forward(model, x, time, *, scale_factor, motion_score=None):
         torch.arange(height // model.patch_size[1]),
         torch.arange(width // model.patch_size[2]),
     ]
-    return model(
-        x,
-        time,
-        rope_pos,
-        scale_factor=scale_factor,
-        motion_score=motion_score,
-    )
+    with set_forward_context(current_timestep=0, attn_metadata=None):
+        return model(
+            x,
+            time,
+            rope_pos,
+            scale_factor=scale_factor,
+            motion_score=motion_score,
+        )
 
 
 def _random_latent(
@@ -403,6 +405,9 @@ def _port_sample(model, x, scale, scheduler, steps, capped=False):
         dit_spec=build_dit_spec(model),
         spec=spec,
         device=x.device,
+        step_context=lambda step: set_forward_context(
+            current_timestep=step, attn_metadata=None
+        ),
     )[0]
 
 

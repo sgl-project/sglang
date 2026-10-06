@@ -28,12 +28,16 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
     extract_source_audio,
     to_output_video,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.video_utils import (
-    clip_to_aligned_frames,
-)
 
 FRAME_COUNTS = [1, 2, 9, 24, 50, 121, 125, 200, 301, 302, 400, 1000]
 SOURCE_FPS = [12, 23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60, 120]
+
+
+def clip_to_aligned_frames(video):
+    video = video[:121]
+    if not len(video):
+        raise ValueError("empty video")
+    return video[: 1 + 8 * ((len(video) - 1) // 8)]
 
 
 def _reference_resample(video, fps):

@@ -56,7 +56,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiling import (
     VAE_SPATIAL_FACTOR,
-    crop_to_hw,
     pad_to_spatial_factor,
     pre_upscale_video,
     resolve_scale_request,
@@ -66,11 +65,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
     DecodedClip,
     decode_clip,
     extract_source_audio,
+    resize_to_target,
     synthetic_clip,
     to_output_video,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.video_utils import (
-    resize_to_target,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -442,10 +439,11 @@ class Kandinsky6SROutputStage(PipelineStage):
         requested_hw = batch.extra.pop(SR_REQUESTED_HW_KEY, None)
         if requested_hw is not None:
             requested_h, requested_w = requested_hw
-            video = crop_to_hw(
-                video,
-                (requested_h * plan.tiling_scale, requested_w * plan.tiling_scale),
-            )
+            video = video[
+                ...,
+                : requested_h * plan.tiling_scale,
+                : requested_w * plan.tiling_scale,
+            ]
 
         target_hw = resolve_target_hw(
             batch.sr_target_resolution,

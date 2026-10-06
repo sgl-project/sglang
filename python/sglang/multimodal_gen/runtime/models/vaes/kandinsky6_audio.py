@@ -48,15 +48,7 @@ class Kandinsky6AudioVAE(nn.Module, LayerwiseOffloadableModuleMixin):
         # audio latent stride; frame-count alignment is owned by the pipeline config
         self.downsample_factor = 1024
 
-        self.mel_converter = MelConverter(
-            sampling_rate=44100,
-            n_fft=2048,
-            num_mels=128,
-            hop_size=512,
-            win_size=2048,
-            fmin=0,
-            fmax=22050,
-        )
+        self.mel_converter = MelConverter()
         # checkpoint weights include the encoder regardless of need_vae_encoder
         self.vae = MMAudioVAE(mode=arch.mode, need_encoder=True)
         # normalize random initialization before loading; checkpoint weights are

@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import msgspec
 import torch
+from torch.nn import functional as F
 
 from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.latents import (
@@ -29,7 +30,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
     extract_all_tiles,
     latent_tile_grid_from_pixel_grid,
     stitch_tiles_hanning,
-    upsample_tiles_to_base,
 )
 
 LatentUpscaleFn = Callable[[torch.Tensor], torch.Tensor]
@@ -140,33 +140,6 @@ def encode_pixel_tile(
     return latent.squeeze(0).permute(1, 2, 3, 0).float() * scaling_factor
 
 
-def build_chunk_latent(
-    lq_tiles: Sequence[torch.Tensor],
-    *,
-    seed: int,
-    dit_spec: DitSpec,
-    spec: SamplingSpec,
-    device: torch.device,
-) -> torch.Tensor:
-    """Initial noisy latent ``[B, T', H', W', C]`` of one chunk of scaled LQ tiles."""
-    lq = torch.cat(list(lq_tiles), dim=0)
-    batch = len(lq_tiles)
-    x = build_initial_latent(
-        instruct_type=dit_spec.instruct_type,
-        visual_cond=dit_spec.visual_cond,
-        in_visual_dim=dit_spec.in_visual_dim,
-        lq_latent=lq,
-        device=device,
-        seed=seed,
-        lq_noise_scale=spec.lq_noise_scale,
-        lq_noise_type=spec.lq_noise_type,
-        lq_channel_noise_scale=spec.lq_channel_noise_scale,
-        # conditioning noise must round in the loaded DiT dtype
-        dtype=dit_spec.dtype,
-    )
-    return x.reshape(batch, -1, *x.shape[1:])
-
-
 @torch.no_grad()
 def prepare_tile_latents(
     source: torch.Tensor,
@@ -190,15 +163,32 @@ def prepare_tile_latents(
     for start, stop in chunk_ranges(len(tiles), spec.tiles_batch_size):
         inputs = tiles[start:stop]
         if not latent_path:
-            inputs = upsample_tiles_to_base(inputs, *plan.base_hw)
+            inputs = [
+                F.interpolate(
+                    tile.float(),
+                    size=plan.base_hw,
+                    mode="bilinear",
+                    align_corners=False,
+                ).permute(0, 2, 3, 1)
+                for tile in inputs
+            ]
         lq_tiles = [tile_encoder(tile) for tile in inputs]
-        chunk = build_chunk_latent(
-            lq_tiles,
-            seed=spec.seed + start,
-            dit_spec=dit_spec,
-            spec=spec,
+        lq = torch.cat(lq_tiles, dim=0)
+        x = build_initial_latent(
+            instruct_type=dit_spec.instruct_type,
+            visual_cond=dit_spec.visual_cond,
+            in_visual_dim=dit_spec.in_visual_dim,
+            lq_latent=lq,
             device=device,
+            seed=spec.seed + start,
+            lq_noise_scale=spec.lq_noise_scale,
+            lq_noise_type=spec.lq_noise_type,
+            lq_channel_noise_scale=spec.lq_channel_noise_scale,
+            # conditioning noise must round in the loaded DiT dtype
+            dtype=dit_spec.dtype,
         )
+        chunk = x.reshape(len(lq_tiles), -1, *x.shape[1:])
+        del lq, x
         chunks.append(chunk.cpu())
     return chunks
 
