@@ -23,6 +23,16 @@ import torch
 import triton
 import triton.language as tl
 
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    _support_tensor_descriptor = True
+except ImportError:
+    # Older Triton has no descriptor API; keep the name bound so the annotation
+    # below still resolves, and leave every tile on the pointer path.
+    TensorDescriptor = None
+    _support_tensor_descriptor = False
+
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
 from sglang.kernels.ops.attention.prefill_attention import context_attention_fwd
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
@@ -32,6 +42,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
+    is_xpu,
 )
 
 _is_cuda = is_cuda()
@@ -39,6 +50,7 @@ if _is_cuda:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
 
@@ -49,6 +61,63 @@ try:
 except (AttributeError, ValueError):
     _triton_version_parts = (0, 0)
 _is_triton_ge_37 = _triton_version_parts >= (3, 7)
+
+
+# Triton raises if a kernel requests global scratch with no allocator set; only
+# device-side ``tl.make_tensor_descriptor`` does, but set one in case that changes.
+_SCRATCH_ALLOCATOR_SET = False
+
+
+def _set_triton_scratch_allocator(device: str):
+    global _SCRATCH_ALLOCATOR_SET
+    if _SCRATCH_ALLOCATOR_SET:
+        return
+
+    def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+        return torch.empty(size, device=device, dtype=torch.int8)
+
+    triton.set_allocator(alloc_fn)
+    _SCRATCH_ALLOCATOR_SET = True
+
+
+# ``TensorDescriptor`` asserts (rather than reports) 16-byte alignment of the
+# base pointer and of every non-innermost stride, so the gate below checks them.
+_DESC_ALIGN_BYTES = 16
+
+
+def _descriptor_fits(*, tensor: torch.Tensor, head_dim: int, tile_width: int) -> bool:
+    """Whether ``tensor`` can back the per-head tile descriptor built below."""
+    # The fp8 prefill paths cast before this point, so that pairing is unvalidated.
+    if tensor.element_size() != 2:
+        return False
+    # A narrower tile would silently drop the tail of the head. A wider one reads
+    # past the declared shape, which the descriptor zero-pads, so it is fine.
+    if tile_width < head_dim:
+        return False
+    if tensor.stride(-1) != 1:
+        return False
+    if tensor.data_ptr() % _DESC_ALIGN_BYTES != 0:
+        return False
+    return all(
+        (stride * tensor.element_size()) % _DESC_ALIGN_BYTES == 0
+        for stride in tensor.stride()[:-1]
+    )
+
+
+def _tile_descriptor(
+    tensor: torch.Tensor, *, block_rows: int, block_width: int
+) -> TensorDescriptor:
+    """Describe one head's tile of a ``(token, head, head_dim)`` tensor."""
+    return TensorDescriptor(
+        tensor, tensor.shape, tensor.stride(), [block_rows, 1, block_width]
+    )
+
+
+@triton.jit
+def _load_tile(desc, row_off, head_idx, col_off: tl.constexpr):
+    """Load one head's tile, dropping the unit head axis the descriptor returns."""
+    tile = desc.load([row_off, head_idx, col_off])
+    return tl.reshape(tile, (tile.shape[0], tile.shape[2]))
 
 
 def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
@@ -395,6 +464,13 @@ def _fwd_kernel(
     aux0_stride_t=0,
     aux0_stride_h=0,
     aux0_len=0,
+    # ``None`` keeps that tile on the tensor-of-pointer path; tiles are gated
+    # independently, so a mix is normal. ``*pe`` are set only when BLOCK_DPE > 0.
+    Q_desc=None,
+    Qpe_desc=None,
+    K_desc=None,
+    Kpe_desc=None,
+    V_desc=None,
 ):
     if USE_COMPACT_TILE_GRID:
         output_tile = tl.program_id(0)
@@ -462,25 +538,37 @@ def _fwd_kernel(
             1.0,
         )
 
-    offs_q = (
-        (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
-        * stride_qbs
-        + cur_head * stride_qh
-        + offs_d[None, :]
-    )
-    q = tl.load(
-        Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
-    )
-
-    if BLOCK_DPE > 0:
-        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
-        offs_qpe = (
+    if Q_desc is not None:
+        # Descriptor load offsets must be 32-bit; indptr-derived indices are
+        # int64, so cast here (the values fit comfortably in int32).
+        q_row_off = (cur_seq_extend_start_idx + cur_block_m * BLOCK_M).to(tl.int32)
+        q = _load_tile(Q_desc, q_row_off, cur_head, 0)
+    else:
+        offs_q = (
             (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
             * stride_qbs
             + cur_head * stride_qh
-            + offs_dpe[None, :]
+            + offs_d[None, :]
         )
-        qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
+        q = tl.load(
+            Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
+        )
+
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        if Qpe_desc is not None:
+            qpe_row_off = (cur_seq_extend_start_idx + cur_block_m * BLOCK_M).to(
+                tl.int32
+            )
+            qpe = _load_tile(Qpe_desc, qpe_row_off, cur_head, BLOCK_DMODEL)
+        else:
+            offs_qpe = (
+                (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
+                * stride_qbs
+                + cur_head * stride_qh
+                + offs_dpe[None, :]
+            )
+            qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
 
     # stage 1: compute scores with prefix
     offs_n = tl.arange(0, BLOCK_N)
@@ -714,28 +802,50 @@ def _fwd_kernel(
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
-            # load k in transposed way
-            offs_k = (
-                (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
-                + cur_kv_head * stride_kh
-                + offs_d[:, None]
-            )
-            k = tl.load(
-                K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
-            )
+            if K_desc is not None:
+                # Load row-major and transpose: the backend folds that into a
+                # column-major block load, while a descriptor with a last stride
+                # != 1 would leave the fast path altogether.
+                k = _load_tile(
+                    K_desc,
+                    (cur_seq_extend_start_idx + start_n).to(tl.int32),
+                    cur_kv_head,
+                    0,
+                ).T
+            else:
+                # load k in transposed way
+                offs_k = (
+                    (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
+                    + cur_kv_head * stride_kh
+                    + offs_d[:, None]
+                )
+                k = tl.load(
+                    K_Extend + offs_k,
+                    mask=(mask_n[None, :]) & (mask_d[:, None]),
+                    other=0.0,
+                )
 
             qk = tl.dot(q, k, out_dtype=tl.float32)
             if BLOCK_DPE > 0:
-                offs_kpe = (
-                    (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
-                    + cur_kv_head * stride_kh
-                    + offs_dpe[:, None]
-                )
-                kpe = tl.load(
-                    K_Extend + offs_kpe,
-                    mask=mask_n[None, :],
-                    other=0.0,
-                )
+                if Kpe_desc is not None:
+                    kpe = _load_tile(
+                        Kpe_desc,
+                        (cur_seq_extend_start_idx + start_n).to(tl.int32),
+                        cur_kv_head,
+                        BLOCK_DMODEL,
+                    ).T
+                else:
+                    offs_kpe = (
+                        (cur_seq_extend_start_idx + start_n + offs_n[None, :])
+                        * stride_kbs
+                        + cur_kv_head * stride_kh
+                        + offs_dpe[:, None]
+                    )
+                    kpe = tl.load(
+                        K_Extend + offs_kpe,
+                        mask=mask_n[None, :],
+                        other=0.0,
+                    )
                 qk += tl.dot(qpe, kpe)
 
             if USE_EXP2:
@@ -779,14 +889,24 @@ def _fwd_kernel(
                 p = tl.exp(qk - n_e_max[:, None])
             deno = deno * re_scale + tl.sum(p, 1)
 
-            offs_v = (
-                (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
-                + cur_kv_head * stride_vh
-                + offs_dv[None, :]
-            )
-            v = tl.load(
-                V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
-            )
+            if V_desc is not None:
+                v = _load_tile(
+                    V_desc,
+                    (cur_seq_extend_start_idx + start_n).to(tl.int32),
+                    cur_kv_head,
+                    0,
+                )
+            else:
+                offs_v = (
+                    (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
+                    + cur_kv_head * stride_vh
+                    + offs_dv[None, :]
+                )
+                v = tl.load(
+                    V_Extend + offs_v,
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
             if USE_FP8_EXTEND:
                 p_dot = (p * FP8_MAX).to(v.dtype)
                 acc = acc * re_scale[:, None] + tl.dot(p_dot, v) * (1.0 / FP8_MAX)
@@ -1024,6 +1144,43 @@ def extend_attention_fwd(
         score_mod, aux_tensors
     )
 
+    # Tiles are gated one at a time: the preconditions vary legitimately between
+    # models, so a tile that fails one silently keeps the pointer path.
+    q_desc = qpe_desc = k_desc = kpe_desc = v_desc = None
+    # Descriptors only beat the pointer path where they lower to a hardware fast
+    # path, so every other backend stays on pointers unless the env var forces them.
+    use_tensor_desc = envs.SGLANG_USE_TRITON_ATTN_TENSOR_DESC.get()
+    if use_tensor_desc is None:
+        use_tensor_desc = _is_xpu
+    if use_tensor_desc and _support_tensor_descriptor:
+        # Q / K carry the rope sub-tile in the same head, so the pair of tiles is
+        # what has to cover the head dim.
+        qk_tile_width = BLOCK_DMODEL + BLOCK_DPE
+        if _descriptor_fits(tensor=q_extend, head_dim=Lq, tile_width=qk_tile_width):
+            # device *type* (not index) so scratch follows the current device.
+            _set_triton_scratch_allocator(q_extend.device.type)
+            q_desc = _tile_descriptor(
+                q_extend, block_rows=BLOCK_M, block_width=BLOCK_DMODEL
+            )
+            if BLOCK_DPE > 0:
+                qpe_desc = _tile_descriptor(
+                    q_extend, block_rows=BLOCK_M, block_width=BLOCK_DPE
+                )
+        if _descriptor_fits(tensor=k_extend, head_dim=Lk, tile_width=qk_tile_width):
+            _set_triton_scratch_allocator(q_extend.device.type)
+            k_desc = _tile_descriptor(
+                k_extend, block_rows=BLOCK_N, block_width=BLOCK_DMODEL
+            )
+            if BLOCK_DPE > 0:
+                kpe_desc = _tile_descriptor(
+                    k_extend, block_rows=BLOCK_N, block_width=BLOCK_DPE
+                )
+        if _descriptor_fits(tensor=v_extend, head_dim=Lv, tile_width=BLOCK_DV):
+            _set_triton_scratch_allocator(q_extend.device.type)
+            v_desc = _tile_descriptor(
+                v_extend, block_rows=BLOCK_N, block_width=BLOCK_DV
+            )
+
     _fwd_kernel[grid](
         q_extend,
         k_extend,
@@ -1094,6 +1251,11 @@ def extend_attention_fwd(
         aux0_stride_t=aux0_stride_t,
         aux0_stride_h=aux0_stride_h,
         aux0_len=aux0_len,
+        Q_desc=q_desc,
+        Qpe_desc=qpe_desc,
+        K_desc=k_desc,
+        Kpe_desc=kpe_desc,
+        V_desc=v_desc,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
