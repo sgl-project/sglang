@@ -155,6 +155,8 @@ class PiflowScheduler(FlowMatchEulerDiscreteScheduler):
             )
             x0 = (t1 - t) * values[:, 0] + (t - t0) * values[:, 1]
             velocity = (sample - x0) / sigma.clamp(min=self.eps)
+            # release grid interpolation temporaries before the state update/next gather
+            del values, x0, indices, t, t0, t1, policy_t
             next_raw = (raw_t - substep_size).clamp(min=0)
             next_sigma = shift_timesteps(next_raw, shift)
             updated = sample + velocity * (next_sigma - sigma)
