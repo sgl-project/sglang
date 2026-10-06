@@ -14,6 +14,9 @@ Opt in with `--cache-aware-ancestor-fallback` when using `cache_aware_zmq`.
 It defaults to off for same-image A/B testing. See
 [behavior, metrics, and rollout guidance](docs/ancestor-fallback.md).
 
+See [KV event stream health](docs/kv-stream-health.md) for publisher reset
+cleanup, sequence-gap diagnostics, and recovery limits.
+
 ## Building
 
 ```bash

@@ -22,6 +22,10 @@
 //! this build does not recognise), so a misbehaving publisher cannot mint
 //! series.
 
+use super::tree::KvWorkerId;
+use parking_lot::Mutex;
+use std::collections::HashMap;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::tree::Tiers;
@@ -66,9 +70,22 @@ pub struct TallyRow {
     pub blocks: u64,
 }
 
-/// Lock-free counters, written by the single pump task and read on scrape.
+/// Local stream observations, not a proof of complete engine state.
+/// Counters persist across publisher resets and disappear on worker removal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamHealth {
+    pub gaps: u64,
+    pub missing_sequences: u64,
+    pub skipped_batches: u64,
+    pub publisher_resets: u64,
+    pub untrusted: bool,
+}
+
+/// Event counters and exceptional per-worker stream observations.
+
 #[derive(Debug, Default)]
 pub struct EventTally {
+    streams: Mutex<HashMap<KvWorkerId, StreamHealth>>,
     events: [[AtomicU64; MEDIUM_LABELS.len()]; EVENT_KINDS.len()],
     blocks: [[AtomicU64; MEDIUM_LABELS.len()]; EVENT_KINDS.len()],
 }
@@ -76,6 +93,50 @@ pub struct EventTally {
 impl EventTally {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn record_gap(&self, worker: &KvWorkerId, missing: u64) {
+        let mut streams = self.streams.lock();
+        let state = streams.entry(worker.clone()).or_default();
+        state.gaps += 1;
+        state.missing_sequences += missing;
+        state.untrusted = true;
+    }
+
+    pub fn record_skipped_batch(&self, worker: &KvWorkerId) {
+        self.streams
+            .lock()
+            .entry(worker.clone())
+            .or_default()
+            .skipped_batches += 1;
+    }
+
+    pub fn record_publisher_reset(&self, worker: &KvWorkerId) {
+        let mut streams = self.streams.lock();
+        let state = streams.entry(worker.clone()).or_default();
+        state.publisher_resets += 1;
+        state.untrusted = false;
+    }
+
+    pub fn record_clear(&self, worker: &KvWorkerId) {
+        if let Some(state) = self.streams.lock().get_mut(worker) {
+            state.untrusted = false;
+        }
+    }
+
+    pub fn forget_worker(&self, worker: &KvWorkerId) {
+        self.streams.lock().remove(worker);
+    }
+
+    pub fn stream_snapshot(&self) -> Vec<(KvWorkerId, StreamHealth)> {
+        let mut rows: Vec<_> = self
+            .streams
+            .lock()
+            .iter()
+            .map(|(w, s)| (w.clone(), s.clone()))
+            .collect();
+        rows.sort_by(|a, b| (&a.0.url, a.0.dp_rank).cmp(&(&b.0.url, b.0.dp_rank)));
+        rows
     }
 
     fn medium_slot(medium: Option<&str>) -> usize {
