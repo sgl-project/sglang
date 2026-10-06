@@ -143,15 +143,17 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
     def test_low_free_memory_still_captures_prefill_graph(self):
         eager_runner = object()
         prefill_runner = object()
+        prefill_config = SimpleNamespace(
+            bs=[4, 12, 20, 28],
+            backend=Backend.BREAKABLE,
+        )
         # The capture decision reads the graph configuration and the LoRA flag
         # out of the bags.
         override = get_context().override_server_args(
             enable_lora=False,
             enable_prefill_cp=False,
             pp_size=1,
-            cuda_graph_config=SimpleNamespace(
-                prefill=SimpleNamespace(bs=[1], backend=Backend.BREAKABLE)
-            ),
+            cuda_graph_config=SimpleNamespace(prefill=prefill_config),
         )
         override.install()
         self.addCleanup(override.restore)
@@ -185,6 +187,11 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             ),
             patch.object(
                 graph_setup,
+                "get_cuda_graph_batch_size_alignment",
+                return_value=8,
+            ),
+            patch.object(
+                graph_setup,
                 "get_available_gpu_memory",
                 side_effect=[3.99, 3.5],
             ),
@@ -198,8 +205,17 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
                 model_runner=model_runner,
                 eager_runner=eager_runner,
             )
+            self.assertIs(capture.runner, prefill_runner)
+            self.assertEqual(prefill_config.bs, [8, 16, 24])
 
-        self.assertIs(capture.runner, prefill_runner)
+            # Alignment can drop every bucket above the configured maximum.
+            prefill_config.bs = [20]
+            capture = capture_prefill_graph(
+                model_runner=model_runner,
+                eager_runner=eager_runner,
+            )
+            self.assertEqual(prefill_config.bs, [])
+            self.assertIs(capture.runner, eager_runner)
 
     def test_eagle_target_tc_piecewise_skips_last_mode_capture(self):
         eager_runner = object()
