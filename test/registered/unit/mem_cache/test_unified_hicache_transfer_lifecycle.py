@@ -35,8 +35,9 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.disaggregation.decode import _bind_root_prefix
 from sglang.srt.managers import cache_controller
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, release_req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -47,6 +48,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.buffer_mode.pipeline import _StagedPrefetch
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import restore_kv_cache
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -66,6 +68,7 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import _TREE_CORE_REG
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -681,6 +684,7 @@ class _UnifiedHiCacheCase(_ConfigCase):
         tokens: int = 128,
         host_memory_mode: str = "cache",
         tree_core_backend: Optional[str] = None,
+        **server_overrides,
     ):
         server_args = ServerArgs(
             model_path="dummy",
@@ -689,6 +693,7 @@ class _UnifiedHiCacheCase(_ConfigCase):
             hicache_write_policy=write_policy,
             hicache_mem_layout="layer_first",
             hicache_host_memory_mode=host_memory_mode,
+            **server_overrides,
         )
         set_global_server_args_for_scheduler(server_args)
         bundle = _unified_swa_bundle(tokens=tokens)
@@ -1261,6 +1266,151 @@ class TestRetractionRoundTrip(_UnifiedHiCacheCase):
         self.allocator.free(reused)
         self.allocator.free(destination)
         self.req_to_token_pool.free(req)
+        self.cache.sanity_check()
+
+
+class TestDecodeRadixRetraction(_UnifiedHiCacheCase):
+    """PD decode with a radix cache retracts a request into the host pool and
+    resumes it while another request keeps the prefix they share.
+
+    The scheduler's own functions drive the requests: `release_req` retracts
+    (and, without a backup, releases at the end), `restore_kv_cache` resumes
+    and `checkpoint` inserts. Rows come from the composite alloc, not the
+    decode preallocation, whose SWA-tail allocation is a Triton kernel.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._cache(
+            write_policy="write_through",
+            hicache_ratio=2.0,
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_decode_retraction_backup="host_pool",
+        )
+        self.cache.validate_retraction_host_capacity()
+
+    def _row(self, req) -> torch.Tensor:
+        row = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
+        return row[: req.kv.kv_committed_len].to(torch.int64)
+
+    def _allocate(self, req) -> torch.Tensor:
+        """A whole row of its own, as decode preallocation gives a request."""
+        fill_len = len(req.origin_input_ids)
+        self.assertIsNotNone(self.req_to_token_pool.alloc([req]))
+        ids = self.allocator.alloc(fill_len)
+        self.req_to_token_pool.write((req.kv.req_pool_idx, slice(0, fill_len)), ids)
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = fill_len
+        return ids
+
+    def _enter(self, req):
+        """Join the batch at the root as a row owner, then insert the row."""
+        if req.last_node is None:
+            _bind_root_prefix(req, self.cache)
+        req.init_next_round_input(None)
+        req.set_extend_range(len(req.prefix_indices), req.kv.kv_committed_len)
+        self.cache.checkpoint(req, up_to=req.extend_range.end)
+        # The write-through backup holds its own lock until the ack.
+        self.cache.flush_pending_backups()
+        self.cache.writing_check()
+
+    def _release(self, req, *, offload_kv: bool) -> bool:
+        return release_req(
+            req=req,
+            remaing_req_count=1,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.allocator,
+            tree_cache=self.cache,
+            hisparse_coordinator=None,
+            offload_kv=offload_kv,
+        )
+
+    def _admit(self, rid, tokens, base):
+        req = Req(
+            rid=rid,
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(max_new_tokens=PAGE),
+            bootstrap_host="localhost",
+        )
+        req.output_ids.append(99)  # sampled; its KV is not written yet
+        expected = self.rows.seed(self._allocate(req), base)
+        self._enter(req)
+        return req, expected
+
+    def test_retracted_request_resumes_while_the_survivor_keeps_the_prefix(self):
+        core = self.cache.tree_core
+        prefix = list(range(1, 9))
+        survivor, survivor_kv = self._admit(
+            "survivor", prefix + list(range(20, 28)), 100
+        )
+        tokens = prefix + list(range(40, 48))
+        retracted, own_kv = self._admit("retracted", tokens, 300)
+        shared = core.get_parent_node_id(retracted.last_node)
+        survivor_row = self._row(survivor)
+
+        def assert_survivor(shared_locks, protected):
+            self.assertTrue(torch.equal(self._row(survivor), survivor_row))
+            self.assertEqual(survivor.kv.cache_protected_len, len(survivor_row))
+            self.assertEqual(
+                core.get_component_device_lock_ref(survivor.last_node, FULL), 1
+            )
+            self.assertEqual(
+                core.get_component_device_lock_ref(shared, FULL), shared_locks
+            )
+            self.assertEqual(self.cache.protected_size(), protected)
+            self._assert_rows(survivor_row, survivor_kv, swa_tail=self.window)
+
+        # The insert swapped the retracted request's prefix rows for the
+        # survivor's, so its KV is the survivor's prefix and its own tail.
+        self.assertEqual(shared, core.get_parent_node_id(survivor.last_node))
+        self.assertTrue(torch.equal(self._row(retracted)[:8], survivor_row[:8]))
+        expected = tuple(
+            torch.cat([mine[:8], own[8:]]) for mine, own in zip(survivor_kv, own_kv)
+        )
+        self._assert_rows(self._row(retracted), expected, swa_tail=self.window)
+        assert_survivor(shared_locks=2, protected=24)
+        host_available = self.cache.host_pool_group.available_size()
+
+        self.assertTrue(self._release(retracted, offload_kv=True))
+
+        self.assertIsNotNone(retracted.kv.retraction_backup)
+        self.assertFalse(retracted.kv.holds_kv)
+        self.assertLess(self.cache.host_pool_group.available_size(), host_available)
+        assert_survivor(shared_locks=1, protected=16)
+        # Its own leaf then leaves the device; the write-through copy stays.
+        self.cache.evict(EvictParams(num_tokens=2 * PAGE))
+        self.assertLess(len(self._match(tokens).device_indices), len(tokens))
+        assert_survivor(shared_locks=1, protected=16)
+
+        ids = self._allocate(retracted)
+        restore_kv_cache(
+            retracted, self.cache, self.req_to_token_pool, self.allocator, "host_pool"
+        )
+
+        self.assertIsNone(retracted.kv.retraction_backup)
+        self.assertEqual(self.cache.host_pool_group.available_size(), host_available)
+        self._assert_rows(ids, expected, swa_tail=self.window)
+        assert_survivor(shared_locks=1, protected=16)
+
+        # Rejoining shares the survivor's prefix rows again and frees its copy.
+        free = self.allocator.available_size()
+        self._enter(retracted)
+        row = self._row(retracted)
+        self.assertTrue(torch.equal(row[:8], survivor_row[:8]))
+        self.assertTrue(torch.equal(row[8:], ids[8:]))
+        self.assertEqual(self.allocator.available_size(), free + len(prefix))
+        self._assert_rows(row, expected, swa_tail=self.window)
+        self.assertEqual(len(self._match(tokens).device_indices), len(tokens))
+        assert_survivor(shared_locks=2, protected=24)
+
+        self._release(retracted, offload_kv=False)
+        self.assertIsNone(retracted.kv.retraction_backup)
+        assert_survivor(shared_locks=1, protected=16)
+        self._release(survivor, offload_kv=False)
+        self.assertEqual(core.get_component_device_lock_ref(shared, FULL), 0)
+        self.assertEqual(self.cache.protected_size(), 0)
+        self.assertEqual(self.allocator.verify_byte_accounting(), [])
         self.cache.sanity_check()
 
 
