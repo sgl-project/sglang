@@ -1,6 +1,6 @@
 """Async invariant probes — fire torch._assert_async without CPU sync.
 
-NaN probes run when SGLANG_ENABLE_NAN_DETECTION or SGLANG_ENABLE_ASYNC_ASSERT
+NaN probes run when SGLANG_ENABLE_NAN_LOGITS_CHECK or SGLANG_ENABLE_ASYNC_ASSERT
 is enabled. Other probes require SGLANG_ENABLE_ASYNC_ASSERT. Both flags default
 off. A violation surfaces at the next CUDA sync point instead of a silent NaN
 cascade or illegal-address crash.
@@ -56,7 +56,10 @@ _nan_warner = _AsyncNanWarner()
 def maybe_warn_nan(tensor: Optional[torch.Tensor], msg: str = ""):
     """Non-fatal counterpart of maybe_detect_nan: throttled sync-free warning
     instead of crashing. Callers sanitize the tensor themselves."""
-    if envs.SGLANG_ENABLE_NAN_DETECTION.get() or envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+    if (
+        envs.SGLANG_ENABLE_NAN_LOGITS_CHECK.get()
+        or envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
+    ):
         # The hard assert path already covers detection.
         return
     if tensor is None:
@@ -92,7 +95,8 @@ def maybe_assert_sum(tensor: torch.Tensor, expected: int, msg: str = "") -> None
 def maybe_detect_nan(tensor: Optional[torch.Tensor], msg: str = ""):
     """Async NaN check — no GPU-CPU sync, error surfaces at next sync point."""
     if not (
-        envs.SGLANG_ENABLE_NAN_DETECTION.get() or envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
+        envs.SGLANG_ENABLE_NAN_LOGITS_CHECK.get()
+        or envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
     ):
         return
     # A None tensor means there is nothing to probe, e.g. hidden_states on
