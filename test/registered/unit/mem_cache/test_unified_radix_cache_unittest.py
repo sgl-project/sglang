@@ -27,7 +27,12 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ReqKvInfo
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    FINISH_LENGTH,
+    Req,
+    ReqKvInfo,
+)
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -11284,9 +11289,9 @@ class TestSegmentLockFuzzWithMamba(TestSegmentLockFuzz):
 
 
 class TestStreamingSessionLockLifecycle(CustomTestCase):
-    """A streaming session must persist swa_prefix_lock_released: closing or
-    aborting a session whose first turn early-released its SWA lock must not
-    release the SWA segment a second time."""
+    """A streaming session owns its record and the tree lock on its prefix
+    from the first turn's row allocation; every move of that lock keeps the
+    tree's lock counts balanced."""
 
     cfg = CacheConfig(
         page_size=1,
@@ -11307,41 +11312,164 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         cache.dec_swa_lock_only(node, lock.to_dec_params())
         return node, lock
 
-    def _streaming_req(self, node, lock, *, session):
-        # No KV row is held: the slot only carries the tree lock receipt.
-        kv = ReqKvInfo()
+    def _session(self, session_id):
         return SimpleNamespace(
-            kv=kv,
-            detach_kv=lambda: kv,
-            last_node=node,
-            lock_receipt=lock.to_dec_params(),
-            swa_prefix_lock_released=True,
-            session=session,
-            finished_reason=None,
+            session_id=session_id,
+            streaming=True,
+            finish_req=lambda req: None,
+            abort_req=lambda: None,
         )
+
+    def _turn(self, tokens, session):
+        req = Req(
+            rid="turn",
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req.session = session
+        req.extra_key = None
+        req.output_ids = array("q")
+        req.refresh_fill_ids()
+        return req
+
+    def _admitted_turn(self, cache, allocator, pool, tokens, session):
+        """A first turn after admission and row allocation, before the session
+        takes it: its own row, and the root lock admission took."""
+        req = self._turn(tokens, session)
+        pool.alloc([req])
+        pool.write(
+            (req.kv.req_pool_idx, slice(0, len(tokens))),
+            allocator.alloc(len(tokens)),
+        )
+        req.kv.kv_committed_len = len(tokens)
+        req.kv.kv_allocated_len = len(tokens)
+        req.last_node = cache.root_node_handle()
+        req.lock_receipt = cache.inc_lock_ref(req.last_node).to_dec_params()
+        return req
 
     def test_close_after_early_release_releases_swa_once(self):
         cache, allocator, _ = build_fixture(self.cfg)
         node, lock = self._lock_and_early_release(cache, allocator)
-        req = self._streaming_req(node, lock, session=None)
-        slot = SessionSlot()
-        cache.session.slots["s"] = slot
-        slot.save_from_req(req, is_first=True)
+        cache.session.slots["s"] = SessionSlot(
+            last_node=node,
+            lock_receipt=lock.to_dec_params(),
+            swa_prefix_lock_released=True,
+        )
         cache.session.release_session("s")
         cache.sanity_check()
 
-    def test_first_req_mid_abort_after_early_release(self):
-        cache, allocator, pool = build_fixture(self.cfg)
+    def test_abort_hands_early_released_lock_back(self):
+        """The aborted turn gets the slot's lock with its SWA part already
+        released, so its own unpin must not release the SWA segment again."""
+        cache, allocator, _ = build_fixture(self.cfg)
         node, lock = self._lock_and_early_release(cache, allocator)
-        session = SimpleNamespace(
-            session_id="s2", streaming=True, abort_req=lambda: None
+        req = SimpleNamespace(
+            rid="r",
+            kv=ReqKvInfo(),
+            last_node=node,
+            lock_receipt=lock.to_dec_params(),
+            swa_prefix_lock_released=True,
+            session=self._session("s2"),
+            finished_reason=None,
         )
-        req = self._streaming_req(node, lock, session=session)
+        cache.maybe_hand_to_session(req)
+        slot = cache.session.slots["s2"]
+        self.assertIs(req.last_node, slot.virtual_node)
+
         req.finished_reason = FINISH_ABORT()
-        # The session leaves an abort to the normal release, whose unpin
-        # must not release the SWA lock a second time.
         self.assertFalse(cache.session.try_cache_finished_req(req))
+        self.assertNotIn("s2", cache.session.slots)
+        self.assertEqual(req.last_node, node)
+        self.assertTrue(req.swa_prefix_lock_released)
         cache.unpin(req)
+        cache.sanity_check()
+
+    def test_slot_publishes_first_prompt_and_keeps_its_lock(self):
+        cache, allocator, pool = build_fixture(self.cfg)
+        tokens = list(range(1, 9))
+        req = self._admitted_turn(cache, allocator, pool, tokens, self._session("s"))
+        cache.maybe_hand_to_session(req)
+        slot = cache.session.slots["s"]
+
+        cache.checkpoint(req, up_to=len(tokens))
+
+        # The prompt is in the tree for anyone, and the slot's lock moved onto it.
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(len(match.device_indices), len(tokens))
+        self.assertEqual(slot.last_node, match.last_device_node)
+        self.assertEqual(slot.kv.cache_protected_len, len(tokens))
+        self.assertIs(req.last_node, slot.virtual_node)
+
+        req.finished_reason = FINISH_LENGTH(length=0)
+        self.assertTrue(cache.session.try_cache_finished_req(req))
+        self.assertFalse(slot.publishes_prompt)
+        self.assertFalse(req.kv.holds_kv)
+        cache.session.release_session("s")
+        cache.sanity_check()
+
+    def test_abort_after_publish_releases_like_any_request(self):
+        cache, allocator, pool = build_fixture(self.cfg)
+        tokens = list(range(1, 9))
+        req = self._admitted_turn(cache, allocator, pool, tokens, self._session("s"))
+        cache.maybe_hand_to_session(req)
+        cache.checkpoint(req, up_to=len(tokens))
+        slot = cache.session.slots["s"]
+
+        req.finished_reason = FINISH_ABORT()
+        self.assertFalse(cache.session.try_cache_finished_req(req))
+        self.assertEqual(req.last_node, slot.last_node)
+        finish_req(cache, req, len(tokens))
+        cache.sanity_check()
+
+    def test_session_turn_releases_slot_swa_prefix_lock_once(self):
+        cache, allocator, pool = build_fixture(self.cfg)
+        tokens = list(range(1, 9))
+        req = self._admitted_turn(cache, allocator, pool, tokens, self._session("s"))
+        cache.maybe_hand_to_session(req)
+        cache.checkpoint(req, up_to=len(tokens))
+        slot = cache.session.slots["s"]
+
+        cache.release_swa_prefix_lock(req)
+        self.assertTrue(slot.swa_prefix_lock_released)
+        self.assertFalse(req.swa_prefix_lock_released)
+        # A second call finds the SWA part already released.
+        cache.release_swa_prefix_lock(req)
+
+        req.finished_reason = FINISH_LENGTH(length=0)
+        self.assertTrue(cache.session.try_cache_finished_req(req))
+        cache.session.release_session("s")
+        cache.sanity_check()
+
+    def test_later_turn_borrows_without_publishing(self):
+        """A later turn runs on the slot's record: its allocation hands nothing
+        over, and its checkpoints neither insert nor move the slot's lock."""
+        cache, allocator, pool = build_fixture(self.cfg)
+        session = self._session("s")
+        first = self._admitted_turn(cache, allocator, pool, list(range(1, 9)), session)
+        cache.maybe_hand_to_session(first)
+        cache.checkpoint(first, up_to=8)
+        first.finished_reason = FINISH_LENGTH(length=0)
+        self.assertTrue(cache.session.try_cache_finished_req(first))
+        slot = cache.session.slots["s"]
+        slot_lock_node = slot.last_node
+
+        tokens = list(range(1, 13))
+        req = self._turn(tokens, session)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+        req.last_node = match.last_device_node
+        pool.write((req.kv.req_pool_idx, slice(8, 12)), allocator.alloc(4))
+        req.kv.kv_committed_len = 12
+        req.kv.kv_allocated_len = 12
+        cache.maybe_hand_to_session(req)
+        cache.checkpoint(req, up_to=12)
+        self.assertIs(slot.last_node, slot_lock_node)
+
+        req.finished_reason = FINISH_LENGTH(length=0)
+        self.assertTrue(cache.session.try_cache_finished_req(req))
+        cache.session.release_session("s")
         cache.sanity_check()
 
 
