@@ -191,6 +191,9 @@ pub trait TypedRpc: Clone + Send + Sync + 'static {
     /// Take the router's additions; a caller's own values win.
     fn apply(&mut self, additions: &Additions);
 
+    /// The trace context the engine propagates.
+    fn trace_headers(&mut self) -> &mut HashMap<String, String>;
+
     fn send(self, client: SglangServiceClient<Channel>) -> RpcFuture<Self::Reply>;
 }
 
@@ -204,17 +207,25 @@ impl<T: TypedRpc> EngineRpc for T {
         client: SglangServiceClient<Channel>,
         _: Bytes,
         additions: &Additions,
-        _: HashMap<String, String>,
+        trace_headers: HashMap<String, String>,
     ) -> RpcFuture<T::Reply> {
         let mut request = self.clone();
         request.apply(additions);
+        // Headers sent as gRPC metadata travel on as trace context; a credential does not.
+        let forwarded = trace_headers
+            .into_iter()
+            .filter(|(name, _)| name != "authorization");
+        for (name, value) in forwarded {
+            request.trace_headers().entry(name).or_insert(value);
+        }
         request.send(client)
     }
 }
 
 /// A sampling contract field as the proto carries it.
 pub fn sampling_value(params: &proto::SamplingParams, field: SamplingField) -> Option<f64> {
-    let float = |value: Option<f32>| value.map(f64::from);
+    // The decimal a JSON caller would send: 0.7, not the f32's 0.699999988.
+    let float = |value: Option<f32>| value.map(|v| v.to_string().parse().unwrap_or(f64::from(v)));
     match field {
         SamplingField::Temperature => float(params.temperature),
         SamplingField::TopP => float(params.top_p),
@@ -290,6 +301,10 @@ impl TypedRpc for proto::GenerateRequest {
         );
     }
 
+    fn trace_headers(&mut self) -> &mut HashMap<String, String> {
+        &mut self.trace_headers
+    }
+
     fn send(self, mut client: SglangServiceClient<Channel>) -> RpcFuture<Self::Reply> {
         Box::pin(async move { Ok(client.generate(self).await?.into_inner().boxed()) })
     }
@@ -316,6 +331,10 @@ impl TypedRpc for proto::TextGenerateRequest {
             &mut self.disaggregated_params,
             &mut self.sampling_params,
         );
+    }
+
+    fn trace_headers(&mut self) -> &mut HashMap<String, String> {
+        &mut self.trace_headers
     }
 
     fn send(self, mut client: SglangServiceClient<Channel>) -> RpcFuture<Self::Reply> {
@@ -401,6 +420,10 @@ macro_rules! embedding_rpc {
                 if self.rid.is_none() {
                     self.rid.clone_from(&additions.rid);
                 }
+            }
+
+            fn trace_headers(&mut self) -> &mut HashMap<String, String> {
+                &mut self.trace_headers
             }
 
             fn send(self, mut client: SglangServiceClient<Channel>) -> RpcFuture<Self::Reply> {
@@ -647,6 +670,20 @@ impl Proxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampling_values_read_as_the_decimal_sent() {
+        let params = proto::SamplingParams {
+            temperature: Some(0.7),
+            top_k: Some(20),
+            ..Default::default()
+        };
+        assert_eq!(
+            sampling_value(&params, SamplingField::Temperature),
+            Some(0.7)
+        );
+        assert_eq!(sampling_value(&params, SamplingField::TopK), Some(20.0));
+    }
 
     #[test]
     fn apply_adds_router_fields_without_overriding_the_caller() {
