@@ -88,7 +88,8 @@ class QuickAllReduce:
         self.disabled = True
         if not qr_rocm_arch_available():
             logger.debug(
-                "Custom quick allreduce is only supported on ROCm MI300 series."
+                "Custom quick allreduce is only supported on ROCm "
+                "MI30X/MI35X/MI45X series."
             )
             return
 
@@ -266,6 +267,38 @@ class QuickAllReduce:
         self.close()
 
 
+class _QuickAllReduceAdapter:
+    """Expose the SGLang QuickReduce interface for bundled and AITER backends."""
+
+    def __init__(self, communicator: Any) -> None:
+        self._communicator = communicator
+
+    @property
+    def disabled(self) -> bool:
+        # AITER does not guarantee this attribute across releases. If it is
+        # absent, the presence of its eligibility method is the enable signal.
+        return bool(getattr(self._communicator, "disabled", False))
+
+    def should_quick_allreduce(self, inp: torch.Tensor) -> bool:
+        eligibility = getattr(self._communicator, "should_quick_allreduce", None)
+        if eligibility is None:
+            return False
+        return bool(eligibility(inp))
+
+    def quick_all_reduce(
+        self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        reduce = self._communicator.quick_all_reduce
+        if out is None:
+            return reduce(inp)
+        return reduce(inp, out=out)
+
+    def close(self) -> None:
+        close = getattr(self._communicator, "close", None)
+        if close is not None:
+            close()
+
+
 def _configure_aiter_quickreduce_env() -> None:
     """Translate legacy SGLang QuickReduce settings for AITER.
 
@@ -288,7 +321,7 @@ def _configure_aiter_quickreduce_env() -> None:
 
 def create_quick_allreduce(
     group: ProcessGroup, device: Union[int, str, torch.device]
-) -> Optional[Any]:
+) -> Optional[_QuickAllReduceAdapter]:
     """Create the configured QuickReduce communicator.
 
     AITER is opt-in through ``SGLANG_USE_AITER``. If its Python implementation
@@ -313,6 +346,8 @@ def create_quick_allreduce(
             )
         else:
             logger.info("Using AITER QuickAllReduce")
-            return AiterQuickAllReduce(group=group, device=device)
+            return _QuickAllReduceAdapter(
+                AiterQuickAllReduce(group=group, device=device)
+            )
 
-    return QuickAllReduce(group=group, device=device)
+    return _QuickAllReduceAdapter(QuickAllReduce(group=group, device=device))
