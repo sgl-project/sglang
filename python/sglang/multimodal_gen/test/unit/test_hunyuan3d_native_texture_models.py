@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
+import trimesh
 from diffusers import AutoencoderKL as DiffusersAutoencoderKL
 from diffusers import LCMScheduler, UNet2DConditionModel
 
@@ -29,6 +30,7 @@ from sglang.multimodal_gen.runtime.pipelines.hunyuan3d_pipeline import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan3d.paint import (
     Hunyuan3DPaintPostprocessStage,
+    Hunyuan3DPaintPreprocessStage,
     Hunyuan3DPaintTexGenStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan3d.shape import (
@@ -234,6 +236,26 @@ class TestHunyuan3DPaintTurboSchedule(unittest.TestCase):
             [989, 890, 791, 692, 593, 494, 395, 296, 197, 98],
         )
         self.assertFalse(stage.scheduler.custom_timesteps)
+
+
+class TestHunyuan3DPaintRemesh(unittest.TestCase):
+    def _unwrap(self, use_remesh: bool) -> trimesh.Trimesh:
+        stage = Hunyuan3DPaintPreprocessStage.__new__(Hunyuan3DPaintPreprocessStage)
+        stage.config = Hunyuan3D2PipelineConfig(paint_use_remesh=use_remesh)
+        mesh = trimesh.creation.icosphere(subdivisions=6)  # 81,920 faces
+        with patch(
+            "sglang.multimodal_gen.runtime.utils.mesh3d_utils.mesh_uv_wrap",
+            side_effect=lambda m: m,
+        ):
+            return stage._unwrap_mesh(mesh)
+
+    def test_remesh_decimates_to_40k_faces_before_uv_unwrap(self):
+        mesh = self._unwrap(use_remesh=True)
+        self.assertLessEqual(len(mesh.faces), 40000)
+        self.assertGreater(len(mesh.faces), 39000)
+
+    def test_remesh_disabled_keeps_all_faces(self):
+        self.assertEqual(len(self._unwrap(use_remesh=False).faces), 81920)
 
 
 if __name__ == "__main__":
