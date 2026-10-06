@@ -159,7 +159,7 @@ impl PreparedRequest {
             .map(|(field, value)| (field.wire_name(), value.to_string()))
             .collect();
         let with_defaults = append_fields(&body, &defaults).unwrap_or_else(|| body.clone());
-        let lowered = if lower { lower_openai(ctx, path, &model, headers, &with_defaults) } else { Err(InputIdsForwarding::Disabled) };
+        let lowered = if lower { lower_openai(ctx, path, &model, headers, &with_defaults) } else { Err("native_grpc") };
         ctx.metrics
             .record_openai_route(&model.0, lowered.as_ref().err().copied());
         if let Ok((mut generate, responder)) = lowered {
