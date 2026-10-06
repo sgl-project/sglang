@@ -57,6 +57,7 @@ if TYPE_CHECKING:
         FlashInferMlaAttnBackend,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
@@ -367,6 +368,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     init_metadata_replay=False,
                     spec_info=spec_info,
                     req_pool_indices=req_pool_indices[:bs],
+                    plan=forward_batch.kv_loc_plan,
                 )
                 self.decode_cuda_graph_metadata[bs] = decode_wrapper
                 self.forward_metadata = DecodeMetadata(decode_wrapper)
@@ -391,6 +393,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 raise ValueError(f"Invalid mode: {forward_mode=}")
 
             self._apply_cuda_graph_metadata(
+                plan=forward_batch.kv_loc_plan,
                 bs=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -408,6 +411,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 prefill_wrapper.plan = partial(fast_mla_prefill_plan, prefill_wrapper)
         else:
             self._apply_cuda_graph_metadata(
+                plan=forward_batch.kv_loc_plan,
                 bs=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -425,6 +429,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 decode_wrapper=self.decode_wrapper,
                 init_metadata_replay=False,
                 req_pool_indices=forward_batch.req_pool_indices,
+                plan=forward_batch.kv_loc_plan,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrapper)
         elif forward_batch.forward_mode.is_target_verify():
@@ -436,6 +441,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 prefill_wrapper_paged=self.prefill_wrapper_verify,
                 use_ragged=False,
                 spec_info=forward_batch.spec_info,
+                plan=forward_batch.kv_loc_plan,
             )
             self.forward_metadata = PrefillMetadata(self.prefill_wrapper_verify, False)
         else:
@@ -484,6 +490,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 qo_indptr_cpu=qo_indptr_cpu,
                 kv_indptr_cpu=kv_indptr_cpu,
                 kv_len_arr_cpu=kv_len_arr_cpu,
+                plan=forward_batch.kv_loc_plan,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrapper_paged, use_ragged
@@ -531,6 +538,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
     def _apply_cuda_graph_metadata(
         self,
+        plan: KVLocPlan,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -566,6 +574,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 init_metadata_replay=True,
                 spec_info=spec_info,
                 req_pool_indices=req_pool_indices[:bs],
+                plan=plan,
                 **self.fast_decode_kwargs,
             )
         elif forward_mode.is_target_verify():
@@ -616,6 +625,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     if use_generic_fast_plan
                     else None
                 ),
+                plan=plan,
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -859,6 +869,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         init_metadata_replay: bool = False,
         spec_info: Optional[SpecInput] = None,
         *,
+        plan: KVLocPlan,
         req_pool_indices: torch.Tensor,
         **fast_decode_kwargs,
     ):
@@ -871,6 +882,7 @@ class FlashInferMLAIndicesUpdaterDecode:
             self.kv_indptr,
             init_metadata_replay,
             spec_info,
+            plan=plan,
             req_pool_indices=req_pool_indices,
             **fast_decode_kwargs,
         )
@@ -885,6 +897,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         init_metadata_replay: bool = False,
         spec_info: Optional[SpecInput] = None,
         *,
+        plan: KVLocPlan,
         req_pool_indices: torch.Tensor,
         **fast_decode_kwargs,
     ):
@@ -904,11 +917,11 @@ class FlashInferMLAIndicesUpdaterDecode:
                 else fast_decode_kwargs["kv_indices"]
             )
             translator = self.attn_backend.kv_index_translator
-            is_translated = translator.fill_packed_read_stream(
+            is_translated = translator.pack_read_stream(
+                plan,
                 req_pool_indices=req_pool_indices,
                 seq_lens=paged_kernel_lens,
                 indptr=kv_indptr,
-                total_tokens=paged_kernel_lens_sum,
                 out=kv_indices,
             )
 
@@ -1006,6 +1019,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None,
         fast_verify_plan_kwargs: Optional[dict] = None,
         *,
+        plan: KVLocPlan,
         qo_indptr_cpu: Optional[torch.Tensor] = None,
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         kv_len_arr_cpu: Optional[torch.Tensor] = None,
@@ -1031,6 +1045,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             spec_info,
             attn_dcp_metadata=attn_dcp_metadata,
             fast_verify_plan_kwargs=fast_verify_plan_kwargs,
+            plan=plan,
             qo_indptr_cpu=qo_indptr_cpu,
             kv_indptr_cpu=kv_indptr_cpu,
             kv_len_arr_cpu=kv_len_arr_cpu,
@@ -1052,6 +1067,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None,
         fast_verify_plan_kwargs: Optional[dict] = None,
         *,
+        plan: KVLocPlan,
         qo_indptr_cpu: Optional[torch.Tensor] = None,
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         kv_len_arr_cpu: Optional[torch.Tensor] = None,
@@ -1068,11 +1084,11 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
-            self.attn_backend.kv_index_translator.fill_packed_read_stream(
+            self.attn_backend.kv_index_translator.pack_read_stream(
+                plan,
                 req_pool_indices=req_pool_indices,
                 seq_lens=paged_kernel_lens,
                 indptr=kv_indptr,
-                total_tokens=paged_kernel_lens_sum,
                 out=kv_indices,
             )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
@@ -1085,6 +1101,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                     paged_kernel_lens=paged_kernel_lens,
                     paged_kernel_lens_sum=paged_kernel_lens_sum,
                     translator=self.attn_backend.kv_index_translator,
+                    plan=plan,
                     kv_indices_buf=fast_verify_plan_kwargs["kv_indices_buf"],
                 )
             )
@@ -1097,6 +1114,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                     paged_kernel_lens=paged_kernel_lens,
                     paged_kernel_lens_sum=paged_kernel_lens_sum,
                     translator=self.attn_backend.kv_index_translator,
+                    plan=plan,
                 )
             )
 

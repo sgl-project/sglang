@@ -266,19 +266,28 @@ class ForwardBatchDeepSeekMHAMixin:
             device=self.req_pool_indices.device,
         )
         kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
-        req_to_token = get_req_to_token_pool().req_to_token
-        create_flashinfer_kv_indices_triton[(self.batch_size,)](
-            req_to_token,
-            self.req_pool_indices,
-            self.seq_lens,
-            kv_indptr,
-            None,
-            kv_indices,
-            req_to_token.shape[1],
-        )
-        # None on a backend that never bound a translator.
+        # None on a backend that never bound a translator, which reads virtual
+        # ids; otherwise one gather from the iteration's plan (DCP takes its
+        # own branch upstream).
         src = get_attn_backend().kv_index_translator
-        if src is not None:
-            kv_indices = src.translate_full_attn_ids(kv_indices)
+        if src is None:
+            req_to_token = get_req_to_token_pool().req_to_token
+            create_flashinfer_kv_indices_triton[(self.batch_size,)](
+                req_to_token,
+                self.req_pool_indices,
+                self.seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                req_to_token.shape[1],
+            )
+        else:
+            src.pack_read_stream(
+                self.kv_loc_plan,
+                req_pool_indices=self.req_pool_indices,
+                seq_lens=self.seq_lens,
+                indptr=kv_indptr,
+                out=kv_indices,
+            )
         self.mha_one_shot_kv_indices = kv_indices
         return kv_indices

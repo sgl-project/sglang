@@ -5,6 +5,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 
@@ -63,6 +64,7 @@ class NgramVerifyInput(SpecInput):
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         translator: KVIndexTranslator,
+        plan: KVLocPlan,
         sliding_window: bool = False,
     ):
         """CSR verify args, gathered straight into the packed stream. The lens
@@ -83,11 +85,11 @@ class NgramVerifyInput(SpecInput):
         total_tokens = paged_kernel_lens_sum + self.draft_token_num * bs
         kv_indices = torch.empty(total_tokens, dtype=torch.int32, device=self.device)
 
-        translator.fill_packed_read_stream(
+        translator.pack_read_stream(
+            plan,
             req_pool_indices=req_pool_indices,
             seq_lens=paged_kernel_lens,
             indptr=cum_kv_seq_len,
-            total_tokens=total_tokens,
             out=kv_indices,
             sliding_window=sliding_window,
         )

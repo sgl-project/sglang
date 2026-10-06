@@ -5,6 +5,7 @@ from typing import Callable, List, Optional
 import torch
 
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -90,6 +91,7 @@ class EagleVerifyInput(SpecInput):
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         translator: KVIndexTranslator,
+        plan: KVLocPlan,
         sliding_window: bool = False,
     ):
         """CSR verify args, gathered straight into the packed stream. The lens
@@ -113,11 +115,11 @@ class EagleVerifyInput(SpecInput):
 
         total_tokens = paged_kernel_lens_sum + self.draft_token_num * batch_size
         kv_indices = torch.empty(total_tokens, dtype=torch.int32, device=device)
-        translator.fill_packed_read_stream(
+        translator.pack_read_stream(
+            plan,
             req_pool_indices=req_pool_indices,
             seq_lens=paged_kernel_lens,
             indptr=cum_kv_seq_len,
-            total_tokens=total_tokens,
             out=kv_indices,
             sliding_window=sliding_window,
         )
@@ -402,6 +404,7 @@ class EagleDraftExtendInput(SpecInput):
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: Optional[int],
         translator: KVIndexTranslator,
+        plan: KVLocPlan,
         sliding_window: bool = False,
     ):
         """Draft-extend CSR args. The lens already include the window, so
@@ -426,11 +429,11 @@ class EagleDraftExtendInput(SpecInput):
             paged_kernel_lens_sum, dtype=torch.int32, device=device
         )
 
-        translator.fill_packed_read_stream(
+        translator.pack_read_stream(
+            plan,
             req_pool_indices=req_pool_indices,
             seq_lens=paged_kernel_lens,
             indptr=cum_kv_seq_len,
-            total_tokens=paged_kernel_lens_sum,
             out=kv_indices,
             sliding_window=sliding_window,
         )

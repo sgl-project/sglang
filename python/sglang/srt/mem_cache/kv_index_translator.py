@@ -239,10 +239,27 @@ class KVIndexTranslator:
         ``runner_slots`` a runner's own buffer), and its reads reach
         `window_read_extent` past its lengths."""
         write_ids = forward_batch.out_cache_loc
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        encoder_lens = getattr(forward_batch, "encoder_lens", None)
+        if (
+            encoder_lens is not None
+            and seq_lens is not None
+            and self.reads_are_translated
+        ):
+            # An encoder-decoder row holds its encoder tokens ahead of the
+            # decoder's, and its self-attention reads past `seq_lens`.
+            seq_lens = seq_lens + encoder_lens
+            encoder_lens_cpu = getattr(forward_batch, "encoder_lens_cpu", None)
+            seq_lens_cpu = (
+                None
+                if seq_lens_cpu is None or encoder_lens_cpu is None
+                else seq_lens_cpu + torch.tensor(encoder_lens_cpu).to(seq_lens_cpu)
+            )
         return self.plan(
             req_pool_indices=getattr(forward_batch, "req_pool_indices", None),
-            seq_lens=getattr(forward_batch, "seq_lens", None),
-            seq_lens_cpu=getattr(forward_batch, "seq_lens_cpu", None),
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
             write_virtual=None if runner_slots else write_ids,
             write_slots=write_ids if runner_slots else None,
             read_extent=window_read_extent(

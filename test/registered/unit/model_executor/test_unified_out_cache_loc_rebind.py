@@ -162,9 +162,9 @@ class TestPadComposesWithDerivation(CustomTestCase):
 
 
 class TestReadRailTranslatesAtProduction(CustomTestCase):
-    """The model-door READ indices (req_to_token-derived, VIRTUAL under the
-    unified pool) are translated at their PRODUCTION site -- the cache then
-    holds the physical result and the pool door never translates."""
+    """The model-door READ indices are physical from their PRODUCTION site
+    (a gather from the iteration's plan under the unified pool) -- the cache
+    then holds the physical result and the pool door never translates."""
 
     def _fb_for_one_shot(self):
         fb = _make_fb(torch.tensor([1, 2], dtype=torch.int64))
@@ -174,39 +174,33 @@ class TestReadRailTranslatesAtProduction(CustomTestCase):
         fb.req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
         return fb
 
-    def test_one_shot_indices_translated_once_and_cached(self):
+    def test_one_shot_indices_gathered_from_the_plan_once_and_cached(self):
         from unittest.mock import patch
 
         from sglang.srt.model_executor import forward_batch_deepseek_mha_mixin as mix
 
-        calls = []
-        sentinel = torch.arange(5, dtype=torch.int64) + 5000
+        plans = []
 
-        def translate(t):
-            calls.append(t)
-            return sentinel
+        def pack(plan, *, req_pool_indices, seq_lens, indptr, out, **_):
+            plans.append(plan)
+            out.fill_(7)
+            return True
 
         fb = self._fb_for_one_shot()
-        fake_pool = SimpleNamespace(
-            req_to_token=torch.zeros((4, 16), dtype=torch.int32)
-        )
+        fb.kv_loc_plan = object()
         # autospec, not a bare namespace: setting a name the translator does
         # not have raises, so renaming the method breaks this test loudly.
         fake_translator = create_autospec(KVIndexTranslator, instance=True)
-        fake_translator.translate_full_attn_ids = translate
+        fake_translator.pack_read_stream = pack
         fake_backend = SimpleNamespace(kv_index_translator=fake_translator)
-        with (
-            patch.object(mix, "get_req_to_token_pool", return_value=fake_pool),
-            patch.object(mix, "get_attn_backend", return_value=fake_backend),
-            patch.object(mix, "create_flashinfer_kv_indices_triton"),
-        ):
+        with patch.object(mix, "get_attn_backend", return_value=fake_backend):
             r1 = fb.fetch_mha_one_shot_kv_indices()
             r2 = fb.fetch_mha_one_shot_kv_indices()
 
-        self.assertIs(r1, sentinel)  # production site translated
-        self.assertIs(r2, sentinel)  # cache holds the TRANSLATED result
-        self.assertEqual(len(calls), 1)  # translated exactly once
-        self.assertEqual(calls[0].dtype, torch.int32)  # raw producer output
+        # One gather, from the iteration's plan; the cache holds its result.
+        self.assertEqual(plans, [fb.kv_loc_plan])
+        self.assertIs(r2, r1)
+        self.assertTrue(torch.equal(r1, torch.full((5,), 7, dtype=torch.int32)))
 
     def test_one_shot_indices_noop_on_unmigrated_backend(self):
         from unittest.mock import patch
