@@ -43,6 +43,7 @@ def _moe_shell() -> DeepseekV2MoE:
     moe.is_deepseek_v4 = False
     moe.is_hash = False
     moe.tp_size = 8
+    moe.reduce_results = True
     moe.layer_id = 7
     moe.experts = torch.nn.Identity()
     moe._shared_expert_tp1 = False
