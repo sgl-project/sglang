@@ -12,7 +12,7 @@ use crate::message::config::{DisaggregationMode, PreferredSamplingParams};
 use crate::message::finish_reason::FinishReason;
 use crate::message::request::GenerateRequest;
 use crate::message::response::{ChunkEvent, ChunkExtras};
-use crate::message::types::TokenIds;
+use crate::message::types::OutputTokenIds;
 
 /// Canonical transport-neutral input for one generation operation.
 ///
@@ -31,7 +31,7 @@ pub(crate) type FrontendRequest = GenerateRequest;
 /// [`crate::frontend::FrontendCall`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FrontendOutput {
-    pub(crate) token_ids: TokenIds,
+    pub(crate) token_ids: OutputTokenIds,
     pub(crate) finish_reason: Option<FinishReason>,
     pub(crate) prompt_tokens: u32,
     pub(crate) text: String,

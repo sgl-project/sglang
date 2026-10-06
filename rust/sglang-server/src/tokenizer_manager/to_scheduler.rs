@@ -357,6 +357,10 @@ impl Intake {
                 rid: req.rid.clone(),
                 sink: req.sink.clone(),
                 decode_logprob_text,
+                output_mode: match &req.kind {
+                    RequestKind::Generate(g) => g.output_mode,
+                    _ => Default::default(),
+                },
                 no_stop_trim,
             })
             .is_ok()

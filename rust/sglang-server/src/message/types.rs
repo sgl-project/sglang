@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 /// (or a broadcast) and a list of lists is per-prompt.
 pub type TokenIds = Vec<i64>;
 
+/// Output chunks usually contain one token; larger outputs spill to the heap.
+pub type OutputTokenIds = smallvec::SmallVec<[i64; 1]>;
+
 /// A field taking a bare `T` **or** `[T,…]` (`text: "hi"` or `text: ["a","b"]`).
 /// `untagged` takes the first variant that matches, so a `T` that itself accepts
 /// a sequence would make `Many` unreachable — hence the [`OneOrManyItem`] gate.

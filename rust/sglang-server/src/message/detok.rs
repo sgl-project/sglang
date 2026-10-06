@@ -18,6 +18,7 @@ pub enum DetokMsg {
         sink: ResponseSink,
         /// Decode logprob token ids to text here (CPU-bound) not on the api threads.
         decode_logprob_text: bool,
+        output_mode: super::request::OutputMode,
         /// `SamplingParams.no_stop_trim`: keep the matched stop; default trims it.
         no_stop_trim: bool,
     },
