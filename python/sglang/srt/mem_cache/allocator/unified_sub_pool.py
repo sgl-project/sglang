@@ -953,8 +953,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc._alloc_bind_fast_or_slow"):
             if N == 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
-            if self.lazy_compaction and self._free_phys_pages.numel() > 0:
-                self._wait_hicache_transfers()
 
             # FAST PATH: eager, or lazy with no current holes.
             if not self.lazy_compaction or self._free_phys_pages.numel() == 0:
@@ -2014,6 +2012,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._pending_hicache_load_pages = 0
 
     def _wait_hicache_transfers(self) -> None:
+        """Order the current stream after outstanding HiCache copies.
+
+        Only paths that move or free pages call this. Allocation does not: it
+        takes pages no copy uses. A D2H source stays locked, or is drained, until
+        its finish event has been observed, and an H2D target stays owned by its
+        load or request until then, so neither is a hole while its copy runs.
+        """
         if not self._hicache_transfer_done_events:
             return
         current_stream = torch.cuda.current_stream()
@@ -2041,8 +2046,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if need_size > self.available_size():
             if not _relieve_for_alloc(self, need_size):
                 return None
-        if self.lazy_compaction and self._free_phys_pages.numel() > 0:
-            self._wait_hicache_transfers()
         physical_pages = self.take_physical_pages(need_size // self.page_size)
         if physical_pages is None:
             return None
