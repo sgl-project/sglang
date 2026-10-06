@@ -29,12 +29,15 @@ def _beam_overrides(server_args: Any, hf_config: Any) -> dict:
     ):
         logger.info("Use trtllm_mha as default attention backend for Beam")
         overrides["attention_backend"] = "trtllm_mha"
-    # BeamMoE runs NVFP4 experts only on flashinfer_trtllm; BF16 keeps auto.
-    is_quantized = (
-        cfg.quantization is not None or get_quantization_config(hf_config) is not None
-    )
+    # Select defaults by checkpoint format; explicit runner choices are preserved.
+    quantization = cfg.quantization or get_quantization_config(hf_config)
+    quant_config = getattr(hf_config, "quantization_config", None) or {}
+    if quantization == "modelopt":
+        quantization = quant_config.get("quant_algo")
+    elif quantization in ("compressed-tensors", "compressed_tensors"):
+        quantization = quant_config.get("format")
     if (
-        is_quantized
+        quantization in ("modelopt_fp4", "NVFP4", "nvfp4-pack-quantized")
         and get_platform().is_sm100
         and cfg.moe_runner_backend == "auto"
         and cfg.moe_a2a_backend == "none"
