@@ -2545,6 +2545,116 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertIsInstance(params["dry_run"], bool)
         self.assertEqual(params["dry_run"], True)
 
+    def test_boolean_parameter_invalid_value_kept_as_string(self):
+        """
+        Test that a boolean parameter value other than true/false is not coerced.
+
+        Scenario: Boolean parameter set to `yes` in one call and `FALSE` in another.
+        Purpose: Verify `yes` keeps the raw string, as the integer and number
+        branches do, instead of silently becoming false, while any casing of
+        true/false still converts.
+        """
+        text = """<tool_call>
+<function=sql_interpreter>
+<parameter=query>SELECT 1</parameter>
+<parameter=dry_run>yes</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=sql_interpreter>
+<parameter=query>SELECT 1</parameter>
+<parameter=dry_run>FALSE</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(json.loads(result.calls[0].parameters)["dry_run"], "yes")
+        self.assertIs(json.loads(result.calls[1].parameters)["dry_run"], False)
+
+    def test_string_parameter_null_text_kept(self):
+        """
+        Test that the text `null` stays a string for a string parameter.
+
+        Scenario: String parameter whose schema does not allow null, with value `null`.
+        Purpose: Verify the value is the string "null", not JSON null.
+        """
+        text = """<tool_call>
+<function=sql_interpreter>
+<parameter=query>
+null
+</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "null")
+
+    def test_null_conversion_when_schema_allows_null(self):
+        """
+        Test that `null` becomes JSON null when the schema allows it.
+
+        Scenario: `null` for string parameters that allow null (type list,
+        nullable, anyOf, enum) and for an integer parameter.
+        Purpose: Verify each of them is converted to None.
+        """
+        tool = Tool(
+            type="function",
+            function=Function(
+                name="update_record",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "type_list": {"type": ["string", "null"]},
+                        "nullable": {"type": "string", "nullable": True},
+                        "any_of": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                        "enum": {"enum": ["open", None]},
+                        "count": {"type": "integer"},
+                    },
+                },
+            ),
+        )
+        names = ["type_list", "nullable", "any_of", "enum", "count"]
+        text = (
+            "<tool_call>\n<function=update_record>\n"
+            + "".join(f"<parameter={name}>\nnull\n</parameter>\n" for name in names)
+            + "</function>\n</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, [tool])
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params, {name: None for name in names})
+
+    def test_streaming_string_null_and_invalid_boolean(self):
+        """
+        Test streaming conversion of `null` for a string and `yes` for a boolean.
+
+        Scenario: Both values are streamed in Qwen3 Coder format.
+        Purpose: Verify the streamed arguments match the non-streaming result.
+        """
+        chunks = [
+            "<tool_call>",
+            "<function=sql_interpreter>",
+            "<parameter=query>",
+            "null",
+            "</parameter>",
+            "<parameter=dry_run>yes</parameter>",
+            "</function>",
+            "</tool_call>",
+        ]
+
+        detector = Qwen3CoderDetector()
+        collected_params = ""
+
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.parameters:
+                    collected_params += call.parameters
+
+        params = json.loads(collected_params)
+        self.assertEqual(params, {"query": "null", "dry_run": "yes"})
+
     def test_complex_array_parameter(self):
         """
         Test parsing of complex array parameters.
