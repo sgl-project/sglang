@@ -16,8 +16,12 @@ from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.overlap_utils import RelayPayload
+from sglang.srt.managers.overlap_utils import RelayPayload, resolve_forward_inputs
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.scheduler_components.pp_dspark_draft import (
+    PPDSparkDraftCoordinator,
+    snapshot_pp_dspark_batch,
+)
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     allocate_distinct_stream,
@@ -33,6 +37,9 @@ from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
     pop_auxiliary_output_from_pp_tensors,
+)
+from sglang.srt.speculative.dspark_components.dspark_pp import (
+    pack_proposal,
 )
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
 from sglang.srt.utils.common import is_npu, is_xpu
@@ -53,14 +60,33 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
+        and not get_spec().speculative_dspark_pp_replicated_draft
+    )
+
+
+def _pp_use_batched_result_relay() -> bool:
+    return get_parallel().pp_size == 2 and (
+        _is_npu
+        or (
+            torch.cuda.is_available()
+            and envs.SGLANG_PP_DSPARK_BATCHED_RESULT_RELAY.get()
+            and get_spec().speculative_dspark_pp_replicated_draft
+        )
     )
 
 
 def _pp_snapshot_forward_batch(batch: ScheduleBatch) -> Optional[ScheduleBatch]:
     if batch.spec_algorithm.is_none():
         return None
-    fwd_batch = batch.copy()
-    fwd_batch.req_pool_indices = batch.req_pool_indices.clone()
+    if get_spec().speculative_dspark_pp_replicated_draft:
+        fwd_batch = snapshot_pp_dspark_batch(batch)
+        fwd_batch.draft_global_num_tokens = batch.draft_global_num_tokens
+        fwd_batch.draft_global_num_tokens_for_logprob = (
+            batch.draft_global_num_tokens_for_logprob
+        )
+    else:
+        fwd_batch = batch.copy()
+        fwd_batch.req_pool_indices = batch.req_pool_indices.clone()
     return fwd_batch
 
 
@@ -88,7 +114,18 @@ class PPBatchMetadata:
     # result arrives, so relayed tensors must be applied against the
     # composition that actually ran the forward.
     fwd_batch: Optional[ScheduleBatch] = None
+    dspark_commit_state: Optional[object] = None
+    speculative_num_draft_tokens: Optional[int] = None
     verify_out_cache_loc: Optional[torch.Tensor] = None
+
+
+def _pp_get_dspark_draft_coordinator(
+    scheduler: Scheduler,
+) -> PPDSparkDraftCoordinator:
+    coordinator = getattr(scheduler, "pp_dspark_draft", None)
+    if coordinator is None:
+        coordinator = scheduler.pp_dspark_draft = PPDSparkDraftCoordinator(scheduler)
+    return coordinator
 
 
 class SchedulerPPMixin:
@@ -161,6 +198,9 @@ class SchedulerPPMixin:
                     spec_relay=self._pp_spec_relay,
                     is_last_rank=self.pp_group.is_last_rank,
                     async_batch_depth=get_parallel().pp_async_batch_depth,
+                ) or (
+                    get_spec().speculative_dspark_pp_replicated_draft
+                    and not self.pp_group.is_last_rank
                 )
                 if exchange_outputs_before_forward:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -185,17 +225,13 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                _pp_get_dspark_draft_coordinator(self).drain()
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
-                    process_target = self.mbs[next_mb_id]
-                    next_md = self.mb_metadata[next_mb_id]
-                    if next_md is not None and next_md.fwd_batch is not None:
-                        # PP+spec: process against the forward-time snapshot;
-                        # the live mb may have been recomposed since launch.
-                        process_target = next_md.fwd_batch
+                    process_batch = self._pp_result_process_batch(next_mb_id)
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
-                            process_target,
+                            process_batch,
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
@@ -360,8 +396,9 @@ class SchedulerPPMixin:
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
+                    process_batch = self._pp_result_process_batch(next_mb_id)
                     self._pp_process_batch_result(
-                        self.mbs[next_mb_id],
+                        process_batch,
                         next_batch_result,
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
@@ -463,8 +500,13 @@ class SchedulerPPMixin:
                     if not cur_batch.forward_mode.is_prebuilt():
                         pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
-                # early send output if possible
-                if get_parallel().pp_async_batch_depth > 0:
+                # Keep zero-depth disaggregated PP launch-first so stage
+                # execution overlaps. Idle draft collectives are deferred
+                # until their relayed result arrives.
+                exchange_outputs_before_forward = (
+                    get_parallel().pp_async_batch_depth > 0
+                )
+                if exchange_outputs_before_forward:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -482,13 +524,14 @@ class SchedulerPPMixin:
                         self.last_rank_comm_queue,
                     )
 
-                if get_parallel().pp_async_batch_depth == 0:
+                if not exchange_outputs_before_forward:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
                         )
                     )
+                _pp_get_dspark_draft_coordinator(self).drain()
 
                 # reach consensus on last rank and send to PP=0
                 # otherwise, just pass along previous consensus
@@ -544,8 +587,9 @@ class SchedulerPPMixin:
                 if self.mbs[next_mb_id] is not None:
                     if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
                         d2h_event.synchronize()
+                        process_batch = self._pp_result_process_batch(next_mb_id)
                         self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
+                            process_batch,
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
@@ -609,6 +653,7 @@ class SchedulerPPMixin:
         self.send_req_work = []
         self.send_proxy_work = []
         self.send_output_work = []
+        self.pp_dspark_draft = PPDSparkDraftCoordinator(self)
         self.send_proxy_requires_forward_fence = False
         self.launch_event = None
         self.pp_proxy_recv_event = None
@@ -900,11 +945,42 @@ class SchedulerPPMixin:
                     result.next_verify_top_scores_index
                 )
 
+        pp_dspark_projected_context = getattr(
+            result, "pp_dspark_projected_context", None
+        )
+        if pp_dspark_projected_context is not None:
+            tensor_dict["dspark_identities"] = [
+                identity.to_wire()
+                for identity in result.pp_dspark_commit_state.identities
+            ]
+            tensor_dict["dspark_projected_context"] = pp_dspark_projected_context
+            tensor_dict["dspark_new_seq_lens"] = result.new_seq_lens
+            tensor_dict["dspark_bonus_tokens"] = result.next_draft_input.bonus_tokens
+            if result.accept_lens is not None:
+                if (
+                    result.pp_dspark_next_proposal is None
+                    and get_spec().speculative_draft_scheduling_policy != "bubble"
+                ):
+                    raise RuntimeError(
+                        "Replicated PP DSpark output is missing the next proposal."
+                    )
+                if result.pp_dspark_next_proposal is not None:
+                    tensor_dict.update(pack_proposal(1, result.pp_dspark_next_proposal))
+                tensor_dict["dspark_accept_lens"] = result.accept_lens
+                tensor_dict["dspark_block_accept_lens"] = result.block_accept_lens
+                if result.cap_lens is not None:
+                    tensor_dict["dspark_cap_lens"] = result.cap_lens
+        elif getattr(result, "pp_dspark_draft_idle", False):
+            tensor_dict["dspark_draft_idle"] = result.next_token_ids.new_ones(
+                (1,), dtype=torch.uint8
+            )
+
         # Draft extend runs only on the last stage, but every rank needs its relayed
         # output to fill PD auxiliary buffers.
         draft_input = result.next_draft_input
         if (
-            draft_input is not None
+            pp_dspark_projected_context is None
+            and draft_input is not None
             and not batch.spec_algorithm.is_dspark()
             and draft_input.topk_p is not None
         ):
@@ -1143,6 +1219,92 @@ class SchedulerPPMixin:
 
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
 
+        dspark_draft = _pp_get_dspark_draft_coordinator(self)
+        dspark_draft.on_relayed_idle(batch, pp_outputs)
+
+        if "dspark_projected_context" in pp_outputs.tensors:
+            from sglang.srt.speculative.dspark_components.dspark_draft import (
+                make_next_draft_input,
+            )
+            from sglang.srt.speculative.dspark_components.dspark_pp import (
+                PPDSparkIdentity,
+                validate_identities,
+            )
+
+            fwd_batch = mb_metadata.fwd_batch
+            commit_state = mb_metadata.dspark_commit_state
+            if fwd_batch is None or commit_state is None:
+                raise RuntimeError(
+                    "Replicated PP DSpark output is missing forward metadata."
+                )
+            validate_identities(
+                commit_state.identities, pp_outputs["dspark_identities"]
+            )
+            validate_identities(
+                commit_state.identities,
+                [PPDSparkIdentity.from_req(req).to_wire() for req in batch.reqs],
+            )
+            fwd_rids = tuple(req.rid for req in fwd_batch.reqs)
+            live_rids = tuple(req.rid for req in batch.reqs)
+            if fwd_rids != live_rids:
+                raise RuntimeError(
+                    "Replicated PP DSpark batch changed while its result was in "
+                    f"flight: forward_rids={fwd_rids}, live_rids={live_rids}."
+                )
+
+            new_seq_lens = pp_outputs["dspark_new_seq_lens"]
+            accept_lens = pp_outputs.tensors.get("dspark_accept_lens")
+            if accept_lens is None or not self.pp_group.is_last_rank:
+                self.model_worker.commit_pp_draft_context(
+                    state=commit_state,
+                    rids=fwd_rids,
+                    projected_context=pp_outputs["dspark_projected_context"],
+                    commit_lens=accept_lens,
+                )
+            next_draft_input = make_next_draft_input(
+                bonus_tokens=pp_outputs["dspark_bonus_tokens"],
+                new_seq_lens=new_seq_lens,
+            )
+            batch.spec_info = next_draft_input
+            batch.seq_lens = new_seq_lens
+            if batch.seq_lens_cpu is not None:
+                batch.seq_lens_cpu = new_seq_lens.to("cpu")
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            fwd_batch.spec_info = next_draft_input
+            fwd_batch.seq_lens = new_seq_lens
+
+            is_decode = accept_lens is not None
+            if is_decode:
+                dspark_draft.on_relayed_proposals(
+                    fwd_batch,
+                    next_draft_input,
+                    pp_outputs,
+                )
+            output_result = GenerationBatchResult(
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+                accept_lens=accept_lens,
+                block_accept_lens=(
+                    pp_outputs["dspark_block_accept_lens"] if is_decode else None
+                ),
+                cap_lens=pp_outputs.tensors.get("dspark_cap_lens"),
+                next_draft_input=next_draft_input,
+                new_seq_lens=new_seq_lens,
+                extend_input_len_per_req=extend_input_len_per_req,
+                extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+                can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+                speculative_num_draft_tokens=(mb_metadata.speculative_num_draft_tokens),
+                copy_done=self.device_module.Event() if is_decode else None,
+            )
+            if is_decode:
+                output_result.copy_to_cpu(
+                    return_logprob=batch.return_logprob,
+                    return_hidden_states=batch.return_hidden_states,
+                )
+            else:
+                output_result.copy_auxiliary_output_to_cpu()
+            return output_result
+
         # Rebind the last stage's ring proposal as batch.spec_info so the PD result
         # processor sees the same object on every rank.
         next_draft_input = None
@@ -1229,10 +1391,38 @@ class SchedulerPPMixin:
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
 
+    def _pp_result_process_batch(self: Scheduler, mb_id: int) -> ScheduleBatch:
+        metadata = self.mb_metadata[mb_id]
+        if metadata is not None and metadata.fwd_batch is not None:
+            return metadata.fwd_batch
+        return self.mbs[mb_id]
+
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
         self.process_batch_result(batch, output_result)
+
+    def _pp_is_replicated_dspark_batch(self: Scheduler, batch: ScheduleBatch) -> bool:
+        return (
+            get_parallel().pp_size > 1
+            and batch.spec_algorithm.is_dspark()
+            and get_spec().speculative_dspark_pp_replicated_draft
+        )
+
+    def _pp_run_replicated_dspark_batch(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+    ) -> GenerationBatchResult:
+        resolve_forward_inputs(batch, self.future_map)
+        with self._forward_isolation(batch, overlap=False):
+            result = self.model_worker.forward_batch_generation(
+                batch, pp_proxy_tensors=pp_proxy_tensors
+            )
+        batch.input_ids = None
+        self.update_cache_from_scheduler(batch, result)
+        result.copy_done = self.device_module.Event()
+        return result
 
     def _pp_spec_commit_relayed_accept(
         self: Scheduler,
@@ -1532,12 +1722,11 @@ class SchedulerPPMixin:
         batch_result = None
         send_output_work = []
 
-        # On NPU (HCCL), isend/irecv may block until a matching peer op is
-        # posted, so the parity-based send-first/recv-first ordering used
-        # for NPU is replaced by batch_isend_irecv which submits all
-        # send/recv operations atomically.
-        if _is_npu and get_parallel().pp_size == 2:
-            return self._pp2_only_send_recv_output_tensors_npu(
+        # HCCL requires paired submission for correctness. CUDA can opt into
+        # the same PP2 exchange for replicated DSpark to remove the odd rank's
+        # recv-before-send serialization from the result-relay critical path.
+        if _pp_use_batched_result_relay():
+            return self._pp2_send_recv_output_tensors_batched(
                 next_first_rank_mb_id,
                 next_mb_id,
                 mbs,
@@ -1563,7 +1752,11 @@ class SchedulerPPMixin:
         # sends before any recv can form the same ring wait on CUDA. Parity
         # makes rank 1 post its recv first, which breaks the cycle for any
         # pp_size > 1.
-        needs_pairing = is_xpu() or self._pp_spec_relay
+        needs_pairing = (
+            is_xpu()
+            or self._pp_spec_relay
+            or get_spec().speculative_dspark_pp_replicated_draft
+        )
         send_first = (not needs_pairing) or ((get_parallel().pp_rank % 2) == 0)
 
         def _do_send():
@@ -1616,7 +1809,7 @@ class SchedulerPPMixin:
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
-    def _pp2_only_send_recv_output_tensors_npu(
+    def _pp2_send_recv_output_tensors_batched(
         self: Scheduler,
         next_first_rank_mb_id: int,
         next_mb_id: int,
@@ -1630,13 +1823,10 @@ class SchedulerPPMixin:
         Optional[torch.Event],
         List[P2PWork],
     ]:
-        """NPU-specific output tensor send/recv using batch_isend_irecv.
+        """Exchange PP2 output tensors using batch_isend_irecv.
 
-        Pairs the send of output tensors to the next stage with the recv
-        of output tensors from the previous stage in a single
-        ``batch_isend_irecv`` call, avoiding the deadlock that can occur
-        on HCCL when separate isend/irecv calls block waiting for each
-        other.
+        HCCL uses this to avoid deadlock. Replicated DSpark can opt into it on
+        CUDA to submit both directions together instead of serializing them.
         """
         next_pp_outputs = None
         d2h_event = None
@@ -1646,14 +1836,15 @@ class SchedulerPPMixin:
         all_gather_group = self.attn_tp_group
 
         # ---- Prepare send dict ----
-        # On NPU, always send something (full output or a lightweight skip
-        # marker) so the peer's recv in batch_isend_irecv always has a
+        # Always send something (full output or a lightweight skip marker) so
+        # the peer's recv in batch_isend_irecv always has a
         # matching send.  Without this, SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM
         # would cause asymmetric skip decisions between adjacent ranks
         # (send target and recv target are different micro-batches), leading
         # to deadlock or forcing the user to disable the optimisation
         # entirely (≈10 % throughput loss).
         send_dict: Optional[Dict[str, torch.Tensor]] = None
+        send_ready_event = None
         if self.pp_group.is_last_rank:
             target_send = mbs[next_first_rank_mb_id]
             if target_send is not None:
@@ -1662,7 +1853,7 @@ class SchedulerPPMixin:
                     if _pp_can_skip_output_comm(target_send):
                         send_dict = {"__msg_type__": "output", "__skip__": True}
                     else:
-                        self.device_module.current_stream().wait_event(q_event)
+                        send_ready_event = q_event
                         send_dict = dict(pp_outputs_to_send.tensors)
                         send_dict["__msg_type__"] = "output"
         elif pp_outputs:
@@ -1682,7 +1873,7 @@ class SchedulerPPMixin:
             target_recv is not None and not target_recv.forward_mode.is_prebuilt()
         )
 
-        def _handle_recv_dict(recv_dict):
+        def _handle_recv_dict(recv_dict, output_recv_event=None):
             nonlocal next_pp_outputs, batch_result, d2h_event
             if recv_dict.get("__skip__"):
                 # _pp_make_skip_output_result returns next_pp_outputs=None
@@ -1697,26 +1888,46 @@ class SchedulerPPMixin:
                 next_pp_outputs = PPProxyTensors(recv_dict)
                 with self.copy_stream_ctx:
                     self.copy_stream.wait_stream(self.schedule_stream)
+                    if output_recv_event is not None:
+                        self.copy_stream.wait_event(output_recv_event)
                     batch_result = self._pp_prep_batch_result(
                         target_recv, mb_metadata[next_mb_id], next_pp_outputs
                     )
                     d2h_event = self.device_module.Event()
-                    d2h_event.record(self.device_module.current_stream())
+                    if (
+                        not _is_npu
+                        and batch_result.logits_output is not None
+                        and batch_result.logits_output.sampling_mask_output is not None
+                    ):
+                        batch_result.copy_done = d2h_event
+                        batch_result.copy_to_cpu(
+                            return_logprob=target_recv.return_logprob,
+                            return_hidden_states=False,
+                        )
+                    else:
+                        d2h_event.record(self.device_module.current_stream())
 
         # ---- Execute communication ----
         if send_dict is not None and should_recv:
             # Paired send + recv via batch_isend_irecv
             with torch.profiler.record_function("send_recv_res_dict"):
-                recv_dict = self.pp_group.send_recv_tensor_dict(
-                    send_tensor_dict=send_dict,
-                    send_all_gather_group=all_gather_group,
-                    recv_all_gather_group=all_gather_group,
-                )
-            _handle_recv_dict(recv_dict)
+                with self.pp_comm_stream_ctx:
+                    if send_ready_event is not None:
+                        self.device_module.current_stream().wait_event(send_ready_event)
+                    recv_dict = self.pp_group.send_recv_tensor_dict(
+                        send_tensor_dict=send_dict,
+                        send_all_gather_group=all_gather_group,
+                        recv_all_gather_group=all_gather_group,
+                    )
+                    output_recv_event = self._pp_record_comm_event()
+            _handle_recv_dict(recv_dict, output_recv_event)
         elif send_dict is not None:
             # Send only (recv not needed — target is None or prebuilt)
             send_output_work = self._pp_send_dict_to_next_stage(
-                send_dict, async_send=True, msg_type="output"
+                send_dict,
+                async_send=True,
+                msg_type="output",
+                ready_event=send_ready_event,
             )
         elif should_recv:
             # Recv only (no send needed)
@@ -1749,9 +1960,14 @@ class SchedulerPPMixin:
                     trace_only=True,
                     attrs={"pp_mb_id": mb_id},
                 )
+                _pp_get_dspark_draft_coordinator(self).on_batch_launched(
+                    cur_batch, result
+                )
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
+                    dspark_commit_state=result.pp_dspark_commit_state,
+                    speculative_num_draft_tokens=(result.speculative_num_draft_tokens),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
                 )
                 event = self.device_module.Event()

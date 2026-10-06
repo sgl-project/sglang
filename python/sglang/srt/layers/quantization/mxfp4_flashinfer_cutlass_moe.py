@@ -165,20 +165,73 @@ class Mxfp4FlashinferCutlassMoEMethod:
         else:
             if self._use_sm90_humming:
                 from flashinfer.fused_moe import (
-                    preprocess_moe_weights_for_sm90_mixed_gemm_humming,
+                    interleave_moe_scales_for_sm90_mixed_gemm,
+                    interleave_moe_weights_for_sm90_mixed_gemm,
+                )
+                from flashinfer.fused_moe.prepare import (
+                    _preprocess_humming_e8m0_weight_scale,
+                    _process_humming_mxfp4_w4a8_payload,
                 )
 
-                w13_il, w13_s_il, w13_residual = (
-                    preprocess_moe_weights_for_sm90_mixed_gemm_humming(
-                        layer.w13_weight.data.view(torch.uint8).contiguous(),
-                        w13_scale_u8,
+                def _preprocess_humming_expert(weight, scale):
+                    offset, residual, delta = _preprocess_humming_e8m0_weight_scale(
+                        scale
                     )
+                    processed_weight = torch.empty_like(weight)
+                    row_chunk_size = 64
+                    for start in range(0, weight.shape[1], row_chunk_size):
+                        end = min(start + row_chunk_size, weight.shape[1])
+                        processed_weight[:, start:end].copy_(
+                            _process_humming_mxfp4_w4a8_payload(
+                                weight[:, start:end].contiguous(),
+                                delta[:, start:end].contiguous(),
+                            )
+                        )
+                    return (
+                        interleave_moe_weights_for_sm90_mixed_gemm(
+                            processed_weight, "fp4_fp8"
+                        ),
+                        interleave_moe_scales_for_sm90_mixed_gemm(offset),
+                        residual,
+                    )
+
+                def _preprocess_humming_in_chunks(weight, scale):
+                    # FlashInfer expands packed FP4 codes to int64 while
+                    # rewriting them. A replicated DSpark draft has all experts
+                    # on every rank, and one expert can require more than 15 GiB
+                    # of temporary memory on H20. Chunk experts and rows.
+                    chunk_size = 1
+                    if weight.shape[0] <= chunk_size:
+                        return _preprocess_humming_expert(weight, scale)
+
+                    weights, scales, residuals = [], [], []
+                    for start in range(0, weight.shape[0], chunk_size):
+                        end = min(start + chunk_size, weight.shape[0])
+                        weight_chunk, scale_chunk, residual_chunk = (
+                            _preprocess_humming_expert(
+                                weight[start:end], scale[start:end]
+                            )
+                        )
+                        weights.append(weight_chunk)
+                        scales.append(scale_chunk)
+                        residuals.append(residual_chunk)
+                    return (
+                        torch.cat(weights, dim=0),
+                        torch.cat(scales, dim=0),
+                        torch.cat(residuals, dim=0),
+                    )
+
+                w13_il, w13_s_il, w13_residual = _preprocess_humming_in_chunks(
+                    layer.w13_weight.data.view(torch.uint8).contiguous(),
+                    w13_scale_u8,
                 )
-                w2_il, w2_s_il, w2_residual = (
-                    preprocess_moe_weights_for_sm90_mixed_gemm_humming(
-                        layer.w2_weight.data.view(torch.uint8).contiguous(),
-                        w2_scale_u8,
-                    )
+                layer.w13_weight = Parameter(w13_il, requires_grad=False)
+                layer.w13_weight_scale_inv = Parameter(w13_s_il, requires_grad=False)
+                torch.cuda.empty_cache()
+
+                w2_il, w2_s_il, w2_residual = _preprocess_humming_in_chunks(
+                    layer.w2_weight.data.view(torch.uint8).contiguous(),
+                    w2_scale_u8,
                 )
                 layer.w13_humming_residual_scale = Parameter(
                     (w13_residual * 64.0).contiguous(), requires_grad=False
@@ -190,6 +243,8 @@ class Mxfp4FlashinferCutlassMoEMethod:
                     torch.ones((), dtype=torch.float32, device=w13_scale_u8.device),
                     requires_grad=False,
                 )
+                layer.w2_weight = Parameter(w2_il, requires_grad=False)
+                layer.w2_weight_scale_inv = Parameter(w2_s_il, requires_grad=False)
             else:
                 from flashinfer.fused_moe import (
                     interleave_moe_scales_for_sm90_mixed_gemm,
@@ -208,10 +263,10 @@ class Mxfp4FlashinferCutlassMoEMethod:
                 w2_s_il = interleave_moe_scales_for_sm90_mixed_gemm(
                     w2_scale_u8, group_size=_GROUP_SIZE
                 )
-            layer.w13_weight = Parameter(w13_il, requires_grad=False)
-            layer.w2_weight = Parameter(w2_il, requires_grad=False)
-            layer.w13_weight_scale_inv = Parameter(w13_s_il, requires_grad=False)
-            layer.w2_weight_scale_inv = Parameter(w2_s_il, requires_grad=False)
+                layer.w13_weight = Parameter(w13_il, requires_grad=False)
+                layer.w2_weight = Parameter(w2_il, requires_grad=False)
+                layer.w13_weight_scale_inv = Parameter(w13_s_il, requires_grad=False)
+                layer.w2_weight_scale_inv = Parameter(w2_s_il, requires_grad=False)
 
         layer._dsv4_mxfp4_backend = (
             "flashinfer_cutlass_sm120"

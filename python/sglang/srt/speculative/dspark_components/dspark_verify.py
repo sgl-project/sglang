@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
@@ -31,7 +31,11 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
@@ -51,6 +55,9 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler import GenerationBatchResult
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -80,6 +87,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
 
 
 def candidate_request_length_bound(
@@ -246,12 +254,16 @@ class TargetVerifyExecutor:
         *,
         batch: ScheduleBatch,
         idle_layout: Optional[RaggedVerifyLayout],
-    ) -> None:
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> GenerationBatchResult:
         """Run a dummy target-verify forward so an idle DP rank joins the
         token-keyed collective ops of the busy ranks' verify step."""
         device = self.model_runner.device
         if self.verify_epilogue is not None:
             self.verify_epilogue.begin_step(None, armed=False)
+        num_dummy_slots = (
+            int(idle_layout.verify_lens.numel()) if idle_layout is not None else 0
+        )
         num_dummy_tokens = (
             idle_layout.graph_num_tokens if idle_layout is not None else 0
         )
@@ -270,8 +282,10 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = torch.zeros(
             (num_dummy_tokens,), dtype=torch.int64, device=device
         )
+        # DP padding materializes this zero-token lane to the active verify
+        # geometry. Keep the same model path even when no ragged layout is used.
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
         if idle_layout is not None:
-            num_dummy_slots = int(idle_layout.verify_lens.numel())
             batch.seq_lens = torch.ones(
                 (num_dummy_slots,), dtype=torch.int64, device=device
             )
@@ -280,14 +294,14 @@ class TargetVerifyExecutor:
             )
             batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
             batch.seq_lens_sum = num_dummy_slots
-            batch.forward_mode = ForwardMode.TARGET_VERIFY
         verify_input.live_seq_lens_cpu = batch.seq_lens_cpu
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
-        self.target_worker.forward_batch_generation(
+        return self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
+            pp_proxy_tensors=pp_proxy_tensors,
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
         )
@@ -300,6 +314,7 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -329,9 +344,10 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        if sampling_info is not None:
+        if sampling_info is not None and result.logits_output is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -347,6 +363,7 @@ class TargetVerifyExecutor:
         verify_input: DFlashVerifyInput,
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> TargetVerifyResult:
         if verify_input.live_seq_lens_cpu is None and self._target_is_dsv41:
             verify_input.candidate_max_seq_len_upper_bound = (
@@ -361,12 +378,14 @@ class TargetVerifyExecutor:
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
+            pp_proxy_tensors=pp_proxy_tensors,
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
         )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
+            pp_hidden_states_proxy_tensors=target_out.pp_hidden_states_proxy_tensors,
         )
 
     def commit_hidden(
@@ -420,6 +439,7 @@ class TargetVerifyExecutor:
         layout: RaggedVerifyLayout,
         ragged_window: RaggedVerifyWindow,
         sampling_info,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> TargetVerifyResult:
         verify_input = DFlashVerifyInput(
             draft_token=ragged_window.verify_ids,
@@ -449,6 +469,7 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
     def run_compact(
@@ -462,7 +483,8 @@ class TargetVerifyExecutor:
         device: str,
         sampling_info,
         inject_gate: bool = False,
-    ) -> tuple[TargetVerifyResult, torch.Tensor]:
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> tuple[TargetVerifyResult, Optional[torch.Tensor]]:
         ragged_window = BuildRaggedVerifyWindow.execute(
             batch=batch,
             layout=layout,
@@ -480,8 +502,11 @@ class TargetVerifyExecutor:
             layout=layout,
             ragged_window=ragged_window,
             sampling_info=sampling_info,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         logits_output = target_verify.logits_output
+        if logits_output is None:
+            return target_verify, None
 
         stride = self.verify_num_draft_tokens
         if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:

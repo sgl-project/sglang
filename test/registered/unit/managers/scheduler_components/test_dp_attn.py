@@ -25,6 +25,37 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
         with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(True):
             self.assertTrue(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=2))
 
+    def test_pp_dspark_owner_count_uses_optional_trailing_slot(self):
+        sync_info = dp_attn.MLPSyncBatchInfo(
+            num_dp_ranks=1,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=2,
+            num_tokens_for_logprob=2,
+            can_run_decode_cuda_graph=True,
+            can_run_draft_cuda_graph=False,
+            can_run_prefill_cuda_graph=False,
+            is_extend_in_batch=False,
+            local_can_run_tbo=True,
+            local_forward_mode=ForwardMode.DECODE.value,
+            pp_dspark_owned_num_tokens=3,
+        )
+
+        local = sync_info._get_local_tensor(device="cpu")
+        fallback = sync_info._get_fallback_tensor(device="cpu")
+        self.assertEqual(local.shape[0], 9)
+        self.assertEqual(local[8].item(), 0)
+        self.assertEqual(fallback[8].item(), 1)
+
+        sync_info.include_pp_dspark_owner_counts = True
+        local = sync_info._get_local_tensor(device="cpu")
+        fallback = sync_info._get_fallback_tensor(device="cpu")
+        self.assertEqual(local.shape[0], 10)
+        self.assertEqual(local[8].item(), 0)
+        self.assertEqual(local[9].item(), 3)
+        self.assertEqual(fallback[8].item(), 1)
+        self.assertEqual(fallback[9].item(), 0)
+
     def test_dp1_skip_preserves_local_tbo_metadata(self):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
@@ -55,6 +86,13 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
                 ),
             ),
             patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
+            patch.object(
+                dp_attn,
+                "get_spec",
+                return_value=SimpleNamespace(
+                    speculative_dspark_pp_replicated_draft=False
+                ),
+            ),
             patch.object(dp_attn.MLPSyncBatchInfo, "all_gather") as all_gather,
         ):
             result = dp_attn.prepare_mlp_sync_batch_raw(
@@ -81,6 +119,34 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
         self.assertEqual(
             tbo_preparer.compute_output.call_args.args[0].tolist(),
             [[1, ForwardMode.DECODE.value]],
+        )
+
+    def test_pp_dspark_owner_count_is_gathered_with_scheduler_metadata(self):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            reqs=[SimpleNamespace(rid=f"request-{i}") for i in range(8)],
+        )
+        with (
+            patch.object(
+                dp_attn,
+                "get_spec",
+                return_value=SimpleNamespace(
+                    speculative_dspark_pp_replicated_draft=True
+                ),
+            ),
+            patch.object(
+                dp_attn,
+                "get_parallel",
+                return_value=SimpleNamespace(pp_rank=1, pp_size=2),
+            ),
+        ):
+            owned = dp_attn._pp_dspark_owned_num_tokens(batch)
+
+        from sglang.srt.speculative.dspark_components.dspark_pp import draft_owner
+
+        self.assertEqual(
+            owned,
+            sum(draft_owner(req.rid, 2) == 1 for req in batch.reqs),
         )
 
 
