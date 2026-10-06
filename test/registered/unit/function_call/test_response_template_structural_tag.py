@@ -235,7 +235,7 @@ class TestToolCallStructuralTag(CustomTestCase):
         spelled = copy.deepcopy(TEMPLATE)
         spelled["fields"]["tool_calls"]["close"] = ['b">x', "</call>"]
         spaced = copy.deepcopy(TEMPLATE)
-        spaced["fields"]["tool_calls"]["close"] = ["\n\n", "</call>"]
+        spaced["fields"]["tool_calls"]["close"] = ["\n", "</call>"]
         colon = copy.deepcopy(TEMPLATE)
         colon["fields"]["tool_calls"]["content_args"]["tag_pattern"] = (
             r"<arg:(?P<key>\w+)>(?P<value>.*?)</arg>"

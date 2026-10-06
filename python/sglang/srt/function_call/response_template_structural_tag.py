@@ -39,7 +39,8 @@ _LITERAL_ESCAPES = {"n": "\n", "r": "\r", "t": "\t"}
 _START = "\0"
 # Arbitrary bound on the strings expanded from one delimiter pattern.
 _MAX_LITERALS = 16
-_WHITESPACE = {"type": "regex", "pattern": r"\s*"}
+# Templates write at most a newline between parameters.
+_SEPARATOR = {"type": "regex", "pattern": r"\n?"}
 _ANY_TEXT = {"type": "any_text"}
 # Character classes in XGrammar regexes take whitespace only as escapes.
 _BLANKS = {" ": " ", "\t": r"\t", "\n": r"\n", "\r": r"\r"}
@@ -624,7 +625,7 @@ def _xml_arguments_format(
             return None
         names = (*properties, *(key for key in required if key not in properties))
     pieces = (
-        _literal_piece(begins, before=r"\s*"),
+        _literal_piece(begins, before=_SEPARATOR["pattern"]),
         (f"(?:{key_pattern})", _endings(names), False),
         _literal_piece(middles),
         # Values of every format are some text.
@@ -641,7 +642,7 @@ def _xml_arguments_format(
         name = {"type": "regex", "pattern": key_pattern}
         content = _sequence(name, _const_strings(middles), text)
         tags = [_tag(begin, content, ends) for begin in begins]
-        return {"type": "star", "content": _sequence(_WHITESPACE, _one_of(tags))}
+        return {"type": "star", "content": _sequence(_SEPARATOR, _one_of(tags))}
 
     if not strict:
         return any_parameters()
@@ -676,7 +677,7 @@ def _xml_arguments_format(
             raise ValueError(f"parameter name {key!r} cannot be encoded in tool calls")
         if choices is None:
             tags = [_tag(b + key + m, value, ends) for b in begins for m in middles]
-            return _sequence(_WHITESPACE, _one_of(tags))
+            return _sequence(_SEPARATOR, _one_of(tags))
         # Optional framing whitespace must not change a text choice.
         tags, framed = [], set()
         for b in begins:
@@ -697,7 +698,7 @@ def _xml_arguments_format(
                         framed.update(group)
         if framed != set(choices):
             return None
-        return _sequence(_WHITESPACE, _one_of(tags))
+        return _sequence(_SEPARATOR, _one_of(tags))
 
     elements = []
     for key, schema in properties.items():
