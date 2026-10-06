@@ -2222,6 +2222,8 @@ class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     error: Optional[str] = None
     runtime_health: Optional[str] = None
     runtime_error: Optional[str] = None
+    recovery_update: bool = False
+    recovery_phase: Optional[str] = None
 
 
 class ScaleElasticEPReqInput(BaseReq, kw_only=True):
@@ -2268,6 +2270,7 @@ class RecoverElasticEPReqOutput(BaseReq, kw_only=True):
     message: str
     conflict: bool = False
     operation_id: Optional[str] = None
+    submission_id: Optional[str] = None
     recovery_phase: str = "idle"
     terminal: bool = False
 

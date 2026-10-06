@@ -47,6 +47,7 @@ from sglang.srt.runtime_context import (
     publish,
     spawn_world_rank,
 )
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -4802,6 +4803,8 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
+        self._maybe_complete_recovery_warmup(batch)
+
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
 
@@ -4925,6 +4928,7 @@ class Scheduler(
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         self.dp_attn_adapter.drop_sync_wait_carry()
+        self._maybe_schedule_recovery_warmup()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
@@ -5776,6 +5780,7 @@ class Scheduler(
         make_output = partial(
             RecoverElasticEPReqOutput,
             operation_id=recv_req.operation_id,
+            submission_id=recv_req.submission_id,
         )
         if state is None:
             return make_output(
@@ -5813,6 +5818,98 @@ class Scheduler(
             message=f"Recovery operation {recv_req.operation_id} is restoring.",
             recovery_phase=state.recovery_phase,
         )
+
+    def _maybe_schedule_recovery_warmup(self) -> None:
+        """Drive fenced recovery without waiting for customer traffic.
+
+        The request follows the ordinary scheduler generation path so the
+        replacement rank participates in the same forward used as readiness
+        evidence. Its health-check RID suppresses user-facing output.
+        """
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        state = ElasticEPStateManager.instance()
+        if state is None:
+            return
+        if state.recovery_phase == "restoring":
+            self.model_worker.model_runner.maybe_join_ep_ranks()
+            return
+        if state.recovery_phase != "slot_restored":
+            return
+
+        operation_id = state.recovery_operation_id
+        if operation_id is None or not ElasticEPStateManager.begin_recovery_warmup(
+            operation_id
+        ):
+            return
+        token_id = self.tokenizer.bos_token_id
+        if token_id is None:
+            token_id = next(iter(self.model_config.hf_eos_token_id), None)
+        if token_id is None:
+            ElasticEPStateManager.complete_recovery_warmup(
+                operation_id, success=False
+            )
+            return
+        self.handle_generate_request(
+            TokenizedGenerateReqInput(
+                rid=f"{HEALTH_CHECK_RID_PREFIX}elastic-recovery-{operation_id}",
+                input_text=None,
+                input_ids=array("q", [token_id]),
+                input_embeds=None,
+                mm_inputs=None,
+                token_type_ids=None,
+                sampling_params=SamplingParams(
+                    max_new_tokens=1, temperature=0.0, top_k=1
+                ),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+                no_logs=True,
+            )
+        )
+
+    def _maybe_complete_recovery_warmup(self, batch: ScheduleBatch) -> None:
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        state = ElasticEPStateManager.instance()
+        if (
+            state is None
+            or state.recovery_phase != "warming_up"
+            or state.recovery_operation_id is None
+        ):
+            return
+        rid = f"{HEALTH_CHECK_RID_PREFIX}elastic-recovery-{state.recovery_operation_id}"
+        for req in batch.reqs:
+            if req.rid == rid and req.finished():
+                success = not isinstance(req.finished_reason, FINISH_ABORT)
+                completed = ElasticEPStateManager.complete_recovery_warmup(
+                    state.recovery_operation_id,
+                    success=success,
+                )
+                if get_parallel().tp_rank == 0:
+                    from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
+
+                    self.ipc_channels.send_to_tokenizer.send_output(
+                        ElasticScaleUpdateReq(
+                            success=success and completed,
+                            terminal=True,
+                            effective_ep_size=state.effective_ep_size,
+                            operation_id=state.recovery_operation_id,
+                            recovery_update=True,
+                            recovery_phase=(
+                                "ready" if success and completed else "warming_up"
+                            ),
+                            error=(
+                                None
+                                if success and completed
+                                else "Replacement-including recovery warmup failed."
+                            ),
+                        )
+                    )
+                return
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput

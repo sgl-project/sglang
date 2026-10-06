@@ -528,6 +528,48 @@ class ElasticEPStateManager:
         return True
 
     @classmethod
+    def mark_recovery_slot_restored(cls) -> None:
+        inst = cls._instance
+        if inst is None or inst.recovery_phase != "restoring":
+            return
+        RecoveryLifecycle(inst.recovery_phase).advance("slot_restored")
+        inst.recovery_phase = "slot_restored"
+
+    @classmethod
+    def begin_recovery_warmup(cls, operation_id: str) -> bool:
+        inst = cls._instance
+        if (
+            inst is None
+            or inst.recovery_operation_id != operation_id
+            or inst.recovery_phase != "slot_restored"
+        ):
+            return False
+        RecoveryLifecycle(inst.recovery_phase).advance("warming_up")
+        inst.recovery_phase = "warming_up"
+        return True
+
+    @classmethod
+    def complete_recovery_warmup(cls, operation_id: str, *, success: bool) -> bool:
+        inst = cls._instance
+        if (
+            inst is None
+            or inst.recovery_operation_id != operation_id
+            or inst.recovery_phase != "warming_up"
+        ):
+            return False
+        if not success:
+            inst.last_error = "Replacement-including recovery warmup failed."
+            return False
+        RecoveryLifecycle(inst.recovery_phase).advance(
+            "ready", warmup_succeeded=True
+        )
+        inst.recovery_phase = "ready"
+        inst.recovery_warmup_succeeded = True
+        inst.operation_succeeded = True
+        inst.last_error = None
+        return True
+
+    @classmethod
     def get_operation_id(cls) -> Optional[str]:
         inst = cls._instance
         return inst.operation_id if inst is not None else None
@@ -866,6 +908,14 @@ def maybe_recover_ep_ranks(
     ranks_to_recover = [
         i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
     ]
+    state = ElasticEPStateManager.instance()
+    if state is not None and state.recovery_phase == "restoring":
+        expected_rank = state.recovery_rank_offset
+        if ranks_to_recover != [expected_rank]:
+            ElasticEPStateManager.fail_recovery(
+                "Recovery operation no longer matches the inactive slot set."
+            )
+            return False
 
     # try_recover_ranks polls peer state via Mooncake EP backend.
     # Mooncake's internal semantics guarantee that all ranks observe

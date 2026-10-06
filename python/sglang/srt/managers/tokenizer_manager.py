@@ -90,6 +90,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    RecoverElasticEPReqInput,
+    RecoverElasticEPReqOutput,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
     SessionParams,
@@ -520,6 +522,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_ready_rank_count = 0
         self.elastic_joining_allocation_ids = []
         self._elastic_scale_lock = asyncio.Lock()
+        self.elastic_recovery_operation_id = None
+        self.elastic_recovery_topology_generation = None
+        self.elastic_recovery_allocation_id = None
+        self.elastic_recovery_rank_offset = None
+        self.elastic_recovery_phase = "idle"
+        self.elastic_recovery_succeeded = None
+        self._elastic_recovery_lock = asyncio.Lock()
         self.enable_metrics = get_observability().enable_metrics
         self.incremental_streaming_output = get_serving().incremental_streaming_output
         self.enable_lora = get_lora().enable_lora
@@ -3522,6 +3531,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._dispatch_to_scheduler(ranks)
 
     def forward_elastic_scale_update(self, msg: ElasticScaleUpdateReq):
+        if msg.recovery_update:
+            if msg.operation_id != self.elastic_recovery_operation_id:
+                logger.warning(
+                    "Ignoring stale Elastic EP recovery update for operation %s; current=%s",
+                    msg.operation_id,
+                    self.elastic_recovery_operation_id,
+                )
+                return
+            self.elastic_recovery_phase = msg.recovery_phase or "failed"
+            if msg.terminal:
+                self.elastic_recovery_succeeded = msg.success
+                self.elastic_last_error = None if msg.success else msg.error
+            return
         if not msg.operation_update:
             if msg.runtime_health is not None:
                 self.elastic_runtime_health = msg.runtime_health
@@ -3587,6 +3609,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "joining_rank_count": self.elastic_joining_rank_count,
             "ready_rank_count": self.elastic_ready_rank_count,
             "joining_allocation_ids": list(self.elastic_joining_allocation_ids),
+            "recovery_operation_id": self.elastic_recovery_operation_id,
+            "recovery_phase": self.elastic_recovery_phase,
+            "recovery_succeeded": self.elastic_recovery_succeeded,
+            "recovery_topology_generation": self.elastic_recovery_topology_generation,
+            "recovery_allocation_id": self.elastic_recovery_allocation_id,
+            "recovery_rank_offset": self.elastic_recovery_rank_offset,
         }
 
     async def scale_elastic_ep(
@@ -3595,6 +3623,96 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Send a scale request to every DP scheduler."""
         async with self._elastic_scale_lock:
             return await self._scale_elastic_ep_locked(obj)
+
+    async def recover_elastic_ep(
+        self, obj: RecoverElasticEPReqInput
+    ) -> RecoverElasticEPReqOutput:
+        """Fan out one fenced fixed-slot recovery operation to every scheduler."""
+        async with self._elastic_recovery_lock:
+            operation_id = obj.operation_id
+            existing = operation_id == self.elastic_recovery_operation_id
+            requested = (
+                obj.topology_generation,
+                obj.allocation_id,
+                obj.rank_offset,
+            )
+            current = (
+                self.elastic_recovery_topology_generation,
+                self.elastic_recovery_allocation_id,
+                self.elastic_recovery_rank_offset,
+            )
+            if existing:
+                if requested != current:
+                    return RecoverElasticEPReqOutput(
+                        success=False,
+                        conflict=True,
+                        message=(
+                            f"Recovery operation {operation_id} does not match "
+                            "its original fenced slot."
+                        ),
+                        operation_id=operation_id,
+                        recovery_phase=self.elastic_recovery_phase,
+                        terminal=self.elastic_recovery_succeeded is not None,
+                    )
+                return RecoverElasticEPReqOutput(
+                    success=self.elastic_recovery_succeeded is not False,
+                    message=(
+                        self.elastic_last_error
+                        if self.elastic_recovery_succeeded is False
+                        else f"Returning existing recovery operation {operation_id}."
+                    ),
+                    operation_id=operation_id,
+                    recovery_phase=self.elastic_recovery_phase,
+                    terminal=self.elastic_recovery_succeeded is not None,
+                )
+            if self.elastic_recovery_operation_id is not None and (
+                self.elastic_recovery_succeeded is None
+            ):
+                return RecoverElasticEPReqOutput(
+                    success=False,
+                    conflict=True,
+                    message="A previous Elastic EP recovery operation is pending.",
+                    operation_id=operation_id,
+                    recovery_phase=self.elastic_recovery_phase,
+                    terminal=True,
+                )
+
+            self.elastic_recovery_operation_id = operation_id
+            self.elastic_recovery_topology_generation = obj.topology_generation
+            self.elastic_recovery_allocation_id = obj.allocation_id
+            self.elastic_recovery_rank_offset = obj.rank_offset
+            self.elastic_recovery_phase = "submitting"
+            self.elastic_recovery_succeeded = None
+            scheduler_obj = RecoverElasticEPReqInput(
+                operation_id=operation_id,
+                runtime_instance_id=self.elastic_instance_id,
+                topology_generation=obj.topology_generation,
+                allocation_id=obj.allocation_id,
+                rank_offset=obj.rank_offset,
+                submission_id=uuid.uuid4().hex,
+            )
+            self.auto_create_handle_loop()
+            try:
+                responses: List[RecoverElasticEPReqOutput] = await asyncio.wait_for(
+                    self.recover_elastic_ep_communicator(scheduler_obj),
+                    timeout=self.elastic_scheduler_response_timeout,
+                )
+            except BaseException:
+                self.elastic_recovery_phase = "submission_unknown"
+                raise
+            if not responses:
+                self.elastic_recovery_phase = "submission_unknown"
+                raise RuntimeError("Recovery submission returned no scheduler responses.")
+            failed = next((response for response in responses if not response.success), None)
+            if failed is not None:
+                self.elastic_recovery_succeeded = False
+                self.elastic_recovery_phase = failed.recovery_phase
+                failed.operation_id = operation_id
+                return failed
+
+            self.elastic_recovery_phase = responses[0].recovery_phase
+            responses[0].operation_id = operation_id
+            return responses[0]
 
     def _current_elastic_scale_output(
         self, operation_id: str, new_ep_size: int
