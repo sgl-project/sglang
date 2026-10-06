@@ -1,7 +1,7 @@
 # docker build -t sglang:xpu -f xpu.Dockerfile --build-arg http_proxy=${http_proxy} --build-arg https_proxy=${https_proxy} --build-arg no_proxy=${no_proxy} --no-cache .
 
 # Use Intel deep learning essentials base image with Ubuntu 24.04
-FROM intel/deep-learning-essentials:2025.3.2-0-devel-ubuntu24.04
+FROM intel/deep-learning-essentials:2026.0.0-devel-ubuntu24.04
 
 # Avoid interactive prompts during package install
 ENV DEBIAN_FRONTEND=noninteractive
@@ -13,15 +13,21 @@ ARG SG_LANG_REPO=https://github.com/sgl-project/sglang.git
 ARG SG_LANG_BRANCH=main
 
 ARG SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
+# Branch, tag or commit SHA; only used when SG_LANG_KERNEL_SOURCE=source.
 ARG SG_LANG_KERNEL_BRANCH=main
+# wheel: prebuilt sglang-kernel-xpu pinned in pyproject_xpu.toml; source: build SG_LANG_KERNEL_BRANCH.
+ARG SG_LANG_KERNEL_SOURCE=wheel
+# AOT target for source builds (bmg | cri); set explicitly since no GPU is visible during docker build.
+ARG SG_LANG_KERNEL_TARGET=bmg
 
 USER root
 
 # Pin Level-Zero UMD + IGC (rolling PPA once faulted libze on B580; see sgl-kernel-xpu#296).
 # Keep in lockstep with the host xe KMD; override via --build-arg.
-ARG COMPUTE_RUNTIME_VERSION=26.05.37020.3
-ARG IGC_VERSION=2.28.4+20760
-ARG GMM_VERSION=22.9.0
+ARG COMPUTE_RUNTIME_VERSION=26.18.38308.1
+ARG IGC_VERSION=2.34.4+21428
+ARG GMM_VERSION=22.10.0
+
 RUN apt-get update && apt-get install -y software-properties-common curl && \
     add-apt-repository -y ppa:kobuk-team/intel-graphics && \
     apt-get update && \
@@ -57,10 +63,14 @@ RUN apt-get update && apt-get install -y software-properties-common curl && \
 RUN apt-get update && apt-get install -y \
     python3-dev \
     build-essential \
+    libssl-dev \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:$PATH"
+ENV PATH="/root/.local/bin:/root/.cargo/bin:$PATH"
+RUN curl --proto '=https' --retry 3 --retry-delay 2 --tlsv1.2 -sSf https://sh.rustup.rs \
+| sh -s -- -y --no-modify-path --profile minimal && rustc --version && cargo --version
 ENV VIRTUAL_ENV="/opt/venv"
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 RUN uv venv --python ${PYTHON_VERSION} --seed ${VIRTUAL_ENV}
@@ -68,14 +78,44 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 WORKDIR /sgl-workspace
 
-RUN  pip install --no-cache-dir msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore && \
-     pip install --no-cache-dir torch==2.12.0+xpu torchvision==0.27.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
+RUN pip install --no-cache-dir torch==2.13.0+xpu torchvision==0.28.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu && \
+    pip install --no-cache-dir msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore
 
 RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} sglang && \
+    git -C sglang fetch --tags --force origin && \
     cd sglang && cd python && \
     cp pyproject_xpu.toml pyproject.toml && \
-    pip install --no-cache-dir . --extra-index-url https://download.pytorch.org/whl/xpu && \
+    pip install --no-cache-dir ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-cache-dir --no-deps xgrammar==0.1.33
 
-CMD ["bash", "-c", "source /opt/intel/oneapi/setvars.sh --force && exec bash"]
+# Optionally replace the prebuilt kernel wheel with a source build. --no-build-isolation
+# so CMake finds the installed torch; build/ is removed to keep the image small.
+RUN if [ "${SG_LANG_KERNEL_SOURCE}" = "source" ]; then \
+        echo "Building sgl-kernel-xpu ${SG_LANG_KERNEL_BRANCH} from ${SG_LANG_KERNEL_REPO} for ${SG_LANG_KERNEL_TARGET}" && \
+        git clone ${SG_LANG_KERNEL_REPO} sgl-kernel-xpu && \
+        git -C sgl-kernel-xpu checkout ${SG_LANG_KERNEL_BRANCH} && \
+        git -C sgl-kernel-xpu log -1 --format='sgl-kernel-xpu commit: %H %s' && \
+        pip install --no-cache-dir "scikit-build-core>=0.10" wheel cmake ninja && \
+        pip install -v --no-cache-dir --no-build-isolation --no-deps --force-reinstall \
+            --config-settings=cmake.define.DPCPP_SYCL_TARGET=${SG_LANG_KERNEL_TARGET} \
+            ./sgl-kernel-xpu && \
+        rm -rf sgl-kernel-xpu/build; \
+    elif [ "${SG_LANG_KERNEL_SOURCE}" != "wheel" ]; then \
+        echo "Invalid SG_LANG_KERNEL_SOURCE=${SG_LANG_KERNEL_SOURCE} (expected wheel or source)" && exit 1; \
+    fi
+
+# Install torch_memory_saver for release/resume_memory_occupation ("memory saver").
+# XPU ships no prebuilt wheel: it is built from source against the local oneAPI +
+# torch-XPU runtime (the .so links libsycl.so.<N>, which must match the installed
+# intel-sycl-rt). TMS_PLATFORM=xpu forces the XPU backend; --no-build-isolation
+# lets the build import the installed torch (above) so it can match the libsycl
+# major to it -- under build isolation torch is absent and the match is skipped.
+# Pinned (v0.0.10b2) so image builds are reproducible; bump via --build-arg.
+ARG TORCH_MEMORY_SAVER_REF=a5c99f11b18ebb8e9fda71a68812e476ae49e417
+# Base image already applies setvars.sh in its own layers (SETVARS_COMPLETED=1,
+# icpx on PATH, LIBRARY_PATH/CPATH populated), so re-sourcing here is redundant.
+RUN TMS_PLATFORM=xpu pip install --no-cache-dir --no-build-isolation \
+    git+https://github.com/fzyzcjy/torch_memory_saver.git@${TORCH_MEMORY_SAVER_REF}
+
+CMD ["bash"]

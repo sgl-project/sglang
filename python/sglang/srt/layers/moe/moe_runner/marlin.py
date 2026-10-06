@@ -43,7 +43,7 @@ def _fused_unpack_packed_topk(packed: torch.Tensor):
 
     Returns (topk_ids int32, topk_weights float32). Collapses the ~5 elementwise
     ops (shift / mask / int16 / bitcast / cast) the torch reference emits per call
-    into one Triton launch. Mirrors _pack_topk_kernel (trtllm_lora_temp/topk_pack).
+    into one Triton launch. Mirrors _pack_topk_kernel (ops/lora/moe/trtllm_lora_temp/topk_pack).
     """
     packed = packed.contiguous()
     ids = torch.empty_like(packed, dtype=torch.int32)

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
@@ -18,21 +19,22 @@ use dynamo_protocols::types::{
     CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
 use futures::StreamExt;
-use tokio::sync::mpsc;
 
-use super::super::guard::AbortGuard;
-use super::super::submit::submit;
 use super::{
-    AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_egress_stream,
+    AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
     openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::ids::Rid;
-use crate::message::{
-    ChunkEvent, ChunkExtras, EgressItem, GenerateRequest, Matched, OneOrMany, RequestKind,
-    SamplingParams, TokenIds,
+use crate::api_server::frontend_error_status;
+use crate::frontend::{
+    FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest,
 };
+use crate::message::finish_reason::Matched;
+use crate::message::ids::Rid;
+use crate::message::response::ChunkExtras;
+use crate::message::sampling::SamplingParams;
+use crate::message::types::{OneOrMany, TokenIds};
 
-pub(super) fn routes() -> Router<AppState> {
+pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/completions", post(completions))
 }
 
@@ -45,20 +47,19 @@ enum PromptSpec {
 pub(super) struct SubmittedChoice {
     pub(super) index: usize,
     pub(super) prompt_index: usize,
-    pub(super) rid: Rid,
     pub(super) echo: String,
-    pub(super) rx: mpsc::Receiver<EgressItem>,
+    pub(super) call: FrontendCall,
 }
 #[derive(Debug, Default)]
 pub(super) struct ChoiceExtensions {
     matched_stop: Option<serde_json::Value>,
     /// Dynamo's enum covers the standard values. Python additionally exposes
-    /// `abort`, and native unknown finish types are preserved rather than lost.
+    /// `abort`; unrecognized scheduler finish types are preserved as well.
     finish_reason_override: Option<String>,
 }
 
 async fn completions(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     body: Result<Json<CreateCompletionRequest>, JsonRejection>,
 ) -> Response {
     let request = match body {
@@ -123,11 +124,7 @@ async fn completions(
     };
     if let Err(error) = sampling.normalize(
         state.server_args.skip_tokenizer_init,
-        state
-            .server_args
-            .model_config
-            .vocab_size
-            .unwrap_or(u64::MAX),
+        state.server_args.model_config.vocab_size,
     ) {
         return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false);
     }
@@ -145,7 +142,6 @@ async fn completions(
     };
     let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
     let created = unix_seconds_u32();
-    let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut submitted = Vec::with_capacity(choice_count);
 
     for (prompt_index, prompt) in prompts.into_iter().enumerate() {
@@ -168,7 +164,7 @@ async fn completions(
                     Err(response) => return response,
                 };
             }
-            let native = GenerateRequest {
+            let native = FrontendRequest {
                 rid: rid.clone(),
                 text: text.clone(),
                 input_ids: input_ids.clone(),
@@ -184,16 +180,15 @@ async fn completions(
                 return_text_in_logprobs: request.logprobs.map(|_| true),
                 ..Default::default()
             };
-            let rx = match submit_generation(&state, native, stream, &mut guard).await {
-                Ok(rx) => rx,
+            let call = match submit_generation(&state, native, stream).await {
+                Ok(call) => call,
                 Err(response) => return response,
             };
             submitted.push(SubmittedChoice {
                 index,
                 prompt_index,
-                rid,
                 echo: prompt_echo.clone(),
-                rx,
+                call,
             });
         }
     }
@@ -211,7 +206,6 @@ async fn completions(
         let want_logprobs = request.logprobs.is_some();
         let s = completion_event_stream(
             submitted,
-            guard,
             response_id,
             model,
             created,
@@ -225,7 +219,6 @@ async fn completions(
     } else {
         unary_completion(
             submitted,
-            guard,
             response_id,
             model,
             created,
@@ -237,45 +230,35 @@ async fn completions(
 }
 
 /// Decode a token-id prompt back to text for `echo=true`, via a
-/// `RequestKind::Detokenize` request through the regular submit path — the
+/// detokenize operation through the shared frontend handle — the
 /// detok stage answers it with a single `Data` payload (the raw UTF-8 text),
 /// or an `Error` (e.g. out-of-range ids → `Validation` → 400).
 async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<String, Response> {
-    let Ok((_rid, mut rx)) = submit(state, RequestKind::Detokenize { token_ids }, false).await
-    else {
-        // Same rule as `submit_generation`: rebuild the refusal in the OpenAI
+    match state.frontend.detokenize(token_ids).await {
+        Ok(text) => Ok(text),
+        // Same rule as `submit_generation`: build the refusal in the OpenAI
         // error shape rather than forwarding the native-shaped response.
-        return Err(openai_error(
+        Err(FrontendError::Unavailable) => Err(openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "service unavailable",
             false,
-        ));
-    };
-    match rx.recv().await {
-        Some(EgressItem::Data(payload)) => String::from_utf8(payload.to_vec()).map_err(|_| {
-            openai_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "detokenized prompt is not valid UTF-8",
-                false,
-            )
-        }),
-        Some(EgressItem::Error(crate::error::Error::Validation(message))) => {
+        )),
+        Err(FrontendError::InvalidArgument(message)) => {
             Err(openai_error(StatusCode::BAD_REQUEST, &message, false))
         }
-        Some(EgressItem::Error(error)) => {
-            let status = StatusCode::from_u16(error.http_status())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        Err(FrontendError::InvalidResponse(message)) => Err(openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+            false,
+        )),
+        Err(error) => {
+            let status = frontend_error_status(&error);
             Err(openai_error(
                 status,
                 format!("failed to decode prompt for echo: {error}"),
                 false,
             ))
         }
-        Some(_) | None => Err(openai_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to decode prompt for echo: reply channel closed",
-            false,
-        )),
     }
 }
 
@@ -307,11 +290,9 @@ fn token_prompt_spec(ids: &[u32]) -> Result<PromptSpec, String> {
     if ids.is_empty() {
         return Err("Prompt cannot be empty".into());
     }
-    let input_ids = ids
-        .iter()
-        .map(|&id| i32::try_from(id).map_err(|_| format!("Token ID {id} is out of range")))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(PromptSpec::TokenIds(input_ids))
+    Ok(PromptSpec::TokenIds(
+        ids.iter().map(|&id| i64::from(id)).collect(),
+    ))
 }
 
 fn completion_sampling_params(request: &CreateCompletionRequest) -> Result<SamplingParams, String> {
@@ -357,7 +338,6 @@ fn completion_sampling_params(request: &CreateCompletionRequest) -> Result<Sampl
 
 pub(super) async fn unary_completion(
     submitted: Vec<SubmittedChoice>,
-    mut guard: AbortGuard,
     response_id: String,
     model: String,
     created: u32,
@@ -373,7 +353,7 @@ pub(super) async fn unary_completion(
     let mut completion_tokens = 0u64;
 
     for choice in submitted {
-        let output = match collect_output(choice.rx, &mut guard, &choice.rid).await {
+        let output = match collect_output(choice.call).await {
             Ok(output) => output,
             Err((status, message)) => {
                 return openai_error(status, &message, false);
@@ -426,7 +406,7 @@ pub(super) async fn unary_completion(
 fn completion_choice(
     index: usize,
     text: String,
-    output: &ChunkEvent,
+    output: &FrontendOutput,
     want_logprobs: bool,
     include_input_logprobs: bool,
 ) -> (Choice, ChoiceExtensions) {
@@ -446,7 +426,7 @@ fn completion_choice(
             Matched::Token(id) => serde_json::json!(id),
             Matched::Str(value) => serde_json::json!(value),
             // Python's OpenAI schema supports an integer or string here, not a
-            // multi-token list. Preserve the native value rather than dropping it.
+            // multi-token list. Preserve the original token IDs.
             Matched::Tokens(ids) => serde_json::json!(ids),
         });
     (
@@ -514,7 +494,6 @@ pub(super) fn completion_response_value(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn completion_event_stream(
     submitted: Vec<SubmittedChoice>,
-    mut guard: AbortGuard,
     response_id: String,
     model: String,
     created: u32,
@@ -525,7 +504,6 @@ pub(super) fn completion_event_stream(
 ) -> impl futures::Stream<Item = String> {
     async_stream::stream! {
         let count = submitted.len();
-        let mut rids = Vec::with_capacity(count);
         let mut prompt_indexes = Vec::with_capacity(count);
         let mut echoes = Vec::with_capacity(count);
         let mut first_chunks = vec![true; count];
@@ -535,40 +513,20 @@ pub(super) fn completion_event_stream(
 
         for choice in submitted {
             let index = choice.index;
-            rids.push(choice.rid);
             prompt_indexes.push(choice.prompt_index);
             echoes.push(choice.echo);
-            streams.push(indexed_egress_stream(index, choice.rx));
+            streams.push(indexed_decode_stream(index, choice.call));
         }
         let mut events = futures::stream::select_all(streams);
 
-        while let Some((index, item)) = events.next().await {
-            let Some(item) = item else {
-                yield error_payload(StatusCode::INTERNAL_SERVER_ERROR, "response truncated before completion").to_string();
-                continue;
-            };
-            let output = match item {
-                EgressItem::Frame(output) => output,
-                EgressItem::Done(output) => {
-                    guard.disarm(&rids[index]);
-                    output
-                }
-                EgressItem::Error(error) => {
-                    guard.disarm(&rids[index]);
-                    yield error_payload(StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.to_string()).to_string();
+        while let Some((index, event)) = events.next().await {
+            let output = match event {
+                FrontendEvent::Delta(output) | FrontendEvent::Finished(output) => output,
+                FrontendEvent::Failed(error) => {
+                    yield error_payload(frontend_error_status(&error), error.to_string()).to_string();
                     continue;
                 }
-                EgressItem::Control(_) | EgressItem::Data(_) => continue,
             };
-
-            if let Some((code, message)) = output
-                .finish_reason
-                .as_ref()
-                .and_then(|reason| reason.abort_status())
-            {
-                yield error_payload(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), message).to_string();
-                continue;
-            }
 
             prompt_tokens_by_prompt
                 .entry(prompt_indexes[index])
@@ -733,13 +691,12 @@ fn append_top_logprobs(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{chunk, senders, submitted};
+    use super::super::test_utils::{chunk, submitted};
     use super::{
         ChoiceExtensions, PromptSpec, completion_event_stream, completion_logprobs,
         completion_prompt_specs, completion_response_value, unary_completion,
     };
-    use crate::api_server::guard::AbortGuard;
-    use crate::message::ChunkExtras;
+    use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
     use dynamo_protocols::types::{
         Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
@@ -829,7 +786,6 @@ mod tests {
 
         let response = unary_completion(
             vec![choice0, choice1],
-            AbortGuard::new_empty(senders()),
             "cmpl-test".into(),
             "model".into(),
             1,
@@ -857,7 +813,6 @@ mod tests {
 
         let stream = completion_event_stream(
             vec![choice],
-            AbortGuard::new_empty(senders()),
             "cmpl-test".into(),
             "model".into(),
             1,

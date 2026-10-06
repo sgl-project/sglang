@@ -8,7 +8,7 @@ from typing import Dict, List, Optional
 
 from cuda.bindings import driver as cuda
 
-from sglang.srt.cuda_vmm_utils import (
+from sglang.srt.utils.cuda_vmm_utils import (
     VmmReservation,
     align_up,
     check_drv,

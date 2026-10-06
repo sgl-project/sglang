@@ -23,7 +23,7 @@ uv venv --python 3.12 && source .venv/bin/activate
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 git fetch origin pull/33829/head && git checkout FETCH_HEAD
-uv pip install -e python
+uv pip install --prerelease=allow -e python
 ```
 
 Then run the **Python** output of the command panel below in that environment.
@@ -57,6 +57,14 @@ import { config }     from "/src/snippets/configs/rednote/dots3-note.jsx";
 
 <Deployment config={config} />
 
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations signed off on this page; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
 ## 1. Model Introduction
 
 dots3.note is RedNote's native multimodal omni model, built on the dots3 language model. It accepts text, image, audio, and native video input.
@@ -66,7 +74,12 @@ dots3.note is RedNote's native multimodal omni model, built on the dots3 languag
 - **Hybrid attention** — dots3 combines MLA with full-attention and sliding-window layers of different geometry, attention gates, and optional DSA indexing on full-attention layers.
 - **MTP speculative decoding** — a full-sharing MTP/NextN architecture exposes one recursively shared, SWA-shaped MTP layer and shares the target LM head.
 
-**Resources:** [Hugging Face](https://huggingface.co/dots-studio/dots3-note-prev) · [SGLang PR #33829](https://github.com/sgl-project/sglang/pull/33829)
+**Available checkpoints:**
+
+- **BF16**: [dots-studio/dots3-note-prev](https://huggingface.co/dots-studio/dots3-note-prev)
+- **FP8**: [dots-studio/dots3-note-prev-fp8](https://huggingface.co/dots-studio/dots3-note-prev-fp8)
+
+**Resources:** [Hugging Face (BF16)](https://huggingface.co/dots-studio/dots3-note-prev) · [Hugging Face (FP8)](https://huggingface.co/dots-studio/dots3-note-prev-fp8) · [SGLang PR #33829](https://github.com/sgl-project/sglang/pull/33829)
 
 ## 2. Configuration Tips
 
@@ -112,10 +125,12 @@ response = client.chat.completions.create(
         }
     ],
     extra_body={
-        "seq": 131072,
-        "audio_cap": 0.5,
-        "audio_sr": 16000,
-        "k_mode": "eval_ek",
+        "video_config": {
+            "seq": 131072,
+            "audio_cap": 0.5,
+            "audio_sr": 16000,
+            "k_mode": "eval_ek",
+        },
     },
 )
 
@@ -132,28 +147,93 @@ Pending update...
 
 </Accordion>
 
-Per-request video preprocessing controls (all optional, passed via `extra_body`):
+Per-request video preprocessing controls are grouped under `video_config` in
+`extra_body`:
 
-| Field | Default | Purpose |
-|-------|---------|---------|
-| `seq` | `131072` | Total sequence budget used by the video flattener. |
-| `audio_cap` | `1.0` | Maximum fraction of the input budget assigned to audio; `0` disables audio processing. |
-| `audio_sr` | `16000` | Audio sample rate. |
-| `k_mode` | `eval_ek` | Deterministic evaluation/sampling mode of the flattener. |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "22%"}} />
+    <col style={{width: "18%"}} />
+    <col style={{width: "60%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Field</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Purpose</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>seq</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>131072</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Total sequence budget used by the video flattener.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>audio_cap</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>1.0</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum fraction of the input budget assigned to audio; <code>0</code> disables audio processing.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>audio_sr</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>16000</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Audio sample rate.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>k_mode</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>eval_ek</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Deterministic evaluation/sampling mode of the flattener.</td>
+    </tr>
+  </tbody>
+</table>
 
-These controls are request-scoped so that evaluation jobs with different context budgets can share one server. The flattener reserves room for `max_new_tokens` inside the budget and falls back to visual-only processing if audio would exceed the configured token budget.
+These controls are request-scoped so that evaluation jobs with different context budgets can share one server. For example: `extra_body={"video_config": {"seq": 131072, "audio_cap": 0.5}}`. The flattener reserves room for `max_new_tokens` inside the budget and falls back to visual-only processing if audio would exceed the configured token budget.
 
-<Warning>
-Native video currently supports one video per request, and a native video cannot be mixed with separate image or audio inputs in the same request.
-</Warning>
+A request may carry several videos, and videos can be mixed with image and audio parts. Each video is flattened independently under the same per-request budget, and the flattened frames and audio segments are spliced back at the position of their `video_url` part, so the modality ordering of the prompt is preserved.
 
 ### 3.2 Image and audio input
 
-Outside the native-video path, images and audio clips use the standard OpenAI multimodal message format and SGLang's multimodal serving (`--enable-multimodal` is in every cell). The vision and audio towers run in-process, so no extra server is needed.
+Outside the native-video path, images and audio clips use the standard OpenAI multimodal message format. `--enable-multimodal` is in every cell; the vision and audio towers run in-process, so no extra server is needed.
+
+<Accordion title="Image Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="dots3.note",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/sample.jpg"},
+                },
+                {"type": "text", "text": "Describe this image."},
+            ],
+        }
+    ],
+)
+
+print(response.choices[0].message.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update...
+```
+
+</Accordion>
 
 ### 3.3 Tool Calling
 
-The cells launch with `--tool-call-parser dots`, so structured tool calls surface via `message.tool_calls` out of the box.
+Toggle **Tool Call Parser** (`--tool-call-parser dots`) and **Reasoning Parser** (`--reasoning-parser dots`) in the **Parsers** card of the [Playground above](#playground). Structured tool calls then surface via `message.tool_calls`.
 
 <Accordion title="Tool Calling Example (Python)">
 
@@ -195,7 +275,7 @@ Pending update...
 
 ### 3.4 Encoder/LLM Disaggregation (EPD)
 
-`Dot3NoteForCausalLM` supports both roles of an encoder/LLM-disaggregated deployment:
+`Dots3NoteForCausalLM` supports both roles of an encoder/LLM-disaggregated deployment:
 
 - **Encoder role** — serve with `--encoder-only`; the instance runs only the vision and audio towers.
 - **Language role** — serve with `--language-only`; the instance skips tower construction, leaving the memory to the language model.

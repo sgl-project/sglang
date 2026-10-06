@@ -171,7 +171,6 @@ def block_quant_dequant(
 
 
 class TestDeepGemmBlackwell(CustomTestCase):
-
     if not _is_cuda:
         OUT_DTYPES = [torch.float32, torch.half, torch.bfloat16]
         M = [1, 7, 83, 512, 2048]

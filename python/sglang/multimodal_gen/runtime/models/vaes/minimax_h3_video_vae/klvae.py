@@ -14,6 +14,7 @@ from diffusers.models import ModelMixin
 from diffusers.utils import logging
 from PIL import Image
 
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_group_coordinator,
     get_decode_parallel_rank,
@@ -206,6 +207,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             "pixel_norm_type": self.pixel_norm_type,
             "transform": self.transform,
             "transform_rev": self.transform_rev,
+            "transform_rev_inplace": self.transform_rev_inplace,
             "use_3d_conv": self.use_3d_conv,
         }
         if hasattr(self, "processor"):
@@ -500,6 +502,17 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         dec = self._assemble_tiles(rows, y_overlap, x_overlap)
         return dec
+
+    def enable_tiling(self) -> None:
+        """Turn on tiled decode for subsequent decodes.
+
+        `decoder_tiling` is read per decode in `_adaptive_decode`, so setting
+        it here takes effect on the next call. Models that already tile from
+        their VAE config (MiniMax-H3) are unaffected; this exists so the
+        runtime `--vae-tiling` switch reaches this VAE at all instead of
+        raising into the caller's guard.
+        """
+        self.decoder_tiling = True
 
     def _adaptive_encode(self, x):
         if self.encoder_tiling:
@@ -1219,6 +1232,9 @@ class AutoencoderKLLegacy(AutoencoderKL):
 
         self.transform = get_normalize_transform(pixel_norm_type)
         self.transform_rev = get_denormalize_transform(pixel_norm_type)
+        self.transform_rev_inplace = get_denormalize_transform(
+            pixel_norm_type, inplace=True
+        )
 
         self.use_3d_conv = use_3d_conv
         self.causal_encoder = causal_encoder
@@ -1270,6 +1286,7 @@ class AutoencoderKLLegacy(AutoencoderKL):
         self.decoder = ViT3DDecoder(**vit_kwargs)
 
     @torch.no_grad()
+    @cached_vae_encode
     def encode(self, x):
         return self.quant_conv(self.encoder(x))
 

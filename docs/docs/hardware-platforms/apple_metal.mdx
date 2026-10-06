@@ -4,20 +4,31 @@ metatags:
     description: "Run SGLang on Apple Silicon using the Metal backend."
 ---
 
-This document describes how run SGLang on Apple Silicon using [Metal (MLX)](https://opensource.apple.com/projects/mlx/). If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
+This document describes how to run the SGLang serving runtime on Apple Silicon
+using [MLX](https://opensource.apple.com/projects/mlx/). SGLang Diffusion uses
+PyTorch MPS instead; see its [installation guide](/docs/sglang-diffusion/installation#platform-specific-apple-mps).
+If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
 ## Prerequisites
 
-Building the native Metal kernels in `sgl-kernel` requires the Apple
-toolchain (`clang++`, the Metal framework headers, and `xcrun`). These ship
-with the **Xcode Command Line Tools**, which cannot be installed via `pip`:
+The MLX runtime requires Apple Silicon with macOS 14 or newer, stable PyTorch
+2.13.x, and stable MLX 0.32.0 or newer. The `srt_mps` extra installs PyTorch
+2.13.0 and MLX 0.32.0 or newer; startup accepts stable PyTorch 2.13 patch
+releases and newer stable MLX releases.
+
+With `SGLANG_USE_MLX=1`, SGLang validates both framework versions and Metal
+availability during argument initialization and stops before resolving or
+downloading a model when the runtime is incompatible.
+
+Building the optional native Metal kernels in `sgl-kernel` requires the Metal
+shader compiler from the full Xcode application. The standalone Xcode Command
+Line Tools are not sufficient. After installing Xcode, select it with:
 
 ```bash
-xcode-select --install
+sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 ```
 
-If you have the full Xcode app installed, the Command Line Tools are already
-available. You can verify with `xcode-select -p && xcrun --find metal`.
+Verify the compiler with `xcrun -sdk macosx metal --version`.
 
 ## Install SGLang
 
@@ -89,15 +100,15 @@ The MLX backend supports two quantization paths on Apple Silicon:
 
 ## Benchmarking with Requests
 
-`sglang.benchmark_one_batch` calls the synchronous prefill/decode methods directly without going through the scheduler and the overlap code path.
+`sglang.benchmark.one_batch` calls the synchronous prefill/decode methods directly without going through the scheduler and the overlap code path.
 
-`sglang.benchmark_offline_throughput` can toggle overlap scheduling as it uses the scheduler and the overlap code path by using the flag `--disable-overlap-schedule`.
+`sglang.benchmark.offline_throughput` can toggle overlap scheduling as it uses the scheduler and the overlap code path by using the flag `--disable-overlap-schedule`.
 
 ### Throughput Testing
 
 Basic synchronous one batch throughput:
 ```bash
-SGLANG_USE_MLX=1 python -m sglang.bench_one_batch \
+SGLANG_USE_MLX=1 python -m sglang.benchmark.one_batch \
   --model-path <MODEL_ID_OR_PATH> \
   --disable-cuda-graph \
   --tp-size 1 \
@@ -108,7 +119,7 @@ SGLANG_USE_MLX=1 python -m sglang.bench_one_batch \
 
 Synchronous offline throughput:
 ```bash
-SGLANG_USE_MLX=1 python -m sglang.bench_offline_throughput \
+SGLANG_USE_MLX=1 python -m sglang.benchmark.offline_throughput \
   --model-path <MODEL_ID_OR_PATH> \
   --disable-cuda-graph \
   --num-prompts 1 \
@@ -117,7 +128,7 @@ SGLANG_USE_MLX=1 python -m sglang.bench_offline_throughput \
 
 Asynchronous offline throughput:
 ```bash
-SGLANG_USE_MLX=1 python -m sglang.bench_offline_throughput \
+SGLANG_USE_MLX=1 python -m sglang.benchmark.offline_throughput \
   --model-path <MODEL_ID_OR_PATH> \
   --disable-cuda-graph \
   --num-prompts 1

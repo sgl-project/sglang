@@ -53,7 +53,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoiceFuncName,
 )
 from sglang.srt.observability.req_time_stats import monotonic_time
-from sglang.srt.parser.template_detection import detect_inline_system_support
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -190,18 +189,7 @@ class AnthropicServing:
 
     def __init__(self, openai_serving_chat: OpenAIServingChat):
         self.openai_serving_chat = openai_serving_chat
-        self._merge_inline_system = not detect_inline_system_support(
-            self._chat_template()
-        )
-
-    def _chat_template(self) -> Optional[str]:
-        tokenizer_manager = getattr(self.openai_serving_chat, "tokenizer_manager", None)
-        if tokenizer_manager is None:
-            return None
-        tokenizer = getattr(tokenizer_manager, "tokenizer", None)
-        if tokenizer is None:
-            return None
-        return getattr(tokenizer, "chat_template", None)
+        self._merge_inline_system = not openai_serving_chat.supports_inline_system
 
     async def handle_messages(
         self,
@@ -368,8 +356,12 @@ class AnthropicServing:
 
         def _convert_assistant_thinking_blocks(
             blocks: list[AnthropicContentBlock],
-        ) -> Optional[str]:
-            """Re-wrap prior-turn thinking blocks in the parser's own tokens.
+        ) -> tuple[Optional[str], Optional[str]]:
+            """Reconstruct prior-turn thinking as ``(reasoning_content, text)``.
+
+            At most one is set: encoders that frame the reasoning channel take
+            it as ``reasoning_content``, everything else gets it re-wrapped and
+            spliced into content.
 
             ``redacted_thinking`` carries encrypted bytes that no local
             parser can interpret, so we raise rather than silently drop it.
@@ -387,11 +379,15 @@ class AnthropicServing:
                 if block.type == "thinking" and block.thinking
             ]
             if not thinking_parts:
-                return None
+                return None, None
+
+            reasoning_text = "\n".join(thinking_parts)
+            if self.openai_serving_chat.supports_native_reasoning_history():
+                return reasoning_text, None
 
             try:
-                return self.openai_serving_chat.wrap_reasoning_history(
-                    "\n".join(thinking_parts)
+                return None, self.openai_serving_chat.wrap_reasoning_history(
+                    reasoning_text
                 )
             except ValueError as e:
                 logger.warning(
@@ -399,7 +395,7 @@ class AnthropicServing:
                     len(thinking_parts),
                     e,
                 )
-                return None
+                return None, None
 
         system_parts: list[str] = []
         if anthropic_request.system:
@@ -454,7 +450,11 @@ class AnthropicServing:
             tool_calls: list[dict] = []
 
             if msg.role == "assistant":
-                reasoning_history = _convert_assistant_thinking_blocks(msg.content)
+                reasoning_content, reasoning_history = (
+                    _convert_assistant_thinking_blocks(msg.content)
+                )
+                if reasoning_content is not None:
+                    openai_msg["reasoning_content"] = reasoning_content
                 if reasoning_history is not None:
                     content_parts.append({"type": "text", "text": reasoning_history})
 
@@ -555,6 +555,7 @@ class AnthropicServing:
             "model": anthropic_request.model,
             "max_tokens": anthropic_request.max_tokens,
             "stream": anthropic_request.stream or False,
+            **anthropic_request.pd_routing_kwargs(),
         }
 
         if anthropic_request.temperature is not None:
@@ -1057,8 +1058,7 @@ class AnthropicServing:
                 effective_finish = finish_reason or "stop"
                 if effective_finish not in STOP_REASON_MAP:
                     logger.warning(
-                        "Unmapped streaming finish_reason %r; defaulting "
-                        "to end_turn",
+                        "Unmapped streaming finish_reason %r; defaulting to end_turn",
                         effective_finish,
                     )
                 stop_reason = STOP_REASON_MAP.get(effective_finish, "end_turn")

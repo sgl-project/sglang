@@ -15,6 +15,7 @@ use axum::routing::{post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::utils::environ;
 use crate::utils::response::json_error;
 use crate::utils::serialize::{parse_int, parse_int_opt, parse_int_vec};
 
@@ -39,6 +40,8 @@ struct PrefillServerInfo {
     pp_size: i64,
     page_size: Option<i64>,
     kv_cache_dtype: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dsv41_spec_layout: Option<serde_json::Value>,
     follow_bootstrap_room: bool,
     enable_dsa_cache_layer_split: bool,
     prefill_http_port: Option<i64>,
@@ -105,6 +108,7 @@ struct Topology {
     pp_size: Option<i64>,
     page_size: Option<i64>,
     kv_cache_dtype: Option<String>,
+    dsv41_spec_layout: Option<serde_json::Value>,
     follow_bootstrap_room: Option<bool>,
     enable_dsa_cache_layer_split: Option<bool>,
     prefill_http_port: Option<i64>,
@@ -152,6 +156,8 @@ struct Route {
     page_size: i64,
     #[serde(default)]
     kv_cache_dtype: Option<String>,
+    #[serde(default)]
+    dsv41_spec_layout: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "parse_int_opt")]
     prefill_http_port: Option<i64>,
     #[serde(default)]
@@ -175,8 +181,15 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
 
     // Copy-on-write update. `rcu` may re-run the closure under write
     // contention, so it only reads `body` and clones what it stores.
+    let mut layout_mismatch = false;
     state.topology.rcu(|current| {
         let mut topo = (**current).clone();
+        layout_mismatch =
+            topo.registered_count > 0 && topo.dsv41_spec_layout != body.dsv41_spec_layout;
+        if layout_mismatch {
+            return topo;
+        }
+        topo.dsv41_spec_layout = body.dsv41_spec_layout.clone();
         topo.attn_tp_size.get_or_insert(body.attn_tp_size);
         topo.attn_cp_size.get_or_insert(body.attn_cp_size);
         topo.dp_size.get_or_insert(dp_size);
@@ -206,6 +219,13 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         topo.registered_count += 1;
         topo
     });
+
+    if layout_mismatch {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "DeepSeek-V4.1 DSpark PD layout differs across prefill ranks",
+        );
+    }
 
     let topo = state.topology.load();
     tracing::debug!(
@@ -261,6 +281,7 @@ async fn route_get(
             pp_size: topo.pp_size.unwrap(),
             page_size: topo.page_size,
             kv_cache_dtype: topo.kv_cache_dtype.clone(),
+            dsv41_spec_layout: topo.dsv41_spec_layout.clone(),
             follow_bootstrap_room: topo.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: topo.enable_dsa_cache_layer_split.unwrap_or(false),
             prefill_http_port: topo.prefill_http_port,
@@ -337,10 +358,13 @@ fn router(state: Arc<Registry>) -> Router {
 
 /// Drop room entries
 async fn cleanup_sweeper(state: Arc<Registry>) {
-    let cleanup_interval = Duration::from_secs(crate::environ::env_u64(
-        ENTRY_CLEANUP_INTERVAL_ENV,
-        ENTRY_CLEANUP_INTERVAL_DEFAULT_SECS,
-    ));
+    let cleanup_interval = Duration::from_secs(
+        environ::env_i64(
+            ENTRY_CLEANUP_INTERVAL_ENV,
+            ENTRY_CLEANUP_INTERVAL_DEFAULT_SECS as i64,
+        )
+        .max(0) as u64,
+    );
     loop {
         tokio::time::sleep(cleanup_interval).await;
         state.rooms.sweep(cleanup_interval);
@@ -356,7 +380,10 @@ pub(crate) fn router_and_sweeper() -> (Router, impl std::future::Future<Output =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{Runtime, RuntimeConfig, RustServerServerArgs, ServerArgs};
+    use crate::message::config::{
+        DisaggregationMode, RuntimeConfig, RustServerServerArgs, ServerArgs,
+    };
+    use crate::runtime::Runtime;
     use std::io::{Read, Write};
     use std::net::SocketAddr;
 
@@ -413,35 +440,36 @@ mod tests {
     const SENTINEL: &str =
         "/route?prefill_dp_rank=-1&prefill_cp_rank=-1&target_tp_rank=-1&target_pp_rank=-1";
 
-    /// Minimal prefill boot blob (same shape as the `runtime` tests): no
-    /// tokenizer load, the two mandatory `model_config` fields, and the
-    /// prefill role that mounts the registry.
-    const TEST_SERVER_ARGS: &str = r#"{
-        "skip_tokenizer_init": true,
-        "disaggregation_mode": "prefill",
-        "model_config": {"context_len": 2048, "vocab_size": 1000}
-    }"#;
+    /// Minimal boot config (same shape as the `runtime` tests): no tokenizer
+    /// load, a complete default `model_config`, and the given PD role.
+    fn test_server_args(disaggregation_mode: DisaggregationMode) -> ServerArgs {
+        ServerArgs {
+            skip_tokenizer_init: true,
+            disaggregation_mode,
+            ..Default::default()
+        }
+    }
 
     /// Pick a free port (probe-bind pattern, as in the `runtime` tests) and
     /// boot the full runtime there with the bootstrap registry mounted — the
     /// registry serves on the api listener, so these tests also pin the merge
     /// wiring (including the `enable_pd_bootstrap()` derivation from the
-    /// blob), not just the handlers.
+    /// role), not just the handlers.
     fn start_on_free_port() -> (Runtime, SocketAddr) {
-        start_runtime(TEST_SERVER_ARGS)
+        start_runtime(test_server_args(DisaggregationMode::Prefill))
     }
 
-    fn start_runtime(server_args_json: &str) -> (Runtime, SocketAddr) {
+    fn start_runtime(server_args: ServerArgs) -> (Runtime, SocketAddr) {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr: addr,
-                api_worker_num: 1,
+                http_api_worker_num: 1,
                 ..Default::default()
             },
-            server_args: Arc::new(ServerArgs::from_json(server_args_json).unwrap()),
+            server_args: Arc::new(server_args),
         };
         (crate::runtime::start(cfg).expect("start runtime"), addr)
     }
@@ -516,6 +544,24 @@ mod tests {
             None,
         );
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn dspark_layout_round_trip_and_rank_mismatch() {
+        let (_rt, addr) = start_on_free_port();
+        let layout = serde_json::json!({"num_draft_tokens": 6, "state_item_lens": [[4096]]});
+        let body = put_route(serde_json::json!({"dsv41_spec_layout": layout}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+        let (status, body) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 200);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["dsv41_spec_layout"], layout);
+
+        let incompatible = put_route(serde_json::json!({"dsv41_spec_layout": null}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&incompatible)).0, 400);
+        let (_, body) = request(addr, "GET", SENTINEL, None);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["dsv41_spec_layout"], layout);
     }
 
     /// System-dp topology derivation: with `system_dp_size > 1` the dp axis
@@ -593,11 +639,7 @@ mod tests {
     /// hiding a misdirected decode/router behind its retry loop.
     #[test]
     fn routes_absent_off_prefill() {
-        let non_prefill = r#"{
-            "skip_tokenizer_init": true,
-            "model_config": {"context_len": 2048, "vocab_size": 1000}
-        }"#;
-        let (_rt, addr) = start_runtime(non_prefill);
+        let (_rt, addr) = start_runtime(test_server_args(DisaggregationMode::Null));
 
         let (status, _) = request(addr, "GET", SENTINEL, None);
         assert_eq!(status, 404);

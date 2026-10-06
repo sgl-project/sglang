@@ -61,7 +61,7 @@ runtime:
     decode_max_running_requests: 1024
     common_extra_flags: "--moe-dense-tp-size 1 --enable-dp-lm-head --decode-log-interval 100 --watchdog-timeout 3600 --load-balance-method round_robin --dist-timeout 3600"
     prefill_extra_flags: "--context-length 9217 --max-total-tokens 262144"
-    decode_extra_flags: "--disable-cuda-graph --prefill-round-robin-balance"
+    decode_extra_flags: "--disable-cuda-graph"
     prefill_extra_env:
       MORI_MAX_DISPATCH_TOKENS_PREFILL: 8192
       MORI_MAX_DISPATCH_TOKENS_DECODE: 256

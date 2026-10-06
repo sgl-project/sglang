@@ -180,13 +180,6 @@ class LTX2DurationHead(nn.Module):
                 num_frames,
                 frame_rate,
             )
-        else:
-            logger.info(
-                "Predicted duration %.2fs (%d frames @ %.2f fps)",
-                seconds,
-                num_frames,
-                frame_rate,
-            )
         return num_frames
 
 

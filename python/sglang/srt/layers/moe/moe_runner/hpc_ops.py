@@ -80,7 +80,6 @@ class HpcOpsMoeQuantInfo(MoeQuantInfo):
     w2_weight: torch.Tensor
     block_quant: bool
     global_num_experts: int
-    moe_ep_rank: int
     # Blockwise path
     w13_weight_scale_inv: Optional[torch.Tensor] = None
     w2_weight_scale_inv: Optional[torch.Tensor] = None
@@ -146,12 +145,12 @@ def fused_experts_none_to_hpc_ops(
             "this backend also expects global top-k ids, so other quant "
             "methods must not run with --moe-runner-backend hpc_ops."
         )
-    assert (
-        quant_info.w13_weight.dtype == torch.float8_e4m3fn
-    ), f"expected fp8 w13_weight, got {quant_info.w13_weight.dtype}"
-    assert (
-        quant_info.w2_weight.dtype == torch.float8_e4m3fn
-    ), f"expected fp8 w2_weight, got {quant_info.w2_weight.dtype}"
+    assert quant_info.w13_weight.dtype == torch.float8_e4m3fn, (
+        f"expected fp8 w13_weight, got {quant_info.w13_weight.dtype}"
+    )
+    assert quant_info.w2_weight.dtype == torch.float8_e4m3fn, (
+        f"expected fp8 w2_weight, got {quant_info.w2_weight.dtype}"
+    )
     _check_runner_config_supported(runner_config)
 
     x = dispatch_output.hidden_states
@@ -183,7 +182,7 @@ def fused_experts_none_to_hpc_ops(
             quant_info.w2_weight_scale_inv,
             topk_ids,
             topk_weights,
-            quant_info.moe_ep_rank,
+            runner_config.moe_ep_rank,
             quant_info.global_num_experts,
         )
     else:
@@ -198,7 +197,7 @@ def fused_experts_none_to_hpc_ops(
             act_and_mul_scale,
             topk_ids,
             topk_weights,
-            quant_info.moe_ep_rank,
+            runner_config.moe_ep_rank,
             quant_info.global_num_experts,
         )
 

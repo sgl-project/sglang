@@ -3,17 +3,21 @@ from __future__ import annotations
 import abc
 import logging
 import threading
+from collections.abc import Iterable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import wraps
-from typing import Optional
+from typing import Optional, TypeGuard
 
-import psutil
 import torch
 
+from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
@@ -25,6 +29,84 @@ _is_hip = is_hip()
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
+
+
+_host_memory_budget: ContextVar[Optional[int]] = ContextVar(
+    "hicache_host_memory_budget", default=None
+)
+
+
+def uses_shared_host_layout(host_pool: object) -> TypeGuard[HostKVCache]:
+    return (
+        isinstance(host_pool, HostKVCache)
+        and host_pool.shared_allocation_domain is not None
+    )
+
+
+def shared_host_layout_domains(host_pools: Iterable[object]) -> list:
+    domains = []
+    seen = set()
+    for pool in host_pools:
+        if not uses_shared_host_layout(pool):
+            continue
+        domain = pool.shared_allocation_domain
+        if id(domain) not in seen:
+            seen.add(id(domain))
+            domains.append(domain)
+    return domains
+
+
+@contextmanager
+def host_memory_budget_scope(budget_bytes: int):
+    """Book every pool built inside against one snapshot, not re-sampled psutil."""
+    token = _host_memory_budget.set(budget_bytes)
+    try:
+        yield
+    finally:
+        _host_memory_budget.reset(token)
+
+
+def ranks_per_host() -> int:
+    """Return the launch ranks per host, assuming uniform placement.
+
+    Avoid a collective: ranks may construct different numbers of host pools.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return 1
+    try:
+        launch_world_size = get_parallel().launch_world_size
+    except (RuntimeError, ValueError):
+        return 1
+    if launch_world_size == 1:
+        return 1
+    return max(launch_world_size // get_parallel().nnodes, 1)
+
+
+def host_memory_budget_bytes(
+    requested_bytes: int = 0, *, auto_size: bool = False
+) -> int:
+    """Host RAM this rank may claim for a HiCache pool.
+
+    Bound machine availability by the visible cgroup limits before splitting
+    among local ranks. Independent engines with separate container budgets
+    therefore size against their own remaining allowance.
+    Auto-sizing requires successful cgroup discovery; explicit pool sizing
+    can fall back to checking host availability when discovery fails.
+
+    Inside host_memory_budget_scope, requested_bytes is booked against the
+    snapshot when it fits; the allowance before booking is returned.
+    """
+    available = _host_memory_budget.get()
+    if available is not None:
+        if requested_bytes <= available:
+            _host_memory_budget.set(available - requested_bytes)
+        return available
+
+    free = (
+        available_host_memory_bytes(allow_cgroup_fallback=not auto_size)
+        - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    )
+    return free // ranks_per_host()
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
@@ -43,10 +125,10 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
         return size
 
     try:
-        from sglang.srt.distributed.parallel_state import get_pp_group
+        from sglang.srt.runtime_context import get_parallel
 
-        pp_group = get_pp_group()
-    except AssertionError:
+        pp_group = get_parallel().pp_group
+    except RuntimeError:
         return size
 
     if pp_group.world_size <= 1:
@@ -81,6 +163,11 @@ def synchronized(func):
 class HostKVCache(abc.ABC):
     dcp_size = 1
     dcp_rank = 0
+    shared_allocation_domain = None
+    stores_page_envelope = False
+    # Names this pool's page byte format in storage keys when it has one of its
+    # own, so pages persisted in another format miss instead of loading.
+    storage_format_tag: Optional[str] = None
 
     def __init__(
         self,
@@ -116,32 +203,36 @@ class HostKVCache(abc.ABC):
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
+        # Unified pools report token capacity separately from their buffer-row count.
+        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
+        if device_capacity is None:
+            device_capacity = device_pool.size
+        self.device_capacity_tokens = device_capacity
         if host_size > 0:
             self.size = sync_fixed_hicache_size(
                 int(host_size * 1e9 // self.size_per_token), host_size
             )
         else:
-            self.size = int(device_pool.size * host_to_device_ratio)
+            self.size = int(device_capacity * host_to_device_ratio)
         # Align up the host memory pool size to the page size
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        if self.size <= device_pool.size:
+        if self.size <= device_capacity:
             logger.warning(
                 "HiCache %s host pool (%d tokens) is smaller than the device pool (%d tokens);"
                 "L2 cache effectiveness is reduced."
                 "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
                 pool_label,
                 self.size,
-                device_pool.size,
+                device_capacity,
             )
 
         # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = host_memory_budget_bytes(requested_bytes)
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -197,6 +288,54 @@ class HostKVCache(abc.ABC):
                 if buf is not None:
                     _cuda_host_unregister(buf)
         self.kv_buffer = None
+
+    # Bytes between strided device KV rows; None (the default, and what a pool
+    # built without `_init_device_row_stride` keeps) means packed rows.
+    _strided_device_row_bytes: Optional[int] = None
+
+    def _init_device_row_stride(self, device_buffers: Iterable[torch.Tensor]) -> None:
+        """Record the row stride of strided device KV buffers.
+
+        A strided per-layer view -- the unified pool's token-major entries --
+        steps its rows by `stride(0)` rather than by the row width, and the
+        device-side addresses in the transfer kernels must follow it.
+        """
+        buffers = list(device_buffers)
+        strides = {
+            buf.stride(0) * buf.element_size()
+            for buf in buffers
+            if not buf.is_contiguous()
+        }
+        if not strides:
+            return
+        if len(strides) > 1 or any(buf.is_contiguous() for buf in buffers):
+            raise NotImplementedError(
+                "HiCache: the device KV buffers do not share one row stride "
+                f"(strided rows {sorted(strides)} B, mixed with packed ones)"
+            )
+        for buf in buffers:
+            assert buf.stride(-1) == 1, (
+                f"HiCache needs packed device rows; got strides {buf.stride()}"
+            )
+        self._strided_device_row_bytes = strides.pop()
+
+    @property
+    def device_rows_packed(self) -> bool:
+        return self._strided_device_row_bytes is None
+
+    @property
+    def device_row_stride_bytes(self) -> int:
+        """Bytes between consecutive device KV rows."""
+        return self._strided_device_row_bytes or self.token_stride_size
+
+    def _require_packed_device_rows(self, kernel: str) -> None:
+        if not self.device_rows_packed:
+            raise NotImplementedError(
+                f"HiCache: {kernel} steps device rows by the row width "
+                f"({self.token_stride_size} B), but this device pool's rows are "
+                f"{self.device_row_stride_bytes} B apart. Use the JIT HiCache "
+                "kernels with a layer_first or page_first host layout."
+            )
 
     @abc.abstractmethod
     def get_size_per_token(self):
@@ -264,6 +403,55 @@ class HostKVCache(abc.ABC):
         Backup KV data from the device memory pool to the host memory pool for all layers.
         """
         raise NotImplementedError()
+
+    def get_page_buffer_element_size(self, split_factor: int = 1) -> Optional[int]:
+        """Byte size of one storage element, or None for a logical anchor."""
+        indices = torch.zeros(self.page_size, dtype=torch.int64)
+        meta = (
+            self.get_split_heads_page_buffer_meta(indices, split_factor)
+            if split_factor != 1
+            else self.get_page_buffer_meta(indices)
+        )
+        sizes = meta[1] if meta else None
+        return int(sizes[0]) if sizes else None
+
+    def prepare_transfer_indices(
+        self, host_indices, device_indices, io_backend
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve indices that must remain stable through one L2 submission.
+
+        Normal host pools expose physical indices directly and controllers have
+        already moved them to the backend-required device. Shared compacting
+        pools override this hook and resolve their logical ids while the transfer
+        engine holds a layout lease.
+        """
+        return host_indices, device_indices
+
+    def backup_from_device_all_layer_physical(
+        self, device_pool, host_indices, device_indices, io_backend
+    ) -> None:
+        self.backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, io_backend
+        )
+
+    def load_to_device_per_layer_physical(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
+    ) -> None:
+        self.load_to_device_per_layer(
+            device_pool,
+            host_indices,
+            device_indices,
+            layer_id,
+            io_backend,
+            is_draft=is_draft,
+        )
 
     @abc.abstractmethod
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
@@ -340,24 +528,11 @@ class HostKVCache(abc.ABC):
         """Page size in that same logical space (the widened DCP page)."""
         return self.page_size * self.dcp_size
 
-    def maybe_dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        """Transfer kernels index per-rank rows; callers hold widened logical slots.
-
-        Keep this rank's slots (% dcp_size == dcp_rank), then collapse (// dcp_size).
-        """
-        if self.dcp_size == 1:
-            return indices
-        assert indices.numel() % self.dcp_size == 0, (
-            "HiCache DCP translation expects runs of whole widened pages; got "
-            f"{indices.numel()} logical slots with dcp_size={self.dcp_size}."
-        )
-        return indices[self.dcp_rank :: self.dcp_size] // self.dcp_size
-
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        assert (
-            need_size % self.logical_page_size == 0
-        ), "The requested size should be a multiple of the page size."
+        assert need_size % self.logical_page_size == 0, (
+            "The requested size should be a multiple of the page size."
+        )
         if need_size > self.available_size():
             return None
 
