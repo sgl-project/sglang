@@ -280,3 +280,35 @@ pub(crate) fn builtin_template(name: &str) -> Option<LegacySpec> {
     };
     Some(spec)
 }
+
+#[cfg(test)]
+mod tests {
+    use dynamo_protocols::types::CreateChatCompletionRequest;
+
+    use super::super::super::ChatFormatter;
+    use super::super::LegacyFormatter;
+    use super::builtin_template;
+
+    fn request() -> CreateChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "messages": [
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "Hello"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn built_in_chatml_does_not_require_a_file() {
+        let formatter = ChatFormatter::Legacy(Box::new(LegacyFormatter {
+            spec: builtin_template("chatml").unwrap(),
+        }));
+        let rendered = formatter.render(&request()).unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>system\nBe concise.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+}
