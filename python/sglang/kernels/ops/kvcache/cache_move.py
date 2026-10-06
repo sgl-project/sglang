@@ -263,5 +263,5 @@ def store_k_slots(k_buffer: torch.Tensor, src: torch.Tensor, loc: torch.Tensor) 
         k_buffer.shape[0],
         ROW_DIM=ROW_DIM,
         BLOCK=BLOCK,
-        num_warps=4,
+        num_warps=1,
     )

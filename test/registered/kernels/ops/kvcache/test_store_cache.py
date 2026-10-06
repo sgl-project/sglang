@@ -7,7 +7,10 @@ import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.kvcache.cache_move import store_k_slots
-from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
+from sglang.kernels.ops.kvcache.cache_ops import (
+    launch_reshape_and_cache_flash,
+    reshape_and_cache_flash,
+)
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseMHAMainPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -509,6 +512,9 @@ def test_as_token_head_dim_does_not_copy() -> None:
 class _PoolStub:
     """The pool state can_store_kv_fused_cast and store_kv_fused_cast read."""
 
+    requires_physical_write_loc = False
+    _check_physical_write_loc = MHATokenToKVPool._check_physical_write_loc
+
     def __init__(self, buffer_dims: int = 3, dtype: torch.dtype = torch.float8_e4m3fn):
         self.kv_cache_layout = "nhd"
         self.use_hnd = False
@@ -529,7 +535,6 @@ class _PoolStub:
         self.v_buffer = [torch.zeros(shape, dtype=torch.uint8, device=DEVICE)]
         self.size = SMALL_CACHE - 1
         self.page_size = 1
-        self.kernel_page_blocks = 1
 
     def _get_key_buffer(self, layer_id: int) -> torch.Tensor:
         return self.k_buffer[layer_id].view(self.dtype)
@@ -588,6 +593,21 @@ def test_can_store_kv_fused_cast_rejects_hisparse_main_pool() -> None:
     assert not HiSparseMHAMainPool.can_store_kv_fused_cast(_PoolStub(), 0, loc, k, v)
     with pytest.raises(NotImplementedError):
         HiSparseMHAMainPool.store_kv_fused_cast(_PoolStub(), 0, loc, k, v)
+
+
+def test_store_kv_fused_cast_rejects_unmarked_loc_on_physical_id_pool() -> None:
+    # As in set_kv_buffer: a pool that takes physical ids rejects an unmarked loc.
+    pool = _PoolStub()
+    pool.requires_physical_write_loc = True
+    loc = torch.arange(1, 9, dtype=torch.int64, device=DEVICE)
+    k, v = _qkv_k_slice(8), _qkv_k_slice(8)
+    before_k, before_v = pool.k_buffer[0].clone(), pool.v_buffer[0].clone()
+
+    with pytest.raises(ValueError):
+        MHATokenToKVPool.store_kv_fused_cast(pool, 0, loc, k, v)
+
+    torch.testing.assert_close(pool.k_buffer[0], before_k, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(pool.v_buffer[0], before_v, rtol=0.0, atol=0.0)
 
 
 FP8_KV_DTYPES = [
@@ -714,6 +734,41 @@ def test_reshape_and_cache_flash_writes_slot_zero_by_default() -> None:
     torch.testing.assert_close(key_cache[[0, 5], 0], key, rtol=0.0, atol=0.0)
 
 
+def test_reshape_and_cache_flash_kernel_launches_with_original_arguments() -> None:
+    # The raw kernel is public: the slot-skip and bound parameters must stay
+    # optional and off by default.
+    key = torch.randn((2, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
+    key_cache = torch.zeros(
+        (SMALL_CACHE, 1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE
+    )
+    value_cache = torch.zeros_like(key_cache)
+    loc = torch.tensor([0, 5], dtype=torch.int64, device=DEVICE)
+
+    reshape_and_cache_flash[(loc.numel(), 1)](
+        key,
+        key,
+        key_cache,
+        value_cache,
+        loc,
+        None,
+        key,
+        key,
+        key_cache.stride(0),
+        key.stride(0),
+        key.stride(0),
+        GUARD_HEAD_NUM,
+        GUARD_HEAD_DIM,
+        key_cache.shape[1],
+        HEAD_BLOCK=4,
+        BLOCK_D=GUARD_HEAD_DIM,
+        HAS_SWA=False,
+        USE_SCALE=False,
+    )
+
+    torch.testing.assert_close(key_cache[loc, 0], key, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(value_cache[loc, 0], key, rtol=0.0, atol=0.0)
+
+
 @pytest.mark.parametrize("size_limit", [None, SMALL_CACHE])
 def test_reshape_and_cache_flash_writes_every_in_range_slot(size_limit) -> None:
     # Neither the default (no bound) nor a bound at the cache's slot count may skip
@@ -753,6 +808,30 @@ def test_reshape_and_cache_flash_size_limit_skips_out_of_range_slots() -> None:
     torch.testing.assert_close(v_backing, expected_v, rtol=0.0, atol=0.0)
 
 
+@pytest.mark.parametrize("size_limit", [None, SMALL_CACHE])
+def test_reshape_and_cache_flash_skips_reserved_slot(size_limit) -> None:
+    key = torch.randn((3, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
+    key_cache = torch.zeros(
+        (SMALL_CACHE, 1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE
+    )
+    value_cache = torch.zeros_like(key_cache)
+    loc = torch.tensor([0, 5, SMALL_CACHE - 1], dtype=torch.int64, device=DEVICE)
+
+    launch_reshape_and_cache_flash(
+        key,
+        key,
+        key_cache,
+        value_cache,
+        loc,
+        reserved_skip_index=0,
+        size_limit=size_limit,
+    )
+
+    for cache in (key_cache, value_cache):
+        assert torch.all(cache[0] == 0)
+        torch.testing.assert_close(cache[loc[1:], 0], key[1:], rtol=0.0, atol=0.0)
+
+
 def test_reshape_and_cache_flash_rejects_size_limit_past_cache() -> None:
     key = torch.randn((1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
     key_cache = torch.zeros(
@@ -763,6 +842,26 @@ def test_reshape_and_cache_flash_rejects_size_limit_past_cache() -> None:
     with pytest.raises(AssertionError):
         launch_reshape_and_cache_flash(
             key, key, key_cache, key_cache.clone(), loc, size_limit=SMALL_CACHE + 1
+        )
+
+
+def test_reshape_and_cache_flash_rejects_size_limit_with_swa() -> None:
+    key = torch.randn((1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
+    key_cache = torch.zeros(
+        (SMALL_CACHE, 1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE
+    )
+    loc = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+    swa_slot_mapping = torch.zeros(SMALL_CACHE, dtype=torch.int64, device=DEVICE)
+
+    with pytest.raises(AssertionError):
+        launch_reshape_and_cache_flash(
+            key,
+            key,
+            key_cache,
+            key_cache.clone(),
+            loc,
+            swa_slot_mapping,
+            size_limit=SMALL_CACHE,
         )
 
 

@@ -2880,10 +2880,8 @@ class MHATokenToKVPool(KVCache):
         """
         from sglang.kernels.ops.attention.utils import launch_reshape_and_cache_flash
 
+        self._check_physical_write_loc(loc, "store_kv_fused_cast")
         maybe_detect_oob(loc, 0, self.size + self.page_size, "store_kv_fused_cast")
-        maybe_detect_kernel_facing_loc(
-            loc, self.page_size, self.kernel_page_blocks, "store_kv_fused_cast"
-        )
         # The kernel indexes `loc` into a paged cache; unsqueeze(1) presents the flat
         # slot-indexed buffer as page-size 1.
         launch_reshape_and_cache_flash(
@@ -2892,10 +2890,9 @@ class MHATokenToKVPool(KVCache):
             self._get_key_buffer(layer_id).unsqueeze(1),
             self._get_value_buffer(layer_id).unsqueeze(1),
             loc,
-            # Padded rows target the reserved slot 0, which attention reads back;
-            # skip it as the store_cache fallback does.
+            # Like the store_cache fallback, skip reserved slot 0. Unlike it, skip
+            # rather than device-assert on a slot outside [0, size + page_size).
             reserved_skip_index=0,
-            # Match store_cache's physical slot bound.
             size_limit=self.size + self.page_size,
         )
 
