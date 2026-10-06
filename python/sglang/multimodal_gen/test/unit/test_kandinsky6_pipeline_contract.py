@@ -214,7 +214,6 @@ def test_parallel_cfg_uses_serial_arithmetic_for_video_and_audio(monkeypatch):
         t_expand=torch.zeros(1),
         visual_rope_pos=[],
         scale_factor=(1.0, 1.0, 1.0),
-        sparse_params=None,
         visual_token_type_ids=None,
     )
     for result, reference in zip(actual, expected, strict=True):

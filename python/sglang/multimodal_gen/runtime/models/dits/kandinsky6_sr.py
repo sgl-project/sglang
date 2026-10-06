@@ -38,12 +38,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.kandinsky6 import (
-    Kandinsky6Attention,
-    Kandinsky6FeedForward,
-    Kandinsky6Modulation,
     Kandinsky6OutLayer,
     Kandinsky6RoPE3D,
     Kandinsky6TimeEmbeddings,
+    Kandinsky6TransformerBlock,
     Kandinsky6VisualEmbeddings,
     _build_rotary_freqs,
 )
@@ -80,40 +78,8 @@ class Kandinsky6SRRoPE3D(Kandinsky6RoPE3D):
         return self
 
 
-class Kandinsky6SRDecoderBlock(nn.Module):
-    """Modulated self-attention and FFN with fp32 residuals and parameter-dtype linears."""
-
-    def __init__(
-        self,
-        model_dim: int,
-        time_dim: int,
-        ff_dim: int,
-        head_dim: int,
-        supported_attention_backends: set[AttentionBackendEnum] | None = None,
-        prefix: str = "",
-        quant_config: QuantizationConfig | None = None,
-    ):
-        super().__init__()
-        self.visual_modulation = Kandinsky6Modulation(time_dim, model_dim, 6)
-        self.self_attention_norm = LayerNormScaleShift(
-            model_dim, eps=1e-5, elementwise_affine=False, dtype=torch.float32
-        )
-        self.self_attention = Kandinsky6Attention(
-            model_dim,
-            head_dim,
-            supported_attention_backends=supported_attention_backends,
-            prefix=add_prefix("self_attention", prefix),
-            quant_config=quant_config,
-        )
-        self.feed_forward_norm = LayerNormScaleShift(
-            model_dim, eps=1e-5, elementwise_affine=False, dtype=torch.float32
-        )
-        self.feed_forward = Kandinsky6FeedForward(
-            model_dim,
-            ff_dim,
-            prefix=add_prefix("feed_forward", prefix),
-            quant_config=quant_config,
-        )
+class Kandinsky6SRDecoderBlock(Kandinsky6TransformerBlock):
+    """Modulated self-attention and FFN with fp32 residuals."""
 
     def forward(
         self,
@@ -145,23 +111,8 @@ class Kandinsky6SROutLayer(Kandinsky6OutLayer):
     def forward(
         self, visual_embed: torch.Tensor, time_embed: torch.Tensor
     ) -> torch.Tensor:
-        shift, scale = torch.chunk(
-            self.modulation(time_embed).unsqueeze(dim=1), 2, dim=-1
-        )
-        x = (
-            self.norm(visual_embed.float()) * (scale.float()[:, None, None] + 1.0)
-            + shift.float()[:, None, None]
-        )
-        x, _ = self.out_layer(x.to(self.out_layer.weight.dtype))
-
-        batch_size, duration, height, width, _ = x.shape
-        pt, ph, pw = self.patch_size
-        return (
-            x.view(batch_size, duration, height, width, -1, pt, ph, pw)
-            .permute(0, 1, 5, 2, 6, 3, 7, 4)
-            .flatten(1, 2)
-            .flatten(2, 3)
-            .flatten(3, 4)
+        return super().forward(
+            visual_embed, time_embed, compute_dtype=self.out_layer.weight.dtype
         )
 
 

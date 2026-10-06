@@ -37,19 +37,8 @@ from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
 class Kandinsky6SRDenoisingStage(DenoisingStage):
     """Runs the bundle's scheduler over every tile chunk prepared by the latent-prep stage."""
 
-    def __init__(self, transformer, scheduler, pipeline=None) -> None:
-        super().__init__(
-            transformer=transformer,
-            scheduler=scheduler,
-            pipeline=pipeline,
-            transformer_2=None,
-            vae=None,
-        )
-
     def _owns_compile_warmup_lifecycle(self) -> bool:
-        # ``forward`` below does not go through the shared ``_denoise`` loop that this guard
-        # normally protects, so claim ownership explicitly (same as MiniMaxH3DenoisingStage):
-        # the offload/restore wrapper is still entered through ``_offload_for_torch_compile_warmup``.
+        # forward wraps the tiled loop in the shared compile warmup lifecycle
         return True
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

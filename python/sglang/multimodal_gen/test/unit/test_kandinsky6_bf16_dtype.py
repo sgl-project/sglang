@@ -266,7 +266,6 @@ def test_bcg_joint_cfg_output_lifetime_and_text_shape_fallback(monkeypatch, use_
         t_expand=torch.tensor([500.0], device="cuda"),
         visual_rope_pos=[torch.arange(2, device="cuda") for _ in range(3)],
         scale_factor=(1.0, 1.0, 1.0),
-        sparse_params=None,
         visual_token_type_ids=None,
     )
 

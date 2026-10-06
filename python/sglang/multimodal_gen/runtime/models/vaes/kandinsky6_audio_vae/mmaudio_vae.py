@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -76,33 +77,22 @@ class ResnetBlock1D(nn.Module):
         *,
         in_dim: int,
         out_dim: int | None = None,
-        conv_shortcut: bool = False,
         kernel_size: int = 3,
-        use_norm: bool = True,
     ) -> None:
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = in_dim if out_dim is None else out_dim
-        self.use_conv_shortcut = conv_shortcut
-        self.use_norm = use_norm
         self.conv1 = _conv1d(in_dim, self.out_dim, kernel_size)
         self.conv2 = _conv1d(self.out_dim, self.out_dim, kernel_size)
         if self.in_dim != self.out_dim:
-            if conv_shortcut:
-                self.conv_shortcut = _conv1d(in_dim, self.out_dim, kernel_size)
-            else:
-                self.nin_shortcut = _conv1d(in_dim, self.out_dim, 1)
+            self.nin_shortcut = _conv1d(in_dim, self.out_dim, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_norm:
-            x = _rms_normalize(x, dim=1)
+        x = _rms_normalize(x, dim=1)
         hidden = self.conv1(F.silu(x) / _SILU_DIVISOR)
         hidden = self.conv2(F.silu(hidden) / _SILU_DIVISOR)
         if self.in_dim != self.out_dim:
-            shortcut = (
-                self.conv_shortcut if self.use_conv_shortcut else self.nin_shortcut
-            )
-            x = shortcut(x)
+            x = self.nin_shortcut(x)
         return torch.lerp(x, hidden, _RESIDUAL_BLEND) / _RESIDUAL_DIVISOR
 
 
@@ -126,30 +116,60 @@ class AttnBlock1D(nn.Module):
 
 
 class Upsample1D(nn.Module):
-    def __init__(self, in_channels: int, with_conv: bool) -> None:
+    def __init__(self, in_channels: int) -> None:
         super().__init__()
-        self.with_conv = with_conv
-        if with_conv:
-            self.conv = _conv1d(in_channels, in_channels, 3)
+        self.conv = _conv1d(in_channels, in_channels, 3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.interpolate(x, scale_factor=2.0, mode="nearest-exact")
-        return self.conv(x) if self.with_conv else x
+        return self.conv(x)
 
 
 class Downsample1D(nn.Module):
-    def __init__(self, in_channels: int, with_conv: bool) -> None:
+    def __init__(self, in_channels: int) -> None:
         super().__init__()
-        self.with_conv = with_conv
-        if with_conv:
-            self.conv1 = _conv1d(in_channels, in_channels, 1)
-            self.conv2 = _conv1d(in_channels, in_channels, 1)
+        self.conv1 = _conv1d(in_channels, in_channels, 1)
+        self.conv2 = _conv1d(in_channels, in_channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.with_conv:
-            x = self.conv1(x)
-        x = F.avg_pool1d(x, kernel_size=2, stride=2)
-        return self.conv2(x) if self.with_conv else x
+        return self.conv2(F.avg_pool1d(self.conv1(x), kernel_size=2, stride=2))
+
+
+def _mid_block(channels: int, kernel_size: int = 3) -> nn.Sequential:
+    return nn.Sequential(
+        OrderedDict(
+            block_1=ResnetBlock1D(in_dim=channels, kernel_size=kernel_size),
+            attn_1=AttnBlock1D(channels),
+            block_2=ResnetBlock1D(in_dim=channels, kernel_size=kernel_size),
+        )
+    )
+
+
+class ResolutionBlock1D(nn.Module):
+    """Residual/attention stack with checkpoint-compatible block and attn names."""
+
+    def __init__(self, in_dim, out_dim, count, attention, kernel_size=3):
+        super().__init__()
+        self.block = nn.ModuleList()
+        self.attn = nn.ModuleList()
+        for index in range(count):
+            self.block.append(
+                ResnetBlock1D(
+                    in_dim=in_dim if index == 0 else out_dim,
+                    out_dim=out_dim,
+                    kernel_size=kernel_size,
+                )
+            )
+            if attention:
+                self.attn.append(AttnBlock1D(out_dim))
+
+    def forward(self, x, clip_act):
+        for index, block in enumerate(self.block):
+            x = block(x)
+            if self.attn:
+                x = self.attn[index](x)
+            x = x.clamp(-clip_act, clip_act)
+        return x
 
 
 class Encoder1D(nn.Module):
@@ -163,73 +183,38 @@ class Encoder1D(nn.Module):
         down_layers: list[int],
         in_dim: int,
         embed_dim: int,
-        resamp_with_conv: bool = True,
-        double_z: bool = True,
         kernel_size: int = 3,
         clip_act: float = 256.0,
     ) -> None:
         super().__init__()
-        self.dim = dim
         self.num_layers = len(ch_mult)
-        self.num_res_blocks = num_res_blocks
-        self.in_channels = in_dim
         self.clip_act = clip_act
         self.down_layers = down_layers
-        self.attn_layers = attn_layers
         self.conv_in = _conv1d(in_dim, dim, kernel_size)
 
         in_ch_mult = (1,) + ch_mult
-        self.in_ch_mult = in_ch_mult
         self.down = nn.ModuleList()
         for level in range(self.num_layers):
-            block = nn.ModuleList()
-            attn = nn.ModuleList()
             block_in = dim * in_ch_mult[level]
             block_out = dim * ch_mult[level]
-            for _ in range(num_res_blocks):
-                block.append(
-                    ResnetBlock1D(
-                        in_dim=block_in,
-                        out_dim=block_out,
-                        kernel_size=kernel_size,
-                        use_norm=True,
-                    )
-                )
-                block_in = block_out
-                if level in attn_layers:
-                    attn.append(AttnBlock1D(block_in))
-            down = nn.Module()
-            down.block = block
-            down.attn = attn
+            down = ResolutionBlock1D(
+                block_in, block_out, num_res_blocks, level in attn_layers, kernel_size
+            )
             if level in down_layers:
-                down.downsample = Downsample1D(block_in, resamp_with_conv)
+                down.downsample = Downsample1D(block_out)
             self.down.append(down)
 
-        self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock1D(
-            in_dim=block_in, out_dim=block_in, kernel_size=kernel_size, use_norm=True
-        )
-        self.mid.attn_1 = AttnBlock1D(block_in)
-        self.mid.block_2 = ResnetBlock1D(
-            in_dim=block_in, out_dim=block_in, kernel_size=kernel_size, use_norm=True
-        )
-        output_dim = 2 * embed_dim if double_z else embed_dim
-        self.conv_out = _conv1d(block_in, output_dim, kernel_size)
+        self.mid = _mid_block(block_out, kernel_size)
+        self.conv_out = _conv1d(block_out, 2 * embed_dim, kernel_size)
         self.learnable_gain = nn.Parameter(torch.zeros([]))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        states = [self.conv_in(x)]
-        for level in range(self.num_layers):
-            for block_index in range(self.num_res_blocks):
-                hidden = self.down[level].block[block_index](states[-1])
-                if len(self.down[level].attn) > 0:
-                    hidden = self.down[level].attn[block_index](hidden)
-                states.append(hidden.clamp(-self.clip_act, self.clip_act))
+        hidden = self.conv_in(x)
+        for level, down in enumerate(self.down):
+            hidden = down(hidden, self.clip_act)
             if level in self.down_layers:
-                states.append(self.down[level].downsample(states[-1]))
-        hidden = self.mid.block_1(states[-1])
-        hidden = self.mid.attn_1(hidden)
-        hidden = self.mid.block_2(hidden).clamp(-self.clip_act, self.clip_act)
+                hidden = down.downsample(hidden)
+        hidden = self.mid(hidden).clamp(-self.clip_act, self.clip_act)
         return _conv1d_with_gain(
             self.conv_out, F.silu(hidden) / _SILU_DIVISOR, self.learnable_gain + 1
         )
@@ -245,47 +230,27 @@ class Decoder1D(nn.Module):
         num_res_blocks: int,
         attn_layers: list[int],
         down_layers: list[int],
-        in_dim: int,
         embed_dim: int,
         kernel_size: int = 3,
-        resamp_with_conv: bool = True,
         clip_act: float = 256.0,
     ) -> None:
         super().__init__()
-        self.ch = dim
         self.num_layers = len(ch_mult)
-        self.num_res_blocks = num_res_blocks
-        self.in_channels = in_dim
         self.clip_act = clip_act
         self.down_layers = [level + 1 for level in down_layers]
         block_in = dim * ch_mult[-1]
         self.conv_in = _conv1d(embed_dim, block_in, kernel_size)
-        self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock1D(
-            in_dim=block_in, out_dim=block_in, use_norm=True
-        )
-        self.mid.attn_1 = AttnBlock1D(block_in)
-        self.mid.block_2 = ResnetBlock1D(
-            in_dim=block_in, out_dim=block_in, use_norm=True
-        )
+        self.mid = _mid_block(block_in)
 
         self.up = nn.ModuleList()
         for level in reversed(range(self.num_layers)):
-            block = nn.ModuleList()
-            attn = nn.ModuleList()
             block_out = dim * ch_mult[level]
-            for _ in range(num_res_blocks + 1):
-                block.append(
-                    ResnetBlock1D(in_dim=block_in, out_dim=block_out, use_norm=True)
-                )
-                block_in = block_out
-                if level in attn_layers:
-                    attn.append(AttnBlock1D(block_in))
-            up = nn.Module()
-            up.block = block
-            up.attn = attn
+            up = ResolutionBlock1D(
+                block_in, block_out, num_res_blocks + 1, level in attn_layers
+            )
+            block_in = block_out
             if level in self.down_layers:
-                up.upsample = Upsample1D(block_in, resamp_with_conv)
+                up.upsample = Upsample1D(block_in)
             self.up.insert(0, up)
 
         self.conv_out = _conv1d(block_in, out_dim, kernel_size)
@@ -293,15 +258,9 @@ class Decoder1D(nn.Module):
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         hidden = self.conv_in(z)
-        hidden = self.mid.block_1(hidden)
-        hidden = self.mid.attn_1(hidden)
-        hidden = self.mid.block_2(hidden).clamp(-self.clip_act, self.clip_act)
+        hidden = self.mid(hidden).clamp(-self.clip_act, self.clip_act)
         for level in reversed(range(self.num_layers)):
-            for block_index in range(self.num_res_blocks + 1):
-                hidden = self.up[level].block[block_index](hidden)
-                if len(self.up[level].attn) > 0:
-                    hidden = self.up[level].attn[block_index](hidden)
-                hidden = hidden.clamp(-self.clip_act, self.clip_act)
+            hidden = self.up[level](hidden, self.clip_act)
             if level in self.down_layers:
                 hidden = self.up[level].upsample(hidden)
         return _conv1d_with_gain(
@@ -348,7 +307,6 @@ class MMAudioVAE(nn.Module):
             num_res_blocks=2,
             attn_layers=[3],
             down_layers=[0],
-            in_dim=data_dim,
             out_dim=data_dim,
             embed_dim=embed_dim,
         )
