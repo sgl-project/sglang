@@ -123,6 +123,15 @@ def resolve_num_tokens_per_req(
     raise ValueError(f"Unknown speculative phase: {phase}")
 
 
+def check_greedy_verify_fallback_allowed() -> None:
+    if envs.SGLANG_SPEC_REQUIRE_EXACT_SAMPLING.get():
+        raise RuntimeError(
+            "Speculative decoding cannot verify sampled requests exactly on this "
+            "build or device and would fall back to greedy verification. Unset "
+            "SGLANG_SPEC_REQUIRE_EXACT_SAMPLING to allow the fallback."
+        )
+
+
 def fast_sample(probs: torch.Tensor, num_samples: int = 1):
     """Draw from `probs` via the Gumbel-max trick: argmax(probs / Exp(1)).
 

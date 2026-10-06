@@ -338,6 +338,25 @@ def test_worker_warns_once_when_selector_sampling_is_disabled(monkeypatch, topol
     assert len(warnings) == 1
 
 
+def test_greedy_verify_fallback_raises_when_exact_sampling_is_required(monkeypatch):
+    from sglang.srt.environ import envs
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    monkeypatch.setattr(
+        worker_mod, "is_dflash_sampling_verify_available", lambda: False
+    )
+    worker = SimpleNamespace(
+        selector=None,
+        lilicorr=None,
+        _warned_sampling_fallback=False,
+    )
+    batch = SimpleNamespace(sampling_info=SimpleNamespace(is_all_greedy=False))
+
+    with envs.SGLANG_SPEC_REQUIRE_EXACT_SAMPLING.override(True):
+        with pytest.raises(RuntimeError, match="greedy verification"):
+            worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
+
+
 def test_disabled_selector_sampling_forces_greedy_draft():
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
