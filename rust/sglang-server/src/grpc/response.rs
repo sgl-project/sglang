@@ -54,7 +54,7 @@ pub(super) fn generate_stream(
                     })?,
                 meta_info,
                 finished,
-                text: return_text.then(|| output.text.clone()),
+                text: Some(&output.text).filter(|_| return_text).cloned(),
             })
         },
     )
