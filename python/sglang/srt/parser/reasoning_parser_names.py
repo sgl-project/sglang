@@ -20,6 +20,7 @@ REASONING_PARSER_NAMES = [
     "kimi_k3",
     "mimo",
     "muse",
+    "plamo3",
     "poolside_v1",
     "qwen3",
     "qwen3-thinking",

@@ -6,10 +6,6 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.plamo3 import Plamo3Config
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -30,6 +26,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
 PLAMO3_POST_MIXER_NORM_OFFSET = 1.0 / 5
@@ -101,7 +98,7 @@ class Plamo3Attention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.config = config
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
 
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
@@ -272,7 +269,7 @@ class Plamo3Decoder(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        pp_group = get_pp_group()
+        pp_group = get_parallel().pp_group
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Plamo3DecoderLayer(
@@ -331,7 +328,7 @@ class Plamo3Model(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
