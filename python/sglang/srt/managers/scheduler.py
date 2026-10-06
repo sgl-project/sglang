@@ -298,7 +298,7 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.events import LoRANameTable
+from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -2438,7 +2438,7 @@ class Scheduler(
 
     def init_kv_event_lora_names(self) -> None:
         """Init the table that maps lora_id to adapter name for KV events."""
-        self.kv_event_lora_names = LoRANameTable.from_lora_refs(get_lora().lora_paths)
+        self.kv_event_lora_names = KvEventLoraNames.from_lora_refs(get_lora().lora_paths)
 
     def init_kv_events_publisher(self) -> None:
         self.kv_events_publisher = SchedulerKvEventsPublisher(
@@ -2767,8 +2767,8 @@ class Scheduler(
 
     def _record_kv_event_lora_name(self, req: Req, lora_name: Optional[str]) -> None:
         # Keyed by the final extra_key, so it must run after elastic namespacing.
-        if lora_name is not None and get_observability().kv_events_config:
-            self.kv_event_lora_names[req.extra_key] = lora_name
+        if get_observability().kv_events_config:
+            self.kv_event_lora_names.register(req, lora_name)
 
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
         if (
