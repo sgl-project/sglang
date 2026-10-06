@@ -95,7 +95,28 @@ class InklingOutputParser:
                 self._apply(update.update, delta)
         return delta.build()
 
-    def finish(self) -> InklingOutputDelta:
+    def finish(
+        self,
+        token_ids: Sequence[int] = (),
+        *,
+        matched_stop: int | str | None = None,
+        keep_matched_stop: bool = False,
+    ) -> InklingOutputDelta:
+        tokenizer = self._tml.tokenizer
+        if (
+            isinstance(matched_stop, int)
+            and not keep_matched_stop
+            and token_ids
+            and token_ids[-1] == matched_stop
+            and not tokenizer.is_special_token(matched_stop)
+        ):
+            token_ids = token_ids[:-1]
+        delta = self.feed(token_ids).merge(self._flush())
+        if isinstance(matched_stop, str):
+            delta = _trim_stop_string(delta, matched_stop, keep_stop=keep_matched_stop)
+        return delta
+
+    def _flush(self) -> InklingOutputDelta:
         delta = _DeltaBuilder()
         try:
             updates = self._parser.flush_updates()
@@ -188,6 +209,20 @@ class InklingOutputParser:
         return tokenizer.decode(
             [t for t in ids[kind_index + 1 :] if not tokenizer.is_special_token(t)]
         )
+
+
+def _trim_stop_string(
+    delta: InklingOutputDelta, stop: str, *, keep_stop: bool
+) -> InklingOutputDelta:
+    # The scheduler stops at the first occurrence; like the detokenizer's text
+    # trim, drop it (unless kept) and whatever followed it in the last token.
+    for field in ("reasoning", "content"):
+        text = getattr(delta, field)
+        pos = text.find(stop)
+        if pos != -1:
+            end = pos + len(stop) if keep_stop else pos
+            return msgspec.structs.replace(delta, **{field: text[:end]})
+    return delta
 
 
 class _DeltaBuilder:

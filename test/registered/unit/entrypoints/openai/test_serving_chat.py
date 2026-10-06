@@ -4980,31 +4980,70 @@ class InklingTokenOutputTest(CustomTestCase):
             [3],
         )
 
-    def test_stream_emits_reasoning_then_one_complete_tool_call(self):
-        output_ids = self._output_ids()
-        split = 4
-        parser_dict, has_tool_calls, chunks = {}, {}, []
-        for cumulative, finish in (
+    def _stream_deltas(
+        self,
+        request,
+        output_ids,
+        finish_reason,
+        *,
+        incremental=False,
+        split=4,
+        has_tool_calls=None,
+    ) -> list[dict]:
+        parser_dict, chunks = {}, []
+        steps = (
             (output_ids[:split], None),
-            (output_ids, "stop"),
+            (output_ids[split:] if incremental else output_ids, finish_reason),
+        )
+        with get_context().override_server_args(
+            incremental_streaming_output=incremental
         ):
-            chunks += self.serving._inkling_stream_chunks(
-                content={
-                    "output_ids": cumulative,
-                    "meta_info": {"id": "chatcmpl-1", "completion_tokens": 0},
-                },
-                index=0,
-                request=self.request,
-                parser_dict=parser_dict,
-                has_tool_calls=has_tool_calls,
-                choice_logprobs=None,
-                finish_reason_type=finish,
-                continuous_usage_stats=False,
-            )
-        deltas = [
+            for ids, finish in steps:
+                chunks += self.serving._inkling_stream_chunks(
+                    content={
+                        "output_ids": ids,
+                        "meta_info": {
+                            "id": "chatcmpl-1",
+                            "completion_tokens": len(output_ids),
+                            "finish_reason": finish,
+                        },
+                    },
+                    index=0,
+                    request=request,
+                    parser_dict=parser_dict,
+                    has_tool_calls={} if has_tool_calls is None else has_tool_calls,
+                    choice_logprobs=None,
+                    finish_reason_type=finish and finish["type"],
+                    continuous_usage_stats=False,
+                )
+        return [
             json.loads(chunk[len("data: ") :])["choices"][0]["delta"]
             for chunk in chunks
         ]
+
+    def _reasoning_and_content(self, request, output_ids, finish_reason) -> dict:
+        reasoning, content, _, _ = self.serving._parse_inkling_response(
+            request, output_ids, finish_reason
+        )
+        results = {"non-stream": (reasoning or "", content)}
+        for incremental in (False, True):
+            deltas = self._stream_deltas(
+                request, output_ids, finish_reason, incremental=incremental, split=2
+            )
+            results[f"stream incremental={incremental}"] = (
+                "".join(d.get("reasoning_content") or "" for d in deltas),
+                "".join(d.get("content") or "" for d in deltas),
+            )
+        return results
+
+    def test_stream_emits_reasoning_then_one_complete_tool_call(self):
+        has_tool_calls = {}
+        deltas = self._stream_deltas(
+            self.request,
+            self._output_ids(),
+            {"type": "stop", "matched": 200006},
+            has_tool_calls=has_tool_calls,
+        )
         self.assertEqual(
             "".join(d.get("reasoning_content") or "" for d in deltas), "plan"
         )
@@ -5013,6 +5052,81 @@ class InklingTokenOutputTest(CustomTestCase):
         self.assertEqual(calls[0]["function"]["name"], "weather")
         self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"city": "SF"})
         self.assertEqual(has_tool_calls, {0: True})
+
+    def test_matched_stop_is_trimmed_from_visible_text(self):
+        """Bug regression: output ids include the matched stop, which only the
+        detokenized text had trimmed; the token-ID parse returned it verbatim."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        encode = tokenizer.encode_ordinary
+        special = tokenizer.encode_special
+        text_block = [special("message_model"), special("content_text")]
+        thinking_block = [special("message_model"), special("content_thinking")]
+        bang = encode("!")
+        self.assertEqual(len(encode(" hello")), 1)
+        cases = [
+            (
+                "string spanning tokens",
+                text_block,
+                encode("hello") + encode("EN") + encode("D"),
+                "END",
+                False,
+                ("", "hello"),
+            ),
+            (
+                "string inside a token",
+                text_block,
+                encode("say") + encode(" hello"),
+                "hel",
+                False,
+                ("", "say "),
+            ),
+            (
+                "kept string inside a token",
+                text_block,
+                encode("say") + encode(" hello"),
+                "hel",
+                True,
+                ("", "say hel"),
+            ),
+            (
+                "string in reasoning",
+                thinking_block,
+                encode("plan") + encode("END"),
+                "END",
+                False,
+                ("plan", ""),
+            ),
+            (
+                "ordinary stop token",
+                text_block,
+                encode("hello") + bang,
+                bang[0],
+                False,
+                ("", "hello"),
+            ),
+            (
+                "kept ordinary stop token",
+                text_block,
+                encode("hello") + bang,
+                bang[0],
+                True,
+                ("", "hello!"),
+            ),
+        ]
+        for name, header, payload, matched, no_stop_trim, expected in cases:
+            request = ChatCompletionRequest(
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                no_stop_trim=no_stop_trim,
+            )
+            results = self._reasoning_and_content(
+                request, header + payload, {"type": "stop", "matched": matched}
+            )
+            for mode, result in results.items():
+                with self.subTest(case=name, mode=mode):
+                    self.assertEqual(result, expected)
 
 
 class TestRequestChatTemplateTrustGate(CustomTestCase):

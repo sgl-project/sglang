@@ -702,8 +702,11 @@ class OpenAIServingChat(OpenAIServingBase):
         output_ids: list[int],
         finish_reason: dict[str, Any],
     ) -> tuple[str | None, str, list[ToolCall] | None, dict[str, Any]]:
-        parser = self._new_inkling_output_parser(request)
-        parsed = parser.feed(output_ids).merge(parser.finish())
+        parsed = self._new_inkling_output_parser(request).finish(
+            output_ids,
+            matched_stop=finish_reason.get("matched"),
+            keep_matched_stop=request.no_stop_trim,
+        )
         if not parsed.tool_calls:
             return parsed.reasoning or None, parsed.content, None, finish_reason
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
@@ -742,17 +745,21 @@ class OpenAIServingChat(OpenAIServingBase):
         if index not in parser_dict:
             parser_dict[index] = self._new_inkling_output_parser(request)
         parser = parser_dict[index]
-        delta = parser.feed(
-            self._new_inkling_output_ids(
-                output_ids=content["output_ids"],
-                num_consumed_tokens=parser.num_consumed_tokens,
-                completion_tokens=content["meta_info"].get("completion_tokens", 0),
-                finish_reason_type=finish_reason_type,
-                incremental=get_serving().incremental_streaming_output,
-            )
+        new_output_ids = self._new_inkling_output_ids(
+            output_ids=content["output_ids"],
+            num_consumed_tokens=parser.num_consumed_tokens,
+            completion_tokens=content["meta_info"].get("completion_tokens", 0),
+            finish_reason_type=finish_reason_type,
+            incremental=get_serving().incremental_streaming_output,
         )
-        if finish_reason_type is not None:
-            delta = delta.merge(parser.finish())
+        if finish_reason_type is None:
+            delta = parser.feed(new_output_ids)
+        else:
+            delta = parser.finish(
+                new_output_ids,
+                matched_stop=content["meta_info"]["finish_reason"].get("matched"),
+                keep_matched_stop=request.no_stop_trim,
+            )
 
         usage = None
         if continuous_usage_stats:
