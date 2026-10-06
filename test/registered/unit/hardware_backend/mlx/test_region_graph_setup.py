@@ -123,3 +123,4 @@ def test_disabled_phases_do_not_export_unused_buckets(prefill_enabled, decode_en
         region = MlxRegionRunner(runner)
     assert region._decode_batch_sizes == ((1, 2) if decode_enabled else ())
     assert region._prefill_token_buckets == ((128,) if prefill_enabled else ())
+    assert region._prefill_batch_sizes == ((1, 2) if prefill_enabled else ())

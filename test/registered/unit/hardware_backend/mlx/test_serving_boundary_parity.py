@@ -103,6 +103,7 @@ _SERVING_ARGS = (
     None,
     None,
     None,
+    None,
 )
 
 

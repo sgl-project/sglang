@@ -119,6 +119,7 @@ def _make_mlx_export_executor(
     out_cache_position = ServingForwardArg.OUT_CACHE_LOC
     prefix_lens_position = ServingForwardArg.EXTEND_PREFIX_LENS
     debug_attention = envs.SGLANG_DEBUG_MLX_EXPORT_ATTENTION.get()
+    prefill_batch_size = example_inputs[ServingForwardArg.REQ_POOL_INDICES].shape[0]
 
     def make_mlx_graph(prefill_attention: str):
         def mlx_graph(*arrays):
@@ -189,14 +190,14 @@ def _make_mlx_export_executor(
                         spec=spec,
                     )
                 elif prefill_attention == "causal":
-                    # Single request, no cached prefix: plain causal SDPA is
-                    # exactly the same math and ~15x faster than the radix
-                    # kernel at prefill shapes. Selection happens per call in
-                    # execute(); this graph is only run when it applies.
+                    # Every request has its own causal segment. Trailing
+                    # padding in a segment cannot affect its real tokens.
                     query = mx.contiguous(query)
                     key = mx.contiguous(key)
                     value = mx.contiguous(value)
-                    attention = causal_gqa(query, key, value, spec=spec)
+                    attention = causal_gqa(
+                        query, key, value, spec=spec, batch_size=prefill_batch_size
+                    )
                 else:
                     query = mx.contiguous(query)
                     key = mx.contiguous(key)
@@ -232,23 +233,32 @@ def _make_mlx_export_executor(
         raise UnsupportedMlxFxGraphError("decode export has no output node")
 
     compiled_graph = mx.compile(make_mlx_graph("radix"), shapeless=False)
-    # Packed multi-request batches and radix-prefix reuse need the custom
-    # kernel; the plain-causal fast path is only valid for one request with
-    # no cached prefix, so it exists only for batch-size-1 exports.
+    # The causal graph also covers packed, equally sized segments. Unequal
+    # extensions and cached prefixes retain the general radix graph.
     causal_prefill_graph = None
+    prefill_seq_len = None
     if (
         mode == "prefill"
-        and example_inputs[ServingForwardArg.REQ_POOL_INDICES].shape[0] == 1
+        and example_inputs[ServingForwardArg.INPUT_IDS].shape[0] % prefill_batch_size
+        == 0
     ):
+        prefill_seq_len = (
+            example_inputs[ServingForwardArg.INPUT_IDS].shape[0] // prefill_batch_size
+        )
         causal_prefill_graph = mx.compile(make_mlx_graph("causal"), shapeless=False)
 
     def execute(*runtime_inputs):
         tensor_inputs = tuple(runtime_inputs[index] for index in tensor_positions)
         graph = compiled_graph
-        if (
-            causal_prefill_graph is not None
-            and int(runtime_inputs[prefix_lens_position].max()) == 0
-        ):
+        use_causal = False
+        if causal_prefill_graph is not None:
+            eligible = runtime_inputs[prefix_lens_position] == 0
+            if prefill_batch_size > 1:
+                eligible = eligible & (
+                    runtime_inputs[ServingForwardArg.EXTEND_SEQ_LENS] == prefill_seq_len
+                )
+            use_causal = bool(eligible.all())
+        if use_causal:
             graph = causal_prefill_graph
         results = mlx_call_multi(
             graph,

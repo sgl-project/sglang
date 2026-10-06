@@ -195,6 +195,7 @@ class ServingForwardExportWrapper(torch.nn.Module):
         extend_prefix_lens: Optional[torch.Tensor],
         extend_start_loc: Optional[torch.Tensor],
         num_token_non_padded: Optional[torch.Tensor],
+        sampling_indices: Optional[torch.Tensor],
     ) -> torch.Tensor:
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
@@ -228,7 +229,9 @@ class ServingForwardExportWrapper(torch.nn.Module):
             # Match LogitsProcessor's no-logprob prefill pruning before the
             # vocabulary projection. These indices come from live metadata:
             # padded tokens and cached prefix tokens need no sampling logits.
-            last_indices = (extend_start_loc + extend_seq_lens - 1).to(torch.int64)
+            last_indices = sampling_indices
+            if last_indices is None:
+                last_indices = (extend_start_loc + extend_seq_lens - 1).to(torch.int64)
             hidden_states = hidden_states.index_select(0, last_indices)
         logits = torch.matmul(
             hidden_states.to(self.model.lm_head.weight.dtype),
@@ -260,15 +263,20 @@ class ServingForwardArg(IntEnum):
     EXTEND_PREFIX_LENS = 6
     EXTEND_START_LOC = 7
     NUM_TOKEN_NON_PADDED = 8
+    SAMPLING_INDICES = 9
 
 
-def serving_forward_args(forward_batch: ForwardBatch) -> tuple[Any, ...]:
+def serving_forward_args(
+    forward_batch: ForwardBatch,
+    sampling_indices: Optional[torch.Tensor] = None,
+) -> tuple[Any, ...]:
     """The flat tensor signature shared by export, validation, and serving.
 
     Order is load-bearing: the exported program's placeholders and the MLX
     executor's runtime-input reads are derived from it, so every caller must
     build the tuple through this function, whose layout follows
-    :class:`ServingForwardArg`.
+    :class:`ServingForwardArg`. Packed prefill passes sampling indices
+    separately so segment padding cannot change the last real token's row.
     """
     values = {
         ServingForwardArg.INPUT_IDS: forward_batch.input_ids,
@@ -280,6 +288,7 @@ def serving_forward_args(forward_batch: ForwardBatch) -> tuple[Any, ...]:
         ServingForwardArg.EXTEND_PREFIX_LENS: forward_batch.extend_prefix_lens,
         ServingForwardArg.EXTEND_START_LOC: forward_batch.extend_start_loc,
         ServingForwardArg.NUM_TOKEN_NON_PADDED: forward_batch.num_token_non_padded,
+        ServingForwardArg.SAMPLING_INDICES: sampling_indices,
     }
     ordered: list[Any] = [None] * len(ServingForwardArg)
     for arg in ServingForwardArg:
@@ -332,15 +341,20 @@ def serving_export_context(model_runner: Any, forward_batch: ForwardBatch) -> An
 def build_serving_forward_wrapper(
     model_runner: Any,
     forward_batch: ForwardBatch,
+    *,
+    sampling_indices: Optional[torch.Tensor] = None,
 ) -> tuple[ServingForwardExportWrapper, tuple[Any, ...]]:
     wrapper = ServingForwardExportWrapper(
         model_runner.model, model_runner, forward_batch
     ).eval()
-    return wrapper, serving_forward_args(forward_batch)
+    return wrapper, serving_forward_args(forward_batch, sampling_indices)
 
 
 def serving_graph_signature(
-    model_runner: Any, forward_batch: ForwardBatch
+    model_runner: Any,
+    forward_batch: ForwardBatch,
+    *,
+    sampling_indices: Optional[torch.Tensor] = None,
 ) -> tuple[str, ...]:
     """The exported graph's op sequence, for constant-independence checks.
 
@@ -356,7 +370,9 @@ def serving_graph_signature(
         reverse=False,
         num_tokens=forward_batch.input_ids.shape[0],
     )
-    wrapper, args = build_serving_forward_wrapper(model_runner, forward_batch)
+    wrapper, args = build_serving_forward_wrapper(
+        model_runner, forward_batch, sampling_indices=sampling_indices
+    )
     exported = torch.export.export(wrapper, args, strict=False)
     return tuple(
         f"{node.op}:{node.target}" for node in exported.graph_module.graph.nodes
@@ -366,6 +382,8 @@ def serving_graph_signature(
 def build_serving_mlx_executor(
     model_runner: Any,
     forward_batch: ForwardBatch,
+    *,
+    sampling_indices: Optional[torch.Tensor] = None,
 ) -> ServingMlxExecutor:
     """Build the MLX executor for one already-prepared serving bucket."""
     from sglang.srt.compilation.torch_compile_decoration import _to_torch
@@ -380,7 +398,9 @@ def build_serving_mlx_executor(
             reverse=False,
             num_tokens=batch.input_ids.shape[0],
         )
-        wrapper, args = build_serving_forward_wrapper(model_runner, batch)
+        wrapper, args = build_serving_forward_wrapper(
+            model_runner, batch, sampling_indices=sampling_indices
+        )
         exported = torch.export.export(wrapper, args, strict=False)
         if batch.forward_mode.is_decode():
             execution_mode = "decode"

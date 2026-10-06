@@ -42,7 +42,8 @@ class TestMlxDeferredDecodeSmallMemory(unittest.TestCase):
         request_rows = torch.tensor([0, 1], device="mps", dtype=torch.int64)
         seq_lens = torch.tensor(lengths, device="mps", dtype=torch.int64)
 
-        operation = lambda *arrays: radix_decode_deferred(*arrays, spec=spec)
+        def operation(*arrays):
+            return radix_decode_deferred(*arrays, spec=spec)
 
         def mutation_operation(*arrays):
             output = mx.empty_like(arrays[0])
@@ -177,6 +178,94 @@ class TestMlxDeferredDecodeSmallMemory(unittest.TestCase):
                 torch.mps.synchronize()
                 torch.testing.assert_close(
                     output.cpu(), reference.cpu(), atol=0.008, rtol=0.03
+                )
+
+    def test_uniform_packed_causal_attention_isolates_requests_and_trailing_padding(
+        self,
+    ):
+        import mlx.core as mx
+
+        from sglang.kernels.ops.attention.mlx_radix_attention import (
+            DeferredAttentionSpec,
+            causal_gqa,
+        )
+        from sglang.srt.utils.tensor_bridge import mlx_call
+
+        torch.manual_seed(20261006)
+        spec = DeferredAttentionSpec(num_q_heads=4, num_kv_heads=2, head_dim=64)
+        batch_size, seq_len, real_len = 4, 7, 5
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                q = torch.randn(batch_size * seq_len, 4, 64, dtype=dtype, device="mps")
+                k = torch.randn(batch_size * seq_len, 2, 64, dtype=dtype, device="mps")
+                v = torch.randn_like(k)
+
+                def operation(q, k, v):
+                    return causal_gqa(q, k, v, spec=spec, batch_size=batch_size)
+
+                compiled = mx.compile(operation, shapeless=False)
+                outputs = [
+                    mlx_call(fn, q, k, v, device="mps") for fn in (operation, compiled)
+                ]
+                references = []
+                for row in range(batch_size):
+                    start = row * seq_len
+                    qc = q[start : start + seq_len].cpu().float().transpose(0, 1)
+                    kc = (
+                        k[start : start + seq_len]
+                        .cpu()
+                        .float()
+                        .repeat_interleave(2, dim=1)
+                        .transpose(0, 1)
+                    )
+                    vc = (
+                        v[start : start + seq_len]
+                        .cpu()
+                        .float()
+                        .repeat_interleave(2, dim=1)
+                        .transpose(0, 1)
+                    )
+                    scores = (qc @ kc.transpose(1, 2)) * spec.attention_scale
+                    scores.masked_fill_(
+                        torch.ones(seq_len, seq_len, dtype=torch.bool).triu(1),
+                        float("-inf"),
+                    )
+                    references.append((scores.softmax(-1) @ vc).transpose(0, 1))
+                reference = torch.stack(references)
+                for output in outputs:
+                    torch.testing.assert_close(
+                        output.cpu().float().reshape_as(reference),
+                        reference,
+                        atol=0.012 if dtype == torch.bfloat16 else 1e-5,
+                        rtol=0.03 if dtype == torch.bfloat16 else 1e-4,
+                    )
+
+                # Changing the first request must not affect later requests.
+                changed_k, changed_v = k.clone(), v.clone()
+                changed_k[:seq_len] = 1000
+                changed_v[:seq_len] = -1000
+                isolated = mlx_call(compiled, q, changed_k, changed_v, device="mps")
+                torch.testing.assert_close(
+                    isolated[seq_len:].cpu(), outputs[1][seq_len:].cpu(), atol=0, rtol=0
+                )
+
+                # Trailing padding in every segment cannot affect real rows.
+                changed_k = k.reshape(batch_size, seq_len, 2, 64).clone()
+                changed_v = v.reshape(batch_size, seq_len, 2, 64).clone()
+                changed_k[:, real_len:] = -1000
+                changed_v[:, real_len:] = 1000
+                padded = mlx_call(
+                    compiled,
+                    q,
+                    changed_k.reshape_as(k),
+                    changed_v.reshape_as(v),
+                    device="mps",
+                )
+                torch.testing.assert_close(
+                    padded.reshape(batch_size, seq_len, 4, 64)[:, :real_len].cpu(),
+                    outputs[1].reshape(batch_size, seq_len, 4, 64)[:, :real_len].cpu(),
+                    atol=0,
+                    rtol=0,
                 )
 
     def test_packed_prefill_reads_radix_prefix_and_extension_rows(self):

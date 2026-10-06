@@ -86,6 +86,7 @@ def _make_runner(*, lora_enabled: bool = False) -> MlxRegionRunner:
     runner._prefill_token_buckets = tuple(
         mlx_region_prefill_token_buckets(DEFAULT_MAX_PREFILL_TOKENS)
     )
+    runner._prefill_batch_sizes = runner._decode_batch_sizes
     runner._executors = {}
     runner._failed_batch_sizes = set()
     runner._state_token = None
@@ -312,7 +313,8 @@ class TestStartupExport(CustomTestCase):
             + [
                 ("extend", b)
                 for b in mlx_region_prefill_token_buckets(DEFAULT_MAX_PREFILL_TOKENS)
-            ],
+            ]
+            + _make_runner()._packed_prefill_keys(),
         )
 
     def test_synthetic_batches_match_the_serving_signature(self):
@@ -347,7 +349,7 @@ class TestStartupExport(CustomTestCase):
             return self._executors[key]
 
         def fake_execute(self, batch):
-            if batch.batch_size == 2:
+            if batch.forward_mode.is_decode() and batch.batch_size == 2:
                 raise RuntimeError("metal dispatch failed")
 
         with (
@@ -574,12 +576,12 @@ class TestServingForwardArgLayout(CustomTestCase):
         )
 
     def test_tuple_position_matches_member_value_and_field_name(self):
-        # Position arg.value must hold the ForwardBatch field named
-        # arg.name.lower(); sentinel strings make any permutation visible.
+        # Sampling indices are an explicit argument derived by the runner;
+        # all other positions come directly from ForwardBatch fields.
         batch = SimpleNamespace(
             **{arg.name.lower(): arg.name.lower() for arg in ServingForwardArg}
         )
-        args = serving_forward_args(batch)
+        args = serving_forward_args(batch, batch.sampling_indices)
         self.assertEqual(len(args), len(ServingForwardArg))
         for arg in ServingForwardArg:
             self.assertEqual(args[arg.value], arg.name.lower())
@@ -878,6 +880,29 @@ class TestPrefillLogitsSelection(CustomTestCase):
             actual = wrapper(*serving_forward_args(batch))
         torch.testing.assert_close(actual, expected)
 
+    def test_explicit_sampling_rows_survive_export_for_segment_padding(self):
+        runner = _make_runner()
+        packed = dataclasses.replace(
+            runner._synthetic_batch(("extend", 12)),
+            batch_size=3,
+            input_ids=torch.arange(1, 13),
+            req_pool_indices=torch.arange(3),
+            extend_seq_lens=torch.full((3,), 4, dtype=torch.int32),
+            extend_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+        )
+        wrapper = self._wrapper(packed)
+        indices = torch.tensor([3, 7, 11])
+        exported = torch.export.export(
+            wrapper, serving_forward_args(packed, indices), strict=False
+        )
+        for live in (indices, torch.tensor([1, 5, 9])):
+            with torch.no_grad():
+                full = wrapper.model.lm_head(
+                    wrapper.model.model.embed_tokens(packed.input_ids)
+                )
+                actual = exported.module()(*serving_forward_args(packed, live))
+            torch.testing.assert_close(actual, full[live, :13])
+
     def test_execute_keeps_the_already_selected_logits_row_for_a_padded_prompt(self):
         runner = _make_runner()
         batch = dataclasses.replace(
@@ -901,6 +926,124 @@ class TestPrefillLogitsSelection(CustomTestCase):
                 (seen[0][ServingForwardArg.OUT_CACHE_LOC][300:] == _PAD_SINK_SLOT).all()
             )
         )
+
+
+class TestPackedPrefillBucketing(CustomTestCase):
+    def _runner(self):
+        runner = _make_runner()
+        runner._prefill_batch_sizes = (1, 2, 4)
+        runner._prefill_token_buckets = (7, 28)
+        return runner
+
+    def _batch(self, runner, lengths=(7, 7, 7), prefixes=None):
+        lengths = list(lengths)
+        prefixes = [0] * len(lengths) if prefixes is None else list(prefixes)
+        size = sum(lengths)
+        return dataclasses.replace(
+            runner._synthetic_batch(("extend", size)),
+            batch_size=len(lengths),
+            input_ids=torch.arange(1, size + 1),
+            positions=torch.cat([torch.arange(n) for n in lengths]),
+            req_pool_indices=torch.arange(5, 5 + len(lengths)),
+            seq_lens=torch.tensor([n + p for n, p in zip(lengths, prefixes)]),
+            seq_lens_cpu=torch.tensor([n + p for n, p in zip(lengths, prefixes)]),
+            out_cache_loc=torch.arange(101, 101 + size),
+            extend_seq_lens=torch.tensor(lengths, dtype=torch.int32),
+            extend_seq_lens_cpu=lengths,
+            extend_prefix_lens=torch.tensor(prefixes, dtype=torch.int32),
+            extend_prefix_lens_cpu=prefixes,
+            extend_start_loc=torch.tensor(
+                [sum(lengths[:i]) for i in range(len(lengths))], dtype=torch.int32
+            ),
+        )
+
+    def test_startup_shapes_are_bounded_by_existing_token_and_request_buckets(self):
+        runner = self._runner()
+        self.assertEqual(
+            runner._packed_prefill_keys(),
+            [("extend_batch", 2, 7), ("extend_batch", 4, 7)],
+        )
+        for key in runner._packed_prefill_keys():
+            synthetic = runner._synthetic_batch(key)
+            self.assertEqual(runner._executor_key(synthetic), key)
+            self.assertEqual(synthetic.input_ids.numel(), key[1] * key[2])
+            self.assertTrue(bool((synthetic.req_pool_indices == 0).all()))
+            self.assertTrue(bool((synthetic.out_cache_loc == _PAD_SINK_SLOT).all()))
+
+    def test_selects_the_smallest_segmented_shape_that_covers_the_batch(self):
+        runner = self._runner()
+        self.assertEqual(
+            runner._executor_key(self._batch(runner)), ("extend_batch", 4, 7)
+        )
+        self.assertEqual(
+            runner._executor_key(self._batch(runner, (5, 5))), ("extend_batch", 2, 7)
+        )
+        self.assertIsNone(runner._executor_key(self._batch(runner, (8, 8))))
+        self.assertIsNone(runner._executor_key(self._batch(runner, (5,) * 5)))
+
+    def test_unsupported_metadata_and_semantics_keep_the_fallback(self):
+        runner = self._runner()
+        cases = [
+            self._batch(runner, (3, 5)),
+            self._batch(runner, prefixes=(0, 1, 0)),
+            dataclasses.replace(self._batch(runner), extend_seq_lens_cpu=None),
+            dataclasses.replace(self._batch(runner), extend_prefix_lens_cpu=[0]),
+            dataclasses.replace(
+                self._batch(runner), input_ids=torch.zeros(14, dtype=torch.int64)
+            ),
+            dataclasses.replace(self._batch(runner), return_logprob=True),
+            dataclasses.replace(self._batch(runner), forward_mode=ForwardMode.MIXED),
+            self._batch(runner, (5, 5, 5)),  # Excessive shape padding stays eager.
+        ]
+        for batch in cases:
+            with self.subTest(batch=batch):
+                self.assertIsNone(runner._executor_key(batch))
+
+    def test_padding_preserves_real_rows_and_sends_every_dummy_kv_to_reserved_slot(
+        self,
+    ):
+        runner = self._runner()
+        original = self._batch(runner, (5, 5, 5))
+        padded, sampling_indices = runner._pad_packed_extend_batch(original, 4, 7)
+        self.assertEqual(
+            padded.input_ids.reshape(4, 7).tolist(),
+            [
+                [1, 2, 3, 4, 5, 0, 0],
+                [6, 7, 8, 9, 10, 0, 0],
+                [11, 12, 13, 14, 15, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0],
+            ],
+        )
+        slots = padded.out_cache_loc.reshape(4, 7)
+        torch.testing.assert_close(slots[:3, :5].reshape(-1), original.out_cache_loc)
+        self.assertTrue(bool((slots[:3, 5:] == _PAD_SINK_SLOT).all()))
+        self.assertTrue(bool((slots[3] == _PAD_SINK_SLOT).all()))
+        self.assertEqual(padded.req_pool_indices.tolist(), [5, 6, 7, 0])
+        self.assertEqual(padded.extend_start_loc.tolist(), [0, 7, 14, 21])
+        self.assertEqual(padded.extend_seq_lens.tolist(), [7] * 4)
+        self.assertEqual(sampling_indices[:3].tolist(), [4, 11, 18])
+        self.assertEqual(padded.extend_num_tokens, 28)
+        self.assertEqual(
+            padded.positions.reshape(4, 7)[:3, :5].tolist(), [list(range(5))] * 3
+        )
+
+    def test_execute_passes_explicit_sampling_rows_and_discards_dummy_requests(self):
+        runner = self._runner()
+        batch = self._batch(runner)
+        logits = torch.arange(4 * 13).reshape(4, 13)
+        seen = []
+
+        def execute(*args):
+            seen.append(args)
+            return logits
+
+        runner._executors[("extend_batch", 4, 7)] = SimpleNamespace(execute=execute)
+        output = runner.execute(batch)
+        torch.testing.assert_close(output.next_token_logits, logits[:3])
+        self.assertEqual(
+            seen[0][ServingForwardArg.SAMPLING_INDICES][:3].tolist(), [6, 13, 20]
+        )
+        self.assertEqual(seen[0][ServingForwardArg.INPUT_IDS].shape, (28,))
 
 
 if __name__ == "__main__":

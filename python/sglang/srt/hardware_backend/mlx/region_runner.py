@@ -4,7 +4,7 @@ The region executor is a pure function over Torch-owned serving state: it
 reads the KV pool through zero-copy views, returns next-token logits, and
 commits the step's K/V delta back through the Torch-side Metal commit.
 Torch keeps ownership of scheduling, pools, sampling, and LoRA; this runner
-replaces the decode forward and single-request prefill.
+replaces decode, single-request prefill, and fresh uniform packed prefill.
 
 Executors are exported per padded shape bucket -- decode batch sizes and
 prefill token counts -- and reused for every later batch the bucket covers,
@@ -227,8 +227,15 @@ class MlxRegionRunner(BaseRunner):
             if graph_config.prefill.backend != "disabled"
             else ()
         )
-        self._executors: dict[tuple[str, int], Any] = {}
-        self._failed_batch_sizes: set[tuple[str, int]] = set()
+        # Request cardinalities share the configured decode ladder even when
+        # decode is disabled; prefill-only serving needs its own captures.
+        self._prefill_batch_sizes = (
+            _configured_decode_batch_sizes(model_runner)
+            if self._prefill_token_buckets
+            else ()
+        )
+        self._executors: dict[tuple, Any] = {}
+        self._failed_batch_sizes: set[tuple] = set()
         self._state_token: Optional[tuple] = None
         self._constants_checked = False
         if model_runner.is_draft_worker:
@@ -273,8 +280,28 @@ class MlxRegionRunner(BaseRunner):
         request path. ``_ensure_executor`` only re-exports after the KV pool
         or weight storage the executors alias has been replaced.
         """
-        return [("decode", batch_size) for batch_size in self._decode_batch_sizes] + [
-            ("extend", bucket) for bucket in self._prefill_token_buckets
+        return (
+            [("decode", batch_size) for batch_size in self._decode_batch_sizes]
+            + [("extend", bucket) for bucket in self._prefill_token_buckets]
+            + self._packed_prefill_keys()
+        )
+
+    def _packed_prefill_keys(self) -> list[tuple]:
+        """Reuse both ladders without exceeding the prefill token cap.
+
+        A packed shape is (requests, tokens per request). Per-request lengths
+        come from the existing prefill ladder, and the entire shape must fit
+        its total-token cap. No shape is exported on the request path.
+        """
+        if not self._prefill_token_buckets:
+            return []
+        cap = self._prefill_token_buckets[-1]
+        return [
+            ("extend_batch", batch_size, seq_len)
+            for batch_size in self._prefill_batch_sizes
+            if batch_size > 1
+            for seq_len in self._prefill_token_buckets
+            if batch_size * seq_len <= cap
         ]
 
     def _export_at_startup(self) -> None:
@@ -341,7 +368,7 @@ class MlxRegionRunner(BaseRunner):
         exactly: the exported executor binds them into its signature.
         """
         device = self.model_runner.device
-        mode, size = key
+        mode, size = key[:2]
         if mode == "decode":
             zeros = torch.zeros(size, dtype=torch.int64, device=device)
             return ForwardBatch(
@@ -354,6 +381,32 @@ class MlxRegionRunner(BaseRunner):
                 out_cache_loc=zeros.clone(),
                 seq_lens_sum=size,
                 global_num_token_non_padded_cpu=size,
+            )
+        if mode == "extend_batch":
+            seq_len = key[2]
+            tokens = size * seq_len
+            return ForwardBatch(
+                forward_mode=ForwardMode.EXTEND,
+                batch_size=size,
+                input_ids=torch.zeros(tokens, dtype=torch.int64, device=device),
+                positions=torch.arange(
+                    seq_len, dtype=torch.int64, device=device
+                ).repeat(size),
+                req_pool_indices=torch.zeros(size, dtype=torch.int64, device=device),
+                seq_lens=torch.full((size,), seq_len, dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.full((size,), seq_len, dtype=torch.int64),
+                out_cache_loc=torch.zeros(tokens, dtype=torch.int64, device=device),
+                seq_lens_sum=tokens,
+                extend_num_tokens=tokens,
+                extend_seq_lens=torch.full(
+                    (size,), seq_len, dtype=torch.int32, device=device
+                ),
+                extend_seq_lens_cpu=[seq_len] * size,
+                extend_prefix_lens=torch.zeros(size, dtype=torch.int32, device=device),
+                extend_prefix_lens_cpu=[0] * size,
+                extend_start_loc=torch.arange(size, dtype=torch.int32, device=device)
+                * seq_len,
+                global_num_token_non_padded_cpu=tokens,
             )
         return ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
@@ -398,8 +451,6 @@ class MlxRegionRunner(BaseRunner):
         # DLLM variants whose semantics the exported graph does not carry.
         if mode != ForwardMode.EXTEND:
             return None
-        if forward_batch.batch_size != 1:
-            return None
         if forward_batch.return_logprob:
             # Prompt logprobs need the full LogitsProcessor machinery.
             return None
@@ -408,6 +459,32 @@ class MlxRegionRunner(BaseRunner):
             or forward_batch.replace_embeds is not None
         ):
             return None
+        if forward_batch.batch_size != 1:
+            lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
+            prefixes = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+            if (
+                not lengths
+                or prefixes is None
+                or len(lengths) != forward_batch.batch_size
+                or len(prefixes) != forward_batch.batch_size
+                or lengths[0] <= 0
+                or any(length != lengths[0] for length in lengths)
+                or any(prefix != 0 for prefix in prefixes)
+                or forward_batch.input_ids.numel() != sum(lengths)
+            ):
+                return None
+            candidates = [
+                key
+                for key in self._packed_prefill_keys()
+                if key[1] >= forward_batch.batch_size
+                and key[2] >= lengths[0]
+                # Extra matrix work can erase the region's dispatch savings.
+                # Cap padding at 50% of real tokens; small batches stay eager.
+                and 2 * key[1] * key[2] <= 3 * sum(lengths)
+            ]
+            return min(
+                candidates, key=lambda key: (key[1] * key[2], key[1]), default=None
+            )
         return self._bucket_key(
             "extend", forward_batch.input_ids.shape[0], self._prefill_token_buckets
         )
@@ -440,6 +517,14 @@ class MlxRegionRunner(BaseRunner):
 
         key = self._executor_key(forward_batch)
         executor = self._executors[key]
+        if key[0] == "extend_batch":
+            padded, sampling_indices = self._pad_packed_extend_batch(
+                forward_batch, key[1], key[2]
+            )
+            logits = executor.execute(*serving_forward_args(padded, sampling_indices))
+            return LogitsProcessorOutput(
+                next_token_logits=logits[: forward_batch.batch_size]
+            )
         if key[0] == "extend":
             padded = self._pad_extend_batch(forward_batch, key[1])
             logits = executor.execute(*serving_forward_args(padded))
@@ -520,6 +605,64 @@ class MlxRegionRunner(BaseRunner):
             ),
         )
 
+    def _pad_packed_extend_batch(
+        self, forward_batch: ForwardBatch, batch_bucket: int, seq_bucket: int
+    ) -> tuple[ForwardBatch, torch.Tensor]:
+        """Pad each prompt independently and keep sampling rows explicit.
+
+        The decoder sees equally sized causal segments. Padding follows real
+        tokens inside each segment, and every dummy K/V goes to reserved slot
+        zero. The independent sampling tensor identifies each last real row
+        before the vocabulary projection; dummy requests are dropped later.
+        """
+        batch_size = forward_batch.batch_size
+        seq_len = forward_batch.input_ids.numel() // batch_size
+
+        def token_rows(tensor: torch.Tensor, value: int) -> torch.Tensor:
+            return torch.nn.functional.pad(
+                tensor.reshape(batch_size, seq_len),
+                (0, seq_bucket - seq_len, 0, batch_bucket - batch_size),
+                value=value,
+            ).reshape(-1)
+
+        device = forward_batch.input_ids.device
+        starts = (
+            torch.arange(batch_bucket, dtype=torch.int32, device=device) * seq_bucket
+        )
+        sampling_indices = starts.to(torch.int64) + seq_len - 1
+        tokens = batch_bucket * seq_bucket
+        padded = dataclasses.replace(
+            forward_batch,
+            batch_size=batch_bucket,
+            input_ids=token_rows(forward_batch.input_ids, 0),
+            positions=token_rows(forward_batch.positions, 0),
+            out_cache_loc=token_rows(forward_batch.out_cache_loc, _PAD_SINK_SLOT),
+            req_pool_indices=torch.nn.functional.pad(
+                forward_batch.req_pool_indices, (0, batch_bucket - batch_size)
+            ),
+            seq_lens=torch.full(
+                (batch_bucket,),
+                seq_bucket,
+                dtype=forward_batch.seq_lens.dtype,
+                device=device,
+            ),
+            seq_lens_cpu=torch.full(
+                (batch_bucket,), seq_bucket, dtype=forward_batch.seq_lens.dtype
+            ),
+            seq_lens_sum=tokens,
+            extend_num_tokens=tokens,
+            extend_seq_lens=torch.full(
+                (batch_bucket,), seq_bucket, dtype=torch.int32, device=device
+            ),
+            extend_seq_lens_cpu=[seq_bucket] * batch_bucket,
+            extend_prefix_lens=torch.zeros(
+                batch_bucket, dtype=torch.int32, device=device
+            ),
+            extend_prefix_lens_cpu=[0] * batch_bucket,
+            extend_start_loc=starts,
+        )
+        return padded, sampling_indices
+
     def _state_identity(self) -> tuple:
         """Storage identity of everything the exported views alias.
 
@@ -567,15 +710,21 @@ class MlxRegionRunner(BaseRunner):
         # Executors are exported at their padded bucket shape so one export
         # serves every prompt length (extend) or batch size (decode) the
         # bucket covers.
-        export_batch = (
-            self._pad_extend_batch(forward_batch, key[1])
-            if key[0] == "extend"
-            else self._pad_decode_batch(forward_batch, key[1])
-        )
+        sampling_indices = None
+        if key[0] == "extend_batch":
+            export_batch, sampling_indices = self._pad_packed_extend_batch(
+                forward_batch, key[1], key[2]
+            )
+        elif key[0] == "extend":
+            export_batch = self._pad_extend_batch(forward_batch, key[1])
+        else:
+            export_batch = self._pad_decode_batch(forward_batch, key[1])
         start = time.perf_counter()
         try:
             with serving_export_context(self.model_runner, export_batch):
-                region = build_serving_mlx_executor(self.model_runner, export_batch)
+                region = build_serving_mlx_executor(
+                    self.model_runner, export_batch, sampling_indices=sampling_indices
+                )
         except Exception:
             logger.exception(
                 "MLX region export failed for %s; serving this shape on the "
@@ -598,7 +747,7 @@ class MlxRegionRunner(BaseRunner):
             time.perf_counter() - start,
         )
         if not self._constants_checked and not self._graph_ignores_baked_constants(
-            region, export_batch
+            region, export_batch, sampling_indices=sampling_indices
         ):
             self._model_reject_reason = (
                 "exported graph depends on batch fields the wrapper bakes as "
@@ -621,7 +770,11 @@ class MlxRegionRunner(BaseRunner):
         return region
 
     def _graph_ignores_baked_constants(
-        self, region: Any, forward_batch: ForwardBatch
+        self,
+        region: Any,
+        forward_batch: ForwardBatch,
+        *,
+        sampling_indices: Optional[torch.Tensor] = None,
     ) -> bool:
         """Prove the export is a function of tensor arguments only.
 
@@ -652,7 +805,11 @@ class MlxRegionRunner(BaseRunner):
         )
         try:
             with serving_export_context(self.model_runner, perturbed_batch):
-                perturbed = serving_graph_signature(self.model_runner, perturbed_batch)
+                perturbed = serving_graph_signature(
+                    self.model_runner,
+                    perturbed_batch,
+                    sampling_indices=sampling_indices,
+                )
         except Exception:
             logger.exception(
                 "MLX region: constant-independence re-export failed; "

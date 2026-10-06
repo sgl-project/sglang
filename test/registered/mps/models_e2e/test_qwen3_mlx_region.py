@@ -67,11 +67,11 @@ class TestQwen3MlxRegion(CustomTestCase):
             )
             try:
 
-                def generate(text):
+                def generate(text, *, input_ids=False):
                     response = requests.post(
                         f"{DEFAULT_URL_FOR_TEST}/generate",
                         json={
-                            "text": text,
+                            "input_ids" if input_ids else "text": text,
                             "sampling_params": {
                                 "temperature": 0,
                                 "ignore_eos": True,
@@ -93,23 +93,59 @@ class TestQwen3MlxRegion(CustomTestCase):
                 self.assertEqual(cold["meta_info"]["cached_tokens"], 0)
                 self.assertGreater(warm["meta_info"]["cached_tokens"], 0)
                 self.assertEqual(cold["output_ids"], warm["output_ids"])
+                # Three fresh requests pad onto four independent 128-token
+                # segments, with both token and request padding exercised.
+                from transformers import AutoTokenizer
+
+                tokenizer = AutoTokenizer.from_pretrained(model)
+                packed_inputs = []
+                for country in ("France", "Canada", "Japan"):
+                    tail = tokenizer.encode(
+                        f"Answer briefly. The capital of {country} is"
+                    )
+                    prefix = tokenizer.encode(
+                        f"{country}: A factual question about geography. " * 30
+                    )
+                    packed_inputs.append(prefix[: 120 - len(tail)] + tail)
+                requests.post(
+                    f"{DEFAULT_URL_FOR_TEST}/flush_cache", timeout=30
+                ).raise_for_status()
+                packed = generate(packed_inputs, input_ids=True)
+                packed_warm = generate(packed_inputs, input_ids=True)
+                self.assertTrue(
+                    all(item["meta_info"]["cached_tokens"] == 0 for item in packed)
+                )
+                self.assertTrue(
+                    all(item["meta_info"]["cached_tokens"] > 0 for item in packed_warm)
+                )
+                self.assertEqual(
+                    [item["output_ids"] for item in packed],
+                    [item["output_ids"] for item in packed_warm],
+                )
             finally:
                 kill_process_tree(process.pid, wait_timeout=30)
                 process.wait(timeout=5)
             log.seek(0)
             output = log.read()
         if enabled:
-            self.assertIn("exported 5/5 shapes at startup", output)
+            self.assertIn("exported 7/7 shapes at startup", output)
             self.assertNotIn("MLX region export failed", output)
             self.assertNotIn("MLX region warm-up execution failed", output)
             self.assertNotIn("MLX region disabled for this model", output)
             self.assertRegex(output, r"Prefill batch[^\n]+cuda graph: True")
             self.assertRegex(
+                output,
+                r"Prefill batch[^\n]+#new-seq: 3[^\n]+#new-token: 360[^\n]+cuda graph: True",
+            )
+            self.assertRegex(
                 output, r"Decode batch[^\n]+#running-req: 3[^\n]+cuda graph: True"
             )
-        return [cold["output_ids"], warm["output_ids"]] + [
-            item["output_ids"] for item in batch
-        ]
+        return (
+            [cold["output_ids"], warm["output_ids"]]
+            + [item["output_ids"] for item in batch]
+            + [item["output_ids"] for item in packed]
+            + [item["output_ids"] for item in packed_warm]
+        )
 
     def test_region_matches_eager_and_reuses_torch_radix_cache(self):
         self.assertEqual(self._run_server(False), self._run_server(True))
