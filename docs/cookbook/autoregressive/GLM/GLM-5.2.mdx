@@ -392,13 +392,25 @@ initialization port `20000`, and send requests to port `30000` on node 0.
 For Docker, use the same image on both nodes and expose the host's fabric
 devices as described in the [multi-node installation guidance](/docs/get-started/install#method-3-using-docker).
 
-HiCache reserves 135 GB of host memory per GPU rank, or 540 GB per node, in
-addition to memory needed for model loading and the runtime. Make that host
-memory available to each process or container before launching.
+<Accordion title="Optional HiCache">
+  For prefix-heavy workloads, append these flags to the generated command on
+  both nodes:
+
+```bash HiCache flags
+--enable-hierarchical-cache \
+  --hicache-size 135 \
+  --hicache-write-policy write_back \
+  --hicache-io-backend direct
+```
+
+  This reserves 135 GB of host memory per GPU rank, or 540 GB per node, in
+  addition to memory needed for model loading and the runtime. Make that host
+  memory available to each process or container before enabling HiCache.
+</Accordion>
 
 <Note>
-  The source configuration passed an InferenceX sweep behind a Dynamo frontend.
-  The standalone `sglang serve` adaptation shown here has not been validated on
-  GPUs, so it is marked **Not Verified** and has no benchmark results in the
-  command panel. FP8 multi-node serving is not qualified by this NVFP4 result.
+  This simplified command is based on a Dynamo-backed InferenceX sweep, but it
+  does not reproduce the full benchmark configuration. It has not been validated
+  on GPUs and remains **Not Verified**, with no benchmark results in the panel.
+  The source result covers NVFP4; FP8 multi-node remains unqualified.
 </Note>

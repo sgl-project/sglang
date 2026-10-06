@@ -157,7 +157,7 @@ sgl-eval run aime25 \\
           { id: "deepep", label: "DeepEP", flags: ["--moe-a2a-backend deepep"] },
         ],
       },
-      ep: { label: "EP", values: [null, 1, 4, 8] },
+      ep: { label: "EP", values: [null, 4, 8] },
     },
 
     // ----- Card 3: "Parsers" -----
@@ -873,7 +873,7 @@ sgl-eval run aime25 \\
         "--port {{PORT}}",
       ],
     },
-    // Two-node GB300 NVFP4 aggregate, adapted from InferenceX #3659's
+    // Two-node GB300 NVFP4 aggregate, simplified from InferenceX #3659's
     // TP8 c4 recipe at e79239ba (run 36997573694, attempt 2).
     // The sweep used Dynamo; this standalone SGLang command is unverified.
     {
@@ -881,17 +881,12 @@ sgl-eval run aime25 \\
       verified: false,
       warn: "TP8 spans two four-GPU GB300 nodes. Set Head node IP and run node ranks 0 and 1. See [multi-node setup](#gb300-nvfp4-multi-node).",
       env: [
-        "TORCH_DISTRIBUTED_DEFAULT_TIMEOUT=1800",
         "NCCL_CUMEM_ENABLE=1",
         "NCCL_MNNVL_ENABLE=1",
-        "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=0",
-        "SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION=8",
       ],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--trust-remote-code",
         "--tp 8",
-        "--ep-size 1",
         "--quantization modelopt_fp4",
         "--fp4-gemm-backend flashinfer_trtllm",
         "--speculative-algorithm EAGLE",
@@ -899,19 +894,7 @@ sgl-eval run aime25 \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
         "--max-running-requests 8",
-        "--cuda-graph-max-bs-decode 8",
-        "--chunked-prefill-size 8192",
-        "--max-prefill-tokens 8192",
-        "--context-length 1048576",
         "--mem-fraction-static 0.8",
-        "--enable-hierarchical-cache",
-        "--hicache-size 135",
-        "--hicache-write-policy write_back",
-        "--hicache-io-backend direct",
-        "--weight-loader-prefetch-checkpoints",
-        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
-        "--enable-metrics",
-        "--enable-cache-report",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
