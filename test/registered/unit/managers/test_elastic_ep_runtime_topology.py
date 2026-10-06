@@ -62,6 +62,7 @@ class TestElasticEPRuntimeTopology(unittest.TestCase):
 
         self.assertEqual(committed.effective_ep_size, 8)
         self.assertEqual(committed.max_committed_ep_size, 12)
+        self.assertEqual(committed.topology_generation, 1)
 
     def test_commit_advances_maximum_after_growth(self):
         publish_runtime_topology(_topology())
@@ -70,6 +71,7 @@ class TestElasticEPRuntimeTopology(unittest.TestCase):
 
         self.assertEqual(committed.effective_ep_size, 12)
         self.assertEqual(committed.max_committed_ep_size, 12)
+        self.assertEqual(committed.topology_generation, 1)
 
     def test_next_unused_offset_is_appendable(self):
         validate_append_candidate(

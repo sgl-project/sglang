@@ -24,6 +24,7 @@ class RuntimeTopology:
     allocation_width: int
     effective_ep_size: int
     max_committed_ep_size: int
+    topology_generation: int = 0
 
     def validate(self) -> None:
         if not self.runtime_instance_id:
@@ -45,6 +46,8 @@ class RuntimeTopology:
                 f"(effective={self.effective_ep_size}, "
                 f"max_committed={self.max_committed_ep_size})."
             )
+        if self.topology_generation < 0:
+            raise ValueError("Elastic EP topology generation must be non-negative.")
 
 
 def _decode_runtime_topology(value: bytes) -> RuntimeTopology:
@@ -98,6 +101,7 @@ def commit_runtime_topology(effective_ep_size: int) -> RuntimeTopology:
             topology.max_committed_ep_size,
             effective_ep_size,
         ),
+        topology_generation=topology.topology_generation + 1,
     )
     publish_runtime_topology(committed)
     return committed

@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 _SCALE_COHORT_KEY_PREFIX = "elastic_ep/scale_cohort"
 _SCALE_OPERATION_KEY_PREFIX = "elastic_ep/scale_operation"
+_RECOVERY_OPERATION_KEY_PREFIX = "elastic_ep/recovery_operation"
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,106 @@ class ScaleCohort:
     ready_rank_count: int
     allocation_id: Optional[str]
     cuda_graph_enabled: bool
+
+
+@dataclass(frozen=True)
+class RecoveryOperation:
+    runtime_instance_id: str
+    topology_generation: int
+    operation_id: str
+    allocation_id: str
+    rank_offset: int
+    rank_count: int = 1
+
+    def validate(self, topology: RuntimeTopology) -> None:
+        if self.runtime_instance_id != topology.runtime_instance_id:
+            raise RuntimeError(
+                "Recovery operation runtime instance does not match the running world."
+            )
+        if self.topology_generation != topology.topology_generation:
+            raise RuntimeError(
+                "Recovery operation topology generation does not match the running world."
+            )
+        if not self.operation_id:
+            raise ValueError("Recovery operation ID must not be empty.")
+        if not self.allocation_id:
+            raise ValueError("Recovery allocation ID must not be empty.")
+        if topology.allocation_width != 1 or self.rank_count != 1:
+            raise RuntimeError(
+                "Fixed-slot recovery currently supports exactly one TP1 allocation."
+            )
+        if not 0 < self.rank_offset < topology.effective_ep_size:
+            raise RuntimeError(
+                "Recovery rank offset must identify a non-primary active-world slot."
+            )
+
+
+@dataclass
+class RecoveryLifecycle:
+    phase: str = "restoring"
+
+    def advance(self, next_phase: str, *, warmup_succeeded: bool = False) -> None:
+        transitions = {
+            "restoring": "slot_restored",
+            "slot_restored": "warming_up",
+            "warming_up": "ready",
+        }
+        expected_phase = transitions.get(self.phase)
+        if next_phase != expected_phase:
+            raise RuntimeError(
+                f"Invalid Elastic EP recovery transition from {self.phase} to "
+                f"{next_phase}; expected {expected_phase}."
+            )
+        if next_phase == "ready" and not warmup_succeeded:
+            raise RuntimeError(
+                "Recovery cannot become ready before an internal warmup succeeds."
+            )
+        self.phase = next_phase
+
+
+def _recovery_operation_key(
+    runtime_instance_id: str, operation_id: str
+) -> str:
+    return (
+        f"{_RECOVERY_OPERATION_KEY_PREFIX}/"
+        f"{quote(runtime_instance_id, safe='')}/{quote(operation_id, safe='')}"
+    )
+
+
+def get_recovery_operation(
+    runtime_instance_id: str, operation_id: str
+) -> Optional[RecoveryOperation]:
+    value = _load_store_json(_recovery_operation_key(runtime_instance_id, operation_id))
+    return RecoveryOperation(**value) if value is not None else None
+
+
+def register_recovery_operation(operation: RecoveryOperation) -> RecoveryOperation:
+    topology = get_runtime_topology()
+    if topology is None:
+        raise RuntimeError("Elastic EP runtime topology has not been published.")
+    operation.validate(topology)
+    key = _recovery_operation_key(
+        operation.runtime_instance_id,
+        operation.operation_id,
+    )
+    store = get_global_tcp_store()
+    assert store is not None
+    encoded = json.dumps(operation.__dict__, sort_keys=True).encode()
+    if hasattr(store, "compare_set"):
+        stored = store.compare_set(key, b"", encoded)
+        registered = RecoveryOperation(**json.loads(stored.decode()))
+    else:
+        existing = _load_store_json(key)
+        if existing is None:
+            _store_json(key, operation.__dict__)
+            return operation
+        registered = RecoveryOperation(**existing)
+    if registered != operation:
+        raise RuntimeError(
+            f"Recovery operation {operation.operation_id} conflicts with "
+            "the existing operation."
+        )
+    return registered
 
 
 def _store_json(key: str, value: dict) -> None:
@@ -188,6 +289,12 @@ class ElasticEPState:
     operation_id: Optional[str] = None
     operation_target_ep_size: Optional[int] = None
     operation_expected_joining_allocation_ids: Optional[List[str]] = None
+    recovery_operation_id: Optional[str] = None
+    recovery_topology_generation: Optional[int] = None
+    recovery_allocation_id: Optional[str] = None
+    recovery_rank_offset: Optional[int] = None
+    recovery_phase: str = "idle"
+    recovery_warmup_succeeded: bool = False
 
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
@@ -359,6 +466,7 @@ class ElasticEPStateManager:
         if (
             inst.pending_ep_size is not None
             or inst.runtime_health == "recovery_unsupported"
+            or inst.recovery_phase != "idle"
         ):
             return False
         register_scale_operation(
@@ -379,6 +487,44 @@ class ElasticEPStateManager:
         inst.operation_succeeded = None
         inst.last_error = None
         inst.pending_since = time.monotonic()
+        return True
+
+    @classmethod
+    def request_recovery(cls, operation: RecoveryOperation) -> bool:
+        inst = cls._instance
+        if inst is None:
+            return False
+        if inst.recovery_phase != "idle":
+            if (
+                inst.recovery_operation_id == operation.operation_id
+                and inst.runtime_instance_id == operation.runtime_instance_id
+                and inst.recovery_topology_generation == operation.topology_generation
+                and inst.recovery_allocation_id == operation.allocation_id
+                and inst.recovery_rank_offset == operation.rank_offset
+            ):
+                return True
+            raise RuntimeError(
+                "Recovery operation conflicts with the pending recovery operation."
+            )
+        if inst.pending_ep_size is not None:
+            return False
+        if (
+            inst.active_ranks_cpu is None
+            or inst.active_ranks_cpu[operation.rank_offset].item() != 0
+        ):
+            raise RuntimeError(
+                "Recovery operation requires its target slot to be inactive."
+            )
+        register_recovery_operation(operation)
+        inst.runtime_instance_id = operation.runtime_instance_id
+        inst.recovery_operation_id = operation.operation_id
+        inst.recovery_topology_generation = operation.topology_generation
+        inst.recovery_allocation_id = operation.allocation_id
+        inst.recovery_rank_offset = operation.rank_offset
+        inst.recovery_phase = "restoring"
+        inst.recovery_warmup_succeeded = False
+        inst.operation_succeeded = None
+        inst.last_error = None
         return True
 
     @classmethod

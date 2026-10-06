@@ -10,12 +10,16 @@ maybe_stub_sgl_kernel()
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPState,
     ElasticEPStateManager,
+    RecoveryLifecycle,
+    RecoveryOperation,
     get_scale_cohort,
+    get_recovery_operation,
     register_scale_cohort,
     register_scale_operation,
 )
 from sglang.srt.managers.io_struct import (
     ElasticScaleUpdateReq,
+    RecoverElasticEPReqInput,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
 )
@@ -37,6 +41,13 @@ class _Store:
 
     def get(self, key):
         return self.values[key]
+
+    def compare_set(self, key, expected, value):
+        existing = self.values.get(key, expected)
+        if existing == expected:
+            self.values[key] = value
+            return value
+        return existing
 
 
 def _manager() -> TokenizerManager:
@@ -438,6 +449,195 @@ class TestElasticEPCohortBinding(unittest.TestCase):
             )
             with self.assertRaisesRegex(RuntimeError, "is not authorized"):
                 register_scale_cohort(4, 8, 1, "stale-pod-uid")
+
+
+class TestElasticEPRecoveryLifecycle(unittest.TestCase):
+    def setUp(self):
+        self.store = _Store()
+        self.store_patch = patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_global_tcp_store",
+            return_value=self.store,
+        )
+        self.store_patch.start()
+        self.addCleanup(self.store_patch.stop)
+        self.topology_patch = patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_runtime_topology",
+            return_value=MagicMock(
+                runtime_instance_id="runtime-1",
+                topology_generation=3,
+                allocation_width=1,
+                effective_ep_size=4,
+            ),
+        )
+        self.topology_patch.start()
+        self.addCleanup(self.topology_patch.stop)
+        self.state = ElasticEPState(
+            active_ranks=MagicMock(),
+            last_active_ranks=None,
+            active_ranks_cpu=MagicMock(),
+            effective_ep_size=4,
+            runtime_instance_id="runtime-1",
+        )
+        self.state.active_ranks_cpu.__getitem__.return_value.item.return_value = 0
+        self.instance_patch = patch.object(ElasticEPStateManager, "_instance", self.state)
+        self.instance_patch.start()
+        self.addCleanup(self.instance_patch.stop)
+
+    def test_recovery_record_is_idempotent_and_fenced(self):
+        operation = RecoveryOperation(
+            runtime_instance_id="runtime-1",
+            topology_generation=3,
+            operation_id="recover-1",
+            allocation_id="pod-uid-5",
+            rank_offset=2,
+        )
+
+        self.assertTrue(ElasticEPStateManager.request_recovery(operation))
+        self.assertTrue(ElasticEPStateManager.request_recovery(operation))
+        self.assertEqual(self.state.recovery_phase, "restoring")
+        self.assertEqual(get_recovery_operation("runtime-1", "recover-1"), operation)
+
+        conflicting = RecoveryOperation(
+            runtime_instance_id="runtime-1",
+            topology_generation=3,
+            operation_id="recover-1",
+            allocation_id="replacement-pod",
+            rank_offset=2,
+        )
+        with self.assertRaisesRegex(RuntimeError, "conflicts"):
+            from sglang.srt.elastic_ep.elastic_ep import register_recovery_operation
+
+            register_recovery_operation(conflicting)
+
+    def test_recovery_rejects_stale_generation_and_active_slot(self):
+        stale = RecoveryOperation(
+            runtime_instance_id="runtime-1",
+            topology_generation=2,
+            operation_id="recover-1",
+            allocation_id="pod-uid-5",
+            rank_offset=2,
+        )
+        with self.assertRaisesRegex(RuntimeError, "generation"):
+            ElasticEPStateManager.request_recovery(stale)
+
+        self.state.active_ranks_cpu.__getitem__.return_value.item.return_value = 1
+        active = RecoveryOperation(
+            runtime_instance_id="runtime-1",
+            topology_generation=3,
+            operation_id="recover-1",
+            allocation_id="pod-uid-5",
+            rank_offset=2,
+        )
+        with self.assertRaisesRegex(RuntimeError, "inactive"):
+            ElasticEPStateManager.request_recovery(active)
+
+    def test_recovery_rejects_wrong_runtime_primary_slot_and_non_tp1_width(self):
+        invalid_operations = [
+            RecoveryOperation(
+                runtime_instance_id="runtime-old",
+                topology_generation=3,
+                operation_id="recover-runtime",
+                allocation_id="pod-uid-5",
+                rank_offset=2,
+            ),
+            RecoveryOperation(
+                runtime_instance_id="runtime-1",
+                topology_generation=3,
+                operation_id="recover-primary",
+                allocation_id="pod-uid-5",
+                rank_offset=0,
+            ),
+            RecoveryOperation(
+                runtime_instance_id="runtime-1",
+                topology_generation=3,
+                operation_id="recover-allocation",
+                allocation_id="",
+                rank_offset=2,
+            ),
+        ]
+        for operation in invalid_operations:
+            with self.subTest(operation_id=operation.operation_id):
+                with self.assertRaisesRegex(
+                    (RuntimeError, ValueError), "runtime|non-primary|allocation"
+                ):
+                    ElasticEPStateManager.request_recovery(operation)
+
+        self.topology_patch.stop()
+        self.topology_patch = patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_runtime_topology",
+            return_value=MagicMock(
+                runtime_instance_id="runtime-1",
+                topology_generation=3,
+                allocation_width=2,
+                effective_ep_size=4,
+            ),
+        )
+        self.topology_patch.start()
+        self.addCleanup(self.topology_patch.stop)
+        with self.assertRaisesRegex(RuntimeError, "TP1"):
+            ElasticEPStateManager.request_recovery(
+                RecoveryOperation(
+                    runtime_instance_id="runtime-1",
+                    topology_generation=3,
+                    operation_id="recover-width",
+                    allocation_id="pod-uid-5",
+                    rank_offset=2,
+                )
+            )
+
+    def test_ready_requires_explicit_successful_internal_warmup(self):
+        lifecycle = RecoveryLifecycle()
+
+        with self.assertRaisesRegex(RuntimeError, "Invalid"):
+            lifecycle.advance("ready", warmup_succeeded=True)
+        lifecycle.advance("slot_restored")
+        lifecycle.advance("warming_up")
+        with self.assertRaisesRegex(RuntimeError, "warmup"):
+            lifecycle.advance("ready", warmup_succeeded=False)
+        lifecycle.advance("ready", warmup_succeeded=True)
+
+        self.assertEqual(lifecycle.phase, "ready")
+
+    def test_conflicting_pending_recovery_is_terminal(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        first = RecoverElasticEPReqInput(
+            runtime_instance_id="runtime-1",
+            topology_generation=3,
+            operation_id="recover-1",
+            allocation_id="pod-uid-5",
+            rank_offset=2,
+        )
+        conflicting = RecoverElasticEPReqInput(
+            runtime_instance_id="runtime-1",
+            topology_generation=3,
+            operation_id="recover-2",
+            allocation_id="replacement-pod",
+            rank_offset=2,
+        )
+
+        self.assertTrue(scheduler.handle_recover_elastic_ep(first).success)
+        result = scheduler.handle_recover_elastic_ep(conflicting)
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.conflict)
+        self.assertTrue(result.terminal)
+
+    def test_scheduler_retries_same_recovery_without_conflict(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        request = RecoverElasticEPReqInput(
+            runtime_instance_id="runtime-1",
+            topology_generation=3,
+            operation_id="recover-1",
+            allocation_id="pod-uid-5",
+            rank_offset=2,
+        )
+
+        first = scheduler.handle_recover_elastic_ep(request)
+        second = scheduler.handle_recover_elastic_ep(request)
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertEqual(second.recovery_phase, "restoring")
 
 
 class TestElasticEPSchedulerIdempotency(unittest.TestCase):

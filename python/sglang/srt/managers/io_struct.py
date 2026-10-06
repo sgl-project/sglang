@@ -2254,6 +2254,24 @@ class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
     effective_ep_size: int = 0
 
 
+class RecoverElasticEPReqInput(BaseReq, kw_only=True):
+    operation_id: str
+    runtime_instance_id: str
+    topology_generation: int
+    allocation_id: str
+    rank_offset: int
+    submission_id: Optional[str] = None
+
+
+class RecoverElasticEPReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    conflict: bool = False
+    operation_id: Optional[str] = None
+    recovery_phase: str = "idle"
+    terminal: bool = False
+
+
 class GetInternalStateReq(BaseReq, kw_only=True):
     pass
 

@@ -169,6 +169,8 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
+    RecoverElasticEPReqInput,
+    RecoverElasticEPReqOutput,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
@@ -1800,6 +1802,7 @@ class Scheduler(
                 (ContinueGenerationReqInput, self.continue_generation),
                 (ConfigureLoggingReq, self.configure_logging),
                 (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
+                (RecoverElasticEPReqInput, self.handle_recover_elastic_ep),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
                 (
@@ -5754,6 +5757,61 @@ class Scheduler(
             pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
             scale_phase=ElasticEPStateManager.get_scale_phase(),
             effective_ep_size=old_ep_size,
+        )
+
+    def handle_recover_elastic_ep(
+        self, recv_req: RecoverElasticEPReqInput
+    ) -> RecoverElasticEPReqOutput:
+        """Publish one fenced fixed-slot recovery operation.
+
+        Process-group admission and readiness remain intentionally outside this
+        control-plane-only handler.
+        """
+        from sglang.srt.elastic_ep.elastic_ep import (
+            ElasticEPStateManager,
+            RecoveryOperation,
+        )
+
+        state = ElasticEPStateManager.instance()
+        make_output = partial(
+            RecoverElasticEPReqOutput,
+            operation_id=recv_req.operation_id,
+        )
+        if state is None:
+            return make_output(
+                success=False,
+                message="Elastic EP recovery requires initialized elastic state.",
+                terminal=True,
+            )
+        operation = RecoveryOperation(
+            runtime_instance_id=recv_req.runtime_instance_id,
+            topology_generation=recv_req.topology_generation,
+            operation_id=recv_req.operation_id,
+            allocation_id=recv_req.allocation_id,
+            rank_offset=recv_req.rank_offset,
+        )
+        try:
+            accepted = ElasticEPStateManager.request_recovery(operation)
+        except (RuntimeError, ValueError) as exc:
+            return make_output(
+                success=False,
+                conflict=True,
+                message=str(exc),
+                recovery_phase=state.recovery_phase,
+                terminal=True,
+            )
+        if not accepted:
+            return make_output(
+                success=False,
+                conflict=True,
+                message="A different Elastic EP operation is already pending.",
+                recovery_phase=state.recovery_phase,
+                terminal=True,
+            )
+        return make_output(
+            success=True,
+            message=f"Recovery operation {recv_req.operation_id} is restoring.",
+            recovery_phase=state.recovery_phase,
         )
 
     def load_lora_adapter(
