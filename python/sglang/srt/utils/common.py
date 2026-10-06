@@ -58,6 +58,7 @@ from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
 from json import JSONDecodeError
+from multiprocessing import parent_process
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
@@ -89,12 +90,11 @@ import torch
 import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -105,6 +105,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_model,
     get_parallel,
+    get_platform,
     get_spec,
 )
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
@@ -221,16 +222,18 @@ def is_cpu() -> bool:
 
 @lru_cache(maxsize=1)
 def is_musa() -> bool:
+    if not hasattr(torch.version, "musa") or torch.version.musa is None:
+        return False
     try:
         import torchada  # noqa: F401
     except ImportError:
         return False
-    return hasattr(torch.version, "musa") and torch.version.musa is not None
+    return True
 
 
 @lru_cache(maxsize=1)
 def is_mps() -> bool:
-    return torch.backends.mps.is_available()
+    return hasattr(torch, "mps") and torch.mps.is_available()
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
@@ -264,8 +267,10 @@ def _check_cuda_device_version(
 ):
     if not is_cuda():
         return False
+    # get_device_sm() answers from NVML while torch.cuda is uninitialized, so
+    # the platform probes evaluated at import time do not create a CUDA context.
     return (
-        torch.cuda.get_device_capability()[0] in device_capability_majors
+        get_device_sm() // 10 in device_capability_majors
         and tuple(map(int, torch.version.cuda.split(".")[:2])) >= cuda_version
     )
 
@@ -316,6 +321,12 @@ is_sm90_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
     )
 )
+
+
+# RTX Blackwell. Unlike is_sm120_supported(), this excludes SM121/GB10.
+@lru_cache(maxsize=1)
+def is_sm120() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 0)
 
 
 # GB10 (DGX Spark and OEM equivalents). Not expressible via
@@ -524,7 +535,23 @@ def get_available_gpu_memory(
             free_gpu_memory = psutil.virtual_memory().available
         free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
     elif device == "mps":
-        free_gpu_memory = psutil.virtual_memory().available
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
+        num_gpus = torch.mps.device_count()
+        assert gpu_id < num_gpus
+
+        if use_mlx():
+            # Torch's allocator does not track MLX Metal allocations.
+            free_gpu_memory = psutil.virtual_memory().available
+        else:
+            if empty_cache:
+                empty_device_cache(torch.mps)
+            # Bound free memory by host RAM and Metal's working-set limit.
+            total_gpu_memory = torch.mps.recommended_max_memory()
+            metal_headroom = max(
+                0, total_gpu_memory - torch.mps.driver_allocated_memory()
+            )
+            free_gpu_memory = min(psutil.virtual_memory().available, metal_headroom)
     else:
         if not current_platform.is_out_of_tree():
             raise ValueError(
@@ -550,6 +577,23 @@ def is_pin_memory_available(device=None) -> bool:
     return current_platform.is_pin_memory_available(device)
 
 
+def async_h2d(args: List, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """A host list on ``device``; staged in pinned memory so the copy is enqueued
+    on the current stream instead of synchronizing like a pageable copy."""
+    pin = is_pin_memory_available(device)
+    return torch.tensor(args, dtype=dtype, pin_memory=pin).to(device, non_blocking=pin)
+
+
+def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
+    """Enqueue a CUDA-to-pinned-host copy on the current stream."""
+    if not tensor.is_cuda:
+        return tensor.to("cpu", non_blocking=True)
+    host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+    host.copy_(tensor, non_blocking=True)
+    tensor.record_stream(torch.cuda.current_stream(tensor.device))
+    return host
+
+
 def get_dispatch_device_backend():
     if is_cuda_alike():
         dispatch_key = "CUDA"
@@ -564,7 +608,22 @@ def get_dispatch_device_backend():
 
 @lru_cache(maxsize=1)
 def get_device_module():
-    return torch.get_device_module()
+    # Resolve from the platform checks: torch.get_device_module() with no
+    # argument initializes the CUDA runtime, which poisons fork() startup.
+    if is_cuda() or is_hip():
+        return torch.cuda
+    if is_npu():
+        return torch.npu
+    if is_xpu():
+        return torch.xpu
+    if is_musa():
+        return torch.musa
+    # From torch 2.14, a bare torch.get_device_module() is torch.cuda on a CUDA wheel
+    # even with no usable device; require an available accelerator instead.
+    accelerator = torch.accelerator.current_accelerator(check_available=True)
+    if accelerator is None:
+        return torch.cpu
+    return torch.get_device_module(accelerator)
 
 
 def create_device_stream(device):
@@ -577,6 +636,17 @@ def create_device_stream(device):
 def device_stream_context(stream):
     """Return the appropriate stream context manager for ``stream``."""
     return torch.get_device_module(stream.device).stream(stream)
+
+
+def is_device_stream_capturing(device: torch.device) -> bool:
+    """Whether ``device``'s current stream is mid graph capture (False if unsupported)."""
+    # Every platform answering support_cuda_graph() already calls
+    # device_module.is_current_stream_capturing() during capture, so it cannot be missing.
+    if device.type != current_platform.device_type:
+        return False
+    if not current_platform.support_cuda_graph():
+        return False
+    return torch.get_device_module(device).is_current_stream_capturing()
 
 
 def get_amdgpu_memory_capacity():
@@ -612,8 +682,55 @@ def get_amdgpu_memory_capacity():
         )
 
 
+def _get_device_sm_via_nvml() -> Optional[int]:
+    # Compute capability of torch device 0, read while torch.cuda stays
+    # uninitialized; None when NVML cannot answer and the caller falls back.
+    try:
+        import pynvml
+    except ImportError:
+        logger.debug("get_device_sm: pynvml is not installed, using torch.cuda")
+        return None
+    # Private torch API, read defensively: it maps the torch ordinal to the NVML
+    # index under CUDA_VISIBLE_DEVICES / MIG; absent or failing -> fall back.
+    getter = getattr(torch.cuda, "_get_nvml_device_index", None)
+    if getter is None:
+        logger.debug(
+            "get_device_sm: torch.cuda._get_nvml_device_index is missing, "
+            "using torch.cuda"
+        )
+        return None
+    try:
+        idx = getter(0)
+    except Exception:
+        logger.debug(
+            "get_device_sm: torch.cuda._get_nvml_device_index(0) failed, "
+            "using torch.cuda",
+            exc_info=True,
+        )
+        return None
+    try:
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+        finally:
+            pynvml.nvmlShutdown()
+        return major * 10 + minor
+    except Exception:
+        logger.debug(
+            "get_device_sm: NVML query failed, using torch.cuda", exc_info=True
+        )
+        return None
+
+
 def get_device_sm():
     if torch.cuda.is_available() or is_musa():
+        # Called at import time (e.g. by the DeepGEMM configurer): initializing
+        # torch.cuda here would create a context and poison fork() startup.
+        if not is_musa() and not torch.cuda.is_initialized():
+            sm = _get_device_sm_via_nvml()
+            if sm is not None:
+                return sm
         major, minor = torch.cuda.get_device_capability()
         return major * 10 + minor
     return 0
@@ -773,6 +890,16 @@ def get_xpu_memory_capacity():
         raise RuntimeError("torch.xpu is not available.")
 
 
+def get_mps_memory_capacity():
+    # Metal's working-set limit is smaller than unified system RAM.
+    try:
+        if torch.mps.is_available():
+            return torch.mps.recommended_max_memory() // 1024 // 1024  # unit: MB
+        raise ValueError("No GPU memory values found.")
+    except AttributeError:
+        raise RuntimeError("torch.mps is not available.")
+
+
 def get_mtgpu_memory_capacity():
     try:
         # Run mthreads-gmi and capture the output
@@ -825,6 +952,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
         gpu_mem = get_amdgpu_memory_capacity()
+    elif device == "mps":
+        gpu_mem = get_mps_memory_capacity()
     elif device == "hpu":
         gpu_mem = get_hpu_memory_capacity()
     elif device == "npu":
@@ -843,6 +972,9 @@ def get_device_memory_capacity(device: str = None):
 
 
 def get_device_name(device_id: int = 0) -> str:
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        return torch.backends.mps.get_name()
+
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_name(device_id)
 
@@ -866,6 +998,17 @@ def is_mnnvl_fabric_device() -> bool:
         return False
     name = (torch.cuda.get_device_name(0) or "").upper()
     return any(tag in name for tag in ("GB200", "GB300"))
+
+
+def is_fi_a2a_supported(
+    *, dcp_size: int, tp_size: int, pp_size: int, nnodes: int
+) -> bool:
+    if not get_platform().is_sm100:
+        return False
+    if is_mnnvl_fabric_device():
+        return True
+    tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
+    return tp_size_per_node % dcp_size == 0
 
 
 @lru_cache(maxsize=1)
@@ -932,6 +1075,12 @@ def get_device(device_id: Optional[int] = None) -> str:
 
 @lru_cache(maxsize=1)
 def get_device_count() -> int:
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        try:
+            return torch.mps.device_count()
+        except RuntimeError:
+            return 0
+
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         try:
             return torch.cuda.device_count()
@@ -995,6 +1144,10 @@ def get_compiler_backend(mode=None) -> str:
     # OOT platforms provide their own compile backend.
     if current_platform.is_out_of_tree():
         return current_platform.get_compile_backend(mode)
+
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        # MPS has no SGLang graph runner.
+        return "eager"
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
@@ -1126,29 +1279,6 @@ def get_cuda_driver_bindings():
     return cuda_driver
 
 
-def get_physical_device_id(pytorch_device_id: int) -> int:
-    """
-    Convert PyTorch logical device ID to physical device ID.
-
-    When CUDA_VISIBLE_DEVICES is set, maps the logical device ID (as seen by PyTorch)
-    to the actual physical device ID. If CUDA_VISIBLE_DEVICES is not set, returns
-    the device ID unchanged.
-
-    Args:
-        pytorch_device_id: The logical device ID from PyTorch (e.g., torch.cuda.current_device())
-
-    Returns:
-        The physical device ID
-    """
-    device_idx = int(pytorch_device_id)
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if cuda_visible_devices:
-        device_list = cuda_visible_devices.split(",")
-        return int(device_list[device_idx])
-    else:
-        return device_idx
-
-
 def get_device_sm_nvidia_smi():
     try:
         # Run nvidia-smi command and capture output
@@ -1204,6 +1334,13 @@ class Range(NamedTuple):
     @property
     def length(self) -> int:
         return self.end - self.start
+
+
+def assert_int64_array(values: array, name: str) -> None:
+    """Require a signed int64 array suitable for zero-copy tensor views."""
+    assert (
+        isinstance(values, array) and values.typecode == "q" and values.itemsize == 8
+    ), f"{name} must be array('q') with 8-byte items"
 
 
 def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
@@ -1412,23 +1549,31 @@ def mark_end(name):
         time_infos[name].pretty_print()
 
 
-def calculate_time(show=False, min_cost_ms=0.0):
-    def wrapper(func):
-        def inner_func(*args, **kwargs):
-            torch.cuda.synchronize()
-            if show:
-                start_time = time.perf_counter()
-            result = func(*args, **kwargs)
-            torch.cuda.synchronize()
-            if show:
-                cost_time = (time.perf_counter() - start_time) * 1000
-                if cost_time > min_cost_ms:
-                    print(f"Function {func.__name__} took {cost_time} ms to run.")
-            return result
+# Set while a layer another pipeline stage holds is built, only for the stage
+# boundaries it declares.
+_building_neighbour_layer = False
 
-        return inner_func
 
-    return wrapper
+def is_building_neighbour_layer() -> bool:
+    """Whether the layer under construction belongs to another pipeline stage
+    and is built here only to read the stage boundaries it declares. It is
+    built on the meta device and never loaded or run, so its constructor skips
+    the host and device resources a running layer needs: tables, streams,
+    engines and communicators."""
+    return _building_neighbour_layer
+
+
+@contextmanager
+def building_neighbour_layer():
+    """Build a pipeline neighbour layer: on the meta device, with
+    is_building_neighbour_layer() true."""
+    global _building_neighbour_layer
+    outer, _building_neighbour_layer = _building_neighbour_layer, True
+    try:
+        with torch.device("meta"):
+            yield
+    finally:
+        _building_neighbour_layer = outer
 
 
 class LayerFn(Protocol):
@@ -1444,9 +1589,16 @@ def make_layers(
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
-    """Make a list of layers with the given layer function"""
+    """Make a list of layers with the given layer function.
+
+    The local layers are built inside one layer stack, so layers that declare
+    stage boundaries connect in order without naming their neighbours. Across
+    a pipeline stage boundary the stack learns the neighbouring stage from the
+    layer itself, built again on the meta device.
+    """
     # circular imports
     from sglang.srt.distributed import get_pp_indices
+    from sglang.srt.layers.layer_boundary.factories import layer_stack
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
 
@@ -1460,41 +1612,71 @@ def make_layers(
         if pp_rank is not None and pp_size is not None
         else (0, num_hidden_layers)
     )
-    modules = torch.nn.ModuleList(
-        [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
-        + get_offloader().wrap_modules(
-            (
-                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-                for idx in range(start_layer, end_layer)
-            ),
-            **(offloader_kwargs or {}),
+
+    def neighbour(idx):
+        return functools.partial(
+            _build_neighbour_layer, layer_fn, idx, add_prefix(idx, prefix)
         )
-        + [
-            PPMissingLayer(return_tuple=return_tuple)
-            for _ in range(end_layer, num_hidden_layers)
-        ]
-    )
+
+    with layer_stack(
+        previous_layers=[neighbour(idx) for idx in reversed(range(start_layer))],
+        next_layers=[neighbour(idx) for idx in range(end_layer, num_hidden_layers)],
+    ):
+        modules = torch.nn.ModuleList(
+            [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
+            + get_offloader().wrap_modules(
+                (
+                    layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                    for idx in range(start_layer, end_layer)
+                ),
+                **(offloader_kwargs or {}),
+            )
+            + [
+                PPMissingLayer(return_tuple=return_tuple)
+                for _ in range(end_layer, num_hidden_layers)
+            ]
+        )
     if pp_rank is None or pp_size is None:
         return modules
     return modules, start_layer, end_layer
 
 
-def make_layers_non_pp(
+def make_pp_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
     prefix: str = "",
-) -> torch.nn.ModuleList:
-    from sglang.srt.utils.offloader import get_offloader
+    return_tuple: bool = False,
+    offloader_kwargs: Optional[Dict[str, Any]] = None,
+) -> Tuple[torch.nn.Module, int, int]:
+    """Make this pipeline stage's layers, and return them with the stage's range.
 
-    layers = torch.nn.ModuleList(
-        get_offloader().wrap_modules(
-            (
-                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-                for idx in range(num_hidden_layers)
-            )
-        )
+    Layers outside ``[start_layer, end_layer)`` are ``PPMissingLayer`` stand-ins.
+    """
+    parallel = get_parallel()
+    return make_layers(
+        num_hidden_layers,
+        layer_fn,
+        pp_rank=parallel.pp_rank,
+        pp_size=parallel.pp_size,
+        prefix=prefix,
+        return_tuple=return_tuple,
+        offloader_kwargs=offloader_kwargs,
     )
-    return layers
+
+
+def _build_neighbour_layer(layer_fn: LayerFn, idx: int, prefix: str) -> None:
+    """Build a layer another pipeline stage holds, only for the stage
+    boundaries it declares (see building_neighbour_layer). RoPE modules it
+    adds to the shared cache are meta, so they are dropped again."""
+    from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
+
+    cached = set(_ROPE_DICT)
+    try:
+        with building_neighbour_layer():
+            layer_fn(idx=idx, prefix=prefix)
+    finally:
+        for key in set(_ROPE_DICT) - cached:
+            del _ROPE_DICT[key]
 
 
 def set_random_seed(seed: int) -> None:
@@ -1812,6 +1994,7 @@ def smart_to_rgb(
     if not isinstance(image, Image.Image):
         return image
 
+    image = ImageOps.exif_transpose(image)
     if image.mode in ("RGBA", "LA") or "transparency" in image.info:
         image = image.convert("RGBA")
         width, height = image.size
@@ -1889,6 +2072,8 @@ def _load_image(
                 )
 
                 return decode_jpeg_with_fancy_upsampling(image_bytes)
+            from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
+
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
@@ -1902,7 +2087,7 @@ def _load_image(
                 )
     try:
         image = Image.open(BytesIO(image_bytes))
-    except OSError as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return _fully_load_pil_image(image)
 
@@ -1911,7 +2096,7 @@ def _fully_load_pil_image(image: Image.Image) -> Image.Image:
     """Force PIL's lazy decode while malformed input is still request-local."""
     try:
         image.load()
-    except OSError as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return image
 
@@ -1953,6 +2138,8 @@ def load_image(
         image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
+    if image_size is not None and isinstance(image, Image.Image):
+        image_size = (image.width, image.height)
     return image, image_size
 
 
@@ -2088,8 +2275,25 @@ def encode_video(video_path, frame_count_limit=None):
     return frames
 
 
+def configure_hf_hub_logger():
+    """Route Hugging Face Hub messages through the application's logger once."""
+    from huggingface_hub.utils import logging as hf_logging
+
+    # CLI model detection can contact Hub before configure_logger runs.
+    # basicConfig leaves any existing application logging setup intact.
+    logging.basicConfig(format="[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    hub_logger = hf_logging.get_logger()
+    for handler in hub_logger.handlers[:]:
+        # Hub installs a plain StreamHandler and also propagates to the root.
+        # Keep file handlers and custom handler subclasses intact.
+        if type(handler) is logging.StreamHandler:
+            hub_logger.removeHandler(handler)
+    hf_logging.enable_propagation()
+
+
 def suppress_noisy_warnings():
     """Suppress known noisy warnings from third-party libraries."""
+    configure_hf_hub_logger()
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
@@ -2195,16 +2399,7 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
 
 
 def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
-    """
-    Check if a package is installed and meets the minimum version requirement.
-
-    Args:
-        pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.18")
-
-    Returns:
-        True if package is installed and version >= min_version, False otherwise
-    """
+    """Check if a package is installed and meets the minimum version requirement."""
     if _should_skip_kernel_pkg_version_check(pkg):
         return True
 
@@ -2340,7 +2535,7 @@ def monkey_patch_p2p_access_check():
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
-    # Suppress the warnings from this delete function when using sglang.bench_one_batch
+    # Suppress the warnings from this delete function when using sglang.benchmark.one_batch
     from sglang.srt.distributed.device_communicators.custom_all_reduce import (
         CustomAllreduce,
     )
@@ -2403,11 +2598,21 @@ def configure_logger(server_args, prefix: str = ""):
         force=True,
     )
 
+    configure_hf_hub_logger()
+
     # Suppress noisy httpx/httpcore loggers in every process that calls
     # configure_logger (main, scheduler, detokenizer). Spawned subprocesses
     # don't inherit the parent's logger state, so this must run here too.
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
+
+    # Server-sent hub warnings (e.g. the unauthenticated-request / HF_TOKEN
+    # hint) are deduplicated per process, so a TP-N launch repeats each one N
+    # times. Keep them only in the launching process -- every worker (scheduler,
+    # detokenizer, DP controller, ...) is spawned via multiprocessing, whether
+    # or not it passes a log prefix -- where they are printed exactly once.
+    if parent_process() is not None:
+        logging.getLogger("huggingface_hub.utils._http").setLevel(logging.ERROR)
 
     if is_flashinfer_available():
         from flashinfer.jit.core import logger as flashinfer_logger
@@ -2788,11 +2993,6 @@ def init_custom_process_group(
     return pg
 
 
-def crash_on_warnings():
-    # Crash on warning if we are running CI tests
-    return get_bool_env_var("SGLANG_IS_IN_CI")
-
-
 @functools.lru_cache(None)
 def print_warning_once(msg: str) -> None:
     # Set the stacklevel to 2 to print the caller's line info
@@ -2890,18 +3090,14 @@ def direct_register_custom_op(
         raise error
 
 
-def set_gpu_proc_affinity(
-    pp_size: int,
-    tp_size: int,
-    nnodes: int,
-    gpu_id: int,
-):
+def set_gpu_proc_affinity(gpu_id: int):
     # current process
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    nnodes_per_tp_group = max(nnodes // pp_size, 1)
-    tp_size_per_node = tp_size // nnodes_per_tp_group
+    parallel = get_parallel()
+    nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
+    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
 
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)
@@ -2924,26 +3120,6 @@ def set_gpu_proc_affinity(
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
-
-
-def permute_weight(x: torch.Tensor) -> torch.Tensor:
-    b_ = x.shape[0]
-    n_ = x.shape[1]
-    k_ = x.shape[2]
-
-    x_ = x
-    if x.dtype == torch.bfloat16 or x.dtype == torch.float16:
-        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 32), 4, 8)
-    elif x.dtype == torch.float8_e4m3fnuz or x.dtype == torch.int8:
-        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 64), 4, 16)
-    else:
-        # return x_
-        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 8), 2, 4)
-
-    x_ = x_.permute(0, 1, 3, 4, 2, 5)
-    x_ = x_.contiguous()
-    x_ = x_.view(*x.shape)
-    return x_
 
 
 class MultiprocessingSerializer:
@@ -3021,78 +3197,239 @@ def normalize_serialized_named_tensor_payloads(
     return [normalize_serialized_named_tensor_payload(data) for data in payloads]
 
 
-class SafeUnpickler(pickle.Unpickler):
-    ALLOWED_MODULE_PREFIXES = {
-        # --- Python types ---
-        "builtins.",
-        "collections.",
-        "copyreg.",
-        "functools.",
-        "itertools.",
-        "operator.",
-        "types.",
-        "weakref.",
-        # --- PyTorch types ---
-        "torch.",
-        "torch._tensor.",
-        "torch.storage.",
-        "torch.nn.parameter.",
-        "torch.autograd.function.",
-        # --- torch distributed ---
-        "torch.distributed.",
-        "torch.distributed._shard.",
-        "torch.distributed._composable.",
-        "torch._C._distributed_c10d.",
-        "torch._C._distributed_fsdp.",
-        "torch.distributed.optim.",
-        # --- multiprocessing ---
-        "multiprocessing.resource_sharer.",
-        "multiprocessing.reduction.",
-        "pickletools.",
-        # --- PEFT / LoRA ---
-        "peft.",
-        "transformers.",
-        "huggingface_hub.",
-        # --- SGLang & Unitest ---
-        "sglang.srt.weight_sync.tensor_bucket.",
-        "sglang.srt.model_executor.model_runner.",
-        "sglang.srt.model_executor.model_runner_components.weight_updater.",
-        "sglang.srt.layers.",
-        "sglang.srt.utils.",
-        "sglang.srt.disaggregation.",
-        "sglang.srt.managers.",
-        "torch_npu.",
-    }
+def _safe_load_torch_storage(data: bytes):
+    storage = torch.load(io.BytesIO(data), weights_only=True)
+    if not isinstance(storage, (torch.storage.TypedStorage, torch.UntypedStorage)):
+        raise pickle.UnpicklingError(
+            f"Expected a Torch storage, got {type(storage).__name__}"
+        )
+    return storage
 
-    DENY_CLASSES = {
-        ("builtins", "eval"),
-        ("builtins", "exec"),
-        ("builtins", "compile"),
-        ("os", "system"),
-        ("subprocess", "Popen"),
-        ("subprocess", "run"),
-        ("codecs", "decode"),
-        ("types", "CodeType"),
-        ("types", "FunctionType"),
+
+class SafeUnpickler(pickle.Unpickler):
+    # Standard-library modules expose powerful callables alongside harmless data
+    # types. Keep these globals exact so a newly added callable is denied by
+    # default instead of silently expanding the unpickling attack surface.
+    ALLOWED_GLOBALS = {
+        # --- Python types ---
+        ("builtins", "bool"),
+        ("builtins", "bytearray"),
+        ("builtins", "bytes"),
+        ("builtins", "complex"),
+        ("builtins", "dict"),
+        ("builtins", "float"),
+        ("builtins", "frozenset"),
+        ("builtins", "int"),
+        ("builtins", "list"),
+        ("builtins", "range"),
+        ("builtins", "set"),
+        ("builtins", "slice"),
+        ("builtins", "str"),
+        ("builtins", "tuple"),
+        ("collections", "OrderedDict"),
+        ("collections", "defaultdict"),
+        ("collections", "deque"),
+        ("collections", "Counter"),
+        ("copyreg", "__newobj__"),
+        ("copyreg", "__newobj_ex__"),
+        ("functools", "partial"),
+        ("itertools", "chain"),
+        ("itertools", "repeat"),
+        ("multiprocessing.reduction", "_rebuild_partial"),
+        ("multiprocessing.reduction", "_rebuild_socket"),
+        ("multiprocessing.resource_sharer", "DupFd"),
+        ("types", "SimpleNamespace"),
+        ("_codecs", "encode"),
+        # --- PyTorch data containers & rebuild functions ---
+        # Code-module prefixes (torch.*, sglang.srt.*) are NOT allowed: they
+        # contain gadgets like sglang.srt.utils.common.dynamic_import
+        ("torch", "Tensor"),
+        ("torch", "BFloat16Tensor"),
+        ("torch", "BoolTensor"),
+        ("torch", "ByteTensor"),
+        ("torch", "CharTensor"),
+        ("torch", "DoubleTensor"),
+        ("torch", "FloatTensor"),
+        ("torch", "HalfTensor"),
+        ("torch", "IntTensor"),
+        ("torch", "LongTensor"),
+        ("torch", "ShortTensor"),
+        ("torch.cuda", "BFloat16Tensor"),
+        ("torch.cuda", "BoolTensor"),
+        ("torch.cuda", "ByteTensor"),
+        ("torch.cuda", "CharTensor"),
+        ("torch.cuda", "DoubleTensor"),
+        ("torch.cuda", "FloatTensor"),
+        ("torch.cuda", "HalfTensor"),
+        ("torch.cuda", "IntTensor"),
+        ("torch.cuda", "LongTensor"),
+        ("torch.cuda", "ShortTensor"),
+        ("torch.cuda.sparse", "BFloat16Tensor"),
+        ("torch.cuda.sparse", "ByteTensor"),
+        ("torch.cuda.sparse", "CharTensor"),
+        ("torch.cuda.sparse", "DoubleTensor"),
+        ("torch.cuda.sparse", "FloatTensor"),
+        ("torch.cuda.sparse", "HalfTensor"),
+        ("torch.cuda.sparse", "IntTensor"),
+        ("torch.cuda.sparse", "LongTensor"),
+        ("torch.cuda.sparse", "ShortTensor"),
+        ("torch.sparse", "BFloat16Tensor"),
+        ("torch.sparse", "ByteTensor"),
+        ("torch.sparse", "CharTensor"),
+        ("torch.sparse", "DoubleTensor"),
+        ("torch.sparse", "FloatTensor"),
+        ("torch.sparse", "HalfTensor"),
+        ("torch.sparse", "IntTensor"),
+        ("torch.sparse", "LongTensor"),
+        ("torch.sparse", "ShortTensor"),
+        ("torch", "Size"),
+        ("torch", "device"),
+        ("torch", "dtype"),
+        ("torch", "bfloat16"),
+        ("torch", "bit"),
+        ("torch", "bits16"),
+        ("torch", "bits1x8"),
+        ("torch", "bits2x4"),
+        ("torch", "bits4x2"),
+        ("torch", "bits8"),
+        ("torch", "bool"),
+        ("torch", "cdouble"),
+        ("torch", "cfloat"),
+        ("torch", "chalf"),
+        ("torch", "complex128"),
+        ("torch", "complex32"),
+        ("torch", "complex64"),
+        ("torch", "double"),
+        ("torch", "float"),
+        ("torch", "float16"),
+        ("torch", "float32"),
+        ("torch", "float4_e2m1fn_x2"),
+        ("torch", "float64"),
+        ("torch", "float8_e4m3fn"),
+        ("torch", "float8_e4m3fnuz"),
+        ("torch", "float8_e5m2"),
+        ("torch", "float8_e5m2fnuz"),
+        ("torch", "float8_e8m0fnu"),
+        ("torch", "half"),
+        ("torch", "int"),
+        ("torch", "int1"),
+        ("torch", "int16"),
+        ("torch", "int2"),
+        ("torch", "int3"),
+        ("torch", "int32"),
+        ("torch", "int4"),
+        ("torch", "int5"),
+        ("torch", "int6"),
+        ("torch", "int64"),
+        ("torch", "int7"),
+        ("torch", "int8"),
+        ("torch", "long"),
+        ("torch", "qint32"),
+        ("torch", "qint8"),
+        ("torch", "quint2x4"),
+        ("torch", "quint4x2"),
+        ("torch", "quint8"),
+        ("torch", "short"),
+        ("torch", "uint1"),
+        ("torch", "uint16"),
+        ("torch", "uint2"),
+        ("torch", "uint3"),
+        ("torch", "uint32"),
+        ("torch", "uint4"),
+        ("torch", "uint5"),
+        ("torch", "uint6"),
+        ("torch", "uint64"),
+        ("torch", "uint7"),
+        ("torch", "uint8"),
+        ("torch.nn.parameter", "Parameter"),
+        ("torch.serialization", "_get_layout"),
+        ("torch._utils", "_rebuild_tensor"),
+        ("torch._utils", "_rebuild_tensor_v2"),
+        ("torch._utils", "_rebuild_tensor_v3"),
+        ("torch._utils", "_rebuild_parameter"),
+        ("torch._utils", "_rebuild_parameter_with_state"),
+        ("torch._utils", "_rebuild_qtensor"),
+        ("torch._utils", "_rebuild_sparse_tensor"),
+        ("torch._utils", "_rebuild_meta_tensor_no_storage"),
+        ("torch._utils", "_rebuild_wrapper_subclass"),
+        ("torch._utils", "_rebuild_device_tensor_from_numpy"),
+        ("torch._utils", "_rebuild_device_tensor_from_cpu_tensor"),
+        ("torch._tensor", "_rebuild_from_type_v2"),
+        ("torch.storage", "UntypedStorage"),
+        ("torch.storage", "_UntypedStorage"),
+        ("torch.storage", "TypedStorage"),
+        ("torch", "UntypedStorage"),
+        ("torch", "BFloat16Storage"),
+        ("torch", "BoolStorage"),
+        ("torch", "ByteStorage"),
+        ("torch", "CharStorage"),
+        ("torch", "ComplexDoubleStorage"),
+        ("torch", "ComplexFloatStorage"),
+        ("torch", "DoubleStorage"),
+        ("torch", "FloatStorage"),
+        ("torch", "HalfStorage"),
+        ("torch", "IntStorage"),
+        ("torch", "LongStorage"),
+        ("torch", "QInt32Storage"),
+        ("torch", "QInt8Storage"),
+        ("torch", "QUInt2x4Storage"),
+        ("torch", "QUInt4x2Storage"),
+        ("torch", "QUInt8Storage"),
+        ("torch", "ShortStorage"),
+        ("torch.cuda", "BFloat16Storage"),
+        ("torch.cuda", "BoolStorage"),
+        ("torch.cuda", "ByteStorage"),
+        ("torch.cuda", "CharStorage"),
+        ("torch.cuda", "ComplexDoubleStorage"),
+        ("torch.cuda", "ComplexFloatStorage"),
+        ("torch.cuda", "DoubleStorage"),
+        ("torch.cuda", "FloatStorage"),
+        ("torch.cuda", "HalfStorage"),
+        ("torch.cuda", "IntStorage"),
+        ("torch.cuda", "LongStorage"),
+        ("torch.cuda", "ShortStorage"),
+        ("torch.multiprocessing.reductions", "rebuild_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_meta_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_cuda_tensor"),
+        ("sglang.srt.utils.patch_torch", "_rebuild_cuda_tensor_modified"),
+        ("torch_npu.multiprocessing.reductions", "rebuild_npu_tensor"),
+        ("sglang.srt.utils.patch_torch", "_rebuild_npu_tensor_modified"),
+        ("torch.multiprocessing.reductions", "rebuild_nested_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_sparse_coo_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_sparse_compressed_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_storage_fd"),
+        ("torch.multiprocessing.reductions", "rebuild_storage_filename"),
+        ("torch.multiprocessing.reductions", "rebuild_storage_empty"),
+        ("torch.multiprocessing.reductions", "rebuild_typed_storage"),
+        ("torch.multiprocessing.reductions", "rebuild_typed_storage_child"),
+        ("torch", "per_tensor_affine"),
+        ("torch", "per_tensor_symmetric"),
+        ("torch", "per_channel_affine"),
+        ("torch", "per_channel_symmetric"),
+        ("torch", "per_channel_affine_float_qparams"),
+        # --- SGLang data containers only (no code modules) ---
+        ("sglang.srt.managers.io_struct", "GenerateReqInput"),
+        ("sglang.srt.managers.io_struct", "EmbeddingReqInput"),
+        ("sglang.srt.disaggregation.encoder.receiver", "EmbeddingData"),
+        ("sglang.srt.managers.schedule_batch", "Modality"),
+        ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorMetadata"),
+        ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorBucket"),
+        (
+            "sglang.srt.model_executor.model_runner_components.weight_updater",
+            "LocalSerializedTensor",
+        ),
+        ("sglang.srt.model_executor.model_runner", "LocalSerializedTensor"),
     }
 
     def find_class(self, module, name):
-        # Block deterministic attacks
-        if (module, name) in self.DENY_CLASSES:
-            raise RuntimeError(
-                f"Blocked unsafe class loading ({module}.{name}), "
-                f"to prevent exploitation of CVE-2025-10164"
-            )
-        # Allowlist of safe-to-load modules.
-        if any(
-            (module + ".").startswith(prefix) for prefix in self.ALLOWED_MODULE_PREFIXES
-        ):
+        if (module, name) == ("torch.storage", "_load_from_bytes"):
+            # Torch's helper calls an unrestricted nested torch.load.
+            return _safe_load_torch_storage
+        if (module, name) in self.ALLOWED_GLOBALS:
             return super().find_class(module, name)
 
-        # Block everything else. (Potential attack surface)
         raise RuntimeError(
-            f"Blocked unsafe class loading ({module}.{name}), "
-            f"to prevent exploitation of CVE-2025-10164"
+            f"Blocked unsafe global ({module}.{name}) during pickle deserialization"
         )
 
 
@@ -3109,30 +3446,6 @@ def safe_pickle_loads(data):
         # zmq.Frame and other buffer-protocol objects
         buf = bytes(memoryview(data))
     return SafeUnpickler(io.BytesIO(buf)).load()
-
-
-def debug_timing(func):
-    # todo: replace with a more organized instrumentation
-    def wrapper(*args, **kwargs):
-        if logger.isEnabledFor(logging.DEBUG):
-            tic = torch.cuda.Event(enable_timing=True)
-            toc = torch.cuda.Event(enable_timing=True)
-            tic.record()
-            result = func(*args, **kwargs)
-            toc.record()
-            toc.synchronize()  # Wait for the function to complete without synchronizing all ops on the GPU
-            elapsed = tic.elapsed_time(toc)
-            indices = kwargs.get("indices", args[1] if len(args) > 1 else None)
-            num_tokens = len(indices) if indices is not None else 0
-            throughput = num_tokens / elapsed * 1000 if elapsed > 0 else 0
-            logger.debug(
-                f"Transfer time: {elapsed} ms, throughput: {throughput} tokens/s"
-            )
-            return result
-        else:
-            return func(*args, **kwargs)
-
-    return wrapper
 
 
 def nullable_str(val: str):
@@ -3675,35 +3988,6 @@ def is_no_spec_infer_or_topk_one(cfg):
     )
 
 
-def is_fa3_default_architecture(hf_config):
-    architectures = getattr(hf_config, "architectures", None)
-    if not isinstance(architectures, list) or not architectures:
-        return False
-    default_archs = {
-        "Llama4ForConditionalGeneration",
-        "LlamaForCausalLM",
-        "Olmo2ForCausalLM",
-        "Gemma2ForCausalLM",
-        "Gemma3ForConditionalGeneration",
-        "MixtralForCausalLM",
-        "Qwen2ForCausalLM",
-        "Qwen3ForCausalLM",
-        "Qwen3MoeForCausalLM",
-        "Qwen3VLForConditionalGeneration",
-        "Qwen3VLMoeForConditionalGeneration",
-        "Glm4MoeForCausalLM",
-        "Glm4vForConditionalGeneration",
-        "Glm4vMoeForConditionalGeneration",
-        "GlmOcrForConditionalGeneration",
-        "Step3VLForConditionalGeneration",
-        "StepVLForConditionalGeneration",
-        "Step3p7ForConditionalGeneration",
-        "MiMoV2ForCausalLM",
-        "MiMoV2FlashForCausalLM",
-    }
-    return architectures[0] in default_archs
-
-
 # Can be more general if it is used in multiple places (keep it simple and thus not general now)
 class BumpAllocator:
     def __init__(self, buffer_size: int, dtype, device):
@@ -3802,15 +4086,22 @@ class Withable(Generic[T]):
             self._value = None
 
 
-def require_mlp_tp_gather():
+def require_mlp_tp_gather(*, moe_a2a_backend=None):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
-    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.layers.moe.utils import MoeA2ABackend, get_moe_a2a_backend
 
-    # elastic-EP scale-up rewrites dp_size on the published config
-    if get_parallel().enable_dp_attention:
-        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
+    if moe_a2a_backend is None:
+        moe_a2a_backend = get_moe_a2a_backend()
+    elif not isinstance(moe_a2a_backend, MoeA2ABackend):
+        moe_a2a_backend = MoeA2ABackend(moe_a2a_backend)
+
+    # elastic-EP scale-up widens num_dp_ranks on the published config
+    if get_parallel().attn_dp_enabled:
+        assert get_parallel().num_dp_ranks > 1, (
+            "attention DP needs more than one DP rank"
+        )
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
@@ -3824,9 +4115,9 @@ def require_mlp_tp_gather():
             return True
         elif not get_parallel().enable_dp_lm_head:
             return True
-        elif get_moe_a2a_backend().is_none():
+        elif moe_a2a_backend.is_none():
             return True
-        elif get_moe_a2a_backend().is_flashinfer():
+        elif moe_a2a_backend.is_flashinfer():
             # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
             # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
             # cuda-graph bucket must be identical across EP ranks, otherwise ranks
@@ -3836,7 +4127,7 @@ def require_mlp_tp_gather():
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
-        elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
+        elif moe_a2a_backend.is_mori() and get_bool_env_var(
             "SGLANG_MORI_RECV_BOUND", "false"
         ):
             # Same bookkeeping, for the same reason. Bounding mori's receive
@@ -3852,7 +4143,7 @@ def require_mlp_tp_gather():
         else:
             return (
                 get_parallel().moe_dense_tp_size
-                > get_parallel().tp_size // get_parallel().dp_size
+                > get_parallel().tp_size // get_parallel().num_dp_ranks
             )
     else:
         return False
@@ -3876,8 +4167,8 @@ def require_attn_tp_gather():
         not get_moe_a2a_backend().is_none()
         or get_parallel().moe_dense_tp_size is not None
     ):
-        if get_parallel().enable_dp_attention:
-            return get_parallel().dp_size < get_parallel().tp_size
+        if get_parallel().attn_dp_enabled:
+            return get_parallel().num_dp_ranks < get_parallel().tp_size
         else:
             return True
     else:
@@ -3890,7 +4181,7 @@ def require_gathered_buffer():
 
 def require_mlp_sync():
 
-    return get_parallel().enable_dp_attention or require_gathered_buffer()
+    return get_parallel().attn_dp_enabled or require_gathered_buffer()
 
 
 def get_cuda_graph_batch_size_alignment() -> int:
@@ -3899,7 +4190,8 @@ def get_cuda_graph_batch_size_alignment() -> int:
         alignment *= 2
     if require_gathered_buffer():
         alignment *= get_parallel().attn_tp_size
-    if alignment % get_parallel().attn_cp_size != 0:
+    # TODO: unverified on NVIDIA; drop the gate once validated on CUDA.
+    if not is_hip() and alignment % get_parallel().attn_cp_size != 0:
         alignment *= get_parallel().attn_cp_size
     return alignment
 
@@ -4106,7 +4398,7 @@ def freeze_gc(context: str):
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
-    logger.info(
+    logger.debug(
         f"Freezing GC in {context} process. "
         f"gen0: {g0_before}->{g0_after}, "
         f"gen1: {g1_before}->{g1_after}, "
@@ -4548,7 +4840,7 @@ def get_extend_input_len_swa_limit(
     sliding_window_size: int, chunked_prefill_size: int, page_size: int
 ) -> int:
     # 1. a factor of 2x is because each prefill contains chunked_prefill_size tokens,
-    #    and between prefills, we run swa_radix_cache.cache_unfinished_req(),
+    #    and between prefills, we run the tree cache's checkpoint(),
     #    so we unlock the previously locked nodes.
     # 2. max is to handle the case that chunked_prefill_size is larger than sliding_window_size.
     #    in that case, each prefill contains chunked_prefill_size tokens,

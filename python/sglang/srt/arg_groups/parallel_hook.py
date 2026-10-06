@@ -9,6 +9,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
+    _dcp_comm_backend_default,
     _dp_lm_head_validation,
     _tp_lm_head_all_to_all_default,
     declare_resolution,
@@ -18,28 +19,99 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
     should_report_expert_balancedness,
 )
+from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    derive_attn_tp_size,
+    get_platform,
+)
 from sglang.srt.utils.common import parse_connector_type
 
 logger = logging.getLogger(__name__)
 
 
+def handle_deprecated_dp_attention(server_args: Any):
+    """Turn the deprecated `--dp-size N --enable-dp-attention` into
+    `--attn-dp-size N`.
+
+    Runs before any handler reads the DP layout. The old spelling counted
+    attention-DP groups with `dp_size`; that width moves to `attn_dp_size`, and
+    `dp_size` counts replicas again. Next to `--attn-dp-size` the flag adds
+    nothing: a serialized config reports it set whenever attention DP runs
+    (`ServerArgs.resolved_dict`), so reading one back resolves the same layout.
+    """
+    cfg = resolving_view(server_args)
+    if not cfg.enable_dp_attention:
+        return
+    if cfg.attn_dp_size == 1:
+        declare_resolution(
+            server_args,
+            "_handle_deprecated_dp_attention",
+            attn_dp_size=cfg.dp_size,
+            dp_size=1,
+        )
+    declare_resolution(
+        server_args, "_handle_deprecated_dp_attention", enable_dp_attention=False
+    )
+
+
+def _boundary_parallelism_overrides(cfg, model_type: str) -> dict:
+    """Resolve the token-row modes the model's forward actually enters."""
+    nemotron = model_type in ("nemotron_h", "nemotron_h_puzzle")
+    longcat = model_type == "longcat_flash"
+    if nemotron and cfg.attn_cp_size > 1:
+        raise ValueError("Nemotron-H does not support --attn-cp-size > 1")
+    if longcat and cfg.enable_prefill_cp and cfg.attn_cp_size > 1:
+        raise ValueError(
+            "LongCat-Flash does not support --enable-prefill-cp with --attn-cp-size > 1"
+        )
+    if (nemotron or longcat) and cfg.enable_attn_tp_input_scattered:
+        # Neither model enters the input-scattered attention scope. Preserve
+        # their existing ordinary execution and make the effective flag explicit.
+        logger.warning(
+            "Disabling input-scattered attention for %s: its forward does not enter that scope",
+            model_type,
+        )
+        return {"enable_attn_tp_input_scattered": False}
+    return {}
+
+
 def handle_context_parallelism(server_args: Any):
+    # Through the registry, not a bare call: an out-of-tree replacement of
+    # `validate_prefill_cp_platform` registered at its own (earlier) pipeline
+    # position must also win here, or a package permitting prefill CP on its
+    # own qualified NPU/MUSA build would still hit the original rejection
+    # at this later, nested call.
+    run_hook(validate_prefill_cp_platform, server_args)
 
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
         model_config = model_config_of(server_args)
         hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
-        platform = get_platform()
+        declare_resolution(
+            server_args,
+            "boundary_parallelism",
+            **_boundary_parallelism_overrides(
+                cfg, model_config.hf_text_config.model_type
+            ),
+        )
+        if (
+            cfg.enable_prefill_cp
+            and get_platform().is_hip
+            and model_arch != "DeepseekV4ForCausalLM"
+        ):
+            raise ValueError(
+                "Prefill CP on HIP is only supported for "
+                f"DeepseekV4ForCausalLM, got {model_arch!r}."
+            )
         if (
             cfg.enable_prefill_cp
             and model_arch == "DeepseekV32ForCausalLM"
             and cfg.cp_strategy == "zigzag"
-            and not (platform.is_hip or platform.is_npu)
         ):
             raise ValueError(
                 "DeepSeek V3.2 prefill CP does not support --cp-strategy "
@@ -68,24 +140,14 @@ def handle_context_parallelism(server_args: Any):
             "--cp-strategy must be set when --enable-prefill-cp is enabled."
         )
 
-    if cfg.enable_prefill_context_parallel and cfg.enable_dsa_prefill_context_parallel:
-        raise ValueError(
-            "--enable-prefill-context-parallel and "
-            "--enable-nsa-prefill-context-parallel are mutually "
-            "exclusive. Use --enable-nsa-prefill-context-parallel for "
-            "DeepSeek V3.2 (NSA) models and "
-            "--enable-prefill-context-parallel for MLA-based models "
-            "(DeepSeek V3/R1, Kimi K2.5) or MHA/GQA-based models."
-        )
-
     view = resolved_view(server_args)
     if view.attn_cp_size > 1:
         # The tp_size is the world size, not the real tensor parallel size
         assert cfg.tp_size % view.attn_cp_size == 0, (
             "tp_size must be divisible by attn_cp_size"
         )
-        assert cfg.tp_size % (cfg.dp_size * view.attn_cp_size) == 0, (
-            "tp_size must be divisible by dp_size * attn_cp_size"
+        assert cfg.tp_size % (cfg.attn_dp_size * view.attn_cp_size) == 0, (
+            "tp_size must be divisible by attn_dp_size * attn_cp_size"
         )
 
         assert not cfg.enable_aiter_allreduce_fusion, (
@@ -125,7 +187,45 @@ def handle_context_parallelism(server_args: Any):
     )
 
 
-def handle_dcp_validation(server_args: Any):
+def handle_shared_experts_tp(server_args: Any):
+    cfg = resolving_view(server_args)
+    size = cfg.shared_experts_tp_size
+    if size is None:
+        return
+
+    view = resolved_view(server_args)
+    attn_tp_size = derive_attn_tp_size(
+        tp_size=cfg.tp_size,
+        attn_cp_size=view.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
+    if size < 1 or attn_tp_size % size != 0:
+        raise ValueError(
+            f"--shared-experts-tp-size ({size}) must be a positive divisor "
+            f"of attention TP size ({attn_tp_size})."
+        )
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        raise ValueError(
+            "--shared-experts-tp-size requires a Kimi-K3 model configuration."
+        )
+    model_arch = model_config_of(server_args).hf_config.architectures[0]
+    if model_arch != "KimiK3ForConditionalGeneration":
+        raise ValueError("--shared-experts-tp-size is only supported for Kimi-K3.")
+    if cfg.moe_a2a_backend not in (
+        "deepep",
+        "megamoe",
+        "mooncake",
+        "ascend_fuseep",
+        "mori",
+    ):
+        raise ValueError(
+            "--shared-experts-tp-size requires an expert-parallel all-to-all "
+            "backend (deepep, megamoe, mooncake, ascend_fuseep or mori)."
+        )
+
+
+def handle_decode_context_parallelism(server_args: Any):
+    run_post_process_pass(server_args, _dcp_comm_backend_default)
     cfg = resolving_view(server_args)
     if cfg.dcp_size < 1:
         raise ValueError(
@@ -143,10 +243,9 @@ def handle_dcp_validation(server_args: Any):
     if cfg.dcp_comm_backend == "fi_a2a" and not get_platform().is_cuda:
         raise ValueError(
             "--dcp-comm-backend fi_a2a delegates the exchange to FlashInfer's "
-            "MNNVL All-to-All kernel, which requires an NVIDIA CUDA platform "
-            "with SM90+ and MNNVL fabric memory (e.g. GB200 NVL72). The "
-            "authoritative fabric probe runs at model-runner init; use 'a2a' "
-            "or 'ag_rs' on clusters without MNNVL."
+            "MNNVL All-to-All kernel, which requires Blackwell and a DCP group "
+            "within one MNNVL domain. Use 'a2a' or 'ag_rs' elsewhere, or leave "
+            "the flag unset to resolve it."
         )
     if cfg.dcp_replicate_q_proj:
         if cfg.dcp_size <= 1:
@@ -160,13 +259,22 @@ def handle_dcp_validation(server_args: Any):
 
 
 def handle_data_parallelism(server_args: Any):
-    # The dp_size==1 resets moved to the resolution pipeline
+    # The resets without attention DP live in the resolution pipeline
     # (arg_groups/overrides.py: _data_parallelism_defaults).
     from sglang.srt.arg_groups.cuda_graph_hook import (
         generate_prefill_cuda_graph_batch_sizes,
     )
 
     cfg = resolving_view(server_args)
+
+    if cfg.attn_dp_size < 1:
+        raise ValueError(f"--attn-dp-size must be positive (got {cfg.attn_dp_size}).")
+    if cfg.attn_dp_size > 1 and cfg.dp_size > 1:
+        raise ValueError(
+            f"--dp-size {cfg.dp_size} with --attn-dp-size {cfg.attn_dp_size}: "
+            "data-parallel replicas combined with attention data parallelism "
+            "are not supported."
+        )
 
     run_post_process_pass(server_args, _data_parallelism_defaults)
 
@@ -188,18 +296,18 @@ def handle_data_parallelism(server_args: Any):
                 cfg.tp_size,
             )
 
-    if resolved_view(server_args).enable_dp_attention:
+    if attn_dp_enabled_of(resolved_view(server_args)):
         declare_resolution(
             server_args,
             "_handle_data_parallelism",
             schedule_conservativeness=cfg.schedule_conservativeness * 0.3,
         )
-        assert cfg.tp_size % cfg.dp_size == 0
+        assert cfg.tp_size % cfg.attn_dp_size == 0
         original_chunked_prefill_size = cfg.chunked_prefill_size
         declare_resolution(
             server_args,
             "_handle_data_parallelism",
-            chunked_prefill_size=cfg.chunked_prefill_size // cfg.dp_size,
+            chunked_prefill_size=cfg.chunked_prefill_size // cfg.attn_dp_size,
         )
         logger.warning(
             f"DP attention is enabled. chunked prefill size is adjusted "
@@ -237,6 +345,57 @@ def handle_data_parallelism(server_args: Any):
 
     run_post_process_pass(server_args, _tp_lm_head_all_to_all_default)
     run_post_process_pass(server_args, _dp_lm_head_validation)
+    if resolving_view(server_args).enable_tp_lm_head_all_to_all:
+        _disable_nccl_graph_buffer_registration(
+            "the graph-captured TP LM-head all-to-all can deadlock with "
+            "registered buffers"
+        )
+    if _graph_pool_is_pausable(server_args):
+        _disable_nccl_graph_buffer_registration(
+            "graph replay can hang once torch_memory_saver resume remaps the "
+            "graph pool, leaving the capture-time registrations on released pages"
+        )
+
+
+def _graph_pool_is_pausable(server_args: Any) -> bool:
+    """Whether CUDA graphs are captured into torch_memory_saver memory, which
+    release/resume of the `cuda_graph` tag remaps to new physical pages at the
+    same virtual addresses."""
+    return bool(
+        resolving_view(server_args).enable_memory_saver
+        and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+    )
+
+
+def _disable_nccl_graph_buffer_registration(reason: str) -> None:
+    """Keep NCCL from registering the buffers of graph-captured collectives.
+
+    NCCL_GRAPH_REGISTER (default on) registers the send/recv buffers of every
+    collective captured in a CUDA graph for the lifetime of the graph, and
+    peers then move data through those registrations directly. The TP LM-head
+    all-to-all is captured in the decode graphs on graph-pool temporaries,
+    whose addresses the pool also hands to other tensors, and the registered
+    exchange does not survive that: under a burst of new requests (DP ranks
+    ramping at different rates) one rank finishes its step while the others
+    spin in ncclDevKernel_SendRecv forever, and every DP rank hangs.
+    Reproduced on tp4/dp4/ep4 and on a multi-node tp16/dp16/ep16 PD decode
+    deployment; disabling the registration removes the hang while dedicated
+    all-to-all buffers alone do not.
+
+    A pausable graph pool breaks the registrations too: torch_memory_saver
+    resume keeps the pool's virtual addresses but maps new physical pages,
+    while NCCL's capture-time registrations still point at the released pages,
+    so graph replay can hang (fzyzcjy/torch_memory_saver#88).
+
+    Must run before the schedulers create their NCCL communicators, which
+    inherit this environment. An explicit setting wins.
+    """
+    if os.environ.setdefault("NCCL_GRAPH_REGISTER", "0") != "0":
+        logger.warning(
+            "NCCL_GRAPH_REGISTER=%s was set explicitly; %s.",
+            os.environ["NCCL_GRAPH_REGISTER"],
+            reason,
+        )
 
 
 def handle_dwdp(server_args: Any):
@@ -275,12 +434,8 @@ def handle_dwdp(server_args: Any):
     declare_resolution(
         server_args,
         "_handle_dwdp",
-        dp_size=cfg.dwdp_size,
-    )
-    declare_resolution(
-        server_args,
-        "_handle_dwdp",
-        enable_dp_attention=True,
+        attn_dp_size=cfg.dwdp_size,
+        dp_size=1,
     )
     declare_resolution(
         server_args, "_handle_dwdp", enable_dp_attention_local_control_broadcast=True
@@ -321,7 +476,7 @@ def handle_dwdp(server_args: Any):
 
     logger.info(
         f"DWDP enabled: dwdp_size={cfg.dwdp_size}, "
-        f"auto-forced dp_size={cfg.dp_size}, ep_size={cfg.dwdp_size}, "
+        f"auto-forced attn_dp_size={cfg.attn_dp_size}, ep_size={cfg.dwdp_size}, "
         f"moe_dense_tp_size=1, moe_a2a_backend=none, "
         f"dp_attention_local_control_broadcast=True, "
         f"enable_dp_lm_head=True, SCHEDULER_SKIP_ALL_GATHER=True, "
@@ -333,21 +488,6 @@ def handle_elastic_ep(server_args: Any):
     from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 
     cfg = resolving_view(server_args)
-    if cfg.elastic_ep_rejoin:
-        if cfg.ep_join_mode is None:
-            logger.warning(
-                "--elastic-ep-rejoin is deprecated, use --elastic-ep-join-mode recover instead."
-            )
-            declare_resolution(
-                server_args,
-                "_handle_elastic_ep",
-                ep_join_mode="recover",
-            )
-        else:
-            assert cfg.ep_join_mode == "recover", (
-                "--elastic-ep-rejoin (deprecated) conflicts with "
-                f"--elastic-ep-join-mode {cfg.ep_join_mode}."
-            )
     if cfg.elastic_ep_backend is not None:
         if cfg.enable_eplb:
             if cfg.eplb_algorithm == "auto":
@@ -474,20 +614,41 @@ def handle_elastic_ep(server_args: Any):
             f"(got pp_size={cfg.pp_size}); WORLD must not span PP stages."
         )
 
-        decode_cuda_graph_disabled = (
-            cfg.cuda_graph_config.decode.backend == Backend.DISABLED
+        decode_backend = cfg.cuda_graph_config.decode.backend
+        assert decode_backend in (Backend.DISABLED, Backend.FULL), (
+            "Elastic EP runtime scale-up supports decode CUDA graph backend "
+            f"'full' or 'disabled' (got {decode_backend!r})."
         )
-        prefill_cuda_graph_disabled = (
-            cfg.cuda_graph_config.prefill.backend == Backend.DISABLED
+        assert cfg.cuda_graph_config.prefill.backend == Backend.DISABLED, (
+            "Elastic EP runtime scale-up requires prefill CUDA graph to be disabled."
         )
-        assert decode_cuda_graph_disabled and prefill_cuda_graph_disabled, (
-            "Elastic EP runtime scale-up requires decode and prefill CUDA "
-            "graphs to be disabled."
-        )
-        assert resolved.enable_dp_attention, (
-            "Elastic EP scale-up requires --enable-dp-attention; without it "
-            "the TP group is not equivalent to WORLD and the post-scale "
-            "collective path is invalid."
+        if decode_backend == Backend.FULL:
+            assert cfg.device == "cuda", (
+                "Elastic EP CUDA graph recapture requires CUDA "
+                f"(got device={cfg.device!r})."
+            )
+            assert cfg.speculative_algorithm is None, (
+                "Elastic EP CUDA graph recapture does not support speculative decoding."
+            )
+            assert not cfg.is_embedding, (
+                "Elastic EP CUDA graph recapture does not support embedding models."
+            )
+            assert cfg.dllm_algorithm is None, (
+                "Elastic EP CUDA graph recapture does not support diffusion models."
+            )
+            assert not cfg.encoder_only, (
+                "Elastic EP CUDA graph recapture does not support encoder-only models."
+            )
+            assert not cfg.forward_hooks, (
+                "Elastic EP CUDA graph recapture does not support forward hooks."
+            )
+            assert not cfg.enable_pdmux, (
+                "Elastic EP CUDA graph recapture does not support PDMux."
+            )
+        assert attn_dp_enabled_of(resolved), (
+            "Elastic EP scale-up requires attention DP (--attn-dp-size); "
+            "without it the TP group is not equivalent to WORLD and the "
+            "post-scale collective path is invalid."
         )
         assert resolved.enable_dp_lm_head, (
             "Elastic EP scale-up requires --enable-dp-lm-head so output "
@@ -506,9 +667,9 @@ def handle_elastic_ep(server_args: Any):
             f"(got ep_size={resolved.ep_size}, tp_size={cfg.tp_size}); EP, TP "
             "and the attention DP group must all coincide with WORLD."
         )
-        assert cfg.dp_size == cfg.tp_size, (
-            "Elastic EP scale-up requires dp_size == tp_size "
-            f"(got dp_size={cfg.dp_size}, tp_size={cfg.tp_size})."
+        assert cfg.attn_dp_size == cfg.tp_size, (
+            "Elastic EP scale-up requires attn_dp_size == tp_size "
+            f"(got attn_dp_size={cfg.attn_dp_size}, tp_size={cfg.tp_size})."
         )
         assert resolved.moe_a2a_backend == "nixl", (
             "Elastic EP scale-up requires --moe-a2a-backend nixl "
@@ -560,104 +721,8 @@ def handle_eplb_and_dispatch(server_args: Any):
         assert resolved_view(server_args).ep_size > 1
 
 
-def handle_platform_cp_compatibility(server_args: Any):
-    cfg = resolving_view(server_args)
-    platform = get_platform()
-    is_protected_platform = platform.is_hip or platform.is_npu
-    if not is_protected_platform:
-        if (
-            cfg.enable_prefill_context_parallel
-            or cfg.enable_dsa_prefill_context_parallel
-        ):
-            raise ValueError(
-                "Legacy prefill context-parallel options are supported only "
-                "by protected HIP or Ascend NPU paths. Use "
-                "--enable-prefill-cp with --cp-strategy."
-            )
-        return
-
-    legacy_mode_to_strategy = {
-        "in-seq-split": "zigzag",
-        "round-robin-split": "interleave",
-    }
-
-    if cfg.enable_prefill_context_parallel or cfg.enable_dsa_prefill_context_parallel:
-        declare_resolution(
-            server_args,
-            "_handle_platform_cp_compatibility",
-            enable_prefill_cp=True,
-        )
-
-    if cfg.enable_prefill_context_parallel and cfg.cp_strategy is None:
-        declare_resolution(
-            server_args,
-            "_handle_platform_cp_compatibility",
-            cp_strategy=legacy_mode_to_strategy[cfg.prefill_cp_mode],
-        )
-    if cfg.enable_dsa_prefill_context_parallel and cfg.cp_strategy is None:
-        declare_resolution(
-            server_args,
-            "_handle_platform_cp_compatibility",
-            cp_strategy=legacy_mode_to_strategy[cfg.dsa_prefill_cp_mode],
-        )
-
-
-def handle_legacy_cp_runtime_compatibility(server_args: Any):
-    """Project canonical CP settings for runtime consumers removed by PR3."""
-    cfg = resolving_view(server_args)
-
-    if cfg.enable_prefill_context_parallel and cfg.enable_dsa_prefill_context_parallel:
-        return
-
-    if not cfg.enable_prefill_cp or cfg.cp_strategy is None:
-        return
-
-    strategy_to_legacy_mode = {
-        "zigzag": "in-seq-split",
-        "interleave": "round-robin-split",
-    }
-    mode = strategy_to_legacy_mode[cfg.cp_strategy]
-    use_dsa_legacy_aliases = cfg.enable_dsa_prefill_context_parallel or getattr(
-        resolved_view(server_args), "attention_backend", None
-    ) in ("dsa", "dsv4")
-    if use_dsa_legacy_aliases:
-        declare_resolution(
-            server_args,
-            "_handle_legacy_cp_runtime_compatibility",
-            enable_dsa_prefill_context_parallel=True,
-        )
-        declare_resolution(
-            server_args,
-            "_handle_legacy_cp_runtime_compatibility",
-            enable_prefill_context_parallel=False,
-        )
-    else:
-        declare_resolution(
-            server_args,
-            "_handle_legacy_cp_runtime_compatibility",
-            enable_prefill_context_parallel=True,
-        )
-    declare_resolution(
-        server_args,
-        "_handle_legacy_cp_runtime_compatibility",
-        dsa_prefill_cp_mode=mode,
-    )
-    declare_resolution(
-        server_args,
-        "_handle_legacy_cp_runtime_compatibility",
-        prefill_cp_mode=mode,
-    )
-
-
 def handle_expert_distribution_metrics(server_args: Any):
     cfg = resolving_view(server_args)
-    if "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC" in os.environ:
-        raise ValueError(
-            "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC is no longer supported. Use "
-            "--expert-balancedness-report-mode with one of: off, server_log, "
-            "prometheus, both."
-        )
-
     if should_report_expert_balancedness(server_args) and (
         cfg.expert_distribution_recorder_mode is None
     ):
@@ -680,3 +745,13 @@ def handle_expert_distribution_metrics(server_args: Any):
                 "_handle_expert_distribution_metrics",
                 expert_distribution_recorder_buffer_size=1000,
             )
+
+
+def validate_prefill_cp_platform(server_args: Any):
+    """Reject deprecated platform CP before resolving models or CP topology."""
+    cfg = resolving_view(server_args)
+    platform = get_platform()
+    if cfg.enable_prefill_cp and platform.is_musa:
+        raise ValueError(
+            "Prefill CP on MUSA is deprecated; CP support will be refactored soon."
+        )

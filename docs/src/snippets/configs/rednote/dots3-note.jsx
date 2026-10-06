@@ -135,9 +135,8 @@ export const config = {
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
-        "--enable-dp-attention",
         "--tp 8",
-        "--dp 8",
+        "--attn-dp-size 8",
         "--ep 8",
         "--moe-dense-tp-size 1",
         "--moe-a2a-backend deepep",
@@ -184,9 +183,8 @@ export const config = {
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
-        "--enable-dp-attention",
         "--tp 8",
-        "--dp 8",
+        "--attn-dp-size 8",
         "--ep 8",
         "--moe-dense-tp-size 1",
         "--moe-a2a-backend deepep",
@@ -233,9 +231,8 @@ export const config = {
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
-        "--enable-dp-attention",
         "--tp 8",
-        "--dp 8",
+        "--attn-dp-size 8",
         "--ep 8",
         "--moe-dense-tp-size 1",
         "--moe-a2a-backend deepep",
@@ -282,9 +279,8 @@ export const config = {
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
-        "--enable-dp-attention",
         "--tp 8",
-        "--dp 8",
+        "--attn-dp-size 8",
         "--ep 8",
         "--moe-dense-tp-size 1",
         "--moe-a2a-backend deepep",

@@ -76,11 +76,21 @@ class RustUnifiedTreeCoreInspector(
             node_id, int(component_type)
         )
 
+    def get_component_host_lock_ref(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> int:
+        return self._binding.inspect_get_component_host_lock_ref(
+            node_id, int(component_type)
+        )
+
     def get_node_hit_count(self, node_id: NodeId) -> int:
         return self._binding.inspect_get_node_hit_count(node_id)
 
     def get_write_through_pending_id(self, node_id: NodeId) -> Optional[int]:
         return self._binding.inspect_get_write_through_pending_id(node_id)
+
+    def is_external_cache_stored(self, node_id: NodeId) -> bool:
+        return self._binding.inspect_is_external_cache_stored(node_id)
 
     def is_node_in_device_lru(
         self, node_id: NodeId, component_type: ComponentType

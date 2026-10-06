@@ -13,16 +13,15 @@
 # ==============================================================================
 """Turns the KV ids stored in `req_to_token` into ids attention kernels can use.
 
-A KV slot can be named in three id spaces:
+A KV slot can be named in two id spaces:
 
   * **virtual** - what `req_to_token` stores. Keeps naming the same logical
     slot even after the pool moves data around.
-  * **physical** - where that slot sits in the pool right now.
-  * **kernel-facing** - what a kernel can index the per-layer K/V tensors
-    with. Same as physical on a plain pool; under the unified pool it is the
-    physical page scaled by the per-page block count.
+  * **physical** - where that slot sits in the pool right now, which is also
+    what a kernel indexes the per-layer K/V views with ("kernel-facing" in
+    older names means the same id).
 
-All three coincide on a plain pool, so nothing here does any work there.
+The two coincide on a plain pool, so nothing here does any work there.
 
 Backends get a `KVIndexTable`, which answers "what do I gather from, and
 which row is mine?":
@@ -31,7 +30,7 @@ which row is mine?":
 
     plain pool : ids = req_to_token, row_ids = req_pool_indices (those very
                  objects - no copy, no kernel)
-    unified    : ids = a built array of kernel-facing ids,
+    unified    : ids = a built array of physical ids,
                  row_ids = arange(batch_size)
 
 Backends call their own copy a *page table* (fa3) or a *block table*
@@ -43,7 +42,7 @@ uses its rows as-is, and one that wants flat per-token ids rebuilds them as
 
     token_id = entry * entry_page_size + pos % entry_page_size
 
-WRITES, IN TWO PHASES. The full-side write loc is rebound to kernel-facing
+WRITES, IN TWO PHASES. The full-side write loc is rebound to physical
 ids at ForwardBatch construction - the earliest consumer can snapshot it
 right after. The sliding-window write loc is derived at the same moment as
 read table, into the same index table.
@@ -64,11 +63,14 @@ from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table,
     build_kv_read_table_packed,
 )
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.multi_ended_allocator import (
-    UnifiedMambaTokenToKVPoolAllocator,
-    UnifiedSWATokenToKVPoolAllocator,
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+    UnifiedSWAAllocatorBase,
 )
+from sglang.srt.mem_cache.allocator.unified_mamba import (
+    UnifiedMambaTokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -90,14 +92,8 @@ class KVIndexTable(msgspec.Struct, frozen=True):
     row_ids: torch.Tensor  # which row belongs to batch lane b
     row_stride: int  # stride between rows of `ids`, in elements
     entry_page_size: int  # what one entry covers: 1 = a token, N = a page of N
-    is_translated: bool  # entries are already kernel-facing ids
+    is_translated: bool  # entries are already physical ids
     sliding_window_ids: Optional[torch.Tensor]  # SWA models: the parallel swa array
-
-    def sliding_window_read_ids(self) -> torch.Tensor:
-        """Which array a sliding-window gather reads: the parallel swa array
-        when translated, else the full-attention array, which the caller maps
-        through the pool's own full->swa map."""
-        return self.sliding_window_ids if self.is_translated else self.ids
 
 
 class KVIndexTranslator:
@@ -119,46 +115,46 @@ class KVIndexTranslator:
         self.is_translating = (
             isinstance(
                 token_to_kv_pool_allocator,
-                (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWATokenToKVPoolAllocator),
+                (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWAAllocatorBase),
             )
             and token_to_kv_pool_allocator.get_kvcache() is token_to_kv_pool
         )
         if self.is_translating:
             alloc = token_to_kv_pool_allocator
+            self._capture_page_size = alloc.page_size
             self._full_v2p_table = alloc.full_v2p_page_table
             self._full_p2v_table = alloc.full_p2v_page_table
-            self._full_page_multiplier = alloc.kernel_page_multiplier
-            self._translate_full = alloc.translate_kv_loc_for_kernel
+            self._translate_full = alloc.translate_kv_loc
             # The WRITE loc is the one id that arrives DCP-WIDENED: read indices
             # are collapsed by the DCP index kernels, `out_cache_loc` still
             # carries the owner rule in `loc % dcp_size`. Identity with the read
             # translate when dcp_size == 1.
-            self._translate_write_full = alloc.translate_write_loc_for_kernel
+            self._translate_write_full = alloc.translate_write_loc
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
             # share changes the length, so only the production site can do it.
             self.defer_read_translate = get_parallel().attn_dcp_size > 1
-            if isinstance(alloc, UnifiedSWATokenToKVPoolAllocator):
+            if isinstance(alloc, UnifiedSWAAllocatorBase):
                 self._swa_v2p_table = alloc.swa_v2p_page_table
-                self._swa_page_multiplier = alloc.swa_kernel_page_multiplier
                 self._swa_write_loc_from_full = self._swa_write_loc_unified
             else:
                 self._swa_v2p_table = None
-                self._swa_page_multiplier = 1
                 self._swa_write_loc_from_full = None
         else:
             self._full_v2p_table = None
             self._full_p2v_table = None
-            self._full_page_multiplier = 1
             self._translate_full = None
             self._translate_write_full = None
             self.defer_read_translate = False
             self._swa_v2p_table = None
-            self._swa_page_multiplier = 1
             # `translate_loc_from_full_to_swa` is abstract on `BaseSWAKVPool`,
             # which is also what the backends' `_resolve_swa_kv_pool` keys on.
             self._swa_write_loc_from_full = (
                 token_to_kv_pool.translate_loc_from_full_to_swa
                 if isinstance(token_to_kv_pool, BaseSWAKVPool)
+                and (
+                    not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                    or token_to_kv_pool.request_window is None
+                )
                 else None
             )
 
@@ -169,11 +165,21 @@ class KVIndexTranslator:
         )
         self._index_table_memo: Optional[Tuple[weakref.ref, KVIndexTable]] = None
 
+    def capture_token_capacity(self, max_token_pool_size: int) -> int:
+        """Host capture rows are indexed by request-token IDs, not kernel IDs.
+
+        Unified IDs span the whole virtual table even when admission is capped.
+        DCP widens allocator pages; the runner's page size stays physical.
+        """
+        if self.is_translating:
+            return self._full_v2p_table.numel() * self._capture_page_size
+        return max_token_pool_size + self.page_size
+
     # -- per-batch view --------------------------------------------------------
 
     @property
     def reads_are_translated(self) -> bool:
-        """Whether a read this translator fills comes out kernel-facing. False
+        """Whether a read this translator fills comes out physical. False
         on a non-unified pool, and under DCP, where the ids stay VIRTUAL for
         ``translate_dcp_read_ids`` to finish."""
         return self.is_translating and not self.defer_read_translate
@@ -235,11 +241,6 @@ class KVIndexTranslator:
             seq_lens=seq_lens,
             v2p=self._swa_v2p_table if sliding_window else self._full_v2p_table,
             indptr=indptr,
-            multiplier=(
-                self._swa_page_multiplier
-                if sliding_window
-                else self._full_page_multiplier
-            ),
             page_size=self.page_size,
             max_tokens=total_tokens,
             out=out,
@@ -302,7 +303,6 @@ class KVIndexTranslator:
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             v2p=self._full_v2p_table,
-            multiplier=self._full_page_multiplier,
             page_size=self.page_size,
             max_pages=width,
             out=out_full,
@@ -313,7 +313,6 @@ class KVIndexTranslator:
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 v2p=self._swa_v2p_table,
-                multiplier=self._swa_page_multiplier,
                 page_size=self.page_size,
                 max_pages=width,
                 out=out_swa,
@@ -403,11 +402,6 @@ class KVIndexTranslator:
         """
         return self._full_v2p_table
 
-    @property
-    def full_page_multiplier(self) -> int:
-        """Scales a physical page into the id space the per-layer views use."""
-        return self._full_page_multiplier
-
     def bind_and_verify_backends(self, backends) -> None:
         """Boot: make every reachable backend carry THIS translator.
 
@@ -430,19 +424,58 @@ class KVIndexTranslator:
 
     def rebind_write_loc(self, forward_batch) -> None:
         """Phase 1 of the WRITE contract: translate the batch's write loc to
-        FULL-side kernel-facing ids exactly once, at ForwardBatch
-        construction. No-op on non-unified pools.
+        FULL-side physical ids exactly once, at ForwardBatch construction, and
+        mark it physical. On non-unified pools the allocation is already
+        physical, so only the mark is set.
 
         REBIND, never mutate: the translate returns a FRESH tensor, so the
         ScheduleBatch's aliased tensor stays VIRTUAL for the radix / accept /
-        in-flight machinery that reads it.
+        in-flight machinery that reads it. The pre-translate tensor stays on
+        the batch for `fill_capture_write_loc`.
         """
         self._index_table_memo = None
-        if not self.is_translating or forward_batch.out_cache_loc is None:
+        if forward_batch.out_cache_loc is None:
             return
-        forward_batch.out_cache_loc = self._translate_write_full(
-            forward_batch.out_cache_loc
-        )
+        if self.is_translating:
+            forward_batch.out_cache_loc_virtual = forward_batch.out_cache_loc
+            forward_batch.out_cache_loc = self._translate_write_full(
+                forward_batch.out_cache_loc
+            )
+        forward_batch.out_cache_loc_is_physical = True
+
+    def fill_capture_write_loc(
+        self,
+        *,
+        out: torch.Tensor,
+        forward_batch,
+        width: Optional[int] = None,
+    ) -> Optional[torch.Tensor]:
+        """Translate this batch's WRITE loc straight into ``out``, a backend's
+        capture-stable buffer, and return the live ``[:n]`` view. One launch
+        fills the live prefix and clears the tail a shorter replay leaves;
+        None when this pool needs no translation.
+
+        Must run at metadata-init time: `out` is reused every step, so filling
+        it sooner would race a still-pending previous step under overlap
+        scheduling.
+        """
+        if not self.is_translating:
+            return None
+        virtual = forward_batch.out_cache_loc_virtual
+        if virtual is None:
+            loc = forward_batch.out_cache_loc
+            if loc is None:
+                return None
+            # The runner builds the capture batch outside `init_new`, so no
+            # rebind marked its virtual source; bake it holding sink ids.
+            width = int(loc.numel()) if width is None else int(width)
+            out[:width].zero_()
+            return out[: int(loc.numel())]
+        n = int(virtual.numel())
+        width = n if width is None else int(width)
+        buf = out[:width]
+        self._translate_write_full(virtual, out=buf, out_width=width)
+        return buf[:n]
 
     def sliding_window_write_loc_for(
         self, out_cache_loc: Optional[torch.Tensor]
@@ -453,17 +486,16 @@ class KVIndexTranslator:
             return None
         return self._swa_write_loc_from_full(out_cache_loc)
 
-    def _swa_write_loc_unified(self, kernel_loc: torch.Tensor) -> torch.Tensor:
-        """Sliding-window write loc, derived pointwise from FULL-side
-        kernel-facing values (phase 2 of the write contract).
+    def _swa_write_loc_unified(self, full_loc: torch.Tensor) -> torch.Tensor:
+        """Sliding-window write loc, derived pointwise from FULL-side physical
+        ids (phase 2 of the write contract).
         """
-        full_stride = self.page_size * self._full_page_multiplier
-        offset = kernel_loc % full_stride  # == virtual_token % page_size
+        ps = self.page_size
+        offset = full_loc % ps  # == virtual_token % page_size
         # An unmapped physical page reads back as -1; clamp it rather than let
         # the gather wrap onto the v2p table's last element.
-        virt_page = self._full_p2v_table[kernel_loc // full_stride].clamp_(min=0)
-        swa_stride = self.page_size * self._swa_page_multiplier
-        return (self._swa_v2p_table[virt_page] * swa_stride + offset).clamp_(min=0)
+        virt_page = self._full_p2v_table[full_loc // ps].clamp_(min=0)
+        return (self._swa_v2p_table[virt_page] * ps + offset).clamp_(min=0)
 
     # -- token-level translate surface (the mixin / local-attn consumers) ------
 
@@ -474,7 +506,7 @@ class KVIndexTranslator:
         return self.is_translating or get_parallel().attn_dcp_size > 1
 
     def translate_dcp_read_ids(self, widened_ids: torch.Tensor) -> torch.Tensor:
-        """Widened logical READ ids -> kernel-facing ids, for either pool.
+        """Widened logical READ ids -> physical ids, for either pool.
 
         The one hook every DCP read-index production site calls; on a static
         pool `widened // dcp_size` IS the whole virtual->physical translation.
@@ -487,7 +519,7 @@ class KVIndexTranslator:
     def translate_full_attn_ids(
         self, kv_indices: torch.Tensor, *, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Virtual token ids -> kernel-facing full-attention ids (the identity
+        """Virtual token ids -> physical full-attention ids (the identity
         when no translation is needed, so callers never branch)."""
         if not self.is_translating:
             assert out is None, "passthrough translate takes no out="

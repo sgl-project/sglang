@@ -3,7 +3,7 @@
 The Rust server replaces the Python api-server + `TokenizerManager` +
 `DetokenizerManager` stack, running them as Rust threads inside the scheduler
 process. This wrapper keeps all `SGLANG_RUST_SERVER` plumbing — startup,
-CPU-core partitioning, the typed `server_args` handoff, and control-response
+CPU-core partitioning, the typed `server_args`, and control-response
 routing — out of `scheduler.py`. The scheduler holds an `Optional[RustServer]`
 and delegates to it.
 """
@@ -14,21 +14,23 @@ import logging
 import os
 from array import array
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import msgspec
 
-from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
 )
-from sglang.srt.runtime_context import get_mm, get_serving
+from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
 from sglang.srt.rust_server.config import _build_server_args, _partition_cores
 from sglang.srt.rust_server.multimodal import (
+    MM_TRANSPORT_STATS,
     RUST_MM_FAMILIES,
     RustMmProcessor,
     RustMmSpec,
+    settle_shm_buffers,
 )
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
@@ -39,6 +41,7 @@ from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
+    from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.rust_extensions._server import MmSpec, Server
 
@@ -55,12 +58,56 @@ class RustServer:
     def __init__(
         self,
         server: Server,
+        http_port: int,
         mm_spec: Optional[RustMmSpec] = None,
         max_per_poll: int = 256,
     ):
         self.server = server
+        self.http_port = http_port
         self.mm_spec = mm_spec
+        self._multimodal_enabled = mm_spec is not None
         self._max_per_poll = max_per_poll
+
+    @classmethod
+    def _load_extension(cls) -> ModuleType:
+        from sglang.srt.rust_extensions import load_rust_extension
+
+        return load_rust_extension("sglang.srt.rust_extensions._server")
+
+    def _start_multimodal(self, scheduler: Scheduler) -> None:
+        """Start the model's Rust workers and retain their scheduler-side state."""
+        mm_host = RustMmProcessor(
+            server_args=scheduler.server_args,
+            model_config=scheduler.model_config,
+            processor=scheduler.processor,
+        )
+        mm_spec = mm_host.resolve_spec()
+        if mm_spec is None:
+            supported = sorted(
+                set(chain.from_iterable(f.model_types for f in RUST_MM_FAMILIES))
+            )
+            raise RuntimeError(
+                "SGLANG_RUST_SERVER=1: no Rust MM pipeline for "
+                f"model_type={scheduler.model_config.hf_config.model_type!r} "
+                f"(supported: {', '.join(supported)}; "
+                "images only). Unset SGLANG_RUST_SERVER to serve this model."
+            )
+        self.server.start_mm_workers(self._build_mm_spec(mm_spec), mm_host.mm_workers)
+        self.mm_spec = mm_spec
+
+    @staticmethod
+    def _server_core_budget(allowed_core_count: int, mm_workers: int) -> int:
+        """Maximum cores available to the Rust frontend and MM workers."""
+        return max(8, mm_workers + 4)
+
+    @classmethod
+    def _partition_cores(
+        cls, mm_workers: int = 0
+    ) -> tuple[Optional[List[int]], Optional[List[int]]]:
+        return _partition_cores(
+            mm_workers=mm_workers,
+            server_core_budget=cls._server_core_budget,
+        )
 
     @classmethod
     def launch(cls, scheduler: Scheduler) -> RustServer:
@@ -69,21 +116,27 @@ class RustServer:
         The caller gates this (``SGLANG_RUST_SERVER`` + rank 0); this always
         creates.
         """
-        from sglang.srt.rust_extensions import load_rust_extension
-
-        Server = load_rust_extension("sglang.srt.rust_extensions._server").Server
-
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-        server_args = scheduler.server_args
-        # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,
-        # so the rank is not conflated with rank 0 of a one-rank group.
-        dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
-        listen_port = get_serving().port + (dp_rank or 0)
+        # Preserve the DP startup log; ports use node-local offsets.
+        dp_rank = (
+            get_parallel().attn_dp_rank if get_parallel().num_dp_ranks > 1 else None
+        )
+        if get_exec().moe.is_ep_scale_joiner:
+            # The joining TP group is entirely local to this node.
+            tp_size_per_node = get_parallel().tp_size
+        else:
+            nnodes_per_pp_rank = max(get_parallel().nnodes // get_parallel().pp_size, 1)
+            tp_size_per_node = get_parallel().tp_size // nnodes_per_pp_rank
+        dp_group_width = get_parallel().attn_tp_size * get_parallel().attn_cp_size
+        # Count DP leaders within this node's TP range. The first leader must
+        # use the base port even when a DP group spans multiple nodes.
+        local_dp_rank = (get_parallel().tp_rank % tp_size_per_node) // dp_group_width
+        listen_port = get_serving().port + local_dp_rank
         listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
-        launch_cores, server_cores = _partition_cores(
+        launch_cores, server_cores = cls._partition_cores(
             mm_workers=(
                 (get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS)
                 if scheduler.model_config.is_multimodal
@@ -91,16 +144,17 @@ class RustServer:
             )
         )
 
-        server = Server(
-            _build_server_args(scheduler),
-            # None -> run unpinned; the list carries the pinning decision.
+        extension = cls._load_extension()
+        server = extension.Server(
+            _build_server_args(scheduler, extension=extension),
+            # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,
-            port_offset=dp_rank,
+            port_offset=local_dp_rank,
         )
+        instance = cls(server, http_port=listen_port)
 
         # Multimodal models must have a Rust pipeline — there is no Python
         # fallback.
-        mm_spec = None
         if scheduler.model_config.is_multimodal:
             # New threads inherit the spawning thread's affinity, and this launch
             # thread still holds the full mask. Narrow it first so every MM thread
@@ -114,23 +168,8 @@ class RustServer:
                     logger.warning(
                         "rust server: cannot confine mm threads to server cores: %s", e
                     )
-            mm_host = RustMmProcessor(
-                server_args=server_args,
-                model_config=scheduler.model_config,
-                processor=scheduler.processor,
-            )
-            mm_spec = mm_host.resolve_spec()
-            if mm_spec is None:
-                supported = sorted(
-                    set(chain.from_iterable(f.model_types for f in RUST_MM_FAMILIES))
-                )
-                raise RuntimeError(
-                    "SGLANG_RUST_SERVER=1: no Rust MM pipeline for "
-                    f"model_type={scheduler.model_config.hf_config.model_type!r} "
-                    f"(supported: {', '.join(supported)}; "
-                    "images only). Unset SGLANG_RUST_SERVER to serve this model."
-                )
-            server.start_mm_workers(cls._build_mm_spec(mm_spec), mm_host.mm_workers)
+            instance._start_multimodal(scheduler)
+            instance._multimodal_enabled = True
 
         # Narrow the scheduler thread only after the server threads are launched.
         if launch_cores is not None:
@@ -143,7 +182,9 @@ class RustServer:
         # Under DP every rank runs its own server on its own port, so the rank is
         # what tells two otherwise identical startup lines apart.
         dp_note = (
-            "" if dp_rank is None else f" (DP rank {dp_rank}/{scheduler.ps.dp_size})"
+            ""
+            if dp_rank is None
+            else f" (DP rank {dp_rank}/{get_parallel().num_dp_ranks})"
         )
         logger.info(
             "SGLANG_RUST_SERVER enabled, Rust server listen on %s%s",
@@ -151,7 +192,24 @@ class RustServer:
             dp_note,
         )
 
-        return cls(server, mm_spec=mm_spec)
+        return instance
+
+    def _wrap_mm_result(self, buffers: dict) -> MultimodalProcessorOutput:
+        """Wrap one request's ``mm.*`` buffers (``{name: numpy array |
+        ShmBuffer}``) into the scheduler's ``MultimodalProcessorOutput``. Model
+        packages with an external processor override this for their own
+        item layout; the buffer names are the contract (see ``wrap_encoded``).
+        A wrapper only translates: it may build ``ShmPointerMMData`` stubs from
+        a ``ShmBuffer``'s name, and the segment stays valid for every TP rank
+        because ``drain`` settles its ownership after the wrapper returns."""
+        assert self.mm_spec is not None
+        return RustMmProcessor.wrap_encoded(self.mm_spec, buffers)
+
+    def mm_transport_stats(self) -> Dict[str, int]:
+        """Snapshot of the zero-copy accounting at the multimodal hand-off
+        (see :class:`~sglang.srt.rust_server.multimodal.MmTransportStats`);
+        surfaced on ``/server_info`` as ``rust_mm_transport``."""
+        return MM_TRANSPORT_STATS.snapshot()
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
@@ -164,60 +222,82 @@ class RustServer:
         request objects. The scheduler's request receiver calls this instead of
         polling the zmq socket when `rust_server_mode` is set.
 
-        The transfer is **columnar**: `recv_requests` returns an `IngressBatch`
-        of scalar msgpack `headers` (with `input_ids` omitted) plus one
-        concatenated raw int64 `data` buffer and per-request `lengths`, so the
-        large `input_ids` lists never go through msgpack. Each header is `msgpack_decode`d (yielding
-        the same `TokenizedGenerateReqInput` / control objects the zmq path
-        produces, so the IPC schema is tracked automatically) and its `input_ids`
-        slice is wrapped as the `array("q")` the scheduler expects. `recv_requests`
-        never waits: the ring drain is `try_recv` (returns the instant the ring
-        is dry, capped at `max_recv`) and the rest is one memcpy per header
-        plus one for the concatenated ids — same contract as `zmq.NOBLOCK`.
-        Parking for work is :meth:`wait_request`, which does release the GIL.
+        Each request arrives as a scalar msgpack `header` (with `input_ids`
+        and `token_ids_logprob` left nil) plus its named **buffers** -- the one
+        data plane every non-scalar payload uses. An inline buffer is a shaped
+        numpy array that owns the Rust vector (nothing was copied to get here);
+        a shm buffer is a `ShmBuffer` naming the segment to map after the TP
+        broadcast. The header is `msgpack_decode`d (yielding the same
+        `TokenizedGenerateReqInput` / control objects the zmq path produces, so
+        the IPC schema is tracked automatically) and each buffer is attached
+        under its name: `input_ids` as the `array("q")` the scheduler expects
+        (the one copy left, forced by that type), `token_ids_logprob` as a
+        list, and the `mm.*` set through :meth:`_wrap_mm_result`.
+        `recv_requests` never waits: the ring drain is `try_recv` (returns the
+        instant the ring is dry, capped at `max_recv`) -- same contract as
+        `zmq.NOBLOCK`. Parking for work is :meth:`wait_request`, which does
+        release the GIL.
         """
         limit = max_recv if max_recv > 0 else self._max_per_poll
-        batch = self.server.recv_requests(limit)
-        # Bind once: each attribute access converts the rust vec to a fresh list.
-        headers, data, lengths = batch.headers, batch.data, batch.lengths
-        if not headers:
-            return []
-
-        ids_view = memoryview(data)
         out = []
-        pos = 0  # byte offset into ids_buf
-        for header, n in zip(headers, lengths):
-            nbytes = n * 8
+        for req in self.server.recv_requests(limit):
+            buffers = dict(req.buffers)
+            # Rust holds the unlink duty for every shm segment until this loop
+            # settles the request: released to the stubs on admission, unlinked
+            # on rejection. The wrapper never decides this (see `_wrap_mm_result`).
             try:
-                obj = msgpack_decode_explained(header)
-            except MsgpackDecodeError as e:
-                # Return 400 for malformed request field (e.g. token_ids_logprob=[[0]].
-                logger.warning(
-                    "rust ingress: dropping undecodable request %s: %s", e.rid, e.reason
-                )
-                if e.rid is not None:
-                    self.server.push_error(e.rid, f"invalid request: {e.reason}")
-                pos += nbytes
+                obj = self._admit(req.header, buffers)
+            except Exception:
+                settle_shm_buffers(buffers, admitted=False)
                 continue
-            if n:  # generate request: attach its int64 ids slice as array("q")
-                ids = array("q")
-                ids.frombytes(ids_view[pos : pos + nbytes])
-                obj.input_ids = ids
-                pos += nbytes
-            if self.mm_spec is not None and isinstance(obj, TokenizedGenerateReqInput):
-                # The buffers were parked in the Rust result store before the
-                # ring push; wrapping them into tensors is the only Python step
-                # of the Rust path. `None` for a text-only request on a
-                # multimodal model.
-                encoded = self.server.take_mm_result(obj.rid)
-                if encoded is not None:
-                    obj.mm_inputs = RustMmProcessor.wrap_encoded(self.mm_spec, encoded)
+            settle_shm_buffers(buffers, admitted=True)
             out.append(obj)
         return out
 
+    def _admit(self, header: bytes, buffers: dict):
+        """Decode and attach one drained request, or report the rejection to
+        its client and raise."""
+        try:
+            obj = msgpack_decode_explained(header)
+        except MsgpackDecodeError as e:
+            # Return 400 for malformed request field (e.g. token_ids_logprob=[[0]].
+            logger.warning(
+                "rust ingress: dropping undecodable request %s: %s", e.rid, e.reason
+            )
+            if e.rid is not None:
+                self.server.push_error(e.rid, f"invalid request: {e.reason}")
+            raise
+        try:
+            self._attach_buffers(obj, buffers)
+        except Exception as e:
+            logger.warning(
+                "rust ingress: rejecting request %s: %s: %s",
+                obj.rid,
+                type(e).__name__,
+                e,
+            )
+            self.server.push_error(obj.rid, f"invalid request: {e}")
+            raise
+        return obj
+
+    def _attach_buffers(self, obj, buffers: dict) -> None:
+        """Attach one drained request's named buffers to its decoded header."""
+        ids = buffers.get("input_ids")
+        if ids is not None:  # generate request
+            obj.input_ids = array("q")
+            obj.input_ids.frombytes(memoryview(ids).cast("B"))
+        token_ids_logprob = buffers.get("token_ids_logprob")
+        if token_ids_logprob is not None:
+            obj.token_ids_logprob = token_ids_logprob.tolist()
+        if self._multimodal_enabled and "mm.meta" in buffers:
+            # Wrapping the worker's buffers into tensors is the only Python
+            # step of the Rust path; a text-only request on a multimodal
+            # model carries no `mm.*` buffers.
+            obj.mm_inputs = self._wrap_mm_result(buffers)
+
     def push_control_output(self, recv_req, output) -> None:
         """Push a control-request response through the egress ring to the waiting
-        request (routed by rid), encoded as **msgpack** (the ring's native
+        request (routed by rid), encoded as **msgpack** (the ring's message
         format).
 
         A msgspec struct is converted to a *named map* (``structs.asdict``, since
@@ -257,9 +337,11 @@ class RustServer:
             the shape metadata for the optional families (``*_lens`` element counts
             for the flat logprob columns, ``*_reqlens``/``*_poslens`` for the ragged
             and hidden ones).
-          - ``data``: the raw little-endian numeric buffer — every column is a
-            4-byte element (``f32`` values, ``i32`` indices), concatenated in the
-            order the Rust ``for_each_chunk`` reads them.
+          - ``data``: the raw little-endian numeric buffer: the token ids
+            first, as the 8-byte ``array("q")`` bytes the scheduler already
+            holds, then every logprob / hidden column as 4-byte elements
+            (``f32`` values, ``i32`` indices), concatenated in the order the
+            Rust ``for_each_chunk`` reads them.
 
         Logprobs are columnar: output families are per-step deltas, input
         (prefill) families ride once on the first chunk. Ragged families (top-k,
@@ -287,18 +369,20 @@ class RustServer:
         # the plain rid strings (hashed to a routing key on the Rust side with a
         # per-process seed, off the GIL — not parsed; a rid is any string),
         # `finished_reasons` already `dict | None`, and `output_ids` entries are
-        # always `array("i")` (never None) so `map(len)` and a bare
-        # `chain.from_iterable` stay in C.
+        # always `array("q")` slices of `Req.output_ids` (never None), so both
+        # `map`s stay in C and their bytes go out as-is: one memcpy per request,
+        # no per-element repack. Measured at 256 single-token requests: 10 us,
+        # against 18 us for `array("i", chain.from_iterable(...))`.
         rids = payload.rids
         finish_reasons = payload.finished_reasons
         tok_lens = list(map(len, output_ids))
-        flat_ids = array("i", chain.from_iterable(output_ids))
+        flat_ids = b"".join(map(array.tobytes, output_ids))
 
         # Column order here MUST match BatchHeader (header_cols) and
         # for_each_chunk's read order (data_cols); the extras contribution
         # is ordered by the `extras` tuple below.
         header_cols = [rids, finish_reasons, prompt_tokens, tok_lens]
-        data_cols = [flat_ids.tobytes()]
+        data_cols = [flat_ids]
 
         if has_extra:
             # The `extras` tuple is the SINGLE source of the extras column
@@ -396,16 +480,14 @@ class RustServer:
                 len(rids),
             )
 
-    @staticmethod
-    def _build_mm_spec(spec: RustMmSpec) -> MmSpec:
-        """The typed MM handoff for ``Server.start_mm_workers``: the
+    @classmethod
+    def _build_mm_spec(cls, spec: RustMmSpec) -> MmSpec:
+        """The typed MM configuration for ``Server.start_mm_workers``: the
         :class:`RustMmSpec` fields the Rust pipeline consumes, as the Rust
         extension's own ``MmSpec`` class (same required-keyword contract as
-        :meth:`_build_server_args`; ``family`` / ``resample`` become the
+        :func:`_build_server_args`; ``family`` / ``resample`` become the
         extension's ``MmFamily`` / ``MmResample`` enums)."""
-        from sglang.srt.rust_extensions import load_rust_extension
-
-        ext = load_rust_extension("sglang.srt.rust_extensions._server")
+        ext = cls._load_extension()
         family = {"qwen_vl": ext.MmFamily.QwenVl}[spec.family]
         resample = {"aten_u8": ext.MmResample.AtenU8, "pil": ext.MmResample.Pil}[
             spec.resample

@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
@@ -314,6 +314,31 @@ class TestSamplingParamsVerify(CustomTestCase):
         """Test that logit_bias with token_ids within [0, vocab_size) is accepted."""
         sp = self._make(logit_bias={"0": 1.0, "31999": -0.5})
         sp.verify(self.VOCAB_SIZE)
+
+    # --- sampling_seed ---
+    def test_sampling_seed_valid(self):
+        """Test that None (the default) and the int64 min/max boundaries are accepted."""
+        self._make(sampling_seed=None).verify(self.VOCAB_SIZE)
+        self._make(sampling_seed=2**63 - 1).verify(self.VOCAB_SIZE)
+        self._make(sampling_seed=-(2**63)).verify(self.VOCAB_SIZE)
+
+    def test_sampling_seed_out_of_range_raises(self):
+        """Test that verify() rejects a seed outside the int64 range.
+
+        With deterministic inference enabled the seed feeds a torch.int64
+        tensor; an out-of-range value raises "Overflow when unpacking long
+        long" inside the scheduler and crashes every rank, so it must be
+        rejected at admission instead.
+        """
+        with self.assertRaises(ValueError):
+            self._make(sampling_seed=2**63).verify(self.VOCAB_SIZE)
+        with self.assertRaises(ValueError):
+            self._make(sampling_seed=-(2**63) - 1).verify(self.VOCAB_SIZE)
+
+    def test_sampling_seed_non_int_raises(self):
+        """Test that verify() rejects a non-integer seed (e.g. a string)."""
+        with self.assertRaises(ValueError):
+            self._make(sampling_seed="100").verify(self.VOCAB_SIZE)
 
     def test_multiple_grammars_raises(self):
         """Reject structural_tag combined with any other grammar constraint.

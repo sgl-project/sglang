@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
     _UnifiedBackupIntent,
@@ -19,15 +20,16 @@ from sglang.srt.mem_cache.hicache_storage import (
     SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
 )
+from sglang.srt.mem_cache.unified_radix_cache import _OngoingPrefetch
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestBufferModeSidecar(unittest.TestCase):
@@ -35,7 +37,11 @@ class TestBufferModeSidecar(unittest.TestCase):
     def _swa_component():
         return SimpleNamespace(
             full_window_pages=2,
-            _swa_kv_pool_host=SimpleNamespace(page_size=2, size=8),
+            _swa_kv_pool_host=SimpleNamespace(
+                page_size=2,
+                size=8,
+                shared_allocation_domain=None,
+            ),
         )
 
     @staticmethod
@@ -135,14 +141,16 @@ class TestBufferModeSidecar(unittest.TestCase):
         ]
 
         controller = MagicMock()
+        controller.mem_pool_host.anchor_entry.host_pool.shared_allocation_domain = None
         controller.mem_pool_host.entry_map = {
             PoolName.SWA: SimpleNamespace(
                 host_pool=SimpleNamespace(page_size=page_size)
             )
         }
 
-        def _write(device_value, *, node_id, extra_pools):
+        def _write(device_value, node_id, extra_pools, flush):
             self.assertEqual(node_id, 7)
+            self.assertFalse(flush)
             self.assertEqual(
                 [transfer.name for transfer in extra_pools],
                 [PoolName.SWA, *[transfer.name for transfer in sidecars]],
@@ -188,7 +196,7 @@ class TestBufferModeSidecar(unittest.TestCase):
         intent = _UnifiedBackupIntent(snapshot=snapshot)
 
         self.assertTrue(
-            pipeline._launch_backup_intent(
+            pipeline._stage_backup_intent(
                 intent,
                 device_indices,
                 comp_xfers={ComponentType.SWA: [swa]},
@@ -231,25 +239,26 @@ class TestBufferModeSidecar(unittest.TestCase):
             )
             for spec in self._dsv4_specs()
         ]
+        host_indices = torch.arange(4, dtype=torch.int64)
         operation = SimpleNamespace(
             id=23,
             pool_transfers=sidecars,
             storage_start=0,
+            buffer_host_occupied_units=len(host_indices),
         )
-        host_indices = torch.arange(4, dtype=torch.int64)
-        req_id = "sidecar-prefetch"
+        req_id = CacheRequestHandle("sidecar-prefetch", 0)
 
         cache = MagicMock()
         cache.page_size = 2
         cache.cache_controller.prefetch_tokens_occupied = len(host_indices)
         cache.ongoing_prefetch = {
-            req_id: (
-                0,
-                RadixKey(array("q", [1, 2, 3, 4])),
-                host_indices,
-                operation,
-                None,
-                {ComponentType.SWA: [swa]},
+            req_id: _OngoingPrefetch(
+                anchor_node_id=0,
+                prefetch_key=RadixKey(array("q", [1, 2, 3, 4])),
+                host_indices=host_indices,
+                operation=operation,
+                anchor_lock_params=None,
+                comp_xfers={ComponentType.SWA: [swa]},
             )
         }
         cache.prefetch_loaded_tokens_by_reqid = {}
@@ -263,7 +272,7 @@ class TestBufferModeSidecar(unittest.TestCase):
 
         self.assertTrue(
             pipeline.stage_completed_prefetch(
-                req_id=req_id,
+                request=req_id,
                 num_tokens=len(host_indices),
                 hash_value=["page-0", "page-1"],
             )

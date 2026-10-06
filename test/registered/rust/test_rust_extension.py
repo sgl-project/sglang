@@ -18,7 +18,7 @@ from sglang.srt.rust_extensions.torch_build import torch_build_configuration
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _hold_filesystem_lock(path: str, ready, release) -> None:
@@ -162,6 +162,7 @@ crate-type = ["cdylib"]
             self.assertEqual(crate.library, "demo_extension")
             self.assertEqual(crate.python_module, "demo._core")
             self.assertEqual(crate.features, ("python",))
+            self.assertEqual(crate.source_inputs, ())
 
             with self.assertRaisesRegex(
                 ModuleNotFoundError, r"declared modules: \['demo\._core'\]"
@@ -200,13 +201,43 @@ crate-type = ["cdylib"]
                     crate,
                     features=(*crate.features, "inspection"),
                     extension_module="demo._inspection",
-                    build_fingerprint={"torch": "2.13"},
+                    build_fingerprint={"torch": "2.14"},
                 )
                 self.assertNotEqual(changed_source.fingerprint, inspection.fingerprint)
                 self.assertNotEqual(
                     changed_source.target_fingerprint,
                     inspection.target_fingerprint,
                 )
+
+    def test_fingerprint_covers_declared_external_source_inputs(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = self._workspace(root)
+            proto = root / "proto/demo.proto"
+            proto.parent.mkdir()
+            proto.write_text("message Demo {}\n", encoding="utf-8")
+            manifest = workspace / "demo/Cargo.toml"
+            manifest.write_text(
+                manifest.read_text(encoding="utf-8").replace(
+                    'features = ["python"]',
+                    'features = ["python"]\nsource-inputs = ["../../proto"]',
+                ),
+                encoding="utf-8",
+            )
+
+            crate = rust_extension._discover_crate(workspace, "demo._core")
+            self.assertEqual(crate.source_inputs, (proto.parent.resolve(),))
+            with mock.patch.object(
+                rust_extension,
+                "_command_version",
+                side_effect=lambda command, *args, **kwargs: f"{command} 1.0",
+            ):
+                first = rust_extension._build_context(crate)
+                proto.write_text("message Changed {}\n", encoding="utf-8")
+                changed = rust_extension._build_context(crate)
+
+            self.assertNotEqual(first.fingerprint, changed.fingerprint)
+            self.assertEqual(first.target_fingerprint, changed.target_fingerprint)
 
     def test_auto_builds_once_then_uses_cache(self):
         with TemporaryDirectory() as directory:
@@ -427,7 +458,7 @@ crate-type = ["cdylib"]
             compat_header = root / "compat.h"
             compat_header.write_text("// compatibility\n", encoding="utf-8")
             fake_torch = SimpleNamespace(
-                __version__="2.13.0+cu130",
+                __version__="2.14.1+cu130",
                 __file__=str(torch_init),
                 compiled_with_cxx11_abi=lambda: True,
                 version=SimpleNamespace(cuda="13.0", hip=None),
@@ -441,17 +472,25 @@ crate-type = ["cdylib"]
                     "PATH": "/usr/bin",
                     "CXXFLAGS": "-O2",
                     "RUSTFLAGS": "-Ctarget-cpu=x86-64",
+                    "LIBTORCH_USE_PYTORCH": "1",
                 },
             )
 
-            self.assertEqual(build.environment["LIBTORCH_USE_PYTORCH"], "1")
+            self.assertNotIn("LIBTORCH_USE_PYTORCH", build.environment)
+            self.assertEqual(build.environment["LIBTORCH"], str(torch_root))
+            self.assertEqual(build.environment["LIBTORCH_INCLUDE"], str(torch_root))
+            self.assertEqual(build.environment["LIBTORCH_LIB"], str(torch_root))
+            self.assertEqual(build.environment["LIBTORCH_CXX11_ABI"], "1")
             self.assertEqual(build.environment["LIBTORCH_BYPASS_VERSION_CHECK"], "1")
             self.assertIn(str(compat_header), build.environment["CXXFLAGS"])
+            # -std=c++20 must trail the inherited CXXFLAGS to beat a caller's -std=;
+            # torch-sys's own -std=c++17 loses anyway, as cc-rs appends CXXFLAGS.
+            self.assertRegex(build.environment["CXXFLAGS"], r"^-O2\b.*\s-std=c\+\+20\b")
             self.assertIn(
                 "$ORIGIN/../../../../torch/lib", build.environment["RUSTFLAGS"]
             )
             self.assertIn(str(torch_root / "lib"), build.environment["RUSTFLAGS"])
-            self.assertEqual(build.fingerprint["torch_version"], "2.13.0+cu130")
+            self.assertEqual(build.fingerprint["torch_version"], "2.14.1+cu130")
             self.assertTrue(build.fingerprint["torch_cxx11_abi"])
 
             wheel_build = torch_build_configuration(
@@ -466,8 +505,37 @@ crate-type = ["cdylib"]
             )
             self.assertFalse(wheel_build.fingerprint["include_absolute_rpath"])
 
-            fake_torch.__version__ = "2.14.0"
-            with self.assertRaisesRegex(RuntimeError, "PyTorch 2.11 through 2.13"):
+            # libtorch declares C++20 from 2.12 on; 2.11 is the only C++17 release.
+            for version, expected in (("2.12.0+cu128", True), ("2.11.0+cu128", False)):
+                fake_torch.__version__ = version
+                older_build = torch_build_configuration(
+                    compat_header=compat_header,
+                    python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
+                    torch_module=fake_torch,
+                    base_environment={},
+                )
+                self.assertEqual(
+                    "-std=c++20" in older_build.environment["CXXFLAGS"],
+                    expected,
+                    msg=version,
+                )
+
+            # cc-rs keeps a quoted, spaced header path whole only in shell-words mode.
+            fake_torch.__version__ = "2.14.1+cu130"
+            spaced_header = root / "compat dir" / "compat.h"
+            spaced_header.parent.mkdir()
+            spaced_header.write_text("// compatibility\n", encoding="utf-8")
+            spaced_build = torch_build_configuration(
+                compat_header=spaced_header,
+                python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
+                torch_module=fake_torch,
+                base_environment={},
+            )
+            self.assertEqual(spaced_build.environment["CC_SHELL_ESCAPED_FLAGS"], "1")
+            self.assertIn(f"'{spaced_header}'", spaced_build.environment["CXXFLAGS"])
+
+            fake_torch.__version__ = "2.15.0"
+            with self.assertRaisesRegex(RuntimeError, "PyTorch 2.11 through 2.14"):
                 torch_build_configuration(
                     compat_header=compat_header,
                     python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
@@ -522,30 +590,35 @@ crate-type = ["cdylib"]
         self.assertNotIn(module_name, sys.modules)
 
     def test_checked_in_crates_are_discovered_from_wheel_metadata(self):
-        for python_module, package, library, features in (
+        grpc_proto = (rust_extension._RUST_WORKSPACE.parent / "proto").resolve()
+        for python_module, package, library, features, source_inputs in (
             (
                 "sglang.srt.rust_extensions._server",
                 "sglang-server",
                 "sglang_server",
                 (),
+                (grpc_proto,),
             ),
             (
                 "sglang.srt.rust_extensions._grpc",
                 "sglang-grpc",
                 "sglang_grpc_core",
                 (),
+                (grpc_proto,),
             ),
             (
                 "sglang.srt.rust_extensions._multimodal",
                 "sglang-mm",
                 "sglang_mm_core",
                 ("python", "parallel"),
+                (),
             ),
             (
                 "sglang.srt.mem_cache.rust_tree_core.mem_cache",
                 "sglang-radix-tree",
                 "mem_cache",
                 ("python-extension",),
+                (),
             ),
         ):
             crate = rust_extension._discover_crate(
@@ -554,6 +627,7 @@ crate-type = ["cdylib"]
             self.assertEqual(crate.package, package)
             self.assertEqual(crate.library, library)
             self.assertEqual(crate.features, features)
+            self.assertEqual(crate.source_inputs, source_inputs)
 
 
 if __name__ == "__main__":

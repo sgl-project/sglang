@@ -77,6 +77,12 @@ class MXFP8Config(SRTFp8Config, QuantizationConfig):
             return UnquantizedLinearMethod()
         if current_platform.is_npu():
             return NPUMXFP8LinearMethod(self)
+        if not self.is_checkpoint_fp8_serialized:
+            from sglang.multimodal_gen.runtime.layers.quantization.mxfp8_online import (
+                MXFP8OnlineLinearMethod,
+            )
+
+            return MXFP8OnlineLinearMethod(self)
         return ComfyMXFP8LinearMethod(self)
 
 
@@ -96,10 +102,14 @@ class ComfyMXFP8LinearMethod(SRTFp8LinearMethod):
     ``layer_markers is None`` and keeps SRT's behaviour byte for byte.
     """
 
-    def _process_mxfp8_linear_weight_scale(self, layer: torch.nn.Module) -> None:
+    def _process_mxfp8_linear_weight_scale(
+        self, layer: torch.nn.Module, scale_u8: torch.Tensor | None = None
+    ) -> None:
         backend = self.mxfp8_dense_backend
+        # an explicit scale_u8 is converted from block-FP8 (row-major) and needs SRT's interleave
         if (
-            self.use_mxfp8
+            scale_u8 is None
+            and self.use_mxfp8
             and self.quant_config.layer_markers is not None
             and backend is not None
             and (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl())
@@ -111,7 +121,7 @@ class ComfyMXFP8LinearMethod(SRTFp8LinearMethod):
                 layer.weight_scale_inv.data.contiguous().view(-1),
             )
             return
-        super()._process_mxfp8_linear_weight_scale(layer)
+        super()._process_mxfp8_linear_weight_scale(layer, scale_u8=scale_u8)
 
 
 __all__ = ["ComfyMXFP8LinearMethod", "MXFP8Config"]

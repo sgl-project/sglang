@@ -120,7 +120,7 @@ class _GlmDistributedCluster:
                 "--disable-fast-image-processor",
                 "--tp-size",
                 "1",
-                "--cuda-graph-bs",
+                "--cuda-graph-bs-decode",
                 "2",
                 "--base-gpu-id",
                 "0",
