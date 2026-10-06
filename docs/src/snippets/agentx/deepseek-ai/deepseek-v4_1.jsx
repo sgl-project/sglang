@@ -32,20 +32,20 @@ export const agentx = {
  },
  "hardware": [
   {
-   "id": "b300",
-   "label": "B300"
-  },
-  {
-   "id": "b200",
-   "label": "B200"
-  },
-  {
    "id": "gb300",
    "label": "GB300"
   },
   {
    "id": "gb200",
    "label": "GB200"
+  },
+  {
+   "id": "b300",
+   "label": "B300"
+  },
+  {
+   "id": "b200",
+   "label": "B200"
   },
   {
    "id": "h200",
@@ -64,11 +64,10 @@ export const agentx = {
  ],
  "envs": [
   {
-   "SGLANG_DEFAULT_THINKING": "1",
-   "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "per_rank",
-   "SGLANG_DSV41_REASONING_EFFORT": "high",
-   "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1",
-   "SGLANG_TIMEOUT_KEEP_ALIVE": "900"
+   "DYN_NATS_REQUEST_TIMEOUT_SECS": "1800",
+   "DYN_REQUEST_PLANE": "tcp",
+   "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+   "NATS_SERVER": "nats://$NATS_IP:4222"
   },
   {
    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
@@ -79,10 +78,11 @@ export const agentx = {
    "SGLANG_TIMEOUT_KEEP_ALIVE": "900"
   },
   {
-   "DYN_NATS_REQUEST_TIMEOUT_SECS": "1800",
-   "DYN_REQUEST_PLANE": "tcp",
-   "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
-   "NATS_SERVER": "nats://$NATS_IP:4222"
+   "SGLANG_DEFAULT_THINKING": "1",
+   "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "per_rank",
+   "SGLANG_DSV41_REASONING_EFFORT": "high",
+   "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1",
+   "SGLANG_TIMEOUT_KEEP_ALIVE": "900"
   }
  ],
  "kvMooncake": {
@@ -148,1294 +148,6 @@ export const agentx = {
  },
  "files": {},
  "cells": [
-  {
-   "id": "dsv41flash-fp4-b300-sglang-agentic-dspark#1",
-   "hw": "b300",
-   "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
-   "label": "Agg TP2·EP2",
-   "detail": "DSpark 5",
-   "gpus": 8,
-   "configKey": "dsv41flash-fp4-b300-sglang-agentic-dspark",
-   "image": "lmsysorg/sglang:nightly-dev-cu13-20260922-582389ce@sha256:35ea4d321b0735051dcce2599fc495853ad1ef30f6a1908f0a75e74204362d14",
-   "imageStatus": "digest-only",
-   "imageCommit": "582389ce",
-   "submitted": "sglang",
-   "setup": [],
-   "disclosures": ["synthetic-acceptance"],
-   "kv": {
-    "available": ["none", "hicache", "mooncake"],
-    "unavailable": {},
-    "hicache": {
-     "args": [
-      ["--enable-hierarchical-cache"],
-      ["--hicache-io-backend", "direct"],
-      ["--hicache-ratio", "1"],
-      ["--hicache-write-policy", "write_back"]
-     ],
-     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
-     "donorHardware": "gb300"
-    }
-   },
-   "points": [
-    {
-     "concs": [1],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
-     "pr": "3342",
-     "date": "2026-09-22",
-     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667235",
-     "goldenAL": "3.51",
-     "kv": "none"
-    },
-    {
-     "concs": [2],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
-     "pr": "3342",
-     "date": "2026-09-22",
-     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667317",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["4"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["4"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [4],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
-     "pr": "3342",
-     "date": "2026-09-22",
-     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667390",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["8"],
-         "--swa-prefix-tails": ["256"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["8"],
-         "--swa-prefix-tails": ["256"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [8],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
-     "pr": "3342",
-     "date": "2026-09-22",
-     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799668150",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["16"],
-         "--swa-prefix-tails": ["512"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["16"],
-         "--swa-prefix-tails": ["512"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [16],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
-     "pr": "3342",
-     "date": "2026-09-22",
-     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667458",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["32"],
-         "--mem-fraction-static": ["0.80"],
-         "--swa-prefix-tails": ["1024"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["32"],
-         "--mem-fraction-static": ["0.80"],
-         "--swa-prefix-tails": ["1024"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [32],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
-     "pr": "3342",
-     "date": "2026-09-22",
-     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667227",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--mem-fraction-static": ["0.85"],
-         "--prefill-decode-interval": ["4"],
-         "--swa-prefix-tails": ["2048"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--mem-fraction-static": ["0.85"],
-         "--prefill-decode-interval": ["4"],
-         "--swa-prefix-tails": ["2048"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [64],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
-     "pr": "3342",
-     "date": "2026-09-22",
-     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799666217",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--mem-fraction-static": ["0.85"],
-         "--prefill-decode-interval": ["4"],
-         "--swa-prefix-tails": ["4096"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--mem-fraction-static": ["0.85"],
-         "--prefill-decode-interval": ["4"],
-         "--swa-prefix-tails": ["4096"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [128],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
-     "pr": "3342",
-     "date": "2026-09-22",
-     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667031",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--mem-fraction-static": ["0.85"],
-         "--prefill-decode-interval": ["4"],
-         "--swa-prefix-tails": ["4096"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--mem-fraction-static": ["0.85"],
-         "--prefill-decode-interval": ["4"],
-         "--swa-prefix-tails": ["4096"]
-        }
-       },
-       null
-      ]
-     }
-    }
-   ],
-   "routers": {
-    "sglang": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "worker",
-       "role": "agg",
-       "workers": 1,
-       "nodes_per_worker": 1,
-       "cmd": "python3 -m sglang.launch_server",
-       "args": [
-        ["--model-path", "deepseek-ai/DeepSeek-V4.1-Flash"],
-        ["--served-model-name", "deepseek-ai/DeepSeek-V4.1-Flash"],
-        ["--host", "0.0.0.0"],
-        ["--port", "30000"],
-        ["--chunked-prefill-size", "4096"],
-        ["--cuda-graph-max-bs-decode", "64"],
-        ["--ep-size", "2"],
-        ["--max-running-requests", "2"],
-        ["--mem-fraction-static", "0.70"],
-        ["--prefill-decode-interval", "16"],
-        ["--reasoning-parser", "auto"],
-        ["--speculative-algorithm", "DSPARK"],
-        ["--speculative-dspark-block-size", "5"],
-        ["--swa-prefix-tails", "128"],
-        ["--tool-call-parser", "auto"],
-        ["--tp", "2"],
-        ["--trust-remote-code"],
-        ["--watchdog-timeout", "3600"],
-        ["--weight-loader-prefetch-checkpoints"]
-       ],
-       "envRef": 0
-      }
-     ]
-    },
-    "dynamo": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "etcd",
-       "count_nodes": 1,
-       "cmd": "etcd",
-       "env": {},
-       "args": [
-        ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
-       ]
-      },
-      {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 1,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-       },
-       "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"]
-       ]
-      }
-     ]
-    }
-   }
-  },
-  {
-   "id": "dsv41flash-fp4-b300-sglang-agentic-dspark#0",
-   "hw": "b300",
-   "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
-   "label": "Agg TP4·EP4",
-   "detail": "DSpark 5",
-   "gpus": 8,
-   "configKey": "dsv41flash-fp4-b300-sglang-agentic-dspark",
-   "image": "lmsysorg/sglang:nightly-dev-cu13-20260922-582389ce@sha256:35ea4d321b0735051dcce2599fc495853ad1ef30f6a1908f0a75e74204362d14",
-   "imageStatus": "digest-only",
-   "imageCommit": "582389ce",
-   "submitted": "sglang",
-   "setup": [],
-   "disclosures": ["synthetic-acceptance"],
-   "kv": {
-    "available": ["none", "hicache", "mooncake"],
-    "unavailable": {},
-    "hicache": {
-     "args": [
-      ["--enable-hierarchical-cache"],
-      ["--hicache-io-backend", "direct"],
-      ["--hicache-ratio", "1"],
-      ["--hicache-write-policy", "write_back"]
-     ],
-     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
-     "donorHardware": "gb300"
-    }
-   },
-   "points": [
-    {
-     "concs": [1],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
-     "pr": "3342",
-     "date": "2026-09-22",
-     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799666410",
-     "goldenAL": "3.51",
-     "kv": "none"
-    },
-    {
-     "concs": [2],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
-     "pr": "3342",
-     "date": "2026-09-22",
-     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667236",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["4"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["4"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [4],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
-     "pr": "3342",
-     "date": "2026-09-22",
-     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667229",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["8"],
-         "--swa-prefix-tails": ["256"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["8"],
-         "--swa-prefix-tails": ["256"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [8],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
-     "pr": "3342",
-     "date": "2026-09-22",
-     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667206",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["16"],
-         "--swa-prefix-tails": ["512"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["16"],
-         "--swa-prefix-tails": ["512"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [16],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
-     "pr": "3342",
-     "date": "2026-09-22",
-     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667446",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["32"],
-         "--swa-prefix-tails": ["1024"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["32"],
-         "--swa-prefix-tails": ["1024"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [32],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
-     "pr": "3342",
-     "date": "2026-09-22",
-     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667454",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--swa-prefix-tails": ["2048"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--swa-prefix-tails": ["2048"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [64],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
-     "pr": "3342",
-     "date": "2026-09-22",
-     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667008",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--swa-prefix-tails": ["4096"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--swa-prefix-tails": ["4096"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [128],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
-     "pr": "3342",
-     "date": "2026-09-22",
-     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667096",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--swa-prefix-tails": ["4096"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--swa-prefix-tails": ["4096"]
-        }
-       },
-       null
-      ]
-     }
-    }
-   ],
-   "routers": {
-    "sglang": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "diff": {
-        "args": {
-         "--ep-size": ["4"],
-         "--tp": ["4"]
-        }
-       },
-       "ref": [0, "sglang", 0]
-      }
-     ]
-    },
-    "dynamo": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "etcd",
-       "count_nodes": 1,
-       "cmd": "etcd",
-       "env": {},
-       "args": [
-        ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
-       ]
-      },
-      {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 1,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-       },
-       "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"]
-       ]
-      }
-     ]
-    }
-   }
-  },
-  {
-   "id": "dsv41flash-fp4-b200-sglang-agentic-dspark#1",
-   "hw": "b200",
-   "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
-   "label": "Agg TP2·EP2",
-   "detail": "DSpark 5",
-   "gpus": 8,
-   "configKey": "dsv41flash-fp4-b200-sglang-agentic-dspark",
-   "image": "lmsysorg/sglang:nightly-dev-cu13-20260922-582389ce@sha256:0e1b14e302619a42ef5581b87db6804651d4f946301cf543d74a3a1eb1c33b40",
-   "imageStatus": "digest-only",
-   "imageCommit": "582389ce",
-   "submitted": "sglang",
-   "setup": [],
-   "disclosures": ["synthetic-acceptance"],
-   "kv": {
-    "available": ["none", "hicache", "mooncake"],
-    "unavailable": {},
-    "hicache": {
-     "args": [
-      ["--enable-hierarchical-cache"],
-      ["--hicache-io-backend", "direct"],
-      ["--hicache-ratio", "1"],
-      ["--hicache-write-policy", "write_back"]
-     ],
-     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
-     "donorHardware": "gb300"
-    }
-   },
-   "points": [
-    {
-     "concs": [1],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
-     "pr": "3346",
-     "date": "2026-09-22",
-     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784145156",
-     "goldenAL": "3.51",
-     "kv": "none"
-    },
-    {
-     "concs": [2],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
-     "pr": "3346",
-     "date": "2026-09-22",
-     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784143620",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["4"],
-         "--swa-prefix-tails": ["256"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["4"],
-         "--swa-prefix-tails": ["256"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [4],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
-     "pr": "3346",
-     "date": "2026-09-22",
-     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144968",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["8"],
-         "--swa-prefix-tails": ["512"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["8"],
-         "--swa-prefix-tails": ["512"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [8],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
-     "pr": "3346",
-     "date": "2026-09-22",
-     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784145125",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["16"],
-         "--swa-prefix-tails": ["1024"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["16"],
-         "--swa-prefix-tails": ["1024"]
-        }
-       },
-       null
-      ]
-     }
-    }
-   ],
-   "routers": {
-    "sglang": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "worker",
-       "role": "agg",
-       "workers": 1,
-       "nodes_per_worker": 1,
-       "cmd": "python3 -m sglang.launch_server",
-       "args": [
-        ["--model-path", "deepseek-ai/DeepSeek-V4.1-Flash"],
-        ["--served-model-name", "deepseek-ai/DeepSeek-V4.1-Flash"],
-        ["--host", "0.0.0.0"],
-        ["--port", "30000"],
-        ["--chunked-prefill-size", "2048"],
-        ["--cuda-graph-max-bs-decode", "64"],
-        ["--ep-size", "2"],
-        ["--max-running-requests", "2"],
-        ["--mem-fraction-static", "0.92"],
-        ["--prefill-decode-interval", "16"],
-        ["--reasoning-parser", "auto"],
-        ["--speculative-algorithm", "DSPARK"],
-        ["--speculative-dspark-block-size", "5"],
-        ["--swa-prefix-tails", "128"],
-        ["--tool-call-parser", "auto"],
-        ["--tp", "2"],
-        ["--trust-remote-code"],
-        ["--watchdog-timeout", "3600"]
-       ],
-       "envRef": 1
-      }
-     ]
-    },
-    "dynamo": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "etcd",
-       "count_nodes": 1,
-       "cmd": "etcd",
-       "env": {},
-       "args": [
-        ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
-       ]
-      },
-      {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 1,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-       },
-       "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"]
-       ]
-      }
-     ]
-    }
-   }
-  },
-  {
-   "id": "dsv41flash-fp4-b200-sglang-agentic-dspark#0",
-   "hw": "b200",
-   "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
-   "label": "Agg TP4·EP4",
-   "detail": "DSpark 5",
-   "gpus": 8,
-   "configKey": "dsv41flash-fp4-b200-sglang-agentic-dspark",
-   "image": "lmsysorg/sglang:nightly-dev-cu13-20260922-582389ce@sha256:0e1b14e302619a42ef5581b87db6804651d4f946301cf543d74a3a1eb1c33b40",
-   "imageStatus": "digest-only",
-   "imageCommit": "582389ce",
-   "submitted": "sglang",
-   "setup": [],
-   "disclosures": ["synthetic-acceptance"],
-   "kv": {
-    "available": ["none", "hicache", "mooncake"],
-    "unavailable": {},
-    "hicache": {
-     "args": [
-      ["--enable-hierarchical-cache"],
-      ["--hicache-io-backend", "direct"],
-      ["--hicache-ratio", "1"],
-      ["--hicache-write-policy", "write_back"]
-     ],
-     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
-     "donorHardware": "gb300"
-    }
-   },
-   "points": [
-    {
-     "concs": [1],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
-     "pr": "3346",
-     "date": "2026-09-22",
-     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144472",
-     "goldenAL": "3.51",
-     "kv": "none"
-    },
-    {
-     "concs": [2],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
-     "pr": "3346",
-     "date": "2026-09-22",
-     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144541",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["4"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["4"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [4],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
-     "pr": "3346",
-     "date": "2026-09-22",
-     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784145073",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["8"],
-         "--swa-prefix-tails": ["256"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["8"],
-         "--swa-prefix-tails": ["256"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [8],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
-     "pr": "3346",
-     "date": "2026-09-22",
-     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144761",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["16"],
-         "--swa-prefix-tails": ["512"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["16"],
-         "--swa-prefix-tails": ["512"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [16],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
-     "pr": "3346",
-     "date": "2026-09-22",
-     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784145886",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["32"],
-         "--swa-prefix-tails": ["1024"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["32"],
-         "--swa-prefix-tails": ["1024"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [32],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
-     "pr": "3346",
-     "date": "2026-09-22",
-     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784145200",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--swa-prefix-tails": ["2048"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--swa-prefix-tails": ["2048"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [64],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
-     "pr": "3346",
-     "date": "2026-09-22",
-     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144883",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--swa-prefix-tails": ["4096"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--swa-prefix-tails": ["4096"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [128],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
-     "pr": "3346",
-     "date": "2026-09-22",
-     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144947",
-     "goldenAL": "3.51",
-     "kv": "none",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--swa-prefix-tails": ["4096"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--max-running-requests": ["64"],
-         "--swa-prefix-tails": ["4096"]
-        }
-       },
-       null
-      ]
-     }
-    }
-   ],
-   "routers": {
-    "sglang": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "diff": {
-        "args": {
-         "--chunked-prefill-size": ["4096"],
-         "--ep-size": ["4"],
-         "--mem-fraction-static": ["0.80"],
-         "--tp": ["4"]
-        },
-        "env": {
-         "PYTORCH_CUDA_ALLOC_CONF": null
-        }
-       },
-       "ref": [2, "sglang", 0]
-      }
-     ]
-    },
-    "dynamo": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "etcd",
-       "count_nodes": 1,
-       "cmd": "etcd",
-       "env": {},
-       "args": [
-        ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
-       ]
-      },
-      {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 1,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-       },
-       "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"]
-       ]
-      }
-     ]
-    }
-   }
-  },
   {
    "id": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-agg#1",
    "hw": "gb300",
@@ -1504,6 +216,20 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "dynamo-frontend",
+       "count": 1,
+       "cmd": "python3 -m dynamo.frontend",
+       "args": [
+        ["--http-port", "8000"],
+        ["--router-mode", "kv"],
+        ["--router-session-affinity-ttl-secs", "3600"],
+        ["--active-decode-blocks-threshold", "None"],
+        ["--active-prefill-tokens-threshold", "None"],
+        ["--active-prefill-tokens-threshold-frac", "None"]
+       ],
+       "envRef": 0
+      },
+      {
        "kind": "worker",
        "role": "agg",
        "workers": 1,
@@ -1543,20 +269,6 @@ export const agentx = {
         ["--watchdog-timeout", "3600"],
         ["--weight-loader-prefetch-checkpoints"]
        ]
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 1,
-       "cmd": "python3 -m dynamo.frontend",
-       "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"],
-        ["--router-session-affinity-ttl-secs", "3600"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"]
-       ],
-       "envRef": 2
       }
      ]
     },
@@ -1565,7 +277,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 3,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -1660,13 +372,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["4"],
          "--swa-prefix-tails": ["128"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -1694,13 +406,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["8"],
          "--swa-prefix-tails": ["256"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -1728,13 +440,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["16"],
          "--swa-prefix-tails": ["512"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -1762,13 +474,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["32"],
          "--swa-prefix-tails": ["1024"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -1796,13 +508,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["64"],
          "--swa-prefix-tails": ["2048"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -1831,14 +543,14 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--chunked-prefill-size": ["8192"],
          "--max-running-requests": ["64"],
          "--swa-prefix-tails": ["4096"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -1867,14 +579,14 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--chunked-prefill-size": ["8192"],
          "--max-running-requests": ["64"],
          "--swa-prefix-tails": ["4096"]
         }
-       },
-       null
+       }
       ]
      }
     }
@@ -1894,7 +606,7 @@ export const agentx = {
          "SGLANG_RAGGED_VERIFY_MODE": null
         }
        },
-       "ref": [4, "sglang", 0]
+       "ref": [0, "sglang", 0]
       }
      ]
     },
@@ -1914,19 +626,6 @@ export const agentx = {
        ]
       },
       {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
        "kind": "dynamo-frontend",
        "count": 1,
        "cmd": "python3 -m dynamo.frontend",
@@ -1938,6 +637,19 @@ export const agentx = {
         ["--http-port", "8000"],
         ["--router-mode", "kv"]
        ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
       }
      ]
     }
@@ -2011,18 +723,6 @@ export const agentx = {
        "args": []
       },
       {
-       "diff": {
-        "args": {
-         "--expert-parallel-size": ["1"],
-         "--tensor-parallel-size": ["4"]
-        },
-        "env": {
-         "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "0"
-        }
-       },
-       "ref": [4, "dynamo", 2]
-      },
-      {
        "kind": "dynamo-frontend",
        "count": 1,
        "cmd": "python3 -m dynamo.frontend",
@@ -2034,7 +734,19 @@ export const agentx = {
         ["--active-prefill-tokens-threshold", "None"],
         ["--active-prefill-tokens-threshold-frac", "None"]
        ],
-       "envRef": 2
+       "envRef": 0
+      },
+      {
+       "diff": {
+        "args": {
+         "--expert-parallel-size": ["1"],
+         "--tensor-parallel-size": ["4"]
+        },
+        "env": {
+         "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "0"
+        }
+       },
+       "ref": [0, "dynamo", 3]
       }
      ]
     },
@@ -2043,7 +755,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 3,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -2138,13 +850,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["4"],
          "--swa-prefix-tails": ["128"]
         }
-       },
-       null
+       }
       ]
      }
     }
@@ -2164,7 +876,7 @@ export const agentx = {
          "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": null
         }
        },
-       "ref": [6, "sglang", 0]
+       "ref": [2, "sglang", 0]
       }
      ]
     },
@@ -2184,19 +896,6 @@ export const agentx = {
        ]
       },
       {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
        "kind": "dynamo-frontend",
        "count": 1,
        "cmd": "python3 -m dynamo.frontend",
@@ -2208,6 +907,19 @@ export const agentx = {
         ["--http-port", "8000"],
         ["--router-mode", "kv"]
        ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
       }
      ]
     }
@@ -2347,7 +1059,7 @@ export const agentx = {
          "SGLANG_RAGGED_VERIFY_MODE": "static"
         }
        },
-       "ref": [5, "sglang", 0]
+       "ref": [1, "sglang", 0]
       }
      ]
     },
@@ -2367,19 +1079,6 @@ export const agentx = {
        ]
       },
       {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
        "kind": "dynamo-frontend",
        "count": 1,
        "cmd": "python3 -m dynamo.frontend",
@@ -2391,6 +1090,19 @@ export const agentx = {
         ["--http-port", "8000"],
         ["--router-mode", "kv"]
        ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
       }
      ]
     }
@@ -2492,6 +1204,20 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "dynamo-frontend",
+       "count": 1,
+       "cmd": "python3 -m dynamo.frontend",
+       "args": [
+        ["--http-port", "8000"],
+        ["--router-mode", "kv"],
+        ["--router-session-affinity-ttl-secs", "1"],
+        ["--active-decode-blocks-threshold", "None"],
+        ["--active-prefill-tokens-threshold", "None"],
+        ["--active-prefill-tokens-threshold-frac", "None"]
+       ],
+       "envRef": 0
+      },
+      {
        "kind": "worker",
        "role": "prefill",
        "workers": 1,
@@ -2590,20 +1316,6 @@ export const agentx = {
         ["--watchdog-timeout", "3600"],
         ["--weight-loader-prefetch-checkpoints"]
        ]
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 1,
-       "cmd": "python3 -m dynamo.frontend",
-       "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"],
-        ["--router-session-affinity-ttl-secs", "1"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"]
-       ],
-       "envRef": 2
       }
      ]
     },
@@ -2612,7 +1324,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 3,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -2628,7 +1340,7 @@ export const agentx = {
        }
       },
       {
-       "from": 3,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -2721,6 +1433,7 @@ export const agentx = {
       "dynamo": [
        null,
        null,
+       null,
        {
         "args": {
          "--enable-hierarchical-cache": [],
@@ -2734,8 +1447,7 @@ export const agentx = {
          "--cuda-graph-max-bs-decode": ["192"],
          "--max-running-requests": ["192"]
         }
-       },
-       null
+       }
       ],
       "sglang": [
        {
@@ -2781,20 +1493,6 @@ export const agentx = {
        "args": []
       },
       {
-       "ref": [9, "dynamo", 2]
-      },
-      {
-       "drop": ["gpu_pinning"],
-       "workers": 1,
-       "diff": {
-        "args": {
-         "--cuda-graph-max-bs-decode": ["128"],
-         "--max-running-requests": ["128"]
-        }
-       },
-       "ref": [9, "dynamo", 3]
-      },
-      {
        "kind": "dynamo-frontend",
        "count": 1,
        "cmd": "python3 -m dynamo.frontend",
@@ -2806,7 +1504,21 @@ export const agentx = {
         ["--active-prefill-tokens-threshold", "None"],
         ["--active-prefill-tokens-threshold-frac", "None"]
        ],
-       "envRef": 2
+       "envRef": 0
+      },
+      {
+       "ref": [5, "dynamo", 3]
+      },
+      {
+       "drop": ["gpu_pinning"],
+       "workers": 1,
+       "diff": {
+        "args": {
+         "--cuda-graph-max-bs-decode": ["128"],
+         "--max-running-requests": ["128"]
+        }
+       },
+       "ref": [5, "dynamo", 4]
       }
      ]
     },
@@ -2815,7 +1527,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 3,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -2831,7 +1543,7 @@ export const agentx = {
        }
       },
       {
-       "from": 3,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -2931,6 +1643,20 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "dynamo-frontend",
+       "count": 1,
+       "cmd": "python3 -m dynamo.frontend",
+       "args": [
+        ["--http-port", "8000"],
+        ["--router-mode", "kv"],
+        ["--router-session-affinity-ttl-secs", "1"],
+        ["--active-decode-blocks-threshold", "None"],
+        ["--active-prefill-tokens-threshold", "None"],
+        ["--active-prefill-tokens-threshold-frac", "None"]
+       ],
+       "envRef": 0
+      },
+      {
        "workers": 2,
        "gpu_pinning": [
         ["0,1"],
@@ -2945,7 +1671,7 @@ export const agentx = {
          "--max-running-requests": ["128"]
         }
        },
-       "ref": [9, "dynamo", 2]
+       "ref": [5, "dynamo", 3]
       },
       {
        "diff": {
@@ -2954,21 +1680,7 @@ export const agentx = {
          "--max-running-requests": ["256"]
         }
        },
-       "ref": [10, "dynamo", 3]
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 1,
-       "cmd": "python3 -m dynamo.frontend",
-       "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"],
-        ["--router-session-affinity-ttl-secs", "1"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"]
-       ],
-       "envRef": 2
+       "ref": [6, "dynamo", 4]
       }
      ]
     },
@@ -2977,7 +1689,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 3,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -2993,7 +1705,7 @@ export const agentx = {
        }
       },
       {
-       "from": 3,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -3093,13 +1805,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["4"],
          "--swa-prefix-tails": ["256"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3127,13 +1839,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["8"],
          "--swa-prefix-tails": ["512"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3161,13 +1873,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["16"],
          "--swa-prefix-tails": ["1024"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3195,13 +1907,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["16"],
          "--swa-prefix-tails": ["1024"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3229,13 +1941,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["16"],
          "--swa-prefix-tails": ["1024"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3263,13 +1975,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["16"],
          "--swa-prefix-tails": ["1024"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3297,13 +2009,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["16"],
          "--swa-prefix-tails": ["1024"]
         }
-       },
-       null
+       }
       ]
      }
     }
@@ -3359,19 +2071,6 @@ export const agentx = {
        ]
       },
       {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
        "kind": "dynamo-frontend",
        "count": 1,
        "cmd": "python3 -m dynamo.frontend",
@@ -3383,6 +2082,19 @@ export const agentx = {
         ["--http-port", "8000"],
         ["--router-mode", "kv"]
        ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
       }
      ]
     }
@@ -3455,13 +2167,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["4"],
          "--swa-prefix-tails": ["128"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3489,13 +2201,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["8"],
          "--swa-prefix-tails": ["256"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3523,13 +2235,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["16"],
          "--swa-prefix-tails": ["512"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3558,14 +2270,14 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["32"],
          "--prefill-decode-interval": ["16"],
          "--swa-prefix-tails": ["1024"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3593,13 +2305,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["64"],
          "--swa-prefix-tails": ["1024"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3627,13 +2339,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["64"],
          "--swa-prefix-tails": ["1024"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3661,13 +2373,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["64"],
          "--swa-prefix-tails": ["1024"]
         }
-       },
-       null
+       }
       ]
      }
     }
@@ -3686,6 +2398,1294 @@ export const agentx = {
          "--swa-prefix-tails": ["64"],
          "--tp": ["4"],
          "--prefill-decode-interval": null
+        },
+        "env": {
+         "PYTORCH_CUDA_ALLOC_CONF": null
+        }
+       },
+       "ref": [8, "sglang", 0]
+      }
+     ]
+    },
+    "dynamo": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "kind": "etcd",
+       "count_nodes": 1,
+       "cmd": "etcd",
+       "env": {},
+       "args": [
+        ["--data-dir", "/tmp/etcd"],
+        ["--listen-client-urls", "http://0.0.0.0:2379"],
+        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
+       ]
+      },
+      {
+       "kind": "dynamo-frontend",
+       "count": 1,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+       },
+       "args": [
+        ["--http-port", "8000"],
+        ["--router-mode", "kv"]
+       ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "dsv41flash-fp4-b300-sglang-agentic-dspark#1",
+   "hw": "b300",
+   "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
+   "label": "Agg TP2·EP2",
+   "detail": "DSpark 5",
+   "gpus": 8,
+   "configKey": "dsv41flash-fp4-b300-sglang-agentic-dspark",
+   "image": "lmsysorg/sglang:nightly-dev-cu13-20260922-582389ce@sha256:35ea4d321b0735051dcce2599fc495853ad1ef30f6a1908f0a75e74204362d14",
+   "imageStatus": "digest-only",
+   "imageCommit": "582389ce",
+   "submitted": "sglang",
+   "setup": [],
+   "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
+   "points": [
+    {
+     "concs": [1],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
+     "pr": "3342",
+     "date": "2026-09-22",
+     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667235",
+     "goldenAL": "3.51",
+     "kv": "none"
+    },
+    {
+     "concs": [2],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
+     "pr": "3342",
+     "date": "2026-09-22",
+     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667317",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["4"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["4"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [4],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
+     "pr": "3342",
+     "date": "2026-09-22",
+     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667390",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["8"],
+         "--swa-prefix-tails": ["256"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["8"],
+         "--swa-prefix-tails": ["256"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [8],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
+     "pr": "3342",
+     "date": "2026-09-22",
+     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799668150",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["16"],
+         "--swa-prefix-tails": ["512"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["16"],
+         "--swa-prefix-tails": ["512"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [16],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
+     "pr": "3342",
+     "date": "2026-09-22",
+     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667458",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["32"],
+         "--mem-fraction-static": ["0.80"],
+         "--swa-prefix-tails": ["1024"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["32"],
+         "--mem-fraction-static": ["0.80"],
+         "--swa-prefix-tails": ["1024"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [32],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
+     "pr": "3342",
+     "date": "2026-09-22",
+     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667227",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--mem-fraction-static": ["0.85"],
+         "--prefill-decode-interval": ["4"],
+         "--swa-prefix-tails": ["2048"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--mem-fraction-static": ["0.85"],
+         "--prefill-decode-interval": ["4"],
+         "--swa-prefix-tails": ["2048"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [64],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
+     "pr": "3342",
+     "date": "2026-09-22",
+     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799666217",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--mem-fraction-static": ["0.85"],
+         "--prefill-decode-interval": ["4"],
+         "--swa-prefix-tails": ["4096"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--mem-fraction-static": ["0.85"],
+         "--prefill-decode-interval": ["4"],
+         "--swa-prefix-tails": ["4096"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [128],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
+     "pr": "3342",
+     "date": "2026-09-22",
+     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667031",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--mem-fraction-static": ["0.85"],
+         "--prefill-decode-interval": ["4"],
+         "--swa-prefix-tails": ["4096"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--mem-fraction-static": ["0.85"],
+         "--prefill-decode-interval": ["4"],
+         "--swa-prefix-tails": ["4096"]
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "routers": {
+    "sglang": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "kind": "worker",
+       "role": "agg",
+       "workers": 1,
+       "nodes_per_worker": 1,
+       "cmd": "python3 -m sglang.launch_server",
+       "args": [
+        ["--model-path", "deepseek-ai/DeepSeek-V4.1-Flash"],
+        ["--served-model-name", "deepseek-ai/DeepSeek-V4.1-Flash"],
+        ["--host", "0.0.0.0"],
+        ["--port", "30000"],
+        ["--chunked-prefill-size", "4096"],
+        ["--cuda-graph-max-bs-decode", "64"],
+        ["--ep-size", "2"],
+        ["--max-running-requests", "2"],
+        ["--mem-fraction-static", "0.70"],
+        ["--prefill-decode-interval", "16"],
+        ["--reasoning-parser", "auto"],
+        ["--speculative-algorithm", "DSPARK"],
+        ["--speculative-dspark-block-size", "5"],
+        ["--swa-prefix-tails", "128"],
+        ["--tool-call-parser", "auto"],
+        ["--tp", "2"],
+        ["--trust-remote-code"],
+        ["--watchdog-timeout", "3600"],
+        ["--weight-loader-prefetch-checkpoints"]
+       ],
+       "envRef": 2
+      }
+     ]
+    },
+    "dynamo": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "kind": "etcd",
+       "count_nodes": 1,
+       "cmd": "etcd",
+       "env": {},
+       "args": [
+        ["--data-dir", "/tmp/etcd"],
+        ["--listen-client-urls", "http://0.0.0.0:2379"],
+        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
+       ]
+      },
+      {
+       "kind": "dynamo-frontend",
+       "count": 1,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+       },
+       "args": [
+        ["--http-port", "8000"],
+        ["--router-mode", "kv"]
+       ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "dsv41flash-fp4-b300-sglang-agentic-dspark#0",
+   "hw": "b300",
+   "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
+   "label": "Agg TP4·EP4",
+   "detail": "DSpark 5",
+   "gpus": 8,
+   "configKey": "dsv41flash-fp4-b300-sglang-agentic-dspark",
+   "image": "lmsysorg/sglang:nightly-dev-cu13-20260922-582389ce@sha256:35ea4d321b0735051dcce2599fc495853ad1ef30f6a1908f0a75e74204362d14",
+   "imageStatus": "digest-only",
+   "imageCommit": "582389ce",
+   "submitted": "sglang",
+   "setup": [],
+   "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
+   "points": [
+    {
+     "concs": [1],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
+     "pr": "3342",
+     "date": "2026-09-22",
+     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799666410",
+     "goldenAL": "3.51",
+     "kv": "none"
+    },
+    {
+     "concs": [2],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
+     "pr": "3342",
+     "date": "2026-09-22",
+     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667236",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["4"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["4"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [4],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
+     "pr": "3342",
+     "date": "2026-09-22",
+     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667229",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["8"],
+         "--swa-prefix-tails": ["256"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["8"],
+         "--swa-prefix-tails": ["256"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [8],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
+     "pr": "3342",
+     "date": "2026-09-22",
+     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667206",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["16"],
+         "--swa-prefix-tails": ["512"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["16"],
+         "--swa-prefix-tails": ["512"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [16],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
+     "pr": "3342",
+     "date": "2026-09-22",
+     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667446",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["32"],
+         "--swa-prefix-tails": ["1024"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["32"],
+         "--swa-prefix-tails": ["1024"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [32],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
+     "pr": "3342",
+     "date": "2026-09-22",
+     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667454",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--swa-prefix-tails": ["2048"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--swa-prefix-tails": ["2048"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [64],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
+     "pr": "3342",
+     "date": "2026-09-22",
+     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667008",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--swa-prefix-tails": ["4096"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--swa-prefix-tails": ["4096"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [128],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d4c38818ce6eb20093b7f6cc7ba860522ef41632/benchmarks/single_node/agentic/dsv41flash_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3342",
+     "pr": "3342",
+     "date": "2026-09-22",
+     "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667096",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--swa-prefix-tails": ["4096"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--swa-prefix-tails": ["4096"]
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "routers": {
+    "sglang": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "diff": {
+        "args": {
+         "--ep-size": ["4"],
+         "--tp": ["4"]
+        }
+       },
+       "ref": [10, "sglang", 0]
+      }
+     ]
+    },
+    "dynamo": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "kind": "etcd",
+       "count_nodes": 1,
+       "cmd": "etcd",
+       "env": {},
+       "args": [
+        ["--data-dir", "/tmp/etcd"],
+        ["--listen-client-urls", "http://0.0.0.0:2379"],
+        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
+       ]
+      },
+      {
+       "kind": "dynamo-frontend",
+       "count": 1,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+       },
+       "args": [
+        ["--http-port", "8000"],
+        ["--router-mode", "kv"]
+       ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "dsv41flash-fp4-b200-sglang-agentic-dspark#1",
+   "hw": "b200",
+   "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
+   "label": "Agg TP2·EP2",
+   "detail": "DSpark 5",
+   "gpus": 8,
+   "configKey": "dsv41flash-fp4-b200-sglang-agentic-dspark",
+   "image": "lmsysorg/sglang:nightly-dev-cu13-20260922-582389ce@sha256:0e1b14e302619a42ef5581b87db6804651d4f946301cf543d74a3a1eb1c33b40",
+   "imageStatus": "digest-only",
+   "imageCommit": "582389ce",
+   "submitted": "sglang",
+   "setup": [],
+   "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
+   "points": [
+    {
+     "concs": [1],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
+     "pr": "3346",
+     "date": "2026-09-22",
+     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784145156",
+     "goldenAL": "3.51",
+     "kv": "none"
+    },
+    {
+     "concs": [2],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
+     "pr": "3346",
+     "date": "2026-09-22",
+     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784143620",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["4"],
+         "--swa-prefix-tails": ["256"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["4"],
+         "--swa-prefix-tails": ["256"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [4],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
+     "pr": "3346",
+     "date": "2026-09-22",
+     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144968",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["8"],
+         "--swa-prefix-tails": ["512"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["8"],
+         "--swa-prefix-tails": ["512"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [8],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
+     "pr": "3346",
+     "date": "2026-09-22",
+     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784145125",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["16"],
+         "--swa-prefix-tails": ["1024"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["16"],
+         "--swa-prefix-tails": ["1024"]
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "routers": {
+    "sglang": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "kind": "worker",
+       "role": "agg",
+       "workers": 1,
+       "nodes_per_worker": 1,
+       "cmd": "python3 -m sglang.launch_server",
+       "args": [
+        ["--model-path", "deepseek-ai/DeepSeek-V4.1-Flash"],
+        ["--served-model-name", "deepseek-ai/DeepSeek-V4.1-Flash"],
+        ["--host", "0.0.0.0"],
+        ["--port", "30000"],
+        ["--chunked-prefill-size", "2048"],
+        ["--cuda-graph-max-bs-decode", "64"],
+        ["--ep-size", "2"],
+        ["--max-running-requests", "2"],
+        ["--mem-fraction-static", "0.92"],
+        ["--prefill-decode-interval", "16"],
+        ["--reasoning-parser", "auto"],
+        ["--speculative-algorithm", "DSPARK"],
+        ["--speculative-dspark-block-size", "5"],
+        ["--swa-prefix-tails", "128"],
+        ["--tool-call-parser", "auto"],
+        ["--tp", "2"],
+        ["--trust-remote-code"],
+        ["--watchdog-timeout", "3600"]
+       ],
+       "envRef": 1
+      }
+     ]
+    },
+    "dynamo": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "kind": "etcd",
+       "count_nodes": 1,
+       "cmd": "etcd",
+       "env": {},
+       "args": [
+        ["--data-dir", "/tmp/etcd"],
+        ["--listen-client-urls", "http://0.0.0.0:2379"],
+        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
+       ]
+      },
+      {
+       "kind": "dynamo-frontend",
+       "count": 1,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+       },
+       "args": [
+        ["--http-port", "8000"],
+        ["--router-mode", "kv"]
+       ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "dsv41flash-fp4-b200-sglang-agentic-dspark#0",
+   "hw": "b200",
+   "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
+   "label": "Agg TP4·EP4",
+   "detail": "DSpark 5",
+   "gpus": 8,
+   "configKey": "dsv41flash-fp4-b200-sglang-agentic-dspark",
+   "image": "lmsysorg/sglang:nightly-dev-cu13-20260922-582389ce@sha256:0e1b14e302619a42ef5581b87db6804651d4f946301cf543d74a3a1eb1c33b40",
+   "imageStatus": "digest-only",
+   "imageCommit": "582389ce",
+   "submitted": "sglang",
+   "setup": [],
+   "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
+   "points": [
+    {
+     "concs": [1],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
+     "pr": "3346",
+     "date": "2026-09-22",
+     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144472",
+     "goldenAL": "3.51",
+     "kv": "none"
+    },
+    {
+     "concs": [2],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
+     "pr": "3346",
+     "date": "2026-09-22",
+     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144541",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["4"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["4"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [4],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
+     "pr": "3346",
+     "date": "2026-09-22",
+     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784145073",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["8"],
+         "--swa-prefix-tails": ["256"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["8"],
+         "--swa-prefix-tails": ["256"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [8],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
+     "pr": "3346",
+     "date": "2026-09-22",
+     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144761",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["16"],
+         "--swa-prefix-tails": ["512"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["16"],
+         "--swa-prefix-tails": ["512"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [16],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
+     "pr": "3346",
+     "date": "2026-09-22",
+     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784145886",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["32"],
+         "--swa-prefix-tails": ["1024"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["32"],
+         "--swa-prefix-tails": ["1024"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [32],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
+     "pr": "3346",
+     "date": "2026-09-22",
+     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784145200",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--swa-prefix-tails": ["2048"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--swa-prefix-tails": ["2048"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [64],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
+     "pr": "3346",
+     "date": "2026-09-22",
+     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144883",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--swa-prefix-tails": ["4096"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--swa-prefix-tails": ["4096"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [128],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f6e7873ff09337d7ad768ced6e2d0ea2e4236d26/benchmarks/single_node/agentic/dsv41flash_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/attempts/2",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3346",
+     "pr": "3346",
+     "date": "2026-09-22",
+     "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144947",
+     "goldenAL": "3.51",
+     "kv": "none",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--swa-prefix-tails": ["4096"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--max-running-requests": ["64"],
+         "--swa-prefix-tails": ["4096"]
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "routers": {
+    "sglang": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "diff": {
+        "args": {
+         "--chunked-prefill-size": ["4096"],
+         "--ep-size": ["4"],
+         "--mem-fraction-static": ["0.80"],
+         "--tp": ["4"]
         },
         "env": {
          "PYTORCH_CUDA_ALLOC_CONF": null
@@ -3711,19 +3711,6 @@ export const agentx = {
        ]
       },
       {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
        "kind": "dynamo-frontend",
        "count": 1,
        "cmd": "python3 -m dynamo.frontend",
@@ -3735,6 +3722,19 @@ export const agentx = {
         ["--http-port", "8000"],
         ["--router-mode", "kv"]
        ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
       }
      ]
     }
@@ -3806,12 +3806,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["4"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3838,12 +3838,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["8"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3870,12 +3870,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["16"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3902,12 +3902,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["32"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3934,12 +3934,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["64"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3966,12 +3966,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["64"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -3998,12 +3998,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["64"]
         }
-       },
-       null
+       }
       ]
      }
     }
@@ -4042,7 +4042,7 @@ export const agentx = {
         ["--trust-remote-code"],
         ["--watchdog-timeout", "3600"]
        ],
-       "envRef": 0
+       "envRef": 2
       }
      ]
     },
@@ -4062,19 +4062,6 @@ export const agentx = {
        ]
       },
       {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
        "kind": "dynamo-frontend",
        "count": 1,
        "cmd": "python3 -m dynamo.frontend",
@@ -4086,6 +4073,19 @@ export const agentx = {
         ["--http-port", "8000"],
         ["--router-mode", "kv"]
        ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
       }
      ]
     }
@@ -4157,12 +4157,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["4"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -4189,12 +4189,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["8"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -4221,12 +4221,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["16"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -4253,12 +4253,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["32"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -4285,12 +4285,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["64"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -4317,12 +4317,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["64"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -4349,12 +4349,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["64"]
         }
-       },
-       null
+       }
       ]
      }
     }
@@ -4390,19 +4390,6 @@ export const agentx = {
        ]
       },
       {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
        "kind": "dynamo-frontend",
        "count": 1,
        "cmd": "python3 -m dynamo.frontend",
@@ -4414,6 +4401,19 @@ export const agentx = {
         ["--http-port", "8000"],
         ["--router-mode", "kv"]
        ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
       }
      ]
     }
@@ -4486,13 +4486,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["4"],
          "--swa-prefix-tails": ["16"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -4520,13 +4520,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["8"],
          "--swa-prefix-tails": ["128"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -4554,13 +4554,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["16"],
          "--swa-prefix-tails": ["256"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -4588,13 +4588,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["32"],
          "--swa-prefix-tails": ["512"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -4622,13 +4622,13 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["40"],
          "--swa-prefix-tails": ["640"]
         }
-       },
-       null
+       }
       ]
      }
     }
@@ -4685,19 +4685,6 @@ export const agentx = {
        ]
       },
       {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
        "kind": "dynamo-frontend",
        "count": 1,
        "cmd": "python3 -m dynamo.frontend",
@@ -4709,6 +4696,19 @@ export const agentx = {
         ["--http-port", "8000"],
         ["--router-mode", "kv"]
        ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
       }
      ]
     }
@@ -4781,12 +4781,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["16"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -4814,12 +4814,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["32"]
         }
-       },
-       null
+       }
       ]
      }
     },
@@ -4847,12 +4847,12 @@ export const agentx = {
       ],
       "dynamo": [
        null,
+       null,
        {
         "args": {
          "--max-running-requests": ["40"]
         }
-       },
-       null
+       }
       ]
      }
     }
@@ -4909,19 +4909,6 @@ export const agentx = {
        ]
       },
       {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
        "kind": "dynamo-frontend",
        "count": 1,
        "cmd": "python3 -m dynamo.frontend",
@@ -4933,6 +4920,19 @@ export const agentx = {
         ["--http-port", "8000"],
         ["--router-mode", "kv"]
        ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
       }
      ]
     }

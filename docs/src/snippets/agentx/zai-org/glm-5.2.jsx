@@ -32,20 +32,20 @@ export const agentx = {
  },
  "hardware": [
   {
-   "id": "b300",
-   "label": "B300"
-  },
-  {
-   "id": "b200",
-   "label": "B200"
-  },
-  {
    "id": "gb300",
    "label": "GB300"
   },
   {
    "id": "gb200",
    "label": "GB200"
+  },
+  {
+   "id": "b300",
+   "label": "B300"
+  },
+  {
+   "id": "b200",
+   "label": "B200"
   },
   {
    "id": "h200",
@@ -65,18 +65,18 @@ export const agentx = {
  "envs": [
   {
    "DYN_REQUEST_PLANE": "tcp",
+   "DYN_ROUTER_TEMPERATURE": "10000000",
+   "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+   "NATS_SERVER": "nats://$NATS_IP:4222"
+  },
+  {
+   "DYN_REQUEST_PLANE": "tcp",
    "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
    "NATS_SERVER": "nats://$NATS_IP:4222",
    "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "900",
    "SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "True",
    "SGLANG_OPT_USE_TOPK_V2": "1",
    "SGLANG_TIMEOUT_KEEP_ALIVE": "900"
-  },
-  {
-   "DYN_REQUEST_PLANE": "tcp",
-   "DYN_ROUTER_TEMPERATURE": "10000000",
-   "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
-   "NATS_SERVER": "nats://$NATS_IP:4222"
   }
  ],
  "kvMooncake": {
@@ -200,2043 +200,6 @@ export const agentx = {
  },
  "cells": [
   {
-   "id": "glm5.2-fp4-b300-sglang-agentic-mtp#0",
-   "hw": "b300",
-   "ckpt": "nvidia/GLM-5.2-NVFP4",
-   "label": "Agg TP8",
-   "detail": "MTP 3-1-4",
-   "gpus": 8,
-   "configKey": "glm5.2-fp4-b300-sglang-agentic-mtp",
-   "image": "lmsysorg/sglang:nightly-dev-cu13-20260901-07c8f729",
-   "imageStatus": "ok",
-   "imageCommit": "07c8f729",
-   "submitted": "sglang",
-   "setup": [],
-   "disclosures": ["synthetic-acceptance"],
-   "kv": {
-    "available": ["none", "hicache"],
-    "unavailable": {
-     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
-    },
-    "hicache": {
-     "args": [
-      ["--enable-hierarchical-cache"],
-      ["--hicache-io-backend", "direct"],
-      ["--hicache-mem-layout", "page_first_direct"],
-      ["--hicache-size", "270"],
-      ["--hicache-write-policy", "write_back"]
-     ],
-     "donor": "glm5.2-fp4-b300-sglang-agentic-mtp",
-     "donorHardware": "b300"
-    }
-   },
-   "points": [
-    {
-     "concs": [1],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375964",
-     "goldenAL": "2.99",
-     "kv": "hicache"
-    },
-    {
-     "concs": [4],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375774",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["8"],
-         "--max-running-requests": ["8"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["8"],
-         "--max-running-requests": ["8"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [8],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375813",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["16"],
-         "--max-running-requests": ["16"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["16"],
-         "--max-running-requests": ["16"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [12],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375382",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["24"],
-         "--max-running-requests": ["24"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["24"],
-         "--max-running-requests": ["24"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [16],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375184",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["32"],
-         "--max-running-requests": ["32"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["32"],
-         "--max-running-requests": ["32"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [20],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044376125",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["40"],
-         "--max-running-requests": ["40"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["40"],
-         "--max-running-requests": ["40"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [24],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375368",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["48"],
-         "--max-running-requests": ["48"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["48"],
-         "--max-running-requests": ["48"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [28],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044374971",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["56"],
-         "--max-running-requests": ["56"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["56"],
-         "--max-running-requests": ["56"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [32],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375267",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["64"],
-         "--max-running-requests": ["64"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["64"],
-         "--max-running-requests": ["64"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [40],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375118",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["64"],
-         "--max-running-requests": ["80"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["64"],
-         "--max-running-requests": ["80"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [48],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375877",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["64"],
-         "--max-running-requests": ["96"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["64"],
-         "--max-running-requests": ["96"]
-        }
-       },
-       null
-      ]
-     }
-    }
-   ],
-   "routers": {
-    "sglang": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "worker",
-       "role": "agg",
-       "workers": 1,
-       "nodes_per_worker": 1,
-       "cmd": "python3 -m sglang.launch_server",
-       "env": {
-        "SGLANG_TIMEOUT_KEEP_ALIVE": "900",
-        "TORCH_CUDA_ARCH_LIST": "10.0"
-       },
-       "args": [
-        ["--model-path", "nvidia/GLM-5.2-NVFP4"],
-        ["--served-model-name", "nvidia/GLM-5.2-NVFP4"],
-        ["--host", "0.0.0.0"],
-        ["--port", "30000"],
-        ["--bf16-gemm-backend", "cutedsl"],
-        ["--chunked-prefill-size", "8192"],
-        ["--cuda-graph-max-bs", "2"],
-        ["--enable-hierarchical-cache"],
-        ["--ep-size", "1"],
-        ["--hicache-io-backend", "direct"],
-        ["--hicache-mem-layout", "page_first_direct"],
-        ["--hicache-size", "270"],
-        ["--hicache-write-policy", "write_back"],
-        ["--kv-cache-dtype", "fp8_e4m3"],
-        ["--max-prefill-tokens", "8192"],
-        ["--max-running-requests", "2"],
-        ["--mem-fraction-static", "0.85"],
-        ["--quantization", "modelopt_fp4"],
-        ["--reasoning-parser", "glm45"],
-        ["--speculative-algorithm", "EAGLE"],
-        ["--speculative-eagle-topk", "1"],
-        ["--speculative-num-draft-tokens", "4"],
-        ["--speculative-num-steps", "3"],
-        ["--tool-call-parser", "glm47"],
-        ["--tp", "8"],
-        ["--trust-remote-code"],
-        ["--watchdog-timeout", "1800"]
-       ]
-      }
-     ]
-    },
-    "dynamo": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "etcd",
-       "count_nodes": 1,
-       "cmd": "etcd",
-       "env": {},
-       "args": [
-        ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
-       ]
-      },
-      {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 1,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-       },
-       "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"]
-       ]
-      }
-     ]
-    }
-   }
-  },
-  {
-   "id": "glm5.2-fp8-b300-sglang-agentic-mtp#0",
-   "hw": "b300",
-   "ckpt": "zai-org/GLM-5.2-FP8",
-   "label": "Agg TP8",
-   "detail": "MTP 3-1-4",
-   "gpus": 8,
-   "configKey": "glm5.2-fp8-b300-sglang-agentic-mtp",
-   "image": "lmsysorg/sglang:nightly-dev-cu13-20260908-20ca564b",
-   "imageStatus": "pruned",
-   "imageCommit": "20ca564b",
-   "submitted": "sglang",
-   "setup": [],
-   "disclosures": ["synthetic-acceptance"],
-   "kv": {
-    "available": ["none", "hicache", "mooncake"],
-    "unavailable": {},
-    "hicache": {
-     "args": [
-      ["--enable-hierarchical-cache"],
-      ["--hicache-io-backend", "direct"],
-      ["--hicache-mem-layout", "page_first_direct"],
-      ["--hicache-size", "270"],
-      ["--hicache-write-policy", "write_back"]
-     ],
-     "donor": "glm5.2-fp4-b300-sglang-agentic-mtp",
-     "donorHardware": "b300"
-    }
-   },
-   "points": [
-    {
-     "concs": [1],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/de588b628068061130059bf4ecd4c08877c74250/benchmarks/single_node/agentic/glm5.2_fp8_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3146",
-     "pr": "3146",
-     "date": "2026-09-16",
-     "sha": "de588b628068061130059bf4ecd4c08877c74250",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340182",
-     "goldenAL": "2.99",
-     "kv": "hicache"
-    },
-    {
-     "concs": [4],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/de588b628068061130059bf4ecd4c08877c74250/benchmarks/single_node/agentic/glm5.2_fp8_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3146",
-     "pr": "3146",
-     "date": "2026-09-16",
-     "sha": "de588b628068061130059bf4ecd4c08877c74250",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340169",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["8"],
-         "--max-running-requests": ["8"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["8"],
-         "--max-running-requests": ["8"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [8],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/de588b628068061130059bf4ecd4c08877c74250/benchmarks/single_node/agentic/glm5.2_fp8_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3146",
-     "pr": "3146",
-     "date": "2026-09-16",
-     "sha": "de588b628068061130059bf4ecd4c08877c74250",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340279",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["16"],
-         "--max-running-requests": ["16"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["16"],
-         "--max-running-requests": ["16"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [12],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/de588b628068061130059bf4ecd4c08877c74250/benchmarks/single_node/agentic/glm5.2_fp8_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3146",
-     "pr": "3146",
-     "date": "2026-09-16",
-     "sha": "de588b628068061130059bf4ecd4c08877c74250",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340368",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["24"],
-         "--max-running-requests": ["24"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["24"],
-         "--max-running-requests": ["24"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [16],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/de588b628068061130059bf4ecd4c08877c74250/benchmarks/single_node/agentic/glm5.2_fp8_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3146",
-     "pr": "3146",
-     "date": "2026-09-16",
-     "sha": "de588b628068061130059bf4ecd4c08877c74250",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340285",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["32"],
-         "--max-running-requests": ["32"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["32"],
-         "--max-running-requests": ["32"]
-        }
-       },
-       null
-      ]
-     }
-    }
-   ],
-   "routers": {
-    "sglang": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "worker",
-       "role": "agg",
-       "workers": 1,
-       "nodes_per_worker": 1,
-       "cmd": "python3 -m sglang.launch_server",
-       "env": {
-        "SGLANG_TIMEOUT_KEEP_ALIVE": "900",
-        "TORCH_CUDA_ARCH_LIST": "10.0"
-       },
-       "args": [
-        ["--model-path", "zai-org/GLM-5.2-FP8"],
-        ["--served-model-name", "zai-org/GLM-5.2-FP8"],
-        ["--host", "0.0.0.0"],
-        ["--port", "30000"],
-        ["--bf16-gemm-backend", "cutedsl"],
-        ["--chunked-prefill-size", "8192"],
-        ["--cuda-graph-max-bs", "2"],
-        ["--enable-hierarchical-cache"],
-        ["--ep-size", "1"],
-        ["--hicache-io-backend", "direct"],
-        ["--hicache-mem-layout", "page_first_direct"],
-        ["--hicache-size", "270"],
-        ["--hicache-write-policy", "write_back"],
-        ["--kv-cache-dtype", "fp8_e4m3"],
-        ["--max-prefill-tokens", "8192"],
-        ["--max-running-requests", "2"],
-        ["--mem-fraction-static", "0.85"],
-        ["--quantization", "fp8"],
-        ["--reasoning-parser", "glm45"],
-        ["--speculative-algorithm", "EAGLE"],
-        ["--speculative-eagle-topk", "1"],
-        ["--speculative-num-draft-tokens", "4"],
-        ["--speculative-num-steps", "3"],
-        ["--tool-call-parser", "glm47"],
-        ["--tp", "8"],
-        ["--trust-remote-code"],
-        ["--watchdog-timeout", "1800"]
-       ]
-      }
-     ]
-    },
-    "dynamo": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "etcd",
-       "count_nodes": 1,
-       "cmd": "etcd",
-       "env": {},
-       "args": [
-        ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
-       ]
-      },
-      {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 1,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-       },
-       "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"]
-       ]
-      }
-     ]
-    }
-   }
-  },
-  {
-   "id": "glm5.2-fp4-b200-dynamo-sglang-agentic-agg#0",
-   "hw": "b200",
-   "ckpt": "nvidia/GLM-5.2-NVFP4",
-   "label": "Agg TP8",
-   "detail": "MTP 3-1-4 · glm5.2-fp4-b200-dynamo-sglang-agentic-agg",
-   "gpus": 8,
-   "configKey": "glm5.2-fp4-b200-dynamo-sglang-agentic-agg",
-   "image": "lmsysorg/sglang:nightly-dev-20260910-00840301",
-   "imageStatus": "pruned",
-   "imageCommit": "00840301",
-   "submitted": "dynamo",
-   "setup": [],
-   "disclosures": ["synthetic-acceptance"],
-   "kv": {
-    "available": ["none", "hicache", "mooncake"],
-    "unavailable": {},
-    "hicache": {
-     "args": [
-      ["--enable-hierarchical-cache"],
-      ["--hicache-io-backend", "direct"],
-      ["--hicache-size", "110"],
-      ["--hicache-write-policy", "write_back"]
-     ],
-     "donor": "glm5.2-fp4-b200-dynamo-sglang-agentic-agg",
-     "donorHardware": "b200"
-    }
-   },
-   "points": [
-    {
-     "concs": [1],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/53483461cd7aace0c8712c2d5cf7ec4a2b3e819a/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/agg-variants.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36304573738/attempts/4",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3400",
-     "pr": "3400",
-     "date": "2026-10-02",
-     "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
-     "override": "override_c1",
-     "goldenAL": "2.99",
-     "kv": "hicache"
-    },
-    {
-     "concs": [4],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/53483461cd7aace0c8712c2d5cf7ec4a2b3e819a/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/agg-variants.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36304573738/attempts/4",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3400",
-     "pr": "3400",
-     "date": "2026-10-02",
-     "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
-     "override": "override_c4",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "dynamo": [
-       null,
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs-decode": ["8"],
-         "--max-running-requests": ["8"]
-        }
-       },
-       null,
-       null
-      ],
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs-decode": ["8"],
-         "--max-running-requests": ["8"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [8],
-     "item": 2,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/53483461cd7aace0c8712c2d5cf7ec4a2b3e819a/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/agg-variants.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36304573738/attempts/4",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3400",
-     "pr": "3400",
-     "date": "2026-10-02",
-     "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
-     "override": "override_c8",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "dynamo": [
-       null,
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs-decode": ["16"],
-         "--max-running-requests": ["16"]
-        }
-       },
-       null,
-       null
-      ],
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs-decode": ["16"],
-         "--max-running-requests": ["16"]
-        }
-       },
-       null
-      ]
-     }
-    }
-   ],
-   "routers": {
-    "dynamo": {
-     "install": [],
-     "files": ["nats.conf#7d9e9ee1", "nginx.conf#524cca35"],
-     "blocks": [
-      {
-       "kind": "etcd",
-       "count_nodes": 1,
-       "cmd": "etcd",
-       "env": {},
-       "args": [
-        ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
-       ]
-      },
-      {
-       "kind": "nats",
-       "count_nodes": 1,
-       "cmd": "nats-server -c nats.conf",
-       "env": {},
-       "args": []
-      },
-      {
-       "kind": "worker",
-       "role": "agg",
-       "workers": 1,
-       "nodes_per_worker": 1,
-       "cmd": "python3 -m dynamo.sglang",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
-        "NATS_SERVER": "nats://$NATS_IP:4222",
-        "NCCL_CUMEM_ENABLE": "1",
-        "SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION": "8",
-        "SGLANG_DEFAULT_THINKING": "1",
-        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
-        "SGLANG_MOE_NVFP4_DISPATCH": "1",
-        "SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE": "0",
-        "SGLANG_REASONING_EFFORT": "max",
-        "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER": "0",
-        "TORCH_DISTRIBUTED_DEFAULT_TIMEOUT": "1800"
-       },
-       "args": [
-        ["--model-path", "nvidia/GLM-5.2-NVFP4"],
-        ["--served-model-name", "nvidia/GLM-5.2-NVFP4"],
-        ["--host", "0.0.0.0"],
-        ["--port", "30000"],
-        ["--request-plane", "tcp"],
-        ["--chunked-prefill-size", "8192"],
-        ["--context-length", "1048576"],
-        ["--cuda-graph-max-bs-decode", "2"],
-        ["--data-parallel-size", "1"],
-        ["--disable-shared-experts-fusion"],
-        ["--dsa-decode-backend", "trtllm"],
-        ["--dsa-prefill-backend", "trtllm"],
-        ["--enable-flashinfer-allreduce-fusion"],
-        ["--enable-hierarchical-cache"],
-        ["--expert-parallel-size", "1"],
-        ["--fp4-gemm-backend", "flashinfer_trtllm"],
-        ["--hicache-io-backend", "direct"],
-        ["--hicache-size", "110"],
-        ["--hicache-write-policy", "write_back"],
-        ["--kv-cache-dtype", "fp8_e4m3"],
-        ["--max-prefill-tokens", "8192"],
-        ["--max-running-requests", "2"],
-        ["--mem-fraction-static", "0.8"],
-        ["--model-loader-extra-config", "{\"enable_multithread_load\": true}"],
-        ["--moe-runner-backend", "flashinfer_trtllm"],
-        ["--quantization", "modelopt_fp4"],
-        ["--speculative-algorithm", "EAGLE"],
-        ["--speculative-eagle-topk", "1"],
-        ["--speculative-num-draft-tokens", "4"],
-        ["--speculative-num-steps", "3"],
-        ["--tensor-parallel-size", "8"],
-        ["--trust-remote-code"],
-        ["--watchdog-timeout", "1800"],
-        ["--weight-loader-prefetch-checkpoints"]
-       ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 2,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
-        "NATS_SERVER": "nats://$NATS_IP:4222"
-       },
-       "args": [
-        ["--http-port", "8180"],
-        ["--router-mode", "kv"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"],
-        ["--router-session-affinity-ttl-secs", "3600"]
-       ]
-      }
-     ]
-    },
-    "sglang": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "from": 2,
-       "cmd": "python3 -m sglang.launch_server",
-       "diff": {
-        "args": {
-         "--request-plane": null
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": null,
-         "ETCD_ENDPOINTS": null,
-         "NATS_SERVER": null
-        }
-       }
-      },
-      {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
-       "env": {},
-       "args": [
-        ["--host", "0.0.0.0"],
-        ["--port", "8000"],
-        ["--policy", "cache_aware"],
-        ["--worker-urls", "http://127.0.0.1:30000"]
-       ]
-      }
-     ]
-    }
-   }
-  },
-  {
-   "id": "glm5.2-fp4-b200-sglang-agentic-mtp#0",
-   "hw": "b200",
-   "ckpt": "nvidia/GLM-5.2-NVFP4",
-   "label": "Agg TP8",
-   "detail": "MTP 3-1-4 · glm5.2-fp4-b200-sglang-agentic-mtp",
-   "gpus": 8,
-   "configKey": "glm5.2-fp4-b200-sglang-agentic-mtp",
-   "image": "lmsysorg/sglang:nightly-dev-cu13-20260901-07c8f729",
-   "imageStatus": "ok",
-   "imageCommit": "07c8f729",
-   "submitted": "sglang",
-   "setup": [],
-   "disclosures": ["synthetic-acceptance"],
-   "kv": {
-    "available": ["none", "hicache"],
-    "unavailable": {
-     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
-    },
-    "hicache": {
-     "args": [
-      ["--enable-hierarchical-cache"],
-      ["--hicache-io-backend", "direct"],
-      ["--hicache-size", "110"],
-      ["--hicache-write-policy", "write_back"]
-     ],
-     "donor": "glm5.2-fp4-b200-dynamo-sglang-agentic-agg",
-     "donorHardware": "b200"
-    }
-   },
-   "points": [
-    {
-     "concs": [1],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d79d82b51c52f18137374897f53860e7cea529b4/benchmarks/single_node/agentic/glm5.2_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2808",
-     "pr": "2808",
-     "date": "2026-09-02",
-     "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089398",
-     "goldenAL": "2.99",
-     "kv": "hicache"
-    },
-    {
-     "concs": [4],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d79d82b51c52f18137374897f53860e7cea529b4/benchmarks/single_node/agentic/glm5.2_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2808",
-     "pr": "2808",
-     "date": "2026-09-02",
-     "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089293",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["8"],
-         "--max-running-requests": ["8"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["8"],
-         "--max-running-requests": ["8"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [8],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d79d82b51c52f18137374897f53860e7cea529b4/benchmarks/single_node/agentic/glm5.2_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2808",
-     "pr": "2808",
-     "date": "2026-09-02",
-     "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089238",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["16"],
-         "--max-running-requests": ["16"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["16"],
-         "--max-running-requests": ["16"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [12],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d79d82b51c52f18137374897f53860e7cea529b4/benchmarks/single_node/agentic/glm5.2_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2808",
-     "pr": "2808",
-     "date": "2026-09-02",
-     "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089321",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["24"],
-         "--hicache-size": ["169"],
-         "--max-running-requests": ["24"],
-         "--hicache-ratio": null
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["24"],
-         "--hicache-size": ["169"],
-         "--max-running-requests": ["24"],
-         "--hicache-ratio": null
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [16],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d79d82b51c52f18137374897f53860e7cea529b4/benchmarks/single_node/agentic/glm5.2_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2808",
-     "pr": "2808",
-     "date": "2026-09-02",
-     "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089397",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["32"],
-         "--hicache-size": ["169"],
-         "--max-running-requests": ["32"],
-         "--hicache-ratio": null
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["32"],
-         "--hicache-size": ["169"],
-         "--max-running-requests": ["32"],
-         "--hicache-ratio": null
-        }
-       },
-       null
-      ]
-     }
-    }
-   ],
-   "routers": {
-    "sglang": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "worker",
-       "role": "agg",
-       "workers": 1,
-       "nodes_per_worker": 1,
-       "cmd": "python3 -m sglang.launch_server",
-       "env": {
-        "SGLANG_TIMEOUT_KEEP_ALIVE": "900",
-        "TORCH_CUDA_ARCH_LIST": "10.0"
-       },
-       "args": [
-        ["--model-path", "nvidia/GLM-5.2-NVFP4"],
-        ["--served-model-name", "nvidia/GLM-5.2-NVFP4"],
-        ["--host", "0.0.0.0"],
-        ["--port", "30000"],
-        ["--bf16-gemm-backend", "cutedsl"],
-        ["--chunked-prefill-size", "8192"],
-        ["--cuda-graph-max-bs", "2"],
-        ["--enable-hierarchical-cache"],
-        ["--ep-size", "1"],
-        ["--hicache-io-backend", "direct"],
-        ["--hicache-mem-layout", "page_first_direct"],
-        ["--hicache-ratio", "0.75"],
-        ["--hicache-write-policy", "write_back"],
-        ["--kv-cache-dtype", "fp8_e4m3"],
-        ["--max-prefill-tokens", "8192"],
-        ["--max-running-requests", "2"],
-        ["--mem-fraction-static", "0.83"],
-        ["--quantization", "modelopt_fp4"],
-        ["--reasoning-parser", "glm45"],
-        ["--speculative-algorithm", "EAGLE"],
-        ["--speculative-eagle-topk", "1"],
-        ["--speculative-num-draft-tokens", "4"],
-        ["--speculative-num-steps", "3"],
-        ["--tool-call-parser", "glm47"],
-        ["--tp", "8"],
-        ["--trust-remote-code"],
-        ["--watchdog-timeout", "1800"]
-       ]
-      }
-     ]
-    },
-    "dynamo": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "etcd",
-       "count_nodes": 1,
-       "cmd": "etcd",
-       "env": {},
-       "args": [
-        ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
-       ]
-      },
-      {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 1,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-       },
-       "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"]
-       ]
-      }
-     ]
-    }
-   }
-  },
-  {
-   "id": "glm5.2-fp4-b200-dynamo-sglang-agentic-disagg#0",
-   "hw": "b200",
-   "ckpt": "nvidia/GLM-5.2-NVFP4",
-   "label": "Disagg 1P4D · prefill DEP8 · decode TP4",
-   "detail": "MTP 2-1-3",
-   "gpus": 40,
-   "configKey": "glm5.2-fp4-b200-dynamo-sglang-agentic-disagg",
-   "image": "lmsysorg/sglang:nightly-dev-20260910-00840301",
-   "imageStatus": "pruned",
-   "imageCommit": "00840301",
-   "submitted": "dynamo",
-   "setup": [],
-   "disclosures": ["synthetic-acceptance"],
-   "kv": {
-    "available": ["none", "hicache", "mooncake"],
-    "unavailable": {},
-    "hicache": {
-     "args": [
-      ["--enable-hierarchical-cache"],
-      ["--hicache-io-backend", "direct"],
-      ["--hicache-size", "110"],
-      ["--hicache-write-policy", "write_back"]
-     ],
-     "donor": "glm5.2-fp4-b200-dynamo-sglang-agentic-disagg",
-     "donorHardware": "b200"
-    }
-   },
-   "points": [
-    {
-     "concs": [48],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/53483461cd7aace0c8712c2d5cf7ec4a2b3e819a/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/disagg-variants.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36304573738/attempts/4",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3400",
-     "pr": "3400",
-     "date": "2026-10-02",
-     "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
-     "override": "override_1p4d_tp4_c48",
-     "goldenAL": "2.5",
-     "kv": "hicache"
-    }
-   ],
-   "routers": {
-    "dynamo": {
-     "install": [],
-     "files": ["nats.conf#7d9e9ee1", "nginx.conf#c1dc3753"],
-     "blocks": [
-      {
-       "kind": "etcd",
-       "count_nodes": 1,
-       "cmd": "etcd",
-       "env": {},
-       "args": [
-        ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
-       ]
-      },
-      {
-       "kind": "nats",
-       "count_nodes": 1,
-       "cmd": "nats-server -c nats.conf",
-       "env": {},
-       "args": []
-      },
-      {
-       "kind": "worker",
-       "role": "prefill",
-       "workers": 1,
-       "nodes_per_worker": 1,
-       "cmd": "python3 -m dynamo.sglang",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
-        "NATS_SERVER": "nats://$NATS_IP:4222",
-        "NCCL_CUMEM_ENABLE": "1",
-        "NVSHMEM_REMOTE_TRANSPORT": "none",
-        "SGLANG_DEFAULT_THINKING": "1",
-        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "100000",
-        "SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT": "3600",
-        "SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE": "100000",
-        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "100000",
-        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
-        "SGLANG_REASONING_EFFORT": "max",
-        "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER": "0",
-        "TORCH_DISTRIBUTED_DEFAULT_TIMEOUT": "1800"
-       },
-       "args": [
-        ["--model-path", "nvidia/GLM-5.2-NVFP4"],
-        ["--served-model-name", "nvidia/GLM-5.2-NVFP4"],
-        ["--host", "0.0.0.0"],
-        ["--port", "30000"],
-        ["--disaggregation-mode", "prefill"],
-        ["--disaggregation-bootstrap-port", "8998"],
-        ["--request-plane", "tcp"],
-        ["--chunked-prefill-size", "65536"],
-        ["--context-length", "1048576"],
-        ["--cuda-graph-max-bs-decode", "16"],
-        ["--data-parallel-size", "8"],
-        ["--disaggregation-transfer-backend", "nixl"],
-        ["--dsa-decode-backend", "trtllm"],
-        ["--dsa-prefill-backend", "trtllm"],
-        ["--enable-dp-attention"],
-        ["--enable-dp-lm-head"],
-        ["--enable-flashinfer-allreduce-fusion"],
-        ["--enable-hierarchical-cache"],
-        ["--expert-parallel-size", "8"],
-        ["--fp4-gemm-backend", "flashinfer_cutlass"],
-        ["--hicache-io-backend", "direct"],
-        ["--hicache-size", "110"],
-        ["--hicache-write-policy", "write_back"],
-        ["--kv-cache-dtype", "fp8_e4m3"],
-        ["--load-balance-method", "total_tokens"],
-        ["--max-prefill-tokens", "16384"],
-        ["--max-running-requests", "16"],
-        ["--mem-fraction-static", "0.8"],
-        ["--model-loader-extra-config", "{\"enable_multithread_load\": true}"],
-        ["--moe-runner-backend", "flashinfer_cutlass"],
-        ["--quantization", "modelopt_fp4"],
-        ["--speculative-algorithm", "EAGLE"],
-        ["--speculative-eagle-topk", "1"],
-        ["--speculative-num-draft-tokens", "3"],
-        ["--speculative-num-steps", "2"],
-        ["--tensor-parallel-size", "8"],
-        ["--trust-remote-code"],
-        ["--watchdog-timeout", "1800"],
-        ["--weight-loader-prefetch-checkpoints"]
-       ]
-      },
-      {
-       "kind": "worker",
-       "role": "decode",
-       "workers": 4,
-       "nodes_per_worker": 1,
-       "gpu_pinning": [
-        ["0,1,2,3"],
-        ["4,5,6,7"],
-        ["0,1,2,3"],
-        ["4,5,6,7"]
-       ],
-       "cmd": "python3 -m dynamo.sglang",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
-        "NATS_SERVER": "nats://$NATS_IP:4222",
-        "NCCL_CUMEM_ENABLE": "1",
-        "NVSHMEM_REMOTE_TRANSPORT": "none",
-        "SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION": "8",
-        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
-        "SGLANG_DEFAULT_THINKING": "1",
-        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "100000",
-        "SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT": "3600",
-        "SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE": "100000",
-        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "100000",
-        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
-        "SGLANG_MOE_NVFP4_DISPATCH": "1",
-        "SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE": "0",
-        "SGLANG_REASONING_EFFORT": "max",
-        "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER": "0",
-        "TORCH_DISTRIBUTED_DEFAULT_TIMEOUT": "1800"
-       },
-       "args": [
-        ["--model-path", "nvidia/GLM-5.2-NVFP4"],
-        ["--served-model-name", "nvidia/GLM-5.2-NVFP4"],
-        ["--host", "0.0.0.0"],
-        ["--port", "30000"],
-        ["--disaggregation-mode", "decode"],
-        ["--request-plane", "tcp"],
-        ["--chunked-prefill-size", "64"],
-        ["--context-length", "1048576"],
-        ["--cuda-graph-max-bs-decode", "16"],
-        ["--data-parallel-size", "1"],
-        ["--disable-radix-cache"],
-        ["--disaggregation-decode-extra-slots", "0"],
-        ["--disaggregation-transfer-backend", "nixl"],
-        ["--dsa-decode-backend", "trtllm"],
-        ["--dsa-prefill-backend", "trtllm"],
-        ["--enable-flashinfer-allreduce-fusion"],
-        ["--expert-parallel-size", "1"],
-        ["--fp4-gemm-backend", "flashinfer_cutlass"],
-        ["--kv-cache-dtype", "fp8_e4m3"],
-        ["--max-running-requests", "16"],
-        ["--mem-fraction-static", "0.9"],
-        ["--model-loader-extra-config", "{\"enable_multithread_load\": true}"],
-        ["--moe-runner-backend", "flashinfer_trtllm"],
-        ["--quantization", "modelopt_fp4"],
-        ["--skip-tokenizer-init"],
-        ["--speculative-algorithm", "EAGLE"],
-        ["--speculative-eagle-topk", "1"],
-        ["--speculative-num-draft-tokens", "3"],
-        ["--speculative-num-steps", "2"],
-        ["--stream-interval", "30"],
-        ["--tensor-parallel-size", "4"],
-        ["--trust-remote-code"],
-        ["--watchdog-timeout", "1800"],
-        ["--weight-loader-prefetch-checkpoints"]
-       ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 4,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
-        "NATS_SERVER": "nats://$NATS_IP:4222"
-       },
-       "args": [
-        ["--http-port", "8180"],
-        ["--router-mode", "kv"],
-        ["--router-session-affinity-ttl-secs", "3600"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"]
-       ]
-      }
-     ]
-    },
-    "sglang": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "from": 2,
-       "cmd": "python3 -m sglang.launch_server",
-       "diff": {
-        "args": {
-         "--skip-server-warmup": [],
-         "--request-plane": null
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": null,
-         "ETCD_ENDPOINTS": null,
-         "NATS_SERVER": null
-        }
-       }
-      },
-      {
-       "from": 3,
-       "cmd": "python3 -m sglang.launch_server",
-       "diff": {
-        "args": {
-         "--skip-server-warmup": [],
-         "--request-plane": null,
-         "--skip-tokenizer-init": null
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": null,
-         "ETCD_ENDPOINTS": null,
-         "NATS_SERVER": null
-        }
-       }
-      },
-      {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
-       "env": {},
-       "args": [
-        ["--decode", "http://$DECODE_3_HEAD_IP:30000"],
-        ["--decode", "http://$DECODE_2_HEAD_IP:30000"],
-        ["--decode", "http://$DECODE_1_HEAD_IP:30000"],
-        ["--decode", "http://$DECODE_0_HEAD_IP:30000"],
-        ["--prefill", "http://$PREFILL_0_HEAD_IP:30000", "8998"],
-        ["--pd-disaggregation"],
-        ["--host", "0.0.0.0"],
-        ["--port", "8000"],
-        ["--policy", "cache_aware"]
-       ]
-      }
-     ]
-    }
-   }
-  },
-  {
-   "id": "glm5.2-fp4-b200-dynamo-sglang-agentic-disagg#1",
-   "hw": "b200",
-   "ckpt": "nvidia/GLM-5.2-NVFP4",
-   "label": "Disagg 1P1D · prefill DEP8 · decode DEP8",
-   "detail": "MTP 2-1-3",
-   "gpus": 16,
-   "configKey": "glm5.2-fp4-b200-dynamo-sglang-agentic-disagg",
-   "image": "lmsysorg/sglang:nightly-dev-20260910-00840301",
-   "imageStatus": "pruned",
-   "imageCommit": "00840301",
-   "submitted": "dynamo",
-   "setup": [],
-   "disclosures": ["synthetic-acceptance"],
-   "kv": {
-    "available": ["none", "hicache", "mooncake"],
-    "unavailable": {},
-    "hicache": {
-     "args": [
-      ["--enable-hierarchical-cache"],
-      ["--hicache-io-backend", "direct"],
-      ["--hicache-size", "110"],
-      ["--hicache-write-policy", "write_back"]
-     ],
-     "donor": "glm5.2-fp4-b200-dynamo-sglang-agentic-disagg",
-     "donorHardware": "b200"
-    }
-   },
-   "points": [
-    {
-     "concs": [64],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/53483461cd7aace0c8712c2d5cf7ec4a2b3e819a/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/disagg-variants.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36304573738/attempts/4",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3400",
-     "pr": "3400",
-     "date": "2026-10-02",
-     "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
-     "override": "override_1p1d_c64",
-     "goldenAL": "2.5",
-     "kv": "hicache"
-    }
-   ],
-   "routers": {
-    "dynamo": {
-     "install": [],
-     "files": ["deepep_config.json#42ebb085", "nats.conf#7d9e9ee1", "nginx.conf#1fa49161"],
-     "blocks": [
-      {
-       "kind": "etcd",
-       "count_nodes": 1,
-       "cmd": "etcd",
-       "env": {},
-       "args": [
-        ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
-       ]
-      },
-      {
-       "kind": "nats",
-       "count_nodes": 1,
-       "cmd": "nats-server -c nats.conf",
-       "env": {},
-       "args": []
-      },
-      {
-       "diff": {
-        "args": {
-         "--max-prefill-tokens": ["8192"]
-        },
-        "env": {
-         "SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT": "1800"
-        }
-       },
-       "ref": [4, "dynamo", 2]
-      },
-      {
-       "drop": ["gpu_pinning"],
-       "workers": 1,
-       "diff": {
-        "args": {
-         "--cuda-graph-max-bs-decode": ["128"],
-         "--data-parallel-size": ["8"],
-         "--deepep-config": ["deepep_config.json"],
-         "--deepep-mode": ["low_latency"],
-         "--enable-dp-attention": [],
-         "--enable-dp-lm-head": [],
-         "--ep-dispatch-algorithm": ["static"],
-         "--ep-num-redundant-experts": ["0"],
-         "--expert-parallel-size": ["8"],
-         "--max-running-requests": ["128"],
-         "--mem-fraction-static": ["0.85"],
-         "--moe-a2a-backend": ["deepep"],
-         "--moe-dense-tp-size": ["1"],
-         "--moe-runner-backend": ["flashinfer_cutedsl"],
-         "--speculative-moe-a2a-backend": ["deepep"],
-         "--speculative-moe-runner-backend": ["deep_gemm"],
-         "--tensor-parallel-size": ["8"]
-        },
-        "env": {
-         "SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT": "1800"
-        }
-       },
-       "ref": [4, "dynamo", 3]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 3,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
-        "NATS_SERVER": "nats://$NATS_IP:4222"
-       },
-       "args": [
-        ["--http-port", "8180"],
-        ["--router-mode", "kv"],
-        ["--router-session-affinity-ttl-secs", "3600"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"]
-       ]
-      }
-     ]
-    },
-    "sglang": {
-     "install": [],
-     "files": ["deepep_config.json#42ebb085"],
-     "blocks": [
-      {
-       "from": 2,
-       "cmd": "python3 -m sglang.launch_server",
-       "diff": {
-        "args": {
-         "--skip-server-warmup": [],
-         "--request-plane": null
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": null,
-         "ETCD_ENDPOINTS": null,
-         "NATS_SERVER": null
-        }
-       }
-      },
-      {
-       "from": 3,
-       "cmd": "python3 -m sglang.launch_server",
-       "diff": {
-        "args": {
-         "--skip-server-warmup": [],
-         "--request-plane": null,
-         "--skip-tokenizer-init": null
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": null,
-         "ETCD_ENDPOINTS": null,
-         "NATS_SERVER": null
-        }
-       }
-      },
-      {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
-       "env": {},
-       "args": [
-        ["--decode", "http://$DECODE_0_HEAD_IP:30000"],
-        ["--prefill", "http://$PREFILL_0_HEAD_IP:30000", "8998"],
-        ["--pd-disaggregation"],
-        ["--host", "0.0.0.0"],
-        ["--port", "8000"],
-        ["--policy", "cache_aware"]
-       ]
-      }
-     ]
-    }
-   }
-  },
-  {
-   "id": "glm5.2-fp8-b200-sglang-agentic-mtp#0",
-   "hw": "b200",
-   "ckpt": "zai-org/GLM-5.2-FP8",
-   "label": "Agg TP8",
-   "detail": "MTP 3-1-4",
-   "gpus": 8,
-   "configKey": "glm5.2-fp8-b200-sglang-agentic-mtp",
-   "image": "lmsysorg/sglang:nightly-dev-cu13-20260908-20ca564b",
-   "imageStatus": "pruned",
-   "imageCommit": "20ca564b",
-   "submitted": "sglang",
-   "setup": [],
-   "disclosures": ["synthetic-acceptance"],
-   "kv": {
-    "available": ["none", "hicache", "mooncake"],
-    "unavailable": {},
-    "hicache": {
-     "args": [
-      ["--enable-hierarchical-cache"],
-      ["--hicache-io-backend", "direct"],
-      ["--hicache-size", "110"],
-      ["--hicache-write-policy", "write_back"]
-     ],
-     "donor": "glm5.2-fp4-b200-dynamo-sglang-agentic-agg",
-     "donorHardware": "b200"
-    }
-   },
-   "points": [
-    {
-     "concs": [1],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/a30c9cb26d6d2a218ef87aadcaf854123ffcf71e/benchmarks/single_node/agentic/glm5.2_fp8_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2863",
-     "pr": "2863",
-     "date": "2026-09-17",
-     "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588543",
-     "goldenAL": "2.99",
-     "kv": "hicache"
-    },
-    {
-     "concs": [4],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/a30c9cb26d6d2a218ef87aadcaf854123ffcf71e/benchmarks/single_node/agentic/glm5.2_fp8_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2863",
-     "pr": "2863",
-     "date": "2026-09-17",
-     "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588624",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["8"],
-         "--max-running-requests": ["8"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["8"],
-         "--max-running-requests": ["8"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [8],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/a30c9cb26d6d2a218ef87aadcaf854123ffcf71e/benchmarks/single_node/agentic/glm5.2_fp8_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2863",
-     "pr": "2863",
-     "date": "2026-09-17",
-     "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588912",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["16"],
-         "--max-running-requests": ["16"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["16"],
-         "--max-running-requests": ["16"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [12],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/a30c9cb26d6d2a218ef87aadcaf854123ffcf71e/benchmarks/single_node/agentic/glm5.2_fp8_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2863",
-     "pr": "2863",
-     "date": "2026-09-17",
-     "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588733",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["24"],
-         "--hicache-size": ["169"],
-         "--max-running-requests": ["24"],
-         "--hicache-ratio": null
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["24"],
-         "--hicache-size": ["169"],
-         "--max-running-requests": ["24"],
-         "--hicache-ratio": null
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [16],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/a30c9cb26d6d2a218ef87aadcaf854123ffcf71e/benchmarks/single_node/agentic/glm5.2_fp8_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2863",
-     "pr": "2863",
-     "date": "2026-09-17",
-     "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588655",
-     "goldenAL": "2.99",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["32"],
-         "--hicache-size": ["169"],
-         "--max-running-requests": ["32"],
-         "--hicache-ratio": null
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["32"],
-         "--hicache-size": ["169"],
-         "--max-running-requests": ["32"],
-         "--hicache-ratio": null
-        }
-       },
-       null
-      ]
-     }
-    }
-   ],
-   "routers": {
-    "sglang": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "worker",
-       "role": "agg",
-       "workers": 1,
-       "nodes_per_worker": 1,
-       "cmd": "python3 -m sglang.launch_server",
-       "env": {
-        "SGLANG_TIMEOUT_KEEP_ALIVE": "900",
-        "TORCH_CUDA_ARCH_LIST": "10.0"
-       },
-       "args": [
-        ["--model-path", "zai-org/GLM-5.2-FP8"],
-        ["--served-model-name", "zai-org/GLM-5.2-FP8"],
-        ["--host", "0.0.0.0"],
-        ["--port", "30000"],
-        ["--bf16-gemm-backend", "cutedsl"],
-        ["--chunked-prefill-size", "8192"],
-        ["--cuda-graph-max-bs", "2"],
-        ["--enable-hierarchical-cache"],
-        ["--ep-size", "1"],
-        ["--hicache-io-backend", "direct"],
-        ["--hicache-mem-layout", "page_first_direct"],
-        ["--hicache-ratio", "0.75"],
-        ["--hicache-write-policy", "write_back"],
-        ["--kv-cache-dtype", "fp8_e4m3"],
-        ["--max-prefill-tokens", "8192"],
-        ["--max-running-requests", "2"],
-        ["--mem-fraction-static", "0.83"],
-        ["--quantization", "fp8"],
-        ["--reasoning-parser", "glm45"],
-        ["--speculative-algorithm", "EAGLE"],
-        ["--speculative-eagle-topk", "1"],
-        ["--speculative-num-draft-tokens", "4"],
-        ["--speculative-num-steps", "3"],
-        ["--tool-call-parser", "glm47"],
-        ["--tp", "8"],
-        ["--trust-remote-code"],
-        ["--watchdog-timeout", "1800"]
-       ]
-      }
-     ]
-    },
-    "dynamo": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "etcd",
-       "count_nodes": 1,
-       "cmd": "etcd",
-       "env": {},
-       "args": [
-        ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
-       ]
-      },
-      {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 1,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-       },
-       "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"]
-       ]
-      }
-     ]
-    }
-   }
-  },
-  {
    "id": "glm5.2-fp4-gb300-dynamo-sglang-agentic-agg#0",
    "hw": "gb300",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
@@ -2294,14 +257,14 @@ export const agentx = {
       "dynamo": [
        null,
        null,
+       null,
+       null,
        {
         "args": {
          "--cuda-graph-max-bs-decode": ["4"],
          "--max-running-requests": ["4"]
         }
-       },
-       null,
-       null
+       }
       ],
       "sglang": [
        {
@@ -2330,14 +293,14 @@ export const agentx = {
       "dynamo": [
        null,
        null,
+       null,
+       null,
        {
         "args": {
          "--cuda-graph-max-bs-decode": ["8"],
          "--max-running-requests": ["8"]
         }
-       },
-       null,
-       null
+       }
       ],
       "sglang": [
        {
@@ -2371,6 +334,30 @@ export const agentx = {
        "kind": "nats",
        "count_nodes": 1,
        "cmd": "nats-server -c nats.conf",
+       "env": {},
+       "args": []
+      },
+      {
+       "kind": "dynamo-frontend",
+       "count": 3,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "NATS_SERVER": "nats://$NATS_IP:4222"
+       },
+       "args": [
+        ["--http-port", "8180"],
+        ["--router-mode", "kv"],
+        ["--active-decode-blocks-threshold", "None"],
+        ["--active-prefill-tokens-threshold", "None"],
+        ["--active-prefill-tokens-threshold-frac", "None"],
+        ["--router-session-affinity-ttl-secs", "3600"]
+       ]
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
        "env": {},
        "args": []
       },
@@ -2427,30 +414,6 @@ export const agentx = {
         ["--watchdog-timeout", "1000000"],
         ["--weight-loader-prefetch-checkpoints"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 3,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
-        "NATS_SERVER": "nats://$NATS_IP:4222"
-       },
-       "args": [
-        ["--http-port", "8180"],
-        ["--router-mode", "kv"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"],
-        ["--router-session-affinity-ttl-secs", "3600"]
-       ]
       }
      ]
     },
@@ -2459,7 +422,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -2550,6 +513,30 @@ export const agentx = {
        "kind": "nats",
        "count_nodes": 1,
        "cmd": "nats-server -c nats.conf",
+       "env": {},
+       "args": []
+      },
+      {
+       "kind": "dynamo-frontend",
+       "count": 6,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "NATS_SERVER": "nats://$NATS_IP:4222"
+       },
+       "args": [
+        ["--http-port", "8180"],
+        ["--router-mode", "kv"],
+        ["--active-decode-blocks-threshold", "None"],
+        ["--active-prefill-tokens-threshold", "None"],
+        ["--active-prefill-tokens-threshold-frac", "None"],
+        ["--router-session-affinity-ttl-secs", "3600"]
+       ]
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
        "env": {},
        "args": []
       },
@@ -2671,30 +658,6 @@ export const agentx = {
         ["--watchdog-timeout", "1000000"],
         ["--weight-loader-prefetch-checkpoints"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 6,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
-        "NATS_SERVER": "nats://$NATS_IP:4222"
-       },
-       "args": [
-        ["--http-port", "8180"],
-        ["--router-mode", "kv"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"],
-        ["--router-session-affinity-ttl-secs", "3600"]
-       ]
       }
      ]
     },
@@ -2703,7 +666,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -2718,7 +681,7 @@ export const agentx = {
        }
       },
       {
-       "from": 3,
+       "from": 5,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -2820,19 +783,6 @@ export const agentx = {
        "args": []
       },
       {
-       "ref": [8, "dynamo", 2]
-      },
-      {
-       "workers": 6,
-       "ref": [8, "dynamo", 3]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
        "kind": "dynamo-frontend",
        "count": 8,
        "cmd": "python3 -m dynamo.frontend",
@@ -2849,6 +799,19 @@ export const agentx = {
         ["--active-prefill-tokens-threshold-frac", "None"],
         ["--router-session-affinity-ttl-secs", "3600"]
        ]
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
+       "ref": [1, "dynamo", 4]
+      },
+      {
+       "workers": 6,
+       "ref": [1, "dynamo", 5]
       }
      ]
     },
@@ -2857,7 +820,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -2872,7 +835,7 @@ export const agentx = {
        }
       },
       {
-       "from": 3,
+       "from": 5,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -2976,19 +939,6 @@ export const agentx = {
        "args": []
       },
       {
-       "ref": [8, "dynamo", 2]
-      },
-      {
-       "workers": 2,
-       "ref": [8, "dynamo", 3]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
        "kind": "dynamo-frontend",
        "count": 4,
        "cmd": "python3 -m dynamo.frontend",
@@ -3005,6 +955,19 @@ export const agentx = {
         ["--active-prefill-tokens-threshold-frac", "None"],
         ["--router-session-affinity-ttl-secs", "3600"]
        ]
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
+       "ref": [1, "dynamo", 4]
+      },
+      {
+       "workers": 2,
+       "ref": [1, "dynamo", 5]
       }
      ]
     },
@@ -3013,7 +976,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -3028,7 +991,7 @@ export const agentx = {
        }
       },
       {
-       "from": 3,
+       "from": 5,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -3128,6 +1091,30 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "dynamo-frontend",
+       "count": 9,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "NATS_SERVER": "nats://$NATS_IP:4222"
+       },
+       "args": [
+        ["--http-port", "8180"],
+        ["--router-mode", "kv"],
+        ["--active-decode-blocks-threshold", "None"],
+        ["--active-prefill-tokens-threshold", "None"],
+        ["--active-prefill-tokens-threshold-frac", "None"],
+        ["--router-session-affinity-ttl-secs", "3600"]
+       ]
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "workers": 2,
        "nodes_per_worker": 2,
        "diff": {
@@ -3144,7 +1131,7 @@ export const agentx = {
          "--tensor-parallel-size": ["8"]
         }
        },
-       "ref": [8, "dynamo", 2]
+       "ref": [1, "dynamo", 4]
       },
       {
        "workers": 1,
@@ -3178,31 +1165,7 @@ export const agentx = {
          "SGLANG_MOE_NVFP4_DISPATCH": "1"
         }
        },
-       "ref": [8, "dynamo", 3]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 9,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
-        "NATS_SERVER": "nats://$NATS_IP:4222"
-       },
-       "args": [
-        ["--http-port", "8180"],
-        ["--router-mode", "kv"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"],
-        ["--router-session-affinity-ttl-secs", "3600"]
-       ]
+       "ref": [1, "dynamo", 5]
       }
      ]
     },
@@ -3211,7 +1174,7 @@ export const agentx = {
      "files": ["deepep_config.json#42ebb085"],
      "blocks": [
       {
-       "from": 2,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -3226,7 +1189,7 @@ export const agentx = {
        }
       },
       {
-       "from": 3,
+       "from": 5,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -3334,6 +1297,30 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "dynamo-frontend",
+       "count": 3,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "NATS_SERVER": "nats://$NATS_IP:4222"
+       },
+       "args": [
+        ["--http-port", "8180"],
+        ["--router-mode", "kv"],
+        ["--active-decode-blocks-threshold", "None"],
+        ["--active-prefill-tokens-threshold", "None"],
+        ["--active-prefill-tokens-threshold-frac", "None"],
+        ["--router-session-affinity-ttl-secs", "3600"]
+       ]
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "worker",
        "role": "agg",
        "workers": 1,
@@ -3401,30 +1388,6 @@ export const agentx = {
         ["--watchdog-timeout", "1800"],
         ["--weight-loader-prefetch-checkpoints"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 3,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
-        "NATS_SERVER": "nats://$NATS_IP:4222"
-       },
-       "args": [
-        ["--http-port", "8180"],
-        ["--router-mode", "kv"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"],
-        ["--router-session-affinity-ttl-secs", "3600"]
-       ]
       }
      ]
     },
@@ -3433,7 +1396,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -3562,30 +1525,6 @@ export const agentx = {
        "args": []
       },
       {
-       "diff": {
-        "args": {
-         "--mem-fraction-static": ["0.8"],
-         "--speculative-num-draft-tokens": ["5"],
-         "--speculative-num-steps": ["4"],
-         "--bf16-gemm-backend": null,
-         "--hicache-mem-layout": null,
-         "--watchdog-timeout": null
-        },
-        "env": {
-         "NVSHMEM_REMOTE_TRANSPORT": null,
-         "SGLANG_TIMEOUT_KEEP_ALIVE": null,
-         "UCX_TLS": null
-        }
-       },
-       "ref": [12, "dynamo", 2]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
        "kind": "dynamo-frontend",
        "count": 3,
        "cmd": "python3 -m dynamo.frontend",
@@ -3602,6 +1541,30 @@ export const agentx = {
         ["--active-prefill-tokens-threshold", "None"],
         ["--active-prefill-tokens-threshold-frac", "None"]
        ]
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
+       "diff": {
+        "args": {
+         "--mem-fraction-static": ["0.8"],
+         "--speculative-num-draft-tokens": ["5"],
+         "--speculative-num-steps": ["4"],
+         "--bf16-gemm-backend": null,
+         "--hicache-mem-layout": null,
+         "--watchdog-timeout": null
+        },
+        "env": {
+         "NVSHMEM_REMOTE_TRANSPORT": null,
+         "SGLANG_TIMEOUT_KEEP_ALIVE": null,
+         "UCX_TLS": null
+        }
+       },
+       "ref": [5, "dynamo", 4]
       }
      ]
     },
@@ -3610,7 +1573,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -3711,6 +1674,33 @@ export const agentx = {
        "kind": "nats",
        "count_nodes": 1,
        "cmd": "nats-server -c nats.conf",
+       "env": {},
+       "args": []
+      },
+      {
+       "kind": "dynamo-frontend",
+       "count": 3,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "NATS_SERVER": "nats://$NATS_IP:4222"
+       },
+       "args": [
+        ["--http-port", "8180"],
+        ["--router-mode", "kv"],
+        ["--router-kv-events"],
+        ["--router-temperature", "0"],
+        ["--kv-cache-block-size", "64"],
+        ["--active-decode-blocks-threshold", "None"],
+        ["--active-prefill-tokens-threshold", "None"],
+        ["--active-prefill-tokens-threshold-frac", "None"],
+        ["--router-session-affinity-ttl-secs", "3600"]
+       ]
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
        "env": {},
        "args": []
       },
@@ -3858,33 +1848,6 @@ export const agentx = {
         ["--watchdog-timeout", "1800"],
         ["--weight-loader-prefetch-checkpoints"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 3,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
-        "NATS_SERVER": "nats://$NATS_IP:4222"
-       },
-       "args": [
-        ["--http-port", "8180"],
-        ["--router-mode", "kv"],
-        ["--router-kv-events"],
-        ["--router-temperature", "0"],
-        ["--kv-cache-block-size", "64"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"],
-        ["--router-session-affinity-ttl-secs", "3600"]
-       ]
       }
      ]
     },
@@ -3893,7 +1856,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -3909,7 +1872,7 @@ export const agentx = {
        }
       },
       {
-       "from": 3,
+       "from": 5,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -4017,6 +1980,30 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "dynamo-frontend",
+       "count": 9,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "NATS_SERVER": "nats://$NATS_IP:4222"
+       },
+       "args": [
+        ["--http-port", "8180"],
+        ["--router-mode", "kv"],
+        ["--router-session-affinity-ttl-secs", "3600"],
+        ["--active-decode-blocks-threshold", "None"],
+        ["--active-prefill-tokens-threshold", "None"],
+        ["--active-prefill-tokens-threshold-frac", "None"]
+       ]
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "nodes_per_worker": 2,
        "diff": {
         "args": {
@@ -4051,7 +2038,7 @@ export const agentx = {
          "SGLANG_TIMEOUT_KEEP_ALIVE": null
         }
        },
-       "ref": [14, "dynamo", 2]
+       "ref": [7, "dynamo", 4]
       },
       {
        "workers": 6,
@@ -4072,31 +2059,7 @@ export const agentx = {
          "SGLANG_TIMEOUT_KEEP_ALIVE": null
         }
        },
-       "ref": [14, "dynamo", 3]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 9,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
-        "NATS_SERVER": "nats://$NATS_IP:4222"
-       },
-       "args": [
-        ["--http-port", "8180"],
-        ["--router-mode", "kv"],
-        ["--router-session-affinity-ttl-secs", "3600"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"]
-       ]
+       "ref": [7, "dynamo", 5]
       }
      ]
     },
@@ -4105,7 +2068,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -4120,7 +2083,7 @@ export const agentx = {
        }
       },
       {
-       "from": 3,
+       "from": 5,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -4232,19 +2195,6 @@ export const agentx = {
        "args": []
       },
       {
-       "ref": [15, "dynamo", 2]
-      },
-      {
-       "workers": 4,
-       "ref": [15, "dynamo", 3]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
        "kind": "dynamo-frontend",
        "count": 7,
        "cmd": "python3 -m dynamo.frontend",
@@ -4261,6 +2211,19 @@ export const agentx = {
         ["--active-prefill-tokens-threshold", "None"],
         ["--active-prefill-tokens-threshold-frac", "None"]
        ]
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
+       "ref": [8, "dynamo", 4]
+      },
+      {
+       "workers": 4,
+       "ref": [8, "dynamo", 5]
       }
      ]
     },
@@ -4269,7 +2232,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -4284,7 +2247,7 @@ export const agentx = {
        }
       },
       {
-       "from": 3,
+       "from": 5,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -4394,6 +2357,30 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "dynamo-frontend",
+       "count": 9,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "NATS_SERVER": "nats://$NATS_IP:4222"
+       },
+       "args": [
+        ["--http-port", "8180"],
+        ["--router-mode", "kv"],
+        ["--router-session-affinity-ttl-secs", "3600"],
+        ["--active-decode-blocks-threshold", "None"],
+        ["--active-prefill-tokens-threshold", "None"],
+        ["--active-prefill-tokens-threshold-frac", "None"]
+       ]
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "workers": 2,
        "diff": {
         "args": {
@@ -4401,7 +2388,7 @@ export const agentx = {
          "--max-prefill-tokens": ["8192"]
         }
        },
-       "ref": [15, "dynamo", 2]
+       "ref": [8, "dynamo", 4]
       },
       {
        "workers": 1,
@@ -4430,31 +2417,7 @@ export const agentx = {
          "--tensor-parallel-size": ["16"]
         }
        },
-       "ref": [15, "dynamo", 3]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 9,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
-        "NATS_SERVER": "nats://$NATS_IP:4222"
-       },
-       "args": [
-        ["--http-port", "8180"],
-        ["--router-mode", "kv"],
-        ["--router-session-affinity-ttl-secs", "3600"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"]
-       ]
+       "ref": [8, "dynamo", 5]
       }
      ]
     },
@@ -4463,7 +2426,7 @@ export const agentx = {
      "files": ["deepep_config.json#42ebb085"],
      "blocks": [
       {
-       "from": 2,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -4478,7 +2441,7 @@ export const agentx = {
        }
       },
       {
-       "from": 3,
+       "from": 5,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -4506,6 +2469,2043 @@ export const agentx = {
         ["--port", "8000"],
         ["--policy", "cache_aware"]
        ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "glm5.2-fp4-b300-sglang-agentic-mtp#0",
+   "hw": "b300",
+   "ckpt": "nvidia/GLM-5.2-NVFP4",
+   "label": "Agg TP8",
+   "detail": "MTP 3-1-4",
+   "gpus": 8,
+   "configKey": "glm5.2-fp4-b300-sglang-agentic-mtp",
+   "image": "lmsysorg/sglang:nightly-dev-cu13-20260901-07c8f729",
+   "imageStatus": "ok",
+   "imageCommit": "07c8f729",
+   "submitted": "sglang",
+   "setup": [],
+   "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-size", "270"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-b300-sglang-agentic-mtp",
+     "donorHardware": "b300"
+    }
+   },
+   "points": [
+    {
+     "concs": [1],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
+     "pr": "2994",
+     "date": "2026-09-11",
+     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375964",
+     "goldenAL": "2.99",
+     "kv": "hicache"
+    },
+    {
+     "concs": [4],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
+     "pr": "2994",
+     "date": "2026-09-11",
+     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375774",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["8"],
+         "--max-running-requests": ["8"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["8"],
+         "--max-running-requests": ["8"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [8],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
+     "pr": "2994",
+     "date": "2026-09-11",
+     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375813",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["16"],
+         "--max-running-requests": ["16"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["16"],
+         "--max-running-requests": ["16"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [12],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
+     "pr": "2994",
+     "date": "2026-09-11",
+     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375382",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["24"],
+         "--max-running-requests": ["24"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["24"],
+         "--max-running-requests": ["24"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [16],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
+     "pr": "2994",
+     "date": "2026-09-11",
+     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375184",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["32"],
+         "--max-running-requests": ["32"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["32"],
+         "--max-running-requests": ["32"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [20],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
+     "pr": "2994",
+     "date": "2026-09-11",
+     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044376125",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["40"],
+         "--max-running-requests": ["40"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["40"],
+         "--max-running-requests": ["40"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [24],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
+     "pr": "2994",
+     "date": "2026-09-11",
+     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375368",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["48"],
+         "--max-running-requests": ["48"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["48"],
+         "--max-running-requests": ["48"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [28],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
+     "pr": "2994",
+     "date": "2026-09-11",
+     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044374971",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["56"],
+         "--max-running-requests": ["56"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["56"],
+         "--max-running-requests": ["56"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [32],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
+     "pr": "2994",
+     "date": "2026-09-11",
+     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375267",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["64"],
+         "--max-running-requests": ["64"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["64"],
+         "--max-running-requests": ["64"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [40],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
+     "pr": "2994",
+     "date": "2026-09-11",
+     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375118",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["64"],
+         "--max-running-requests": ["80"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["64"],
+         "--max-running-requests": ["80"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [48],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
+     "pr": "2994",
+     "date": "2026-09-11",
+     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375877",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["64"],
+         "--max-running-requests": ["96"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["64"],
+         "--max-running-requests": ["96"]
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "routers": {
+    "sglang": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "kind": "worker",
+       "role": "agg",
+       "workers": 1,
+       "nodes_per_worker": 1,
+       "cmd": "python3 -m sglang.launch_server",
+       "env": {
+        "SGLANG_TIMEOUT_KEEP_ALIVE": "900",
+        "TORCH_CUDA_ARCH_LIST": "10.0"
+       },
+       "args": [
+        ["--model-path", "nvidia/GLM-5.2-NVFP4"],
+        ["--served-model-name", "nvidia/GLM-5.2-NVFP4"],
+        ["--host", "0.0.0.0"],
+        ["--port", "30000"],
+        ["--bf16-gemm-backend", "cutedsl"],
+        ["--chunked-prefill-size", "8192"],
+        ["--cuda-graph-max-bs", "2"],
+        ["--enable-hierarchical-cache"],
+        ["--ep-size", "1"],
+        ["--hicache-io-backend", "direct"],
+        ["--hicache-mem-layout", "page_first_direct"],
+        ["--hicache-size", "270"],
+        ["--hicache-write-policy", "write_back"],
+        ["--kv-cache-dtype", "fp8_e4m3"],
+        ["--max-prefill-tokens", "8192"],
+        ["--max-running-requests", "2"],
+        ["--mem-fraction-static", "0.85"],
+        ["--quantization", "modelopt_fp4"],
+        ["--reasoning-parser", "glm45"],
+        ["--speculative-algorithm", "EAGLE"],
+        ["--speculative-eagle-topk", "1"],
+        ["--speculative-num-draft-tokens", "4"],
+        ["--speculative-num-steps", "3"],
+        ["--tool-call-parser", "glm47"],
+        ["--tp", "8"],
+        ["--trust-remote-code"],
+        ["--watchdog-timeout", "1800"]
+       ]
+      }
+     ]
+    },
+    "dynamo": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "kind": "etcd",
+       "count_nodes": 1,
+       "cmd": "etcd",
+       "env": {},
+       "args": [
+        ["--data-dir", "/tmp/etcd"],
+        ["--listen-client-urls", "http://0.0.0.0:2379"],
+        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
+       ]
+      },
+      {
+       "kind": "dynamo-frontend",
+       "count": 1,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+       },
+       "args": [
+        ["--http-port", "8000"],
+        ["--router-mode", "kv"]
+       ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "glm5.2-fp8-b300-sglang-agentic-mtp#0",
+   "hw": "b300",
+   "ckpt": "zai-org/GLM-5.2-FP8",
+   "label": "Agg TP8",
+   "detail": "MTP 3-1-4",
+   "gpus": 8,
+   "configKey": "glm5.2-fp8-b300-sglang-agentic-mtp",
+   "image": "lmsysorg/sglang:nightly-dev-cu13-20260908-20ca564b",
+   "imageStatus": "pruned",
+   "imageCommit": "20ca564b",
+   "submitted": "sglang",
+   "setup": [],
+   "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-size", "270"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-b300-sglang-agentic-mtp",
+     "donorHardware": "b300"
+    }
+   },
+   "points": [
+    {
+     "concs": [1],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/de588b628068061130059bf4ecd4c08877c74250/benchmarks/single_node/agentic/glm5.2_fp8_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3146",
+     "pr": "3146",
+     "date": "2026-09-16",
+     "sha": "de588b628068061130059bf4ecd4c08877c74250",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340182",
+     "goldenAL": "2.99",
+     "kv": "hicache"
+    },
+    {
+     "concs": [4],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/de588b628068061130059bf4ecd4c08877c74250/benchmarks/single_node/agentic/glm5.2_fp8_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3146",
+     "pr": "3146",
+     "date": "2026-09-16",
+     "sha": "de588b628068061130059bf4ecd4c08877c74250",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340169",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["8"],
+         "--max-running-requests": ["8"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["8"],
+         "--max-running-requests": ["8"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [8],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/de588b628068061130059bf4ecd4c08877c74250/benchmarks/single_node/agentic/glm5.2_fp8_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3146",
+     "pr": "3146",
+     "date": "2026-09-16",
+     "sha": "de588b628068061130059bf4ecd4c08877c74250",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340279",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["16"],
+         "--max-running-requests": ["16"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["16"],
+         "--max-running-requests": ["16"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [12],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/de588b628068061130059bf4ecd4c08877c74250/benchmarks/single_node/agentic/glm5.2_fp8_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3146",
+     "pr": "3146",
+     "date": "2026-09-16",
+     "sha": "de588b628068061130059bf4ecd4c08877c74250",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340368",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["24"],
+         "--max-running-requests": ["24"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["24"],
+         "--max-running-requests": ["24"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [16],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/de588b628068061130059bf4ecd4c08877c74250/benchmarks/single_node/agentic/glm5.2_fp8_b300_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3146",
+     "pr": "3146",
+     "date": "2026-09-16",
+     "sha": "de588b628068061130059bf4ecd4c08877c74250",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340285",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["32"],
+         "--max-running-requests": ["32"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["32"],
+         "--max-running-requests": ["32"]
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "routers": {
+    "sglang": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "kind": "worker",
+       "role": "agg",
+       "workers": 1,
+       "nodes_per_worker": 1,
+       "cmd": "python3 -m sglang.launch_server",
+       "env": {
+        "SGLANG_TIMEOUT_KEEP_ALIVE": "900",
+        "TORCH_CUDA_ARCH_LIST": "10.0"
+       },
+       "args": [
+        ["--model-path", "zai-org/GLM-5.2-FP8"],
+        ["--served-model-name", "zai-org/GLM-5.2-FP8"],
+        ["--host", "0.0.0.0"],
+        ["--port", "30000"],
+        ["--bf16-gemm-backend", "cutedsl"],
+        ["--chunked-prefill-size", "8192"],
+        ["--cuda-graph-max-bs", "2"],
+        ["--enable-hierarchical-cache"],
+        ["--ep-size", "1"],
+        ["--hicache-io-backend", "direct"],
+        ["--hicache-mem-layout", "page_first_direct"],
+        ["--hicache-size", "270"],
+        ["--hicache-write-policy", "write_back"],
+        ["--kv-cache-dtype", "fp8_e4m3"],
+        ["--max-prefill-tokens", "8192"],
+        ["--max-running-requests", "2"],
+        ["--mem-fraction-static", "0.85"],
+        ["--quantization", "fp8"],
+        ["--reasoning-parser", "glm45"],
+        ["--speculative-algorithm", "EAGLE"],
+        ["--speculative-eagle-topk", "1"],
+        ["--speculative-num-draft-tokens", "4"],
+        ["--speculative-num-steps", "3"],
+        ["--tool-call-parser", "glm47"],
+        ["--tp", "8"],
+        ["--trust-remote-code"],
+        ["--watchdog-timeout", "1800"]
+       ]
+      }
+     ]
+    },
+    "dynamo": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "kind": "etcd",
+       "count_nodes": 1,
+       "cmd": "etcd",
+       "env": {},
+       "args": [
+        ["--data-dir", "/tmp/etcd"],
+        ["--listen-client-urls", "http://0.0.0.0:2379"],
+        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
+       ]
+      },
+      {
+       "kind": "dynamo-frontend",
+       "count": 1,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+       },
+       "args": [
+        ["--http-port", "8000"],
+        ["--router-mode", "kv"]
+       ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "glm5.2-fp4-b200-dynamo-sglang-agentic-agg#0",
+   "hw": "b200",
+   "ckpt": "nvidia/GLM-5.2-NVFP4",
+   "label": "Agg TP8",
+   "detail": "MTP 3-1-4 · glm5.2-fp4-b200-dynamo-sglang-agentic-agg",
+   "gpus": 8,
+   "configKey": "glm5.2-fp4-b200-dynamo-sglang-agentic-agg",
+   "image": "lmsysorg/sglang:nightly-dev-20260910-00840301",
+   "imageStatus": "pruned",
+   "imageCommit": "00840301",
+   "submitted": "dynamo",
+   "setup": [],
+   "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "110"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-b200-dynamo-sglang-agentic-agg",
+     "donorHardware": "b200"
+    }
+   },
+   "points": [
+    {
+     "concs": [1],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/53483461cd7aace0c8712c2d5cf7ec4a2b3e819a/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/agg-variants.yaml",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36304573738/attempts/4",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3400",
+     "pr": "3400",
+     "date": "2026-10-02",
+     "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
+     "override": "override_c1",
+     "goldenAL": "2.99",
+     "kv": "hicache"
+    },
+    {
+     "concs": [4],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/53483461cd7aace0c8712c2d5cf7ec4a2b3e819a/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/agg-variants.yaml",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36304573738/attempts/4",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3400",
+     "pr": "3400",
+     "date": "2026-10-02",
+     "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
+     "override": "override_c4",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "dynamo": [
+       null,
+       null,
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs-decode": ["8"],
+         "--max-running-requests": ["8"]
+        }
+       }
+      ],
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs-decode": ["8"],
+         "--max-running-requests": ["8"]
+        }
+       },
+       null
+      ]
+     }
+    },
+    {
+     "concs": [8],
+     "item": 2,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/53483461cd7aace0c8712c2d5cf7ec4a2b3e819a/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/agg-variants.yaml",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36304573738/attempts/4",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3400",
+     "pr": "3400",
+     "date": "2026-10-02",
+     "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
+     "override": "override_c8",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "dynamo": [
+       null,
+       null,
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs-decode": ["16"],
+         "--max-running-requests": ["16"]
+        }
+       }
+      ],
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs-decode": ["16"],
+         "--max-running-requests": ["16"]
+        }
+       },
+       null
+      ]
+     }
+    }
+   ],
+   "routers": {
+    "dynamo": {
+     "install": [],
+     "files": ["nats.conf#7d9e9ee1", "nginx.conf#524cca35"],
+     "blocks": [
+      {
+       "kind": "etcd",
+       "count_nodes": 1,
+       "cmd": "etcd",
+       "env": {},
+       "args": [
+        ["--data-dir", "/tmp/etcd"],
+        ["--listen-client-urls", "http://0.0.0.0:2379"],
+        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
+       ]
+      },
+      {
+       "kind": "nats",
+       "count_nodes": 1,
+       "cmd": "nats-server -c nats.conf",
+       "env": {},
+       "args": []
+      },
+      {
+       "kind": "dynamo-frontend",
+       "count": 2,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "NATS_SERVER": "nats://$NATS_IP:4222"
+       },
+       "args": [
+        ["--http-port", "8180"],
+        ["--router-mode", "kv"],
+        ["--active-decode-blocks-threshold", "None"],
+        ["--active-prefill-tokens-threshold", "None"],
+        ["--active-prefill-tokens-threshold-frac", "None"],
+        ["--router-session-affinity-ttl-secs", "3600"]
+       ]
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
+       "kind": "worker",
+       "role": "agg",
+       "workers": 1,
+       "nodes_per_worker": 1,
+       "cmd": "python3 -m dynamo.sglang",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "NATS_SERVER": "nats://$NATS_IP:4222",
+        "NCCL_CUMEM_ENABLE": "1",
+        "SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION": "8",
+        "SGLANG_DEFAULT_THINKING": "1",
+        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
+        "SGLANG_MOE_NVFP4_DISPATCH": "1",
+        "SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE": "0",
+        "SGLANG_REASONING_EFFORT": "max",
+        "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER": "0",
+        "TORCH_DISTRIBUTED_DEFAULT_TIMEOUT": "1800"
+       },
+       "args": [
+        ["--model-path", "nvidia/GLM-5.2-NVFP4"],
+        ["--served-model-name", "nvidia/GLM-5.2-NVFP4"],
+        ["--host", "0.0.0.0"],
+        ["--port", "30000"],
+        ["--request-plane", "tcp"],
+        ["--chunked-prefill-size", "8192"],
+        ["--context-length", "1048576"],
+        ["--cuda-graph-max-bs-decode", "2"],
+        ["--data-parallel-size", "1"],
+        ["--disable-shared-experts-fusion"],
+        ["--dsa-decode-backend", "trtllm"],
+        ["--dsa-prefill-backend", "trtllm"],
+        ["--enable-flashinfer-allreduce-fusion"],
+        ["--enable-hierarchical-cache"],
+        ["--expert-parallel-size", "1"],
+        ["--fp4-gemm-backend", "flashinfer_trtllm"],
+        ["--hicache-io-backend", "direct"],
+        ["--hicache-size", "110"],
+        ["--hicache-write-policy", "write_back"],
+        ["--kv-cache-dtype", "fp8_e4m3"],
+        ["--max-prefill-tokens", "8192"],
+        ["--max-running-requests", "2"],
+        ["--mem-fraction-static", "0.8"],
+        ["--model-loader-extra-config", "{\"enable_multithread_load\": true}"],
+        ["--moe-runner-backend", "flashinfer_trtllm"],
+        ["--quantization", "modelopt_fp4"],
+        ["--speculative-algorithm", "EAGLE"],
+        ["--speculative-eagle-topk", "1"],
+        ["--speculative-num-draft-tokens", "4"],
+        ["--speculative-num-steps", "3"],
+        ["--tensor-parallel-size", "8"],
+        ["--trust-remote-code"],
+        ["--watchdog-timeout", "1800"],
+        ["--weight-loader-prefetch-checkpoints"]
+       ]
+      }
+     ]
+    },
+    "sglang": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "from": 4,
+       "cmd": "python3 -m sglang.launch_server",
+       "diff": {
+        "args": {
+         "--request-plane": null
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": null,
+         "ETCD_ENDPOINTS": null,
+         "NATS_SERVER": null
+        }
+       }
+      },
+      {
+       "kind": "sglang-router",
+       "cmd": "python3 -m sglang_router.launch_router",
+       "env": {},
+       "args": [
+        ["--host", "0.0.0.0"],
+        ["--port", "8000"],
+        ["--policy", "cache_aware"],
+        ["--worker-urls", "http://127.0.0.1:30000"]
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "glm5.2-fp4-b200-sglang-agentic-mtp#0",
+   "hw": "b200",
+   "ckpt": "nvidia/GLM-5.2-NVFP4",
+   "label": "Agg TP8",
+   "detail": "MTP 3-1-4 · glm5.2-fp4-b200-sglang-agentic-mtp",
+   "gpus": 8,
+   "configKey": "glm5.2-fp4-b200-sglang-agentic-mtp",
+   "image": "lmsysorg/sglang:nightly-dev-cu13-20260901-07c8f729",
+   "imageStatus": "ok",
+   "imageCommit": "07c8f729",
+   "submitted": "sglang",
+   "setup": [],
+   "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "110"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-b200-dynamo-sglang-agentic-agg",
+     "donorHardware": "b200"
+    }
+   },
+   "points": [
+    {
+     "concs": [1],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d79d82b51c52f18137374897f53860e7cea529b4/benchmarks/single_node/agentic/glm5.2_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2808",
+     "pr": "2808",
+     "date": "2026-09-02",
+     "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089398",
+     "goldenAL": "2.99",
+     "kv": "hicache"
+    },
+    {
+     "concs": [4],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d79d82b51c52f18137374897f53860e7cea529b4/benchmarks/single_node/agentic/glm5.2_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2808",
+     "pr": "2808",
+     "date": "2026-09-02",
+     "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089293",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["8"],
+         "--max-running-requests": ["8"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["8"],
+         "--max-running-requests": ["8"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [8],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d79d82b51c52f18137374897f53860e7cea529b4/benchmarks/single_node/agentic/glm5.2_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2808",
+     "pr": "2808",
+     "date": "2026-09-02",
+     "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089238",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["16"],
+         "--max-running-requests": ["16"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["16"],
+         "--max-running-requests": ["16"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [12],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d79d82b51c52f18137374897f53860e7cea529b4/benchmarks/single_node/agentic/glm5.2_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2808",
+     "pr": "2808",
+     "date": "2026-09-02",
+     "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089321",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["24"],
+         "--hicache-size": ["169"],
+         "--max-running-requests": ["24"],
+         "--hicache-ratio": null
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["24"],
+         "--hicache-size": ["169"],
+         "--max-running-requests": ["24"],
+         "--hicache-ratio": null
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [16],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d79d82b51c52f18137374897f53860e7cea529b4/benchmarks/single_node/agentic/glm5.2_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2808",
+     "pr": "2808",
+     "date": "2026-09-02",
+     "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089397",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["32"],
+         "--hicache-size": ["169"],
+         "--max-running-requests": ["32"],
+         "--hicache-ratio": null
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["32"],
+         "--hicache-size": ["169"],
+         "--max-running-requests": ["32"],
+         "--hicache-ratio": null
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "routers": {
+    "sglang": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "kind": "worker",
+       "role": "agg",
+       "workers": 1,
+       "nodes_per_worker": 1,
+       "cmd": "python3 -m sglang.launch_server",
+       "env": {
+        "SGLANG_TIMEOUT_KEEP_ALIVE": "900",
+        "TORCH_CUDA_ARCH_LIST": "10.0"
+       },
+       "args": [
+        ["--model-path", "nvidia/GLM-5.2-NVFP4"],
+        ["--served-model-name", "nvidia/GLM-5.2-NVFP4"],
+        ["--host", "0.0.0.0"],
+        ["--port", "30000"],
+        ["--bf16-gemm-backend", "cutedsl"],
+        ["--chunked-prefill-size", "8192"],
+        ["--cuda-graph-max-bs", "2"],
+        ["--enable-hierarchical-cache"],
+        ["--ep-size", "1"],
+        ["--hicache-io-backend", "direct"],
+        ["--hicache-mem-layout", "page_first_direct"],
+        ["--hicache-ratio", "0.75"],
+        ["--hicache-write-policy", "write_back"],
+        ["--kv-cache-dtype", "fp8_e4m3"],
+        ["--max-prefill-tokens", "8192"],
+        ["--max-running-requests", "2"],
+        ["--mem-fraction-static", "0.83"],
+        ["--quantization", "modelopt_fp4"],
+        ["--reasoning-parser", "glm45"],
+        ["--speculative-algorithm", "EAGLE"],
+        ["--speculative-eagle-topk", "1"],
+        ["--speculative-num-draft-tokens", "4"],
+        ["--speculative-num-steps", "3"],
+        ["--tool-call-parser", "glm47"],
+        ["--tp", "8"],
+        ["--trust-remote-code"],
+        ["--watchdog-timeout", "1800"]
+       ]
+      }
+     ]
+    },
+    "dynamo": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "kind": "etcd",
+       "count_nodes": 1,
+       "cmd": "etcd",
+       "env": {},
+       "args": [
+        ["--data-dir", "/tmp/etcd"],
+        ["--listen-client-urls", "http://0.0.0.0:2379"],
+        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
+       ]
+      },
+      {
+       "kind": "dynamo-frontend",
+       "count": 1,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+       },
+       "args": [
+        ["--http-port", "8000"],
+        ["--router-mode", "kv"]
+       ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "glm5.2-fp4-b200-dynamo-sglang-agentic-disagg#0",
+   "hw": "b200",
+   "ckpt": "nvidia/GLM-5.2-NVFP4",
+   "label": "Disagg 1P4D · prefill DEP8 · decode TP4",
+   "detail": "MTP 2-1-3",
+   "gpus": 40,
+   "configKey": "glm5.2-fp4-b200-dynamo-sglang-agentic-disagg",
+   "image": "lmsysorg/sglang:nightly-dev-20260910-00840301",
+   "imageStatus": "pruned",
+   "imageCommit": "00840301",
+   "submitted": "dynamo",
+   "setup": [],
+   "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "110"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-b200-dynamo-sglang-agentic-disagg",
+     "donorHardware": "b200"
+    }
+   },
+   "points": [
+    {
+     "concs": [48],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/53483461cd7aace0c8712c2d5cf7ec4a2b3e819a/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/disagg-variants.yaml",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36304573738/attempts/4",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3400",
+     "pr": "3400",
+     "date": "2026-10-02",
+     "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
+     "override": "override_1p4d_tp4_c48",
+     "goldenAL": "2.5",
+     "kv": "hicache"
+    }
+   ],
+   "routers": {
+    "dynamo": {
+     "install": [],
+     "files": ["nats.conf#7d9e9ee1", "nginx.conf#c1dc3753"],
+     "blocks": [
+      {
+       "kind": "etcd",
+       "count_nodes": 1,
+       "cmd": "etcd",
+       "env": {},
+       "args": [
+        ["--data-dir", "/tmp/etcd"],
+        ["--listen-client-urls", "http://0.0.0.0:2379"],
+        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
+       ]
+      },
+      {
+       "kind": "nats",
+       "count_nodes": 1,
+       "cmd": "nats-server -c nats.conf",
+       "env": {},
+       "args": []
+      },
+      {
+       "kind": "dynamo-frontend",
+       "count": 4,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "NATS_SERVER": "nats://$NATS_IP:4222"
+       },
+       "args": [
+        ["--http-port", "8180"],
+        ["--router-mode", "kv"],
+        ["--router-session-affinity-ttl-secs", "3600"],
+        ["--active-decode-blocks-threshold", "None"],
+        ["--active-prefill-tokens-threshold", "None"],
+        ["--active-prefill-tokens-threshold-frac", "None"]
+       ]
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
+       "kind": "worker",
+       "role": "prefill",
+       "workers": 1,
+       "nodes_per_worker": 1,
+       "cmd": "python3 -m dynamo.sglang",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "NATS_SERVER": "nats://$NATS_IP:4222",
+        "NCCL_CUMEM_ENABLE": "1",
+        "NVSHMEM_REMOTE_TRANSPORT": "none",
+        "SGLANG_DEFAULT_THINKING": "1",
+        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "100000",
+        "SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT": "3600",
+        "SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE": "100000",
+        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "100000",
+        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
+        "SGLANG_REASONING_EFFORT": "max",
+        "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER": "0",
+        "TORCH_DISTRIBUTED_DEFAULT_TIMEOUT": "1800"
+       },
+       "args": [
+        ["--model-path", "nvidia/GLM-5.2-NVFP4"],
+        ["--served-model-name", "nvidia/GLM-5.2-NVFP4"],
+        ["--host", "0.0.0.0"],
+        ["--port", "30000"],
+        ["--disaggregation-mode", "prefill"],
+        ["--disaggregation-bootstrap-port", "8998"],
+        ["--request-plane", "tcp"],
+        ["--chunked-prefill-size", "65536"],
+        ["--context-length", "1048576"],
+        ["--cuda-graph-max-bs-decode", "16"],
+        ["--data-parallel-size", "8"],
+        ["--disaggregation-transfer-backend", "nixl"],
+        ["--dsa-decode-backend", "trtllm"],
+        ["--dsa-prefill-backend", "trtllm"],
+        ["--enable-dp-attention"],
+        ["--enable-dp-lm-head"],
+        ["--enable-flashinfer-allreduce-fusion"],
+        ["--enable-hierarchical-cache"],
+        ["--expert-parallel-size", "8"],
+        ["--fp4-gemm-backend", "flashinfer_cutlass"],
+        ["--hicache-io-backend", "direct"],
+        ["--hicache-size", "110"],
+        ["--hicache-write-policy", "write_back"],
+        ["--kv-cache-dtype", "fp8_e4m3"],
+        ["--load-balance-method", "total_tokens"],
+        ["--max-prefill-tokens", "16384"],
+        ["--max-running-requests", "16"],
+        ["--mem-fraction-static", "0.8"],
+        ["--model-loader-extra-config", "{\"enable_multithread_load\": true}"],
+        ["--moe-runner-backend", "flashinfer_cutlass"],
+        ["--quantization", "modelopt_fp4"],
+        ["--speculative-algorithm", "EAGLE"],
+        ["--speculative-eagle-topk", "1"],
+        ["--speculative-num-draft-tokens", "3"],
+        ["--speculative-num-steps", "2"],
+        ["--tensor-parallel-size", "8"],
+        ["--trust-remote-code"],
+        ["--watchdog-timeout", "1800"],
+        ["--weight-loader-prefetch-checkpoints"]
+       ]
+      },
+      {
+       "kind": "worker",
+       "role": "decode",
+       "workers": 4,
+       "nodes_per_worker": 1,
+       "gpu_pinning": [
+        ["0,1,2,3"],
+        ["4,5,6,7"],
+        ["0,1,2,3"],
+        ["4,5,6,7"]
+       ],
+       "cmd": "python3 -m dynamo.sglang",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "NATS_SERVER": "nats://$NATS_IP:4222",
+        "NCCL_CUMEM_ENABLE": "1",
+        "NVSHMEM_REMOTE_TRANSPORT": "none",
+        "SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION": "8",
+        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+        "SGLANG_DEFAULT_THINKING": "1",
+        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "100000",
+        "SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT": "3600",
+        "SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE": "100000",
+        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "100000",
+        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
+        "SGLANG_MOE_NVFP4_DISPATCH": "1",
+        "SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE": "0",
+        "SGLANG_REASONING_EFFORT": "max",
+        "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER": "0",
+        "TORCH_DISTRIBUTED_DEFAULT_TIMEOUT": "1800"
+       },
+       "args": [
+        ["--model-path", "nvidia/GLM-5.2-NVFP4"],
+        ["--served-model-name", "nvidia/GLM-5.2-NVFP4"],
+        ["--host", "0.0.0.0"],
+        ["--port", "30000"],
+        ["--disaggregation-mode", "decode"],
+        ["--request-plane", "tcp"],
+        ["--chunked-prefill-size", "64"],
+        ["--context-length", "1048576"],
+        ["--cuda-graph-max-bs-decode", "16"],
+        ["--data-parallel-size", "1"],
+        ["--disable-radix-cache"],
+        ["--disaggregation-decode-extra-slots", "0"],
+        ["--disaggregation-transfer-backend", "nixl"],
+        ["--dsa-decode-backend", "trtllm"],
+        ["--dsa-prefill-backend", "trtllm"],
+        ["--enable-flashinfer-allreduce-fusion"],
+        ["--expert-parallel-size", "1"],
+        ["--fp4-gemm-backend", "flashinfer_cutlass"],
+        ["--kv-cache-dtype", "fp8_e4m3"],
+        ["--max-running-requests", "16"],
+        ["--mem-fraction-static", "0.9"],
+        ["--model-loader-extra-config", "{\"enable_multithread_load\": true}"],
+        ["--moe-runner-backend", "flashinfer_trtllm"],
+        ["--quantization", "modelopt_fp4"],
+        ["--skip-tokenizer-init"],
+        ["--speculative-algorithm", "EAGLE"],
+        ["--speculative-eagle-topk", "1"],
+        ["--speculative-num-draft-tokens", "3"],
+        ["--speculative-num-steps", "2"],
+        ["--stream-interval", "30"],
+        ["--tensor-parallel-size", "4"],
+        ["--trust-remote-code"],
+        ["--watchdog-timeout", "1800"],
+        ["--weight-loader-prefetch-checkpoints"]
+       ]
+      }
+     ]
+    },
+    "sglang": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "from": 4,
+       "cmd": "python3 -m sglang.launch_server",
+       "diff": {
+        "args": {
+         "--skip-server-warmup": [],
+         "--request-plane": null
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": null,
+         "ETCD_ENDPOINTS": null,
+         "NATS_SERVER": null
+        }
+       }
+      },
+      {
+       "from": 5,
+       "cmd": "python3 -m sglang.launch_server",
+       "diff": {
+        "args": {
+         "--skip-server-warmup": [],
+         "--request-plane": null,
+         "--skip-tokenizer-init": null
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": null,
+         "ETCD_ENDPOINTS": null,
+         "NATS_SERVER": null
+        }
+       }
+      },
+      {
+       "kind": "sglang-router",
+       "cmd": "python3 -m sglang_router.launch_router",
+       "env": {},
+       "args": [
+        ["--decode", "http://$DECODE_3_HEAD_IP:30000"],
+        ["--decode", "http://$DECODE_2_HEAD_IP:30000"],
+        ["--decode", "http://$DECODE_1_HEAD_IP:30000"],
+        ["--decode", "http://$DECODE_0_HEAD_IP:30000"],
+        ["--prefill", "http://$PREFILL_0_HEAD_IP:30000", "8998"],
+        ["--pd-disaggregation"],
+        ["--host", "0.0.0.0"],
+        ["--port", "8000"],
+        ["--policy", "cache_aware"]
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "glm5.2-fp4-b200-dynamo-sglang-agentic-disagg#1",
+   "hw": "b200",
+   "ckpt": "nvidia/GLM-5.2-NVFP4",
+   "label": "Disagg 1P1D · prefill DEP8 · decode DEP8",
+   "detail": "MTP 2-1-3",
+   "gpus": 16,
+   "configKey": "glm5.2-fp4-b200-dynamo-sglang-agentic-disagg",
+   "image": "lmsysorg/sglang:nightly-dev-20260910-00840301",
+   "imageStatus": "pruned",
+   "imageCommit": "00840301",
+   "submitted": "dynamo",
+   "setup": [],
+   "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "110"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-b200-dynamo-sglang-agentic-disagg",
+     "donorHardware": "b200"
+    }
+   },
+   "points": [
+    {
+     "concs": [64],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/53483461cd7aace0c8712c2d5cf7ec4a2b3e819a/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/disagg-variants.yaml",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36304573738/attempts/4",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3400",
+     "pr": "3400",
+     "date": "2026-10-02",
+     "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
+     "override": "override_1p1d_c64",
+     "goldenAL": "2.5",
+     "kv": "hicache"
+    }
+   ],
+   "routers": {
+    "dynamo": {
+     "install": [],
+     "files": ["deepep_config.json#42ebb085", "nats.conf#7d9e9ee1", "nginx.conf#1fa49161"],
+     "blocks": [
+      {
+       "kind": "etcd",
+       "count_nodes": 1,
+       "cmd": "etcd",
+       "env": {},
+       "args": [
+        ["--data-dir", "/tmp/etcd"],
+        ["--listen-client-urls", "http://0.0.0.0:2379"],
+        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
+       ]
+      },
+      {
+       "kind": "nats",
+       "count_nodes": 1,
+       "cmd": "nats-server -c nats.conf",
+       "env": {},
+       "args": []
+      },
+      {
+       "kind": "dynamo-frontend",
+       "count": 3,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "NATS_SERVER": "nats://$NATS_IP:4222"
+       },
+       "args": [
+        ["--http-port", "8180"],
+        ["--router-mode", "kv"],
+        ["--router-session-affinity-ttl-secs", "3600"],
+        ["--active-decode-blocks-threshold", "None"],
+        ["--active-prefill-tokens-threshold", "None"],
+        ["--active-prefill-tokens-threshold-frac", "None"]
+       ]
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
+       "diff": {
+        "args": {
+         "--max-prefill-tokens": ["8192"]
+        },
+        "env": {
+         "SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT": "1800"
+        }
+       },
+       "ref": [15, "dynamo", 4]
+      },
+      {
+       "drop": ["gpu_pinning"],
+       "workers": 1,
+       "diff": {
+        "args": {
+         "--cuda-graph-max-bs-decode": ["128"],
+         "--data-parallel-size": ["8"],
+         "--deepep-config": ["deepep_config.json"],
+         "--deepep-mode": ["low_latency"],
+         "--enable-dp-attention": [],
+         "--enable-dp-lm-head": [],
+         "--ep-dispatch-algorithm": ["static"],
+         "--ep-num-redundant-experts": ["0"],
+         "--expert-parallel-size": ["8"],
+         "--max-running-requests": ["128"],
+         "--mem-fraction-static": ["0.85"],
+         "--moe-a2a-backend": ["deepep"],
+         "--moe-dense-tp-size": ["1"],
+         "--moe-runner-backend": ["flashinfer_cutedsl"],
+         "--speculative-moe-a2a-backend": ["deepep"],
+         "--speculative-moe-runner-backend": ["deep_gemm"],
+         "--tensor-parallel-size": ["8"]
+        },
+        "env": {
+         "SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT": "1800"
+        }
+       },
+       "ref": [15, "dynamo", 5]
+      }
+     ]
+    },
+    "sglang": {
+     "install": [],
+     "files": ["deepep_config.json#42ebb085"],
+     "blocks": [
+      {
+       "from": 4,
+       "cmd": "python3 -m sglang.launch_server",
+       "diff": {
+        "args": {
+         "--skip-server-warmup": [],
+         "--request-plane": null
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": null,
+         "ETCD_ENDPOINTS": null,
+         "NATS_SERVER": null
+        }
+       }
+      },
+      {
+       "from": 5,
+       "cmd": "python3 -m sglang.launch_server",
+       "diff": {
+        "args": {
+         "--skip-server-warmup": [],
+         "--request-plane": null,
+         "--skip-tokenizer-init": null
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": null,
+         "ETCD_ENDPOINTS": null,
+         "NATS_SERVER": null
+        }
+       }
+      },
+      {
+       "kind": "sglang-router",
+       "cmd": "python3 -m sglang_router.launch_router",
+       "env": {},
+       "args": [
+        ["--decode", "http://$DECODE_0_HEAD_IP:30000"],
+        ["--prefill", "http://$PREFILL_0_HEAD_IP:30000", "8998"],
+        ["--pd-disaggregation"],
+        ["--host", "0.0.0.0"],
+        ["--port", "8000"],
+        ["--policy", "cache_aware"]
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "glm5.2-fp8-b200-sglang-agentic-mtp#0",
+   "hw": "b200",
+   "ckpt": "zai-org/GLM-5.2-FP8",
+   "label": "Agg TP8",
+   "detail": "MTP 3-1-4",
+   "gpus": 8,
+   "configKey": "glm5.2-fp8-b200-sglang-agentic-mtp",
+   "image": "lmsysorg/sglang:nightly-dev-cu13-20260908-20ca564b",
+   "imageStatus": "pruned",
+   "imageCommit": "20ca564b",
+   "submitted": "sglang",
+   "setup": [],
+   "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "110"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-b200-dynamo-sglang-agentic-agg",
+     "donorHardware": "b200"
+    }
+   },
+   "points": [
+    {
+     "concs": [1],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/a30c9cb26d6d2a218ef87aadcaf854123ffcf71e/benchmarks/single_node/agentic/glm5.2_fp8_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2863",
+     "pr": "2863",
+     "date": "2026-09-17",
+     "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588543",
+     "goldenAL": "2.99",
+     "kv": "hicache"
+    },
+    {
+     "concs": [4],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/a30c9cb26d6d2a218ef87aadcaf854123ffcf71e/benchmarks/single_node/agentic/glm5.2_fp8_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2863",
+     "pr": "2863",
+     "date": "2026-09-17",
+     "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588624",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["8"],
+         "--max-running-requests": ["8"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["8"],
+         "--max-running-requests": ["8"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [8],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/a30c9cb26d6d2a218ef87aadcaf854123ffcf71e/benchmarks/single_node/agentic/glm5.2_fp8_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2863",
+     "pr": "2863",
+     "date": "2026-09-17",
+     "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588912",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["16"],
+         "--max-running-requests": ["16"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["16"],
+         "--max-running-requests": ["16"]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [12],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/a30c9cb26d6d2a218ef87aadcaf854123ffcf71e/benchmarks/single_node/agentic/glm5.2_fp8_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2863",
+     "pr": "2863",
+     "date": "2026-09-17",
+     "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588733",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["24"],
+         "--hicache-size": ["169"],
+         "--max-running-requests": ["24"],
+         "--hicache-ratio": null
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["24"],
+         "--hicache-size": ["169"],
+         "--max-running-requests": ["24"],
+         "--hicache-ratio": null
+        }
+       }
+      ]
+     }
+    },
+    {
+     "concs": [16],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/a30c9cb26d6d2a218ef87aadcaf854123ffcf71e/benchmarks/single_node/agentic/glm5.2_fp8_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2863",
+     "pr": "2863",
+     "date": "2026-09-17",
+     "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588655",
+     "goldenAL": "2.99",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["32"],
+         "--hicache-size": ["169"],
+         "--max-running-requests": ["32"],
+         "--hicache-ratio": null
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["32"],
+         "--hicache-size": ["169"],
+         "--max-running-requests": ["32"],
+         "--hicache-ratio": null
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "routers": {
+    "sglang": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "kind": "worker",
+       "role": "agg",
+       "workers": 1,
+       "nodes_per_worker": 1,
+       "cmd": "python3 -m sglang.launch_server",
+       "env": {
+        "SGLANG_TIMEOUT_KEEP_ALIVE": "900",
+        "TORCH_CUDA_ARCH_LIST": "10.0"
+       },
+       "args": [
+        ["--model-path", "zai-org/GLM-5.2-FP8"],
+        ["--served-model-name", "zai-org/GLM-5.2-FP8"],
+        ["--host", "0.0.0.0"],
+        ["--port", "30000"],
+        ["--bf16-gemm-backend", "cutedsl"],
+        ["--chunked-prefill-size", "8192"],
+        ["--cuda-graph-max-bs", "2"],
+        ["--enable-hierarchical-cache"],
+        ["--ep-size", "1"],
+        ["--hicache-io-backend", "direct"],
+        ["--hicache-mem-layout", "page_first_direct"],
+        ["--hicache-ratio", "0.75"],
+        ["--hicache-write-policy", "write_back"],
+        ["--kv-cache-dtype", "fp8_e4m3"],
+        ["--max-prefill-tokens", "8192"],
+        ["--max-running-requests", "2"],
+        ["--mem-fraction-static", "0.83"],
+        ["--quantization", "fp8"],
+        ["--reasoning-parser", "glm45"],
+        ["--speculative-algorithm", "EAGLE"],
+        ["--speculative-eagle-topk", "1"],
+        ["--speculative-num-draft-tokens", "4"],
+        ["--speculative-num-steps", "3"],
+        ["--tool-call-parser", "glm47"],
+        ["--tp", "8"],
+        ["--trust-remote-code"],
+        ["--watchdog-timeout", "1800"]
+       ]
+      }
+     ]
+    },
+    "dynamo": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "kind": "etcd",
+       "count_nodes": 1,
+       "cmd": "etcd",
+       "env": {},
+       "args": [
+        ["--data-dir", "/tmp/etcd"],
+        ["--listen-client-urls", "http://0.0.0.0:2379"],
+        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
+       ]
+      },
+      {
+       "kind": "dynamo-frontend",
+       "count": 1,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+       },
+       "args": [
+        ["--http-port", "8000"],
+        ["--router-mode", "kv"]
+       ]
+      },
+      {
+       "from": 0,
+       "cmd": "python3 -m dynamo.sglang",
+       "diff": {
+        "args": {
+         "--request-plane": ["tcp"]
+        },
+        "env": {
+         "DYN_REQUEST_PLANE": "tcp",
+         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        }
+       }
       }
      ]
     }
@@ -4569,14 +4569,14 @@ export const agentx = {
       "dynamo": [
        null,
        null,
+       null,
+       null,
        {
         "args": {
          "--cuda-graph-max-bs-decode": ["8"],
          "--max-running-requests": ["8"]
         }
-       },
-       null,
-       null
+       }
       ],
       "sglang": [
        {
@@ -4605,14 +4605,14 @@ export const agentx = {
       "dynamo": [
        null,
        null,
+       null,
+       null,
        {
         "args": {
          "--cuda-graph-max-bs-decode": ["16"],
          "--max-running-requests": ["16"]
         }
-       },
-       null,
-       null
+       }
       ],
       "sglang": [
        {
@@ -4641,14 +4641,14 @@ export const agentx = {
       "dynamo": [
        null,
        null,
+       null,
+       null,
        {
         "args": {
          "--cuda-graph-max-bs-decode": ["24"],
          "--max-running-requests": ["24"]
         }
-       },
-       null,
-       null
+       }
       ],
       "sglang": [
        {
@@ -4677,14 +4677,14 @@ export const agentx = {
       "dynamo": [
        null,
        null,
+       null,
+       null,
        {
         "args": {
          "--cuda-graph-max-bs-decode": ["32"],
          "--max-running-requests": ["32"]
         }
-       },
-       null,
-       null
+       }
       ],
       "sglang": [
        {
@@ -4718,6 +4718,30 @@ export const agentx = {
        "kind": "nats",
        "count_nodes": 1,
        "cmd": "nats-server -c nats.conf",
+       "env": {},
+       "args": []
+      },
+      {
+       "kind": "dynamo-frontend",
+       "count": 2,
+       "cmd": "python3 -m dynamo.frontend",
+       "env": {
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "NATS_SERVER": "nats://$NATS_IP:4222"
+       },
+       "args": [
+        ["--http-port", "8180"],
+        ["--router-mode", "kv"],
+        ["--router-session-affinity-ttl-secs", "3600"],
+        ["--active-decode-blocks-threshold", "None"],
+        ["--active-prefill-tokens-threshold", "None"],
+        ["--active-prefill-tokens-threshold-frac", "None"]
+       ]
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
        "env": {},
        "args": []
       },
@@ -4770,30 +4794,6 @@ export const agentx = {
         ["--trust-remote-code"],
         ["--watchdog-timeout", "86400"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 2,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
-        "NATS_SERVER": "nats://$NATS_IP:4222"
-       },
-       "args": [
-        ["--http-port", "8180"],
-        ["--router-mode", "kv"],
-        ["--router-session-affinity-ttl-secs", "3600"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"]
-       ]
       }
      ]
     },
@@ -4802,7 +4802,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -4926,6 +4926,26 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "dynamo-frontend",
+       "count": 2,
+       "cmd": "python3 -m dynamo.frontend",
+       "args": [
+        ["--http-port", "8180"],
+        ["--router-mode", "kv"],
+        ["--router-reset-states"],
+        ["--active-decode-blocks-threshold", "None"],
+        ["--active-prefill-tokens-threshold", "None"],
+        ["--active-prefill-tokens-threshold-frac", "None"]
+       ],
+       "envRef": 0
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "worker",
        "role": "prefill",
        "workers": 1,
@@ -4968,7 +4988,7 @@ export const agentx = {
         ["--trust-remote-code"],
         ["--watchdog-timeout", "86400"]
        ],
-       "envRef": 0
+       "envRef": 1
       },
       {
        "kind": "worker",
@@ -5006,26 +5026,6 @@ export const agentx = {
         ["--trust-remote-code"],
         ["--watchdog-timeout", "86400"]
        ],
-       "envRef": 0
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 2,
-       "cmd": "python3 -m dynamo.frontend",
-       "args": [
-        ["--http-port", "8180"],
-        ["--router-mode", "kv"],
-        ["--router-reset-states"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"]
-       ],
        "envRef": 1
       }
      ]
@@ -5035,7 +5035,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -5050,7 +5050,7 @@ export const agentx = {
        }
       },
       {
-       "from": 3,
+       "from": 5,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -5177,6 +5177,26 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "dynamo-frontend",
+       "count": 4,
+       "cmd": "python3 -m dynamo.frontend",
+       "args": [
+        ["--http-port", "8180"],
+        ["--router-mode", "kv"],
+        ["--router-reset-states"],
+        ["--active-decode-blocks-threshold", "None"],
+        ["--active-prefill-tokens-threshold", "None"],
+        ["--active-prefill-tokens-threshold-frac", "None"]
+       ],
+       "envRef": 0
+      },
+      {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "workers": 2,
        "diff": {
         "args": {
@@ -5190,7 +5210,7 @@ export const agentx = {
          "--page-size": null
         }
        },
-       "ref": [19, "dynamo", 2]
+       "ref": [19, "dynamo", 4]
       },
       {
        "workers": 2,
@@ -5200,27 +5220,7 @@ export const agentx = {
          "--speculative-num-steps": ["3"]
         }
        },
-       "ref": [19, "dynamo", 3]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 4,
-       "cmd": "python3 -m dynamo.frontend",
-       "args": [
-        ["--http-port", "8180"],
-        ["--router-mode", "kv"],
-        ["--router-reset-states"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"]
-       ],
-       "envRef": 1
+       "ref": [19, "dynamo", 5]
       }
      ]
     },
@@ -5229,7 +5229,7 @@ export const agentx = {
      "files": [],
      "blocks": [
       {
-       "from": 2,
+       "from": 4,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
@@ -5244,7 +5244,7 @@ export const agentx = {
        }
       },
       {
-       "from": 3,
+       "from": 5,
        "cmd": "python3 -m sglang.launch_server",
        "diff": {
         "args": {
