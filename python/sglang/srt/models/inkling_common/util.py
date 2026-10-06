@@ -9,12 +9,12 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_lora
 
 
 def lora_compatible_layout_enabled() -> bool:
     """Use the contiguous ``[gate || up]`` layout required by LoRA slicing."""
-    return get_server_args().enable_lora
+    return get_lora().enable_lora
 
 
 def use_inkling_shared_fused_moe(
@@ -88,6 +88,7 @@ class FusedMoELoadingMixin(abc.ABC):
         quant_method: UnquantizedFusedMoEMethod,
         moe_runner_config: MoeRunnerConfig,
         moe_tp_rank: int,
+        moe_tp_size: int,
     ) -> None:
         super().__init__()
         helper = FusedMoE.__new__(FusedMoE)
@@ -97,6 +98,7 @@ class FusedMoELoadingMixin(abc.ABC):
         helper.moe_runner_config = moe_runner_config
         helper.use_triton_kernels = False
         helper.moe_tp_rank = moe_tp_rank
+        helper.moe_tp_size = moe_tp_size
         helper.use_presharded_weights = False
         helper.use_flashinfer_trtllm_moe = False
         # Keep this parameterless loading helper out of the module tree so

@@ -1,9 +1,11 @@
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.models.vaes import wanvae
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
     DupUp3D,
     forward_context,
@@ -59,7 +61,8 @@ def test_add_into_matches_materialized_shortcut(
         assert actual.is_contiguous(memory_format=torch.channels_last_3d)
 
 
-def test_residual_up_block_uses_fused_shortcut():
+@pytest.mark.parametrize("kernel_enabled", (False, True))
+def test_residual_up_block_uses_fused_shortcut(kernel_enabled):
     torch.manual_seed(0)
     dup = DupUp3D(64, 32, factor_t=2, factor_s=2)
     x = torch.randn(1, 64, 1, 2, 3, device=_DEVICE)
@@ -74,6 +77,8 @@ def test_residual_up_block_uses_fused_shortcut():
     )
 
     with (
+        nullcontext() if kernel_enabled else patch.object(wanvae, "dup_up3d_add", None),
+        patch.object(dup, "add_into_", wraps=dup.add_into_) as add_into,
         patch.object(
             dup,
             "forward",
@@ -84,3 +89,7 @@ def test_residual_up_block_uses_fused_shortcut():
         actual = residual_up_block_forward(block, x)
 
     assert torch.equal(actual, expected)
+    if kernel_enabled and wanvae.dup_up3d_add is not None and _DEVICE.type == "cuda":
+        add_into.assert_not_called()
+    else:
+        add_into.assert_called_once()

@@ -72,5 +72,33 @@ def benchmark(batch_size: int, item_size: int, impl: str):
     )
 
 
+# Asymmetric K/V (head_dim != v_head_dim). The item_size sweep above drives both
+# rows from one value, so it never reaches the split-prefix-plus-tail path.
+# 192/128 and 384/256 both go live in a single MiMoV2 TP=4 deployment, whose
+# layers carry either 1 or 2 kv heads per rank; the reversed and wide pairs cover
+# a V-side tail and a num_split > 1 shape.
+ASYM_ITEM_SIZES = [(192, 128), (384, 256), (128, 192), (1024, 512)]
+
+
+@marker.parametrize("k_item,v_item", ASYM_ITEM_SIZES, [(192, 128), (1024, 512)])
+@marker.parametrize("batch_size", [2**n for n in range(0, 15)], [16])
+@marker.benchmark("impl", ["jit", "torch_compile", "torch_streams"])
+def benchmark_asymmetric(batch_size: int, k_item: int, v_item: int, impl: str):
+    torch.manual_seed(42)
+    k = create_random(batch_size, k_item)
+    k_cache = create_empty(CACHE_SIZE, k_item)
+    v = create_random(batch_size, v_item)
+    v_cache = create_empty(CACHE_SIZE, v_item)
+    indices = torch.randperm(CACHE_SIZE, device=DEFAULT_DEVICE)[:batch_size]
+    return marker.do_bench(
+        FN_MAP[impl],
+        input_args=(k, v, k_cache, v_cache, indices),
+        graph_clone_args=(0, 1, 4),  # not need to clone cache, which is large
+        memory_args=(k, v, indices),  # k_cache / v_cache excluded
+        memory_output=(k, v),  # inplace write, size = k + v
+    )
+
+
 if __name__ == "__main__":
     benchmark.run()
+    benchmark_asymmetric.run()

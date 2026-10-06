@@ -12,17 +12,18 @@ from transformers import PretrainedConfig
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.kernels.ops.attention.fla.layernorm_gated import layernorm_fn
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.distributed import (
-    get_pp_group,
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -31,7 +32,6 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -56,12 +56,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP, _is_hip
+from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import (
-    get_forward,
+    get_device,
     get_parallel,
-    get_server_args,
+    get_platform,
     get_stream,
 )
 from sglang.srt.utils import (
@@ -77,8 +77,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
-    is_sm100_supported,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.common import rank0_log
 
@@ -98,7 +97,7 @@ if _use_aiter_gfx95:
     pass
 
 if _is_cuda:
-    from sgl_kernel import awq_dequantize
+    from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -112,7 +111,7 @@ if _is_hip:
     pass
 
 _is_flashinfer_available = is_flashinfer_available()
-_is_sm100_supported = is_cuda() and is_sm100_supported()
+_is_sm100_supported = is_cuda() and get_platform().is_sm100
 
 
 class DsV3MLA(DeepseekV2AttentionMLA):
@@ -164,7 +163,6 @@ def weight_loader_with_alias(alias: str):
 
 
 class BailingMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -233,7 +231,6 @@ class BailingMoEGate(nn.Module):
 
 
 class BailingMoE(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -248,7 +245,6 @@ class BailingMoE(nn.Module):
         self.layer_id = layer_id
 
         self.tp_size = get_parallel().tp_size
-        self.tp_rank = get_parallel().tp_rank
 
         self.top_k = config.num_experts_per_tok
         self.norm_expert_prob = getattr(config, "norm_topk_prob", False)
@@ -296,10 +292,13 @@ class BailingMoE(nn.Module):
                 self.score_function == "softmax" and self.correction_bias is None
             ) or (
                 self.score_function == "sigmoid" and self.correction_bias is not None
-            ), "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            ), (
+                "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            )
 
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=self.layer_id,
             use_grouped_topk=self.use_grouped_topk,
             renormalize=self.norm_expert_prob,
             num_expert_group=self.num_expert_group,
@@ -365,10 +364,6 @@ class BailingMoE(nn.Module):
             if self.num_shared_experts > 0:
                 final_hidden_states = final_hidden_states + shared_output
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
 
@@ -503,12 +498,12 @@ class BailingMoELinearAttention(nn.Module):
 
         self.group_norm_size = getattr(config, "group_norm_size", 1)
         self.rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-5))
-        assert (
-            self.tp_size <= self.group_norm_size
-        ), "tp_size must be less than or equal to group_norm_size that can use local rms norm"
-        assert (
-            self.group_norm_size % self.tp_size == 0
-        ), "group_norm_size must be divisible by tp_size"
+        assert self.tp_size <= self.group_norm_size, (
+            "tp_size must be less than or equal to group_norm_size that can use local rms norm"
+        )
+        assert self.group_norm_size % self.tp_size == 0, (
+            "group_norm_size must be divisible by tp_size"
+        )
         self.g_norm = BailingGroupRMSNormGate(
             hidden_size=self.hidden_inner_size // self.tp_size,
             eps=self.rms_norm_eps,
@@ -529,7 +524,7 @@ class BailingMoELinearAttention(nn.Module):
             base=self.rope_theta,
             rope_scaling=config.rope_scaling,
             is_neox_style=True,
-            device=get_server_args().device,
+            device=get_device().device,
             dtype=torch.float32,
         )
 
@@ -622,7 +617,6 @@ class BailingMoELinearAttention(nn.Module):
 
 
 class BailingMoEAttention(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -675,6 +669,7 @@ class BailingMoEAttention(nn.Module):
             bias=config.use_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            reduce_results=False,
         )
         if hasattr(config, "rotary_dim"):
             self.rotary_dim = config.rotary_dim
@@ -690,7 +685,7 @@ class BailingMoEAttention(nn.Module):
             max_position=self.max_position_embeddings,
             base=self.rope_theta,
             rope_scaling=config.rope_scaling,
-            device=get_server_args().device,
+            device=get_device().device,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -731,7 +726,6 @@ class BailingMoEAttention(nn.Module):
 
 
 class BailingMoELinearDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -788,8 +782,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
 
         self.expert_num = config.num_experts
         self.hidden_size = config.hidden_size
-        is_moe_layer = self._is_layer_sparse(config, self.layer_id)
-        is_previous_moe_layer = self._is_layer_sparse(config, self.layer_id - 1)
+        is_moe_layer = self._is_layer_sparse(config, self.layer_id, is_nextn=is_nextn)
         is_next_layer_moe_layer = self._is_layer_sparse(config, self.layer_id + 1)
         if self.expert_num == 1:
             self.mlp = BailingMLP(
@@ -797,6 +790,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
             )
         else:
             if is_nextn or self.layer_id >= config.first_k_dense_replace:
@@ -815,30 +809,30 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     intermediate_size=config.intermediate_size,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp", prefix),
+                    reduce_results=False,
                 )
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-5))
         self.input_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
-
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=is_moe_layer,
-            is_previous_layer_sparse=is_previous_moe_layer,
-            is_next_layer_sparse=is_next_layer_moe_layer,
-        )
 
         qkv_latent_func = (
             self.attention.prepare_qkv_latent
             if config.attention_type == 1 and self.use_mla
             else None
         )
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=False,
-            qkv_latent_func=qkv_latent_func,
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (
+                declare_attn(),
+                self.input_layernorm,
+                {"qkv_latent_func": qkv_latent_func},
+            ),
+            (
+                declare_ffn(
+                    sparse=is_moe_layer,
+                    next_layer_sparse=is_next_layer_moe_layer,
+                ),
+                self.post_attention_layernorm,
+            ),
         )
 
     def _is_layer_sparse(
@@ -853,13 +847,10 @@ class BailingMoELinearDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         # logger.warning(
         #     f"===={self.layer_id=}, 1 shape= {hidden_states.shape}, {residual.shape}"
         # )
@@ -880,32 +871,14 @@ class BailingMoELinearDecoderLayer(nn.Module):
         # logger.warning(
         #     f"===={self.layer_id=}, 2 shape= {hidden_states.shape}, {residual.shape}"
         # )
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         # logger.warning(
         #     f"===={self.layer_id=}, 3 shape= {hidden_states.shape}, {residual.shape}"
         # )
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
-            hidden_states = self.mlp(hidden_states)
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-        return hidden_states, residual
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        return hidden_states
 
     @staticmethod
     def shared_moe_coefficient_loader(
@@ -918,7 +891,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
 
 
 class BailingMoELinearModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -926,7 +898,7 @@ class BailingMoELinearModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.vocab_size = config.vocab_size
         self.embed_dim = config.hidden_size
@@ -943,9 +915,9 @@ class BailingMoELinearModel(nn.Module):
             f"Layer config: {num_linear} linear attention layers, {num_full} full attention layers"
         )
 
-        assert (
-            self.num_layers % self.layer_group_size == 0
-        ), f"num_layers={self.num_layers} must be divided by layer_group_size={self.layer_group_size}"
+        assert self.num_layers % self.layer_group_size == 0, (
+            f"num_layers={self.num_layers} must be divided by layer_group_size={self.layer_group_size}"
+        )
 
         if self.pp_group.is_first_rank:
             self.word_embeddings = VocabParallelEmbedding(
@@ -972,11 +944,9 @@ class BailingMoELinearModel(nn.Module):
                 alt_stream=self.alt_stream,
             )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             self.num_layers,
             layer_fn,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 
@@ -1003,11 +973,12 @@ class BailingMoELinearModel(nn.Module):
                 hidden_states = self.word_embeddings(input_ids)
             else:
                 hidden_states = inputs_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         total_num_layers = self.end_layer - self.start_layer
         device = inputs_embeds.device if inputs_embeds is not None else input_ids.device
@@ -1020,28 +991,24 @@ class BailingMoELinearModel(nn.Module):
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     hidden_states=hidden_states,
                     positions=positions,
                     forward_batch=forward_batch,
-                    residual=residual,
                     zero_allocator=zero_allocator,
                 )
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         else:
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                hidden_states = residual_batch.final_norm(
+                    hidden_states, forward_batch, self.norm
+                )
             return hidden_states
 
 
 class BailingMoELinearForCausalLM(nn.Module):
-
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1073,7 +1040,7 @@ class BailingMoELinearForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = BailingMoELinearModel(
@@ -1089,7 +1056,7 @@ class BailingMoELinearForCausalLM(nn.Module):
                     config.hidden_size,
                     params_dtype=torch.float32,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
             )
             self.logits_processor = LogitsProcessor(config)
@@ -1492,7 +1459,6 @@ class BailingMoELinearForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
@@ -1514,7 +1480,6 @@ class BailingMoELinearForCausalLM(nn.Module):
                     )
                     break
                 else:
-
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     if "slope" in name:
@@ -1571,7 +1536,6 @@ class BailingMoELinearForCausalLM(nn.Module):
                             cached_a_proj.pop(q_a_proj_name)
                             cached_a_proj.pop(kv_a_proj_name)
                     else:
-
                         if name not in params_dict:
                             name = name.replace(".dense.", ".o_proj.")
                             if name not in params_dict:

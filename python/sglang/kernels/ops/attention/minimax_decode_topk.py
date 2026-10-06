@@ -3,8 +3,10 @@
 Drop-in replacement for the 2-stage split-K Triton topk
 (``_topk_index_partial_kernel`` + ``_topk_index_merge_kernel``): given the
 decode score tensor ``[num_heads, batch, max_seqblock]`` it produces
-``topk_idx`` ``[num_heads, batch, topk]`` (0-indexed block ids, front-packed,
-``-1`` padded), matching the consumer ``_gqa_share_sparse_decode_kernel``.
+``topk_idx`` ``[num_heads, batch, topk]`` (0-indexed block ids, sorted
+ascending, ``-1`` padded at the tail). Ascending order is required by the MSA
+fmha_sm100 consumer; the Triton ``_gqa_share_sparse_decode_kernel`` is
+order-insensitive.
 
 ``minimax_decode_topk_page_table`` additionally fuses the page-table transform
 for the dense paged backend (trtllm_mha / fa3) and returns the page table plus
@@ -17,15 +19,23 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
+# Must match TopKTrait::kMaxNumBlocks in minimax_decode_topk.cuh.
+_MAX_NUM_BLOCKS = 16384 if torch.version.hip else 4096
+
 
 @cache_once
 def _jit_module(seq_dtype: torch.dtype) -> Module:
-    args = make_cpp_args(seq_dtype, True)  # SeqLenT, kUsePDL
+    args = make_cpp_args(seq_dtype, is_arch_support_pdl())  # SeqLenT, kUsePDL
     return load_jit(
         "minimax_decode_topk",
         *args,
@@ -52,6 +62,9 @@ def minimax_decode_topk(
     assert seq_lens.dtype in (torch.int32, torch.int64)
     num_heads, batch, max_seqblock = score.shape
     assert seq_lens.shape[0] == batch
+    assert max_seqblock <= _MAX_NUM_BLOCKS, (
+        f"max_seqblock={max_seqblock} exceeds kMaxNumBlocks={_MAX_NUM_BLOCKS}"
+    )
 
     if not score.is_contiguous():
         score = score.contiguous()
@@ -97,6 +110,9 @@ def minimax_decode_topk_page_table(
     TP>=4 behavior (page index == base_page)."""
     assert score.is_cuda and score.dtype == torch.float32 and score.dim() == 3
     num_heads, batch, max_seqblock = score.shape
+    assert max_seqblock <= _MAX_NUM_BLOCKS, (
+        f"max_seqblock={max_seqblock} exceeds kMaxNumBlocks={_MAX_NUM_BLOCKS}"
+    )
     assert block_size % page_size == 0
     assert req_to_token.dtype == torch.int32 and slot_ids.dtype == torch.int64
     if not score.is_contiguous():

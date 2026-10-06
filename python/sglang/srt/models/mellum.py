@@ -25,8 +25,11 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -51,7 +54,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, is_cuda
 
 _is_cuda = is_cuda()
@@ -184,8 +187,6 @@ class MellumAttention(Qwen3MoeAttention):
         self.rope_theta = rope_params.get("rope_theta", 10000.0)
         rope_scaling = rope_params if _get_rope_type(rope_params) != "default" else None
 
-        self.tp_rank = get_parallel().tp_rank
-
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -231,7 +232,7 @@ class MellumAttention(Qwen3MoeAttention):
         _yarn_factor = self._yarn_params["factor"]
 
         self.use_fused_qk_norm_rope = (
-            get_server_args().enable_fused_qk_norm_rope
+            get_exec().kernel.enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
             and _is_cuda
             and can_use_fused_qk_norm_rope(
@@ -395,9 +396,6 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
             alt_stream=alt_stream,
         )
 
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-
         mlp_layer_types = cfg.mlp_layer_types
         num_experts = cfg.num_experts
 
@@ -438,28 +436,23 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
                 hidden_act=cfg.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
             )
 
-        is_previous_layer_sparse = _is_sparse(layer_id - 1)
         is_next_layer_sparse = _is_sparse(layer_id + 1)
-
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=cfg.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
 
         self.input_layernorm = RMSNorm(cfg.hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=rms_norm_eps)
 
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            is_last_layer=(layer_id == cfg.num_hidden_layers - 1),
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
         )
 
 
@@ -494,7 +487,7 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
 
         from sglang.srt.layers.logits_processor import LogitsProcessor
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         cfg = cast(Any, config)
         self.config = cfg
         self.quant_config = quant_config
@@ -520,13 +513,12 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
             cfg.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(cfg)
         self.capture_aux_hidden_states = False
 
         self.attn_cp_size = get_parallel().attn_cp_size
-        self.attn_cp_rank = get_parallel().attn_cp_rank
         self.moe_dp_size = get_parallel().moe_dp_size
 
         assert self.attn_cp_size % self.moe_dp_size == 0, (

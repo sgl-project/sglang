@@ -1,30 +1,19 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
 
+from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline, Req
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    calculate_linear_shift,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.zimage import (
     ZImageProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
-
-
-def calculate_shift(
-    image_seq_len,
-    base_seq_len: int = 256,
-    max_seq_len: int = 4096,
-    base_shift: float = 0.5,
-    max_shift: float = 1.15,
-):
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    mu = image_seq_len * m + b
-    return mu
 
 
 def prepare_mu(batch: Req, server_args: ServerArgs):
@@ -34,19 +23,16 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
     image_seq_len = ((int(height) // vae_scale_factor) // 2) * (
         (int(width) // vae_scale_factor) // 2
     )
-    mu = calculate_shift(
-        image_seq_len,
-        # hard code, since scheduler_config is not in PipelineConfig now
-        256,
-        4096,
-        0.5,
-        1.15,
-    )
-    return "mu", mu
+    return "mu", calculate_linear_shift(image_seq_len)
 
 
 class ZImagePipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "ZImagePipeline"
+
+    # Used when the checkpoint is a single safetensors file with no
+    # model_index.json to derive these from.
+    pipeline_config_cls = ZImagePipelineConfig
+    sampling_params_cls = ZImageSamplingParams
 
     _required_config_modules = [
         "text_encoder",

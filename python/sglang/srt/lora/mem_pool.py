@@ -17,15 +17,16 @@ import torch
 
 from sglang.srt.distributed import (
     divide,
-    get_pp_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.eviction_policy import get_eviction_policy
-from sglang.srt.lora.layers import BaseLayerWithLoRA
+from sglang.srt.lora.layers import BaseLayerWithLoRA, unwrap_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.utils import (
+    ATTN_TP_LORA_MODULE_NAMES,
     EMBEDDING_NAMES,
     REPLICATED_LINEAR_LORA_NAMES,
     ROW_PARALLELISM_LINEAR_LORA_NAMES,
@@ -130,13 +131,13 @@ def _moe_runner_keeps_global_expert_ids() -> bool:
 class LoRAMemoryPool:
     """Class for memory pool management of lora modules"""
 
+    supports_dp_attention_overlap_loading = False
+
     def __init__(
         self,
         base_hf_config: AutoConfig,
         max_loras_per_batch: int,
         dtype: torch.dtype,
-        tp_size: int,
-        tp_rank: int,
         max_lora_rank: int,
         target_modules: Set[str],
         base_model: torch.nn.Module,
@@ -150,8 +151,9 @@ class LoRAMemoryPool:
         self.num_layer: int = base_hf_config.num_hidden_layers
         self.max_loras_per_batch: int = max_loras_per_batch
         self.dtype: torch.dtype = dtype
-        self.tp_size: int = tp_size
-        self.tp_rank: int = tp_rank
+        parallel = get_parallel()
+        self.tp_size: int = parallel.tp_size
+        self.tp_rank: int = parallel.tp_rank
         self.lora_added_tokens_size: int = lora_added_tokens_size
         self.max_lora_rank: int = max_lora_rank
         self.target_modules: Set[str] = target_modules
@@ -176,15 +178,20 @@ class LoRAMemoryPool:
         )
 
         # Per-expert MoE weights are sharded by `moe_tp_size`, NOT the outer
-        # `tp_size`: `moe_tp_size = tp_size // ep_size // dp_size`, so under
+        # `tp_size`: `moe_tp_size = tp_size // ep_size // moe_dp_size`, so under
         # e.g. `--tp 4 --ep 4` each rank holds full-width expert weights
         # (`moe_tp_size == 1`). Sizing per-expert LoRA buffers by `tp_size`
         # here would yield a 4x-narrower inner dim than the adapter weight
         # (which MoE LoRA modules correctly skip-slice when
         # `moe_tp_size <= 1`), producing a shape-mismatch
-        # assert during weight load. Non-MoE modules still shard by
-        # `tp_size` because attention TP is unchanged.
+        # assert during weight load.
         self.moe_tp_size, self.moe_tp_rank = _get_moe_tp_context()
+
+        # Attention projections shard along the attention TP group, which
+        # under attention DP is `attn_tp_size = tp_size // attn_dp_size`.
+        # The corresponding LoRA wrappers slice weights by the base layer's
+        # attn_tp-local rank, so the buffer shapes must match that shard.
+        self.attn_tp_size: int = parallel.attn_tp_size
 
         # Initialize eviction policy
         self.eviction_policy = get_eviction_policy(eviction_policy)
@@ -218,7 +225,7 @@ class LoRAMemoryPool:
         # Cache lm_head shard_indices from the base model so that buffer
         # allocation uses the same sharding as the base ParallelLMHead layer.
         self.lm_head_shard_indices = None
-        if "lm_head" in target_modules and tp_size > 1:
+        if "lm_head" in target_modules and self.tp_size > 1:
             from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
             for _, module in base_model.named_modules():
@@ -259,6 +266,52 @@ class LoRAMemoryPool:
     def is_shared_moe_module(module_name: str) -> bool:
         """Whether this buffer belongs to the shared-expert MoE namespace."""
         return module_name.endswith("_shared_moe")
+
+    def _effective_tp_size(self, module_name: str) -> int:
+        """TP width the module's weights are actually sharded along: routed
+        MoE experts shard by `moe_tp_size` (shared experts by the outer
+        `tp_size` at EP=1), attention projections by `attn_tp_size` (smaller
+        than the outer `tp_size` under attention DP), everything
+        else by the outer `tp_size`."""
+        if self.is_moe_module(module_name) and not self.is_shared_moe_module(
+            module_name
+        ):
+            return self.moe_tp_size
+        if module_name in ATTN_TP_LORA_MODULE_NAMES:
+            return self.attn_tp_size
+        return self.tp_size
+
+    def _dense_local_dim(
+        self,
+        module_name: str,
+        base_model: torch.nn.Module,
+        layer_idx: int,
+        axis: str,
+    ) -> Optional[int]:
+        """Per-rank LoRA width of a dense linear along ``axis``, read from its base layer."""
+        if module_name in ATTN_TP_LORA_MODULE_NAMES or self.is_moe_module(module_name):
+            return None
+        linears = getattr(self, "_dense_linears", None)
+        if linears is None:
+            linears = {}
+            for name, module in base_model.named_modules():
+                layer_id = get_layer_id(name)
+                base_layer = unwrap_lora_layer(module)
+                if layer_id is not None and (
+                    hasattr(base_layer, "input_size_per_partition")
+                    or hasattr(base_layer, "output_partition_sizes")
+                ):
+                    linears.setdefault((name.rsplit(".", 1)[-1], layer_id), base_layer)
+            self._dense_linears = linears
+        base_layer = linears.get((module_name, layer_idx))
+        if base_layer is None:
+            return None
+        if axis == "input":
+            return getattr(base_layer, "input_size_per_partition", None)
+        partitions = getattr(base_layer, "output_partition_sizes", None)
+        if not partitions:
+            return None
+        return sum(partitions[: get_stacked_multiply(module_name, base_model)])
 
     @staticmethod
     def _get_num_experts(base_model: torch.nn.Module) -> int:
@@ -388,19 +441,18 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name, base_model)
-        # Routed MoE shards along moe_tp_size; shared MoE shards over full TP at EP=1.
-        effective_tp_size = (
-            self.tp_size
-            if not self.is_moe_module(module_name)
-            or self.is_shared_moe_module(module_name)
-            else self.moe_tp_size
-        )
+        effective_tp_size = self._effective_tp_size(module_name)
         if (
-            effective_tp_size > 1
-            and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            input_dim = divide(input_dim, effective_tp_size)
+            local_dim = self._dense_local_dim(
+                module_name, base_model, layer_idx, "input"
+            )
+            if local_dim is not None:
+                input_dim = local_dim
+            elif effective_tp_size > 1:
+                input_dim = divide(input_dim, effective_tp_size)
 
         if self.is_moe_module(module_name):
             if self.is_shared_moe_module(module_name):
@@ -491,21 +543,21 @@ class LoRAMemoryPool:
         _, output_dim = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        # Same TP-vs-moe-TP sharding rule as get_lora_A_shape above.
-        effective_tp_size = (
-            self.tp_size
-            if not self.is_moe_module(module_name)
-            or self.is_shared_moe_module(module_name)
-            else self.moe_tp_size
-        )
+        # Same sharding rule as get_lora_A_shape above.
+        effective_tp_size = self._effective_tp_size(module_name)
         if (
-            effective_tp_size > 1
-            and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            output_dim = self._column_parallel_lora_b_per_rank_dim(
-                module_name, output_dim, effective_tp_size
+            local_dim = self._dense_local_dim(
+                module_name, base_model, layer_idx, "output"
             )
+            if local_dim is not None:
+                output_dim = local_dim
+            elif effective_tp_size > 1:
+                output_dim = self._column_parallel_lora_b_per_rank_dim(
+                    module_name, output_dim, effective_tp_size
+                )
 
         # Check if MoE module and return appropriate shape
         if self.is_moe_module(module_name):
@@ -855,9 +907,9 @@ class LoRAMemoryPool:
                 # to avoid contamination from the residual weight of the evicted adapters.
                 buffer_view.zero_()
             else:
-                assert (
-                    buffer_view.shape == weight.shape
-                ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+                assert buffer_view.shape == weight.shape, (
+                    f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+                )
                 copy_weight_into_buffer(buffer_view, weight)
 
         if uid is None:
@@ -1067,7 +1119,7 @@ class LoRAMemoryPool:
 
                 # Handle standard modules
                 temp_A_buffer[target_module] = module.slice_lora_a_weights(
-                    temp_A_buffer[target_module], self.tp_rank
+                    temp_A_buffer[target_module]
                 )
                 cache_keys = temp_A_cache_keys[target_module]
                 assert cache_keys is not None
@@ -1077,7 +1129,7 @@ class LoRAMemoryPool:
                 )
 
                 temp_B_buffer[target_module] = module.slice_lora_b_weights(
-                    temp_B_buffer[target_module], self.tp_rank
+                    temp_B_buffer[target_module]
                 )
                 cache_keys = temp_B_cache_keys[target_module]
                 assert cache_keys is not None
@@ -1413,7 +1465,7 @@ class LoRAMemoryPool:
                     # Slice B along vocab dimension for this TP rank
                     if self.tp_size > 1:
                         lora_b_weights = lora_lm_head_module.slice_lora_b_weights(
-                            lora_b_weights, self.tp_rank
+                            lora_b_weights
                         )
                         cache_key = append_cache_key_suffix(name, f"tp{self.tp_rank}")
                     else:
@@ -1447,9 +1499,9 @@ class LoRAMemoryPool:
                     # Non-last PP stages do not own lm_head, so adapters can
                     # legitimately contain lm_head LoRA weights with no local
                     # module to load them into, otherwise we should have been able to load this weight.
-                    assert (
-                        not get_pp_group().is_last_rank
-                    ), f"Failed to load lm_head LoRA weight: {name}, this is only expected to happen on non-last PP stages."
+                    assert not get_parallel().pp_group.is_last_rank, (
+                        f"Failed to load lm_head LoRA weight: {name}, this is only expected to happen on non-last PP stages."
+                    )
                     continue
         else:
             # Zero out embedding/lm_head buffers for adapters without embedding LoRA

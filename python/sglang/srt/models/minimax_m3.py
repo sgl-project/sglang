@@ -23,26 +23,29 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
-)
-from sglang.srt.distributed import (
-    get_pp_group,
-    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerScatterModes,
-    ScatterMode,
-    enable_moe_dense_fully_dp,
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
 )
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+    is_dense_ffn_fully_dp,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -54,7 +57,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    is_shared_experts_fusion_disabled,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -74,25 +80,39 @@ from sglang.srt.model_executor.forward_context import (
     get_forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
+    is_npu,
     log_info_on_rank0,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
+_is_gfx95_supported = _is_hip and is_gfx95_supported()
 _device_sm = get_device_sm()
+
+if _is_gfx95_supported:
+    from sglang.kernels.ops.gemm.router_gemv import (
+        router_gemv,
+        router_gemv_supported,
+    )
+else:
+    router_gemv = router_gemv_supported = None
 
 _FP8_KV_DTYPES = (
     torch.float8_e4m3fn,
@@ -117,6 +137,27 @@ if _is_hip:
     except ImportError:
         _has_rocm_qk_norm_rope = False
 
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
+        split_qkv_rmsnorm_rope_pos_cache_half_npu,
+    )
+
+    from sglang.srt.hardware_backend.npu.utils import (
+        process_shared_expert,
+        wait_share_stream,
+    )
+
+_aiter = None
+_has_aiter_fused_qknorm = False
+if _is_hip and envs.SGLANG_USE_AITER.get():
+    try:
+        import aiter as _aiter
+
+        _has_aiter_fused_qknorm = hasattr(_aiter, "fused_qknorm_idxrqknorm")
+    except ImportError:
+        _aiter = None
+        _has_aiter_fused_qknorm = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -130,7 +171,6 @@ class MultiHeadRMSNorm(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_world = get_parallel().attn_tp_size
-        self.tp_rank = get_parallel().attn_tp_rank
         self.num_heads = num_heads
         self.num_heads_per_tp = num_heads // self.tp_world
         self.head_dim = head_dim
@@ -194,9 +234,18 @@ class _FusedQKVIndexProj(nn.Module):
                 "weight_scale_inv", nn.Parameter(weight_scale_inv, requires_grad=False)
             )
             self.weight_scale_inv.format_ue8m0 = True
-            # Must derive the backend scale layout here: the loader skips this
-            # module (see ``_qm``), so it won't run process_weights_after_loading.
-            quant_method._process_mxfp8_linear_weight_scale(self)
+            # The loader skips this module (see ``_qm``), so run the weight
+            # post-process here instead of process_weights_after_loading.
+            if getattr(quant_method, "convert_mxfp8_to_block", False):
+                # Block-fp8 (gfx942/gfx950): convert the concatenated MXFP8 weight
+                # to block-fp8 [128,128] and run the same fnuz/scale/preshuffle
+                # steps as the per-linear path (this also flips quant_method into
+                # block-fp8 state). q/kv and index output sizes are 128-aligned, so
+                # converting the concatenation equals converting each proj alone.
+                quant_method.process_weights_after_loading_block_quant(self)
+            else:
+                # Derive the backend scale layout for the native MXFP8 GEMM.
+                quant_method._process_mxfp8_linear_weight_scale(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._qm.apply(self, x, None)
@@ -209,6 +258,14 @@ def build_minimax_fused_qkv_index(model: nn.Module) -> None:
 
 
 class MiniMaxM3MLP(nn.Module):
+    @staticmethod
+    def _swigluoai_fused(x: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
+        """swiglu_oai using fused Triton kernel (sgl_kernel_npu), no quant."""
+        from sgl_kernel_npu.activation.swiglu_oai_quant import swiglu_oai_quant
+
+        out, _ = swiglu_oai_quant(x, alpha, limit, need_quant=False)
+        return out
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -245,13 +302,18 @@ class MiniMaxM3MLP(nn.Module):
         if hidden_act == "silu":
             self.act_fn = SiluAndMul()
         elif hidden_act == "swigluoai":
-            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
-                swiglu_no_interleaved_with_alpha_and_limit,
-            )
+            if _is_npu:
+                self.act_fn = lambda x: self._swigluoai_fused(
+                    x, config.swiglu_alpha, config.swiglu_limit
+                )
+            else:
+                from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+                    swiglu_no_interleaved_with_alpha_and_limit,
+                )
 
-            self.act_fn = lambda x: swiglu_no_interleaved_with_alpha_and_limit(
-                x, config.swiglu_alpha, config.swiglu_limit
-            )
+                self.act_fn = lambda x: swiglu_no_interleaved_with_alpha_and_limit(
+                    x, config.swiglu_alpha, config.swiglu_limit
+                )
         else:
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
@@ -260,15 +322,11 @@ class MiniMaxM3MLP(nn.Module):
     def forward(
         self,
         x,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x,
-            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
-        )
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -280,15 +338,15 @@ class MiniMaxM3MoE(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
+        alt_stream: Optional[torch.cuda.Stream] = None,
         prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
+        self.alt_stream = alt_stream
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
         self.num_fused_shared_experts = (
-            0
-            if get_server_args().disable_shared_experts_fusion
-            else config.n_shared_experts
+            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
         )
 
         if self.tp_size > config.num_local_experts:
@@ -311,7 +369,7 @@ class MiniMaxM3MoE(nn.Module):
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_local_experts
             + self.num_fused_shared_experts
-            + get_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
@@ -321,6 +379,7 @@ class MiniMaxM3MoE(nn.Module):
             activation="silu",
             is_gated=True,
             gemm1_alpha=config.swiglu_alpha,
+            gemm1_beta=1.0,
             gemm1_clamp_limit=config.swiglu_limit,
             prefix=add_prefix("experts", prefix),
             gate_up_interleaved=False,
@@ -365,7 +424,6 @@ class MiniMaxM3MoE(nn.Module):
         self.layer_id = layer_id
 
         if get_moe_a2a_backend().is_deepep():
-            self.ep_size = get_parallel().moe_ep_size
             self.top_k = config.num_experts_per_tok
 
     @staticmethod
@@ -377,50 +435,65 @@ class MiniMaxM3MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if get_moe_a2a_backend().is_deepep():
             return self.forward_deepep(hidden_states, forward_batch)
         else:
-            return self.forward_normal(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
+            return self.forward_normal(hidden_states)
 
-    def forward_normal(
-        self,
-        hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
+    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
-            shared_output = self._forward_shared_experts(hidden_states)
-            router_logits = self._compute_router_logits(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            if (
+                self.alt_stream is not None
+                and self.shared_experts is not None
+                and get_is_capture_mode()
+            ):
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                shared_output = self._forward_shared_experts(hidden_states)
+                with torch.cuda.stream(self.alt_stream):
+                    final_hidden_states = self._forward_router_experts(hidden_states)
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                shared_output = self._forward_shared_experts(hidden_states)
+                final_hidden_states = self._forward_router_experts(hidden_states)
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
-
-        final_hidden_states = self.experts(hidden_states, topk_output)
+            final_hidden_states = self.experts(hidden_states, topk_output)
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1 and not should_allreduce_fusion and not use_reduce_scatter:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-
         return final_hidden_states
+
+    def _forward_router_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        router_logits = self._compute_router_logits(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
+        return self.experts(hidden_states, topk_output)
 
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
+        """DeepEP MoE forward: routed experts via a2a, shared experts replicated."""
         shared_output = None
+        enable_npu_dual_stream = _is_npu and (
+            forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_decode()
+        )
         if hidden_states.shape[0] > 0:
-            shared_output = self._forward_shared_experts(hidden_states)
             router_logits = self._compute_router_logits(hidden_states)
+            if enable_npu_dual_stream:
+                # Overlap shared experts with router/experts on a separate stream.
+                shared_output = process_shared_expert(
+                    hidden_states, self._forward_shared_experts
+                )
+            else:
+                shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -432,6 +505,9 @@ class MiniMaxM3MoE(nn.Module):
         # shared experts are replicated (tp_size=1), so both add directly.
         final_hidden_states = self.experts(hidden_states, topk_output)
 
+        if enable_npu_dual_stream:
+            wait_share_stream()
+
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
@@ -439,6 +515,13 @@ class MiniMaxM3MoE(nn.Module):
 
     def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.bf16_router_gemm:
+            if router_gemv is not None and router_gemv_supported(
+                hidden_states, self.gate.weight
+            ):
+                return router_gemv(hidden_states, self.gate.weight)
+            if _is_npu:
+                # NPU lacks aten::mm.dtype; bf16 mm then cast keeps topk semantics.
+                return torch.mm(hidden_states, self.gate.weight.t()).float()
             return torch.mm(
                 hidden_states, self.gate.weight.t(), out_dtype=torch.float32
             )
@@ -470,7 +553,6 @@ class MiniMaxM3Attention(nn.Module):
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_size = attn_tp_size
-        self.attn_tp_rank = attn_tp_rank
 
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % attn_tp_size == 0
@@ -498,6 +580,7 @@ class MiniMaxM3Attention(nn.Module):
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.rotary_dim = getattr(config, "rotary_dim", self.head_dim)
 
+        self.use_qk_norm = getattr(config, "use_qk_norm", False)
         self.qk_norm_type = getattr(config, "qk_norm_type", "per_layer")
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
 
@@ -702,6 +785,23 @@ class MiniMaxM3Attention(nn.Module):
             and self.index_k_norm.variance_epsilon == self.q_norm.variance_epsilon
             and self.index_rotary_emb is self.rotary_emb
         )
+        self._aiter_cos_sin_cache = None
+        self._can_use_aiter_fused_qknorm_static = (
+            self.is_sparse_attention_layer
+            and self.disable_index_value
+            and _has_aiter_fused_qknorm
+            and envs.SGLANG_M3_USE_AITER_FUSED_QKNORM.get()
+            and self.qk_norm_type == "per_head"
+            and self.use_gemma_norm
+            and self.head_dim == 128
+            and self.idx_head_dim == 128
+            and self.rotary_dim <= self.head_dim
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and self.index_rotary_emb is self.rotary_emb
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
+            and self.index_q_norm.variance_epsilon == self.q_norm.variance_epsilon
+            and self.index_k_norm.variance_epsilon == self.q_norm.variance_epsilon
+        )
 
     def _can_use_rocm_qk_norm_rope(
         self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
@@ -819,11 +919,6 @@ class MiniMaxM3Attention(nn.Module):
         if type(ip.quant_method) is not type(qm):
             return
 
-        # gfx942 converts MXFP8->block-fp8 in process_weights_after_loading; the
-        # fused module skips that pass, so keep two separate (converted) GEMMs.
-        if getattr(qm, "convert_mxfp8_to_block", False):
-            return
-
         is_unquant = isinstance(qm, UnquantizedLinearMethod)
         use_mxfp8 = getattr(qm, "use_mxfp8", False) and hasattr(qp, "weight_scale_inv")
         if not (is_unquant or use_mxfp8):
@@ -936,6 +1031,158 @@ class MiniMaxM3Attention(nn.Module):
         sparse_backend = getattr(attn_backend, "sparse", None)
         return getattr(sparse_backend, "kv_pool", None)
 
+    def _get_aiter_cos_sin_cache(self, packed_qkv: torch.Tensor) -> torch.Tensor:
+        source = self.rotary_emb.cos_sin_cache
+        cached = self._aiter_cos_sin_cache
+        if (
+            cached is not None
+            and cached.dtype == packed_qkv.dtype
+            and cached.device == packed_qkv.device
+            and cached.shape == source.shape
+        ):
+            return cached
+
+        cached = source.to(
+            device=packed_qkv.device, dtype=packed_qkv.dtype
+        ).contiguous()
+        if not torch.compiler.is_compiling():
+            self._aiter_cos_sin_cache = cached
+        return cached
+
+    def _aiter_sparse_qknorm_cache(
+        self,
+        packed_qkv: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[
+        Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Optional[torch.Tensor],
+        ]
+    ]:
+        """Run AITER's packed MiniMax-M3 producer with SGLang cache semantics.
+
+        The SGLang contract is page-major NHD storage, unit-scale main FP8, and
+        a BF16 index-K cache. The sparse attention consumer reads those caches
+        directly, so K/V/index-K tensor outputs are intentionally left raw and
+        must not be stored a second time by the backend.
+        """
+        if not self._can_use_aiter_fused_qknorm_static:
+            return None
+
+        kv_pool = self._get_sparse_kv_pool()
+        main_pool = getattr(kv_pool, "main_pool", None)
+        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        if (
+            kv_pool is None
+            or main_pool is None
+            or getattr(main_pool, "kv_cache_layout", None) != "nhd"
+            or out_cache_loc is None
+            or positions.dim() != 1
+            or positions.dtype != torch.int64
+            or not positions.is_contiguous()
+            or out_cache_loc.dim() != 1
+            or out_cache_loc.dtype != torch.int64
+            or not out_cache_loc.is_contiguous()
+            or packed_qkv.dim() != 2
+            or packed_qkv.dtype not in (torch.bfloat16, torch.float16)
+        ):
+            return None
+
+        num_tokens = packed_qkv.shape[0]
+        expected_width = (
+            self.num_heads + 2 * self.num_kv_heads + self.num_idx_heads + 1
+        ) * self.head_dim
+        if (
+            packed_qkv.shape[1] != expected_width
+            or positions.shape[0] < num_tokens
+            or out_cache_loc.shape[0] < num_tokens
+        ):
+            return None
+
+        layer_id = self.attn.layer_id
+        k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
+        idx_k_cache = kv_pool.get_index_k_buffer(layer_id)
+        page_size = int(kv_pool.page_size)
+        if (
+            page_size <= 0
+            or k_cache.dim() != 3
+            or v_cache.dim() != 3
+            or idx_k_cache.dim() != 3
+            or not k_cache.is_contiguous()
+            or not v_cache.is_contiguous()
+            or not idx_k_cache.is_contiguous()
+            or k_cache.shape != v_cache.shape
+            or k_cache.shape[1:] != (self.num_kv_heads, self.head_dim)
+            or idx_k_cache.shape[1:] != (1, self.idx_head_dim)
+            or k_cache.shape[0] % page_size != 0
+            or idx_k_cache.dtype != packed_qkv.dtype
+        ):
+            return None
+
+        fp8_e4m3_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        if k_cache.dtype in fp8_e4m3_dtypes:
+            kv_cache_dtype = "fp8_e4m3_unit"
+        elif k_cache.dtype == packed_qkv.dtype:
+            kv_cache_dtype = "auto"
+        else:
+            return None
+
+        num_blocks = k_cache.shape[0] // page_size
+        k_cache_pages = k_cache.view(
+            num_blocks, page_size, self.num_kv_heads, self.head_dim
+        )
+        v_cache_pages = v_cache.view(
+            num_blocks, page_size, self.num_kv_heads, self.head_dim
+        )
+        q_out = torch.empty(
+            (num_tokens, self.q_size),
+            dtype=packed_qkv.dtype,
+            device=packed_qkv.device,
+        )
+        idx_q_out = torch.empty(
+            (num_tokens, self.num_idx_heads * self.idx_head_dim),
+            dtype=packed_qkv.dtype,
+            device=packed_qkv.device,
+        )
+
+        _aiter.fused_qknorm_idxrqknorm(
+            packed_qkv.contiguous(),
+            self.q_norm.weight.data,
+            self.k_norm.weight.data,
+            self._get_aiter_cos_sin_cache(packed_qkv),
+            positions,
+            self.num_heads,
+            self.num_kv_heads,
+            self.rotary_dim,
+            self.q_norm.variance_epsilon,
+            self.index_q_norm.weight.data,
+            self.index_k_norm.weight.data,
+            self.num_idx_heads,
+            out_cache_loc,
+            k_cache_pages,
+            v_cache_pages,
+            idx_k_cache,
+            page_size,
+            q_out,
+            idx_q_out,
+            out_cache_loc,
+            kv_cache_dtype=kv_cache_dtype,
+            index_cache_dtype="auto",
+            asm_layout=False,
+        )
+
+        main_qkv = packed_qkv[:, : self._fused_main_size]
+        _, k, v = main_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        idx_qkv = packed_qkv[:, self._fused_main_size :]
+        _, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+        self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
+        return q_out, k, v, idx_q_out, idx_k, idx_v
+
     def _sparse_qk_index_norm_rope_cache(
         self,
         positions: torch.Tensor,
@@ -991,6 +1238,44 @@ class MiniMaxM3Attention(nn.Module):
             return q, k, idx_q, idx_k
         return self._sparse_qk_index_norm_rope(positions, q, k, idx_q, idx_k)
 
+    def forward_prepare_npu(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        """NPU qkv projection + fused norm/RoPE/split; returns (None, fb, inner_state)."""
+        if hidden_states.shape[0] == 0:
+            assert not self.o_proj.reduce_results, (
+                "short-circuiting allreduce will lead to hangs"
+            )
+            return hidden_states, forward_batch, None
+
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
+            input_tensor=qkv,
+            positions=positions.reshape(-1),
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            q_hidden_size=self.q_size,
+            kv_hidden_size=self.kv_size,
+            head_dim=self.head_dim,
+            eps=self.q_norm.variance_epsilon,
+            q_weight=self.q_norm.gemma_weight,
+            k_weight=self.k_norm.gemma_weight,
+            rope_dim=self.rotary_dim,
+            cast_norm_to_bf16=True,
+        )
+        if self.is_sparse_attention_layer:
+            idx_qkv, _ = self.index_qkv_proj(hidden_states)
+            # Index attention disables the V head on all M3 sparse layers, so
+            # index_qkv_proj emits a 2-way [q|k] tensor.
+            idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+            idx_q, idx_k = self._index_qk_norm_rope(positions, idx_q, idx_k)
+            inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
+        else:
+            inner_state = (q, k, v, forward_batch)
+        return None, forward_batch, inner_state
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -1001,6 +1286,14 @@ class MiniMaxM3Attention(nn.Module):
         if self._fused_qkv_index is not None:
             fused_out = self.fused_qkv_index_proj(hidden_states)
             qkv = fused_out[:, : self._fused_main_size]
+
+            aiter_prepared = self._aiter_sparse_qknorm_cache(
+                fused_out, positions, forward_batch
+            )
+            if aiter_prepared is not None:
+                q, k, v, idx_q, idx_k, idx_v = aiter_prepared
+                inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
+                return None, forward_batch, inner_state
 
             if self._combined_qknorm_ok:
                 from sglang.kernels.ops.attention.minimax_qknorm_rope import (
@@ -1107,8 +1400,7 @@ class MiniMaxM3Attention(nn.Module):
             output, _ = self.o_proj(attn_output)
             if self.disable_index_value:
                 return output
-            # idx_replica_size ranks produce identical idx_o; pre-divide idx_o (not the
-            # o_proj weight) so the TP all-reduce sums right and stays FP8-quant-safe.
+            # Pre-divide idx_o (not the weight) so the TP all-reduce sums right.
             if self.idx_replica_size > 1:
                 idx_o = idx_o / self.idx_replica_size
             idx_output, _ = self.index_o_proj(idx_o)
@@ -1125,11 +1417,18 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        s = self.forward_prepare(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
+        if _is_npu:
+            s = self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        else:
+            s = self.forward_prepare(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
         return self.forward_core(s)
 
 
@@ -1139,6 +1438,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
+        alt_stream: Optional[torch.cuda.Stream] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -1168,7 +1468,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
         moe_layer_freq = getattr(config, "moe_layer_freq", None)
         # Means "MLP is a sparse MoE", not attention sparsity. Kept as ``is_layer_sparse``
-        # because LayerCommunicator / LayerScatterModes / other models read this attr.
+        # because model construction and downstream integrations read this attr.
         self.is_layer_sparse = (
             moe_layer_freq[layer_id] != 0 if moe_layer_freq is not None else True
         )
@@ -1178,10 +1478,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
+                alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -1192,6 +1493,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 intermediate_size=config.dense_intermediate_size,
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
+                reduce_results=False,
             )
 
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
@@ -1215,21 +1517,17 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 return True
             return moe_layer_freq[lid] != 0
 
-        is_previous_layer_sparse = _is_layer_sparse(layer_id - 1)
         is_next_layer_sparse = _is_layer_sparse(layer_id + 1)
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
 
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
         )
 
     def forward(
@@ -1237,18 +1535,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-                **kwargs,
-            )
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            capture_gathered=captured_last_layer_outputs,
+            **kwargs,
         )
 
         if hidden_states.shape[0] != 0:
@@ -1258,39 +1552,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        if self.is_layer_sparse and get_parallel().tp_size > 1:
-            # Sparse MoE outputs are TP-partial; deferring their all-reduce into the next
-            # layer's fusion re-triggers the M3 no-EOS runaway. Force immediate all-reduce.
-            should_allreduce_fusion = False
-
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         if self.is_layer_sparse or hidden_states.shape[0] != 0:
-            hidden_states = self.mlp(
-                hidden_states,
-                should_allreduce_fusion,
-                use_reduce_scatter,
-            )
-
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-
-        return hidden_states, residual
+            hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class MiniMaxM3Model(nn.Module):
@@ -1308,7 +1575,7 @@ class MiniMaxM3Model(nn.Module):
 
         self.padding_idx = getattr(config, "pad_token_id", 0)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
 
         if self.pp_group.is_first_rank:
@@ -1321,19 +1588,20 @@ class MiniMaxM3Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        alt_stream = get_stream("alt") if _is_cuda else None
+
         def layer_fn(idx, prefix: str) -> nn.Module:
             return MiniMaxM3DecoderLayer(
                 config=config,
                 layer_id=idx,
                 quant_config=quant_config,
+                alt_stream=alt_stream,
                 prefix=prefix,
             )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             layer_fn,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -1363,22 +1631,21 @@ class MiniMaxM3Model(nn.Module):
                 hidden_states = embeds(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         if forward_batch.can_run_tbo:
-            hidden_states, residual = model_forward_maybe_tbo(
+            hidden_states = model_forward_stages(
                 layers=self.layers,
                 enable_tbo=True,
-                input_data_scatter_mode=ScatterMode.model_input_output(),
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
-                residual=residual,
             )
         else:
             for i in range(self.start_layer, self.end_layer):
@@ -1390,27 +1657,20 @@ class MiniMaxM3Model(nn.Module):
                 )
                 with ctx:
                     layer = self.layers[i]
-                    hidden_states, residual = layer(
+                    hidden_states = layer(
                         positions=positions,
                         forward_batch=forward_batch,
                         hidden_states=hidden_states,
-                        residual=residual,
-                        captured_last_layer_outputs=(
-                            aux_hidden_states
-                            if getattr(layer, "_is_layer_to_capture", False)
-                            else None
-                        ),
+                        captured_last_layer_outputs=aux_hidden_states
+                        if getattr(layer, "_is_layer_to_capture", False)
+                        else None,
                     )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
-        if hidden_states.shape[0] != 0:
-            if residual is not None:
-                hidden_states, _ = self.norm(hidden_states, residual)
-            else:
-                hidden_states = self.norm(hidden_states)
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -1418,6 +1678,16 @@ class MiniMaxM3Model(nn.Module):
 
 
 class MiniMaxM3SparseForCausalLM(nn.Module):
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={".block_sparse_moe.": ".mlp."}
+    )
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        # no index_v_proj in the M3 checkpoint
+        "index_qkv_proj": ["index_q_proj", "index_k_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1428,7 +1698,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.num_fused_shared_experts = 0
         self.determine_num_fused_shared_experts()
@@ -1443,7 +1713,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
 
             self.logits_processor = LogitsProcessor(config)
@@ -1455,39 +1725,37 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
 
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        """Why this checkpoint cannot fuse its shared expert, or None. Asked by
+        the loader before any layer is built."""
+        if not getattr(hf_config, "n_shared_experts", None):
+            return "No shared experts are defined in the config."
+        if quant_config is not None and quant_config.get_name() == "modelopt_mixed":
+            return (
+                "Shared and routed experts may use different quantization formats "
+                "in ModelOpt mixed-precision checkpoints."
+            )
+        if not (_is_cuda or _is_hip):
+            return "Shared experts fusion currently requires CUDA or ROCm devices."
+        if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
+            return "Shared experts fusion requires SM80 or newer GPUs."
+        if _is_hip and not _is_gfx95_supported:
+            return "Shared experts fusion on ROCm is validated on gfx950 only."
+        if get_parallel().moe_ep_size > 1:
+            return "Shared experts fusion is not supported together with expert parallelism yet."
+        if get_moe_a2a_backend().is_deepep():
+            return "Shared experts fusion is not supported when Deepep MoE backend is enabled."
+        return None
+
     def determine_num_fused_shared_experts(self):
-        if get_server_args().disable_shared_experts_fusion:
+        # The decision was installed by the loader; this only reads it.
+        if is_shared_experts_fusion_disabled():
             return
-
-        disable_reason = None
-        if not getattr(self.config, "n_shared_experts", None):
-            disable_reason = "No shared experts are defined in the config."
-        elif not _is_cuda:
-            disable_reason = "Shared experts fusion currently requires CUDA devices."
-        elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
-            disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
-        elif get_parallel().moe_ep_size > 1:
-            disable_reason = "Shared experts fusion is not supported together with expert parallelism yet."
-        elif get_moe_a2a_backend().is_deepep():
-            disable_reason = "Shared experts fusion is not supported when Deepep MoE backend is enabled."
-
-        if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "MiniMaxM3ForCausalLM.determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
-            )
-            return
-
         self.num_fused_shared_experts = self.config.n_shared_experts
-        assert (
-            self.num_fused_shared_experts == 1
-        ), "Only 1 fused shared expert is supported for MiniMax-M3"
+        assert self.num_fused_shared_experts == 1, (
+            "Only 1 fused shared expert is supported for MiniMax-M3"
+        )
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
@@ -1504,6 +1772,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             ]
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+        # forward checks the per-layer ``_is_layer_to_capture`` flag, not the id
+        # list, so set it explicitly (mirrors qwen3_next/qwen2_moe).
+        for layer_id in self.model.layers_to_capture:
+            if 0 <= layer_id < len(self.model.layers):
+                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

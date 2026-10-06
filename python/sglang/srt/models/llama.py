@@ -26,10 +26,17 @@ from torch import nn
 from transformers import LlamaConfig
 
 from sglang.srt.distributed import (
-    get_pp_group,
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_QUANT_READOUT
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -53,8 +60,14 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_xpu, make_layers
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    is_npu,
+    is_xpu,
+    make_pp_layers,
+)
 from sglang.utils import get_exception_traceback
 
 _is_cuda = is_cuda()
@@ -103,8 +116,7 @@ class LlamaMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -151,6 +163,7 @@ class LlamaAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         bias: bool = False,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -195,6 +208,7 @@ class LlamaAttention(nn.Module):
             hidden_size,
             bias=bias,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -288,7 +302,11 @@ class LlamaDecoderLayer(nn.Module):
         start_layer: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        stage_boundaries: bool = True,
     ) -> None:
+        """``stage_boundaries=False`` is for a subclass that drives its own
+        residual in its own forward(): the attention and the MLP then complete
+        their own sums and no boundaries are built."""
         super().__init__()
         self.hidden_size = config.hidden_size
         rope_parameters = getattr(config, "rope_parameters", None)
@@ -325,6 +343,7 @@ class LlamaDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
             bias=attention_bias,
+            reduce_results=not stage_boundaries,
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -332,25 +351,38 @@ class LlamaDecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            reduce_results=not stage_boundaries,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        if not stage_boundaries:
+            return
+        self.input_layernorm.fuse_input_quant(self.self_attn.qkv_proj)
+        self.post_attention_layernorm.fuse_input_quant(self.mlp.gate_up_proj)
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(read=self._attn_readout(layer_id)), self.input_layernorm),
+            (
+                declare_ffn(sparse=False, next_layer_sparse=False),
+                self.post_attention_layernorm,
+            ),
+        )
+
+    def _attn_readout(self, layer_id: int):
+        return NORM_QUANT_READOUT
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        capture_output=None,
+    ) -> torch.Tensor:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, capture=capture_output
+        )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -358,9 +390,10 @@ class LlamaDecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class LlamaModel(nn.Module):
@@ -374,7 +407,7 @@ class LlamaModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -390,7 +423,7 @@ class LlamaModel(nn.Module):
             self.pp_group.rank_in_group,
             self.pp_group.world_size,
         )
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: LlamaDecoderLayer(
                 config=config,
@@ -399,8 +432,6 @@ class LlamaModel(nn.Module):
                 start_layer=pp_start_layer,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix="model.layers",
         )
 
@@ -423,35 +454,29 @@ class LlamaModel(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            # FIXME(@ying): reduce the number of proxy tensors by not fusing layer norms
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
-            deferred_norm = None
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states + residual)
-            layer = self.layers[i]
-            hidden_states, residual = layer(
+            hidden_states = self.layers[i](
                 positions,
                 hidden_states,
                 forward_batch,
-                residual,
+                capture_output=aux_hidden_states.capture
+                if i in self.layers_to_capture
+                else None,
             )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-        else:
-            hidden_states, _ = self.norm(hidden_states, residual)
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm
+        )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -479,7 +504,7 @@ class LlamaModel(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -516,7 +541,7 @@ class LlamaForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = self._init_model(config, quant_config, add_prefix("model", prefix))
@@ -530,7 +555,7 @@ class LlamaForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -601,6 +626,7 @@ class LlamaForCausalLM(nn.Module):
         start, end = split_interval
         # embed
         if start == 0:
+            residual_batch.start(forward_batch)
             if input_embeds is None:
                 forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
@@ -608,19 +634,17 @@ class LlamaForCausalLM(nn.Module):
         # decoder layer
         for i in range(start, end):
             layer = self.model.layers[i]
-            forward_batch.hidden_states, forward_batch.residual = layer(
+            forward_batch.hidden_states = layer(
                 positions,
                 forward_batch.hidden_states,
                 forward_batch,
-                forward_batch.residual,
             )
 
         if end == self.model.config.num_hidden_layers:
             # norm
-            hidden_states, _ = self.model.norm(
-                forward_batch.hidden_states, forward_batch.residual
+            forward_batch.hidden_states = residual_batch.final_norm(
+                forward_batch.hidden_states, forward_batch, self.model.norm
             )
-            forward_batch.hidden_states = hidden_states
             # logits process
             result = self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch

@@ -1,11 +1,8 @@
 import json
 import logging
-import re
 from collections.abc import Mapping
 from typing import List, Optional
 
-from partial_json_parser.core.exceptions import MalformedJSON
-from partial_json_parser.core.options import Allow
 from xgrammar import StructuralTag
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -16,9 +13,9 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import _is_complete_json, _partial_json_loads
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_INVOKE_TOOL_JSON,
+    CONTENT_INVOKE_TOOL_TEXT,
     END_MESSAGE,
     INKLING_CONTROL_TOKENS,
     INKLING_SPECIAL_TOKEN_IDS,
@@ -26,6 +23,11 @@ from sglang.srt.parser.inkling_tokenizer import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _reject_nonfinite_number(value: str) -> float:
+    # Strict tool-payload parsing rejects NaN/Infinity; only recovery accepts them.
+    raise ValueError(f"{value} is not a valid JSON number")
 
 
 class InklingDetector(BaseFormatDetector):
@@ -40,208 +42,189 @@ class InklingDetector(BaseFormatDetector):
         super().__init__()
         self.bot_token = CONTENT_INVOKE_TOOL_JSON
         self.eot_token = END_MESSAGE
-        self.tool_call_regex = re.compile(
-            re.escape(self.bot_token) + r"\s*(.*?)\s*" + re.escape(self.eot_token),
-            re.DOTALL,
-        )
-        self._current_header_name: str | None = None
+        # Streaming: index of the next call to emit; once a call fails to frame,
+        # the rest of the response streams through verbatim.
+        self._stream_call_index = 0
+        self._raw_passthrough = False
 
     def has_tool_call(self, text: str) -> bool:
-        return self.bot_token in text
+        return self.bot_token in text or CONTENT_INVOKE_TOOL_TEXT in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        if self.bot_token not in text:
+        if not self.has_tool_call(text):
             return StreamingParseResult(normal_text=self._clean_normal_text(text))
 
-        try:
-            calls: list[ToolCallItem] = []
-            for match in self.tool_call_regex.finditer(text):
-                try:
-                    payload = json.loads(match.group(1).strip())
-                except json.JSONDecodeError as exc:
-                    logger.warning("Invalid Inkling tool call JSON: %s", exc)
-                    continue
-                if not isinstance(payload, Mapping):
-                    logger.warning("Invalid Inkling tool call payload: %s", payload)
-                    continue
-                _, header_name = self._split_trailing_tool_header(text[: match.start()])
-                call = self._tool_call_item(
-                    payload, tools, len(calls), header_name=header_name
-                )
-                if call is not None:
-                    calls.append(call)
-
-            if not calls:
-                # Every candidate call was rejected (bad payload or a
-                # header/payload name mismatch). Match the framework contract
-                # every other detector follows: normal_text is only the content
-                # BEFORE the tool marker — the rejected tool-call region is
-                # dropped, never regurgitated as visible content.
-                prefix, _ = self._split_trailing_tool_header(
-                    text[: text.find(self.bot_token)]
-                )
-                return StreamingParseResult(normal_text=self._clean_normal_text(prefix))
-
-            normal_prefix, _ = self._split_trailing_tool_header(
-                text[: text.find(self.bot_token)]
-            )
-            normal_text = self._clean_normal_text(normal_prefix)
+        parsed = self._parse_canonical(text, tools)
+        if parsed is not None:
+            normal_text, calls = parsed
             return StreamingParseResult(normal_text=normal_text, calls=calls)
-        except Exception as exc:
-            logger.error("Error in Inkling detect_and_parse: %s", exc, exc_info=True)
-            prefix, _ = self._split_trailing_tool_header(
-                text[: text.find(self.bot_token)]
-            )
-            return StreamingParseResult(normal_text=self._clean_normal_text(prefix))
+
+        # Canonical framing failed. Recover a single call from the last tool
+        # marker; if that fails too, surface the whole visible payload as text.
+        recovered = self._recover_last_json_call(text, tools)
+        if recovered is not None:
+            return StreamingParseResult(normal_text="", calls=[recovered])
+        return StreamingParseResult(normal_text=self._clean_normal_text(text))
+
+    def _parse_canonical(
+        self, text: str, tools: List[Tool]
+    ) -> tuple[str, list[ToolCallItem]] | None:
+        """Extract every tool call under strict framing.
+
+        Returns (visible_text, calls) when EVERY marker frames a valid call, or
+        None if any marker is malformed/unterminated — one bad call fails the
+        whole batch, matching streaming.
+        """
+        calls: list[ToolCallItem] = []
+        normal_parts: list[str] = []
+        pos = 0
+        while pos < len(text):
+            marker_pos, marker_token, is_json = self._next_tool_marker(text, pos)
+            if marker_pos is None:
+                normal_parts.append(text[pos:])
+                break
+
+            prefix, _ = self._split_trailing_tool_header(text[pos:marker_pos])
+            normal_parts.append(prefix)
+
+            body_start = marker_pos + len(marker_token)
+            eot = text.find(self.eot_token, body_start)
+            if eot == -1:
+                return None  # unterminated -> recovery reads through EOS
+            body = text[body_start:eot]
+
+            if is_json:
+                call = self._canonical_json_call(body, tools, len(calls))
+                if call is None:
+                    return None
+            else:
+                call = self._text_tool_call(body, len(calls))
+            calls.append(call)
+            pos = eot + len(self.eot_token)
+
+        return self._clean_normal_text("".join(normal_parts)), calls
+
+    def _next_tool_marker(self, text: str, start: int) -> tuple[int | None, str, bool]:
+        """Earliest json/text tool marker at or after ``start`` (is_json flag)."""
+        json_pos = text.find(self.bot_token, start)
+        text_pos = text.find(CONTENT_INVOKE_TOOL_TEXT, start)
+        if json_pos == -1 and text_pos == -1:
+            return None, "", True
+        if text_pos == -1 or (json_pos != -1 and json_pos <= text_pos):
+            return json_pos, self.bot_token, True
+        return text_pos, CONTENT_INVOKE_TOOL_TEXT, False
+
+    def _canonical_json_call(
+        self, body: str, tools: List[Tool], call_index: int
+    ) -> ToolCallItem | None:
+        try:
+            payload = json.loads(body.strip(), parse_constant=_reject_nonfinite_number)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        return self._tool_call_item(payload, tools, call_index)
+
+    def _recover_last_json_call(
+        self, text: str, tools: List[Tool]
+    ) -> ToolCallItem | None:
+        """Recover one call from the last json marker, reading through the next
+        end token or EOS. Requires a nonempty name; accepts NaN/Infinity."""
+        last = text.rfind(self.bot_token)
+        if last == -1:
+            return None
+        body_start = last + len(self.bot_token)
+        eot = text.find(self.eot_token, body_start)
+        candidate = text[body_start:eot] if eot != -1 else text[body_start:]
+        candidate = self._clean_normal_text(candidate).strip()
+        try:
+            payload = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(payload, Mapping) or not payload.get("name"):
+            return None
+        return self._tool_call_item(payload, tools, 0)
+
+    def _text_tool_call(self, body: str, call_index: int) -> ToolCallItem:
+        # Headerless raw-text invocation: no structured name/args on the wire.
+        return ToolCallItem(
+            tool_index=call_index,
+            name="",
+            parameters=json.dumps({"text": self._clean_normal_text(body)}),
+        )
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
-        # Drain every complete call in the delta: this detector has no
-        # stream-end flush, so anything left in self._buffer is lost.
         self._buffer += new_text
-        all_calls: list[ToolCallItem] = []
+        if self._raw_passthrough:
+            out = self._clean_normal_text(self._buffer)
+            self._buffer = ""
+            return StreamingParseResult(normal_text=out)
+
         normal_parts: list[str] = []
-        while True:
-            result, made_progress = self._parse_buffered_increment(tools)
-            if result.normal_text:
-                normal_parts.append(result.normal_text)
-            if result.calls:
-                all_calls.extend(result.calls)
-            if not made_progress:
-                break
-        return StreamingParseResult(
-            normal_text="".join(normal_parts),
-            calls=all_calls,
-        )
-
-    def _parse_buffered_increment(
-        self, tools: List[Tool]
-    ) -> tuple[StreamingParseResult, bool]:
-        # One drain step: emit a text run or one complete call; the bool is
-        # whether the buffer advanced (the caller loops while it does).
-        current_text = self._buffer
-
-        if self.bot_token not in current_text:
-            header_start = self._pending_tool_header_start(current_text)
-            if header_start is not None:
-                safe_text = current_text[:header_start]
-                self._buffer = current_text[header_start:]
-                return (
-                    StreamingParseResult(
-                        normal_text=self._clean_normal_text(safe_text)
-                    ),
-                    False,
-                )
-            # Hold back a partial prefix of ANY token _clean_normal_text
-            # strips — emitting a split control token leaks its first half as
-            # visible text (the completed token would have been stripped).
-            partial_len = max(
-                self._ends_with_partial_token(current_text, token)
-                for token in INKLING_CONTROL_TOKENS
-            )
-            if partial_len:
-                safe_text = current_text[:-partial_len]
-                self._buffer = current_text[-partial_len:]
-            else:
-                safe_text = current_text
-                self._buffer = ""
-            return (
-                StreamingParseResult(normal_text=self._clean_normal_text(safe_text)),
-                False,
-            )
-
-        bot_pos = current_text.find(self.bot_token)
-        if bot_pos > 0:
-            normal_text, self._current_header_name = self._split_trailing_tool_header(
-                current_text[:bot_pos]
-            )
-            self._buffer = current_text[bot_pos:]
-            normal_text = self._clean_normal_text(normal_text)
-            if normal_text:
-                # prefix stripped, call now at buffer head -> keep draining
-                return StreamingParseResult(normal_text=normal_text), True
-            current_text = self._buffer
-
-        if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
-
-        start_idx = len(self.bot_token)
-        while start_idx < len(current_text) and current_text[start_idx].isspace():
-            start_idx += 1
-
-        flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
-        try:
-            payload, end_idx = _partial_json_loads(current_text[start_idx:], flags)
-        except (MalformedJSON, json.JSONDecodeError):
-            return StreamingParseResult(), False
-        if not isinstance(payload, Mapping):
-            return StreamingParseResult(), False
-
         calls: list[ToolCallItem] = []
-        name = payload.get("name")
-        if (
-            not self.current_tool_name_sent
-            and isinstance(name, str)
-            and (self._current_header_name is None or self._current_header_name == name)
-        ):
-            self._ensure_current_tool()
-            calls.append(
-                ToolCallItem(
-                    tool_index=self.current_tool_id,
-                    name=name,
-                    parameters="",
-                )
-            )
-            self.current_tool_name_sent = True
-            self.prev_tool_call_arr[self.current_tool_id] = {
-                "name": name,
-                "arguments": {},
-            }
+        while self._buffer:
+            marker_pos, marker_token, is_json = self._next_tool_marker(self._buffer, 0)
+            if marker_pos is None:
+                safe, hold = self._split_safe_text(self._buffer)
+                normal_parts.append(self._clean_normal_text(safe))
+                self._buffer = hold
+                break
 
-        json_text = current_text[start_idx : start_idx + end_idx]
-        if not _is_complete_json(json_text):
-            return StreamingParseResult(calls=calls), False
+            prefix, _ = self._split_trailing_tool_header(self._buffer[:marker_pos])
+            body_start = marker_pos + len(marker_token)
+            eot = self._buffer.find(self.eot_token, body_start)
+            if eot == -1:
+                # Region incomplete — emit only the text before it and hold the
+                # marker + partial body so name/args stay atomic until the close.
+                normal_parts.append(self._clean_normal_text(prefix))
+                self._buffer = self._buffer[marker_pos:]
+                break
 
-        call = self._tool_call_item(
-            payload,
-            tools,
-            self.current_tool_id,
-            header_name=self._current_header_name,
+            body = self._buffer[body_start:eot]
+            if is_json:
+                call = self._canonical_json_call(body, tools, self._stream_call_index)
+                if call is None:
+                    return self._stream_recover_or_fallback(tools)
+            else:
+                call = self._text_tool_call(body, self._stream_call_index)
+            normal_parts.append(self._clean_normal_text(prefix))
+            calls.append(call)
+            self._stream_call_index += 1
+            self._buffer = self._buffer[eot + len(self.eot_token) :]
+
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
+
+    def _stream_recover_or_fallback(self, tools: List[Tool]) -> StreamingParseResult:
+        # A call failed to frame: recover one call from the last marker, then
+        # pass the rest of the response through as text.
+        self._raw_passthrough = True
+        recovered = self._recover_last_json_call(self._buffer, tools)
+        buffered = self._buffer
+        self._buffer = ""
+        if recovered is not None:
+            recovered.tool_index = self._stream_call_index
+            self._stream_call_index += 1
+            return StreamingParseResult(calls=[recovered])
+        return StreamingParseResult(normal_text=self._clean_normal_text(buffered))
+
+    def _split_safe_text(self, text: str) -> tuple[str, str]:
+        """Split off text safe to emit now from a tail that may be a forming
+        tool header or a split control token."""
+        header_start = self._pending_tool_header_start(text)
+        if header_start is not None:
+            return text[:header_start], text[header_start:]
+        partial_len = max(
+            (
+                self._ends_with_partial_token(text, token)
+                for token in INKLING_CONTROL_TOKENS
+            ),
+            default=0,
         )
-        if call is None:
-            # Drop only the rejected call's span, not the whole buffer, or a
-            # trailing valid call dies; clear the header so it can't leak.
-            self._abandon_current_tool()
-            self._buffer = self._remaining_after_call(current_text, start_idx + end_idx)
-            self._current_header_name = None
-            return StreamingParseResult(calls=calls), True
-
-        if self.current_tool_id == -1:
-            self._ensure_current_tool()
-
-        args = json.loads(call.parameters)
-        self.prev_tool_call_arr[self.current_tool_id] = {
-            "name": call.name,
-            "arguments": args,
-        }
-        sent = self.streamed_args_for_tool[self.current_tool_id]
-        remaining_args = call.parameters[len(sent) :]
-        if remaining_args:
-            calls.append(
-                ToolCallItem(
-                    tool_index=self.current_tool_id,
-                    name=None,
-                    parameters=remaining_args,
-                )
-            )
-            self.streamed_args_for_tool[self.current_tool_id] += remaining_args
-
-        self._buffer = self._remaining_after_call(current_text, start_idx + end_idx)
-        self.current_tool_id += 1
-        self.current_tool_name_sent = False
-        self._current_header_name = None
-        return StreamingParseResult(calls=calls), True
+        if partial_len:
+            return text[:-partial_len], text[-partial_len:]
+        return text, ""
 
     def structure_info(self) -> _GetInfoFunc:
         def info(name: str) -> StructureInfo:
@@ -255,7 +238,10 @@ class InklingDetector(BaseFormatDetector):
         return info
 
     def get_auto_tool_call_structural_tag(
-        self, tools: Optional[List[Tool]] = None
+        self,
+        tools: Optional[List[Tool]] = None,
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
     ) -> StructuralTag:
         """Constrain JSON after Inkling's tool-payload trigger token.
 
@@ -265,7 +251,7 @@ class InklingDetector(BaseFormatDetector):
         ``END_MESSAGE``. This mirrors the TML sampling default used by the OAI
         API and intentionally does not restrict names to the request's tools.
         """
-        del tools
+        del tools, thinking_mode, parallel_tool_calls
         return StructuralTag.model_validate(
             {
                 "type": "structural_tag",
@@ -310,20 +296,11 @@ class InklingDetector(BaseFormatDetector):
         payload: Mapping[str, object],
         tools: List[Tool],
         call_index: int,
-        *,
-        header_name: str | None = None,
     ) -> ToolCallItem | None:
         name = payload.get("name")
         args = payload.get("args")
         if not isinstance(name, str) or not isinstance(args, Mapping):
             logger.warning("Invalid Inkling tool call payload: %s", payload)
-            return None
-        if header_name is not None and header_name != name:
-            logger.warning(
-                "Inkling tool header %r does not match payload name %r",
-                header_name,
-                name,
-            )
             return None
 
         if not hasattr(self, "_tool_indices"):
@@ -340,28 +317,6 @@ class InklingDetector(BaseFormatDetector):
             name=name,
             parameters=json.dumps(args, ensure_ascii=False),
         )
-
-    def _ensure_current_tool(self) -> None:
-        if self.current_tool_id == -1:
-            self.current_tool_id = 0
-        while len(self.prev_tool_call_arr) <= self.current_tool_id:
-            self.prev_tool_call_arr.append({})
-        while len(self.streamed_args_for_tool) <= self.current_tool_id:
-            self.streamed_args_for_tool.append("")
-
-    def _abandon_current_tool(self) -> None:
-        """Discard the in-flight call after a rejected payload.
-
-        Resetting ``current_tool_id`` to -1 here would collide the NEXT valid
-        call with tool index 0 (``_ensure_current_tool`` maps -1 -> 0) and
-        slice its arguments against index 0's already-streamed args. Keep the
-        counter: an unannounced slot is simply reused; an announced slot is
-        abandoned by advancing past it.
-        """
-        if self.current_tool_name_sent:
-            self.current_tool_id += 1
-        self.current_tool_name_sent = False
-        self._current_header_name = None
 
     def _split_trailing_tool_header(self, text: str) -> tuple[str, str | None]:
         message_pos = self._pending_tool_header_start(text)
@@ -381,14 +336,6 @@ class InklingDetector(BaseFormatDetector):
         if any(token in header for token in INKLING_CONTROL_TOKENS):
             return None
         return message_pos
-
-    def _remaining_after_call(self, text: str, end_idx: int) -> str:
-        remaining = text[end_idx:]
-        if remaining.startswith(self.eot_token):
-            return remaining[len(self.eot_token) :]
-        if self.eot_token in remaining:
-            return remaining.split(self.eot_token, 1)[1]
-        return remaining
 
     def _clean_normal_text(self, text: str) -> str:
         for token in INKLING_CONTROL_TOKENS:

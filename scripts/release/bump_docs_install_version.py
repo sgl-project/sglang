@@ -15,8 +15,8 @@ from utils import (
 # Docs pages that pin a release branch in their "install from source" snippet,
 # e.g. `git clone -b v0.5.12 https://github.com/sgl-project/sglang.git`.
 FILES_TO_UPDATE = [
-    Path("docs_new/docs/get-started/install.mdx"),
-    Path("docs_new/docs/hardware-platforms/amd_gpu.mdx"),
+    Path("docs/docs/get-started/install.mdx"),
+    Path("docs/docs/hardware-platforms/amd_gpu.mdx"),
 ]
 
 # Matches `git clone -b v<version> https://github.com/sgl-project/sglang.git`,
@@ -25,14 +25,6 @@ CLONE_RE = re.compile(
     r"(git clone -b )v([0-9][0-9A-Za-z.\-]*)"
     r"( https://github\.com/sgl-project/sglang\.git)"
 )
-
-# Matches a version-pinned docker image such as `lmsysorg/sglang:v0.5.12`
-# (leaving any suffix like `-cu130`/`-runtime` untouched), capturing the
-# version in group 2. Mutable tags (`latest`, `dev`, ...) are not matched.
-DOCKER_RE = re.compile(r"(lmsysorg/sglang:)v(\d+\.\d+\.\d+(?:rc\d+|\.post\d+)?)\b")
-
-# All version references the bump keeps in sync, each with the version in group 2.
-VERSION_PATTERNS = [CLONE_RE, DOCKER_RE]
 
 
 def read_current_version(file_path: Path) -> str:
@@ -48,12 +40,7 @@ def read_current_version(file_path: Path) -> str:
 def stale_versions(file_path: Path, new_version: str) -> list:
     """Return any pinned versions in the file that differ from new_version."""
     content = file_path.read_text()
-    return [
-        m.group(2)
-        for pattern in VERSION_PATTERNS
-        for m in pattern.finditer(content)
-        if m.group(2) != new_version
-    ]
+    return [m.group(2) for m in CLONE_RE.finditer(content) if m.group(2) != new_version]
 
 
 def replace_version(file_path: Path, new_version: str) -> bool:
@@ -63,7 +50,6 @@ def replace_version(file_path: Path, new_version: str) -> bool:
 
     content = file_path.read_text()
     new_content = CLONE_RE.sub(rf"\g<1>v{new_version}\g<3>", content)
-    new_content = DOCKER_RE.sub(rf"\g<1>v{new_version}", new_content)
 
     if content == new_content:
         print(f"No changes needed in {file_path}")

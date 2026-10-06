@@ -12,6 +12,7 @@ from sglang.srt.distributed.device_communicators.all_reduce_utils import (
     TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES,
 )
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_cuda, is_hip
 
 try:
@@ -98,10 +99,9 @@ class TorchSymmMemCommunicator:
         # ([16384, 6144] bf16 = 192 MiB), including room for tail regions.
         if envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get():
             self.max_size = max(self.max_size, 256 * 1024 * 1024)
-            from sglang.srt.runtime_context import get_server_args
 
             if (
-                get_server_args().enable_scattered_sconv
+                get_exec().comm.enable_scattered_sconv
                 or envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV.get()
             ):
                 # Fused extend kernels are out-of-place, so OUT must hold the

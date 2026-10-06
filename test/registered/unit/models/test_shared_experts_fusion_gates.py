@@ -1,0 +1,1111 @@
+"""Every MoE family's fusion gate, asked the way the loader asks it.
+
+`install_shared_experts_fusion_decision` calls
+`<model class>.shared_experts_fusion_disable_reason(hf_config, quant_config)`
+before the model is built, so the gate must answer from the config and
+quantization it is handed — no instance, no layers. These cases pin each
+family's branch table, which matters because most of these checkpoints cannot
+be run on a single dev box: a wrong answer here is a silently wrong weight
+remap (the loader remaps `mlp.shared_experts` into a fused slot the layers
+never allocated), not a crash.
+
+Conditions that depend on the device or the parallel topology are exercised
+through `get_parallel().override(...)`; the ones that are pure config /
+quantization are exercised directly.
+"""
+
+import importlib.util
+import sys
+import unittest
+import unittest.mock
+from types import ModuleType, SimpleNamespace
+
+import pytest
+import torch
+
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+
+
+def _quant(name: str):
+    return SimpleNamespace(get_name=lambda: name)
+
+
+_QUARK_MXFP4 = {
+    "weight": {
+        "dtype": "fp4",
+        "qscheme": "per_group",
+        "group_size": 32,
+        "is_dynamic": False,
+        "scale_format": "e8m0",
+    },
+    "input_tensors": {
+        "dtype": "fp4",
+        "qscheme": "per_group",
+        "group_size": 32,
+        "is_dynamic": True,
+        "scale_format": "e8m0",
+    },
+    "output_tensors": None,
+    "bias": None,
+}
+_QUARK_BLOCK_FP8 = {
+    "weight": {
+        "dtype": "fp8_e4m3",
+        "qscheme": "per_block",
+        "block_size": [128, 128],
+        "is_dynamic": False,
+    },
+    "input_tensors": {
+        "dtype": "fp8_e4m3",
+        "qscheme": "per_group",
+        "group_size": 128,
+        "is_dynamic": True,
+    },
+    "output_tensors": None,
+    "bias": None,
+}
+
+
+def _import_bailing_modules():
+    if importlib.util.find_spec("vllm") is not None:
+        from sglang.srt.models import bailing_moe_nextn, bailing_moe_v3
+
+        return bailing_moe_v3, bailing_moe_nextn
+
+    # CPU CI omits vLLM; these fusion gates never execute the imported AWQ kernel.
+    vllm = ModuleType("vllm")
+    vllm.__path__ = []
+    custom_ops = ModuleType("vllm._custom_ops")
+    custom_ops.awq_dequantize = unittest.mock.Mock()
+    with unittest.mock.patch.dict(
+        sys.modules, {"vllm": vllm, "vllm._custom_ops": custom_ops}
+    ):
+        from sglang.srt.models import bailing_moe_nextn, bailing_moe_v3
+
+    return bailing_moe_v3, bailing_moe_nextn
+
+
+class _FusionGateCase(CustomTestCase):
+    def _seed(self, **fields):
+        override = get_context().override_server_args(**fields)
+        override.install()
+        self.addCleanup(override.restore)
+
+    def _reason(
+        self,
+        model_class,
+        hf_config,
+        quant_config=None,
+        moe_ep_size=1,
+        tp_size=None,
+    ):
+        # The gates consult the live EP size; without a group installed the
+        # canonical getter asserts, so every case states a topology.
+        explicit_tp_size = tp_size is not None
+        tp_size = moe_ep_size if tp_size is None else tp_size
+        with get_parallel().override(
+            tp_size=tp_size,
+            attn_tp_size=tp_size,
+            attn_dp_size=1,
+            attn_cp_size=1,
+            moe_ep_size=moe_ep_size,
+            moe_dp_size=1,
+            moe_tp_size=tp_size // moe_ep_size if explicit_tp_size else 1,
+        ):
+            return model_class.shared_experts_fusion_disable_reason(
+                hf_config, quant_config
+            )
+
+
+class TestDeepseekV2Gate(_FusionGateCase):
+    def _config(self, **kw):
+        base = dict(
+            architectures=["DeepseekV3ForCausalLM"],
+            n_routed_experts=256,
+            n_shared_experts=1,
+        )
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def test_a_foreign_architecture_cannot_fuse(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+        self._seed()
+        self.assertIn(
+            "does not support",
+            self._reason(
+                DeepseekV2ForCausalLM,
+                self._config(architectures=["SomeOtherForCausalLM"]),
+            ),
+        )
+
+    def test_an_unvalidated_expert_count_cannot_fuse(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+        self._seed()
+        self.assertIn(
+            "does not support",
+            self._reason(DeepseekV2ForCausalLM, self._config(n_routed_experts=128)),
+        )
+
+    def test_the_384_expert_layout_needs_a_quark_checkpoint(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+        self._seed()
+        config = self._config(n_routed_experts=384)
+        self.assertIn(
+            "does not support",
+            self._reason(DeepseekV2ForCausalLM, config, _quant("compressed-tensors")),
+        )
+        # With Quark the layout is pre-fused, so this branch stops objecting.
+        self.assertNotIn(
+            "does not support",
+            self._reason(DeepseekV2ForCausalLM, config, _quant("quark")) or "",
+        )
+
+    def test_the_nextn_draft_declares_its_own_architecture(self):
+        from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+        self.assertEqual(
+            DeepseekV3ForCausalLMNextN.fused_shared_experts_architecture,
+            "DeepseekV3ForCausalLMNextN",
+        )
+        self._seed()
+        draft_config = self._config(architectures=["DeepseekV3ForCausalLMNextN"])
+        # The draft's own class accepts it; the target's class does not.
+        self.assertNotIn(
+            "does not support",
+            self._reason(DeepseekV3ForCausalLMNextN, draft_config) or "",
+        )
+        self.assertIn(
+            "does not support", self._reason(DeepseekV2ForCausalLM, draft_config)
+        )
+
+    def test_expert_parallelism_blocks_fusion_off_rocm(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+        self._seed()
+        self.assertTrue(
+            self._reason(DeepseekV2ForCausalLM, self._config(), moe_ep_size=2)
+        )
+
+    def test_mixed_precision_quant_vetoes_even_when_enforced(self):
+        """A precision mismatch causes crash when shared expert fusion is enabled,
+        so --enforce-shared-experts-fusion must not override it. Guards the gap
+        where the enforce early-return skipped the quant check entirely."""
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+        self._seed(enforce_shared_experts_fusion=True)
+        mixed = SimpleNamespace(
+            get_name=lambda: "quark", can_fuse_shared_expert=lambda: False
+        )
+        self.assertIn(
+            "higher precision",
+            self._reason(DeepseekV2ForCausalLM, self._config(), mixed),
+        )
+        matched = SimpleNamespace(
+            get_name=lambda: "quark", can_fuse_shared_expert=lambda: True
+        )
+        self.assertIsNone(self._reason(DeepseekV2ForCausalLM, self._config(), matched))
+
+    def test_hopper_modelopt_fp4_marlin_disables_fusion_by_default(self):
+        import sglang.srt.models.deepseek_v2 as deepseek_v2
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+        self._seed()
+        with (
+            unittest.mock.patch.object(
+                deepseek_v2, "is_sm90_supported", return_value=True
+            ),
+            unittest.mock.patch.object(
+                deepseek_v2,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.MARLIN,
+            ),
+        ):
+            self.assertIn(
+                "fusion off by default",
+                self._reason(
+                    DeepseekV2ForCausalLM,
+                    self._config(),
+                    _quant("modelopt_fp4"),
+                ),
+            )
+
+    def test_hopper_modelopt_fp4_marlin_can_still_be_forced(self):
+        import sglang.srt.models.deepseek_v2 as deepseek_v2
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+        self._seed(enforce_shared_experts_fusion=True)
+        with (
+            unittest.mock.patch.object(
+                deepseek_v2, "is_sm90_supported", return_value=True
+            ),
+            unittest.mock.patch.object(
+                deepseek_v2,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.MARLIN,
+            ),
+        ):
+            self.assertIsNone(
+                self._reason(
+                    DeepseekV2ForCausalLM,
+                    self._config(),
+                    _quant("modelopt_fp4"),
+                )
+            )
+
+
+class TestGlmMoeLiteGate(_FusionGateCase):
+    def _config(self, **kw):
+        base = dict(architectures=["Glm4MoeLiteForCausalLM"], n_shared_experts=1)
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def test_more_than_one_shared_expert_cannot_fuse(self):
+        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteForCausalLM
+
+        self._seed()
+        self.assertTrue(
+            self._reason(Glm4MoeLiteForCausalLM, self._config(n_shared_experts=2))
+        )
+
+    def test_expert_parallelism_blocks_fusion(self):
+        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteForCausalLM
+
+        self._seed()
+        config = self._config()
+        reason = self._reason(Glm4MoeLiteForCausalLM, config, moe_ep_size=2)
+        self.assertTrue(reason)
+        # This family checks the device capability before expert parallelism, so
+        # only ask *which* branch refused on a device that would otherwise fuse
+        # (a CPU runner never gets past the capability check).
+        if self._reason(Glm4MoeLiteForCausalLM, config) is None:
+            self.assertIn("expert parallelism", reason)
+
+    def test_the_nextn_draft_declares_its_own_architecture(self):
+        from sglang.srt.models.glm4_moe_lite_nextn import Glm4MoeLiteForCausalLMNextN
+
+        self.assertEqual(
+            Glm4MoeLiteForCausalLMNextN.fused_shared_experts_architecture,
+            "Glm4MoeLiteForCausalLMNextN",
+        )
+
+
+class TestGlmMoeGate(_FusionGateCase):
+    def test_a_w4afp8_checkpoint_cannot_fuse(self):
+        from sglang.srt.models.glm4_moe import Glm4MoeForCausalLM
+
+        self._seed()
+        reason = self._reason(
+            Glm4MoeForCausalLM, SimpleNamespace(n_shared_experts=1), _quant("w4afp8")
+        )
+        self.assertTrue(reason)
+
+    def test_the_dsa_variant_declares_its_own_architecture(self):
+        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLM
+
+        self.assertEqual(
+            GlmMoeDsaForCausalLM.fused_shared_experts_architecture,
+            "GlmMoeDsaForCausalLM",
+        )
+
+
+class TestGlm5NextGate(_FusionGateCase):
+    def _config(self, **kw):
+        base = dict(
+            model_type="glm5_next_text",
+            hidden_size=4096,
+            moe_intermediate_size=2048,
+            n_routed_experts=288,
+            n_shared_experts=1,
+            num_experts_per_tok=8,
+            hidden_act="silu",
+            swiglu_limit=10.0,
+            first_k_dense_replace=3,
+            num_hidden_layers=46,
+        )
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def _fp8(self, **kw):
+        base = dict(
+            get_name=lambda: "fp8",
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=[128, 128],
+            activation_scheme="dynamic",
+            ignored_layers=[],
+            packed_modules_mapping={},
+        )
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def _reason_on_gfx950(self, *, tp_size=4, config=None, quant=None, ep_size=1):
+        import sglang.srt.models.glm5_next as glm5_next
+
+        self._seed()
+        with (
+            unittest.mock.patch.object(glm5_next, "_is_cuda", False),
+            unittest.mock.patch.object(glm5_next, "_use_aiter_gfx95", True),
+        ):
+            return self._reason(
+                glm5_next.Glm5NextForConditionalGeneration,
+                config or self._config(),
+                quant or self._fp8(),
+                moe_ep_size=ep_size,
+                tp_size=tp_size,
+            )
+
+    def test_exact_tp4_and_tp8_contract_is_admitted(self):
+        for tp_size in (4, 8):
+            with self.subTest(tp_size=tp_size):
+                self.assertIsNone(self._reason_on_gfx950(tp_size=tp_size))
+
+    def test_unvalidated_tp_and_expert_geometry_are_rejected(self):
+        self.assertIn("TP4 and TP8", self._reason_on_gfx950(tp_size=2))
+        self.assertIn(
+            "E=288/topk=8",
+            self._reason_on_gfx950(config=self._config(n_routed_experts=256)),
+        )
+        self.assertIn(
+            "E=288/topk=8",
+            self._reason_on_gfx950(config=self._config(num_experts_per_tok=4)),
+        )
+
+    def test_activation_and_block_fp8_contracts_are_rejected_independently(self):
+        self.assertIn(
+            "clamped SiLU G1U1",
+            self._reason_on_gfx950(config=self._config(swiglu_limit=None)),
+        )
+        self.assertIn(
+            "128x128 block-FP8",
+            self._reason_on_gfx950(quant=self._fp8(weight_block_size=[1, 128])),
+        )
+        self.assertIn(
+            "128x128 block-FP8",
+            self._reason_on_gfx950(quant=_quant("compressed-tensors")),
+        )
+
+    def test_mixed_routed_or_shared_expert_precision_is_rejected(self):
+        for suffix in ("experts", "shared_experts"):
+            with self.subTest(suffix=suffix):
+                quant = self._fp8(ignored_layers=[f"model.layers.3.mlp.{suffix}"])
+                self.assertIn(
+                    "same block-FP8 layout",
+                    self._reason_on_gfx950(quant=quant),
+                )
+
+    def _quark(
+        self, *, exclude=(), fp8_experts=(45,), fp8_shared=(45,), fp8_shared_down=()
+    ):
+        """A Quark export shaped like amd/GLM-5.3-Flash-Quark-MXFP4: MXFP4 by
+        default, layer 45 (the MTP draft) pinned to block-FP8 expert by expert,
+        and its names mapped the way the loader maps them."""
+        from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+        from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+
+        layer_quant_config = {}
+        for layer in fp8_experts:
+            for expert in range(288):
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    name = f"model.language_model.layers.{layer}.mlp.experts.{expert}.{proj}"
+                    layer_quant_config[name] = _QUARK_BLOCK_FP8
+        for layer in fp8_shared:
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                name = f"model.language_model.layers.{layer}.mlp.shared_experts.{proj}"
+                layer_quant_config[name] = _QUARK_BLOCK_FP8
+        for layer in fp8_shared_down:
+            name = f"model.language_model.layers.{layer}.mlp.shared_experts.down_proj"
+            layer_quant_config[name] = _QUARK_BLOCK_FP8
+        quant = QuarkConfig.from_config(
+            {
+                "quant_method": "quark",
+                "export": {"kv_cache_group": [], "pack_method": "reorder"},
+                "global_quant_config": _QUARK_MXFP4,
+                "layer_quant_config": layer_quant_config,
+                "layer_type_quant_config": {},
+                "exclude": [f"model.language_model.layers.{name}" for name in exclude],
+                "packed_modules_mapping": {
+                    **Glm5NextForConditionalGeneration.packed_modules_mapping,
+                    "gate_up_proj": ["gate_proj", "up_proj"],
+                },
+            }
+        )
+        quant.apply_weight_name_mapper(
+            Glm5NextForConditionalGeneration.hf_to_sglang_mapper
+        )
+        return quant
+
+    def test_quark_mxfp4_is_admitted(self):
+        config = self._config(num_hidden_layers=45)
+        self.assertIsNone(self._reason_on_gfx950(config=config, quant=self._quark()))
+
+    def test_quark_target_layer_experts_must_share_one_mxfp4_spec(self):
+        config = self._config(num_hidden_layers=45)
+        cases = {
+            "excluded routed expert": self._quark(
+                exclude=["10.mlp.experts.5.gate_proj"]
+            ),
+            "excluded shared expert": self._quark(
+                exclude=[
+                    "10.mlp.shared_experts.gate_proj",
+                    "10.mlp.shared_experts.up_proj",
+                ]
+            ),
+            "block-FP8 routed and shared experts": self._quark(
+                fp8_experts=(10, 45), fp8_shared=(10, 45)
+            ),
+            "block-FP8 shared expert only": self._quark(fp8_shared=(10, 45)),
+            "block-FP8 shared down_proj only": self._quark(fp8_shared_down=(10,)),
+        }
+        for name, quant in cases.items():
+            with self.subTest(name):
+                self.assertIn(
+                    "same Quark MXFP4 layout",
+                    self._reason_on_gfx950(config=config, quant=quant),
+                )
+
+    def test_ep_and_a2a_topologies_are_rejected(self):
+        import sglang.srt.models.glm5_next as glm5_next
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
+
+        self.assertIn(
+            "expert parallelism",
+            self._reason_on_gfx950(tp_size=4, ep_size=2),
+        )
+        with unittest.mock.patch.object(
+            glm5_next, "get_moe_a2a_backend", return_value=MoeA2ABackend.MORI
+        ):
+            self.assertIn("A2A backend", self._reason_on_gfx950())
+
+    def test_hip_without_aiter_gfx950_is_rejected(self):
+        import sglang.srt.models.glm5_next as glm5_next
+
+        self._seed()
+        with (
+            unittest.mock.patch.object(glm5_next, "_is_cuda", False),
+            unittest.mock.patch.object(glm5_next, "_use_aiter_gfx95", False),
+        ):
+            reason = self._reason(
+                glm5_next.Glm5NextForConditionalGeneration,
+                self._config(),
+                self._fp8(),
+                tp_size=4,
+            )
+        self.assertIn("AITER on a gfx950", reason)
+
+    def test_shared_checkpoint_weights_load_into_appended_expert_288(self):
+        """Enabling fusion must not silently drop the separately named shared
+        tensors; all three projections must reach the appended physical slot."""
+        from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+            DeepseekV2WeightLoaderMixin,
+        )
+        from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+
+        loaded = []
+
+        class Param:
+            def weight_loader(
+                self,
+                _param,
+                loaded_weight,
+                candidate,
+                *,
+                shard_id,
+                expert_id,
+            ):
+                loaded.append((loaded_weight, candidate, shard_id, expert_id))
+
+        class Model:
+            config = SimpleNamespace(n_routed_experts=288)
+            num_fused_shared_experts = 1
+            quant_config = None
+            encoder_only = False
+            language_only = True
+
+            def named_parameters(self):
+                return [
+                    ("model.layers.3.mlp.experts.w13_weight", Param()),
+                    ("model.layers.3.mlp.experts.w2_weight", Param()),
+                ]
+
+        weights = [
+            (
+                f"model.layers.3.mlp.shared_experts.{projection}.weight",
+                torch.full((1,), value),
+            )
+            for value, projection in enumerate(
+                ("gate_proj", "down_proj", "up_proj"), start=1
+            )
+        ]
+        with unittest.mock.patch.object(
+            DeepseekV2WeightLoaderMixin, "post_load_weights"
+        ):
+            Glm5NextForConditionalGeneration.load_weights(Model(), weights)
+
+        self.assertEqual([entry[2] for entry in loaded], ["w1", "w2", "w3"])
+        self.assertEqual([entry[3] for entry in loaded], [288, 288, 288])
+        self.assertEqual(
+            [entry[1] for entry in loaded],
+            [
+                "model.layers.3.mlp.experts.w13_weight",
+                "model.layers.3.mlp.experts.w2_weight",
+                "model.layers.3.mlp.experts.w13_weight",
+            ],
+        )
+        self.assertEqual([entry[0].item() for entry in loaded], [1, 2, 3])
+
+
+class TestMiniMaxGates(_FusionGateCase):
+    def test_a_config_without_shared_experts_cannot_fuse(self):
+        from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
+
+        self._seed()
+        self.assertIn(
+            "No shared experts",
+            self._reason(
+                MiniMaxM3SparseForCausalLM, SimpleNamespace(n_shared_experts=0)
+            ),
+        )
+
+    def test_a_modelopt_mixed_checkpoint_cannot_fuse(self):
+        from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
+
+        self._seed()
+        reason = self._reason(
+            MiniMaxM3SparseForCausalLM,
+            SimpleNamespace(n_shared_experts=1),
+            _quant("modelopt_mixed"),
+        )
+        self.assertIn("quantization formats", reason)
+
+    def test_the_vl_variant_reads_the_text_config(self):
+        from sglang.srt.models.minimax_m3_vl import (
+            MiniMaxM3SparseForConditionalGeneration,
+        )
+
+        self._seed()
+        wrapper = SimpleNamespace(text_config=SimpleNamespace(n_shared_experts=0))
+        self.assertIn(
+            "No shared experts",
+            self._reason(MiniMaxM3SparseForConditionalGeneration, wrapper),
+        )
+
+
+class TestBailingMoeV3Gate(_FusionGateCase):
+    def _config(self):
+        return SimpleNamespace(
+            architectures=["BailingMoeV3ForCausalLM"],
+            num_shared_experts=1,
+            moe_intermediate_size=1024,
+        )
+
+    def _compressed_tensors(self, ignore):
+        return SimpleNamespace(
+            get_name=lambda: "compressed_tensors",
+            ignore=ignore,
+            packed_modules_mapping={},
+        )
+
+    def _width_only_config(self):
+        return SimpleNamespace(
+            architectures=["BailingMoeV3ForCausalLM"],
+            moe_intermediate_size=1024,
+            moe_shared_expert_intermediate_size=1024,
+        )
+
+    def _reason_on_cuda(self, quant_config, config=None, model_class=None):
+        bailing_moe_v3, _ = _import_bailing_modules()
+
+        self._seed()
+        with (
+            unittest.mock.patch.object(bailing_moe_v3, "_is_cuda", True),
+            unittest.mock.patch.object(
+                bailing_moe_v3.torch.cuda,
+                "get_device_capability",
+                return_value=(9, 0),
+            ),
+        ):
+            return self._reason(
+                model_class or bailing_moe_v3.BailingMoeV3ForCausalLM,
+                config if config is not None else self._config(),
+                quant_config,
+            )
+
+    def test_width_only_fp4_mixed_experts_cannot_fuse(self):
+        quant_config = SimpleNamespace(get_name=lambda: "fp8", is_fp4_experts=True)
+        reason = self._reason_on_cuda(quant_config, self._width_only_config())
+        self.assertIn("different quant methods", reason)
+
+    def test_vl_wrapper_checks_the_width_on_its_text_config(self):
+        from sglang.srt.models.bailing_mm_v3 import (
+            BailingMoeV3VLForConditionalGeneration,
+        )
+
+        quant_config = SimpleNamespace(get_name=lambda: "fp8", is_fp4_experts=True)
+        config = SimpleNamespace(text_config=self._width_only_config())
+        reason = self._reason_on_cuda(
+            quant_config, config, BailingMoeV3VLForConditionalGeneration
+        )
+        self.assertIn("different quant methods", reason)
+
+    def test_width_only_bf16_experts_can_fuse(self):
+        self.assertIsNone(self._reason_on_cuda(None, self._width_only_config()))
+
+    def test_num_shared_experts_only_config_still_fuses(self):
+        self.assertIsNone(self._reason_on_cuda(None, self._config()))
+
+    def test_width_only_int4_mixed_experts_cannot_fuse(self):
+        reason = self._reason_on_cuda(
+            self._compressed_tensors(
+                [r"re:.*mlp\.shared_experts\.(gate|up|down)_proj.*"]
+            ),
+            self._width_only_config(),
+        )
+        self.assertIn("different quant methods", reason)
+
+    def test_width_controls_construction_count(self):
+        bailing_moe_v3, _ = _import_bailing_modules()
+        self.assertEqual(
+            bailing_moe_v3._get_bailing_num_shared_experts(self._width_only_config()),
+            1,
+        )
+        self.assertEqual(
+            bailing_moe_v3._get_bailing_num_shared_experts(self._config()), 1
+        )
+        legacy_multi_shared = self._config()
+        legacy_multi_shared.num_shared_experts = 2
+        self.assertEqual(
+            bailing_moe_v3._get_bailing_num_shared_experts(legacy_multi_shared), 2
+        )
+        no_shared = self._width_only_config()
+        no_shared.moe_shared_expert_intermediate_size = 0
+        self.assertEqual(bailing_moe_v3._get_bailing_num_shared_experts(no_shared), 0)
+
+    def test_compressed_tensors_mixed_expert_layout_cannot_fuse(self):
+        reason = self._reason_on_cuda(
+            self._compressed_tensors(
+                ["re:.*(mlp|shared_experts)\\.(gate|up|gate_up|down|eh)_proj.*"]
+            )
+        )
+        self.assertIn("different quant methods", reason)
+
+    def test_compressed_tensors_uniform_expert_layout_can_fuse(self):
+        self.assertIsNone(self._reason_on_cuda(self._compressed_tensors([])))
+
+    def test_nextn_uses_its_rewritten_architecture(self):
+        bailing_moe_v3, bailing_moe_nextn = _import_bailing_modules()
+
+        config = self._config()
+        config.architectures = ["BailingMoeForCausalLMNextN"]
+        config.model_type = "bailing_hybrid"
+        config.use_kda = True
+        self._seed()
+        with (
+            unittest.mock.patch.object(bailing_moe_v3, "_is_cuda", True),
+            unittest.mock.patch.object(
+                bailing_moe_v3.torch.cuda,
+                "get_device_capability",
+                return_value=(9, 0),
+            ),
+        ):
+            reason = self._reason(
+                bailing_moe_nextn.BailingMoeForCausalLMNextN,
+                config,
+                self._compressed_tensors(
+                    ["re:.*(mlp|shared_experts)\\.(gate|up|gate_up|down|eh)_proj.*"]
+                ),
+            )
+
+        self.assertIn("different quant methods", reason)
+
+    def test_nextn_constructor_calls_v3_fusion_setup(self):
+        bailing_moe_v3, bailing_moe_nextn = _import_bailing_modules()
+
+        config = SimpleNamespace(
+            architectures=["BailingMoeForCausalLMNextN"],
+            model_type="bailing_hybrid",
+            use_kda=True,
+            num_shared_experts=1,
+            vocab_size=32000,
+            hidden_size=4096,
+        )
+        self._seed(enable_dp_lm_head=False)
+        with (
+            get_parallel().override(tp_size=1, moe_ep_size=1),
+            unittest.mock.patch.object(
+                bailing_moe_v3,
+                "is_shared_experts_fusion_disabled",
+                return_value=False,
+            ),
+            unittest.mock.patch.object(bailing_moe_nextn, "BailingMoEModelNextN"),
+            unittest.mock.patch.object(bailing_moe_nextn, "ParallelLMHead"),
+            unittest.mock.patch.object(bailing_moe_nextn, "LogitsProcessor"),
+        ):
+            model = bailing_moe_nextn.BailingMoeForCausalLMNextN(config)
+
+        self.assertEqual(model.num_fused_shared_experts, 1)
+
+
+class TestQwen3_5Gate(_FusionGateCase):
+    def test_every_entry_class_answers(self):
+        import sglang.srt.models.qwen3_5 as qwen3_5
+
+        for cls in (
+            qwen3_5.Qwen3_5ForCausalLM,
+            qwen3_5.Qwen3_5MoeForCausalLM,
+            qwen3_5.Qwen3_5ForConditionalGeneration,
+            qwen3_5.Qwen3_5MoeForConditionalGeneration,
+        ):
+            self.assertTrue(
+                hasattr(cls, "shared_experts_fusion_disable_reason"),
+                f"{cls.__name__} would silently skip the ROCm auto-disable",
+            )
+
+    def test_the_auto_disable_is_rocm_only(self):
+        import sglang.srt.models.qwen3_5 as qwen3_5
+
+        self._seed()
+        # On a non-ROCm build the gate never objects, whatever the checkpoint is.
+        wrapper = SimpleNamespace(
+            text_config=SimpleNamespace(model_type="qwen3_5_moe_text")
+        )
+        if not qwen3_5._is_hip:
+            self.assertIsNone(
+                self._reason(qwen3_5.Qwen3_5MoeForConditionalGeneration, wrapper)
+            )
+
+
+class TestWrapperEntryClassGates(_FusionGateCase):
+    """A wrapper model answers with the config it hands its nested family.
+
+    The loader asks the class it instantiates, which for these models is the
+    wrapper — not the DeepSeek/Qwen3.5 body inside it. Each wrapper therefore
+    delegates to its family's gate with the config (and quantization) the
+    nested construction uses; these cases pin *what gets handed over*, because
+    handing over the top-level config instead would answer for the wrong
+    checkpoint (or raise on a config that has no expert counts at all).
+    """
+
+    def _recording_gate(self, family_cls):
+        seen = {}
+
+        def recorder(hf_config, quant_config):
+            seen["config"] = hf_config
+            seen["quant"] = quant_config
+            return None
+
+        return seen, unittest.mock.patch.object(
+            family_cls,
+            "shared_experts_fusion_disable_reason",
+            staticmethod(recorder),
+        )
+
+    def test_kimi_vl_never_fuses_and_says_why(self):
+        from sglang.srt.models.kimi_vl import KimiVLForConditionalGeneration
+
+        self._seed()
+        config = SimpleNamespace(
+            encoder_only=False,
+            text_config=SimpleNamespace(
+                architectures=["Whatever"], n_routed_experts=256, n_shared_experts=1
+            ),
+        )
+        # The construction rewrites the architecture to DeepseekV2ForCausalLM,
+        # which is not the architecture the fused path validated.
+        self.assertIn(
+            "does not support",
+            self._reason(KimiVLForConditionalGeneration, config),
+        )
+        self.assertIsNone(
+            self._reason(
+                KimiVLForConditionalGeneration,
+                SimpleNamespace(encoder_only=True, text_config=None),
+            ),
+            "an encoder-only Kimi-VL builds no language model",
+        )
+
+    def test_kimi_k25_hands_over_its_text_config(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
+        from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
+
+        self._seed()
+        text_config = SimpleNamespace(
+            architectures=["DeepseekV3ForCausalLM"],
+            n_routed_experts=384,
+            n_shared_experts=1,
+        )
+        config = SimpleNamespace(encoder_only=False, text_config=text_config)
+        # The standard compressed-tensors Kimi-K2.5 checkpoint stores its shared
+        # expert loose, so this must refuse to fuse.
+        self.assertIn(
+            "does not support",
+            self._reason(
+                KimiK25ForConditionalGeneration,
+                config,
+                _quant("compressed-tensors"),
+            ),
+        )
+        seen, patcher = self._recording_gate(DeepseekV3ForCausalLM)
+        with patcher:
+            self._reason(KimiK25ForConditionalGeneration, config, _quant("quark"))
+        self.assertIs(seen["config"], text_config)
+        self.assertIsNone(
+            self._reason(
+                KimiK25ForConditionalGeneration,
+                SimpleNamespace(encoder_only=True, text_config=None),
+            )
+        )
+
+    def test_pixtral_only_asks_for_its_mla_backbone(self):
+        from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
+        from sglang.srt.models.pixtral import PixtralForConditionalGeneration
+
+        self._seed()
+        mla_text = SimpleNamespace(
+            model_type="deepseek_v3",
+            architectures=["DeepseekV3ForCausalLM"],
+            n_routed_experts=256,
+            n_shared_experts=1,
+        )
+        seen, patcher = self._recording_gate(MistralLarge3ForCausalLM)
+        with patcher:
+            self._reason(
+                PixtralForConditionalGeneration,
+                SimpleNamespace(text_config=mla_text),
+            )
+        self.assertIs(seen["config"], mla_text)
+        # A GQA text config builds the dense Mistral backbone instead.
+        self.assertIsNone(
+            self._reason(
+                PixtralForConditionalGeneration,
+                SimpleNamespace(text_config=SimpleNamespace(model_type="mistral")),
+            )
+        )
+
+    def test_dots_vlm_hands_over_the_language_config(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+        from sglang.srt.models.dots_vlm import DotsVLMForCausalLM
+
+        language_config = SimpleNamespace(
+            architectures=["DeepseekV3ForCausalLM"],
+            n_routed_experts=256,
+            n_shared_experts=1,
+        )
+        config = SimpleNamespace(encoder_only=False, language_config=language_config)
+        seen, patcher = self._recording_gate(DeepseekV2ForCausalLM)
+        with patcher:
+            self._reason(DotsVLMForCausalLM, config, _quant("fp8"))
+        self.assertIs(seen["config"], language_config)
+        self.assertEqual(seen["quant"].get_name(), "fp8")
+
+    def test_deepseek_vl2_mirrors_its_unquantized_language_model(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+        from sglang.srt.models.deepseek_vl2 import DeepseekVL2ForCausalLM
+
+        language_config = SimpleNamespace(
+            use_mla=True,
+            architectures=["DeepseekV3ForCausalLM"],
+            n_routed_experts=256,
+            n_shared_experts=1,
+        )
+        seen, patcher = self._recording_gate(DeepseekV2ForCausalLM)
+        with patcher:
+            self._reason(
+                DeepseekVL2ForCausalLM,
+                SimpleNamespace(language_config=language_config),
+                _quant("fp8"),
+            )
+        self.assertIs(seen["config"], language_config)
+        self.assertIsNone(
+            seen["quant"], "the language model is constructed without quantization"
+        )
+        # deepseek-vl2-tiny forbids MLA and builds the dense model instead.
+        self.assertIsNone(
+            self._reason(
+                DeepseekVL2ForCausalLM,
+                SimpleNamespace(language_config=SimpleNamespace(use_mla=False)),
+            )
+        )
+
+    def test_deepseek_ocr_only_asks_for_its_moe_branches(self):
+        from sglang.srt.models.deepseek_ocr import DeepseekOCRForCausalLM
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+        text_config = SimpleNamespace(
+            topk_method="noaux_tc",
+            use_mla=True,
+            architectures=["DeepseekV3ForCausalLM"],
+            n_routed_experts=256,
+            n_shared_experts=1,
+        )
+        moe_config = SimpleNamespace(
+            vision_config=SimpleNamespace(model_name="deepencoder"),
+            projector_config=SimpleNamespace(input_dim=1280),
+            text_config=text_config,
+        )
+        seen, patcher = self._recording_gate(DeepseekV2ForCausalLM)
+        with patcher:
+            self._reason(DeepseekOCRForCausalLM, moe_config, _quant("fp8"))
+        self.assertIs(seen["config"], text_config)
+
+        # OCR2 (and any non-MLA, non-noaux_tc config) builds the dense model.
+        ocr2 = SimpleNamespace(
+            vision_config=SimpleNamespace(model_name="DeepEncoderV2"),
+            projector_config=SimpleNamespace(input_dim=896),
+            text_config=text_config,
+        )
+        self.assertIsNone(self._reason(DeepseekOCRForCausalLM, ocr2))
+        dense = SimpleNamespace(
+            vision_config=SimpleNamespace(model_name="deepencoder"),
+            projector_config=SimpleNamespace(input_dim=1280),
+            text_config=SimpleNamespace(topk_method="greedy", use_mla=False),
+        )
+        self.assertIsNone(self._reason(DeepseekOCRForCausalLM, dense))
+
+    def test_minicpmv_entries_delegate_to_the_qwen3_5_gate(self):
+        from sglang.srt.models.minicpmv import (
+            MiniCPMV,
+            MiniCPMV4_6ForConditionalGeneration,
+        )
+        from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
+
+        text_config = SimpleNamespace(model_type="qwen3_5_moe_text")
+        for cls in (MiniCPMV, MiniCPMV4_6ForConditionalGeneration):
+            seen, patcher = self._recording_gate(Qwen3_5ForCausalLM)
+            with patcher:
+                self._reason(cls, SimpleNamespace(text_config=text_config))
+            self.assertIs(seen["config"], text_config, cls.__name__)
+
+    def test_the_text_only_qwen3_5_entries_delegate_to_their_body(self):
+        import sglang.srt.models.qwen3_5 as qwen3_5
+        import sglang.srt.models.qwen3_5_text as qwen3_5_text
+
+        # A text-only Qwen3.5 checkpoint resolves to these classes, which shadow
+        # the multimodal ones by name — attaching the gate to the multimodal
+        # classes alone leaves the registry's text-only entries gate-less.
+        self.assertIs(
+            qwen3_5_text.Qwen3_5MoeForCausalLM.body_cls,
+            qwen3_5.Qwen3_5MoeForCausalLM,
+        )
+        text_config = SimpleNamespace(model_type="qwen3_5_moe_text")
+        seen, patcher = self._recording_gate(qwen3_5.Qwen3_5MoeForCausalLM)
+        with patcher:
+            self._reason(
+                qwen3_5_text.Qwen3_5MoeForCausalLM, text_config, _quant("quark")
+            )
+        self.assertIs(seen["config"], text_config)
+        self.assertEqual(seen["quant"].get_name(), "quark")
+
+    def test_the_qwen3_5_mtp_entry_normalizes_its_quantization(self):
+        from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
+        from sglang.srt.models.qwen3_5_mtp import (
+            Qwen3_5ForCausalLMMTP,
+            _mtp_quant_config,
+        )
+
+        # The normalization the constructor applies, shared with the gate.
+        mixed_bf16_mtp = SimpleNamespace(
+            get_name=lambda: "modelopt_mixed",
+            quantized_layers={"model.layers.0.mlp.experts": {"quant_algo": "NVFP4"}},
+        )
+        self.assertIsNone(_mtp_quant_config(mixed_bf16_mtp))
+        # MIXED_PRECISION checkpoints that quantize the MTP head keep it.
+        mixed_fp8_mtp = SimpleNamespace(
+            get_name=lambda: "modelopt_mixed",
+            quantized_layers={
+                "model.layers.0.mlp.experts": {"quant_algo": "NVFP4"},
+                "mtp.layers.0.mlp.experts": {"quant_algo": "FP8_BLOCK_SCALES"},
+            },
+        )
+        self.assertIs(_mtp_quant_config(mixed_fp8_mtp), mixed_fp8_mtp)
+        serialized = SimpleNamespace(
+            get_name=lambda: "modelopt_fp4", is_checkpoint_nvfp4_serialized=True
+        )
+        self.assertIsNone(_mtp_quant_config(serialized))
+        # A non-serialized modelopt_fp4 checkpoint still converts on load, so
+        # the MTP module keeps the quantization.
+        online = SimpleNamespace(
+            get_name=lambda: "modelopt_fp4", is_checkpoint_nvfp4_serialized=False
+        )
+        self.assertIs(_mtp_quant_config(online), online)
+        quark_mtp = SimpleNamespace(
+            get_name=lambda: "quark", exclude_layers=["mtp.mlp.experts"]
+        )
+        self.assertIsNone(_mtp_quant_config(quark_mtp))
+        kept = _quant("fp8")
+        self.assertIs(_mtp_quant_config(kept), kept)
+
+        text_config = SimpleNamespace(model_type="qwen3_5_moe_text")
+        seen, patcher = self._recording_gate(Qwen3_5ForCausalLM)
+        with patcher:
+            self._reason(
+                Qwen3_5ForCausalLMMTP,
+                SimpleNamespace(text_config=text_config),
+                serialized,
+            )
+        self.assertIs(seen["config"], text_config)
+        self.assertIsNone(
+            seen["quant"], "the MTP module ships unquantized in that checkpoint"
+        )
+
+
+class TestA2ABackendGate(_FusionGateCase):
+    """`can_fuse_shared_expert` must refuse for every DeepEP-class backend it
+    is wired for. MoRI runs the same per-rank EP expert layout as DeepEP, so a
+    fused shared expert would occupy a global slot the layers never allocate —
+    the routed experts then read the wrong rows and accuracy collapses."""
+
+    def _config(self):
+        return SimpleNamespace(
+            model_type="qwen3_5_moe_text",
+            shared_expert_intermediate_size=1024,
+            moe_intermediate_size=1024,
+        )
+
+    def _use_backend(self, name: str):
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
+        from sglang.srt.runtime_context import get_flags
+
+        moe = get_flags().moe
+        previous = moe.a2a_backend
+        moe.a2a_backend = MoeA2ABackend(name)
+        self.addCleanup(setattr, moe, "a2a_backend", previous)
+
+    def test_the_a2a_backends_refuse_fusion(self):
+        from sglang.srt.models.qwen2_moe import can_fuse_shared_expert
+
+        self._seed()
+        for backend in ("deepep", "mori"):
+            with self.subTest(backend=backend):
+                self._use_backend(backend)
+                self.assertFalse(can_fuse_shared_expert(self._config(), None))
+
+    def test_a_plain_tp_deployment_still_fuses(self):
+        from sglang.srt.models.qwen2_moe import can_fuse_shared_expert
+
+        self._seed()
+        self._use_backend("none")
+        self.assertTrue(can_fuse_shared_expert(self._config(), None))
+
+
+class TestFamiliesWithoutAGate(_FusionGateCase):
+    def test_qwen2_moe_style_families_follow_the_intent(self):
+        """A family with no gate must not grow one by accident: the installer
+        falls back to the user's intent for it."""
+        from sglang.srt.models.qwen2_moe import Qwen2MoeForCausalLM
+
+        self.assertFalse(
+            hasattr(Qwen2MoeForCausalLM, "shared_experts_fusion_disable_reason")
+        )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

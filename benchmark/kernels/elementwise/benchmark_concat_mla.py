@@ -143,9 +143,7 @@ output_exp = execute_and_get_output(fn_cuda, data)
 if not torch.all(output_ref == output_exp):
     abs_delta = torch.abs(output_ref - output_exp)
     raise AssertionError(
-        f"{output_ref=} {output_exp=} "
-        f"{abs_delta=} "
-        f"{torch.argwhere(abs_delta != 0.0)=} "
+        f"{output_ref=} {output_exp=} {abs_delta=} {torch.argwhere(abs_delta != 0.0)=} "
     )
 
 
