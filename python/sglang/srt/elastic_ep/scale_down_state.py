@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, List, Optional
 
+from sglang.srt.elastic_ep.errors import ElasticLayoutFatal
+
 logger = logging.getLogger(__name__)
 
 
@@ -91,6 +93,13 @@ class ScaleDownStateMachine:
             self._advance(driver)
             if self.state is ScaleDownState.EXIT:
                 driver.on_exit(self)
+        except ElasticLayoutFatal:
+            # Ahead of the handler below, and not caught. FAILED leaves the rank
+            # serving, which is the one thing a rank whose map and weights disagree
+            # must not do: it answers from one expert's weights under another's label
+            # and nothing downstream can tell. Reported as a failure this reads as a
+            # scale that did not take, while the rank quietly returns wrong tokens.
+            raise
         except Exception as exc:  # noqa: BLE001
             self.last_error = f"{type(exc).__name__}: {exc}"
             logger.error(

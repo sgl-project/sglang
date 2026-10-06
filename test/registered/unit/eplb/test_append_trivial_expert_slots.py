@@ -8,7 +8,10 @@ import unittest
 
 import torch
 
-from sglang.srt.eplb.expert_location import append_trivial_expert_slots
+from sglang.srt.eplb.expert_location import (
+    append_trivial_expert_slots,
+    build_trivial_physical_to_logical_map,
+)
 from sglang.test.test_utils import CustomTestCase
 
 NUM_LAYERS = 4
@@ -35,18 +38,21 @@ class TestAppendTrivialExpertSlots(CustomTestCase):
         self.assertIs(out, base)
         self.assertEqual(out.shape, (NUM_LAYERS, 16))
 
-    def test_build_then_append_reaches_every_target_width(self):
-        """The caller's contract: pick the narrower width first, then append.
+    def test_build_reaches_every_target_width(self):
+        """The layout init_trivial performs, called rather than re-implemented.
 
-        Covers narrowing, exact and widening against a fixed base, which is the
-        invariant init_trivial now holds and did not before.
+        Covers narrowing, exact and widening against a fixed base. Narrowing is the
+        case that matters: building at the base width and appending a negative count
+        leaves the map base-wide while ep_size says otherwise, so a target below the
+        base fails here without the fix.
         """
-        base_width = 32
         for target in (8, 16, 31, 32, 33, 48):
             with self.subTest(target=target):
-                built = _base_map(min(base_width, target))
-                out = append_trivial_expert_slots(
-                    built, target - built.shape[-1], NUM_LOGICAL
+                out = build_trivial_physical_to_logical_map(
+                    base_num_physical_experts=32,
+                    num_physical_experts=target,
+                    num_layers=NUM_LAYERS,
+                    num_logical_experts=NUM_LOGICAL,
                 )
                 self.assertEqual(out.shape, (NUM_LAYERS, target))
                 self.assertTrue(bool((out >= 0).all()))
