@@ -16,7 +16,6 @@ use crate::policies::{Policy, PrefixLookupResult};
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
-use crate::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 use axum::body::Body;
@@ -52,7 +51,7 @@ pub async fn chat_completions(
             .take()
             .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
     );
-    let routing = ModelRouting::lookup(&ctx, &model)?;
+    let (model, routing) = ModelRouting::lookup_openai(&ctx, model)?;
     let request = PreparedRequest::chat(
         &ctx,
         model,
@@ -103,7 +102,7 @@ async fn embedding_input(
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
     let (model, value) = parse_embedding_request(&body)?;
-    let routing = ModelRouting::lookup(&ctx, &model)?;
+    let (model, routing) = ModelRouting::lookup_openai(&ctx, model)?;
     require_plain_workers(&ctx, &model, path)?;
     let request = PreparedRequest::embeddings(&ctx, path, model, body, value)?;
     routing.dispatch(&ctx, request, headers, start).await
@@ -147,6 +146,19 @@ impl<'a> ModelRouting<'a> {
             ChatRouting::Reorg(resolvers) => resolvers.get(model).map(Self::Reorg),
         };
         routing.ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))
+    }
+
+    /// Like `lookup`, but `base:adapter` (SGLang's LoRA syntax) resolves to
+    /// `base`; the body still names the adapter for the engine.
+    fn lookup_openai(ctx: &'a AppContext, model: ModelId) -> Result<(ModelId, Self), ApiError> {
+        match (Self::lookup(ctx, &model), model.0.split_once(':')) {
+            (Err(error), Some((base, _))) => {
+                let base = ModelId(base.trim().to_owned());
+                let routing = Self::lookup(ctx, &base).map_err(|_| error)?;
+                Ok((base, routing))
+            }
+            (routing, _) => Ok((model, routing?)),
+        }
     }
 
     fn needs_request_tokens(&self, ctx: &AppContext) -> bool {
@@ -405,6 +417,7 @@ fn pick_prefill_worker(
         request_input_tokens: request.input_token_count as u64,
         request_sequence_tokens: request.sequence_token_count as u64,
         request_tokens: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+        cache_namespace: &request.cache_namespace,
         external_prefix: routing.prefix_matches.as_ref(),
         load_snapshot: routing.load_snapshot.as_ref(),
         workers: candidates,
@@ -463,18 +476,19 @@ async fn lookup_prefix_matches(
     ctx: &AppContext,
     request: &PreparedRequest,
 ) -> Result<Option<PrefixLookupResult>, ApiError> {
-    let signal = match (
-        ctx.prefix_index.as_ref(),
-        request.tokens.as_ref(),
-        ctx.block_size_oracle.get(),
-    ) {
-        // Remote indexer: hash tokens into blocks and match against the KV index.
-        (Some(index), Some(tokens), Some(block_size)) => {
-            let hashes = if ctx.block_size_oracle.is_bigram() {
-                compute_block_hashes_bigram(&tokens.ids, block_size as usize)
-            } else {
-                compute_block_hashes(&tokens.ids, block_size as usize)
-            };
+    let namespace = &request.cache_namespace;
+    let tokens = request.tokens.as_ref();
+    let remote = ctx
+        .prefix_index
+        .as_ref()
+        .zip(tokens)
+        .and_then(|(index, tokens)| {
+            let hashes = ctx.block_size_oracle.block_hashes(&tokens.ids, namespace)?;
+            Some((index, hashes))
+        });
+    let signal = match remote {
+        // Remote indexer: match the prompt's block hashes against the KV index.
+        Some((index, hashes)) => {
             let query_blocks = hashes.len();
             let outcome = if hashes.is_empty() {
                 sgl_kv_indexer::PrefixOutcome::Empty
@@ -488,11 +502,11 @@ async fn lookup_prefix_matches(
             })
         }
         // Without usable indexer inputs, try the in-process radix tree.
-        _ => ctx
+        None => ctx
             .radix_tree_prefix_provider
             .as_ref()
-            .zip(request.tokens.as_ref())
-            .and_then(|(provider, tokens)| provider.match_request_tokens(&tokens.ids)),
+            .zip(tokens)
+            .and_then(|(provider, tokens)| provider.match_request_tokens(&tokens.ids, namespace)),
     };
     Ok(signal)
 }

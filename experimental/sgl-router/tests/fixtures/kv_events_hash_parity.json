@@ -228,5 +228,51 @@
       3368460852864325515,
       1233425155141659070
     ]
+  },
+  {
+    "name": "salted",
+    "tokens": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "block_size": 2,
+    "cache_salt": "tenant-a",
+    "expected_i64_hashes": [
+      31502315585564397,
+      -6358338539514506595
+    ]
+  },
+  {
+    "name": "lora",
+    "tokens": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "block_size": 2,
+    "lora_name": "adapter-a",
+    "expected_i64_hashes": [
+      1132550695741458728,
+      3694048958605100876
+    ]
+  },
+  {
+    "name": "salted_lora",
+    "tokens": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "block_size": 2,
+    "cache_salt": "tenant-a",
+    "lora_name": "adapter-a",
+    "expected_i64_hashes": [
+      5453732947292851540,
+      -615216578871236088
+    ]
   }
 ]

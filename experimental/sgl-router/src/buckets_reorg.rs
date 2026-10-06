@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use crate::discovery::{ModelId, WorkerId};
 use crate::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
+use crate::state::kv_events::CacheNamespace;
 use crate::workers::{paired_prefills, Worker, WorkerRegistry};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -138,6 +139,7 @@ pub struct BucketRequest<'a> {
     pub expected_peak_tokens: Option<u64>,
     pub prefix: Option<&'a crate::policies_reorg::cache_aware::PrefixMemo>,
     pub token_ids: Option<&'a [u32]>,
+    pub cache_namespace: &'a CacheNamespace,
     pub session_key: Option<&'a str>,
     pub routing_key: Option<&'a str>,
     /// Engines this request already failed on; no group offers them again.
@@ -301,6 +303,7 @@ impl Bucket {
             expected_peak_tokens: request.expected_peak_tokens,
             prefix: request.prefix,
             token_ids: request.token_ids,
+            cache_namespace: request.cache_namespace,
             session_key: request.session_key,
             routing_key: request.routing_key,
         };
