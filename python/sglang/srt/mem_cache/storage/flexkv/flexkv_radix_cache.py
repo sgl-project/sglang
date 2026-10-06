@@ -385,8 +385,8 @@ class FlexKVRadixCache(RadixCache):
     # checkpoint (STORE)
     # ------------------------------------------------------------------
 
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        if not inserted:
+    def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if not checkpointed:
             self._load_markers.pop(req.cache_request_handle, None)
 
     def checkpoint(self, req: Req, *, up_to: int) -> None:  # type: ignore[override]
