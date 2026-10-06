@@ -215,7 +215,6 @@ class DecodeHiCacheTransferMixin:
             self.tree_cache,
             dr.req.origin_input_ids,
             cow_mamba=False,
-            include_req=True,
             max_prefix_len=pm.decode_prefix_len,
         )
         new_indices, restored_node = self.tree_cache.init_load_back(

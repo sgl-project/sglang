@@ -795,7 +795,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.tree_cache,
             req.origin_input_ids,
             cow_mamba=self.tree_cache.supports_mamba(),
-            include_req=True,
             max_prefix_len=max_prefix_len,
         )
         req.lock = self.tree_cache.lock(result.last_device_node)

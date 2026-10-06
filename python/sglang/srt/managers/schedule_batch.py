@@ -1597,7 +1597,6 @@ class Req(ReqDllmMixin):
         token_ids: Optional[array] = None,
         *,
         cow_mamba: bool = False,
-        include_req: bool = False,
         max_prefix_len: Optional[int] = None,
     ) -> MatchResult:
         """Match token_ids against tree_cache and adopt the hit as this request's prefix."""
@@ -1622,7 +1621,7 @@ class Req(ReqDllmMixin):
                     cache_salt=self.cache_salt,
                 ),
                 cow_mamba=cow_mamba,
-                req=self if include_req else None,
+                req=self,
             )
         )
         if envs.SGLANG_RADIX_FORCE_MISS.get():
@@ -1705,7 +1704,6 @@ class Req(ReqDllmMixin):
                 tree_cache,
                 token_ids_to_match,
                 cow_mamba=cow_mamba,
-                include_req=True,
                 max_prefix_len=key_limit,
             )
             self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
