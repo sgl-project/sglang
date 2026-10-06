@@ -142,6 +142,19 @@ def export_to_trimesh(mesh_output: Any) -> Any:
         return trimesh.Trimesh(mesh_output.mesh_v, mesh_output.mesh_f)
 
 
+# Hunyuan3D-2.1's use_remesh decimates to this many faces before UV unwrapping.
+REMESH_TARGET_FACES = 40000
+
+
+def mesh_simplify(mesh: Any, target_faces: int = REMESH_TARGET_FACES) -> Any:
+    """Quadric-decimate mesh to at most target_faces faces (Hunyuan3D-2.1 remesh)."""
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.dump(concatenate=True)
+    if len(mesh.faces) <= target_faces:
+        return mesh
+    return mesh.simplify_quadric_decimation(face_count=target_faces)
+
+
 def mesh_uv_wrap(mesh: Any) -> Any:
     """Apply UV unwrapping to mesh. In-place like native Hunyuan3D-2 for same layout."""
     try:
