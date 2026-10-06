@@ -266,6 +266,14 @@ ENV LIBRARY_PATH=$ROCM_HOME/lib
 ENV LD_LIBRARY_PATH=$ROCM_HOME/lib
 RUN echo 'export PATH=$ROCM_HOME/llvm/bin:$ROCM_HOME/bin:$PATH' >> /etc/bash.bashrc
 
+# GPU_ARCH no longer determines the torch version on its own: a rocm1000 flavor
+# points at either the 10.0 index (torch 2.11) or the 10.1 one (torch 2.12,
+# since 10.1 publishes no 2.11 wheel). Carry what was actually installed into
+# the final stage, which has to pick matching sglang extras and assert on it.
+ENV ROCM_STACK_TORCH_VERSION=${ROCM_TORCH_VERSION}
+ENV ROCM_STACK_TORCHVISION_VERSION=${ROCM_TORCHVISION_VERSION}
+ENV ROCM_STACK_TORCHAUDIO_VERSION=${ROCM_TORCHAUDIO_VERSION}
+
 # The SDK's hsakmtTargets.cmake hardcodes /usr/lib64/libc.so from its own build
 # host; Ubuntu keeps libc in /lib/x86_64-linux-gnu, so cmake would otherwise
 # fail with "ninja: error: /usr/lib64/libc.so missing and no known rule to make it".
@@ -310,10 +318,15 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 # flavor name, so they apply here unchanged.
 FROM $BASE_IMAGE_1250_ROCM1000 AS gfx1250-rocm1000
 ENV BUILD_VLLM="0"
-# Unlike the gfx942/gfx950 images, this one replaces the SDK's Triton: the
-# revision below is what the MI45x bring-up ran on, and it carries a fix the
-# SDK build does not have yet.
-ENV BUILD_TRITON="1"
+# Keep the Triton the SDK ships. The source build below (TRITON_COMMIT, from
+# main) carries a gfx1250 software-pipeliner fix the SDK build lacks, but it is
+# also past upstream #10833, which removed block pointers: that makes every
+# kernel under sglang/kernels/ops/attention/fla fail to compile, and it drops
+# triton_kernels, which the MXFP4 and some FP8 paths import unguarded.
+# The SDK Triton keeps both at the cost of faulting on tl.dot with num_stages>1.
+# Neither revision is correct on both counts; flip this back to "1" once a
+# Triton with the pipeliner fix and block pointers is available.
+ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
@@ -324,6 +337,14 @@ ENV AITER_COMMIT_DEFAULT="a6d2b564fd671724a3720b8edf70e8d674e4d694"
 # The upstream Triton the gfx1250 bring-up was validated against, carried over
 # from the ROCm 7.14 flavor this image replaced. Built from source below.
 ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
+# hipBLASLt resolves its Tensile library relative to this directory. The SDK
+# wheels keep those files under library/<arch>/, which hipBLASLt 10.0 finds on
+# its own but 10.1 does not: it looks for library/TensileLibrary_lazy_gfx1250.dat
+# directly and every GEMM then fails with HIPBLAS_STATUS_INVALID_VALUE. Pointing
+# it at the arch directory restores 10.0-level throughput; symlinking just the
+# index file is not enough because the kernel .hsaco files live there too.
+# Harmless on 10.0, where this is the directory it already resolves to.
+ENV HIPBLASLT_TENSILE_LIBPATH="/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/hipblaslt/library/gfx1250"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
@@ -497,13 +518,28 @@ RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which
 
 # Install AMD SMI Python package from ROCm distribution.
 # Neither the ROCm 7.2 base image (rocm/pytorch) nor the pip-installed ROCm 10.0.0
-# SDK pre-installs this package.
+# SDK pre-installs this package. sglang needs it for the XGMI link-type probe in
+# custom_all_reduce_utils.
+# ROCm 10.1 still ships share/amd_smi/amdsmi (pure python over libamd_smi) but no
+# longer the setup.py/pyproject.toml beside it, so pip has nothing to build from
+# and there is no amdsmi wheel on the ROCm index to fall back to.
 RUN set -eux; \
     case "${GPU_ARCH}" in \
       *rocm720*|*rocm724*|*rocm1000*) \
         echo "ROCm 7.2 / 10.0.0 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
-        cd /opt/rocm/share/amd_smi \
-        && python3 -m pip install --no-cache-dir . \
+        cd /opt/rocm/share/amd_smi; \
+        if [ -f setup.py ] || [ -f pyproject.toml ]; then \
+          python3 -m pip install --no-cache-dir . ; \
+        else \
+          version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' amdsmi/_version.py); \
+          rm -rf /tmp/amdsmi-pkg; \
+          mkdir -p /tmp/amdsmi-pkg; \
+          cp -r amdsmi /tmp/amdsmi-pkg/; \
+          printf '[build-system]\nrequires = ["setuptools>=59.0"]\nbuild-backend = "setuptools.build_meta"\n\n[project]\nname = "amdsmi"\nversion = "%s"\ndescription = "AMDSMI Python LIB - AMD GPU Monitoring Library"\n\n[tool.setuptools]\npackages = ["amdsmi"]\ninclude-package-data = true\n' "${version}" > /tmp/amdsmi-pkg/pyproject.toml; \
+          python3 -m pip install --no-cache-dir /tmp/amdsmi-pkg; \
+          rm -rf /tmp/amdsmi-pkg; \
+        fi; \
+        python3 -c "import amdsmi"; \
         ;; \
       *) \
         echo "Not rocm720/rocm724/rocm1000 (GPU_ARCH=${GPU_ARCH}), skip amdsmi installation"; \
@@ -719,8 +755,14 @@ RUN pip list --format=freeze | grep -E '^(torch|triton)' > /tmp/constraints.txt
 RUN cd sglang \
     && cp python/pyproject_other.toml python/pyproject.toml \
     && case "${GPU_ARCH}" in \
-         *-rocm1000) srt_extras="srt_hip_rocm724,diffusion_hip"; \
-                     all_extras="all_hip_rocm724" ; \
+         *-rocm1000) case "${ROCM_STACK_TORCH_VERSION}" in \
+                       2.11.*) srt_extras="srt_hip_rocm724,diffusion_hip"; \
+                               all_extras="all_hip_rocm724" ;; \
+                       2.12.*) srt_extras="srt_hip_rocm101,diffusion_hip"; \
+                               all_extras="all_hip_rocm101" ;; \
+                       *) echo "No sglang extras pin torch ${ROCM_STACK_TORCH_VERSION}"; \
+                          exit 1 ;; \
+                     esac ; \
                      CONS="-c /tmp/constraints.txt" ; \
                      ;; \
          *-rocm724) srt_extras="srt_hip_rocm724,diffusion_hip"; \
@@ -750,7 +792,9 @@ RUN python -m pip cache purge
 
 RUN case "${GPU_ARCH##*-}" in \
       rocm724) expected_torch="2.11."; expected_audio="2.11."; expected_vision="0.26." ;; \
-      rocm1000) expected_torch="2.11."; expected_audio="2.11."; expected_vision="0.26." ;; \
+      rocm1000) expected_torch="${ROCM_STACK_TORCH_VERSION%.*}."; \
+                expected_audio="${ROCM_STACK_TORCHAUDIO_VERSION%.*}."; \
+                expected_vision="${ROCM_STACK_TORCHVISION_VERSION%.*}." ;; \
       *) exit 0 ;; \
     esac \
     && python3 -m pip check \
