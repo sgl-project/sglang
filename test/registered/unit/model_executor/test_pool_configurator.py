@@ -1091,8 +1091,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
             self,
             kv_cache_dtype="auto",
             tp_size=16,
-            dp_size=16,
-            enable_dp_attention=True,
+            attn_dp_size=16,
         )
         seen = []
 
