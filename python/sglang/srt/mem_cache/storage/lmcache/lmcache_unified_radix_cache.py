@@ -832,9 +832,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         )
 
         # Move the request lock to the published boundary.
-        if req.last_node is not None:
-            self._dec_req_lock(req)
-        lock_result = self.inc_lock_ref(matched.last_device_node)
+        self.unlock(req.lock)
+        req.lock = self.lock(matched.last_device_node)
         if total_hit < token_ids_len:
             req.prefix_indices = torch.cat(
                 [canonical, kv_indices[total_hit:].to(dtype=torch.int64, copy=True)]
@@ -843,8 +842,6 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             req.prefix_indices = canonical
         req.kv.cache_protected_len = total_hit
         req.last_node = matched.last_device_node
-        req.lock_receipt = lock_result.to_dec_params()
-        req.swa_prefix_lock_released = False
         flow.request_mamba_value = None
         flow.allocated_request_mamba_for_load = False
         flow.load_req = None
