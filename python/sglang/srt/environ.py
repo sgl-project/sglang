@@ -691,7 +691,11 @@ class Envs:
     # - Source builds with a missing or unusable Rust toolchain.
     # This also applies when Rust is explicitly selected.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("rust")
-    SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
+    # Once decode passes the sliding window, drop the SWA part of the prefill's
+    # tree lock; its SWA KV becomes evictable rather than freed.
+    SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW"
+    )
 
     # ===================================================================
     # PD disaggregation runtime

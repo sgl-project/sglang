@@ -46,8 +46,11 @@ pub(super) struct PreparedRequest {
     pub(super) expected_peak_sequence_tokens: Option<u64>,
     caller_set_rid: bool,
     pub(super) fans_out: bool,
-    /// `None` for `/generate`, embeddings, classify and rerank, which prepare their own body.
-    forwarding_scope: Option<ForwardingScope>,
+    /// Whether chat forwards `tokens` as `input_ids`; `None` for `/generate`,
+    /// embeddings, classify and rerank, which prepare their own body.
+    input_ids_forwarding: Option<InputIdsForwarding>,
+    /// Set by the first outgoing body, so a retry does not book it again.
+    forwarding_booked: bool,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
 }
@@ -82,6 +85,9 @@ impl PreparedRequest {
         let tokens = parsed_body
             .as_ref()
             .and_then(|parsed_body| request_tokens_for(&ctx.tokenizers, &model, parsed_body));
+        // Routing tokens can replace engine tokenization only for supported chat templates.
+        let forwarding =
+            input_ids_forwarding(forwarding_scope, parsed_body.as_ref(), tokens.as_ref());
         let input_tokens = input_token_count(tokens.as_ref(), &body);
         let output_tokens = fields.requested_max_output_tokens();
         Ok(Self {
@@ -97,7 +103,8 @@ impl PreparedRequest {
             tokens,
             caller_set_rid: fields.caller_set_rid,
             fans_out: requests_multiple_samples(&fields, &sampling_defaults),
-            forwarding_scope: Some(forwarding_scope),
+            input_ids_forwarding: Some(forwarding),
+            forwarding_booked: false,
             parsed_body,
             sampling_defaults,
         })
@@ -172,7 +179,8 @@ impl PreparedRequest {
             tokens,
             caller_set_rid: !value["rid"].is_null(),
             fans_out,
-            forwarding_scope: None,
+            input_ids_forwarding: None,
+            forwarding_booked: false,
             parsed_body: Some(value),
             sampling_defaults: Vec::new(),
         })
@@ -256,7 +264,8 @@ impl PreparedRequest {
             tokens: None,
             caller_set_rid: false,
             fans_out: false,
-            forwarding_scope: None,
+            input_ids_forwarding: None,
+            forwarding_booked: false,
             parsed_body: None,
             sampling_defaults: Vec::new(),
         }
@@ -277,24 +286,23 @@ impl PreparedRequest {
         Some(uuid::Uuid::new_v4().simple().to_string())
     }
 
-    pub(super) fn into_outgoing_body(
-        self,
+    /// The engine body for one dispatch attempt; each attempt brings its own
+    /// bootstrap fields and rid.
+    pub(super) fn outgoing_body(
+        &mut self,
         ctx: &AppContext,
         bootstrap: Option<&BootstrapFields>,
         engine_rid: Option<&str>,
     ) -> Result<Bytes, ApiError> {
-        // Routing tokens can replace engine tokenization only for supported chat templates.
-        let forwarding = self.forwarding_scope.map(|scope| {
-            input_ids_forwarding(scope, self.parsed_body.as_ref(), self.tokens.as_ref())
-        });
         let input_ids = self
             .tokens
             .as_ref()
-            .filter(|_| forwarding == Some(InputIdsForwarding::Forwarded))
+            .filter(|_| self.input_ids_forwarding == Some(InputIdsForwarding::Forwarded))
             .map(|tokens| tokens.ids.as_slice());
+        // The first attempt consumes the cached parse; a retry re-parses `body`.
         let body = build_outgoing_body(
             &self.body,
-            self.parsed_body,
+            self.parsed_body.take(),
             input_ids,
             bootstrap,
             &self.sampling_defaults,
@@ -302,7 +310,8 @@ impl PreparedRequest {
         )?;
         // Book only after the outgoing body exists; a request rejected here
         // (an f64-overflow literal re-parsed for PD bootstrap) was never dispatched.
-        if let Some(forwarding) = forwarding {
+        if let (Some(forwarding), false) = (self.input_ids_forwarding, self.forwarding_booked) {
+            self.forwarding_booked = true;
             ctx.metrics
                 .record_input_ids_forwarding(&self.model.0, forwarding);
             if forwarding == InputIdsForwarding::TokenizeFailed {
