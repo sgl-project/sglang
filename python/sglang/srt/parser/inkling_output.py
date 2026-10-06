@@ -119,17 +119,23 @@ class InklingOutputParser:
         # The scheduler matched ``stop`` on the decoded ids, framing included,
         # and ended on the token completing it; cut the raw stream there.
         tokenizer = self._tml.tokenizer
+        if not token_ids:
+            return []
         stop_bytes = stop.encode()
-        pieces: list[bytes] = []
-        region = b""
-        start = len(token_ids)
-        while start > 0 and stop_bytes not in region:
-            if pieces and len(region) >= len(stop_bytes) + len(pieces[-1]):
-                return list(token_ids)
+        pieces = [tokenizer.decode_bytes([token_ids[-1]])]
+        last_len = region_len = len(pieces[0])
+        start = len(token_ids) - 1
+        # A match ending in the last token starts at most len(stop) - 1 bytes
+        # before it; take the earliest such match, not the first suffix hit.
+        while start > 0 and region_len < last_len + len(stop_bytes) - 1:
             start -= 1
             pieces.insert(0, tokenizer.decode_bytes([token_ids[start]]))
-            region = pieces[0] + region
+            region_len += len(pieces[0])
+        region = b"".join(pieces)
+        min_end = len(region) - last_len
         cut = region.find(stop_bytes)
+        while cut != -1 and cut + len(stop_bytes) <= min_end:
+            cut = region.find(stop_bytes, cut + 1)
         if cut == -1:
             return list(token_ids)
         if keep_stop:

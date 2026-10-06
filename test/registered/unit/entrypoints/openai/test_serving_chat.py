@@ -5186,6 +5186,37 @@ class InklingTokenOutputTest(CustomTestCase):
                 with self.subTest(no_stop_trim=no_stop_trim, mode=mode):
                     self.assertEqual(result, expected)
 
+    def test_overlapping_stop_is_cut_at_its_earliest_start(self):
+        """Bug regression: the backward search stopped at the first suffix
+        holding any match, so a stop that began in the previous token and
+        overlapped a later match in the final token was cut too late."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        header = [
+            tokenizer.encode_special("message_model"),
+            tokenizer.encode_special("content_text"),
+        ]
+        cases = [("\n", "\n\n", "\n\n"), ("ab", "aba", "aba")]
+        for previous, final, stop in cases:
+            sampled = [
+                *tokenizer.encode_ordinary(previous),
+                *tokenizer.encode_ordinary(final),
+            ]
+            self.assertEqual(len(sampled), 2)
+            for no_stop_trim, expected in ((False, ("", "")), (True, ("", stop))):
+                request = ChatCompletionRequest(
+                    model="test-model",
+                    messages=[{"role": "user", "content": "hi"}],
+                    no_stop_trim=no_stop_trim,
+                )
+                results = self._reasoning_and_content(
+                    request, header + sampled, {"type": "stop", "matched": stop}
+                )
+                for mode, result in results.items():
+                    with self.subTest(stop=stop, no_stop_trim=no_stop_trim, mode=mode):
+                        self.assertEqual(result, expected)
+
     def test_special_stop_inside_open_text_block_is_not_visible(self):
         """Bug regression: inside an open text block TML renders a special token
         as text, so a custom special stop id leaked unless trimmed by id."""
