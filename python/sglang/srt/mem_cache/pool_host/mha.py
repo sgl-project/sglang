@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Sequence
+from typing import Iterable, Sequence
 
 import torch
 
@@ -120,6 +120,13 @@ def prepare_mha_write_back_staging(
     return staging
 
 
+def _iter_device_buffers(pool, side: str) -> Iterable[torch.Tensor]:
+    """Yield per-layer views from either a sequence or multi-layer tensor."""
+    buffers = getattr(pool, side, None)
+    if buffers is not None:
+        yield from buffers
+
+
 class MHATokenToKVPoolHost(HostKVCache):
     device_pool: MHATokenToKVPool | None = None
     mtp_draft_device_pools: tuple[MHATokenToKVPool, ...] = ()
@@ -157,7 +164,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             for pool in (self.device_pool, *self.mtp_draft_device_pools)
             if pool is not None
             for side in ("k_buffer", "v_buffer")
-            for buf in getattr(pool, side, None) or ()
+            for buf in _iter_device_buffers(pool, side)
         )
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged

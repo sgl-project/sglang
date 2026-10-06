@@ -57,6 +57,25 @@ class TestHostKVCache(CustomTestCase):
             allocator_type="default",
         )
 
+    def test_builds_with_multi_layer_tensor_device_buffers(self):
+        # NPU HiCache without FIA exposes each side as one multi-layer tensor
+        # instead of a list of per-layer tensors.
+        self.device_pool.k_buffer = torch.stack(self.device_pool.k_buffer)
+        self.device_pool.v_buffer = torch.stack(self.device_pool.v_buffer)
+
+        host_pool = MHATokenToKVPoolHost(
+            device_pool=self.device_pool,
+            host_to_device_ratio=2.0,
+            host_size=0,
+            page_size=self.page_size,
+            layout="layer_first",
+            pin_memory=False,
+            device="cpu",
+            allocator_type="default",
+        )
+
+        self.assertTrue(host_pool.device_rows_packed)
+
     def test_index_k_host_pool_joins_a_host_pool_group(self):
         """Grouping a main KV pool with a K-only index pool raised AttributeError."""
         index_pool = MHATokenToKOnlyPool(
