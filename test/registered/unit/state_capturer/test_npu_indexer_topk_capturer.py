@@ -8,7 +8,7 @@ from sglang.srt.state_capturer import indexer_topk as indexer_topk_mod
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 def _model_config(architecture, **attrs):

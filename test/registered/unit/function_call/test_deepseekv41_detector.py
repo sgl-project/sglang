@@ -21,7 +21,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 CHUNK_SIZES = [1, 2, 3, 5, 7, 11, 23, 1000]
 DSML = "｜DSML｜"

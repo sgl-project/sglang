@@ -35,7 +35,7 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-large")
 
 # Global configuration for all indexer tests
 DEFAULT_CONFIG = {

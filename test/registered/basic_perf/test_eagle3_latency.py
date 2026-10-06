@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     run_bench_serving,
 )
 
-register_cuda_ci(est_time=145, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=135, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestEagle3Latency(CustomTestCase):

@@ -34,7 +34,7 @@ from sglang.test.test_utils import (
     DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST,
 )
 
-register_cuda_ci(est_time=172, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=180, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class TestInt8MambaCheckpointE2E(KLDivergenceMixin, DefaultServerBase):

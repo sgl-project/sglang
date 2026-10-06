@@ -51,7 +51,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # Note: PYTHONPATH=python should be set when running tests
 
-register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestModelOptModelLoader(CustomTestCase):

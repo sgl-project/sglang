@@ -14,7 +14,7 @@ from sglang.srt.layers.logits_processor import _reassemble_tp_lm_head_all_to_all
 from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 class TestParallelConsumers(CustomTestCase):

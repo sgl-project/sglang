@@ -17,7 +17,7 @@ from sglang.srt.runtime_context import override_platform
 from sglang.srt.utils import Withable
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 def _batch(mode: ForwardMode, *, extend_tokens: int = 0, any_prefill: bool = False):

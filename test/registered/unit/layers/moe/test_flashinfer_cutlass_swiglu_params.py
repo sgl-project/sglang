@@ -11,7 +11,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 GPT_OSS_ALPHA = 1.702
 GPT_OSS_LIMIT = 7.0

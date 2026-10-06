@@ -28,7 +28,7 @@ from sglang.srt.parser.chat_parsing.response_parser import _coerce, _schema_type
 from sglang.srt.parser.chat_parsing.response_templates import load_response_template
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 cohere_template = {

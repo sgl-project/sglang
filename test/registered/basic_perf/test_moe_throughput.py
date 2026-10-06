@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     run_bench_serving,
 )
 
-register_cuda_ci(est_time=290, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=266, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=770, suite="stage-b-test-2-gpu-large-amd")
 
 

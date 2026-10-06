@@ -6,7 +6,7 @@ from sglang.srt.models.solar import _check_skips_stay_in_stage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 # The backbone skip connections of upstage/solar-pro-preview-instruct.
 CONFIG = SimpleNamespace(

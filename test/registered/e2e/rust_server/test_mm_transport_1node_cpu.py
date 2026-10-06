@@ -12,7 +12,7 @@ from sglang.test.server_fixtures.rust_mm_transport_fixture import (
     RustMmTransportServerBase,
 )
 
-register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=42, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestRustMmTransport1NodeCpu(RustMmTransportServerBase):

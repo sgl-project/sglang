@@ -21,7 +21,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import assert_output_close, init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
 E, H, I, TOPK, M = 8, 1024, 1024, 2, 32
 GROUP_SIZE, PACK_FACTOR = 128, 8
