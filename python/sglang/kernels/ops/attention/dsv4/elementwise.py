@@ -62,18 +62,10 @@ def _jit_main_k_norm_rope_flashmla_module(
     rope_dim: int,
     page_size: int,
     layout: KVLayout,
-    uniform_fp8_store: bool = False,
 ):
-    """Main MLA path K kernel: rmsnorm + RoPE + write to FlashMLA paged cache
-    (or, with uniform_fp8_store, plain e4m3 rows in the uniform 512B pool)."""
+    """Main MLA path K kernel: rmsnorm + RoPE + write to FlashMLA paged cache."""
     args = make_cpp_args(
-        dtype,
-        head_dim,
-        rope_dim,
-        page_size,
-        layout.cpp_name,
-        is_arch_support_pdl(),
-        uniform_fp8_store,
+        dtype, head_dim, rope_dim, page_size, layout.cpp_name, is_arch_support_pdl()
     )
     return load_jit(
         make_name("main_k_norm_rope_flashmla"),
@@ -187,14 +179,6 @@ def fused_q_norm_rope(
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
 ) -> None:
-    # Reuse the BF16 kernel and preserve its rounding before FP8 conversion.
-    # Keep the temporary separate from q_input: callers may reuse the input.
-    fp8_output = q_output if q_output.dtype == torch.float8_e4m3fn else None
-    if fp8_output is not None:
-        assert q_input.dtype == torch.bfloat16
-        assert q_output.shape == q_input.shape
-        assert q_output.device == q_input.device
-        q_output = torch.empty_like(q_input)
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = q_input.shape[-1]
     rope_dim = freqs_real.shape[-1]
@@ -334,7 +318,6 @@ def fused_k_norm_rope_flashmla(
     page_size: int,
     layout: Union[KVLayout, str] = KVLayout.V4,
     q: Optional[torch.Tensor] = None,
-    uniform_fp8_store: bool = False,
 ) -> None:
     """RMSNorm + RoPE ``kv`` and write it into the ``layout`` paged FlashMLA
     cache at ``out_loc``."""
@@ -345,13 +328,11 @@ def fused_k_norm_rope_flashmla(
     if _is_xpu:
         assert layout is KVLayout.V4, "the V4.1 KV layouts are CUDA (sm100) only"
         assert q is None, "the XPU K kernel does not rope q"
-        assert not uniform_fp8_store, "the XPU K kernel has no uniform-FP8 store"
         fused_k_norm_rope_flashmla_xpu(
             kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, page_size
         )
     elif q is not None:
         assert _is_hip, "only the ROCm K launch ropes q"
-        assert not uniform_fp8_store, "the ROCm K+q launch has no uniform-FP8 store"
         module = _jit_main_k_norm_rope_q_flashmla_module(
             kv.dtype, head_dim, rope_dim, page_size, layout
         )
@@ -360,6 +341,6 @@ def fused_k_norm_rope_flashmla(
         )
     else:
         module = _jit_main_k_norm_rope_flashmla_module(
-            kv.dtype, head_dim, rope_dim, page_size, layout, uniform_fp8_store
+            kv.dtype, head_dim, rope_dim, page_size, layout
         )
         module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)

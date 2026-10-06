@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
 )
 from sglang.srt.layers.attention.dsv4.metadata import copy_unless_aliased
 from sglang.srt.runtime_context import (
+    get_buffer,
     get_context,
     get_exec,
     get_parallel,
@@ -136,6 +137,31 @@ def _check_trtllm_query_rows(num_rows: int) -> None:
         )
 
 
+def _refresh_indexed_tail(
+    core: DSV4AttnMetadata,
+    compress_ratio: int,
+    extra_indices: Optional[torch.Tensor],
+    table: torch.Tensor,
+    lens: torch.Tensor,
+    rows: int,
+) -> None:
+    """Write this layer's top-k into the shared indexed table and its lens."""
+    assert extra_indices is not None
+    extra_indices = extra_indices[:rows]
+    width = extra_indices.shape[-1]
+    assert table.shape == (rows, SWA_WINDOW + width), f"{table.shape=} {width=}"
+    if compress_ratio == 4 and core._c4_topk_writes_table():
+        # Lens were set per step; the indexer wrote the tail in place.
+        copy_unless_aliased(table[:, SWA_WINDOW:], extra_indices)
+        return
+    pack_sparse_tail(
+        extra_indices,
+        core.sparse_topk_lengths(compress_ratio)[:rows],
+        table,
+        lens[:rows],
+    )
+
+
 class TrtllmSparseTablePool:
     """One persistent int32 parent per table role, handed out as a ``[:rows]``
     view (2-D when ``width`` is given) whose 64-row tile pad is re-inerted each
@@ -233,6 +259,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         self.trtllm_topk_writes_table = (
             self.dsa_topk_backend.should_use_topk_v2()
             and not get_exec().features.enable_return_indexer_topk
+            and not self.low_ratios
         )
 
         # Preallocate every role at its maximum so nothing is allocated while serving.
@@ -254,7 +281,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         pool.preallocate("d_swa_lens", max_decode_rows, fill=SWA_WINDOW)
         pool.preallocate("p_swa", max_prefill_rows, fill=-1, width=SWA_WINDOW)
         pool.preallocate("p_swa_lens", max_prefill_rows, fill=SWA_WINDOW)
-        if self.has_c4:
+        if self.has_c4 or self.low_ratios:
             pool.preallocate("d_c4", max_decode_rows, fill=-1, width=SWA_WINDOW + w4)
             pool.preallocate("d_c4_lens", max_decode_rows, fill=SWA_WINDOW)
             pool.preallocate("p_c4", max_prefill_rows, fill=-1, width=SWA_WINDOW + w4)
@@ -425,7 +452,8 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         if extra_indices is not None:
             extra_indices = extra_indices[:bs]
 
-        # Only the c4 tail and lens vary by layer; other table data is prebuilt.
+        # Only indexed tails and lens vary by layer; other table data is prebuilt.
+        swa_width = core_attn_metadata.swa_page_indices.shape[1]
         if compress_ratio == 0:
             # swa_page_indices is itself a valid all-SWA combined table.
             sparse_indices = core_attn_metadata.swa_page_indices
@@ -434,6 +462,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sparse_indices = core_attn_metadata.trtllm_c128_indices
             sparse_topk_lens = core_attn_metadata.trtllm_c128_lens
         else:
+            # Ratios 1, 2 and 4 share one indexed table.
             sparse_indices = core_attn_metadata.trtllm_c4_indices
             sparse_topk_lens = core_attn_metadata.trtllm_c4_lens
         assert sparse_indices is not None and sparse_topk_lens is not None, (
@@ -447,14 +476,15 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             assert sparse_topk_lens.shape[0] > bs, f"{sparse_topk_lens.shape=}"
             sparse_topk_lens = sparse_topk_lens[:bs]
 
-        if compress_ratio == 4:
-            assert extra_indices is not None
-            width = extra_indices.shape[-1]
-            assert SWA_WINDOW + width == sparse_indices.shape[1], (
-                f"{width=} {sparse_indices.shape=}"
+        if compress_ratio in (1, 2, 4):
+            _refresh_indexed_tail(
+                core_attn_metadata,
+                compress_ratio,
+                extra_indices,
+                sparse_indices,
+                sparse_topk_lens,
+                bs,
             )
-            # No-op when the indexer already wrote the tail in place.
-            copy_unless_aliased(sparse_indices[:, SWA_WINDOW:], extra_indices)
 
         swa_kv_cache, compressed_kv_cache = self._trtllm_kv_cache_views(
             layer.layer_id, compress_ratio
@@ -469,19 +499,18 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         if seq_lens.shape[0] != bs:
             assert seq_lens.shape[0] > bs, f"{seq_lens.shape=} {bs=}"
             seq_lens = seq_lens[:bs]
+        seq_lens_req = core_attn_metadata.trtllm_seq_lens_req
         if swa_width > SWA_WINDOW:
-            # DSpark attends noncausally to its context window plus the whole
-            # draft block. The tail still indexes SWA storage, not compressed
-            # KV. Use the complete block's visible length rather than each
-            # token's causal length, including for short requests.
+            # DSpark attends noncausally to its window plus the whole draft block:
+            # dense rows bounded by the block's visible length, all from SWA storage.
             compressed_kv_cache = swa_kv_cache
             seq_lens = core_attn_metadata.swa_topk_lengths[:bs]
+            seq_lens_req = None
         assert attn_sink.dtype == torch.float32
         assert self.trtllm_workspace_buffer is not None
         _check_trtllm_query_rows(bs)
 
         # Uniform verify/draft-extend metadata uses VarSeq; ragged verify uses dense per-token.
-        seq_lens_req = core_attn_metadata.trtllm_seq_lens_req
         cum_seq_lens_q = core_attn_metadata.trtllm_cum_seq_lens_q
         common = dict(
             swa_kv_cache=swa_kv_cache,
@@ -493,6 +522,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             bmm2_scale=bmm2_scale,
             sinks=attn_sink,
             kv_layout="HND",
+            backend="trtllm-gen",
         )
         out_arg = None if out_pad_tail is None else out_pad_tail[:bs]
         if seq_lens_req is not None:
@@ -568,17 +598,18 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             assert core.trtllm_prefill_c128 is not None
             sparse_indices, sparse_topk_lens = core.trtllm_prefill_c128
         else:
-            width = extra_indices.shape[-1]
-            # _pad_last_dim keeps the combined c4 capacity divisible by four.
-            assert width % 4 == 0, f"{width=}"
+            # Ratios 1, 2 and 4 share one indexed table.
             sparse_indices = core.trtllm_prefill_c4_indices
-            assert sparse_indices is not None
-            assert sparse_indices.shape == (
-                sum_q,
-                SWA_WINDOW + width,
-            ), f"{sparse_indices.shape=} {width=}"
-            copy_unless_aliased(sparse_indices[:, SWA_WINDOW:], extra_indices[:sum_q])
             sparse_topk_lens = core.trtllm_prefill_c4_lens
+            assert sparse_indices is not None and sparse_topk_lens is not None
+            _refresh_indexed_tail(
+                core,
+                compress_ratio,
+                extra_indices,
+                sparse_indices,
+                sparse_topk_lens,
+                sum_q,
+            )
 
         assert sparse_topk_lens is not None
 
@@ -617,6 +648,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             bmm2_scale=bmm2_scale,
             sinks=attn_sink,
             kv_layout="HND",
+            backend="trtllm-gen",
         )
         return out_padded if out_padded is not None else out.view(sum_q, num_heads, 512)
 

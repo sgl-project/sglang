@@ -536,11 +536,24 @@ class DSV4AttnMetadata:
         # stride-unaware v1 kernel, so never alias when it exists.
         return self.trtllm_topk_writes_table and self.c4_sparse_raw_indices is None
 
+    def _has_trtllm_indexed_table(self) -> bool:
+        # Ratios 1, 2 and 4 all select index_topk entries into one shared table.
+        return self.has_c4 or bool(self.low_ratios)
+
+    def _zero_empty_low_ratio_lengths(self) -> None:
+        # FlashMLA metadata clamps empty compressed histories to one; trtllm needs
+        # the true zero, since a -1 entry still adds to the softmax denominator.
+        for ratio in self.low_ratios:
+            lengths = self.sparse_topk_lengths(ratio)
+            if lengths is not None:
+                torch.minimum(lengths, self.seq_lens_casual // ratio, out=lengths)
+
     def init_trtllm_sparse_buffers(self) -> None:
         """Build tile-padded TRT-LLM tables and lengths for indexed attention
         or SWA-only DSpark blocks; indexed tails are refreshed per layer."""
 
         num_tokens = self.seq_lens_casual.shape[0]
+        # DSpark draft verify widens the SWA table to window + block.
         swa_width = self.swa_page_indices.shape[1]
         assert self.swa_page_indices.shape[0] == num_tokens
         assert swa_width >= SWA_WINDOW
@@ -561,11 +574,20 @@ class DSV4AttnMetadata:
 
             self.seq_lens_casual = _tile_padded_step(1, self.seq_lens_casual)
             self.swa_page_indices = _tile_padded_step(
-                -1, self.swa_page_indices, width=SWA_WINDOW
+                -1, self.swa_page_indices, width=swa_width
             )
-        self.trtllm_swa_lens = pool.view("d_swa_lens", num_tokens, fill=SWA_WINDOW)
-        if self.has_c4:
-            # Lens are per step; the c4 index tail is filled per layer by the indexer.
+        if swa_width > SWA_WINDOW:
+            self.trtllm_swa_lens = pool.view(
+                "d_swa_lens", num_tokens, fill=SWA_WINDOW, rows_written_by_caller=True
+            )
+            torch.clamp(self.swa_topk_lengths, min=SWA_WINDOW, out=self.trtllm_swa_lens)
+        else:
+            self.trtllm_swa_lens = pool.view("d_swa_lens", num_tokens, fill=SWA_WINDOW)
+        self._zero_empty_low_ratio_lengths()
+        if self._has_trtllm_indexed_table():
+            assert swa_width == SWA_WINDOW
+            # The indexed tail and lens are refreshed per layer, except when topk_v2
+            # writes the c4 tail itself; then the lens are set once per step.
             self.trtllm_c4_indices = pool.view(
                 "d_c4", num_tokens, fill=-1, width=SWA_WINDOW + self._c4_table_width()
             )
@@ -573,9 +595,10 @@ class DSV4AttnMetadata:
             self.trtllm_c4_lens = pool.view(
                 "d_c4_lens", num_tokens, fill=SWA_WINDOW, rows_written_by_caller=True
             )
-            torch.add(self.c4_sparse_topk_lengths, SWA_WINDOW, out=self.trtllm_c4_lens)
             if self._c4_topk_writes_table():
-                # topk_v2 writes each layer's top-k into the table tail; the forward skips its copy.
+                torch.add(
+                    self.c4_sparse_topk_lengths, SWA_WINDOW, out=self.trtllm_c4_lens
+                )
                 self.c4_sparse_page_indices = self.trtllm_c4_indices[:, SWA_WINDOW:]
 
         if self.c128_page_indices is not None:
@@ -621,7 +644,8 @@ class DSV4AttnMetadata:
             "p_swa_lens", num_tokens, fill=SWA_WINDOW
         )
 
-        if self.has_c4:
+        self._zero_empty_low_ratio_lengths()
+        if self._has_trtllm_indexed_table():
             full_table = pool.view(
                 "p_c4",
                 num_metadata_rows,
@@ -633,12 +657,12 @@ class DSV4AttnMetadata:
             self.trtllm_prefill_c4_lens = pool.view(
                 "p_c4_lens", num_tokens, fill=SWA_WINDOW, rows_written_by_caller=True
             )
-            torch.add(
-                self.c4_sparse_topk_lengths[:num_tokens],
-                SWA_WINDOW,
-                out=self.trtllm_prefill_c4_lens,
-            )
             if self._c4_topk_writes_table():
+                torch.add(
+                    self.c4_sparse_topk_lengths[:num_tokens],
+                    SWA_WINDOW,
+                    out=self.trtllm_prefill_c4_lens,
+                )
                 self.c4_sparse_page_indices = full_table[:, SWA_WINDOW:]
 
         if self.c128_page_indices is not None:
