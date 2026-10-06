@@ -525,63 +525,59 @@ class TestHostSnapshot(unittest.TestCase):
                 metadata(),
             )
 
-    def test_chunked_payload_reader_handles_tails_and_drains_on_failure(self):
+    def test_payload_reader_handles_short_reads_and_failure(self):
         path = self.root / "payload.bin"
-        with patch.object(host, "_READ_CHUNK_BYTES", 64):
-            for data in (b"", bytes(range(251)) * 9, b"x" * 256):
-                with self.subTest(bytes=len(data)):
-                    path.write_bytes(data)
-                    with memoryview(bytearray(len(data))) as destination:
-                        times = host._read_verify_payload(
-                            path,
-                            destination,
-                            {
-                                "nbytes": len(data),
-                                "sha256": hashlib.sha256(data).hexdigest(),
-                            },
-                        )
-                        self.assertEqual(destination, data)
-                        self.assertTrue(all(value >= 0 for value in times))
-            path.write_bytes(b"a" * 80)
-            with memoryview(bytearray(100)) as destination:
-                with self.assertRaisesRegex(ValueError, "truncated delta payload"):
-                    host._read_verify_payload(
-                        path, destination, {"nbytes": 80, "sha256": "0" * 64}
+
+        class ShortReader:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.stream.close()
+
+            def fileno(self):
+                return self.stream.fileno()
+
+            def readinto(self, destination):
+                with destination[:64] as part:
+                    return self.stream.readinto(part)
+
+            def read(self, count):
+                return self.stream.read(count)
+
+        for data in (b"", bytes(range(251)) * 9, b"x" * 256):
+            with self.subTest(bytes=len(data)):
+                path.write_bytes(data)
+                reader = ShortReader(path.open("rb", buffering=0))
+                with (
+                    patch.object(Path, "open", return_value=reader),
+                    memoryview(bytearray(len(data))) as destination,
+                ):
+                    times = host._read_verify_payload(
+                        path,
+                        destination,
+                        {
+                            "nbytes": len(data),
+                            "sha256": hashlib.sha256(data).hexdigest(),
+                        },
                     )
-
-            entered, release, finished = [threading.Event() for _ in range(3)]
-
-            class Reader(ThreadPoolExecutor):
-                def submit(self, fn, offset):
-                    def task():
-                        if offset:
-                            entered.set()
-                            assert release.wait(5)
-                        result = fn(offset)
-                        if offset:
-                            finished.set()
-                        return result
-
-                    return super().submit(task)
-
-            class BrokenDigest:
-                def update(self, region):
-                    assert entered.wait(5)
-                    release.set()
-                    raise RuntimeError("hash failure")
-
-            path.write_bytes(b"a" * 129)
-            with (
-                mmap.mmap(-1, 129) as mapping,
-                memoryview(mapping) as destination,
-                patch.object(host, "ThreadPoolExecutor", Reader),
-                patch.object(host, "hashlib", SimpleNamespace(sha256=BrokenDigest)),
-            ):
-                with self.assertRaisesRegex(RuntimeError, "hash failure"):
-                    host._read_verify_payload(
-                        path, destination, {"nbytes": 129, "sha256": "0" * 64}
-                    )
-                self.assertTrue(finished.is_set())
+                    self.assertEqual(destination, data)
+                    self.assertTrue(all(value >= 0 for value in times))
+                self.assertTrue(reader.stream.closed)
+        path.write_bytes(b"a" * 80)
+        with memoryview(bytearray(100)) as destination:
+            with self.assertRaisesRegex(ValueError, "truncated delta payload"):
+                host._read_verify_payload(
+                    path, destination, {"nbytes": 80, "sha256": "0" * 64}
+                )
+        with mmap.mmap(-1, 80) as mapping, memoryview(mapping) as destination:
+            with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+                host._read_verify_payload(
+                    path, destination, {"nbytes": 80, "sha256": "0" * 64}
+                )
 
     def test_local_decode_does_not_hold_engine_encoded_cache_lock(self):
         path, digest, manifest, expected = fixture(self.root)

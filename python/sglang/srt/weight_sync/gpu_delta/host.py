@@ -26,7 +26,6 @@ import re
 import stat
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import orjson
@@ -130,47 +129,18 @@ def _write_record(directory, name, record):
     temporary.replace(directory / (name + ".json"))
 
 
-# Bounded read-ahead directly into the final encoded cache; no copied chunk buffers.
-_READ_CHUNK_BYTES = 8 << 20
-
-
 def _read_verify_payload(source, destination, expected):
-    read_s, hash_s = 0.0, 0.0
-    checksum = hashlib.sha256()
-    # File tasks already run concurrently in the outer pool. A private reader
-    # cannot deadlock waiting for another slot in that same saturated pool.
-    with (
-        source.open("rb", buffering=0) as incoming,
-        ThreadPoolExecutor(max_workers=1) as reader,
-    ):
+    started = time.perf_counter()
+    with source.open("rb", buffering=0) as incoming:
         before = os.fstat(incoming.fileno())
         if before.st_size != expected["nbytes"]:
             raise ValueError("delta payload size mismatch")
-
-        def read_chunk(offset):
-            started = time.perf_counter()
-            with destination[offset : offset + _READ_CHUNK_BYTES] as chunk:
-                position = 0
-                while position < len(chunk):
-                    with chunk[position:] as remaining:
-                        count = incoming.readinto(remaining)
-                    if not count:
-                        raise ValueError("truncated delta payload")
-                    position += count
-            return time.perf_counter() - started
-
-        future = reader.submit(read_chunk, 0) if destination else None
-        for offset in range(0, len(destination), _READ_CHUNK_BYTES):
-            read_s += future.result()
-            next_offset = offset + _READ_CHUNK_BYTES
-            if next_offset < len(destination):
-                future = reader.submit(read_chunk, next_offset)
-            # The next read writes only the disjoint suffix. Executor exit drains
-            # it even if hashing fails, before incoming/destination can close.
-            started = time.perf_counter()
-            with destination[offset:next_offset] as chunk:
-                checksum.update(chunk)
-            hash_s += time.perf_counter() - started
+        position = 0
+        while position < len(destination):
+            count = incoming.readinto(destination[position:])
+            if not count:
+                raise ValueError("truncated delta payload")
+            position += count
         after = os.fstat(incoming.fileno())
         if incoming.read(1) or (
             before.st_ino,
@@ -179,10 +149,12 @@ def _read_verify_payload(source, destination, expected):
             before.st_ctime_ns,
         ) != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             raise ValueError("delta payload size mismatch or source changed")
-    # Authenticate the retained copy before encoded READY allows local decode.
-    if checksum.hexdigest() != expected["sha256"]:
+    read_s = time.perf_counter() - started
+    started = time.perf_counter()
+    # Authenticate the retained copy, never reread the publication file.
+    if hashlib.sha256(destination).hexdigest() != expected["sha256"]:
         raise ValueError("delta payload SHA256 mismatch")
-    return read_s, hash_s
+    return read_s, time.perf_counter() - started
 
 
 def _read_verify_payloads(publication, files, definitions, manifest, pool, metrics):
