@@ -136,16 +136,20 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         foundry = get_foundry_adapter()
         if foundry.enabled:
-            # CUDA graph persistence: SAVE captures and archives this shape
-            # (without the warmup forwards, whose allocations LOAD could not
-            # reproduce); LOAD restores the archived graph instead.
-            self._graphs[shape_key], self._outputs[shape_key] = foundry.capture_one(
+            # CUDA graph persistence: in its preparation pass SAVE runs the two
+            # warmups in a private pool (no graph, None); in the capture pass
+            # SAVE captures and archives this shape, LOAD restores it.
+            result = foundry.capture_one(
                 shape_key,
                 forward_fn,
                 pool=self._pool,
                 stream=self._capture_stream,
                 prefill_req_slots=self._prefill_req_slots(),
+                post_warmup_hook=post_warmup_hook,
+                tp_group=self._tp_group,
             )
+            if result is not None:
+                self._graphs[shape_key], self._outputs[shape_key] = result
             return
         # When per-bs capture traces are enabled (--enable-profile-cuda-graph +
         # SGLANG_GRAPH_BATCH_CAPTURE), the runner created a scheduled

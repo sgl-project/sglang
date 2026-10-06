@@ -1576,7 +1576,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 ) as graph_capture_context:
                     self.stream = graph_capture_context.stream
                     with self.backend.capture_session(self.stream):
-                        self._capture_one_stream()
+                        # Foundry SAVE warms every shape (private pool), then captures.
+                        get_foundry_adapter().run_capture_loop(
+                            self, self._capture_one_stream
+                        )
         finally:
             dp_flags.capturing_prefill_graph = False
         if dp_flags.prefill_graph_has_dp_gather:

@@ -13,7 +13,9 @@ Call sites: the resolution steps in ``arg_groups/cuda_graph_hook.py``,
 ``managers/data_parallel_controller.py``), ``run_scheduler_process``,
 ``bootstrap.init_parallel_runtime``, ``ModelRunner.init_torch_distributed`` and
 ``alloc_memory_pool``, ``KVCacheConfigurator._resolve_memory_pool_config``, the
-decode / prefill runners' ``capture`` and ``FullCudaGraphBackend.capture_one``.
+decode / prefill runners' ``capture`` and their per-shape loop
+(``run_capture_loop``: SAVE warms every shape in a private memory pool in a
+first pass, then captures in a second), and ``FullCudaGraphBackend.capture_one``.
 Restored decode graphs carry no in-graph shared-read marker; the decode
 runner's own fallback for that case (POST_REPLAY) is the fence they need.
 
@@ -38,7 +40,7 @@ logger = logging.getLogger(__name__)
 # Version of foundry.integration.sglang.api this adapter calls: same major,
 # at least this minor.
 FOUNDRY_INTEGRATION_API_MAJOR = 1
-FOUNDRY_INTEGRATION_API_MIN_MINOR = 0
+FOUNDRY_INTEGRATION_API_MIN_MINOR = 1
 # Distribution name (import name ``foundry``) and minimum version, checked
 # when the flag is set.
 FOUNDRY_PACKAGE = "foundry-core"
@@ -108,6 +110,9 @@ class FoundryAdapter:
     def capture_scope(self, runner: Any):
         yield
 
+    def run_capture_loop(self, runner: Any, loop_fn):
+        return loop_fn()
+
     def capture_one(
         self,
         shape_key: Any,
@@ -116,8 +121,11 @@ class FoundryAdapter:
         pool: Any,
         stream: Any,
         prefill_req_slots: Optional[int] = None,
+        post_warmup_hook=None,
+        tp_group: Any = None,
     ):
-        """Returns ``(graph, output)`` for the backend to store."""
+        """Returns ``(graph, output)`` for the backend to store, or None in the
+        warm-up pass of ``run_capture_loop``."""
         raise RuntimeError("capture_one is only called when Foundry is enabled")
 
 
@@ -168,8 +176,19 @@ class _FoundryAdapterReal(FoundryAdapter):
     def capture_scope(self, runner):
         return self._api.capture_scope(runner)
 
+    def run_capture_loop(self, runner, loop_fn):
+        return self._api.run_capture_loop(runner, loop_fn)
+
     def capture_one(
-        self, shape_key, forward_fn, *, pool, stream, prefill_req_slots=None
+        self,
+        shape_key,
+        forward_fn,
+        *,
+        pool,
+        stream,
+        prefill_req_slots=None,
+        post_warmup_hook=None,
+        tp_group=None,
     ):
         return self._api.capture_one(
             shape_key,
@@ -177,6 +196,8 @@ class _FoundryAdapterReal(FoundryAdapter):
             pool=pool,
             stream=stream,
             prefill_req_slots=prefill_req_slots,
+            post_warmup_hook=post_warmup_hook,
+            tp_group=tp_group,
         )
 
 
