@@ -139,6 +139,27 @@ def storage_namespace_seed(
     return digest.hexdigest()
 
 
+def kv_event_lora_seed(lora_name: Optional[str]) -> Optional[bytes]:
+    """Seed that namespaces a LoRA adapter's published block hashes by its name."""
+    if lora_name is None:
+        return None
+    return hashlib.sha256(
+        b"sglang-kv-event-lora-v1\0" + lora_name.encode("utf-8")
+    ).digest()
+
+
+def namespace_event_block_hash(block_hash: int, seed: Optional[bytes]) -> int:
+    """Mix a published block hash with a namespace seed.
+
+    sgl-router recomputes this for requests (src/state/kv_events/hash.rs), so the
+    byte layout must stay in sync with it.
+    """
+    if seed is None:
+        return block_hash
+    digest = hashlib.sha256(seed + block_hash.to_bytes(8, "big", signed=True)).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
+
+
 def get_storage_hash_str(
     key: Any,
     prior_hash: Optional[str] = None,

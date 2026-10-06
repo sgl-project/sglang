@@ -34,6 +34,8 @@ from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
     hash_str_to_int64,
+    kv_event_lora_seed,
+    namespace_event_block_hash,
 )
 
 if TYPE_CHECKING:
@@ -64,6 +66,9 @@ class LoRANameTable:
 
     def register(self, *, lora_id: str, lora_name: str) -> None:
         self._names[lora_id] = lora_name
+
+    def get(self, extra_key: Optional[str]) -> Optional[str]:
+        return self.resolve(extra_key)
 
     def resolve(self, extra_key: Optional[str]) -> Optional[str]:
         if not extra_key:
@@ -114,6 +119,7 @@ class KVCacheEventRecorder:
                     and tail.block_size == event.block_size
                     and tail.cache_salt == event.cache_salt
                     and tail.session_id == event.session_id
+                    and tail.lora_name == event.lora_name
                     and tail.block_hashes
                     and event.parent_block_hash == tail.block_hashes[-1]
                 ):
@@ -151,9 +157,8 @@ class KVCacheEventRecorder:
         return hash_str_to_int64(parent_hash_values[-1])
 
     def _namespace_seed(self, node: Any) -> Optional[bytes]:
-        # The default format publishes the hashes unchanged.
         if not self.dynamo_format:
-            return None
+            return kv_event_lora_seed(self.lora_names.get(node.key.extra_key))
         return kv_event_namespace_seed(
             extra_key=node.key.extra_key, cache_salt=node.key.cache_salt
         )
@@ -177,7 +182,7 @@ class KVCacheEventRecorder:
                 parent_block_hash, namespace_seed=namespace_seed
             )
         lora_name = (
-            self.lora_names.resolve(node.key.extra_key) if self.dynamo_format else None
+            self.lora_names.get(node.key.extra_key)
         )
 
         page_index = 0
