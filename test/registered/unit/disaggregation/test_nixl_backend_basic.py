@@ -1616,6 +1616,8 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
             kv_data_ptrs=[0x1000, 0x2000],
             kv_data_lens=[64, 64],
             kv_item_lens=[16, 16],
+            aux_data_ptrs=[0],
+            aux_item_lens=[16],
         )
         mgr.decode_kv_args_table = {}
         for name in peers:
@@ -1628,6 +1630,7 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
                 dst_kv_ptrs=[0x3000, 0x4000],
                 dst_kv_mem_kinds=["VRAM", "VRAM"],
                 dst_aux_ptrs=[0],
+                dst_aux_item_lens=[16],
                 dst_state_data_ptrs=[],
                 gpu_id=0,
                 decode_tp_size=1,

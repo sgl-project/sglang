@@ -678,6 +678,8 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.failure_lock = manager.session_lock = threading.Lock()
         manager.failure_records = {}
         manager.failed_sessions = set()
+        manager.state_layout_rejections = {}
+        manager._deferred_ack_targets = {}
         manager._staging_outstanding = defaultdict(int)
         manager.req_to_decode_prefix_len = {}
         manager.request_status = {room: KVPoll.WaitingForInput for room in (21, 22)}
