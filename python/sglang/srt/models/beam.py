@@ -226,10 +226,6 @@ class BeamMoE(nn.Module):
                 else TopKOutputFormat.STANDARD
             ),
         )
-        # An FP8 checkpoint may leave a layer's experts in BF16. They need the
-        # BF16 method above; the generic one drops the routed scale when
-        # compiled for a single token. A partial ignore is left to the
-        # quantization config, which rejects it.
         bf16_experts = quant_config is None or (
             quant_scheme == "fp8"
             and all(
