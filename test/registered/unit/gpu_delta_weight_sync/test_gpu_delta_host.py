@@ -136,6 +136,13 @@ def local_entries(manifest, names):
     return [entry for entry in manifest["tensors"] if entry["name"] in names]
 
 
+def prepare_snapshot(arena, path, digest, manifest, entries, pool, timings, metadata):
+    index, files = arena.prepare_encoded(
+        path, digest, manifest, pool, timings, metadata
+    )
+    return arena.decode_local(index, files, entries, pool, timings)
+
+
 def fake_fallocate(fd, offset, length):
     os.ftruncate(fd, offset + length)
 
@@ -171,7 +178,8 @@ def _child(root, path, digest, manifest, names, barrier, output):
             identity = host.host_cache_id("a")
             barrier.wait(timeout=10)
             metrics = {}
-            snapshot = arena.prepare(
+            snapshot = prepare_snapshot(
+                arena,
                 path,
                 digest,
                 manifest,
@@ -248,7 +256,8 @@ class TestHostSnapshot(unittest.TestCase):
         def build():
             try:
                 snapshots.append(
-                    arena.prepare(
+                    prepare_snapshot(
+                        arena,
                         path,
                         digest,
                         manifest,
@@ -298,17 +307,15 @@ class TestHostSnapshot(unittest.TestCase):
             metrics["host_rank_decode_call_s"], metrics["host_rank_outer_zstd_decode_s"]
         )
         self.assertGreaterEqual(
-            metrics["host_rank_prepare_body_s"],
-            metrics["host_encoded_cache_access_s"]
-            + metrics["host_rank_layout_s"]
-            + metrics["host_rank_decode_call_s"],
+            metrics["host_encoded_cache_access_s"], metrics["host_encoded_cache_wait_s"]
         )
         snapshot = snapshots[0]
         self.assertEqual(
             {name: bytes(snapshot.get(name).numpy()) for name in expected}, expected
         )
         follower_metrics = {}
-        follower = self.arena().prepare(
+        follower = prepare_snapshot(
+            self.arena(),
             path,
             digest,
             manifest,
@@ -330,7 +337,8 @@ class TestHostSnapshot(unittest.TestCase):
             unchecked, follower = self.arena(), self.arena()
             unchecked_strict_peer = self.arena("strict")
         strict_peer = self.arena()
-        strict_snapshot = strict.prepare(
+        strict_snapshot = prepare_snapshot(
+            strict,
             path,
             digest,
             manifest,
@@ -340,7 +348,8 @@ class TestHostSnapshot(unittest.TestCase):
             metadata(engine="strict"),
         )
         with self.assertRaisesRegex(ValueError, "payload hash policy differs"):
-            unchecked_strict_peer.prepare(
+            prepare_snapshot(
+                unchecked_strict_peer,
                 path,
                 digest,
                 manifest,
@@ -357,7 +366,8 @@ class TestHostSnapshot(unittest.TestCase):
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         for arena, created in ((unchecked, 1), (follower, 0)):
             metrics = {}
-            snapshot = arena.prepare(
+            snapshot = prepare_snapshot(
+                arena,
                 path,
                 digest,
                 manifest,
@@ -377,7 +387,8 @@ class TestHostSnapshot(unittest.TestCase):
                 self.assertEqual(metrics["host_encoded_cache_" + field], 0)
             snapshot.close()
         with self.assertRaisesRegex(ValueError, "payload hash policy differs"):
-            strict_peer.prepare(
+            prepare_snapshot(
+                strict_peer,
                 path,
                 digest,
                 manifest,
@@ -387,7 +398,8 @@ class TestHostSnapshot(unittest.TestCase):
                 metadata(),
             )
         with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
-            self.arena("strict-bad-sha").prepare(
+            prepare_snapshot(
+                self.arena("strict-bad-sha"),
                 path,
                 digest,
                 manifest,
@@ -416,7 +428,8 @@ class TestHostSnapshot(unittest.TestCase):
 
         def build():
             try:
-                self.arena().prepare(
+                prepare_snapshot(
+                    self.arena(),
                     path,
                     digest,
                     manifest,
@@ -447,7 +460,8 @@ class TestHostSnapshot(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, ["delta payload SHA256 mismatch"])
         with self.assertRaisesRegex(ValueError, "failed or already released"):
-            self.arena().prepare(
+            prepare_snapshot(
+                self.arena(),
                 path,
                 digest,
                 manifest,
@@ -463,7 +477,8 @@ class TestHostSnapshot(unittest.TestCase):
         ).hexdigest()
         arena = self.arena("bad-decode")
         with self.assertRaisesRegex(ValueError, "standard Zstd frame"):
-            arena.prepare(
+            prepare_snapshot(
+                arena,
                 path,
                 digest,
                 manifest,
@@ -473,7 +488,8 @@ class TestHostSnapshot(unittest.TestCase):
                 metadata(engine="bad-decode"),
             )
         with self.assertRaisesRegex(ValueError, "engine APPLIED release"):
-            arena.prepare(
+            prepare_snapshot(
+                arena,
                 path,
                 digest,
                 manifest,
@@ -526,7 +542,8 @@ class TestHostSnapshot(unittest.TestCase):
         for row in records:
             self.assertEqual(row[2], {name: expected[name] for name in row[2]})
         with self.assertRaisesRegex(ValueError, "engine APPLIED release"):
-            self.arena().prepare(
+            prepare_snapshot(
+                self.arena(),
                 path,
                 digest,
                 manifest,
@@ -560,7 +577,8 @@ class TestHostSnapshot(unittest.TestCase):
 
         def build():
             try:
-                arena.prepare(
+                prepare_snapshot(
+                    arena,
                     path,
                     digest,
                     manifest,
@@ -603,7 +621,8 @@ class TestHostSnapshot(unittest.TestCase):
         decode.assert_not_called()
         self.assertIsNone(arena.allocation)
         with self.assertRaisesRegex(ValueError, "failed or already released"):
-            follower.prepare(
+            prepare_snapshot(
+                follower,
                 path,
                 digest,
                 manifest,
@@ -694,7 +713,8 @@ class TestHostSnapshot(unittest.TestCase):
         def build_first():
             try:
                 snapshots.append(
-                    first.prepare(
+                    prepare_snapshot(
+                        first,
                         path,
                         digest,
                         manifest,
@@ -713,7 +733,8 @@ class TestHostSnapshot(unittest.TestCase):
             try:
                 self.assertTrue(entered.wait(5))
                 metrics = {}
-                second = follower.prepare(
+                second = prepare_snapshot(
+                    follower,
                     path,
                     digest,
                     manifest,
@@ -722,7 +743,8 @@ class TestHostSnapshot(unittest.TestCase):
                     metrics,
                     metadata(),
                 )
-                third = other.prepare(
+                third = prepare_snapshot(
+                    other,
                     path,
                     digest,
                     manifest,
@@ -746,7 +768,8 @@ class TestHostSnapshot(unittest.TestCase):
     def test_rank_capacity_reuse_growth_and_late_encoded_release(self):
         path, digest, manifest, expected = fixture(self.root)
         arena, first_metrics = self.arena(), {}
-        first = arena.prepare(
+        first = prepare_snapshot(
+            arena,
             path,
             digest,
             manifest,
@@ -766,7 +789,8 @@ class TestHostSnapshot(unittest.TestCase):
         first.mark_reusable()
         first.close()
         warm = {}
-        second = arena.prepare(
+        second = prepare_snapshot(
+            arena,
             path,
             digest,
             manifest,
@@ -781,7 +805,8 @@ class TestHostSnapshot(unittest.TestCase):
         self.assertEqual(warm["host_rank_mapping_reused"], 1)
         first.mark_reusable()
         with self.assertRaisesRegex(ValueError, "engine APPLIED release"):
-            arena.prepare(
+            prepare_snapshot(
+                arena,
                 path,
                 digest,
                 manifest,
@@ -806,7 +831,8 @@ class TestHostSnapshot(unittest.TestCase):
         )
         path.write_text(json.dumps(manifest))
         growth = {}
-        third = arena.prepare(
+        third = prepare_snapshot(
+            arena,
             path,
             hashlib.sha256(path.read_bytes()).hexdigest(),
             manifest,
@@ -830,7 +856,8 @@ class TestHostSnapshot(unittest.TestCase):
         )
         third.close()
         with self.assertRaisesRegex(ValueError, "engine APPLIED release"):
-            arena.prepare(
+            prepare_snapshot(
+                arena,
                 path,
                 digest,
                 manifest,

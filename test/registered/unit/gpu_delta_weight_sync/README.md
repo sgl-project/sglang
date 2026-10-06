@@ -73,6 +73,10 @@ Preparation reads, validates and hashes encoded publication files once per engin
 cache index and READY token bind the policy, and all ranks in the original cohort
 must agree. Skipping trusts payload contents without SHA authentication; manifest
 SHA, file identity/size, path, frame-range and decode checks remain in force.
+After encoded-cache READY admission drains global validation, the caller keeps
+only its rank's entries and releases the global manifest before local arena
+planning and decode. Encoded file views remain owned until all decode jobs drain;
+failed preparation never authorizes cache reuse.
 Each rank unwraps only its local tensors directly into its own retained, original
 DE-capable host allocation for CPU and GPU access.
 Preparation packs each publication's frames into one contiguous numeric table of
@@ -342,14 +346,17 @@ READY or failure returns; rank allocation and local decode start only after both
 pass. `host_encoded_cache_wait_s` isolates the
 cache mutex wait. `host_encoded_cache_build_s` repeats the cached build duration
 on followers and must not be summed across ranks. `host_rank_prepare_s` includes
-cache access, rank allocation and local outer decode through HostArena return.
-`host_encoded_cache_access_s` covers HostArena entry through cache mutex release,
+cache access, global-metadata release, rank allocation and local outer decode,
+including the final encoded-file view release.
+`host_encoded_cache_access_s` covers encoded admission through cache mutex release,
 including wait/build/attachment. `host_rank_layout_s` covers local tensor ordering
 and arena-offset planning before allocation. `host_rank_decode_call_s` includes
 the outer-decode call and cleanup of its local jobs/results on return.
-`host_rank_prepare_body_s` ends after snapshot construction, before the final timing
-copy and function-return cleanup. These timers are nested within preparation;
-the caller-minus-body residual includes final bookkeeping and return cleanup.
+`host_rank_metadata_release_s` covers narrowing entries and dropping the global
+manifest/content after READY. `host_rank_prepare_body_s` ends after local decode
+returns its snapshot, before the caller releases encoded-file views. These timers
+are nested within preparation; caller-minus-body includes the final mapping
+release and timing bookkeeping.
 
 `host_plan_cache_reused` reports whether the canonical plan's static definitions
 were already qualified. Every publication still authenticates its manifest and

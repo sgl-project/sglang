@@ -371,16 +371,16 @@ class HostArena:
         metrics["host_rank_allocation_calls"] = int(allocation is not None)
         metrics["host_rank_allocation_bytes"] = self.capacity["capacity"]
 
-    def prepare(
+    def prepare_encoded(
         self,
         manifest_path,
         manifest_sha256,
         manifest,
-        local_entries,
         pool,
         timings,
         metadata,
     ):
+        """Admit READY encoded bytes; returned file views own their mmap lease."""
         started = time.perf_counter()
         root = _cache_root(self.engine_id)
         publication = Path(manifest_path).resolve(strict=True)
@@ -434,11 +434,6 @@ class HostArena:
                 "host_encoded_cache_allocation_s",
                 "host_encoded_cache_allocation_calls",
                 "host_encoded_cache_allocation_bytes",
-                "host_rank_allocation_s",
-                "host_rank_allocation_calls",
-                "host_rank_allocation_bytes",
-                "host_rank_mapping_reused",
-                *_DECODE_METRICS,
             )
         }
         waiting = time.perf_counter()
@@ -541,6 +536,27 @@ class HostArena:
                 metrics["host_encoded_cache_created"] = 1
         metrics["host_encoded_cache_access_s"] = time.perf_counter() - started
         self.directory = directory
+        metrics.update(
+            host_encoded_cache_capacity_bytes=index["encoded"]["capacity"],
+            host_encoded_cache_capacity_generation=index["encoded"]["generation"],
+            host_encoded_cache_build_s=index["build_s"],
+            host_encoded_cache_skip_payload_hash=int(self.skip_payload_hash),
+        )
+        timings.update(metrics)
+        return index, files
+
+    def decode_local(self, index, files, local_entries, pool, timings):
+        """Decode local entries; the caller retains file views until this returns."""
+        metrics = {
+            name: 0
+            for name in (
+                "host_rank_allocation_s",
+                "host_rank_allocation_calls",
+                "host_rank_allocation_bytes",
+                "host_rank_mapping_reused",
+                *_DECODE_METRICS,
+            )
+        }
         layout_started = time.perf_counter()
         if self.tensor_order is None:
             # Local binding order is immutable; retain indices, not old entries.
@@ -570,17 +586,12 @@ class HostArena:
             host_rank_capacity_bytes=self.capacity["capacity"],
             host_rank_capacity_generation=self.capacity["generation"],
             host_rank_cpu_workers=pool.workers,
-            host_encoded_cache_capacity_bytes=index["encoded"]["capacity"],
-            host_encoded_cache_capacity_generation=index["encoded"]["generation"],
-            host_encoded_cache_build_s=index["build_s"],
-            host_encoded_cache_skip_payload_hash=int(self.skip_payload_hash),
         )
         snapshot = HostDecodedSnapshot(
             self,
             index
             | {"tensors": layout, "arena_bytes": size, "rank_arena": self.capacity},
         )
-        metrics["host_rank_prepare_body_s"] = time.perf_counter() - started
         timings.update(metrics)
         return snapshot
 

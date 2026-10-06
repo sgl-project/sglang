@@ -133,18 +133,21 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
             barrier.wait(timeout=90)
             metrics = {}
             manifest = json.loads(Path(path).read_text())
-            snapshot = arena.prepare(
+            index, files = arena.prepare_encoded(
                 path,
                 digest,
                 manifest,
-                [entry for entry in manifest["tensors"] if entry["name"] in names],
                 pool,
                 metrics,
                 metadata,
             )
+            entries = [entry for entry in manifest["tensors"] if entry["name"] in names]
+            del manifest
+            snapshot = arena.decode_local(index, files, entries, pool, metrics)
+            del files
             source = arena.tensor
             frames, offsets, size = [], {}, 0
-            for entry in manifest["tensors"]:
+            for entry in entries:
                 name = entry["name"]
                 if name not in names:
                     continue

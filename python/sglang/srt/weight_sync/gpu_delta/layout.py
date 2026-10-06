@@ -425,21 +425,33 @@ class PreparedDelta:
                 "host tensor union does not cover the admitted local tensors"
             )
         payload_started = time.perf_counter()
-        self.host_snapshot = backend.host_arena.prepare(
+        index, files = backend.host_arena.prepare_encoded(
             path,
             manifest_sha256,
             manifest,
-            [entries[name] for name in local_names],
             backend.outer_pool,
             self.timings,
             metadata,
         )
+        release_started = time.perf_counter()
+        # READY admission drained global validation; local decode only needs this rank.
+        entries = {name: entries[name] for name in local_names}
+        del manifest, content
+        self.timings["host_rank_metadata_release_s"] = (
+            time.perf_counter() - release_started
+        )
+        self.host_snapshot = backend.host_arena.decode_local(
+            index,
+            files,
+            [entries[name] for name in local_names],
+            backend.outer_pool,
+            self.timings,
+        )
+        self.timings["host_rank_prepare_body_s"] = time.perf_counter() - payload_started
+        del files
         self.timings["host_rank_prepare_s"] = time.perf_counter() - payload_started
 
         tensors_started = time.perf_counter()
-        # Host validation and decode finished; planning only needs this rank.
-        entries = {name: entries[name] for name in local_names}
-        del manifest, content
         compressed, raw_entries = [], []
         for binding in backend.layout.bindings:
             entry = entries[binding.name]

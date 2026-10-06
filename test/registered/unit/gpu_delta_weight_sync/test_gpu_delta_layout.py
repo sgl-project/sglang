@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+import weakref
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -745,6 +746,8 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
     def _check_host_direct_batches(self, stages):
         import zstandard as zstd
 
+        from sglang.srt.weight_sync.gpu_delta import host
+
         targets = [
             torch.zeros(2, size, dtype=torch.uint8)
             for size in (4, 6, 5, 7, 8, 3, 9, 10)
@@ -862,6 +865,29 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             ),
         )
         operations, decoded_batches, slots = [], [], []
+        foreign_refs = []
+        parse_manifest = layout.orjson.loads
+        tensor_layout = host._tensor_layout
+
+        class TrackedEntry(dict):
+            pass
+
+        def tracked_parse(content):
+            value = parse_manifest(content)
+            if "tensors" in value:
+                for index, entry in enumerate(value["tensors"]):
+                    if entry["name"] == "foreign":
+                        tracked = TrackedEntry(entry)
+                        value["tensors"][index] = tracked
+                        foreign_refs.append(weakref.ref(tracked))
+            return value
+
+        def local_layout(entries):
+            # Global validation already drained; foreign descriptors must be
+            # released before allocating local layout/decode job containers.
+            self.assertTrue(foreign_refs)
+            self.assertIsNone(foreign_refs[-1]())
+            return tensor_layout(entries)
 
         class CpuStream:
             def __init__(self, device):
@@ -958,6 +984,8 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             path.write_bytes(content)
             with (
                 cpu_host_snapshot(backend, metadata, directory),
+                patch.object(layout.orjson, "loads", side_effect=tracked_parse),
+                patch.object(host, "_tensor_layout", side_effect=local_layout),
                 patch.object(torch, "empty", side_effect=unpinned),
                 patch.object(torch.cuda, "Stream", side_effect=CpuStream) as streams,
                 patch.object(torch.cuda, "stream", return_value=nullcontext()),
@@ -982,6 +1010,16 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     backend, path, layout.hashlib.sha256(content).hexdigest(), metadata
                 )
                 self.assertEqual(prepared.timings["host_encoded_cache_created"], 1)
+                self.assertGreaterEqual(
+                    prepared.timings["host_rank_prepare_s"],
+                    prepared.timings["host_rank_prepare_body_s"],
+                )
+                self.assertGreaterEqual(
+                    prepared.timings["host_rank_prepare_body_s"],
+                    prepared.timings["host_rank_metadata_release_s"]
+                    + prepared.timings["host_encoded_cache_access_s"]
+                    + prepared.timings["host_rank_decode_call_s"],
+                )
                 self.assertEqual(prepared.timings["host_rank_outer_zstd_tensors"], 8)
                 self.assertEqual(prepared.timings["host_rank_outer_zstd_frames"], 8)
                 self.assertEqual(streams.call_count, 2)
