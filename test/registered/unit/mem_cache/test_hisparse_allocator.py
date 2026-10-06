@@ -299,7 +299,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         )
         self.assertEqual(req.kv.kv_allocated_len, fill_len)
         self.assertEqual(req.kv.kv_committed_len, fill_len)
-        self.assertEqual(req.extend_len, fill_len)
+        self.assertEqual(req.extend_end, fill_len)
         self.assertEqual(len(req_to_token_pool.writes), 1)
         coordinator.host_token_len.assert_called_once_with(fill_len)
         regular_host_alloc.assert_called_once_with(
