@@ -1,13 +1,16 @@
 # KV event stream health
 
 PublisherReset clears the emitting worker URL/DP rank from every cache tier,
-discards its held pre-reset batches and splice proof, and removes its cursor.
-Other ranks are preserved. New publisher batches can then start from zero.
+discards its held pre-reset batches and splice proof, and sets its cursor to -1.
+Other ranks are preserved. New publisher batches must start from zero; a
+first batch above zero reports a gap.
 This prevents pre-restart owners from surviving an explicit reset sentinel.
 
 A forward gap after an applied cursor emits a WARN with worker identity,
-previous/current sequence, and the number of missing sequence values. The
-batch still applies. The router does not infer which transport lost events,
+previous/current sequence, and the number of missing sequence values.
+WARNs are sampled per worker (first occurrence, then every 64); counters
+include every observation. The batch still applies. The router does not infer
+which transport lost events,
 clear the tree, or replay missing batches automatically.
 
 The following metrics have worker_url and dp_rank labels:
@@ -16,9 +19,12 @@ The following metrics have worker_url and dp_rank labels:
 - sgl_router_kv_event_missing_sequences_total: sequence values inside those gaps.
 - sgl_router_kv_event_skipped_batches_total: duplicate/older batches discarded
   by the existing cursor filter. A rollback without a reset sentinel is also
-  counted here; the router cannot distinguish restart from delayed delivery.
+  counted here and sets untrusted=1 with a sampled WARN when seq < cursor.
+  Equality alone does not mark the stream untrusted. No implicit reset is
+  performed: fresh batches remain filtered until they exceed the old cursor
+  or an explicit reset is received.
 - sgl_router_kv_event_publisher_resets_total: reset sentinels handled.
-- sgl_router_kv_event_stream_untrusted: 1 after a gap; returns to 0 only after
+- sgl_router_kv_event_stream_untrusted: 1 after a gap or rollback; returns to 0 only after
   an explicit publisher reset or AllBlocksCleared for that rank. Normal
   subsequent traffic does not repair the missing history.
 
@@ -27,7 +33,18 @@ worker rank is removed. Counters persist across publisher resets. These are
 local observations, not peer-synchronized state. The gauge is diagnostic:
 it does not gate routing or snapshot export. Zero/absent does not prove cache
 coverage; a cold subscriber may have missed all earlier history. A snapshot
-bootstrap has its own continuity checks and counters.
+bootstrap has its own continuity checks and counters. Batches covered by the
+snapshot watermark are expected overlap and excluded from skipped/rollback
+statistics. Deferred splice validation handles its first forward gap before
+normal accounting, discarding the snapshot via the existing bootstrap path;
+subsequent genuine live gaps remain observable. A successful proof does not
+clear unrelated prior stream anomalies.
+
+Adaptive Metrics must retain worker_url and dp_rank for these metrics (and
+router pod identity to distinguish local observations). Confirm the rules
+before deployment; aggregation would hide which stream is affected. Zero gap
+counts alone cannot exclude missing history before subscription or failures
+that do not produce a visible forward discontinuity.
 
 Do not use raw store-minus-remove event counts as node growth: duplicate
 stores and unmatched removals are counted too. Tree occupancy counts carrier

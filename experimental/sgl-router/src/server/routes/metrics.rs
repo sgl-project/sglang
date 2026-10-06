@@ -325,7 +325,7 @@ mod tests {
         let worker = KvWorkerId::new("http://w".into(), 2);
         let tally = index.event_tally();
         tally.record_gap(&worker, 3);
-        tally.record_skipped_batch(&worker);
+        tally.record_skipped_batch(&worker, false);
         let text = render_kv_tiers(&index);
         for (name, count) in [
             ("sequence_gaps_total", 1),

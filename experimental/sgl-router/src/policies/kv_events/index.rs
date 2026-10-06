@@ -2034,8 +2034,8 @@ fn spawn_mode_recheck(
 /// Drain `WorkerEvent`s: apply KV `Batch`es to the tree and `Load` snapshots
 /// to the engine-load table. Out-of-order (seq ≤ last_applied) and stale
 /// (worker not in `live_workers`) KV batches are skipped; `Load` is a gauge
-/// with no seq. `PublisherReset` events clear the cursor so a publisher
-/// restarting from seq=1 (after sending END_SEQ) is not filtered.
+/// with no seq. `PublisherReset` sets the cursor to -1, accepting seq=0
+/// and detecting missing batches at the start of the new stream.
 ///
 /// Also the sole writer of tree state, including snapshot grafts arriving as
 /// [`PumpControl`]; see the single-writer property in [`super::tree`].
@@ -2326,10 +2326,10 @@ async fn pump_loop(
                 }
                 held.remove(&worker);
                 tally.record_publisher_reset(&worker);
-                let had_cursor = cursors.lock().remove(&worker).is_some();
+                let had_cursor = cursors.lock().insert(worker.clone(), -1).is_some();
                 info!(
                     worker = ?worker, had_cursor,
-                    "kv-events pump: publisher reset; tree and cursor cleared",
+                    "kv-events pump: publisher reset; tree cleared, cursor reset to -1",
                 );
                 // A reset also means the engine process restarted — possibly
                 // with different speculative-decoding config. Discovery only
@@ -2338,8 +2338,8 @@ async fn pump_loop(
                 // (same pod UID/IP, or static worker-urls) emits nothing, so
                 // the pump re-introspects the vote itself. Note resets only
                 // follow a graceful publisher shutdown. Without the sentinel,
-                // a sequence rollback is ambiguous with delayed delivery; it
-                // remains filtered and is exposed by skipped-batch metrics.
+                // a sequence rollback is reported as untrusted but remains
+                // filtered; automatic epoch inference is not implemented.
                 spawn_mode_recheck(&http, &oracle, &live_workers, &bootstrap, &worker);
             }
             WorkerEvent::Batch { worker, seq, batch } => {
@@ -2369,6 +2369,13 @@ async fn pump_loop(
                 }
                 // First batch after a graft proves — or disproves — that the
                 // snapshot joins up with this rank's live stream.
+                if let Some(proof) = awaiting_splice_proof.get(&worker) {
+                    if seq <= proof.watermark {
+                        // Expected snapshot overlap, not a live rollback. Keep
+                        // waiting for evidence beyond the snapshot watermark.
+                        continue;
+                    }
+                }
                 if let Some(proof) = awaiting_splice_proof.remove(&worker) {
                     if seq > proof.watermark + 1 {
                         warn!(
@@ -2424,7 +2431,10 @@ fn apply_batch(
 ) {
     if let Some(p) = cursors.lock().get(worker).copied() {
         if seq <= p {
-            tally.record_skipped_batch(worker);
+            if tally.record_skipped_batch(worker, seq < p) {
+                warn!(worker = ?worker, last_applied = p, seq,
+                    "kv-events pump: sequence rollback without reset; cache index untrusted; batch skipped");
+            }
             debug!(
                 worker = ?worker,
                 seq,
@@ -2434,8 +2444,7 @@ fn apply_batch(
             return;
         }
         let distance = seq.abs_diff(p);
-        if distance > 1 {
-            tally.record_gap(worker, distance - 1);
+        if distance > 1 && tally.record_gap(worker, distance - 1) {
             warn!(
                 worker = ?worker, last_applied = p, seq,
                 missing_sequences = distance - 1,
@@ -2803,6 +2812,10 @@ fn apply_snapshot(
         bootstrap.set(&rank, BootstrapState::Recovered);
         // The seeded cursor filters whatever the snapshot already reflects.
         for (seq, batch) in queue {
+            if seq <= peer_cursor {
+                // Already represented by the snapshot, not a skipped live batch.
+                continue;
+            }
             apply_batch(tree, cursors, st.tally, &rank, seq, &batch);
         }
         // Tallied only once the splice is proven. When it is not yet, the
@@ -2881,6 +2894,50 @@ mod tests {
         );
         assert!(!tally.stream_snapshot()[0].1.untrusted);
         assert!(tree.match_prefix(None, &[11]).workers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rollback_without_sentinel_marks_stream_untrusted() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        for seq in [100, 100, 0] {
+            h.tx.send(WorkerEvent::Batch {
+                worker: id.clone(),
+                seq,
+                batch: batch(vec![]),
+            })
+            .await
+            .unwrap();
+        }
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+        let state = &h.tally.stream_snapshot()[0].1;
+        assert!(state.untrusted);
+        assert_eq!(state.skipped_batches, 2);
+        assert_eq!(state.gaps, 0);
+        assert_eq!(h.cursors.lock().get(&id).copied(), Some(100));
+    }
+
+    #[tokio::test]
+    async fn deferred_snapshot_overlap_does_not_report_rollback_or_gap() {
+        let id = worker_id("http://w1", 0);
+        let (tracker, h) = graft_with_deferred_proof(&id, 5).await;
+        for seq in [3, 5, 6, 7] {
+            h.tx.send(WorkerEvent::Batch {
+                worker: id.clone(),
+                seq,
+                batch: batch(vec![]),
+            })
+            .await
+            .unwrap();
+        }
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+        assert!(h.tally.stream_snapshot().is_empty());
+        assert_eq!(rank_count(&tracker, "warm"), 1);
+        assert_eq!(h.cursors.lock().get(&id).copied(), Some(7));
     }
 
     // ---- bootstrap fan-in (take_pending / drain_ready) ----
@@ -4364,6 +4421,7 @@ mod tests {
             "a batch the snapshot already reflects must be filtered",
         );
         assert_eq!(h.cursors.lock().get(&id).copied(), Some(5));
+        assert!(h.tally.stream_snapshot().is_empty());
         assert_eq!(tracker.state_of(&id), Some(BootstrapState::Recovered));
     }
 
@@ -5284,7 +5342,7 @@ mod tests {
         );
     }
 
-    /// S1: a restarted publisher renumbers from 1, so its cursor MUST be cleared.
+    /// A reset starts a new stream at zero; missing its first batch is visible.
     ///
     /// Without this, every post-restart batch has `seq < last_applied` and is
     /// dropped as out-of-order: the rank's tree freezes at pre-restart state
@@ -5324,7 +5382,11 @@ mod tests {
         );
         assert_eq!(h.cursors.lock().get(&id).copied(), Some(1));
         assert!(!h.tree.match_prefix(None, &[11]).workers.contains(&id));
-        assert_eq!(h.tally.stream_snapshot()[0].1.publisher_resets, 1);
+        let state = &h.tally.stream_snapshot()[0].1;
+        assert_eq!(state.publisher_resets, 1);
+        // The first post-reset batch is 1: seq 0 was lost.
+        assert_eq!((state.gaps, state.missing_sequences), (1, 1));
+        assert!(state.untrusted);
     }
 
     #[tokio::test]
