@@ -73,8 +73,17 @@ def get_scale_cohort(rank_offset: int) -> Optional[ScaleCohort]:
     return msgspec.json.decode(store.get(key), type=ScaleCohort)
 
 
-def register_recover_cohort(rank_offset: int, effective_ep_size: int) -> None:
+def register_recover_cohort(
+    rank_offset: int, effective_ep_size: int, tp_size: int = 1
+) -> None:
     """Announce the cohort width a recover joiner sized its expert map for.
+
+    One key per slot the joiner covers, not one at its offset.
+    ``required_recover_width`` plans for a set of slots and wants a key for each, so a
+    ``tp_size > 1`` joiner that announced only its offset left every slot above it
+    silent: the width never resolved,
+    the tokenizer retried for two minutes holding the scale lock, and the grow then
+    staged through a width no joiner was waiting at.
 
     Its own key space, not the scale cohort's: survivors ask ``get_scale_cohort``
     whether an append grow has a cohort waiting, and a recover joiner parked at an
@@ -83,15 +92,19 @@ def register_recover_cohort(rank_offset: int, effective_ep_size: int) -> None:
     store = get_global_tcp_store()
     if store is None:
         raise RuntimeError("Elastic EP recover-mode join requires the global TCPStore.")
-    store.set(f"{_RECOVER_COHORT_KEY_PREFIX}/{rank_offset}", str(effective_ep_size))
+    for slot in range(rank_offset, rank_offset + tp_size):
+        store.set(f"{_RECOVER_COHORT_KEY_PREFIX}/{slot}", str(effective_ep_size))
 
 
-def clear_recover_cohort(rank_offset: int) -> None:
+def clear_recover_cohort(rank_offset: int, tp_size: int = 1) -> None:
     """Drop a stale announce so a later grow cannot be planned off a dead joiner."""
     store = get_global_tcp_store()
-    key = f"{_RECOVER_COHORT_KEY_PREFIX}/{rank_offset}"
-    if store is not None and store.check([key]):
-        store.delete_key(key)
+    if store is None:
+        return
+    for slot in range(rank_offset, rank_offset + tp_size):
+        key = f"{_RECOVER_COHORT_KEY_PREFIX}/{slot}"
+        if store.check([key]):
+            store.delete_key(key)
 
 
 def required_recover_width(recover_slots: List[int]) -> Optional[int]:
@@ -172,6 +185,7 @@ class ElasticEPState:
 class ElasticEPStateManager:
     _instance: Optional[ElasticEPState] = None
     _on_scale: Optional[Callable[[int, int], None]] = None
+    _poll_faults: Optional[Callable[[], None]] = None
 
     @classmethod
     def instance(cls) -> ElasticEPState:
@@ -200,6 +214,7 @@ class ElasticEPStateManager:
 
             if get_exec().moe.moe_a2a_backend == "nixl":
                 cls._on_scale = cls._on_scale_nixl
+                cls._poll_faults = cls._poll_faults_nixl
 
             inst.ep_join_rank_offset = get_parallel().ep_join_rank_offset
             if get_exec().moe.is_ep_joiner:
@@ -469,6 +484,17 @@ class ElasticEPStateManager:
         NixlEPBuffer.on_scale(from_ep_size, to_ep_size)
 
     @classmethod
+    def poll_faults(cls) -> None:
+        if cls._poll_faults is not None:
+            cls._poll_faults()
+
+    @staticmethod
+    def _poll_faults_nixl() -> None:
+        from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
+
+        NixlEPBuffer.poll_rank_faults()
+
+    @classmethod
     def get_inactive_ranks(cls) -> Tuple[int, ...]:
         """Ranks inside the current width whose mask bit is clear.
 
@@ -564,6 +590,12 @@ _BARRIER_NS: dict[str, tuple[str, str, str, str]] = {
         "sglang_scale_ready_cycle_counter",
         "sglang_scale_ready_e{}_posted",
         "[Elastic EP][scale_ready]",
+    ),
+    "nixl_wired": (
+        "sglang_nixl_wired_arrival_counter",
+        "sglang_nixl_wired_cycle_counter",
+        "sglang_nixl_wired_e{}_posted",
+        "[Elastic EP][nixl_wired]",
     ),
 }
 _last_local_cycle_id: dict[str, int] = {ns: 0 for ns in _BARRIER_NS}
@@ -706,6 +738,17 @@ def assert_shrink_supported() -> None:
             "Elastic EP scale-down requires attn_tp_size == 1 (got "
             f"attn_tp_size={parallel.attn_tp_size}): the shrink reports retired EP "
             "ranks as DP slots. Retiring whole logical replicas is not implemented yet."
+        )
+    # The same predicate the launch hook calls scalable, so the two halves agree.
+    # Without it the hook relaxes three checks on the grounds that the deployment never
+    # retires a rank: --enable-symm-mem and SGLANG_SYNC_TOKEN_IDS_ACROSS_TP tolerated
+    # with a warning, and the shm broadcaster kept. Admitting a shrink anyway runs it
+    # on the path this PR's own launch-time error calls bypassing active_ranks.
+    if parallel.max_ep_size is None:
+        raise RuntimeError(
+            "Elastic EP scale-down requires --max-ep-size. Without it this deployment "
+            "was launched as fault-tolerance only, and the launch checks were relaxed "
+            "on the understanding that it never retires a rank."
         )
     if get_exec().moe.elastic_ep_backend != "mooncake":
         return
@@ -1201,6 +1244,99 @@ def scale_ready_barrier_via_store(target_size: int, *, timeout_s: float = 60.0) 
         )
 
 
+def nixl_wired_barrier_via_store(cohort_size: int, *, timeout_s: float = 30.0) -> None:
+    """Hold a rank that has just wired itself to a width until its peers have too.
+
+    ``connect_ranks`` is not a rendezvous. A rank returns from it once its own side is
+    set up, so the first one out posts a dispatch at the new width to peers still
+    inside theirs, and times out once per expert per peer. At server start rank 0 came
+    out of connect in 1.010s against 1.24s for ranks 1 to 3, and was the only rank to
+    report: 22 timeouts against each of the three. A grow skews wider still, because
+    the joiner has several GiB of transport buffers to register before it even begins
+    connecting, and it lands in the post-scale graph capture, where the timeout is
+    captured along with everything else.
+
+    Warn-only, unlike the scale barriers, which raise. This runs inside a forward and
+    under decode graph capture, where raising is fatal, and giving up here only leaves
+    the skew that was there before. The wait is bounded well under the scale barriers'
+    minute for the same reason: the leg being waited on is the joiner registering its
+    buffers, measured at about 3s, so a wait that reaches the deadline is one that was
+    never going to be met.
+    """
+    if cohort_size <= 1 or not torch.distributed.is_initialized():
+        return
+    rank = torch.distributed.get_rank()
+    store = _store_or_none(f"[Elastic EP][nixl_wired] rank={rank}")
+    if store is None:
+        return
+
+    state = _StoreBarrier.post(store, rank, "nixl_wired", cohort_size)
+    if state is None:
+        logger.warning(
+            "[Elastic EP][nixl_wired] rank=%d could not arm the barrier at width %d; "
+            "proceeding unsynchronized",
+            rank,
+            cohort_size,
+        )
+        return
+
+    reached, count = state.check(store, timeout_s)
+    # Consume before returning: a timed-out leader still owes ARRIVAL, else a
+    # second leader.
+    state.consume()
+    if not reached:
+        logger.warning(
+            "[Elastic EP][nixl_wired] rank=%d e=%d timeout after %.0fs "
+            "(count=%d / target=%d); proceeding unsynchronized",
+            rank,
+            state.epoch,
+            timeout_s,
+            count,
+            cohort_size,
+        )
+
+
+_HEARTBEAT_KEY = "sglang_elastic_heartbeat_r{}"
+
+
+def beat_heartbeat() -> None:
+    """Publish one liveness tick for this rank.
+
+    ``add`` creates the key at the increment when it is absent, so there is nothing to
+    seed and a read never blocks on a rank that has not started.
+    """
+    if not torch.distributed.is_initialized():
+        return
+    store = _store_or_none()
+    if store is None:
+        return
+    rank = torch.distributed.get_rank()
+    try:
+        store.add(_HEARTBEAT_KEY.format(rank), 1)
+    except Exception:
+        logger.debug(
+            "[Elastic EP][heartbeat] rank=%d could not beat", rank, exc_info=True
+        )
+
+
+def read_heartbeats(ranks: Sequence[int]) -> dict:
+    """Liveness tick of each rank. Zero means a rank that has never beaten."""
+    store = _store_or_none()
+    if store is None:
+        return {}
+    ticks = {}
+    for rank in ranks:
+        try:
+            # add(key, 0) reads and creates at zero, so an absent rank reads as zero
+            # instead of blocking the way get does.
+            ticks[rank] = int(store.add(_HEARTBEAT_KEY.format(rank), 0))
+        except Exception:
+            logger.debug(
+                "[Elastic EP][heartbeat] could not read rank=%d", rank, exc_info=True
+            )
+    return ticks
+
+
 def cohort_vote_via_store(
     ok: bool, cohort_size: int, *, tag: str, timeout_s: float = 60.0
 ) -> bool:
@@ -1455,6 +1591,12 @@ def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
     # after commit, so a real fault is deferred by one resize rather than missed.
     if ElasticEPStateManager.is_scale_pending():
         return False
+    # Poll here rather than from inside the combine. This runs once per forward on the
+    # host, after the model returns, so it is reached on a replayed decode graph too --
+    # a counter stepped inside the combine is not, because the replay never runs the
+    # python around it. It rate limits itself on wall clock, so every rank looks at the
+    # same evidence at the same time however much of the routing each one carries.
+    ElasticEPStateManager.poll_faults()
     if elastic_ep_state.is_active_equal_last():
         return False
     elastic_ep_state.snapshot_active_to_last()

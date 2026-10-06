@@ -2215,6 +2215,14 @@ class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     error: Optional[str] = None
 
 
+class ElasticDrainClearReq(BaseReq, kw_only=True):
+    """Tell the DPC to route to the retiring slots again: the shrink is not happening.
+
+    Its own message because nothing else reaches the DPC on these paths. A rejected
+    shrink produces no scale update at all, and a failed one is dropped before dispatch.
+    """
+
+
 class ScaleElasticEPReqInput(BaseReq, kw_only=True):
     """Request to scale EP by changing the effective EP size (dp_attention mode)."""
 

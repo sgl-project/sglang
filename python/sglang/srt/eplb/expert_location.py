@@ -135,22 +135,11 @@ class ExpertLocationMetadata:
         num_layers = model_config_for_expert_location.num_layers
         num_logical_experts = model_config_for_expert_location.num_logical_experts
 
-        base_num_physical_experts = common["base_num_physical_experts"]
-        # Build at whichever is narrower, then append the rest. Laying out the base
-        # width first and appending only works while the cohort is at least as wide:
-        # a recover joiner regrowing into a slot below the launch width wants fewer
-        # physical experts than the base, append_trivial_expert_slots no-ops on the
-        # negative count, and the map stays base-wide while ep_size says otherwise.
-        physical_to_logical_map = (
-            torch.arange(
-                0, min(base_num_physical_experts, num_physical_experts)
-            ).repeat(num_layers, 1)
-            % num_logical_experts
-        )
-        physical_to_logical_map = append_trivial_expert_slots(
-            physical_to_logical_map,
-            num_physical_experts - physical_to_logical_map.shape[-1],
-            num_logical_experts,
+        physical_to_logical_map = build_trivial_physical_to_logical_map(
+            base_num_physical_experts=common["base_num_physical_experts"],
+            num_physical_experts=num_physical_experts,
+            num_layers=num_layers,
+            num_logical_experts=num_logical_experts,
         )
 
         return ExpertLocationMetadata.init_by_mapping(
@@ -574,6 +563,36 @@ def append_trivial_expert_slots(
     ).unsqueeze(0)
     new_slots = new_slots.expand(physical_to_logical_map.shape[0], -1)
     return torch.cat([physical_to_logical_map, new_slots % num_logical_experts], dim=1)
+
+
+def build_trivial_physical_to_logical_map(
+    *,
+    base_num_physical_experts: int,
+    num_physical_experts: int,
+    num_layers: int,
+    num_logical_experts: int,
+) -> torch.Tensor:
+    """Lay out logical expert i at physical slot i, at whichever width is narrower.
+
+    Building at the base width and appending the rest only works while the cohort is at
+    least as wide as the base. A recover joiner regrowing into a slot below the launch
+    width wants fewer physical experts than the base, append_trivial_expert_slots no-ops
+    on the negative count, and the map stays base-wide while ep_size says otherwise.
+
+    Its own function so a test can reach it: init_trivial needs a ModelConfig and the
+    global exec context, which is more than this layout decision depends on.
+    """
+    physical_to_logical_map = (
+        torch.arange(0, min(base_num_physical_experts, num_physical_experts)).repeat(
+            num_layers, 1
+        )
+        % num_logical_experts
+    )
+    return append_trivial_expert_slots(
+        physical_to_logical_map,
+        num_physical_experts - physical_to_logical_map.shape[-1],
+        num_logical_experts,
+    )
 
 
 def broadcast_global_expert_location_metadata(

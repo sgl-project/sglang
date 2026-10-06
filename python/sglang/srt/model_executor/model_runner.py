@@ -547,7 +547,7 @@ class ModelRunner:
         parallel = get_parallel()
         if parallel.tp_rank == 0:
             offset = parallel.ep_join_rank_offset
-            register_recover_cohort(offset, offset + parallel.tp_size)
+            register_recover_cohort(offset, offset + parallel.tp_size, parallel.tp_size)
 
     def _initialize_elastic_ep_joiner(self) -> None:
         # Offset-0 recovery rejoins later; a second rendezvous here goes unanswered.
@@ -583,11 +583,11 @@ class ModelRunner:
             )
         else:
             join_process_groups()
-            # The survivors read the announce while planning the grow that unblocks
-            # the join above, so by here it has served its purpose. Drop it, or a
-            # later grow gets planned off a width this rank no longer represents.
-            if parallel.tp_rank == 0:
-                clear_recover_cohort(offset)
+            # The announce is dropped by the survivors once the grow that consumed it
+            # commits, not here. This rank only reaches this line if its join returned,
+            # and the key has to go even when it does not: a joiner that dies before
+            # then would otherwise leave a later grow onto the same slots planned off a
+            # width nothing is waiting at.
 
         global_ep_rank = parallel.tp_rank + offset
         # Snapshot what our weights were loaded against: the broadcast overwrites in place.
@@ -2391,6 +2391,17 @@ class ModelRunner:
         self._elastic_scale_ready_barrier(target_size=target_size, log_tag="PRIMARY")
         self._rearm_eplb_after_elastic_scale()
 
+        # Drop the announce this grow was planned from, now that it has committed. A
+        # survivor does it, not the joiner: the joiner clears only once its own join
+        # returns, so one that dies before then leaves its key standing and the next
+        # grow onto those slots is planned off a width nothing is waiting at. A
+        # survivor is here on both paths.
+        if is_recover and self._elastic_global_rank() == _lowest_survivor(
+            set(ranks_to_join)
+        ):
+            for slot in ranks_to_join:
+                clear_recover_cohort(slot)
+
         if self._elastic_global_rank() == 0:
             from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
@@ -2500,6 +2511,18 @@ class ModelRunner:
         # control fan-out from it.
         reconciled = ElasticEPStateManager.get_effective_ep_size() or effective_size
         self._narrow_to_reconciled_width(reconciled)
+        # Only a committed scale asks the finalizer for a recapture, but the mask flip
+        # lands before the commit: a failure after it narrows this rank while the decode
+        # graphs stay captured at the pre-shrink width, and they then replay against a
+        # layout that no longer exists. Compare against the width the runner was built
+        # at rather than tracking the capture separately, and read it after the narrowing
+        # so a narrowing that itself failed does not ask for a rebuild it does not need.
+        decode_runner = self.decode_cuda_graph_runner
+        if (
+            decode_runner is not None
+            and decode_runner.num_dp_ranks != get_parallel().num_dp_ranks
+        ):
+            self._elastic_pending_graph_recapture = True
         self._report_elastic_scale_failure(error, reconciled)
         if self._elastic_global_rank() == 0:
             logger.error("[Elastic EP] %s", error)

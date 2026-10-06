@@ -81,6 +81,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    ElasticDrainClearReq,
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
     EncoderDispatchErrorReq,
@@ -1801,6 +1802,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _open_elastic_shrink_gate(self) -> None:
         self._elastic_shrink_retiring = set()
         self._elastic_shrink_pause_event.set()
+
+    def _clear_elastic_draining(self) -> None:
+        """Tell the DPC the retiring slots are staying, so it routes to them again.
+
+        The gate above is this side of the same pair: the DPC stopped feeding those
+        slots when the request went out, and only a successful scale update takes it
+        back. A rejection never produces one.
+        """
+        self._dispatch_to_scheduler(ElasticDrainClearReq())
 
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.
@@ -3768,6 +3778,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # safe_to_terminate_ranks would see this id, idle, and nothing left to reap.
         prev_operation_id = self.elastic_operation_id
         prev_retired_ranks = list(self.elastic_retired_ranks)
+        # The phase with them. A rejection answers with the scheduler's phase, which is
+        # idle on a scheduler that is not mid-scale, and writing that over this one's
+        # serving_shrunk is what leaves safe_to_terminate_ranks empty for an operation
+        # that already completed and still has ranks to reap.
+        prev_scale_phase = self.elastic_scale_phase
         self.elastic_pending_ep_size = obj.new_ep_size
         self.elastic_scale_phase = "waiting_for_cohort"
         self.elastic_operation_id = obj.operation_id
@@ -3837,11 +3852,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.elastic_retired_ranks = prev_retired_ranks
             if is_shrink:
                 self._open_elastic_shrink_gate()
+                self._clear_elastic_draining()
             raise
 
         for res in responses:
             if not res.success:
-                self.elastic_scale_phase = res.scale_phase
+                self.elastic_scale_phase = prev_scale_phase
                 self.elastic_pending_ep_size = res.pending_ep_size
                 self._clear_staged_scale()
                 self.elastic_last_error = res.message
@@ -3849,6 +3865,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.elastic_retired_ranks = prev_retired_ranks
                 if is_shrink:
                     self._open_elastic_shrink_gate()
+                    self._clear_elastic_draining()
                 return res
         self.elastic_scale_phase = responses[0].scale_phase
         self.elastic_last_error = None
