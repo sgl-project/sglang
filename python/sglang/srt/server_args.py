@@ -277,6 +277,43 @@ class ServerArgs:
 
             # Validate resolved arguments and checkpoint-derived constraints.
             cfg = resolving_view(self)
+            if cfg.mps_execution_backend != "eager":
+                if cfg.device != "mps" or use_mlx():
+                    raise ValueError(
+                        "MPS graph execution requires the standard Torch MPS path "
+                        "(--device mps with native MLX disabled)"
+                    )
+                if cfg.mps_execution_backend != "mlx-compiled":
+                    raise ValueError("Unknown MPS execution backend")
+                if cfg.mps_graph_max_batch_size <= 0:
+                    raise ValueError("--mps-graph-max-batch-size must be positive")
+                if (
+                    cfg.enable_lora
+                    or cfg.lora_paths
+                    or cfg.enable_torch_compile
+                    or cfg.enable_memory_saver
+                    or cfg.enable_page_major_kv_layout
+                ):
+                    raise ValueError(
+                        "MPS graph execution does not support LoRA, torch.compile, "
+                        "memory saver or page-major KV layouts"
+                    )
+            if (
+                cfg.mps_execution_backend == "mlx-compiled"
+                and not cfg.disable_mps_graph_async
+                and (
+                    cfg.disaggregation_mode != "null"
+                    or cfg.enable_pdmux
+                    or cfg.enable_hierarchical_cache
+                    or cfg.enable_lmcache
+                    or cfg.enable_session_radix_cache
+                )
+            ):
+                raise ValueError(
+                    "Asynchronous mlx-compiled requires the normal scheduler and "
+                    "standard local radix cache; use --disable-mps-graph-async "
+                    "for synchronous compiled decode"
+                )
             if (
                 cfg.device == "mps"
                 and not use_mlx()

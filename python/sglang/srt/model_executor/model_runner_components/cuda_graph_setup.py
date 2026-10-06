@@ -408,7 +408,21 @@ def capture_cuda_graphs(
         capture_time=0,
     )
     if capture_decode_cuda_graph:
-        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
+        if (
+            model_runner.device == "mps"
+            and get_exec().graph.mps_execution_backend != "eager"
+        ):
+            from sglang.srt.hardware_backend.mps.compiled_runner import (
+                CompiledMlxRunner,
+            )
+
+            decode = GraphCapture(
+                runner=CompiledMlxRunner(model_runner),
+                memory_phase=decode_phase,
+                memory_usage_gb=0,
+                capture_time=0,
+            )
+        elif model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
             decode = capture_decode_graph(model_runner=model_runner)
         elif (
             current_platform.is_out_of_tree() and current_platform.support_cuda_graph()

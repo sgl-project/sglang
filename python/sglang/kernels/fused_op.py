@@ -113,6 +113,7 @@ BACKEND_METHODS: Dict[KernelBackend, str] = {
     KernelBackend.DEEPGEMM: "forward_deepgemm",
     KernelBackend.AITER: "forward_aiter",
     KernelBackend.TORCH_NPU: "forward_torch_npu",
+    KernelBackend.MLX: "forward_mlx",
 }
 
 _METHOD_BACKEND_LABELS: Dict[str, str] = {
@@ -450,6 +451,9 @@ class BaseFusedOp(nn.Module, ABC):
 
     def forward_torch_npu(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no torch_npu backend")
+
+    def forward_mlx(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no mlx backend")
 
     def _op_label(self) -> str:
         return self.op or type(self).__name__

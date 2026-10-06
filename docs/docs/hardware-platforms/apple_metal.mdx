@@ -9,6 +9,10 @@ using [MLX](https://opensource.apple.com/projects/mlx/). SGLang Diffusion uses
 PyTorch MPS instead; see its [installation guide](/docs/sglang-diffusion/installation#platform-specific-apple-mps).
 If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
+You can also keep the standard PyTorch MPS model loader and opt into
+[direct compiled MLX decode](#experimental-direct-compiled-mlx-decode).
+This is separate from native MLX; neither existing path is replaced.
+
 ## Prerequisites
 
 The MLX runtime requires Apple Silicon with macOS 14 or newer, stable PyTorch
@@ -97,6 +101,156 @@ The MLX backend supports two quantization paths on Apple Silicon:
    Quantization complete in 0.13s — active mem: 1.11 GB -> 0.31 GB (71.9% reduction)
    ```
    The MLX backend silently ignores `--quantization mlx_q4` when the model is already quantized in its HF config (path 1), so the same flag is safe to pass either way.
+
+## Experimental direct compiled MLX decode
+
+`mlx-compiled` follows the direct `torch.export` to MLX approach discussed in
+[the MPS graph RFC](https://github.com/sgl-project/sglang/issues/32321):
+lower the exported ATen graph to MLX operations and compile the entire decode
+function with `mx.compile`. This is **not an ExecuTorch delegate** and does not
+require ExecuTorch. It captures the existing causal-LM forward, including its
+logits processor, with RMS normalization fusion and custom Metal radix attention.
+Admission is based on decoder structure and export capabilities, not a model-name
+allowlist.
+
+After the source installation above, the existing `srt_mps` extra is sufficient:
+
+```bash
+SGLANG_USE_MLX=0 python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-0.6B --device mps --dtype bfloat16 --tp-size 1 \
+  --mps-execution-backend mlx-compiled \
+  --mps-graph-max-batch-size 16 \
+  --context-length 1024 --max-total-tokens 16384 \
+  --max-running-requests 16 --mem-fraction-static 0.6
+```
+
+Async lookahead is the default for `mlx-compiled`. Add
+`--disable-mps-graph-async` for synchronous debugging or an A/B comparison. Both modes keep the
+Torch-initialized model and standard Torch-owned KV pools; native MLX is unchanged.
+The default execution backend remains `eager`.
+
+### What asynchronous decode means
+
+For an eligible greedy batch, the runner submits the current decode with
+`mx.async_eval`, computes a lazy MLX argmax, and submits the next dependent decode
+**before waiting for or exporting the current result**. The GPU still respects
+the autoregressive dependency: token n+1 cannot be computed independently of n.
+The optimization avoids a host token read between those two submissions.
+
+Lookahead is bounded to one token. Its attention reads the previous step's private
+K/V outputs as a virtual tail, without prematurely allocating a KV slot or
+writing a future token into the shared cache. Only accepted scheduled steps
+commit K/V through the standard pool setter. The normal Torch sampler remains
+authoritative; a prefetched result is used only if the actual next input tokens,
+request rows/generations, lengths, positions, prior KV locations and model state
+match.
+
+The scheduler drains outstanding reads before ingress, control RPCs and slot
+reuse. New requests/control operations, incompatible batches and idle/shutdown
+discard unused results. Greedy requests with grammar, bias or penalty processing
+do not prefetch; ordinary compiled execution still supports their Torch sampling.
+EOS, completion or a changed batch may waste one read-only computation, never
+commit an extra generated token. This is not the CUDA overlap scheduler.
+
+Weights are borrowed through live Torch MPS storage, and K/V deltas are exported
+through DLPack. Sampling receives its own FP32 logits copy so in-place Torch
+logit transforms cannot race the queued MLX forward. Direct users of the internal
+graph API must fence Torch producers and drain MLX before mutating borrowed
+weights or pools.
+
+### Scope and extending kernels
+
+This remains an experimental **dense, unquantized, single-rank decode**
+backend, not a general exporter for all Torch MPS models. Real-checkpoint serving
+parity has been checked for Qwen3-0.6B, SmolLM2-135M (`LlamaForCausalLM`) and GPT-2.
+Other models are candidates only if they pass the same capability checks; these
+three checks do not certify every checkpoint in those families. Prefill, including
+production of the first token, remains eager Torch MPS. Batches above the graph
+limit, embedding-input requests and hidden-state capture also use eager MPS.
+Each admitted batch shape compiles lazily; warm both graph modes before timing.
+
+The admission contract requires one unambiguous `ModuleList`/`ModuleDict` decoder
+stack, one ordinary `RadixAttention` invocation per block, unique layer IDs,
+homogeneous KV geometry and supported forward arguments. Export must contain only
+supported ATen operations or explicitly registered custom lowerings, and must not
+mutate borrowed inputs or buffers. Unsupported admission or operator coverage
+produces a logged eager-MPS fallback before launching MLX; unexpected export or
+execution errors are not caught and retried.
+
+The tensor wrapper calls the original outer model forward by argument name instead
+of assuming `.model`, positional argument order, or a bias-free linear head.
+FP32 LM-head computation and logit scaling follow the actual logits processor.
+Auxiliary model outputs that cannot be preserved are rejected. Reads of static
+`ForwardBatch` metadata are recorded during capture and checked at replay; a
+different value uses eager MPS instead of reusing a specialized constant. Attention
+invocation order is also checked, so shared/repeated decoder execution cannot
+silently write K/V to the wrong layer. Apart from region-local residual
+bookkeeping, writes to batch metadata are rejected during capture.
+
+Compatible weight/buffer replacement refreshes live views. Replacing modules
+invalidates graphs and reruns structural admission. Model configuration and
+forward code are otherwise initialization-static: restart the runner after
+changing them. Changes to borrowed tensor data require the usual Torch/MLX fences.
+
+LoRA, speculative decoding, MoE/recurrent-state regions, distributed execution,
+memory saver and page-major KV layouts are not supported. Async lookahead additionally requires
+the normal scheduler and local radix cache, not disaggregated serving,
+HiCache, LMCache, PDMux or session radix caching. BF16 rounding can change tied greedy
+choices relative to eager execution. LayerNorm, GELU, ReLU and tanh are supported;
+SiLU retains FP32 intermediates before its output cast to match Torch's
+low-precision activation semantics.
+
+`python/sglang/kernels/ops/attention/compiled_mlx_radix.py` is a concrete custom
+Metal extension: an `mx.fast.metal_kernel` callable usable inside `mx.compile`,
+registered as `attention.compiled_mlx_radix_decode`. The Torch reference and fake
+export contract live in `mlx_radix_export.py`.
+
+To add another custom kernel:
+
+1. Put the Metal implementation under `sglang.kernels.ops.<group>` using
+   `mx.fast.metal_kernel`. Register lazy `KernelSpec` metadata in that group's
+   `__init__.py` with `KernelBackend.MLX` and `DeviceType.MPS`. Registration
+   inventories the callable; it does not automatically lower a Torch graph.
+2. Define a `torch.library.custom_op(..., mutates_args=())` with a Torch reference
+   and `register_fake` implementation that validates shapes/dtypes. The model's
+   exported forward must actually call this op.
+3. Pass the op-overload-to-MLX-callable mapping when constructing the graph in
+   `CompiledMlxRunner._compile`:
+
+   ```python
+   graph = CompiledMlxGraph(
+       model=wrapper,
+       example_inputs=_batch_inputs(batch),
+       attention=mlx_radix_decode,
+       custom_lowerings={
+           torch.ops.sglang.my_custom_op.default: my_mlx_kernel,
+       },
+   )
+   ```
+
+4. Test reference parity, supported and rejected shapes/dtypes, no input
+   mutation, and dependent `mx.async_eval` launches through the exported
+   `mx.compile` graph. Add numerical kernel coverage under
+   `test/registered/kernels/ops/<group>` and export/lifetime coverage under the
+   MPS runtime tests.
+
+Lowerings receive MLX arrays (plus scalar op arguments) and must return lazy MLX
+arrays without host reads or synchronization. Write only newly allocated outputs;
+do not mutate borrowed Torch weights, the table or KV pools. Mutable exports and
+unregistered operations fail closed. The radix attention lowering additionally
+accepts the pending-token K/V tail; stateful kernels must preserve that dependency
+rather than reading an uncommitted slot. Model and pool ownership stay in the
+runner, not in kernels.
+
+`test_compiled_graph.py::test_custom_metal_lowering_survives_export_and_dependent_compile`
+verifies this extension contract with a separate custom Metal op: graph
+construction without its lowering is rejected, and two dependent compiled launches
+match the Torch reference.
+
+See `benchmark/mps/README.md` for the current structural-region Qwen3/SmolLM2
+standalone comparison and separately labeled historical async-server measurements.
+Standalone `bench_one` measurements explicitly disable lookahead; they do not
+measure default asynchronous serving.
 
 ## Benchmarking with Requests
 

@@ -40,6 +40,21 @@ import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.j
 
 <Qwen3Deployment />
 
+### Experimental Apple Silicon decode
+
+For unquantized dense Qwen3 on a single Apple GPU, you can keep Torch MPS weight
+loading and KV ownership while exporting decode to direct compiled MLX
+(`--mps-execution-backend mlx-compiled`). Bounded asynchronous greedy lookahead
+is enabled by default, enqueueing dependent decode work before the current token
+is read by the host. Use `--disable-mps-graph-async` for synchronous debugging. Prefill
+remains eager MPS. See the
+[Apple Silicon guide](/docs/hardware-platforms/apple_metal#experimental-direct-compiled-mlx-decode)
+for installation, limits and measured results. This experimental option leaves
+native MLX unchanged and is not faster at every batch size. The current M4 Pro
+standalone comparison uses Qwen3-0.6B BF16, TP=1 and context length 16384;
+the earlier server comparison used context length 1024. These are small-model
+Apple measurements rather than the large-model configurations above.
+
 ### 3.2 Configuration Tips
 
 - **Memory Management:** Set lower `--context-length` to conserve memory. A value of `128000` is sufficient for most scenarios, down from the default 262K.

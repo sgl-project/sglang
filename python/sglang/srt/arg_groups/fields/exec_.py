@@ -497,6 +497,28 @@ class ExecGraph(msgspec.Struct):
 
     _NS_PATH = "exec.graph"
 
+    mps_execution_backend: A[
+        Literal["eager", "mlx-compiled"],
+        Arg(
+            help="Experimental Torch MPS execution backend. mlx-compiled uses "
+            "torch.export and mx.compile for capability-checked dense model decode "
+            "including the existing model forward and logits processor, "
+            "with asynchronous greedy lookahead by default. Prefill remains eager. "
+            "Unsupported regions use eager MPS with a diagnostic. Native MLX is unchanged.",
+            choices=["eager", "mlx-compiled"],
+        ),
+    ] = "eager"
+    mps_graph_max_batch_size: A[
+        int,
+        "Largest exact decode batch exported by an MPS graph backend. Larger batches "
+        "use eager MPS. Each admitted size is compiled on first use.",
+    ] = 16
+    disable_mps_graph_async: A[
+        bool,
+        "Disable the default asynchronous greedy lookahead in mlx-compiled. "
+        "Use synchronous compiled decode for debugging or A/B measurement.",
+    ] = False
+
     # -------------------------------------------------------------------------
     # Cuda graphs
     # -------------------------------------------------------------------------

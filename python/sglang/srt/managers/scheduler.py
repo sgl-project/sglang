@@ -1894,12 +1894,32 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        mps_runner = None
+        if (
+            get_exec().graph.mps_execution_backend == "mlx-compiled"
+            and not get_exec().graph.disable_mps_graph_async
+        ):
+            from sglang.srt.hardware_backend.mps.compiled_runner import (
+                CompiledMlxRunner,
+            )
+
+            mps_runner = self.tp_worker.model_runner.decode_cuda_graph_runner
+            if not isinstance(mps_runner, CompiledMlxRunner):
+                raise RuntimeError(
+                    "Asynchronous MPS decode requires the compiled runner"
+                )
         while True:
+            if mps_runner is not None:
+                mps_runner.drain()
             if self.gracefully_exit:
+                if mps_runner is not None:
+                    mps_runner.drain(discard=True)
                 break
 
             # Receive requests
-            self.ingest_requests()
+            incoming = self.ingest_requests()
+            if incoming and mps_runner is not None:
+                mps_runner.drain(discard=True)
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -1917,6 +1937,8 @@ class Scheduler(
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
+                if mps_runner is not None:
+                    mps_runner.drain(discard=True)
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
                 self.on_idle()

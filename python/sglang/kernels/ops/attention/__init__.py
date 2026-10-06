@@ -14,9 +14,24 @@ from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CapabilityRequirement,
+    DeviceType,
     FormatSignature,
     KernelBackend,
     KernelSpec,
+)
+
+register_kernel(
+    KernelSpec(
+        op="attention.compiled_mlx_radix_decode",
+        backend=KernelBackend.MLX,
+        target="sglang.kernels.ops.attention.compiled_mlx_radix:radix_decode",
+        capabilities=frozenset({CapabilityRequirement(device=DeviceType.MPS)}),
+        format_signature=FormatSignature(
+            supported_dtypes=("float32", "float16", "bfloat16"),
+            description="MLX arrays; read-only GQA decode with optional previous-token K/V",
+        ),
+        description="Direct MLX Metal radix attention, usable inside mx.compile.",
+    )
 )
 
 if TYPE_CHECKING:
