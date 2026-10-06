@@ -101,7 +101,6 @@ _FORMATS = (
     _QuantFormat("fp8",       _Fmt.NATIVE_FP8, _Fmt.NATIVE_FP8, gfx942=True),
     _QuantFormat("mxfp8",     _Fmt.NATIVE_FP8, _Fmt.NATIVE_FP8, block_scaled=True),
     _QuantFormat("mxfp6",     _Fmt.MXFP6,      _Fmt.NATIVE_FP8),
-    # MXFP4 Q/K with FP8 V is not a row aiter has; it rejects the combination.
     _QuantFormat("mxfp4",     _Fmt.MXFP4,      _Fmt.MXFP4),
 )
 # fmt: on
