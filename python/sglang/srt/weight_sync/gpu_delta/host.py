@@ -26,6 +26,7 @@ import re
 import stat
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import orjson
@@ -129,18 +130,47 @@ def _write_record(directory, name, record):
     temporary.replace(directory / (name + ".json"))
 
 
+# Bounded read-ahead directly into the final encoded cache; no copied chunk buffers.
+_READ_CHUNK_BYTES = 8 << 20
+
+
 def _read_verify_payload(source, destination, expected):
-    started = time.perf_counter()
-    with source.open("rb", buffering=0) as incoming:
+    read_s, hash_s = 0.0, 0.0
+    checksum = hashlib.sha256()
+    # File tasks already run concurrently in the outer pool. A private reader
+    # cannot deadlock waiting for another slot in that same saturated pool.
+    with (
+        source.open("rb", buffering=0) as incoming,
+        ThreadPoolExecutor(max_workers=1) as reader,
+    ):
         before = os.fstat(incoming.fileno())
         if before.st_size != expected["nbytes"]:
             raise ValueError("delta payload size mismatch")
-        position = 0
-        while position < len(destination):
-            count = incoming.readinto(destination[position:])
-            if not count:
-                raise ValueError("truncated delta payload")
-            position += count
+
+        def read_chunk(offset):
+            started = time.perf_counter()
+            with destination[offset : offset + _READ_CHUNK_BYTES] as chunk:
+                position = 0
+                while position < len(chunk):
+                    with chunk[position:] as remaining:
+                        count = incoming.readinto(remaining)
+                    if not count:
+                        raise ValueError("truncated delta payload")
+                    position += count
+            return time.perf_counter() - started
+
+        future = reader.submit(read_chunk, 0) if destination else None
+        for offset in range(0, len(destination), _READ_CHUNK_BYTES):
+            read_s += future.result()
+            next_offset = offset + _READ_CHUNK_BYTES
+            if next_offset < len(destination):
+                future = reader.submit(read_chunk, next_offset)
+            # The next read writes only the disjoint suffix. Executor exit drains
+            # it even if hashing fails, before incoming/destination can close.
+            started = time.perf_counter()
+            with destination[offset:next_offset] as chunk:
+                checksum.update(chunk)
+            hash_s += time.perf_counter() - started
         after = os.fstat(incoming.fileno())
         if incoming.read(1) or (
             before.st_ino,
@@ -149,18 +179,27 @@ def _read_verify_payload(source, destination, expected):
             before.st_ctime_ns,
         ) != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             raise ValueError("delta payload size mismatch or source changed")
-    read_s = time.perf_counter() - started
-    started = time.perf_counter()
-    # Authenticate the retained copy, never reread the publication file.
-    if hashlib.sha256(destination).hexdigest() != expected["sha256"]:
+    # Authenticate the retained copy before encoded READY allows local decode.
+    if checksum.hexdigest() != expected["sha256"]:
         raise ValueError("delta payload SHA256 mismatch")
-    return read_s, time.perf_counter() - started
+    return read_s, hash_s
 
 
-def _read_verify_payloads(publication, files, definitions, pool, metrics):
+def _read_verify_payloads(publication, files, definitions, manifest, pool, metrics):
+    def validate_frames():
+        started = time.perf_counter()
+        validate_outer_entries(
+            manifest["tensors"],
+            {name: record["nbytes"] for name, record in definitions.items()},
+            manifest["frame_bytes"],
+        )
+        return time.perf_counter() - started
+
     started = time.perf_counter()
-    futures, error = [], None
+    futures, validation, error = [], None, None
     try:
+        # Independent CPU work; neither worker waits for another pool task.
+        validation = pool.executor.submit(validate_frames)
         for name, record in definitions.items():
             source = (publication.parent / name).resolve(strict=True)
             if source.parent != publication.parent:
@@ -179,6 +218,13 @@ def _read_verify_payloads(publication, files, definitions, pool, metrics):
             if error is None:
                 error = exc
     metrics["host_encoded_cache_read_hash_s"] = time.perf_counter() - started
+    if validation is not None:
+        try:
+            metrics["host_encoded_cache_frames_validate_s"] = validation.result()
+            metrics["host_encoded_cache_frames_validations"] = 1
+        except BaseException as exc:  # noqa: BLE001 - both branches drain before READY
+            if error is None:
+                error = exc
     if error is not None:
         raise error
 
@@ -449,18 +495,6 @@ class HostArena:
                         "encoded cache requires prior engine APPLIED release before overwrite"
                     )
                 build_started = time.perf_counter()
-                frames_started = time.perf_counter()
-                # Validate the entire immutable publication once, including
-                # foreign tensors whose compressed contents this rank skips.
-                validate_outer_entries(
-                    manifest["tensors"],
-                    {name: record["nbytes"] for name, record in definitions.items()},
-                    manifest["frame_bytes"],
-                )
-                metrics["host_encoded_cache_frames_validate_s"] = (
-                    time.perf_counter() - frames_started
-                )
-                metrics["host_encoded_cache_frames_validations"] = 1
                 encoded_size = sum(record["nbytes"] for record in definitions.values())
                 encoded = _reserve_encoded_cache(
                     directory,
@@ -486,7 +520,9 @@ class HostArena:
                     },
                 )
                 files = _map_files(directory, encoded, definitions)
-                _read_verify_payloads(publication, files, definitions, pool, metrics)
+                _read_verify_payloads(
+                    publication, files, definitions, manifest, pool, metrics
+                )
                 metrics["host_encoded_cache_hash_bytes"] = encoded_size
                 metrics["host_encoded_cache_hash_files"] = len(definitions)
                 index["build_s"] = time.perf_counter() - build_started

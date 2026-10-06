@@ -274,7 +274,9 @@ packed path rather than being split into layer batches.
 Preparation reports manifest loading/parsing (`host_manifest_read_parse_s`), plan
 validation (`host_plan_validate_s`), frame validation (`host_encoded_cache_frames_validate_s`),
 local tensor planning (`host_tensor_prepare_s`) and full preparation
-(`host_prepare_s`). `host_metadata_prepare_s` covers small GPU input setup and
+(`host_prepare_s`). Local planning releases the global manifest and foreign
+entries after host verification/decode; that release is included in both spans.
+`host_metadata_prepare_s` covers small GPU input setup and
 status-callback preparation, including its own stream waits (`host_metadata_wait_s`).
 `paused_setup_host_s` includes decoded-slot allocation, output-pointer binding and
 uploads, and scratch-dependent apply setup; `paused_apply_tune_s` isolates cold tuning.
@@ -297,12 +299,19 @@ setup. These spans overlap and must not be summed. nvCOMP can wait inside an Asy
 call, so host enqueue durations can contain GPU backpressure.
 
 `host_encoded_cache_created`/`host_encoded_cache_reused` identify the creator
-and followers. Creator-only `host_encoded_cache_read_hash_s` measures parallel
-file verification, including path checks, submission and all joins.
+and followers. Creator-only `host_encoded_cache_read_hash_s` measures submission
+through file verification joins, before waiting for global frame validation.
+Frame validation runs in the same pool and can overlap this span; both are nested
+inside cache build and must not be added to obtain elapsed time.
 `host_encoded_cache_read_worker_sum_s` and `host_encoded_cache_sha256_worker_sum_s`
-sum overlapping worker intervals; neither is additive with the wall span.
+sum read-loop and hash-update intervals. A private reader fills the next disjoint
+chunk while the file worker hashes the completed chunk, so these intervals can
+overlap within a file as well as across files. Neither is additive with the wall
+span; thread setup, file checks and joins remain in enclosing wall time.
 `host_encoded_cache_hash_files`, `hash_bytes` and `frames_validations` (with the
-same prefix) count shared work once. Verification finishes before local decode starts. `host_encoded_cache_wait_s` isolates the
+same prefix) count shared work once. All reads and frame validation drain before
+READY or failure returns; rank allocation and local decode start only after both
+pass. `host_encoded_cache_wait_s` isolates the
 cache mutex wait. `host_encoded_cache_build_s` repeats the cached build duration
 on followers and must not be summed across ranks. `host_rank_prepare_s` includes
 cache access, rank allocation and local outer decode.

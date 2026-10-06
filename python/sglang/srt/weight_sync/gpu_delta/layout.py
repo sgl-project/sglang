@@ -1017,6 +1017,9 @@ class PreparedDelta:
         self.timings["host_rank_prepare_s"] = time.perf_counter() - payload_started
 
         tensors_started = time.perf_counter()
+        # Host validation and decode finished; planning only needs this rank.
+        entries = {name: entries[name] for name in local_names}
+        del manifest, content
         compressed, raw_entries = [], []
         for binding in backend.layout.bindings:
             entry = entries[binding.name]

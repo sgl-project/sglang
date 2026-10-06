@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import mmap
 import multiprocessing
 import os
 import tempfile
@@ -225,7 +226,14 @@ class TestHostSnapshot(unittest.TestCase):
         entered, release, finished = [threading.Event() for _ in range(3)]
         snapshots, errors = [], []
         peer_finished = threading.Event()
+        validating, validated = threading.Event(), threading.Event()
         original_read = host._read_verify_payload
+        original_validate = host.validate_outer_entries
+
+        def delayed_validation(*args):
+            original_validate(*args)
+            validating.set()
+            assert validated.wait(5)
 
         def delayed_read(source, destination, expected):
             result = original_read(source, destination, expected)
@@ -256,21 +264,30 @@ class TestHostSnapshot(unittest.TestCase):
 
         with (
             patch.object(host, "_read_verify_payload", side_effect=delayed_read),
+            patch.object(
+                host, "validate_outer_entries", side_effect=delayed_validation
+            ),
             patch.object(self.pool, "decode", wraps=self.pool.decode) as decode,
         ):
             builder = threading.Thread(target=build)
             builder.start()
             try:
+                self.assertTrue(validating.wait(5))
                 self.assertTrue(entered.wait(5))
-                self.assertTrue(peer_finished.wait(5))
                 self.assertFalse(finished.is_set())
                 decode.assert_not_called()
                 self.assertIsNone(arena.allocation)
                 state = json.loads(next(self.cache.glob("*/*/state.json")).read_text())
                 self.assertEqual(state["state"], "BUILDING")
                 (self.root / "owner.bin").write_bytes(b"changed after retained read")
+                release.set()
+                self.assertTrue(peer_finished.wait(5))
+                self.assertFalse(finished.is_set())
+                decode.assert_not_called()
+                self.assertIsNone(arena.allocation)
             finally:
                 release.set()
+                validated.set()
                 builder.join(5)
         self.assertFalse(builder.is_alive())
         self.assertEqual(errors, [])
@@ -434,34 +451,137 @@ class TestHostSnapshot(unittest.TestCase):
                 metadata(2),
             )
 
-    def test_invalid_foreign_metadata_fails_before_allocation_read_or_decode(self):
+    def test_invalid_foreign_metadata_drains_reads_before_rank_allocation_or_decode(
+        self,
+    ):
         path, _, manifest, expected = fixture(self.root)
         manifest["tensors"][-1]["outer"]["frames"][0]["decoded_bytes"] = 11
         content = json.dumps(manifest).encode()
         path.write_bytes(content)
+        digest = hashlib.sha256(content).hexdigest()
+        arena, errors = self.arena(), []
+        entered, release, finished = [threading.Event() for _ in range(3)]
+        original_read = host._read_verify_payload
+
+        def delayed_read(source, destination, record):
+            result = original_read(source, destination, record)
+            if source.name == "owner.bin":
+                entered.set()
+                assert release.wait(5)
+            return result
+
+        def build():
+            try:
+                arena.prepare(
+                    path,
+                    digest,
+                    manifest,
+                    local_entries(manifest, expected),
+                    self.pool,
+                    {},
+                    metadata(),
+                )
+            except ValueError as error:
+                errors.append(str(error))
+            finally:
+                finished.set()
+
         with (
             patch.object(
                 host, "_reserve_encoded_cache", wraps=host._reserve_encoded_cache
             ) as allocate,
             patch.object(
-                host, "_read_verify_payload", wraps=host._read_verify_payload
+                host, "_read_verify_payload", side_effect=delayed_read
             ) as read,
             patch.object(self.pool, "decode", wraps=self.pool.decode) as decode,
-            self.assertRaisesRegex(ValueError, "outer Zstd chunk range"),
         ):
+            builder = threading.Thread(target=build)
+            builder.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertFalse(finished.is_set())
+                self.assertIsNone(arena.allocation)
+                decode.assert_not_called()
+                state = json.loads(next(self.cache.glob("*/*/state.json")).read_text())
+                self.assertEqual(state["state"], "BUILDING")
+            finally:
+                release.set()
+                builder.join(5)
+        self.assertFalse(builder.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIn("outer Zstd chunk range", errors[0])
+        allocate.assert_called_once()
+        self.assertEqual(read.call_count, len(manifest["files"]))
+        decode.assert_not_called()
+        self.assertIsNone(arena.allocation)
+        with self.assertRaisesRegex(ValueError, "failed or already released"):
             self.arena().prepare(
                 path,
-                hashlib.sha256(content).hexdigest(),
+                digest,
                 manifest,
                 local_entries(manifest, expected),
                 self.pool,
                 {},
                 metadata(),
             )
-        allocate.assert_not_called()
-        read.assert_not_called()
-        decode.assert_not_called()
-        self.assertEqual(list(self.cache.glob("*/*/state.json")), [])
+
+    def test_chunked_payload_reader_handles_tails_and_drains_on_failure(self):
+        path = self.root / "payload.bin"
+        with patch.object(host, "_READ_CHUNK_BYTES", 64):
+            for data in (b"", bytes(range(251)) * 9, b"x" * 256):
+                with self.subTest(bytes=len(data)):
+                    path.write_bytes(data)
+                    with memoryview(bytearray(len(data))) as destination:
+                        times = host._read_verify_payload(
+                            path,
+                            destination,
+                            {
+                                "nbytes": len(data),
+                                "sha256": hashlib.sha256(data).hexdigest(),
+                            },
+                        )
+                        self.assertEqual(destination, data)
+                        self.assertTrue(all(value >= 0 for value in times))
+            path.write_bytes(b"a" * 80)
+            with memoryview(bytearray(100)) as destination:
+                with self.assertRaisesRegex(ValueError, "truncated delta payload"):
+                    host._read_verify_payload(
+                        path, destination, {"nbytes": 80, "sha256": "0" * 64}
+                    )
+
+            entered, release, finished = [threading.Event() for _ in range(3)]
+
+            class Reader(ThreadPoolExecutor):
+                def submit(self, fn, offset):
+                    def task():
+                        if offset:
+                            entered.set()
+                            assert release.wait(5)
+                        result = fn(offset)
+                        if offset:
+                            finished.set()
+                        return result
+
+                    return super().submit(task)
+
+            class BrokenDigest:
+                def update(self, region):
+                    assert entered.wait(5)
+                    release.set()
+                    raise RuntimeError("hash failure")
+
+            path.write_bytes(b"a" * 129)
+            with (
+                mmap.mmap(-1, 129) as mapping,
+                memoryview(mapping) as destination,
+                patch.object(host, "ThreadPoolExecutor", Reader),
+                patch.object(host, "hashlib", SimpleNamespace(sha256=BrokenDigest)),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "hash failure"):
+                    host._read_verify_payload(
+                        path, destination, {"nbytes": 129, "sha256": "0" * 64}
+                    )
+                self.assertTrue(finished.is_set())
 
     def test_local_decode_does_not_hold_engine_encoded_cache_lock(self):
         path, digest, manifest, expected = fixture(self.root)
