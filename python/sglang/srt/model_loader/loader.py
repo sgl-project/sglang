@@ -12,7 +12,6 @@ import fnmatch
 import gc
 import glob
 import hashlib
-import itertools
 import json
 import logging
 import math
@@ -1161,7 +1160,10 @@ class LayeredModelLoader(DefaultModelLoader):
 
 class QuantizedRLModelLoader(DefaultModelLoader):
     """
-    Model loader for RL training with FP8 quantization (profile-free, native SGLang).
+    Model loader for RL training with FP8 quantization using audited native loaders.
+
+    Qwen2ForCausalLM (legacy/v2) and Qwen3ForCausalLM declare the reload contract.
+    Other native loaders are rejected before initialization loads any weights.
 
     Workflow:
       1. Initial load: Load base model → Record state → Apply FP8 quantization
@@ -1233,6 +1235,14 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         logger.info("[QuantizedRL] Initial load with FP8 quantization")
 
         original_load_weights = model.load_weights
+        native = getattr(original_load_weights, "__func__", original_load_weights)
+        if getattr(native, "_supports_quantized_rl_reload", None) is not native:
+            raise ValueError(
+                f"FlashRL does not support {type(model).__name__}.load_weights: "
+                "the native loader has not declared the deferred FP8-write contract. "
+                "Supported native loaders are Qwen2ForCausalLM (legacy/v2) and "
+                "Qwen3ForCausalLM; use a regular load format for other models."
+            )
 
         def load_weights_proxy(weights):
             if QuantizedRLModelLoader.is_reload_scenario(model):
@@ -1368,84 +1378,79 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 )
             row_masks[name] = (rows, per_channel)
 
-        def load_destinations():
-            for name, sources in grouped.items():
-                if name not in row_masks:
-                    yield sources
-                    continue
-                param = params[name]
-                data = param.data
-                rebuild = model.original_weights_rebuild_keys[name]
-                layer = model.get_submodule(name.rpartition(".")[0])
-                rows, per_channel = row_masks[name]
-                complete = rows is None or bool(rows.all())
-                staging = torch.empty_strided(
-                    rebuild["shape"],
-                    rebuild["stride"],
-                    dtype=rebuild["dtype"],
-                    device=data.device,
-                )
-                param.data = staging
-                for key, loaders in model.recorded_loader.items():
-                    if name in loaders and not hasattr(param, key):
-                        loader = loaders[name]
-                        setattr(
-                            param,
-                            key,
-                            QuantizedRLModelLoader._bind_method_to_cls(loader, param)
-                            if callable(loader)
-                            else loader,
-                        )
-                try:
-                    # The caller completes this group before requesting the next.
-                    yield sources
-                    local_weight = torch.as_strided(
-                        data, rebuild["shape"], rebuild["stride"]
+        # Keep one native call with the complete, re-iterable input. Only FP8
+        # parameter writes are deferred; model-level cross-key logic and non-FP8
+        # loads (including tied embeddings) execute in their original order.
+        writes = collections.defaultdict(list)
+        native_loaders = {}
+        for name in row_masks:
+            param = params[name]
+            for key, loaders in model.recorded_loader.items():
+                if name in loaders and not hasattr(param, key):
+                    loader = loaders[name]
+                    setattr(
+                        param,
+                        key,
+                        QuantizedRLModelLoader._bind_method_to_cls(loader, param)
+                        if callable(loader)
+                        else loader,
                     )
-                    if per_channel:
-                        # Quantize only the supplied row ranges; old FP8 bytes
-                        # and scales never pass through dequantization.
-                        if complete:
-                            ranges = [(0, staging.shape[0])]
-                        else:
-                            padded = torch.cat(
-                                (rows.new_zeros(1), rows, rows.new_zeros(1))
-                            )
-                            edges = (
-                                (padded[1:] != padded[:-1]).nonzero().flatten().tolist()
-                            )
-                            ranges = zip(edges[::2], edges[1::2])
-                        for begin, end in ranges:
-                            per_token_group_quant_fp8(
-                                staging[begin:end],
-                                staging.shape[-1],
-                                output_q=local_weight[begin:end],
-                                output_s=layer.weight_scale.data[:, begin:end].t(),
-                            )
-                    else:
-                        _, scale = input_to_float8(
-                            staging, dtype=data.dtype, out=local_weight
-                        )
-                        layer.weight_scale.data.copy_(scale)
-                finally:
-                    param.data = data
-                    # Release this destination before allocating the next one.
-                    del staging
+            native_loaders[name] = param.weight_loader
 
-        destinations = load_destinations()
+            def record_write(*args, _name=name, **kwargs):
+                writes[_name].append((args, kwargs))
+
+            param.weight_loader = record_write
         try:
-            native = getattr(
-                first_time_load_weights, "__func__", first_time_load_weights
-            )
-            if getattr(native, "_streams_weight_loading", None) is native:
-                first_time_load_weights(itertools.chain.from_iterable(destinations))
-            else:
-                # Generic loaders may eagerly materialize or reorder weights.
-                # Keep BF16 staging active until their native call returns.
-                for sources in destinations:
-                    first_time_load_weights(sources)
+            first_time_load_weights(weights_list)
         finally:
-            destinations.close()
+            for name, loader in native_loaders.items():
+                params[name].weight_loader = loader
+
+        for name, calls in writes.items():
+            param = params[name]
+            data = param.data
+            rebuild = model.original_weights_rebuild_keys[name]
+            layer = model.get_submodule(name.rpartition(".")[0])
+            rows, per_channel = row_masks[name]
+            complete = rows is None or bool(rows.all())
+            staging = torch.empty_strided(
+                rebuild["shape"],
+                rebuild["stride"],
+                dtype=rebuild["dtype"],
+                device=data.device,
+            )
+            param.data = staging
+            try:
+                for args, kwargs in calls:
+                    native_loaders[name](*args, **kwargs)
+                local_weight = torch.as_strided(
+                    data, rebuild["shape"], rebuild["stride"]
+                )
+                if per_channel:
+                    # Untouched rows never pass through dequantization.
+                    if complete:
+                        ranges = [(0, staging.shape[0])]
+                    else:
+                        padded = torch.cat((rows.new_zeros(1), rows, rows.new_zeros(1)))
+                        edges = (padded[1:] != padded[:-1]).nonzero().flatten().tolist()
+                        ranges = zip(edges[::2], edges[1::2])
+                    for begin, end in ranges:
+                        per_token_group_quant_fp8(
+                            staging[begin:end],
+                            staging.shape[-1],
+                            output_q=local_weight[begin:end],
+                            output_s=layer.weight_scale.data[:, begin:end].t(),
+                        )
+                else:
+                    _, scale = input_to_float8(
+                        staging, dtype=data.dtype, out=local_weight
+                    )
+                    layer.weight_scale.data.copy_(scale)
+            finally:
+                param.data = data
+                # No BF16 destination survives to the next destination or call.
+                del staging
 
         if is_last_update:
             gc.collect()

@@ -32,7 +32,7 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
-    streaming_weight_loader,
+    supports_quantized_rl_reload,
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
@@ -621,7 +621,7 @@ class Qwen3ForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
-    @streaming_weight_loader
+    @supports_quantized_rl_reload
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

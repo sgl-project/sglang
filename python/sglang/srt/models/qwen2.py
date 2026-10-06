@@ -55,6 +55,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
+    supports_quantized_rl_reload,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -616,6 +617,7 @@ class Qwen2ForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
+    @supports_quantized_rl_reload
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         from sglang.srt.environ import envs
 

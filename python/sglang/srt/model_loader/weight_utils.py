@@ -1474,13 +1474,15 @@ def gguf_quant_weights_iterator(
             yield name, param
 
 
-def streaming_weight_loader(func: Callable) -> Callable:
-    """Declare that each input tensor is loaded before advancing the iterator.
+def supports_quantized_rl_reload(func: Callable) -> Callable:
+    """Allow FlashRL to defer FP8 parameter writes until this method returns.
 
-    Quantized reloads can then finalize one destination before staging the next.
-    Methods that buffer or reorder their inputs must not use this declaration.
+    Checkpoint names must use the parameter names or QKV/gate-up aliases supported
+    by QuantizedRLModelLoader. FP8 writes must go through param.weight_loader;
+    the method must not read their values afterward, and source tensors must
+    remain unchanged until return. Non-FP8 parameters are loaded immediately.
     """
-    func._streams_weight_loading = func
+    func._supports_quantized_rl_reload = func
     return func
 
 
