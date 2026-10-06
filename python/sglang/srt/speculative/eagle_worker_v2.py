@@ -700,7 +700,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
-        if get_spec().speculative_use_rejection_sampling:
+        # Verify commits argmax for an all-greedy batch and never reads the
+        # draft distribution, so skip building it.
+        needs_draft_probs = (
+            get_spec().speculative_use_rejection_sampling
+            and not forward_batch.sampling_info.is_all_greedy
+        )
+        if needs_draft_probs:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
 
         topk1_chain_fits = (
@@ -715,7 +721,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk1_chain_fits
             and _is_cuda
             and self.hot_token_id is None
-            and not get_spec().speculative_use_rejection_sampling
+            and not needs_draft_probs
         ):
             draft_tokens_topk1 = torch.empty(
                 (topk_index.shape[0], self.speculative_num_steps),
@@ -778,7 +784,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_inf(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
-                if get_spec().speculative_use_rejection_sampling:
+                if needs_draft_probs:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
@@ -804,7 +810,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     probs = renorm_draft_probs(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info,
-                        get_spec().speculative_use_rejection_sampling,
+                        needs_draft_probs,
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
@@ -821,9 +827,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 hidden_states = logits_output.hidden_states
 
         draft_probs = (
-            torch.stack(draft_probs_list, dim=1)
-            if get_spec().speculative_use_rejection_sampling
-            else None
+            torch.stack(draft_probs_list, dim=1) if needs_draft_probs else None
         )
 
         # Organize the results
@@ -1024,33 +1028,53 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
+        # Cast to int64 before entering plan stream to avoid cross-stream
+        # synchronization issues with .to() inside the plan stream context.
+        if batch_result.prepared_draft_extend_inputs is not None:
+            num_correct_drafts, select_index, next_token_ids = (
+                batch_result.prepared_draft_extend_inputs
+            )
+        elif batch_result.accept_lens.is_cuda:
+            from sglang.kernels.ops.speculative.eagle import prepare_draft_extend_inputs
+
+            num_correct_drafts, select_index, next_token_ids = (
+                prepare_draft_extend_inputs(
+                    batch_result.accept_lens,
+                    batch_result.next_token_ids,
+                    self.speculative_num_draft_tokens,
+                )
+            )
+        else:
+            num_correct_drafts = batch_result.accept_lens - 1
+            select_index = (
+                torch.arange(
+                    0,
+                    len(batch.seq_lens) * self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens,
+                    device=self.device,
+                )
+                + batch_result.accept_lens
+                - 1
+            )
+
+            next_token_ids = batch_result.next_token_ids.to(torch.int64)
+
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
-            num_correct_drafts=batch_result.accept_lens - 1,
+            num_correct_drafts=num_correct_drafts,
             num_accept_tokens=batch_result.accept_lens,
             # Draft-extend fills the whole tree width (num_draft_tokens) per req,
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
-        select_index = (
-            torch.arange(
-                0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
-                device=self.device,
-            )
-            + batch_result.accept_lens
-            - 1
-        )
-
-        # Cast to int64 before entering plan stream to avoid cross-stream
-        # synchronization issues with .to() inside the plan stream context.
-        next_token_ids = batch_result.next_token_ids.to(torch.int64)
-
         # Prepare for draft extend in a separate stream
+        if self.plan_stream:
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(
                 draft_extend_input,
