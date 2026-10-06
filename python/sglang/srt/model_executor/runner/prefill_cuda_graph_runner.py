@@ -82,6 +82,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.forward_batch_context import set_forward_batch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -747,6 +748,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         raw_num_tokens: Optional[int] = None,
     ):
         with (
+            set_forward_batch(forward_batch),
             forward_context(
                 ForwardContext(attn_backend=self.model_runner.attn_backend)
             ),
@@ -879,6 +881,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         set_is_extend_in_batch(False)
 
         with (
+            set_forward_batch(fb),
             forward_context(
                 ForwardContext(attn_backend=self.model_runner.attn_backend)
             ),
