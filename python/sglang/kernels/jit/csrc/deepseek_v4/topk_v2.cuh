@@ -23,6 +23,7 @@
 #include <bit>
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <mutex>
 #include <utility>
@@ -437,11 +438,128 @@ constexpr uint32_t kMaxCluster16BatchSize = SGL_TOPK_V2_MAX_C16_OCC1;
 constexpr uint32_t kClusterMaxBatch = 512;
 #define CLUSTER_TOPK_KERNEL TOPK_KERNEL __cluster_dims__(1, kClusterSize, 1)
 
+#if defined(SGL_ROCM_ARCH_GFX1250)
+constexpr uint32_t kGfx1250SmallShortClusterSize = 8;
+constexpr uint32_t kGfx1250SmallLongClusterSize = 15;
+constexpr uint32_t kGfx1250PersistentShortClusterSize = 4;
+constexpr uint32_t kGfx1250PersistentLongClusterSize = 2;
+constexpr uint32_t kGfx1250NumPersistentClusters = 60;
+constexpr uint32_t kGfx1250MaxClusterSize = kGfx1250SmallLongClusterSize;
+
+template <uint32_t kClusterSize>
+constexpr size_t gfx1250_cluster_workspace_bytes(uint32_t batch_size) {
+  const auto hist_items =
+      static_cast<size_t>(batch_size) * kClusterSize * impl::TopKGfx1250Cluster<kClusterSize>::kHistSize;
+  const auto count_items = static_cast<size_t>(batch_size) * kClusterSize * 2;
+  const auto tie_items = static_cast<size_t>(batch_size) * impl::TopKConfig::kMaxNumTie;
+  return hist_items * sizeof(uint32_t) + count_items * sizeof(uint32_t) + tie_items * sizeof(impl::TieValue);
+}
+
+template <uint32_t kClusterSize>
+inline impl::Gfx1250ClusterWorkspace gfx1250_cluster_workspace(
+    const tvm::ffi::Optional<tvm::ffi::TensorView>& storage, uint32_t batch_size, DLDevice device) {
+  using namespace host;
+  RuntimeCheck(storage.has_value(), "gfx1250 cooperative TopK requires an explicit workspace");
+  const auto tensor = storage.value();
+  TensorMatcher({-1}).with_dtype<uint8_t>().with_device(device).verify(tensor);
+  const auto required_bytes = gfx1250_cluster_workspace_bytes<kClusterSize>(batch_size);
+  RuntimeCheck(
+      static_cast<size_t>(tensor.size(0)) >= required_bytes,
+      "gfx1250 cooperative TopK workspace is too small: got ",
+      tensor.size(0),
+      " bytes, need ",
+      required_bytes);
+
+  auto* ptr = static_cast<char*>(tensor.data_ptr());
+  const auto hist_bytes =
+      static_cast<size_t>(batch_size) * kClusterSize * impl::TopKGfx1250Cluster<kClusterSize>::kHistSize *
+      sizeof(uint32_t);
+  const auto count_bytes = static_cast<size_t>(batch_size) * kClusterSize * 2 * sizeof(uint32_t);
+  impl::Gfx1250ClusterWorkspace workspace{};
+  workspace.hist = reinterpret_cast<uint32_t*>(ptr);
+  ptr += hist_bytes;
+  workspace.counts = reinterpret_cast<uint32_t*>(ptr);
+  ptr += count_bytes;
+  workspace.ties = reinterpret_cast<impl::TieValue*>(ptr);
+  return workspace;
+}
+
+template <uint32_t kClusterSize, auto kKernel>
+inline void validate_gfx1250_cluster_launch(DLDevice device) {
+  constexpr int kMaxDevices = 16;
+  static std::once_flag once[kMaxDevices];
+  static hipError_t status[kMaxDevices] = {};
+  static int potential_size[kMaxDevices] = {};
+  static int active_clusters[kMaxDevices] = {};
+  host::RuntimeCheck(
+      device.device_id >= 0 && device.device_id < kMaxDevices,
+      "gfx1250 cooperative TopK does not support device id ",
+      device.device_id);
+  std::call_once(once[device.device_id], [=] {
+    int previous_device = 0;
+    status[device.device_id] = hipGetDevice(&previous_device);
+    if (status[device.device_id] != hipSuccess) return;
+    status[device.device_id] = hipSetDevice(device.device_id);
+    if (status[device.device_id] != hipSuccess) return;
+
+    const auto kernel_ptr = reinterpret_cast<const void*>(kKernel);
+    if constexpr (kClusterSize > 8) {
+      status[device.device_id] =
+          hipFuncSetAttribute(kernel_ptr, hipFuncAttributeNonPortableClusterSizeAllowed, 1);
+      if (status[device.device_id] != hipSuccess) {
+        (void)hipSetDevice(previous_device);
+        return;
+      }
+    }
+
+    hipLaunchAttribute attr{};
+    attr.id = hipLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {1, kClusterSize, 1};
+    hipLaunchConfig_t config{};
+    config.gridDim = {1, kClusterSize, 1};
+    config.blockDim = {kBlockSize, 1, 1};
+    config.attrs = &attr;
+    config.numAttrs = 1;
+    status[device.device_id] =
+        hipOccupancyMaxPotentialClusterSize(&potential_size[device.device_id], kernel_ptr, &config);
+    if (status[device.device_id] == hipSuccess) {
+      status[device.device_id] =
+          hipOccupancyMaxActiveClusters(&active_clusters[device.device_id], kernel_ptr, &config);
+    }
+    (void)hipSetDevice(previous_device);
+  });
+  host::RuntimeCheck(
+      status[device.device_id] == hipSuccess,
+      "gfx1250 cooperative TopK occupancy probe failed: ",
+      hipGetErrorString(status[device.device_id]));
+  host::RuntimeCheck(
+      potential_size[device.device_id] >= static_cast<int>(kClusterSize) &&
+          active_clusters[device.device_id] > 0,
+      "gfx1250 cooperative TopK cluster width ",
+      kClusterSize,
+      " is not schedulable (max width ",
+      potential_size[device.device_id],
+      ", active clusters ",
+      active_clusters[device.device_id],
+      ")");
+}
+#endif
+
 /// Persistent cluster kernel for the items the plan routed to the pool; topk_main_kernel handles the rest.
 template <bool kPDL, uint32_t kClusterSize>
-CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKPagedParams params) {
+CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(
+    const __grid_constant__ TopKPagedParams params
+#if defined(SGL_ROCM_ARCH_GFX1250)
+    ,
+    const impl::Gfx1250ClusterWorkspace workspace
+#endif
+) {
   device::enable_smem_spilling();
+#if defined(SGL_ROCM_ARCH_GFX1250)
+  using ClusterN = impl::TopKGfx1250Cluster<kClusterSize>;
+#else
   using ClusterN = impl::TopKCluster<kClusterSize>;
+#endif
   __shared__ impl::MaxSmem<typename ClusterN::Smem> smem;
   const auto bx = blockIdx.x;
   const auto num_cluster_items = params.global().num_cluster_items;
@@ -453,21 +571,39 @@ CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ 
   while (idx >= 0) {
     const auto it = params.item(idx);
     const auto problem = params.problem(it.batch_id, it.seq_len);
+#if defined(SGL_ROCM_ARCH_GFX1250)
+    ClusterN::template forward<false>(problem, &smem, workspace, bx);
+#else
     ClusterN::template forward<false>(problem, &smem);
+#endif
+#if defined(SGL_ROCM_ARCH_GFX1250)
+    idx -= kGfx1250NumPersistentClusters;
+#else
     idx -= kNumPersistentClusters;
+#endif
     if (idx >= 0) __syncthreads();
   }
 }
 
 template <bool kPDL, TopKMode kMode, uint32_t kClusterSize, uint32_t kOccupancy>
-CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__ TopKPagedParams params) {
+CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(
+    const __grid_constant__ TopKPagedParams params
+#if defined(SGL_ROCM_ARCH_GFX1250)
+    ,
+    const impl::Gfx1250ClusterWorkspace workspace
+#endif
+) {
   device::enable_smem_spilling();
   constexpr bool kNeedStaging = kMode != TopKMode::INDICES;
   const auto bx = blockIdx.x;
   const auto by = blockIdx.y;
   auto problem = params.problem(bx);
   __shared__ int32_t s_topk_indices[kMaxTopK];
+#if defined(SGL_ROCM_ARCH_GFX1250)
+  using ClusterN = impl::TopKGfx1250Cluster<kClusterSize>;
+#else
   using ClusterN = impl::TopKCluster<kClusterSize>;
+#endif
   __shared__ impl::MaxSmem<Register4::Smem, Streaming::Smem, typename ClusterN::Smem> smem;
 
   // randomly elect one worker rank to avoid workload imbalance
@@ -488,6 +624,20 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
     if (by != worker_rank) return;
     Streaming::forward<kPDL>(problem, &smem);
   } else {
+#if defined(SGL_ROCM_ARCH_GFX1250)
+    // The register-multicast path writes raw indices directly to global output.
+    problem.out = params.get_output_ptr(bx);
+    ClusterN::template forward<kPDL>(problem, &smem, workspace, bx);
+    device::PDLTriggerSecondary<kPDL>();
+    if constexpr (kNeedStaging) {
+      if (by == 0) {
+        paged_transform<kMode>(problem, problem.out, params.get_transform(bx));
+      }
+      ClusterN::barrier_cluster_arrive_release();
+      ClusterN::barrier_cluster_wait();
+    }
+    return;
+#else
     auto cluster = cooperative_groups::this_cluster();
     if constexpr (kNeedStaging) {
       problem.out = cluster.map_shared_rank(s_topk_indices, 0);
@@ -502,6 +652,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
     } else {
       return device::PDLTriggerSecondary<kPDL>();
     }
+#endif
   }
 
   device::PDLTriggerSecondary<kPDL>();
@@ -942,6 +1093,30 @@ inline auto split_plan(uint32_t batch_size, uint32_t max_seq_len, DLDevice devic
 }
 #endif  // USE_ROCM
 
+#if defined(SGL_ROCM_ARCH_GFX1250)
+// Default stays on the ROCm split/streaming path. Set to exactly "1" to test
+// the cooperative cluster route.
+inline bool gfx1250_topk_cluster_enabled() {
+  const char* value = std::getenv("SGLANG_GFX1250_TOPK_CLUSTER");
+  return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+inline uint32_t gfx1250_topk_cluster_size(uint32_t batch_size, uint32_t max_seq_len) {
+  if (const char* value = std::getenv("SGLANG_GFX1250_TOPK_CLUSTER_SIZE"); value != nullptr) {
+    const auto width = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+    host::RuntimeCheck(
+        width == 2 || width == 4 || width == 8 || width == 15,
+        "SGLANG_GFX1250_TOPK_CLUSTER_SIZE must be one of 2, 4, 8, 15");
+    return width;
+  }
+  if (batch_size <= kNumPersistentClusters) {
+    if (max_seq_len > 131072) return 8;
+    return batch_size <= 8 ? 4 : 8;
+  }
+  return max_seq_len > 131072 ? kGfx1250PersistentLongClusterSize : kGfx1250PersistentShortClusterSize;
+}
+#endif
+
 template <bool kUsePDL>
 struct TopKKernel {
   static void plan(  //
@@ -966,17 +1141,33 @@ struct TopKKernel {
     RuntimeCheck(metadata.size(0) == B.unwrap() + 1, "invalid metadata shape");
 #if SUPPORT_CLUSTER
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
+#if defined(SGL_ROCM_ARCH_GFX1250)
+    // gfx1250 always uses the direct-row cluster kernel. The CUDA persistent
+    // pool plan is unused, so do not launch a dead planning kernel.
+    static_cast<void>(batch_size);
+    static_cast<void>(static_cluster_threshold);
+    return;
+#endif
     // persistent cluster not supported
     if (kNumPersistentClusters == 0) return;
     // will not route to persistent cluster
     if (batch_size <= kNumPersistentClusters || batch_size > kClusterMaxBatch) return;
     const auto device = device_.unwrap();
+#if defined(SGL_ROCM_ARCH_GFX1250)
+    // The CUDA plan candidates are tuned for H200/B200 pool sizes. On gfx1250
+    // use the same fixed floor as host dispatch so every eligible long row is
+    // actually consumed by the persistent cluster pool.
+    const int32_t plan_threshold =
+        static_cluster_threshold >= 0 ? static_cluster_threshold : (batch_size <= 15 ? 32768 : 65536);
+#else
+    const int32_t plan_threshold = static_cluster_threshold;
+#endif
     LaunchKernel(1, kBlockSize, device)(  //
         topk_plan_cluster,
         static_cast<const uint32_t*>(seq_lens.data_ptr()),
         static_cast<PlanItem*>(metadata.data_ptr()),
         batch_size,
-        static_cluster_threshold);
+        plan_threshold);
 #else
     static_cast<void>(static_cluster_threshold);
 #endif
@@ -989,7 +1180,8 @@ struct TopKKernel {
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
       const tvm::ffi::TensorView metadata,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> cluster_workspace) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
@@ -1058,7 +1250,12 @@ struct TopKKernel {
       } else if constexpr (SGL_ARCH_HOPPER_OR_GREATER) {
         return batch_size <= 15 ? 32768 : 65536;
       } else {
+#if defined(SGL_ROCM_ARCH_GFX1250)
+        // Hopper small-batch floor. Used only when SGLANG_GFX1250_TOPK_CLUSTER=1.
+        return batch_size <= 15 ? 32768u : 65536u;
+#else
         return UINT_MAX;
+#endif
       }
     };
 
@@ -1096,8 +1293,35 @@ struct TopKKernel {
     };
     dispatch([&]<TopKMode kMode>() {
 #if SUPPORT_CLUSTER
-      const bool use_cluster = (max_seq_len > params.static_cluster_floor) && (batch_size <= kClusterMaxBatch);
+      bool use_cluster = (max_seq_len > params.static_cluster_floor) && (batch_size <= kClusterMaxBatch);
+#if defined(SGL_ROCM_ARCH_GFX1250)
+      use_cluster = use_cluster && gfx1250_topk_cluster_enabled() && batch_size > 1;
+#endif
       if (use_cluster) {
+#if defined(SGL_ROCM_ARCH_GFX1250)
+        const auto launch_gfx1250_cluster = [&]<uint32_t kClusterSize>() {
+          constexpr auto kernel = topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 1>;
+          validate_gfx1250_cluster_launch<kClusterSize, kernel>(device);
+          const auto workspace =
+              gfx1250_cluster_workspace<kClusterSize>(cluster_workspace, batch_size, device);
+          LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
+              .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
+              .launch(kernel, params, workspace);
+        };
+        switch (gfx1250_topk_cluster_size(batch_size, max_seq_len)) {
+          case 2:
+            return launch_gfx1250_cluster.template operator()<2>();
+          case 4:
+            return launch_gfx1250_cluster.template operator()<4>();
+          case 8:
+            return launch_gfx1250_cluster.template operator()<8>();
+          case 15:
+            return launch_gfx1250_cluster.template operator()<15>();
+          default:
+            Panic("invalid gfx1250 cluster size");
+        }
+#else
+#if !defined(USE_ROCM)
         if constexpr (kMaxCluster16BatchSize > 0) {
           if (batch_size <= kMaxCluster16BatchSize) {
             constexpr uint32_t kClusterSize = 16;
@@ -1114,27 +1338,51 @@ struct TopKKernel {
                 .launch(kernel, params);
           }
         }
+#endif
 
         if constexpr (kNumPersistentClusters > 0) {
           if (batch_size <= kNumPersistentClusters) {
+#if defined(SGL_ROCM_ARCH_GFX1250)
+            constexpr uint32_t kClusterSize = kGfx1250SmallClusterSize;
+            return LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
+                .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
+                .launch(
+                    topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 1>,
+                    params,
+                    gfx1250_resources->workspace);
+#else
             constexpr uint32_t kClusterSize = 8;
             return LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
                 .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
                 .launch(topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 2>, params);
+#endif
           } else {
+#if defined(SGL_ROCM_ARCH_GFX1250)
+            constexpr uint32_t kClusterSize = kGfx1250PersistentClusterSize;
+            const uint32_t num_clusters = std::min(batch_size, kGfx1250NumPersistentClusters);
+            LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device)
+                .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
+                .launch(
+                    topk_persistent_cluster_kernel<kUsePDL, kClusterSize>,
+                    params,
+                    gfx1250_resources->workspace);
+#else
             constexpr uint32_t kClusterSize = 8;
             const uint32_t num_clusters = std::min(batch_size, kNumPersistentClusters);
             LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device)
                 .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
                 .launch(topk_persistent_cluster_kernel<kUsePDL, kClusterSize>, params);
+#endif
             LaunchKernel(batch_size, kBlockSize, device)
                 .config({.use_pdl = kUsePDL})
                 .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3, kMode>, params);
             return void();
           }
         }
+#endif
       }
-#elif defined(USE_ROCM)
+#endif
+#if defined(USE_ROCM)
       // Split dispatch. One block per row leaves a long row latency bound on one
       // CU however idle the rest is; split_plan decides where a second launch pays.
       // PDL stays off: the hist -> select kernel boundary is the barrier.

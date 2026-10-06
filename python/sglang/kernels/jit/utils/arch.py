@@ -123,6 +123,8 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
                 flags.append("-DHIP_FP8_TYPE_FNUZ=1")
             else:
                 flags.append("-DHIP_FP8_TYPE_E4M3=1")
+            if "gfx1250" in gcn_arch:
+                flags.append("-DSGL_ROCM_ARCH_GFX1250=1")
         except Exception:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
         return flags
