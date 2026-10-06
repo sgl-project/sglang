@@ -15,8 +15,8 @@ from sglang.srt.managers.io_struct import (
     msgpack_encode,
 )
 from sglang.srt.utils.auth import AuthLevel, add_api_key_middleware
-from sglang.srt.weight_sync.gpu_delta_http import register_gpu_delta_routes
-from sglang.srt.weight_sync.gpu_delta_io import (
+from sglang.srt.weight_sync.gpu_delta.http import register_gpu_delta_routes
+from sglang.srt.weight_sync.gpu_delta.io import (
     AbortWeightsFromDeltaReqInput,
     DeltaWeightsReqOutput,
     GetWeightsDeltaInfoReqInput,
@@ -112,7 +112,7 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
         assert isinstance(calls[-1], request_type)
         received = msgpack_decode(msgpack_encode(calls[-1]))
         assert type(received) is request_type
-        assert request_type.__module__ == "sglang.srt.weight_sync.gpu_delta_io"
+        assert request_type.__module__ == "sglang.srt.weight_sync.gpu_delta.io"
         assert received == calls[-1]
         assert pickle.loads(pickle.dumps(received)) == received
     response = DeltaWeightsReqOutput(

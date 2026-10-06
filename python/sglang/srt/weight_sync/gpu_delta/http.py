@@ -8,7 +8,7 @@ from fastapi import Body, FastAPI
 from fastapi.responses import ORJSONResponse
 
 from sglang.srt.utils.auth import AuthLevel, auth_level
-from sglang.srt.weight_sync.gpu_delta_io import (
+from sglang.srt.weight_sync.gpu_delta.io import (
     AbortWeightsFromDeltaReqInput,
     GetWeightsDeltaInfoReqInput,
     GetWeightsDeltaStatusReqInput,

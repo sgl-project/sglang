@@ -388,7 +388,7 @@ class GpuDeltaLayout:
     """Frozen, fail-closed map from startup checkpoint names to live buffers."""
 
     def __init__(self, model, inventory):
-        from sglang.srt.weight_sync.gpu_delta_host import _natural_key
+        from sglang.srt.weight_sync.gpu_delta.host import _natural_key
 
         self.model = model
         if not inventory:
@@ -730,10 +730,10 @@ class GpuDeltaBackend:
 
     def __init__(self, model_runner, identity):
         from sglang.srt.runtime_context import get_exec
-        from sglang.srt.weight_sync.gpu_delta_checkpoint import (
+        from sglang.srt.weight_sync.gpu_delta.checkpoint import (
             read_canonical_checkpoint_inventory,
         )
-        from sglang.srt.weight_sync.gpu_delta_payload import (
+        from sglang.srt.weight_sync.gpu_delta.payload import (
             OuterZstdPool,
             configured_codec,
             configured_cpu_workers,
@@ -752,7 +752,7 @@ class GpuDeltaBackend:
         self.device = next(model_runner.model.parameters()).device
         if self.device.type != "cuda" or self.device.index is None:
             raise ValueError("direct GPU deltas require an explicit CUDA device")
-        from sglang.srt.weight_sync.gpu_delta_host import HostArena
+        from sglang.srt.weight_sync.gpu_delta.host import HostArena
 
         self.outer_pool = OuterZstdPool(configured_cpu_workers())
         self.host_arena = HostArena(identity["engine_id"], self.device.index)
@@ -802,7 +802,7 @@ def _plan_layers(backend, bindings, entries, layers_per_batch=1):
         if not bindings:
             backend.batch_plan = (key, [])
             return []
-        from sglang.srt.weight_sync.gpu_delta_apply import plan_apply
+        from sglang.srt.weight_sync.gpu_delta.apply import plan_apply
 
         layers = {}
         non_layers = {"embed_tokens": [], "lm_head": [], "standalone": []}
@@ -838,7 +838,7 @@ def _plan_layers(backend, bindings, entries, layers_per_batch=1):
 
 def _plan_decode(outputs, entries, records):
     """Point DE at host frames and collect omitted output bytes in one pass."""
-    from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame
+    from sglang.srt.weight_sync.gpu_delta.codec import DecodeFrame
 
     frames, gaps = [], []
     for binding, decoded_offset, size in outputs:
@@ -963,7 +963,7 @@ class PreparedDelta:
     def __init__(self, backend, manifest_path, manifest_sha256, metadata):
         from pathlib import Path
 
-        from sglang.srt.weight_sync.gpu_delta_payload import validate_codec
+        from sglang.srt.weight_sync.gpu_delta.payload import validate_codec
 
         self.stream = self.de_stream = None
         self.host_snapshot = None
@@ -1089,7 +1089,7 @@ class PreparedDelta:
 
     def _prepare_gpu_metadata(self, frame_plans, raw_targets):
         """Prepare small GPU inputs; retain their leases, not wire-frame objects."""
-        from sglang.srt.weight_sync.gpu_delta_codec import NvcompDecoder
+        from sglang.srt.weight_sync.gpu_delta.codec import NvcompDecoder
 
         started = time.perf_counter()
         backend = self.backend
@@ -1136,7 +1136,7 @@ class PreparedDelta:
                     self.workspace,
                     self.de_stream,
                 )
-            from sglang.srt.weight_sync.gpu_delta_apply import prepare_status_check
+            from sglang.srt.weight_sync.gpu_delta.apply import prepare_status_check
 
             with torch.cuda.stream(self.stream):
                 self.status_checks = [

@@ -13,14 +13,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.weight_sync.gpu_delta_apply import prepare_status_check
-from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame, NvcompDecoder
-from sglang.srt.weight_sync.gpu_delta_layout import (
+from sglang.srt.weight_sync.gpu_delta.apply import prepare_status_check
+from sglang.srt.weight_sync.gpu_delta.codec import DecodeFrame, NvcompDecoder
+from sglang.srt.weight_sync.gpu_delta.layout import (
     PreparedDelta,
     _plan_decode,
     _PreparedBatch,
 )
-from sglang.srt.weight_sync.gpu_delta_memory import HostAllocation
+from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation
 
 
 def _encode(values, codec, offsets=None):

@@ -14,8 +14,8 @@ from unittest.mock import patch
 
 import zstandard as zstd
 
-from sglang.srt.weight_sync import gpu_delta_host as host
-from sglang.srt.weight_sync.gpu_delta_payload import OuterZstdPool
+from sglang.srt.weight_sync.gpu_delta import host as host
+from sglang.srt.weight_sync.gpu_delta.payload import OuterZstdPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")

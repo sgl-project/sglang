@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import zstandard as zstd
 
-from sglang.srt.weight_sync.gpu_delta_payload import (
+from sglang.srt.weight_sync.gpu_delta.payload import (
     OuterZstdPool,
     configured_codec,
     validate_codec,

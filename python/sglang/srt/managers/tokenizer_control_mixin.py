@@ -197,7 +197,7 @@ class TokenizerControlMixin:
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
 
-        from sglang.srt.weight_sync.gpu_delta_tokenizer import GpuDeltaTokenizerControl
+        from sglang.srt.weight_sync.gpu_delta.tokenizer import GpuDeltaTokenizerControl
 
         self.gpu_delta = GpuDeltaTokenizerControl(self, get_parallel().dp_size)
 

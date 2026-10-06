@@ -30,8 +30,8 @@ from pathlib import Path
 
 import orjson
 
-from sglang.srt.weight_sync.gpu_delta_memory import HostAllocation
-from sglang.srt.weight_sync.gpu_delta_payload import validate_outer_entries
+from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation
+from sglang.srt.weight_sync.gpu_delta.payload import validate_outer_entries
 
 
 def _cache_base():

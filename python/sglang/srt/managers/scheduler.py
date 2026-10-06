@@ -367,7 +367,7 @@ from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
     record_weight_version_events,
 )
-from sglang.srt.weight_sync.gpu_delta_session import with_gpu_delta_controls
+from sglang.srt.weight_sync.gpu_delta.session import with_gpu_delta_controls
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():

@@ -16,7 +16,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 _path = (
     Path(__file__).resolve().parents[4]
-    / "python/sglang/srt/weight_sync/gpu_delta_codec.py"
+    / "python/sglang/srt/weight_sync/gpu_delta/codec.py"
 )
 _spec = importlib.util.spec_from_file_location("gpu_delta_codec_under_test", _path)
 codec = importlib.util.module_from_spec(_spec)
@@ -85,7 +85,7 @@ def test_codec_abi_and_frozen_hardware_options(
 
     monkeypatch.setitem(
         sys.modules,
-        "sglang.srt.weight_sync.gpu_delta_memory",
+        "sglang.srt.weight_sync.gpu_delta.memory",
         SimpleNamespace(
             _driver=lambda: SimpleNamespace(cuDeviceGetAttribute=device_attribute)
         ),
@@ -248,7 +248,7 @@ def test_host_input_plans_split_output_and_status_slots(monkeypatch, name, stage
     uploads, admitted = [], []
     monkeypatch.setitem(
         sys.modules,
-        "sglang.srt.weight_sync.gpu_delta_memory",
+        "sglang.srt.weight_sync.gpu_delta.memory",
         SimpleNamespace(require_de_capable=admitted.append),
     )
 

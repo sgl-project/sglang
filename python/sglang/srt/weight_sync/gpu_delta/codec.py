@@ -46,7 +46,7 @@ _MAX_FRAME_BYTES = 4 << 20
 
 
 def _require_hardware_device(device: torch.device, algorithm: str) -> int:
-    from sglang.srt.weight_sync.gpu_delta_memory import _driver
+    from sglang.srt.weight_sync.gpu_delta.memory import _driver
 
     driver = _driver()
     mask, maximum = ctypes.c_int(), ctypes.c_int()
@@ -224,7 +224,7 @@ class NvcompDecoder:
         DE submissions use one stream and share temporary storage. Status and
         actual-size rows belong to each decoded slot until apply consumes them.
         """
-        from sglang.srt.weight_sync.gpu_delta_memory import require_de_capable
+        from sglang.srt.weight_sync.gpu_delta.memory import require_de_capable
 
         if slot_count not in (2, 3, 4):
             raise ValueError("nvCOMP requires 2, 3 or 4 decoded output slots")
@@ -267,7 +267,7 @@ class NvcompDecoder:
         status validation and weight writes belong to the separate apply stream.
         ``workspace`` must be allocated for these batches with ``allocate_workspace``.
         """
-        from sglang.srt.weight_sync.gpu_delta_memory import require_de_capable
+        from sglang.srt.weight_sync.gpu_delta.memory import require_de_capable
 
         if (
             host_input.device.type != "cpu"
@@ -443,7 +443,7 @@ class PreparedDecodePlan:
         The caller waits for prior apply readers before reusing each output and
         its status/actual-size row; DE uses one stream and temporary workspace.
         """
-        from sglang.srt.weight_sync.gpu_delta_memory import require_de_capable
+        from sglang.srt.weight_sync.gpu_delta.memory import require_de_capable
 
         if len(decoded_slots) != self.slot_count:
             raise ValueError("Decoded output count differs from prepared slots")

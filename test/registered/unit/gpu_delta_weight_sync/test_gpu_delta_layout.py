@@ -22,7 +22,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 # importing serving-time CUDA dependencies through sglang's package root.
 _path = (
     Path(__file__).resolve().parents[4]
-    / "python/sglang/srt/weight_sync/gpu_delta_layout.py"
+    / "python/sglang/srt/weight_sync/gpu_delta/layout.py"
 )
 _spec = importlib.util.spec_from_file_location("gpu_delta_layout_under_test", _path)
 layout = importlib.util.module_from_spec(_spec)
@@ -37,8 +37,8 @@ def _bytes(tensor):
 @contextmanager
 def cpu_host_snapshot(backend, metadata, directory):
     """Real outer decode and file checks with CPU-only host allocation backing."""
-    from sglang.srt.weight_sync import gpu_delta_host as host
-    from sglang.srt.weight_sync.gpu_delta_payload import OuterZstdPool
+    from sglang.srt.weight_sync.gpu_delta import host as host
+    from sglang.srt.weight_sync.gpu_delta.payload import OuterZstdPool
 
     backend.identity = {"engine_id": "cpu-engine", "host_cache_id": "cpu-host"}
     metadata["host_tensor_names"] = {
@@ -796,13 +796,13 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 patch.object(torch.cuda, "default_stream", return_value=object()),
                 patch.object(torch.cuda, "Event", side_effect=CpuEvent) as events,
                 patch(
-                    "sglang.srt.weight_sync.gpu_delta_codec.NvcompDecoder",
+                    "sglang.srt.weight_sync.gpu_delta.codec.NvcompDecoder",
                     CpuLiteralDecoder,
                 ),
                 patch.dict(
                     sys.modules,
                     {
-                        "sglang.srt.weight_sync.gpu_delta_apply": SimpleNamespace(
+                        "sglang.srt.weight_sync.gpu_delta.apply": SimpleNamespace(
                             plan_apply=lambda outputs: (None, outputs),
                             prepare_status_check=status_check,
                         )
@@ -967,9 +967,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             patch.dict(sys.modules, {"sglang.srt.runtime_context": runtime}),
             patch.object(layout, "_require_fixed_moe_topology"),
             patch.object(layout, "GpuDeltaLayout", return_value=fake_plan),
-            patch("sglang.srt.weight_sync.gpu_delta_host.HostArena"),
+            patch("sglang.srt.weight_sync.gpu_delta.host.HostArena"),
             patch(
-                "sglang.srt.weight_sync.gpu_delta_checkpoint.read_canonical_checkpoint_inventory",
+                "sglang.srt.weight_sync.gpu_delta.checkpoint.read_canonical_checkpoint_inventory",
                 return_value={"weight": {"shape": [1], "dtype": "U8"}},
             ) as read_inventory,
         ):

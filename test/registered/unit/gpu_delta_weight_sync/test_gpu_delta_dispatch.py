@@ -3,8 +3,8 @@
 import time
 from types import SimpleNamespace
 
-from sglang.srt.weight_sync import gpu_delta_io as io
-from sglang.srt.weight_sync import gpu_delta_session as delta_runtime
+from sglang.srt.weight_sync.gpu_delta import io as io
+from sglang.srt.weight_sync.gpu_delta import session as delta_runtime
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.utils import TypeBasedDispatcher
 

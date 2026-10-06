@@ -4,7 +4,7 @@ import io
 import sys
 from types import SimpleNamespace
 
-from sglang.srt.weight_sync.gpu_delta_session import (
+from sglang.srt.weight_sync.gpu_delta.session import (
     GpuDeltaSchedulerControl,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -57,7 +57,7 @@ def test_describe_binds_published_scheduler_ranks_without_legacy_ps(monkeypatch)
 
         monkeypatch.setitem(
             sys.modules,
-            "sglang.srt.weight_sync.gpu_delta_layout",
+            "sglang.srt.weight_sync.gpu_delta.layout",
             SimpleNamespace(GpuDeltaBackend=make_backend),
         )
         monkeypatch.setattr(
@@ -68,7 +68,7 @@ def test_describe_binds_published_scheduler_ranks_without_legacy_ps(monkeypatch)
         # Linux starttime field; comm deliberately contains spaces and ')'.
         stat = "123 (scheduler worker)) " + " ".join(["0"] * 19 + ["456"])
         monkeypatch.setattr(
-            "sglang.srt.weight_sync.gpu_delta_session.open",
+            "sglang.srt.weight_sync.gpu_delta.session.open",
             lambda path: io.StringIO(stat),
             raising=False,
         )
@@ -79,7 +79,7 @@ def test_describe_binds_published_scheduler_ranks_without_legacy_ps(monkeypatch)
             return "shared-host-test"
 
         monkeypatch.setattr(
-            "sglang.srt.weight_sync.gpu_delta_host.host_cache_id",
+            "sglang.srt.weight_sync.gpu_delta.host.host_cache_id",
             cache_id,
         )
         control = GpuDeltaSchedulerControl(scheduler)

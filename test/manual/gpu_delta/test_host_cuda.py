@@ -99,10 +99,10 @@ def _publication(directory, version, repeat):
 def _consumer(rank, engine, workers, publications, cache, barrier, output):
     import torch
 
-    from sglang.srt.weight_sync import gpu_delta_host as host
-    from sglang.srt.weight_sync import gpu_delta_memory as memory
-    from sglang.srt.weight_sync.gpu_delta_codec import DecodeFrame, NvcompDecoder
-    from sglang.srt.weight_sync.gpu_delta_payload import OuterZstdPool
+    from sglang.srt.weight_sync.gpu_delta import host as host
+    from sglang.srt.weight_sync.gpu_delta import memory as memory
+    from sglang.srt.weight_sync.gpu_delta.codec import DecodeFrame, NvcompDecoder
+    from sglang.srt.weight_sync.gpu_delta.payload import OuterZstdPool
 
     os.environ["GPU_DELTA_HOST_CACHE_DIR"] = cache
     # Exercise the exact capacity-growth algorithm with small oracle tensors.

@@ -1,12 +1,12 @@
 """Control plane for engines exclusively owned by the GPU-delta coordinator."""
 
 from sglang.srt.runtime_context import get_serving
-from sglang.srt.weight_sync.gpu_delta_io import (
+from sglang.srt.weight_sync.gpu_delta.io import (
     DeltaWeightsReqOutput,
     ResumeWeightsFromDeltaReqInput,
     UpdateWeightsFromDeltaReqInput,
 )
-from sglang.srt.weight_sync.gpu_delta_session import GpuDeltaCommunicator
+from sglang.srt.weight_sync.gpu_delta.session import GpuDeltaCommunicator
 
 
 class GpuDeltaTokenizerControl:

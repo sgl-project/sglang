@@ -23,7 +23,7 @@ implement a server-wide ownership lock. A stream starts with fresh engines and
 never automatically replays an uncertain XOR update.
 
 HTTP routes, tokenizer coordination and scheduler control handlers live under
-`srt/weight_sync/gpu_delta_*`. Shared integration consists of route, IPC schema,
+`srt/weight_sync/gpu_delta/`. Shared integration consists of route, IPC schema,
 communicator and scheduler-handler registration. Preparation takes no model-update
 writer lock. Partial mutation poisons the delta session instead of attempting
 recovery or falling back to a different update path.
@@ -32,8 +32,8 @@ recovery or falling back to a different update path.
 python -m pytest -q test/registered/unit/gpu_delta_weight_sync \
   --ignore=test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_layout_cuda.py
 python -m pytest -q test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_layout_cuda.py
-python -m pytest -q test/manual/weight_sync/test_gpu_delta_codec.py
-python -m pytest -q test/manual/weight_sync/test_gpu_delta_host_cuda.py
+python -m pytest -q test/manual/gpu_delta/test_codec.py
+python -m pytest -q test/manual/gpu_delta/test_host_cuda.py
 ```
 
 Layout algebra, allocator admission, protocol and session tests run in the

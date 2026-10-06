@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from sglang.srt.weight_sync import gpu_delta_memory as memory
+from sglang.srt.weight_sync.gpu_delta import memory as memory
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")

@@ -24,7 +24,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 _root = Path(__file__).resolve().parents[4] / "python/sglang/srt"
 _spec = importlib.util.spec_from_file_location(
-    "gpu_delta_checkpoint_under_test", _root / "weight_sync/gpu_delta_checkpoint.py"
+    "gpu_delta_checkpoint_under_test", _root / "weight_sync/gpu_delta/checkpoint.py"
 )
 checkpoint = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(checkpoint)

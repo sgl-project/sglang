@@ -8,12 +8,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from sglang.srt.weight_sync import gpu_delta_session as delta_runtime
+from sglang.srt.weight_sync.gpu_delta import session as delta_runtime
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
-from sglang.srt.weight_sync.gpu_delta_session import (
+from sglang.srt.weight_sync.gpu_delta.session import (
     DeltaSession,
     GpuDeltaCommunicator,
     GpuDeltaSchedulerControl,

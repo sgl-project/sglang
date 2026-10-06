@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from sglang.srt.weight_sync import gpu_delta_io as delta_io
+from sglang.srt.weight_sync.gpu_delta import io as delta_io
 
 
 class GpuDeltaCommunicator:
@@ -281,8 +281,8 @@ class GpuDeltaSchedulerControl:
         if error is not None:
             raise ValueError(error)
         if self.session is None:
-            from sglang.srt.weight_sync.gpu_delta_host import host_cache_id
-            from sglang.srt.weight_sync.gpu_delta_layout import GpuDeltaBackend
+            from sglang.srt.weight_sync.gpu_delta.host import host_cache_id
+            from sglang.srt.weight_sync.gpu_delta.layout import GpuDeltaBackend
 
             # proc stat starttime is the 22nd field; comm may contain spaces.
             with open("/proc/self/stat") as source:
