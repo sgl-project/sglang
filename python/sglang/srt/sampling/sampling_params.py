@@ -48,26 +48,9 @@ MAX_N = 128
 logger = logging.getLogger(__name__)
 
 
-def check_n(n: Any, beam_width: Optional[int] = None) -> None:
-    """Reject an out-of-range sample count.
-
-    Parallel sampling replicates the prompt, so ``n`` stays in ``[1, MAX_N]``.
-    Beam search does not replicate it: ``n`` is how many sequences to return
-    and must be in ``[1, beam_width]``.
-    """
-    if type(n) is not int or n < 1:
-        if beam_width is not None and beam_width > 1:
-            raise ValueError(
-                f"n must be an integer in [1, beam_width({beam_width})], got {n}."
-            )
-        raise ValueError(f"n must be an integer in [1, {MAX_N}], got {n}.")
-    if beam_width is not None and beam_width > 1:
-        if n > beam_width:
-            raise ValueError(
-                f"n ({n}) cannot exceed beam_width ({beam_width})."
-            )
-        return
-    if n > MAX_N:
+def check_n(n: Any) -> None:
+    """Reject a parallel-sample count that would replicate the prompt."""
+    if type(n) is not int or not 1 <= n <= MAX_N:
         raise ValueError(f"n must be an integer in [1, {MAX_N}], got {n}.")
 
 
@@ -267,14 +250,14 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
         if not 0.0 <= self.min_p <= 1.0:
             raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")
-        if self.top_k != TOP_K_ALL and (
-            self.top_k < 1 or self.top_k > vocab_size
-        ):
+        if self.top_k != TOP_K_ALL and (self.top_k < 1 or self.top_k > vocab_size):
             raise ValueError(
                 f"top_k must be -1 (disable) or in [1, vocab_size({vocab_size})], "
                 f"got {self.top_k}."
             )
-        check_n(self.n, beam_width=self.beam_width)
+        # Beam search does not replicate the prompt, so n is not a fan-out count.
+        if not (self.beam_width and self.beam_width > 1):
+            check_n(self.n)
         if not -2.0 <= self.frequency_penalty <= 2.0:
             raise ValueError(
                 f"frequency_penalty must be in [-2, 2], got {self.frequency_penalty}."

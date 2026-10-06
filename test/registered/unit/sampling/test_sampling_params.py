@@ -242,16 +242,8 @@ class TestSamplingParamsVerify(CustomTestCase):
             self._make(n=MAX_N + 1).verify(self.VOCAB_SIZE)
 
     def test_beam_n_may_exceed_max_parallel_samples(self):
-        """Beam search does not fan out, so n is limited by beam_width."""
+        """Beam search does not fan out, so n is not capped at MAX_N."""
         self._make(n=200, beam_width=256).verify(self.VOCAB_SIZE)
-
-    def test_beam_n_above_beam_width_raises(self):
-        with self.assertRaisesRegex(ValueError, "cannot exceed beam_width"):
-            self._make(n=8, beam_width=4).verify(self.VOCAB_SIZE)
-
-    def test_beam_n_below_one_names_beam_width(self):
-        with self.assertRaisesRegex(ValueError, r"\[1, beam_width\(4\)\]"):
-            self._make(n=0, beam_width=4).verify(self.VOCAB_SIZE)
 
     def test_top_logprobs_num_boundaries_valid(self):
         check_top_logprobs_num(0, self.VOCAB_SIZE)

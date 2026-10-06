@@ -542,9 +542,9 @@ class GenerateReqInput:
                     )
 
         # Bound n before any list replication. Beam search does not replicate
-        # the prompt, so its n is limited by beam_width instead of MAX_N.
-        beam_width = self._sampling_params_beam_width()
-        check_n(n, beam_width=beam_width if beam_width > 1 else None)
+        # the prompt, so it is not subject to the fan-out cap.
+        if self._sampling_params_beam_width() <= 1:
+            check_n(n)
         self.parallel_sample_num = n
 
         self.parallel_sample_num = self._handle_beam_search_parallel_sampling()

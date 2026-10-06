@@ -1489,9 +1489,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
-            check_top_logprobs_num(
-                obj.top_logprobs_num, self.model_config.vocab_size
-            )
+            check_top_logprobs_num(obj.top_logprobs_num, self.model_config.vocab_size)
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
