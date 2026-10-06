@@ -108,6 +108,10 @@ async fn text_generate_maps_request_and_streams_cumulative_responses() {
     let mut stream = response.into_inner();
 
     let intake = harness.next_generation().await;
+    assert_eq!(
+        intake.request.output_mode,
+        crate::message::request::OutputMode::TextAndTokenIds
+    );
     assert!(intake.admission.try_accept());
     assert_eq!(intake.request.text.as_deref(), Some("prompt"));
     assert!(intake.request.input_ids.is_none());
@@ -155,6 +159,10 @@ async fn generate_streams_incremental_token_ids_with_cumulative_count() {
     let mut stream = response.into_inner();
 
     let intake = harness.next_generation().await;
+    assert_eq!(
+        intake.request.output_mode,
+        crate::message::request::OutputMode::TokenIds
+    );
     assert!(intake.admission.try_accept());
     assert_eq!(intake.request.input_ids.as_deref(), Some(&[4, 5][..]));
     assert!(intake.request.text.is_none());

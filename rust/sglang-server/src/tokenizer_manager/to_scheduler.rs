@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
 use crate::message::io_struct::{AbortReq, ControlRequest};
-use crate::message::request::{Request, RequestKind, SchedulerRequest};
+use crate::message::request::{OutputMode, Request, RequestKind, SchedulerRequest};
 use crate::message::response::ResponseItem;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::ToSchedulerTx;
@@ -340,16 +340,19 @@ impl Intake {
 
     /// Register the response sink with the owning detok shard (by id) so the response
     /// has a home. Carries the per-request detok flags — `return_text_in_logprobs`
-    /// (decode logprob text on this shard) and `no_stop_trim` (keep the matched
-    /// stop in the output) — so the shard needs no back-reference to the request.
+    /// (decode logprob text on this shard), `no_stop_trim` (keep the matched
+    /// stop), and `output_mode` — so the shard needs no back-reference to the request.
     /// Returns `false` if the shard is gone.
     fn register_detok(&self, req: &Request) -> bool {
-        let (decode_logprob_text, no_stop_trim) = match &req.kind {
+        let (decode_logprob_text, no_stop_trim, output_mode) = match &req.kind {
             RequestKind::Generate(g) => (
                 g.return_text_in_logprobs.unwrap_or(false),
                 g.sampling_params.no_stop_trim,
+                g.output_mode,
             ),
-            RequestKind::Control(_) | RequestKind::Detokenize { .. } => (false, false),
+            RequestKind::Control(_) | RequestKind::Detokenize { .. } => {
+                (false, false, OutputMode::TokenIds)
+            }
         };
         self.senders
             .detok_for(&req.rid)
@@ -357,6 +360,7 @@ impl Intake {
                 rid: req.rid.clone(),
                 sink: req.sink.clone(),
                 decode_logprob_text,
+                output_mode,
                 no_stop_trim,
             })
             .is_ok()

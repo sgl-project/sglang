@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::ids::Rid;
 use crate::message::io_struct::{ControlRequest, GetInternalStateReq};
-use crate::message::request::{Request, RequestKind};
+use crate::message::request::{OutputMode, Request, RequestKind};
 use crate::message::response::{ResponseItem, ResponseSink};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::TokenIds;
@@ -279,6 +279,7 @@ impl FrontendHandle {
         let baseline = self.response_activity();
         let probe = FrontendRequest {
             rid: Rid::new_health_check(),
+            output_mode: OutputMode::TokenIds,
             input_ids: Some(vec![0]),
             sampling_params: SamplingParams {
                 max_new_tokens: Some(1),
@@ -917,6 +918,10 @@ mod tests {
         let request = accept_intake(intake_rx.recv_async().await.unwrap());
         let rid = request.rid.clone();
         assert!(rid.as_str().starts_with("HEALTH_CHECK_"));
+        let RequestKind::Generate(request) = request.kind else {
+            panic!("health must submit a generation request");
+        };
+        assert_eq!(request.output_mode, OutputMode::TokenIds);
         activity.fetch_add(1, Ordering::Relaxed);
 
         assert_eq!(probe.await.unwrap().unwrap(), HealthStatus::Healthy);
@@ -952,6 +957,7 @@ mod tests {
         };
         assert_eq!(probe.bootstrap_host.as_deref(), Some(FAKE_BOOTSTRAP_HOST));
         assert_eq!(probe.bootstrap_room, Some(0));
+        assert_eq!(probe.output_mode, OutputMode::TokenIds);
         assert_eq!(probe_task.await.unwrap(), HealthStatus::Stalled);
         assert!(matches!(
             abort_rx.recv().unwrap(),

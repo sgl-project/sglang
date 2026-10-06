@@ -10,6 +10,7 @@ use tonic::Status;
 use crate::frontend::FrontendRequest;
 use crate::message::config::PreferredSamplingParams;
 use crate::message::ids::Rid;
+use crate::message::request::OutputMode;
 use crate::message::sampling::SamplingParams;
 
 type ConvertResult<T> = Result<T, ConvertError>;
@@ -85,6 +86,7 @@ pub(super) fn text_generate(
     Ok(FrontendRequest {
         rid: request_id(rid),
         text: Some(text),
+        output_mode: OutputMode::TextAndTokenIds,
         input_ids: None,
         skip_special_tokens: false,
         sampling_params: convert_sampling_params(sampling_params, preferred)?,
@@ -151,6 +153,7 @@ pub(super) fn generate(
     Ok(FrontendRequest {
         rid: request_id(rid),
         text: None,
+        output_mode: OutputMode::TokenIds,
         input_ids: Some(input_ids.into_iter().map(i64::from).collect()),
         skip_special_tokens: false,
         sampling_params: convert_sampling_params(sampling_params, preferred)?,
