@@ -470,7 +470,7 @@ def capture_prefill_graph(
             context_length,
             model_runner.req_to_token_pool.size,
         )
-        return eager_runner
+        return result(eager_runner)
 
     # Collect attention layers and moe layers from the model. Keep a VLM
     # wrapper that exposes ``language_model`` unchanged: assigning it to
