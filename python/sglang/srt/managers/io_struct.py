@@ -1081,6 +1081,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
+    # Adapter name; KV events namespace this request's blocks by it.
+    lora_name: Optional[str] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -1437,6 +1439,8 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     sampling_params: SamplingParams
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
+    # Adapter name; KV events namespace this request's blocks by it.
+    lora_name: Optional[str] = None
     # Embedding overrides to place at specific token positions.
     positional_embed_overrides: Optional[PositionalEmbeds] = None
     # For DP routing

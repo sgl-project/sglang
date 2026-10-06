@@ -33,6 +33,8 @@ class CacheInitParams:
 
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False
+    # extra_key -> LoRA adapter name for KV events; the scheduler fills it.
+    kv_event_lora_names: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_session_radix_cache: bool = False
 
     enable_mamba_extra_buffer: bool = False

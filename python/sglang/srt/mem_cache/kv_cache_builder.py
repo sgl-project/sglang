@@ -253,6 +253,7 @@ def build_kv_cache(
     spec_algorithm: SpeculativeAlgorithm,
     enable_metrics: bool,
     enable_kv_cache_events: bool,
+    kv_event_lora_names: dict[str, str],
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
 ) -> KVCacheBuildResult:
@@ -346,6 +347,7 @@ def build_kv_cache(
         eviction_policy_config=get_memory().radix_eviction_policy_config,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
+        kv_event_lora_names=kv_event_lora_names,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,

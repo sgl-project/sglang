@@ -21,7 +21,9 @@ from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     get_hash_str,
     hash_str_to_int64,
+    kv_event_lora_seed,
     maybe_init_custom_mem_pool,
+    namespace_event_block_hash,
     split_node_hash_value,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -314,6 +316,29 @@ class TestHashStrToInt64(unittest.TestCase):
         int64_val = hash_str_to_int64(hash_hex)
         self.assertIsInstance(int64_val, int)
         self.assertTrue(-(2**63) <= int64_val < 2**63)
+
+
+class TestKvEventLoraNamespace(unittest.TestCase):
+    def test_golden_values(self):
+        # Golden values shared with sgl-router's hash.rs; changing them breaks routing.
+        seed_a = kv_event_lora_seed("adapter-a")
+        self.assertEqual(
+            seed_a.hex(),
+            "db029e7a0593feb1f6ebceb88cf48855b6213e34d1ee39551e6faa67db8f27af",
+        )
+        self.assertEqual(
+            namespace_event_block_hash(1234567890123456789, seed_a),
+            -5123786714487272477,
+        )
+        self.assertEqual(namespace_event_block_hash(-1, seed_a), 8494360141609380621)
+        self.assertEqual(
+            namespace_event_block_hash(0, kv_event_lora_seed("adapter-b")),
+            8944885059690141594,
+        )
+
+    def test_base_model_hashes_are_unchanged(self):
+        self.assertIsNone(kv_event_lora_seed(None))
+        self.assertEqual(namespace_event_block_hash(42, None), 42)
 
 
 class TestComputeNodeHashValues(unittest.TestCase):

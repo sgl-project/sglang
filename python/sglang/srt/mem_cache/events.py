@@ -30,6 +30,8 @@ from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
     hash_str_to_int64,
+    kv_event_lora_seed,
+    namespace_event_block_hash,
 )
 
 
@@ -40,9 +42,17 @@ class KVCacheEventRecorder:
     empty list, so callers never have to guard.
     """
 
-    def __init__(self, *, enabled: bool, page_size: int):
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        page_size: int,
+        lora_names: Optional[dict[str, str]] = None,
+    ):
         self.enabled = enabled
         self.page_size = page_size
+        # extra_key -> LoRA adapter name, filled by the scheduler.
+        self.lora_names = lora_names if lora_names is not None else {}
         self._queue: list = []
 
     def enqueue(self, event) -> None:
@@ -67,6 +77,7 @@ class KVCacheEventRecorder:
                     and tail.block_size == event.block_size
                     and tail.cache_salt == event.cache_salt
                     and tail.session_id == event.session_id
+                    and tail.lora_name == event.lora_name
                     and tail.block_hashes
                     and event.parent_block_hash == tail.block_hashes[-1]
                 ):
@@ -84,7 +95,7 @@ class KVCacheEventRecorder:
             return node.hash_value
         return compute_node_event_hash_values(node, self.page_size)
 
-    def _parent_block_hash(self, node: Any) -> Optional[int]:
+    def _parent_block_hash(self, node: Any, seed: Optional[bytes]) -> Optional[int]:
         """The hash the first page of ``node`` links back to.
 
         ``None`` when the parent is the tree root: a root carries an empty
@@ -101,7 +112,9 @@ class KVCacheEventRecorder:
             parent_hash_values = parent.hash_value
         if not parent_hash_values:
             return None
-        return hash_str_to_int64(parent_hash_values[-1])
+        return namespace_event_block_hash(
+            hash_str_to_int64(parent_hash_values[-1]), seed
+        )
 
     def record_store(
         self, node: Any, medium=None, *, session_id: Optional[str] = None
@@ -114,8 +127,10 @@ class KVCacheEventRecorder:
         if medium is None:
             medium = StorageMedium.GPU
 
+        lora_name = self.lora_names.get(node.key.extra_key)
+        seed = kv_event_lora_seed(lora_name)
         event_hash_values = self._node_event_hash_values(node)
-        parent_block_hash = self._parent_block_hash(node)
+        parent_block_hash = self._parent_block_hash(node, seed)
 
         page_index = 0
         logical_len = len(node.key)
@@ -131,7 +146,9 @@ class KVCacheEventRecorder:
             else:
                 page_tokens = list(raw[start:end])
 
-            block_hash = hash_str_to_int64(event_hash_values[page_index])
+            block_hash = namespace_event_block_hash(
+                hash_str_to_int64(event_hash_values[page_index]), seed
+            )
 
             self.enqueue(
                 BlockStored(
@@ -143,6 +160,7 @@ class KVCacheEventRecorder:
                     medium=medium,
                     cache_salt=node.key.cache_salt,
                     session_id=session_id,
+                    lora_name=lora_name,
                 )
             )
 
@@ -159,6 +177,7 @@ class KVCacheEventRecorder:
             medium = StorageMedium.GPU
 
         # Hash values must match what was stored.
+        seed = kv_event_lora_seed(self.lora_names.get(node.key.extra_key))
         event_hash_values = self._node_event_hash_values(node)
 
         block_hashes = []
@@ -169,7 +188,11 @@ class KVCacheEventRecorder:
             if end <= start:
                 continue
 
-            block_hashes.append(hash_str_to_int64(event_hash_values[page_index]))
+            block_hashes.append(
+                namespace_event_block_hash(
+                    hash_str_to_int64(event_hash_values[page_index]), seed
+                )
+            )
             page_index += 1
 
         if block_hashes:
