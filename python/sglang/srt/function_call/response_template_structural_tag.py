@@ -257,26 +257,37 @@ def _call_opener(
 def _thinking_format(
     thinking: ResponseTemplateField,
     message_start: list[str] | None,
-    visible: bool = False,
+    nonempty: bool = False,
 ) -> dict[str, Any] | None:
-    """The reasoning, which holds `visible` text if asked."""
+    """The reasoning, which holds at least a character if `nonempty`."""
     openers, closers = _openers(thinking, message_start), _closers(thinking)
     if not openers or not closers:
         return None
-    text = _sequence(_visible_start(closers), _ANY_TEXT) if visible else _ANY_TEXT
+    text = _sequence(_nonempty_start(closers), _ANY_TEXT) if nonempty else _ANY_TEXT
     return _one_of([_tag(opener, text, closers) for opener in openers])
 
 
-def _visible_start(excludes: list[str]) -> dict[str, Any]:
-    """Whitespace, then a visible character. None of them starts one of the
-    `excludes`, which the text after them could no longer see."""
-    starts = {text[0] for text in excludes if text}
-    blank = "".join(escape for char, escape in _BLANKS.items() if char not in starts)
-    visible = "".join(map(_class_escape, sorted(starts)))
-    return {
-        "type": "regex",
-        "pattern": (f"[{blank}]*" if blank else "") + rf"[^\s{visible}]",
-    }
+def _nonempty_start(closers: list[str]) -> dict[str, Any]:
+    """The start of non-empty text that does not begin with a closer. It ends on
+    a character that starts no closer, so no closer begins inside it."""
+    closers = [closer for closer in closers if closer]
+    starts = {closer[0] for closer in closers}
+    prefixes = dict.fromkeys(
+        [""] + [closer[:end] for closer in closers for end in range(1, len(closer))]
+    )
+    branches = []
+    for prefix in prefixes:
+        # A prefix holding a whole closer has already closed the text.
+        if any(closer in prefix for closer in closers):
+            continue
+        nexts = {
+            closer[len(prefix)]
+            for closer in closers
+            if len(closer) > len(prefix) and closer.startswith(prefix)
+        }
+        excluded = "".join(map(_class_escape, sorted(starts | nexts)))
+        branches.append(f"{_escape(prefix)}[^{excluded}]")
+    return {"type": "regex", "pattern": "|".join(branches)}
 
 
 def _class_escape(char: str) -> str:
@@ -934,7 +945,7 @@ def _structural_tag(
     grammar_requires_reasoning: bool = False,
 ) -> dict[str, Any] | None:
     """Frame output at the message start or after reasoning, which is optional
-    unless `grammar_requires_reasoning` makes the message open with visible
+    unless `grammar_requires_reasoning` makes the message open with non-empty
     reasoning."""
     rest = output(None)
     if rest is None:

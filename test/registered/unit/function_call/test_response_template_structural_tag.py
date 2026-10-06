@@ -151,7 +151,7 @@ class TestToolCallStructuralTag(CustomTestCase):
                 self.assertIs(_accepts(tag, text), expected)
         self.assertIsNone(_build(ANSWER_TEMPLATE, tools=()))
 
-    def test_required_reasoning_opens_the_message_with_visible_text(self):
+    def test_required_reasoning_opens_the_message_with_nonempty_reasoning(self):
         loaded = load_response_template(ANSWER_TEMPLATE)
         for required in (False, True):
             tag = tool_call_structural_tag(
@@ -166,7 +166,7 @@ class TestToolCallStructuralTag(CustomTestCase):
             cases = [
                 ("<answer>Sunny.", not required),
                 ("<think></think><answer>Sunny.", not required),
-                ("<think> \n</think><answer>Sunny.", not required),
+                ("<think> \n</think><answer>Sunny.", True),
                 ("<think>\nplan</think><answer>Sunny.", True),
             ]
             for text, expected in cases:
