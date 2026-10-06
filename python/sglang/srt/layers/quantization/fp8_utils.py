@@ -1238,6 +1238,17 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 
 
+def _deepgemm_block_fp8_supported(
+    weight_shape: Tuple[int, int], block_size: List[int], output_dtype: torch.dtype
+) -> bool:
+    if output_dtype != torch.bfloat16:
+        return False
+    n, k = weight_shape
+    if list(block_size) == [32, 32] and get_platform().is_sm90:
+        return n % 8 == 0 and k % 32 == 0
+    return list(block_size) == [128, 128] and n % 64 == 0 and k % 128 == 0
+
+
 def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1249,39 +1260,13 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     weight_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     block32 = list(block_size) == [32, 32] and get_platform().is_sm90
-    shape_supported = (
-        weight.shape[0] % 8 == 0 and weight.shape[1] % 32 == 0
-        if block32
-        else weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
-    )
-    block_supported = block32 or list(block_size) == [128, 128]
     if input_scale is not None:
-        # Pre-quantized activations retain their per-token group size and
-        # fp32 scales. DeepGEMM aligns scale storage for TMA when needed.
         assert not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         assert input.dtype == torch.float8_e4m3fn
-        assert shape_supported and block_supported, (
-            "pre-quantized fp8 input requires DeepGEMM-supported weight shapes "
-            f"(got {tuple(weight.shape)})"
-        )
-        input_2d = input.view(-1, input.shape[-1])
-        output = w8a8_block_fp8_matmul_deepgemm(
-            input_2d,
-            weight,
-            input_scale,
-            weight_scale,
-            block_size,
-            output_dtype=torch.bfloat16,
-        )
-        if bias is not None:
-            output += bias
-        return output.view(*input.shape[:-1], weight.shape[0])
-
-    output_dtype = input.dtype
-    dtype_supported = output_dtype == torch.bfloat16
+    output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
 
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
-    if not (shape_supported and dtype_supported and block_supported):
+    if not _deepgemm_block_fp8_supported(weight.shape, block_size, output_dtype):
         # fall back to triton
         # If weight_scale is in UE8M0 packed format (int32), convert back to float32
         # UE8M0 format has shape (N, K//block_k//4) with dtype int32
@@ -1300,6 +1285,22 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             act_scale_ue8m0=act_scale_ue8m0,
             weight_bf16=weight_bf16,
         )
+
+    if input_scale is not None:
+        # Pre-quantized activations retain their per-token group size and
+        # fp32 scales. DeepGEMM aligns scale storage for TMA when needed.
+        input_2d = input.view(-1, input.shape[-1])
+        output = w8a8_block_fp8_matmul_deepgemm(
+            input_2d,
+            weight,
+            input_scale,
+            weight_scale,
+            block_size,
+            output_dtype=output_dtype,
+        )
+        if bias is not None:
+            output += bias
+        return output.view(*input.shape[:-1], weight.shape[0])
 
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]

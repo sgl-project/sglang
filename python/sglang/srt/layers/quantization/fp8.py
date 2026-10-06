@@ -53,6 +53,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    _deepgemm_block_fp8_supported,
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
     block_fp8_scale_to_mxfp8_e8m0,
@@ -829,7 +830,14 @@ class Fp8LinearMethod(LinearMethodBase):
             _is_cuda
             and get_platform().is_sm90
             and envs.SGLANG_OPT_HOPPER_BLOCK_FP8_BF16.get()
-            and not use_deepgemm_runner
+            and not (
+                use_deepgemm_runner
+                and _deepgemm_block_fp8_supported(
+                    weight.shape,
+                    self.weight_block_size,
+                    getattr(layer, "orig_dtype", None),
+                )
+            )
             and weight.is_cuda
             and weight.dtype == torch.float8_e4m3fn
             and self.weight_block_size == [32, 32]

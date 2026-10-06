@@ -361,6 +361,37 @@ class TestSm90Block32Linear(_LinearBackendCheck):
     def test_triton_override(self):
         self._check_backend("triton", ["triton"], self._shapes, self._build_layer)
 
+    def test_unsupported_shape_keeps_triton_and_bf16_fallback(self):
+        torch.manual_seed(7)
+        with (
+            mock.patch.object(
+                fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM
+            ),
+            mock.patch.object(
+                fp8_utils.envs.SGLANG_OPT_HOPPER_BLOCK_FP8_BF16,
+                "get",
+                return_value=True,
+            ),
+            mock.patch.object(
+                fp8_utils,
+                "w8a8_block_fp8_matmul_deepgemm",
+                side_effect=AssertionError("unsupported shape reached DeepGEMM"),
+            ),
+        ):
+            layer, w_dequant = self._build_layer(32, 64)
+            layer.weight.data = layer.weight.data[:10].contiguous()
+            layer.quant_method.process_weights_after_loading(layer)
+            self.assertIsNotNone(getattr(layer, "_block_fp8_bf16_weight", None))
+            x = torch.randn(65, 64, device="cuda", dtype=torch.bfloat16) / 10
+            q, scales = fp8_utils.sglang_per_token_group_quant_fp8(
+                x, 32, scale_ue8m0=True
+            )
+            ref = fp8_utils.dequant_group_fp8_to_bf16(q, scales).float()
+            ref = ref @ w_dequant[:10].T
+            for inputs in (x, (q, scales)):
+                out = layer.quant_method.apply(layer, inputs)
+                assert_output_close(self, out, ref, rtol=5e-2, atol=1e-1)
+
     def test_preserves_checkpoint_and_prequantized_input(self):
         torch.manual_seed(7)
         with mock.patch.object(
