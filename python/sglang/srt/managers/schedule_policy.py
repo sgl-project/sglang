@@ -1038,9 +1038,6 @@ class PrefillAdder:
         )
         self._account_prefill_cache_admission(req, prefix_len)
 
-    def _req_inc_lock_ref(self, req: Req):
-        req.lock = self.tree_cache.lock(req.last_node)
-
     def _kv_shard_reserve_scratch(self, prefix_len: int, extend_len: int) -> bool:
         """Reserve scratch or return False to defer; no-op when sharding is off.
 
@@ -1609,7 +1606,7 @@ class PrefillAdder:
         req.set_extend_range(
             admission.prefix_len, admission.prefix_len + admission.extend_len
         )
-        self._req_inc_lock_ref(req)
+        req.lock = self.tree_cache.lock(req.last_node)
         self.can_run_list.append(req)
         if admission.is_chunked:
             self.new_chunked_req = req

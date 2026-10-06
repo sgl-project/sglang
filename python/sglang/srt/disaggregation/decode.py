@@ -502,10 +502,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             swa_budget_tokens=swa_allocatable_tokens,
         )
 
-    def _release_matched_prefix_lock(self, req: Req) -> None:
-        self.tree_cache.unlock(req.lock)
-        req.lock = None
-
     def _reclaim_swa_tail_capacity(
         self, swa_tail_len: int, req_id: str, *, full_len: int = 0
     ) -> Optional[str]:
@@ -1482,7 +1478,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 swa_allocatable_tokens=swa_allocatable_tokens,
             ):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
-                    self._release_matched_prefix_lock(decode_req.req)
+                    self.tree_cache.unlock(decode_req.req.lock)
+                    decode_req.req.lock = None
                 break
 
             if swa_allocatable_tokens is not None:
@@ -1493,7 +1490,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 if reclaim_error is not None:
                     if prefix_match is not None and prefix_match.l1_prefix_len > 0:
-                        self._release_matched_prefix_lock(decode_req.req)
+                        self.tree_cache.unlock(decode_req.req.lock)
+                        decode_req.req.lock = None
                     logger.error(reclaim_error)
                     prepare_abort(
                         decode_req.req,

@@ -2305,7 +2305,7 @@ class UnifiedRadixCacheSuite:
             1,
             "Mamba locked before release",
         )
-        cache.dec_swa_lock_only(node_a, lock_result.to_dec_params())
+        cache.release_swa(TreeLock(node_a, lock_result.to_dec_params()))
         self.assertEqual(_device_lock_ref(cache, node_a, ComponentType.SWA), 0)
         self.assertEqual(
             _device_lock_ref(cache, node_a, ComponentType.MAMBA),
@@ -2385,7 +2385,7 @@ class UnifiedRadixCacheSuite:
         )
 
         # B: early SWA release, then final release -- both replay B's receipt.
-        cache.dec_swa_lock_only(node, lock_b.to_dec_params())
+        cache.release_swa(TreeLock(node, lock_b.to_dec_params()))
         self.assertEqual(
             _device_lock_ref(cache, node, ComponentType.MAMBA),
             1,
@@ -2398,7 +2398,7 @@ class UnifiedRadixCacheSuite:
             "B's final release spares A",
         )
 
-        cache.dec_swa_lock_only(node, lock_a.to_dec_params())
+        cache.release_swa(TreeLock(node, lock_a.to_dec_params()))
         self.assertEqual(
             _device_lock_ref(cache, node, ComponentType.MAMBA),
             0,
@@ -2439,7 +2439,7 @@ class UnifiedRadixCacheSuite:
         # Early SWA release (decode advanced past the window), via the public
         # path the scheduler calls. The leaf's SWA is tombstoned and the
         # co-located lower-tier Mamba lock must drop in the same release.
-        cache.dec_swa_lock_only(node_a, lock_result.to_dec_params())
+        cache.release_swa(TreeLock(node_a, lock_result.to_dec_params()))
         self.assertEqual(
             _device_lock_ref(cache, node_a, ComponentType.SWA), 0, "SWA early-released"
         )
@@ -2475,7 +2475,7 @@ class UnifiedRadixCacheSuite:
         self.assertIn(ComponentType.MAMBA, skipped.skipped_lock_components)
         self.assertEqual(_device_lock_ref(cache, node_a, ComponentType.MAMBA), 1)
 
-        cache.dec_swa_lock_only(node_a, skipped.to_dec_params())
+        cache.release_swa(TreeLock(node_a, skipped.to_dec_params()))
         self.assertEqual(
             _device_lock_ref(cache, node_a, ComponentType.MAMBA),
             1,
@@ -2640,7 +2640,7 @@ class UnifiedRadixCacheSuite:
         self.assertGreaterEqual(_device_lock_ref(cache, node_a, ComponentType.MAMBA), 1)
         self.assertGreaterEqual(_device_lock_ref(cache, node_a, ComponentType.FULL), 1)
 
-        cache.dec_swa_lock_only(node_a, lock_result.to_dec_params())
+        cache.release_swa(TreeLock(node_a, lock_result.to_dec_params()))
         self.assertEqual(
             _device_lock_ref(cache, node_a, ComponentType.SWA), 0, "SWA released"
         )
@@ -3070,10 +3070,7 @@ class UnifiedRadixCacheSuite:
         else:
             lock_result = cache.inc_lock_ref(node)
             self.assertGreater(_device_lock_ref(cache, node, aux), 0)
-            cache.dec_swa_lock_only(
-                node,
-                lock_result.to_dec_params(),
-            )
+            cache.release_swa(TreeLock(node, lock_result.to_dec_params()))
             # FULL still locked -> not a device leaf -> no inline evict; the
             # value stays evictable for the explicit aux eviction below.
             self.assertIsNotNone(_device_value(cache, node, aux))
@@ -4595,7 +4592,7 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(int(spliced.numel()), len(seq), "load-back degraded")
         cons.ready_to_load_host_cache()
-        cons.inc_lock_ref(last_node)  # _req_inc_lock_ref
+        cons.inc_lock_ref(last_node)  # the admission lock
 
         self.assertEqual(cons.swa_evictable_size(), 0)  # window is protected
         # FULL stays roomy: only SWA can fail below.
@@ -9920,7 +9917,7 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
 
         lock_result = cache.inc_lock_ref(node)
         self.assertGreaterEqual(_device_lock_ref(cache, node, ComponentType.SWA), 1)
-        cache.dec_swa_lock_only(node, lock_result.to_dec_params())
+        cache.release_swa(TreeLock(node, lock_result.to_dec_params()))
         self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 0)
         self.assertGreaterEqual(_device_lock_ref(cache, node, ComponentType.FULL), 1)
 
@@ -10054,7 +10051,12 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
             (
                 "dec_swa_lock_only",
                 lambda: make(DecSwaLockOnlyResult),
-                lambda: cache.dec_swa_lock_only(node, DecLockRefParams()),
+                lambda: cache.release_swa(
+                    TreeLock(
+                        node,
+                        DecLockRefParams(component_lock_uuids={ComponentType.SWA: 1}),
+                    )
+                ),
                 None,
             ),
         ]
@@ -11060,7 +11062,7 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
         self._insert(cache, allocator, req_to_token_pool, seq)
         leaf = self._match_leaf(cache, seq)
         lock = cache.inc_lock_ref(leaf)
-        cache.dec_swa_lock_only(leaf, lock.to_dec_params())
+        cache.release_swa(TreeLock(leaf, lock.to_dec_params()))
         self._assert_protocol_violation(
             lambda: cache.dec_lock_ref(leaf, lock.to_dec_params()), "lock_ref=0"
         )
@@ -11073,7 +11075,7 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
         self._insert(cache, allocator, req_to_token_pool, seq)
         leaf = self._match_leaf(cache, seq)
         lock = cache.inc_lock_ref(leaf)
-        cache.dec_swa_lock_only(leaf, lock.to_dec_params())
+        cache.release_swa(TreeLock(leaf, lock.to_dec_params()))
         cache.dec_lock_ref(leaf, lock.to_dec_params(), skip_swa=True)
         self.assertEqual(self._swa_ref(cache, leaf), 0)
         self.assertEqual(_device_lock_ref(cache, leaf, ComponentType.FULL), 0)
@@ -11223,10 +11225,7 @@ class TestSegmentLockFuzz(_InsertWalkSuite):
                         or receipt.component_lock_uuids[ComponentType.SWA] is None
                     ):
                         continue
-                    cache.dec_swa_lock_only(
-                        node_id,
-                        receipt.to_dec_params(),
-                    )
+                    cache.release_swa(TreeLock(node_id, receipt.to_dec_params()))
                     held[idx][2] = True
                 else:
                     cache.evict(
@@ -11290,7 +11289,7 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         node = match.last_device_node
         lock = cache.inc_lock_ref(node)
         self.assertIsNotNone(lock.component_lock_uuids[ComponentType.SWA])
-        cache.dec_swa_lock_only(node, lock.to_dec_params())
+        cache.release_swa(TreeLock(node, lock.to_dec_params()))
         return node, lock
 
     def _session(self, session_id):
