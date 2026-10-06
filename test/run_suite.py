@@ -1,6 +1,7 @@
 import argparse
 import glob
 import json
+import math
 import os
 import sys
 from typing import Dict, List, Optional
@@ -443,7 +444,7 @@ def _parse_timeout_override(value: str) -> tuple[str, float]:
         timeout = float(seconds)
     except ValueError:
         timeout = 0
-    if not sep or not path or timeout <= 0:
+    if not sep or not path or not math.isfinite(timeout) or timeout <= 0:
         raise argparse.ArgumentTypeError(f"expected PATH=SECONDS, got {value!r}")
     return path, timeout
 

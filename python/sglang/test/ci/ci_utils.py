@@ -270,7 +270,7 @@ def run_unittest_files(
         first_timeout = base_timeout
         for suffix, override in (timeout_overrides or {}).items():
             if filename == suffix or filename.endswith("/" + suffix):
-                first_timeout = override
+                first_timeout = min(base_timeout, override)
 
         process = None
         output_lines = []
