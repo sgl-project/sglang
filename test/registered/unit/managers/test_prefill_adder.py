@@ -1,4 +1,5 @@
 import unittest
+from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +27,7 @@ from sglang.srt.mem_cache.prefill_budget import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
@@ -1656,6 +1658,202 @@ class TestPrefillAdder(CustomTestCase):
                 size_swa=4096, sliding_window=128
             ).memory_budget.swa_never_fits(**req)
         )
+
+
+class _WindowLockTree:
+    """SWA lock accounting of a unified radix tree, reduced to what prefill
+    admission reads: locking a node protects the device SWA segments inside
+    that node's sliding window, and a HiCache load-back allocates the host-only
+    part of the window and locks the window from `best_match_node`."""
+
+    def __init__(self, *, swa_available, windows, other_swa_evictable):
+        self.swa_available = swa_available
+        # node -> {segment: tokens} of device SWA its window lock protects.
+        self.windows = windows
+        self.other_swa_evictable = other_swa_evictable
+        self.locks = Counter()
+
+    def swa_evictable_size(self):
+        locked = {
+            segment
+            for node, count in self.locks.items()
+            if count
+            for segment in self.windows.get(node, {})
+        }
+        segments = {
+            segment: tokens
+            for window in self.windows.values()
+            for segment, tokens in window.items()
+        }
+        return self.other_swa_evictable + sum(
+            tokens for segment, tokens in segments.items() if segment not in locked
+        )
+
+    def inc_lock_ref(self, node, skip_lock_components=()):
+        self.locks[node] += 1
+        return IncLockRefResult(node_id=node)
+
+    def dec_lock_ref(self, node, params=None, skip_swa=False):
+        assert self.locks[node] > 0, f"unbalanced release of {node}"
+        self.locks[node] -= 1
+        return DecLockRefResult()
+
+    def init_load_back(self, params):
+        self.swa_available -= params.req.swa_host_hit_length
+        # The in-flight load holds its own lock until the H2D ack.
+        self.inc_lock_ref(params.best_match_node)
+        return torch.arange(params.host_hit_length), params.best_match_node
+
+
+class TestHiCacheLoadBackSWAWindow(CustomTestCase):
+    """A HiCache load-back must not be admitted on device SWA that its window lock
+    (from best_match_node, past the device match) takes; replays a real crash."""
+
+    WINDOW = 1024
+    DEVICE_PREFIX = 13
+    HOST_HIT = 5286
+    SWA_HOST_HIT = 1019
+    EXTEND = 247
+    CHUNK = 2071
+    WINDOW_DEVICE_SWA = 350
+    OTHER_SWA_EVICTABLE = 158
+
+    def setUp(self):
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
+    def _build(self, *, swa_available):
+        tree = _WindowLockTree(
+            swa_available=swa_available,
+            windows={"best_match": {"device_window": self.WINDOW_DEVICE_SWA}},
+            other_swa_evictable=self.OTHER_SWA_EVICTABLE,
+        )
+        # The load-back pin applies to the unified radix tree only.
+        tree_cache = MagicMock(spec=UnifiedRadixCache)
+        tree_cache.disable = False
+        tree_cache.buffer_pipeline = None
+        tree_cache.linker = None
+        tree_cache.sliding_window_size = self.WINDOW
+        tree_cache.supports_mamba.return_value = False
+        tree_cache.full_evictable_size.return_value = 0
+        tree_cache.swa_evictable_size.side_effect = tree.swa_evictable_size
+        tree_cache.inc_lock_ref.side_effect = tree.inc_lock_ref
+        tree_cache.dec_lock_ref.side_effect = tree.dec_lock_ref
+        tree_cache.inc_host_lock_ref.return_value = IncLockRefResult()
+        tree_cache.dec_host_lock_ref.return_value = DecLockRefResult()
+        tree_cache.init_load_back.side_effect = tree.init_load_back
+        tree_cache.tree_core = MagicMock()
+        tree_cache.tree_core.build_hicache_transfers.return_value = [
+            SimpleNamespace(host_indices=torch.arange(self.HOST_HIT))
+        ]
+
+        allocator = MagicMock()
+        allocator.page_size = 1
+        allocator.size_swa = 42985
+        allocator.full_available_size.return_value = 100_000
+        allocator.available_size.return_value = 100_000
+        allocator.swa_available_size.side_effect = lambda: tree.swa_available
+        allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
+            SWAPrefillBudget(allocator, tree_cache, **kwargs)
+        )
+        running_batch = MagicMock()
+        running_batch.reqs = []
+        adder = PrefillAdder(
+            page_size=1,
+            tree_cache=tree_cache,
+            token_to_kv_pool_allocator=allocator,
+            running_batch=running_batch,
+            new_token_ratio=1.0,
+            rem_input_tokens=16384,
+            rem_chunk_tokens=4096,
+        )
+        return tree, adder
+
+    def _req(self, rid, *, prefix_len, fill_len, max_new_tokens, last_node):
+        req = MagicMock(spec=Req)
+        req.rid = rid
+        req.cache_request_handle = CacheRequestHandle(rid, 0)
+        req.priority = 0
+        req.prefix_indices = torch.arange(prefix_len)
+        req.full_untruncated_fill_ids = list(range(fill_len))
+        req.output_ids = []
+        req.sampling_params = SimpleNamespace(
+            max_new_tokens=max_new_tokens, ignore_eos=False
+        )
+        req.retracted_stain = False
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.storage_hit_length = 0
+        req.storage_hit_start = None
+        req.host_hit_is_storage = False
+        req.host_loaded_length = 0
+        req.materialized_host_hit_len.return_value = 0
+        req.fulfilled_storage_hit_len.return_value = 0
+        req.needs_host_load_back.return_value = False
+        req.last_node = last_node
+        req.best_match_node = last_node
+        req.kv = SimpleNamespace(cache_protected_len=prefix_len, holds_mamba=False)
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        return req
+
+    def _admit_batch(self, *, swa_available):
+        tree, adder = self._build(swa_available=swa_available)
+        prefix = 4108
+        chunked = self._req(
+            "chunked",
+            prefix_len=prefix,
+            fill_len=prefix + self.CHUNK,
+            max_new_tokens=204,
+            last_node="chunk_tail",
+        )
+        self.assertIsNone(adder.add_chunked_req(chunked))
+
+        loaded = self._req(
+            "load-back",
+            prefix_len=self.DEVICE_PREFIX,
+            fill_len=self.DEVICE_PREFIX + self.HOST_HIT + self.EXTEND,
+            max_new_tokens=175,
+            last_node="device_prefix",
+        )
+        loaded.host_hit_length = self.HOST_HIT
+        loaded.swa_host_hit_length = self.SWA_HOST_HIT
+        loaded.needs_host_load_back.return_value = True
+        loaded.best_match_node = "best_match"
+        verdict = adder.add_one_req(
+            loaded, has_chunked_req=False, truncation_align_size=None
+        )
+        return tree, adder, loaded, verdict
+
+    def _assert_allocatable(self, tree, adder):
+        # alloc_for_extend takes every admitted extend from free + evictable SWA.
+        demand = sum(req.extend_range.length for req in adder.can_run_list)
+        self.assertLessEqual(demand, tree.swa_available + tree.swa_evictable_size())
+
+    def test_load_back_waits_when_its_window_lock_overcommits_swa(self):
+        tree, adder, loaded, verdict = self._admit_batch(swa_available=3131)
+        self.assertNotIn(loaded, adder.can_run_list)
+        self._assert_allocatable(tree, adder)
+        self.assertIs(verdict, AddReqResult.NO_TOKEN)
+        # A refused candidate starts no H2D and leaves no lock behind.
+        adder.tree_cache.init_load_back.assert_not_called()
+        loaded.set_extend_range.assert_not_called()
+        self.assertEqual(+tree.locks, Counter())
+        self.assertEqual(
+            tree.swa_evictable_size(),
+            self.WINDOW_DEVICE_SWA + self.OTHER_SWA_EVICTABLE,
+        )
+
+    def test_load_back_admitted_when_swa_covers_its_window_lock(self):
+        tree, adder, loaded, _ = self._admit_batch(swa_available=4000)
+        self.assertIn(loaded, adder.can_run_list)
+        self._assert_allocatable(tree, adder)
+        self.assertGreaterEqual(adder.memory_budget.remaining_swa, 0)
+        # Only the request's lock and the in-flight load's lock remain, both on
+        # the loaded node; the admission pins are released.
+        self.assertEqual(+tree.locks, Counter({"best_match": 2}))
 
 
 if __name__ == "__main__":
