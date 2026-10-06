@@ -71,28 +71,41 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
         ):
             return [f() for f in thunks], len(calls)
 
-    def test_gemm_matches_aiter_tuple_fallback_and_kill_switch(self):
+    def cases(self):
+        """(n, m, w, s, in range, x, q, xs, aiter ref) on both sides of each shape's max M."""
         from aiter import gemm_a8w8_bpreshuffle
 
         for w, s, max_m in self.shapes:
             for m in (1, 4, 8, 9, 16, 17, 24, 29, 33, 36, 41):
-                with self.subTest(n=w.shape[1], m=m):
-                    x = torch.randn(m, w.shape[0], device="cuda", dtype=torch.bfloat16)
-                    q, xs = self.quant(x, group_size=x.shape[1])
-                    (got, got_tuple), n = self.run_counted(
-                        lambda: self.linear(x, w, s), lambda: self.linear((q, xs), w, s)
-                    )
-                    self.assertEqual(n, 2 if m <= max_m else 0)
-                    self.assertTrue(torch.equal(got, got_tuple))
-                    ref = gemm_a8w8_bpreshuffle(q, w.t(), xs, s, None, torch.bfloat16)
-                    ref = ref.float()
-                    ulp = torch.exp2(torch.floor(torch.log2(ref.abs() + 1e-30)) - 7)
-                    err = (got.float() - ref).abs()
-                    self.assertTrue((err <= ulp + 1e-5 * ref.abs().max()).all())
-                    with patch.dict(os.environ, _OFF):
-                        (off,), n = self.run_counted(lambda: self.linear(x, w, s))
-                    self.assertEqual(n, 0)
-                    self.assertTrue(torch.equal(off.float(), ref))
+                x = torch.randn(m, w.shape[0], device="cuda", dtype=torch.bfloat16)
+                q, xs = self.quant(x, group_size=x.shape[1])
+                ref = gemm_a8w8_bpreshuffle(q, w.t(), xs, s, None, torch.bfloat16)
+                yield w.shape[1], m, w, s, m <= max_m, x, q, xs, ref.float()
+
+    def test_gemm_matches_aiter(self):
+        for n, m, w, s, in_range, x, _, _, ref in self.cases():
+            with self.subTest(n=n, m=m):
+                (got,), calls = self.run_counted(lambda: self.linear(x, w, s))
+                self.assertEqual(calls, int(in_range))
+                ulp = torch.exp2(torch.floor(torch.log2(ref.abs() + 1e-30)) - 7)
+                err = (got.float() - ref).abs()
+                self.assertTrue((err <= ulp + 1e-5 * ref.abs().max()).all())
+
+    def test_tuple_input_matches_bf16(self):
+        for n, m, w, s, in_range, x, q, xs, _ in self.cases():
+            with self.subTest(n=n, m=m):
+                (got, got_tuple), calls = self.run_counted(
+                    lambda: self.linear(x, w, s), lambda: self.linear((q, xs), w, s)
+                )
+                self.assertEqual(calls, 2 * in_range)
+                self.assertTrue(torch.equal(got, got_tuple))
+
+    def test_kill_switch(self):
+        for n, m, w, s, _, x, _, _, ref in self.cases():
+            with self.subTest(n=n, m=m), patch.dict(os.environ, _OFF):
+                (off,), calls = self.run_counted(lambda: self.linear(x, w, s))
+                self.assertEqual(calls, 0)
+                self.assertTrue(torch.equal(off.float(), ref))
 
     def test_producer_guard(self):
         from sglang.srt.models import qwen3_5
@@ -188,6 +201,8 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
                         )
                         self.assertEqual(n, 2)
                         self.assertTrue(torch.equal(got, ref))
+            with patch.dict(os.environ, _OFF), self.assertRaises(AssertionError):
+                proj(fused[0]())
 
     def test_graph_replay_matches_eager(self):
         (w_in, s_in, _), _, (w_out, s_out, _) = self.shapes[:3]

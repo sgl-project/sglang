@@ -2237,7 +2237,7 @@ def apply_fp8_linear(
 
     if input_prequantized:
         assert input_scale is not None and (
-            input_scale.numel() == 1 or use_per_token_if_dynamic
+            input_scale.numel() == 1 or (_use_aiter and use_per_token_if_dynamic)
         )
         qinput = input_2d
         if channelwise_cutlass and not native_scalar_a_scale:
