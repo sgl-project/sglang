@@ -14,6 +14,7 @@ from sglang.kernels.ops.gemm.fp8_kernel import (
     w8a8_block_fp8_matmul_triton,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
+    dequant_group_fp8_to_bf16,
     fp8_dtype,
     fp8_max,
     fp8_min,
@@ -383,6 +384,8 @@ class Mxfp8DenseGemmBackend(Enum):
     GFX95_DOT_SCALED = "gfx95_dot_scaled"
     # gfx950 native MXFP8: lane-ordered fp8 weight + ue8m0 scale bytes; untiled shapes keep bf16
     GFX95_MXFP8_NATIVE = "gfx95_mxfp8_native"
+    # gfx950 aiter MXFP8 GEMM: plain fp8 weight + compact 32x32 ue8m0 block scale bytes
+    GFX95_MXFP8_AITER = "gfx95_mxfp8_aiter"
     UNSUPPORTED = "unsupported"
 
     def is_flashinfer_cutlass(self) -> bool:
@@ -406,10 +409,14 @@ class Mxfp8DenseGemmBackend(Enum):
     def is_gfx95_mxfp8_native(self) -> bool:
         return self == Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE
 
+    def is_gfx95_mxfp8_aiter(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.GFX95_MXFP8_AITER
+
     def is_gfx95(self) -> bool:
         return self in (
             Mxfp8DenseGemmBackend.GFX95_DOT_SCALED,
             Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE,
+            Mxfp8DenseGemmBackend.GFX95_MXFP8_AITER,
         )
 
     def is_unsupported(self) -> bool:
@@ -742,6 +749,8 @@ def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
     if _is_hip and _is_gfx95_supported:
         if backend.is_triton():
             return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
+        if backend.is_aiter():
+            return Mxfp8DenseGemmBackend.GFX95_MXFP8_AITER
         return Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE
     # Explicit CUTLASS / CuTe-DSL only: they leave the weight untouched and store
     # the swizzled scale separately, so the block layout stays readable by Triton.
@@ -787,6 +796,12 @@ def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
         )
 
         return mxfp8_native_blockscaled_linear
+    if backend.is_gfx95_mxfp8_aiter():
+        from sglang.kernels.ops.quantization.mxfp8_aiter_gfx95 import (
+            aiter_mxfp8_blockscaled_linear,
+        )
+
+        return aiter_mxfp8_blockscaled_linear
     return _unsupported_mxfp8_linear
 
 
@@ -1459,6 +1474,7 @@ def triton_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     act_scale_ue8m0: bool = False,
+    weight_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if input_scale is not None:
         # Pre-quantized input: ``input`` is already fp8 and ``input_scale`` is
@@ -1483,9 +1499,30 @@ def triton_w8a8_block_fp8_linear(
                 input_2d, block_size[1], column_major_scales=False
             )
 
-    output = w8a8_block_fp8_matmul_triton(
-        q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
-    )
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    if (
+        weight_bf16 is not None
+        and input_scale is None
+        and act_scale_ue8m0
+        and block_size == [32, 32]
+        and q_input.shape[0] >= 64
+        and output_dtype == torch.bfloat16
+        and not is_batch_invariant_mode_enabled()
+    ):
+        # Keep activation quantization: only the GEMM implementation changes.
+        output = torch.nn.functional.linear(
+            dequant_group_fp8_to_bf16(q_input, x_scale), weight_bf16
+        )
+    else:
+        output = w8a8_block_fp8_matmul_triton(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            block_size,
+            output_dtype=output_dtype,
+        )
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
@@ -1715,6 +1752,10 @@ def quantize_block_fp8_weight_to_mxfp4(
     weight_block_size: List[int],
     mxfp4_block_size: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if _is_hip:
+        return _quantize_block_fp8_weight_to_mxfp4_rne(
+            fp8_weight, fp8_scale, weight_block_size, mxfp4_block_size
+        )
     fp8_weight_dequant = block_quant_dequant(
         fp8_weight,
         fp8_scale.to(torch.float32),
@@ -1731,6 +1772,44 @@ def quantize_block_fp8_weight_to_mxfp4(
         fp8_weight_dequant.shape[-1] // mxfp4_block_size,
     )
     return fp4_weight, fp4_scale.contiguous().view(torch.float8_e8m0fnu)
+
+
+def _quantize_block_fp8_weight_to_mxfp4_rne(
+    fp8_weight: torch.Tensor,
+    fp8_scale: torch.Tensor,
+    weight_block_size: List[int],
+    mxfp4_block_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    fp8_weight_dequant = block_quant_dequant(
+        fp8_weight,
+        fp8_scale.to(torch.float32),
+        weight_block_size,
+        torch.float32,
+    )
+    *lead, k = fp8_weight_dequant.shape
+    x = fp8_weight_dequant.reshape(-1, mxfp4_block_size)
+
+    # Scale as in aiter dynamic_mxfp4_quant: round amax's mantissa at 1.75, then
+    # floor(log2) - 2 (e2m1 emax), saturating the few elements above 6 * scale.
+    amax = x.abs().amax(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
+    amax = ((amax.view(torch.int32) + 0x200000) & 0x7F800000).view(torch.float32)
+    exp = (torch.floor(torch.log2(amax)) - 2).clamp(-127, 127)
+    y = (x.abs() / torch.exp2(exp)).clamp(max=6.0)
+
+    # Round to nearest, ties to even mantissa. The FP8 source puts many elements
+    # exactly on e2m1 midpoints; ties toward zero shrink each matrix by ~5%.
+    mag = torch.where(
+        y < 2.0,
+        torch.round(y * 2.0),
+        torch.where(y < 4.0, torch.round(y) + 2.0, torch.round(y * 0.5) + 4.0),
+    ).to(torch.uint8)
+    codes = mag | ((x < 0) & (mag != 0)).to(torch.uint8) << 3
+    codes = codes.reshape(*lead, k)
+    fp4_weight = (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous()
+    fp4_scale = (exp + 127).to(torch.uint8).reshape(*lead, k // mxfp4_block_size)
+    return fp4_weight.view(torch.int8), fp4_scale.contiguous().view(
+        torch.float8_e8m0fnu
+    )
 
 
 def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
