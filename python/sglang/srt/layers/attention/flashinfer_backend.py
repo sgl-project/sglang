@@ -1319,6 +1319,14 @@ class FlashInferAttnBackend(AttentionBackend):
 
         logits_soft_cap = layer.logit_cap
 
+        # DP attention pads rows to a multiple of attn_tp_size; qo_indptr covers only
+        # the real ones. k/v stay padded so KV writes align with out_cache_loc.
+        padded_num_tokens = q.shape[0]
+        if (
+            forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
+            q = q[: sum(forward_batch.extend_seq_lens_cpu)]
         q = q.contiguous()
 
         assert not (self.prefill_uses_dequant_workspace and layer.is_cross_attention), (
@@ -1465,7 +1473,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     *self._kv_write_scales(layer),
                 )
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        o = o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        if o.shape[0] < padded_num_tokens:
+            o = torch.cat(
+                [o, o.new_zeros(padded_num_tokens - o.shape[0], o.shape[1])], dim=0
+            )
+        return o
 
     @debug_kernel_api
     def forward_decode(
