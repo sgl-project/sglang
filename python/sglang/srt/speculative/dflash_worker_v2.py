@@ -1,3 +1,4 @@
+import itertools
 import logging
 import math
 import os
@@ -423,6 +424,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
+        # Request pools determine the scan-state capacity before graph warmup.
+        self._has_scan_kda = bool(
+            getattr(self.draft_model, "has_scan_kda_layers", False)
+        )
+        self._kda_state_ready = False
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu
@@ -625,6 +631,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
+        if self._has_scan_kda and not self._kda_state_ready:
+            self._init_kda_context_state()
         with (
             draft_pp_context(),
             draft_tp_context(self.draft_owns_attention),
@@ -1744,6 +1752,81 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return out_tokens
 
+    def _init_kda_context_state(self) -> None:
+        """Allocate the per-request running state once the request pools exist."""
+        req_pool = getattr(self.draft_model_runner, "req_to_token_pool", None)
+        if req_pool is None:
+            req_pool = getattr(self.model_runner, "req_to_token_pool", None)
+        if req_pool is None:
+            raise RuntimeError(
+                "DFLASH context-scanning KDA draft needs a request pool to size "
+                "its per-request running state."
+            )
+        max_slots = int(req_pool.size) + 1  # +1 for the padding sentinel slot
+        self.draft_model.init_kda_context_state(
+            max_slots=max_slots,
+            device=self.model_runner.device,
+            dtype=next(self.draft_model.parameters()).dtype,
+        )
+        self._kda_state_ready = True
+        if self.model_runner.tp_rank == 0:
+            logger.info(
+                "DFLASH context-scanning KDA draft: per-request running state "
+                "allocated for %d slots.",
+                max_slots,
+            )
+
+    def _advance_kda_context(
+        self,
+        *,
+        ctx_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        req_pool_indices: Optional[torch.Tensor],
+        row_lens: Optional[torch.Tensor],
+        row_stride: Optional[int],
+    ) -> None:
+        """Feed newly verified context rows to context-scanning KDA draft layers.
+
+        ``row_lens[i]`` rows belong to request ``req_pool_indices[i]``; they start
+        at ``i * row_stride`` (dense ``[bs, block]`` layouts) or right after the
+        previous request's rows (``row_stride=None``, packed prefill layouts). A
+        request whose first row sits at position 0 starts fresh, so its running
+        state is reset before the rows are consumed.
+        """
+        if not self._has_scan_kda:
+            return
+        if req_pool_indices is None or row_lens is None:
+            raise RuntimeError(
+                "DFLASH context-scanning KDA needs req_pool_indices and row_lens "
+                "for every context append."
+            )
+        if not self._kda_state_ready:
+            self._init_kda_context_state()
+        lens = [int(n) for n in row_lens.to(torch.int64).tolist()]
+        if row_stride is None:
+            starts = [0, *itertools.accumulate(lens)][:-1]
+        else:
+            starts = [i * int(row_stride) for i in range(len(lens))]
+        keep = [i for i, n in enumerate(lens) if n > 0]
+        if not keep:
+            return
+        if row_stride is None and len(keep) == len(lens):
+            rows = ctx_hidden[: starts[-1] + lens[-1]]
+        else:
+            rows = torch.cat(
+                [ctx_hidden[starts[i] : starts[i] + lens[i]] for i in keep]
+            )
+        device = ctx_hidden.device
+        first_rows = torch.tensor(
+            [starts[i] for i in keep], device=device, dtype=torch.int64
+        )
+        reset_mask = positions.to(device)[first_rows] == 0
+        slots = req_pool_indices.to(device=device, dtype=torch.int64).reshape(-1)[
+            torch.tensor(keep, device=device, dtype=torch.int64)
+        ]
+        kept_lens = torch.tensor([lens[i] for i in keep], dtype=torch.int64)
+        self.draft_model.advance_kda_context(slots, rows, kept_lens, reset_mask)
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -1752,6 +1835,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         positions: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        req_pool_indices: Optional[torch.Tensor] = None,
+        row_lens: Optional[torch.Tensor] = None,
+        row_stride: Optional[int] = None,
         extend_lens: Optional[torch.Tensor] = None,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
@@ -1849,6 +1935,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tp_context(self.draft_owns_attention),
         ):
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            self._advance_kda_context(
+                ctx_hidden=ctx_hidden,
+                positions=positions,
+                req_pool_indices=req_pool_indices,
+                row_lens=row_lens,
+                row_stride=row_stride,
+            )
             if self.lilicorr is not None:
                 self._lilicorr_anchor = publish_anchor(
                     draft_sampler=self._draft_sampler,
@@ -1884,7 +1977,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
 
-                for layer in self.draft_model.layers:
+                for layer in self.draft_model.iter_context_attention_layers():
                     attn = layer.self_attn
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                         layer, ctx_hidden
@@ -1934,7 +2027,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
     ) -> None:
-        for layer in self.draft_model.layers:
+        for layer in self.draft_model.iter_context_attention_layers():
             attn = layer.self_attn
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                 layer, ctx_hidden
@@ -2309,6 +2402,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_hidden=logits_output.hidden_states,
                 cache_loc=batch.out_cache_loc,
                 positions=positions,
+                req_pool_indices=batch.req_pool_indices,
+                row_lens=ctx_lens,
+                row_stride=None,
                 extend_lens=ctx_lens,
             )
 
@@ -2869,6 +2965,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             cache_loc_2d=verify_out_cache_loc_2d,
             positions=positions,
             commit_lens=commit_lens,
+            req_pool_indices=batch.req_pool_indices,
+            row_lens=commit_lens,
+            row_stride=int(self.block_size),
         )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
