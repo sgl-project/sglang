@@ -1317,8 +1317,10 @@ class UnifiedRadixCache(BasePrefixCache):
         elif isinstance(action, BackupKV):
             if self.linker is not None:
                 self.linker.offload_nodes(action.node_ids)
-            else:
+            elif self._batched_backup and self.buffer_pipeline is None:
                 self._queue_write_through_backup(action)
+            else:
+                self._execute_and_commit_kv_backup(action)
         else:
             raise AssertionError(f"unhandled CacheAction: {type(action).__name__}")
 
@@ -1601,8 +1603,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Overlapping chain actions may revisit nodes with Full KV already
         # backed up. Skip only when no transfer remains.
         if device_value.numel() == 0 and not comp_xfers:
-            if lock_params is not None:
-                self.dec_lock_ref(node_id, lock_params)
+            self._release_queued_backup(node_id, lock_params)
             return None
         return _NodeBackupSpec(
             node_id,
@@ -3557,9 +3558,6 @@ class UnifiedRadixCache(BasePrefixCache):
         self.cache_controller.start_writing()
 
     def _queue_write_through_backup(self, action: BackupKV) -> None:
-        if self.buffer_pipeline is not None or not self._batched_backup:
-            self._execute_and_commit_kv_backup(action)
-            return
         for node_id in action.node_ids:
             if node_id in self.queued_backups or node_id in self.ongoing_write_through:
                 continue
@@ -3599,12 +3597,7 @@ class UnifiedRadixCache(BasePrefixCache):
         for node_id, lock_params in queued.items():
             chain = []
             parent = self.tree_core.get_parent_node_id(node_id)
-            while (
-                parent is not None
-                and parent not in ordered
-                and not self.tree_core.is_root(parent)
-                and not self.tree_core.is_backuped(parent)
-            ):
+            while parent not in ordered and self._is_unbacked_node(parent):
                 chain.append(parent)
                 parent = self.tree_core.get_parent_node_id(parent)
             for ancestor in reversed(chain):
@@ -3612,14 +3605,17 @@ class UnifiedRadixCache(BasePrefixCache):
             ordered.setdefault(node_id, lock_params)
         return ordered
 
+    def _is_unbacked_node(self, node_id: Optional[NodeId]) -> bool:
+        """A non-root node with no host backup yet."""
+        return (
+            node_id is not None
+            and not self.tree_core.is_root(node_id)
+            and not self.tree_core.is_backuped(node_id)
+        )
+
     def _parent_backed_up(self, node_id: NodeId, batch_ids: set[NodeId]) -> bool:
         parent = self.tree_core.get_parent_node_id(node_id)
-        return (
-            parent is None
-            or parent in batch_ids
-            or self.tree_core.is_root(parent)
-            or self.tree_core.is_backuped(parent)
-        )
+        return parent in batch_ids or not self._is_unbacked_node(parent)
 
     def _release_queued_backup(
         self, node_id: NodeId, lock_params: Optional[DecLockRefParams]
