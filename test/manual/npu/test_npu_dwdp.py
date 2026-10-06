@@ -1,4 +1,4 @@
-"""Run with DWDP_TEST_DEVICES=4,5 python -m pytest .../test_npu_dwdp.py -s.
+"""Run with DWDP_TEST_DEVICES=0,1 pytest test/manual/npu/test_npu_dwdp.py -s.
 
 Exercises real FusedMoE kernels, IPC, ND/NZ source weights, slot reuse and
 unequal forward counts (no matching collective may be required by a forward).
