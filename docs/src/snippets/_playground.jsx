@@ -265,10 +265,16 @@ export const Playground = ({ config }) => {
         disabled = matchConstraint(base, entry.disable);
       }
     }
+    // `labelWhen: [{when, label}]` renames an entry for the selections it
+    // matches, first match wins. One option can be the same flag value behind
+    // two different implementations (MegaMoE is DeepGEMM on Blackwell and
+    // MORI-backed Aiter MegaMoEv2 on ROCm); the label should say which.
+    const labelOverride = (entry.labelWhen || []).find(
+      (l) => l && l.when && matchConstraint(base, l.when));
     return {
       ...entry,
       value: entry.id !== undefined ? entry.id : entry.value,
-      label: entry.label,
+      label: labelOverride ? labelOverride.label : entry.label,
       hidden,
       disabled,
       disableReason,
@@ -698,7 +704,7 @@ export const Playground = ({ config }) => {
         };
       },
 
-      apply: ({ flags, env, value, fc, h, derived }) => {
+      apply: ({ flags, env, value, fc, sel, h, derived }) => {
         if (value.backend !== null) {
           flags = h.stripFlagsByFirstToken(flags, [
             "--moe-a2a-backend", "--moe-runner-backend",
@@ -715,14 +721,28 @@ export const Playground = ({ config }) => {
           if (opt?.flags?.length) {
             flags = h.insertAfter(flags, h.ANCHOR_NEAR_DPATTN, opt.flags);
           }
-          if (opt?.env?.length) env = [...env, ...opt.env];
+          // `envWhen` scopes a backend option's env to the selections that need
+          // it (same shape as a PD transfer backend's). MegaMoE is configured by
+          // a different env family on ROCm than on Blackwell, so the option
+          // carries the ROCm one and gates it on the hardware.
+          if (opt?.env?.length
+              && (!opt.envWhen || h.matchConstraint(sel, opt.envWhen))) {
+            env = [...env, ...opt.env];
+          }
         }
         // MegaMoE owns the MoE path: when the effective backend is megamoe, strip the
         // DeepEP dispatch + any prior MegaMoE quant settings, then re-add the
         // selected quant's flags/env. When the backend is explicitly switched
         // away from MegaMoE, only drop the MegaMoE quant settings (leave DeepEP
         // dispatch intact).
+        // `hideHw` drops the quant SELECTION where its env family does not apply:
+        // the ROCm FlyDSL MegaMoE path is configured by the backend option's own
+        // env (`SGLANG_AMD_FLYDSL_MEGA_*`), not by the DeepGEMM per-rank token
+        // budget these options set. The family STRIP stays unconditional — it is
+        // what keeps a stale quant flag from surviving a backend switch — so the
+        // gate is applied to the emit branches, not to `mq` itself.
         const mq = fc.megamoeQuant;
+        const mqActive = !!mq && !(mq.hideHw || []).includes(sel && sel.hw);
         if (mq) {
           const quantKeys = [];
           const quantFlagHeads = [];
@@ -733,7 +753,7 @@ export const Playground = ({ config }) => {
           flags = h.stripFlagsByFirstToken(flags, quantFlagHeads);
           const effBackend = value.backend !== null
             ? value.backend : (derived && derived.backend);
-          if (effBackend === "megamoe") {
+          if (effBackend === "megamoe" && mqActive) {
             env = h.stripEnvByPrefix(env, [...(mq.stripEnv || []), ...quantKeys]);
             const quant = value.mmQuant != null
               ? value.mmQuant : ((derived && derived.mmQuant) || "w4a8");
@@ -792,7 +812,8 @@ export const Playground = ({ config }) => {
                     { hideValues: [...hideNull("backend"), ...(mmAvail ? [] : ["megamoe"])] })}
                 </span>
               )}
-              {fc.megamoeQuant && backendIsMega && (
+              {fc.megamoeQuant && backendIsMega
+                && !(fc.megamoeQuant.hideHw || []).includes(base.hw) && (
                 <span style={s.field}>
                   <span style={s.fieldLabel}>Quantization</span>
                   {renderSelect(
@@ -932,14 +953,13 @@ export const Playground = ({ config }) => {
         }).disabled) {
           return { flags, env };
         }
-        flags = h.stripFlagsByFirstToken(flags, [
-          "--speculative-algorithm", "--speculative-num-steps",
-          "--speculative-eagle-topk", "--speculative-num-draft-tokens",
-          "--speculative-adaptive",
-          "--speculative-dspark-block-size", "--enable-linear-replayssm-spec",
-          "--linear-replayssm-cache-len",
-          "--speculative-ngram-max-bfs-breadth",
-        ]);
+        // Model-specific draft precision and acceptance settings belong to the
+        // old algorithm too; Off/DFlash must not inherit them from EAGLE.
+        flags = flags.filter((flag) => {
+          const head = flag.split(/[\s=]/)[0];
+          return !head.startsWith("--speculative-") &&
+            !["--enable-linear-replayssm-spec", "--linear-replayssm-cache-len"].includes(head);
+        });
         const preset = (fc.options || []).find((p) => p.id === value);
         if (preset?.flags?.length) flags = h.insertBeforeTail(flags, preset.flags);
         return { flags, env };
@@ -986,18 +1006,23 @@ export const Playground = ({ config }) => {
     // Owns the `--disaggregation-*` flags (unconditional strip). A backend may
     // carry hw-gated env (transferBackends[].env + .envWhen).
     pdDisagg: {
-      // The transport default is the config's first entry, so a model whose
-      // recipes standardize on one backend does not silently start on another.
-      // An entry with `defaultWhen` takes over as the default for the selections
-      // it matches (e.g. MORI and the rdmaN NIC list on ROCm).
+      // The transport default is the config's first entry that is VISIBLE for
+      // this selection, so a model whose recipes standardize on one backend does
+      // not silently start on another. Skipping hidden entries is what lets a
+      // transport be listed first for the platform it belongs to without
+      // becoming the default on platforms that hide it. An entry with
+      // `defaultWhen` takes over for the selections it matches (e.g. the rdmaN
+      // NIC list on ROCm).
       initState: (fc, base) => {
+        const visible = (entries) => (entries || []).filter((e) =>
+          e && !(e.hide && base && matchConstraint(base, e.hide)));
         const pick = (entries) => (entries || []).find((e) =>
           e && e.defaultWhen && base && matchConstraint(base, e.defaultWhen));
-        const backends = (fc && fc.transferBackends) || [];
+        const backends = visible(fc && fc.transferBackends);
         return {
           mode: "off",
           transferBackend: (pick(backends) || backends[0] || {}).id || "mooncake",
-          ibDevice: (pick(fc && fc.ibDevices) || {}).id || "auto",
+          ibDevice: (pick(visible(fc && fc.ibDevices)) || {}).id || "auto",
         };
       },
 
@@ -1066,12 +1091,35 @@ export const Playground = ({ config }) => {
           const modeOk = !modeGate || Object.keys(modeGate).every(
             (k) => (modeGate[k] || []).includes(sel[k]));
           if (modeOk && roleSpec && roleSpec.flags && roleSpec.flags.length) {
-            flags = h.stripFlagsByFirstToken(
-              flags, roleSpec.flags.map((f) => f.split(/[\s=]/)[0]));
-            adds.push(...roleSpec.flags);
+            // In-place substitution, the same policy flagSelects uses: a flag
+            // the base cell already carries changes value WHERE IT STANDS, so
+            // the rendered command keeps the base cell's argument order and the
+            // diff shows one changed line instead of a removal mid-command plus
+            // an addition at the end. Only flags the base cell does not have
+            // join `adds` and append before the --host/--port tail.
+            const byHead = new Map();
+            for (const f of roleSpec.flags) {
+              const t = f.split(/[\s=]/)[0];
+              if (!byHead.has(t)) byHead.set(t, []);
+              byHead.get(t).push(f);
+            }
+            const consumed = new Set();
+            const next = [];
+            for (const f of flags) {
+              const t = f.split(/[\s=]/)[0];
+              if (!byHead.has(t)) { next.push(f); continue; }
+              if (consumed.has(t)) continue;      // drop a duplicate head
+              consumed.add(t);
+              for (const r of byHead.get(t)) next.push(r);
+            }
+            flags = next;
+            for (const [t, fs] of byHead) {
+              if (!consumed.has(t)) adds.push(...fs);
+            }
           }
-          // `stripFlags` drops base-cell flags the role has no use for (an
-          // aggregated-serving knob) without re-emitting a value of its own.
+          // `stripFlags` / `stripEnv` drop base-cell flags and env keys the role
+          // has no use for (an aggregated-serving knob, a comm scheme the role's
+          // MoE backend replaces) without re-emitting a value of its own.
           if (modeOk && roleSpec && roleSpec.stripFlags && roleSpec.stripFlags.length) {
             flags = h.stripFlagsByFirstToken(flags, roleSpec.stripFlags);
           }
@@ -1087,6 +1135,15 @@ export const Playground = ({ config }) => {
           flags = flags.map((f) =>
             f.split(/[\s=]/)[0] === "--port" ? `--port ${servePort}` : f);
 
+          // `stripEnv` drops BASE-CELL env keys the role re-values, so a role
+          // that disagrees with the base on a key emits one assignment rather
+          // than two conflicting ones (the appends below de-dupe on the whole
+          // `K=V` string, not on the key). It runs before the transport and role
+          // env are merged in: those are the role's own values and are never the
+          // thing being stripped.
+          if (modeOk && roleSpec && roleSpec.stripEnv && roleSpec.stripEnv.length) {
+            env = h.stripEnvByPrefix(env, roleSpec.stripEnv);
+          }
           // Add the selected backend's env (gated by hw via `envWhen`), keeping
           // any the base cell already carries in place. We don't strip base env
           // (e.g. gb200 NCCL_*): a blanket strip would drop it when PD is off and
@@ -1443,7 +1500,10 @@ export const Playground = ({ config }) => {
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
-              <span style={s.axisTitle}>UMBP</span>
+              {/* Named after the flags it owns (--enable-unified-cache-external-linker,
+                  --unified-cache-external-linker-backend). UMBP is one backend of
+                  this feature, not the feature itself. */}
+              <span style={s.axisTitle}>Unified Cache External Linker</span>
               <span style={s.field}>
                 {renderChip("Enable", enabled, true,
                   () => setSlot("enable", !enabled),
@@ -1454,7 +1514,7 @@ export const Playground = ({ config }) => {
               </span>
               {(fc.backends || []).length > 0 && (
                 <span style={s.field}>
-                  <span style={s.fieldLabel}>Store</span>
+                  <span style={s.fieldLabel}>Backend</span>
                   {renderSelect(backend, fc.backends,
                     (v) => setSlot("backend", v), base)}
                 </span>

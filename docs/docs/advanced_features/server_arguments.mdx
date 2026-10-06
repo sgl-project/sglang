@@ -534,13 +534,13 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-page-major-kv-layout`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the page-major KV layout: lay out the Mamba state and full/SWA KV caches in a page-granularity envelope (page is the outermost axis, layer-major within a page) instead of the default per-layer (layer-major) layout. Requires the Triton attention / linear-attn / Mamba backends (`--attention-backend triton`, and for hybrid models `--linear-attn-backend triton --mamba-backend triton`).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Store the Mamba state and full/SWA KV caches as one entry per token slot, holding every layer's state, in a single page-granular buffer instead of one buffer per layer. Implied by `--enable-unified-memory`, and currently supported only with it.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-unified-memory`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>For hybrid Mamba/GDN and hybrid SWA models, replace the statically-partitioned pools (full-attention KV + SWA/Mamba conv/SSM state) with a single byte buffer split dynamically between the sub-pools, so KV-vs-state capacity flexes with the workload instead of being fixed at startup. Implies `--enable-page-major-kv-layout`. Requires the Triton attention / linear-attn / Mamba backends; monolithic (decode) cuda-graph capture only; not yet compatible with PD disaggregation or speculative decoding.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>For hybrid Mamba/GDN and hybrid SWA models, replace the statically-partitioned pools (full-attention KV + SWA/Mamba conv/SSM state) with a single byte buffer split dynamically between the sub-pools, so KV-vs-state capacity flexes with the workload instead of being fixed at startup. Implies `--enable-page-major-kv-layout`. Requires stride-aware attention, linear-attention and Mamba backends; the allowed backends and the supported PD-disaggregation and speculative-decoding configurations are validated at startup.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
@@ -970,7 +970,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--kv-events-config`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Runtime-load publishing for load-aware routers is a separate opt-in; see `--load-publish-endpoint`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Runtime-load publishing for load-aware routers is a separate opt-in; see `--load-publish-endpoint`. Set `replay_endpoint` (e.g. `tcp://*:5558`) to let routers re-fetch dropped batches; `/server_info` advertises its port.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
@@ -1470,7 +1470,13 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dsa-prefill-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DSA backend for the prefill stage (overrides `--attention-backend` when running DeepSeek DSA-style attention).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Auto (hardware-dependent)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>flashmla_sparse</code>, <code>flashmla_sparse_q8</code>, <code>flashmla_kv</code>, <code>flashmla_auto</code>, <code>fa3</code>, <code>tilelang</code>, <code>aiter</code>, <code>trtllm</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>flashmla_sparse</code>, <code>flashmla_sparse_q8</code>, <code>triton_sparse_mla</code>, <code>flashmla_kv</code>, <code>flashmla_auto</code>, <code>fa3</code>, <code>tilelang</code>, <code>aiter</code>, <code>trtllm</code></td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dsa-triton-union`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Union group size for `--dsa-prefill-backend triton_sparse_mla`: adjacent query tokens share one gathered index set (exact; an ownership mask restores each token's own softmax). Requires `num_q_heads * union` to be a power of two in [16, 32]; forced off under `--enable-deterministic-inference`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>0</code>, <code>2</code>, <code>4</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dsa-decode-backend`</td>
@@ -2868,7 +2874,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
 
 ### FFN boundary reduction
 
-Use `--boundary-reduction` to choose which optional FFN output reductions may combine the sum with token redistribution. The selected policy applies to the dense and MoE FFN stages of decoders built with independently constructed stage boundaries (`declare_ffn` / `make_stages`; see [Layer boundaries](/docs/developer_guide/layer_boundary)). Other models keep their built-in FFN output communication and ignore this option.
+Use `--boundary-reduction` to choose which optional FFN output reductions may combine the sum with token redistribution. The selected policy applies to the dense and MoE FFN stages of decoders built with independently constructed stage boundaries (`declare_ffn` / `append_stages`; see [Layer boundaries](/docs/developer_guide/layer_boundary)). Other models keep their built-in FFN output communication and ignore this option.
 
 | Value | Behavior |
 | --- | --- |
@@ -3006,6 +3012,12 @@ This option does not disable required attention or MoE collectives, including ex
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when mooncake backend is enabled.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disaggregation-decode-allocation-policy`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When to reserve per-request decode KV slots. Set the same policy on prefill and decode. See <a href="/docs/advanced_features/pd_disaggregation#decode-allocation-policy">requirements and tradeoffs</a>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`early`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>early</code>, <code>prefill_complete</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disaggregation-decode-enable-offload-kvcache`</td>

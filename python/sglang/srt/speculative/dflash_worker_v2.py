@@ -19,12 +19,14 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -401,11 +403,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._full_embed_gpu: Optional[torch.Tensor] = None
         # Under dp attention, peer DP ranks run different (idle) paths, so
         # spec broadcasts must stay within the attn-TP group.
-        self._tp_sync = SpecTpSync(
-            get_parallel().attn_tp_group
-            if get_parallel().attn_dp_enabled
-            else get_parallel().tp_group
-        )
+        self._tp_sync = SpecTpSync(get_dp_tp_group())
 
         # Under dp attention, the draft worker runs on the per-DP attn-TP
         # group, independent of idle peer DP ranks; it is built and run under
@@ -1159,7 +1157,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         *,
         batch_seq_lens_cpu: Optional[torch.Tensor],
         nxt_kv_lens_cpu: Optional[torch.Tensor],
-        draft_prefix_lens: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
         """Fill the seq_lens_cpu planning bound, sync-free when a host-side
@@ -1170,8 +1167,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         elif nxt_kv_lens_cpu is not None:
             self._compute_compact_draft_seq_lens_host(nxt_kv_lens_cpu, out=out)
         else:
-            # Last resort: the legacy blocking D2H copy.
-            out.copy_(draft_prefix_lens)
+            # Compact device lengths never exceed the window plus one page.
+            out.fill_(
+                int(self.draft_window_size)
+                + (self.page_size if self.page_size > 1 else 0)
+            )
 
     def _rebuild_compact_draft_cache(
         self,
@@ -1950,9 +1950,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+            # The draft pool is static, so its slot ids are physical.
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
-                ctx_cache_loc,
+                KVWriteLoc(ctx_cache_loc, physical=True),
                 k,
                 v,
                 attn.attn.k_scale,
@@ -1991,7 +1992,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 token_to_kv_pool.set_kv_buffer(
                     attn,
-                    ctx_cache_loc,
+                    KVWriteLoc(ctx_cache_loc, physical=True),
                     cache_k,
                     cache_v,
                     attn.k_scale,
@@ -2490,7 +2491,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._fill_compact_seq_lens_cpu_bound(
                 batch_seq_lens_cpu=batch.seq_lens_cpu,
                 nxt_kv_lens_cpu=draft_input.nxt_kv_lens_cpu,
-                draft_prefix_lens=draft_prefix_lens,
                 out=seq_lens_cpu,
             )
             self._rebuild_compact_draft_cache(
@@ -2518,11 +2518,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_cpu.copy_(draft_input.nxt_kv_lens_cpu)
                 draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
             else:
-                seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
-                draft_seq_lens_sum = int(prefix_lens.sum().item())
+                # Allocated lengths include the in-flight verify reservation.
+                for i, req in enumerate(batch.reqs):
+                    seq_lens_cpu[i] = req.kv.kv_allocated_len
+                draft_seq_lens_sum = int(seq_lens_cpu.sum())
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
+            out_cache_loc_is_physical=True,
             batch_size=bs,
             input_ids=block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
