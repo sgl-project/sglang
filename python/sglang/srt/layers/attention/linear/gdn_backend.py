@@ -190,11 +190,12 @@ elif is_cpu():
 def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     """FlashInfer for the narrow SM90/SM100 GDN prefill domains we validated, else None."""
     sm_major = torch.cuda.get_device_capability()[0] if is_cuda() else 0
+    # A page-major pool qualifies too: `forward_extend` hands every prefill kernel
+    # contiguous per-sequence state copies (`needs_state_gather`).
     if (
         get_exec().mamba.linear_attn_prefill_backend is not None
         or get_exec().mamba.linear_attn_backend != "triton"
         or get_exec().deterministic.enable_deterministic_inference
-        or get_memory().enable_page_major_kv_layout
         or sm_major not in (9, 10)
     ):
         return None
