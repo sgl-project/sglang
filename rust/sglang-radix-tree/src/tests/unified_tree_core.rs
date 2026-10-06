@@ -700,10 +700,13 @@ fn dec_swa_lock_only_returns_device_frees_in_the_device_dict() {
 }
 
 #[test]
-fn next_swa_uuid_counts_up_from_two() {
+fn next_component_uuid_counts_up_independently() {
     let mut tc = core();
-    assert_eq!(tc.next_swa_uuid_(), 2);
-    assert_eq!(tc.next_swa_uuid_(), 3);
+    assert_eq!(tc.next_component_uuid_(SWA), 100_000_000_000_001);
+    assert_eq!(tc.next_component_uuid_(SWA), 100_000_000_000_002);
+    assert_eq!(tc.next_component_uuid_(FULL), 200_000_000_000_001);
+    assert_eq!(tc.next_component_uuid_(MAMBA), 300_000_000_000_001);
+    assert_eq!(tc.next_component_uuid_(FULL), 200_000_000_000_002);
 }
 
 #[test]
@@ -2816,6 +2819,107 @@ fn backup_kv_action_chains_unbacked_ancestors_first() {
     assert_eq!(action.node_ids, vec![c]);
 }
 
+// Mirrors UnifiedRadixCache._execute_and_commit_kv_backup: back up each chain
+// node and stamp every node its transfers cover with that node's ack.
+// It skips the inc_lock_ref the Python side takes; the asserts do not depend on it.
+fn execute_backup_kv_for_test(tc: &mut UnifiedTreeCore<Vec<i64>>, backup: &BackupKV) {
+    for &node_id in &backup.node_ids {
+        let (device_value, mut comp_xfers) = tc.build_backup_spec(node_id).expect("backup spec");
+        if device_value.numel() == 0 && comp_xfers.is_empty() {
+            continue;
+        }
+        let mut publish_node_ids = Vec::new();
+        for transfer in comp_xfers.values_mut().flatten() {
+            transfer.host_indices = transfer.device_indices.as_ref().map(Tensor::copy);
+            publish_node_ids.extend(transfer.nodes_to_load.iter().flatten().copied());
+        }
+        if !publish_node_ids.contains(&node_id) {
+            publish_node_ids.push(node_id);
+        }
+        tc.commit_backup(node_id, device_value.copy(), comp_xfers)
+            .expect("live test node");
+        tc.mark_write_through_pending(publish_node_ids, /* ack_id = */ node_id)
+            .expect("live test nodes");
+    }
+}
+
+#[test]
+fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
+    // c(Full unbacked) -> b(Full backed) -> t1(Full backed)
+    //                  -> d(Full unbacked) -> t2(Full backed)
+    // Every node holds a device-only SWA value inside the window.
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            is_write_back: true,
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            swa_sliding_window_size: Some(8),
+            ..Default::default()
+        },
+        vec![FULL, SWA],
+    );
+    let (key_t1, key_t2) = (vec![1, 2, 3, 4], vec![1, 2, 5, 6]);
+    tc.insert(&insert_params(&key_t1, &[10, 11, 12, 13]));
+    tc.insert(&insert_params(&key_t2, &[10, 11, 14, 15]));
+    tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
+    tc.insert(&insert_params(&vec![1, 2, 5], &[10, 11, 14]));
+    let child = |parent, page: &[i64]| {
+        tc.arena
+            .child_on_page(parent, /* extra_key = */ None, page)
+            .expect("child on page")
+    };
+    let c_idx = child(tc.arena.root(), &[1]);
+    let b_idx = child(c_idx, &[3]);
+    let t1_idx = child(b_idx, &[4]);
+    let d_idx = child(c_idx, &[5]);
+    let t2_idx = child(d_idx, &[6]);
+    let [c, b, t1, d, t2] = [c_idx, b_idx, t1_idx, d_idx, t2_idx].map(|idx| tc.arena.node(idx).id);
+    for idx in [c_idx, b_idx, t1_idx, d_idx, t2_idx] {
+        let full = tc.arena.node(idx).device_value(FULL).copy();
+        tc.set_component_device_value(tc.arena.node(idx).id, SWA, full.copy())
+            .expect("live test node");
+        if [b_idx, t1_idx, t2_idx].contains(&idx) {
+            tc.arena.set_host_value(idx, FULL, full);
+        }
+    }
+
+    // Two requests in one batch finish at t1 and t2; neither ack drains.
+    for (key, target) in [(&key_t1, t1), (&key_t2, t2)] {
+        let result = tc.insert(&insert_params(key, &[20, 21, 22, 23]));
+        let backups: Vec<&BackupKV> = result
+            .cache_actions
+            .iter()
+            .filter_map(|action| match action {
+                CacheAction::BackupKV(backup) => Some(backup),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(backups[0].node_ids, vec![target]);
+        execute_backup_kv_for_test(&mut tc, backups[0]);
+    }
+
+    let pending = |node_id| {
+        tc.arena
+            .node(tc.arena.resolve(node_id).expect("live test node"))
+            .write_through_pending_id
+    };
+    for (node_id, ack_id) in [(c, t1), (b, t1), (t1, t1), (d, t2), (t2, t2)] {
+        assert_eq!(pending(node_id), Some(ack_id));
+    }
+    // Write-back defers the unbacked Full prefix to eviction.
+    assert!(
+        !tc.arena
+            .node(tc.arena.resolve(c).expect("live test node"))
+            .backuped()
+    );
+    assert!(
+        !tc.arena
+            .node(tc.arena.resolve(d).expect("live test node"))
+            .backuped()
+    );
+}
+
 #[test]
 fn backup_kv_action_stops_at_an_externally_stored_or_pending_ancestor() {
     let mut tc = core();
@@ -4002,23 +4106,22 @@ fn insert_host_allows_a_suffix_under_an_unbacked_write_back_parent() {
 fn insert_host_drops_a_suffix_under_an_unbacked_write_through_parent() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
-    let root = tc.arena.root();
+    let anchor = tc
+        .match_prefix(&match_params(&vec![1, 2]))
+        .best_match_node_id;
     let nodes_before = tc.arena.len();
     let result = tc
         .insert_host(
-            tc.arena.node(root).id,
+            anchor,
             /* extra_key = */ None,
-            vec![1, 2, 3, 4],
-            Tensor::from_slice(&[100i64, 101, 102, 103]),
-            vec!["h0", "h1", "h2", "h3"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            vec![3, 4],
+            Tensor::from_slice(&[102i64, 103]),
+            vec!["h2", "h3"].into_iter().map(String::from).collect(),
         )
         .expect("live test node");
 
-    assert_eq!(result.prefix_len, 2);
-    assert_eq!(result.total_len, 4);
+    assert_eq!(result.prefix_len, 0);
+    assert_eq!(result.total_len, 2);
     assert_eq!(result.inserted_host_node, None);
     assert!(result.host_insert_dropped);
     assert!(result.cache_actions.is_empty());
@@ -4026,7 +4129,7 @@ fn insert_host_drops_a_suffix_under_an_unbacked_write_through_parent() {
 }
 
 #[test]
-fn insert_host_drop_preserves_split_actions_and_lengths() {
+fn insert_host_refill_preserves_split_actions_and_lengths() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     let leaf = tc
@@ -4045,10 +4148,10 @@ fn insert_host_drop_preserves_split_actions_and_lengths() {
         )
         .expect("live test node");
 
-    assert_eq!(result.prefix_len, 1);
+    assert_eq!(result.prefix_len, 0);
     assert_eq!(result.total_len, 2);
-    assert_eq!(result.inserted_host_node, None);
-    assert!(result.host_insert_dropped);
+    assert!(result.inserted_host_node.is_some());
+    assert!(!result.host_insert_dropped);
     assert!(matches!(
         result.cache_actions.as_slice(),
         [CacheAction::ReplaceWriteThroughOnNodeSplit { ack_id, .. }] if *ack_id == leaf
@@ -4151,7 +4254,7 @@ fn insert_host_full_match_reports_only_a_backuped_node() {
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
     let root = tc.arena.root();
-    // The device-only match reports no host node.
+    // The device-only match consumes the supplied host slots.
     let result = tc
         .insert_host(
             tc.arena.node(root).id,
@@ -4161,14 +4264,15 @@ fn insert_host_full_match_reports_only_a_backuped_node() {
             vec!["h0".to_string(), "h1".to_string()],
         )
         .expect("live test node");
-    assert_eq!(result.prefix_len, 2);
-    assert_eq!(result.inserted_host_node, None);
+    assert_eq!(result.prefix_len, 0);
+    assert_eq!(result.inserted_host_node, Some(leaf));
     assert!(!result.host_insert_dropped);
-    // Once backuped, the same insert reports the node.
-    tc.arena.set_host_value(
-        tc.arena.resolve(leaf).expect("live test node"),
-        FULL,
-        Tensor::from_slice(&[20i64, 21]),
+    // The refill owns these rows; a repeat reports only the duplicate prefix.
+    assert!(
+        tc.arena
+            .node(tc.arena.resolve(leaf).expect("live test node"))
+            .host_value(FULL)
+            .equal(&Tensor::from_slice(&[100i64, 101]))
     );
     let result = tc
         .insert_host(

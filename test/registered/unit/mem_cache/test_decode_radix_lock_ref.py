@@ -5,13 +5,13 @@ Verifies that inc_lock_ref / dec_lock_ref are balanced across the four
 transfer scenarios identified in PR #19746:
 
 1. Incremental transfer & success (prefix match > 0)
-   inc_lock_ref(pop_preallocated) -> dec+inc(insert_req) -> dec(release_kv_cache)
+   inc_lock_ref(pop_preallocated) -> dec+inc(checkpoint) -> dec(release_kv_cache)
 
 2. Full transfer & success (prefix match == 0, full KV transferred)
-   inc_lock_ref(get_new_prebuilt_batch) -> dec+inc(insert_req) -> dec(release_kv_cache)
+   inc_lock_ref(get_new_prebuilt_batch) -> dec+inc(checkpoint) -> dec(release_kv_cache)
 
 3. Incremental transfer & failure (prefix match > 0, transfer fails)
-   inc_lock_ref(pop_preallocated) -> dec(unpin via release_kv_cache is_insert=False)
+   inc_lock_ref(pop_preallocated) -> dec(unpin via release_kv_cache checkpoint=False)
 
 4. Full transfer & failure (prefix match == 0, transfer fails)
    no inc_lock_ref -> dec(root_node) is no-op since root lock_ref starts at 1
@@ -60,7 +60,7 @@ from sglang.test.test_utils import CustomTestCase
 
 
 def _make_cache_with_pools(page_size=1):
-    """Create a RadixCache with mock pools sufficient for insert_req / insert_req."""
+    """Create a RadixCache with mock pools sufficient for checkpoint and release_kv_cache."""
     mock_allocator = MagicMock()
     mock_allocator.device = torch.device("cpu")
     mock_allocator.page_size = page_size
@@ -84,7 +84,7 @@ def _make_cache_with_pools(page_size=1):
 
 
 class MockReq:
-    """Minimal mock Req with fields needed by insert_req / release_kv_cache."""
+    """Minimal mock Req with fields needed by checkpoint / release_kv_cache."""
 
     def __init__(self, fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
         self.full_untruncated_fill_ids = array("q", fill_ids)
@@ -116,7 +116,7 @@ class MockReq:
     def finished(self):
         return self.finished_reason is not None
 
-    def _refresh_fill_ids(self):
+    def refresh_fill_ids(self):
         pass
 
     def owned_kv_len(self):
@@ -224,7 +224,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         """Scenario 1: prefix match > 0, transfer succeeds.
 
         Flow: inc_lock_ref(pop_preallocated)
-              -> dec_lock_ref + inc_lock_ref(insert_req)
+              -> dec_lock_ref + inc_lock_ref(checkpoint)
               -> dec_lock_ref(cache_finished_req)
         """
         cache, req_to_token = _make_cache_with_pools()
@@ -256,12 +256,12 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             last_node=matched_node,
         )
 
-        # Step 2: insert_req (dec old lock, inc new lock)
-        cache.insert_req(req, up_to=req.extend_range.end)
+        # Step 2: checkpoint (dec old lock, inc new lock)
+        cache.checkpoint(req, up_to=req.extend_range.end)
 
         # Step 3: release_kv_cache (insert, free the rest, dec lock)
         req.finished_reason = "finished"
-        release_kv_cache(req, cache)
+        release_kv_cache(req, cache, checkpoint=True)
 
         # Verify: all non-root nodes should have lock_ref == 0
         # (root always has lock_ref == 1)
@@ -274,7 +274,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         """Scenario 2: no prefix match, full KV transferred, succeeds.
 
         Flow: inc_lock_ref(root, via init_next_round_input/get_new_prebuilt_batch)
-              -> dec_lock_ref + inc_lock_ref(insert_req)
+              -> dec_lock_ref + inc_lock_ref(checkpoint)
               -> dec_lock_ref(cache_finished_req)
         """
         cache, req_to_token = _make_cache_with_pools()
@@ -306,12 +306,12 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             last_node=matched_node,
         )
 
-        # Step 2: insert_req (dec root=no-op, inc new leaf)
-        cache.insert_req(req, up_to=req.extend_range.end)
+        # Step 2: checkpoint (dec root=no-op, inc new leaf)
+        cache.checkpoint(req, up_to=req.extend_range.end)
 
         # Step 3: cache_finished_req (dec leaf)
         req.finished_reason = "finished"
-        release_kv_cache(req, cache)
+        release_kv_cache(req, cache, checkpoint=True)
 
         # Root lock unchanged, all nodes unlocked
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)
@@ -325,7 +325,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         must preserve the matched prefix and release the full request-owned suffix.
 
         Flow: inc_lock_ref(pop_preallocated)
-              -> dec_lock_ref(unpin via release_kv_cache is_insert=False)
+              -> dec_lock_ref(unpin via release_kv_cache checkpoint=False)
         """
         cache, req_to_token = _make_cache_with_pools()
 
@@ -358,7 +358,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         # Transfer fails -> discard without inserting
         cache.token_to_kv_pool_allocator.reset_mock()
-        release_kv_cache(req, cache, is_insert=False)
+        release_kv_cache(req, cache, checkpoint=False)
 
         ((indices, start_pos),) = (
             cache.token_to_kv_pool_allocator.free_segments.call_args.args[0]
@@ -404,7 +404,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         cache.token_to_kv_pool_allocator.reset_mock()
         req.finished_reason = "finished"
-        release_kv_cache(req, cache)
+        release_kv_cache(req, cache, checkpoint=True)
 
         # The unnamed tail slot is freed as the segment past the radix key.
         segments = cache.token_to_kv_pool_allocator.free_segments.call_args.args[0]
@@ -454,7 +454,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         )
 
         # Transfer fails -> discard without inserting; dec_lock_ref(root) is a no-op
-        release_kv_cache(req, cache, is_insert=False)
+        release_kv_cache(req, cache, checkpoint=False)
 
         # Root lock unchanged, nothing protected or evictable
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)
@@ -545,9 +545,8 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 
-        # The 4-token match is locked, then capped to zero because the whole
-        # 8-token request is inside the SWA window. Admission rejection must
-        # still release the original matched-node lock.
+        # Admission rejection must release the matched-node lock, including
+        # when the SWA lock was already released for fresh tail allocation.
         queue._allocatable_token_budgets = MagicMock(return_value=3)
 
         preallocated, failed = queue.pop_preallocated()
@@ -662,7 +661,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch(
                 scheduler, SimpleNamespace(batch_size=lambda: 0)
             )
-        cache.insert_req(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_range.end)
 
         self.assertEqual(shared.lock_ref, 2)
         self.assertEqual(req_to_token[0, :3].tolist(), prefix_vals)
@@ -698,9 +697,9 @@ class TestDecodeLockRefScenarios(CustomTestCase):
                 last_node=matched_node,
             )
 
-            cache.insert_req(req, up_to=req.extend_range.end)
+            cache.checkpoint(req, up_to=req.extend_range.end)
             req.finished_reason = "finished"
-            release_kv_cache(req, cache)
+            release_kv_cache(req, cache, checkpoint=True)
 
         # After all iterations, root lock should be 1, no protected nodes
         self.assertEqual(cache.root_node.lock_ref, 1)

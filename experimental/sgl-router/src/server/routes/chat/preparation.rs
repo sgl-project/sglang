@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Request validation, optional tokenization, and outgoing body preparation for
-//! chat completions, the native `/generate` endpoint, and embeddings.
+//! chat completions, the native `/generate` endpoint, embeddings, classify and rerank.
 
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
@@ -21,7 +21,9 @@ const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 
 const CHAT_PATH: &str = "/v1/chat/completions";
 const GENERATE_PATH: &str = "/generate";
-const EMBEDDINGS_PATH: &str = "/v1/embeddings";
+pub(super) const EMBEDDINGS_PATH: &str = "/v1/embeddings";
+pub(super) const CLASSIFY_PATH: &str = "/v1/classify";
+const RERANK_PATH: &str = "/v1/rerank";
 
 /// Validated routing inputs and the original body, ready for worker selection.
 ///
@@ -44,8 +46,11 @@ pub(super) struct PreparedRequest {
     pub(super) expected_peak_sequence_tokens: Option<u64>,
     caller_set_rid: bool,
     pub(super) fans_out: bool,
-    /// `None` for `/generate` and embeddings, whose tokens replace text during preparation.
-    forwarding_scope: Option<ForwardingScope>,
+    /// Whether chat forwards `tokens` as `input_ids`; `None` for `/generate`,
+    /// embeddings, classify and rerank, which prepare their own body.
+    input_ids_forwarding: Option<InputIdsForwarding>,
+    /// Set by the first outgoing body, so a retry does not book it again.
+    forwarding_booked: bool,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
 }
@@ -80,6 +85,9 @@ impl PreparedRequest {
         let tokens = parsed_body
             .as_ref()
             .and_then(|parsed_body| request_tokens_for(&ctx.tokenizers, &model, parsed_body));
+        // Routing tokens can replace engine tokenization only for supported chat templates.
+        let forwarding =
+            input_ids_forwarding(forwarding_scope, parsed_body.as_ref(), tokens.as_ref());
         let input_tokens = input_token_count(tokens.as_ref(), &body);
         let output_tokens = fields.requested_max_output_tokens();
         Ok(Self {
@@ -95,7 +103,8 @@ impl PreparedRequest {
             tokens,
             caller_set_rid: fields.caller_set_rid,
             fans_out: requests_multiple_samples(&fields, &sampling_defaults),
-            forwarding_scope: Some(forwarding_scope),
+            input_ids_forwarding: Some(forwarding),
+            forwarding_booked: false,
             parsed_body,
             sampling_defaults,
         })
@@ -170,16 +179,18 @@ impl PreparedRequest {
             tokens,
             caller_set_rid: !value["rid"].is_null(),
             fans_out,
-            forwarding_scope: None,
+            input_ids_forwarding: None,
+            forwarding_booked: false,
             parsed_body: Some(value),
             sampling_defaults: Vec::new(),
         })
     }
 
-    /// The engine's OpenAI `EmbeddingRequest`, whose text `input` is forwarded
-    /// as token IDs, as `/generate` forwards `text`.
+    /// The engine's OpenAI `EmbeddingRequest` or its `ClassifyRequest`, whose text
+    /// `input` is forwarded as token IDs, as `/generate` forwards `text`.
     pub(super) fn embeddings(
         ctx: &AppContext,
+        path: &'static str,
         model: ModelId,
         mut body: Bytes,
         mut value: Value,
@@ -187,24 +198,22 @@ impl PreparedRequest {
         let batch = is_embedding_batch(&value["input"]);
         let text_ids = tokenize_input_text(ctx, &model, &value["input"]);
         let forward = !ctx.config.model.disable_input_ids_forwarding;
-        if let Some(ids) = text_ids.as_ref().filter(|_| forward) {
+        // `ClassifyRequest` takes the token IDs of one prompt, not of a batch.
+        let takes_ids = !(batch && path == CLASSIFY_PATH);
+        if let Some(ids) = text_ids.as_ref().filter(|_| forward && takes_ids) {
             value["input"] = if batch { json!(ids) } else { json!(ids[0]) };
             body = serde_json::to_vec(&value)
                 .map_err(|error| ApiError::Internal(error.into()))?
                 .into();
         }
         let prompts = text_ids.or_else(|| caller_token_rows(&value["input"]));
-        // Context limits apply to each prompt even when the engine must tokenize text;
-        // multimodal items count only their text, as image tokens are the engine's to count.
-        let estimate = |item: &Value| {
-            estimate_prefill_tokens(item.as_str().or(item["text"].as_str()).map_or(0, str::len))
-        };
-        let lengths = match (&prompts, &value["input"]) {
+        // Context limits apply to each prompt even when the engine must tokenize text.
+        let estimate = |item: &Value| estimate_prefill_tokens(text_len(item));
+        let lengths: Vec<_> = match (&prompts, &value["input"]) {
             (Some(prompts), _) => prompts.iter().map(|ids| ids.len().max(1)).collect(),
             (None, Value::Array(items)) => items.iter().map(estimate).collect(),
             (None, input) => vec![estimate(input)],
         };
-        let sequence_tokens = lengths.iter().copied().max().unwrap_or(1);
         let tokens = prompts
             .filter(|_| !batch)
             .and_then(|prompts| prompts.into_iter().next())
@@ -213,7 +222,38 @@ impl PreparedRequest {
                 rendered_from_chat: false,
             });
         Ok(Self {
-            path: EMBEDDINGS_PATH,
+            tokens,
+            caller_set_rid: !value["rid"].is_null(),
+            fans_out: batch,
+            ..Self::no_output(path, model, body, &lengths)
+        })
+    }
+
+    /// SGLang's `V1RerankReqInput`, forwarded as sent: the engine renders and
+    /// tokenizes each query-document pair as its own prompt.
+    pub(super) fn rerank(model: ModelId, body: Bytes) -> Result<Self, ApiError> {
+        let value = Value::Object(serde_json::from_slice(&body).map_err(|_| invalid_request())?);
+        // Qwen rerankers include the instruction in every query-document prompt.
+        let shared = text_len(&value["instruct"]) + text_len(&value["query"]);
+        let lengths: Vec<_> = value["documents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|document| estimate_prefill_tokens(shared + text_len(document)))
+            .collect();
+        Ok(Self {
+            // Each document is its own engine request, and the engine reads no `rid`.
+            fans_out: true,
+            ..Self::no_output(RERANK_PATH, model, body, &lengths)
+        })
+    }
+
+    /// A request of `lengths` prompts that generates nothing. No PD serves it,
+    /// so it keeps no parsed body for bootstrap fields.
+    fn no_output(path: &'static str, model: ModelId, body: Bytes, lengths: &[usize]) -> Self {
+        let sequence_tokens = lengths.iter().copied().max().unwrap_or(1);
+        Self {
+            path,
             model,
             streaming: false,
             output_tokens: Some(0),
@@ -221,19 +261,20 @@ impl PreparedRequest {
             sequence_token_count: sequence_tokens,
             expected_peak_sequence_tokens: Some(sequence_tokens as u64),
             body,
-            tokens,
-            caller_set_rid: !value["rid"].is_null(),
-            fans_out: batch,
-            forwarding_scope: None,
-            // Only PD bootstrap needs the parsed body, and embeddings have no PD.
+            tokens: None,
+            caller_set_rid: false,
+            fans_out: false,
+            input_ids_forwarding: None,
+            forwarding_booked: false,
             parsed_body: None,
             sampling_defaults: Vec::new(),
-        })
+        }
     }
 
-    /// Whether the engine endpoint honors a routed DP rank; `/v1/embeddings` takes none.
+    /// Whether the engine endpoint honors a routed DP rank; embeddings, classify
+    /// and rerank take none.
     pub(super) fn accepts_dp_rank(&self) -> bool {
-        self.path != EMBEDDINGS_PATH
+        !matches!(self.path, EMBEDDINGS_PATH | CLASSIFY_PATH | RERANK_PATH)
     }
 
     pub(super) fn engine_rid(&self) -> Option<String> {
@@ -245,24 +286,23 @@ impl PreparedRequest {
         Some(uuid::Uuid::new_v4().simple().to_string())
     }
 
-    pub(super) fn into_outgoing_body(
-        self,
+    /// The engine body for one dispatch attempt; each attempt brings its own
+    /// bootstrap fields and rid.
+    pub(super) fn outgoing_body(
+        &mut self,
         ctx: &AppContext,
         bootstrap: Option<&BootstrapFields>,
         engine_rid: Option<&str>,
     ) -> Result<Bytes, ApiError> {
-        // Routing tokens can replace engine tokenization only for supported chat templates.
-        let forwarding = self.forwarding_scope.map(|scope| {
-            input_ids_forwarding(scope, self.parsed_body.as_ref(), self.tokens.as_ref())
-        });
         let input_ids = self
             .tokens
             .as_ref()
-            .filter(|_| forwarding == Some(InputIdsForwarding::Forwarded))
+            .filter(|_| self.input_ids_forwarding == Some(InputIdsForwarding::Forwarded))
             .map(|tokens| tokens.ids.as_slice());
+        // The first attempt consumes the cached parse; a retry re-parses `body`.
         let body = build_outgoing_body(
             &self.body,
-            self.parsed_body,
+            self.parsed_body.take(),
             input_ids,
             bootstrap,
             &self.sampling_defaults,
@@ -270,7 +310,8 @@ impl PreparedRequest {
         )?;
         // Book only after the outgoing body exists; a request rejected here
         // (an f64-overflow literal re-parsed for PD bootstrap) was never dispatched.
-        if let Some(forwarding) = forwarding {
+        if let (Some(forwarding), false) = (self.input_ids_forwarding, self.forwarding_booked) {
+            self.forwarding_booked = true;
             ctx.metrics
                 .record_input_ids_forwarding(&self.model.0, forwarding);
             if forwarding == InputIdsForwarding::TokenizeFailed {
@@ -413,6 +454,18 @@ fn tokenize_input_text(ctx: &AppContext, model: &ModelId, input: &Value) -> Opti
         .into_iter()
         .map(|text| ctx.tokenizers.encode_prompt(&model.0, text))
         .collect()
+}
+
+/// Prompt text bytes of a string, a multimodal item or a list of content parts;
+/// image tokens are the engine's to count.
+fn text_len(content: &Value) -> usize {
+    match content {
+        Value::Array(parts) => parts.iter().map(text_len).sum(),
+        content => content
+            .as_str()
+            .or(content["text"].as_str())
+            .map_or(0, str::len),
+    }
 }
 
 /// Caller token IDs, one flat list or a row per prompt; `None` if malformed,
@@ -1127,7 +1180,7 @@ mod tests {
     fn prepare_embeddings(ctx: &AppContext, input: Value) -> (PreparedRequest, Value) {
         let body = Bytes::from(json!({"model": "stub-model", "input": input}).to_string());
         let (model, value) = parse_embedding_request(&body).unwrap();
-        let r = PreparedRequest::embeddings(ctx, model, body, value).unwrap();
+        let r = PreparedRequest::embeddings(ctx, EMBEDDINGS_PATH, model, body, value).unwrap();
         let input = serde_json::from_slice::<Value>(&r.body).unwrap()["input"].take();
         (r, input)
     }
@@ -1186,6 +1239,21 @@ mod tests {
         let (r, input) = prepare_embeddings(&ctx, json!("hi"));
         let ids = ctx.tokenizers.encode_prompt("stub-model", "hi");
         assert_eq!((input, r.tokens.map(|t| t.ids)), (json!("hi"), ids));
+    }
+
+    #[test]
+    fn rerank_estimates_each_query_document_pair() {
+        let image = json!({"type": "image_url", "image_url": {"url": "x".repeat(4096)}});
+        let documents = json!(["abcd", [{"type": "text", "text": "abcdefgh"}, image]]);
+        for (instruct, total, longest) in [(json!(null), 5, 3), (json!("abcdefgh"), 9, 5)] {
+            let body = json!({"query": "abcd", "documents": documents, "instruct": instruct});
+            let r = PreparedRequest::rerank(ModelId("stub-model".into()), body.to_string().into());
+            let r = r.unwrap();
+            assert_eq!(
+                (r.input_token_count, r.sequence_token_count),
+                (total, longest)
+            );
+        }
     }
 
     #[test]

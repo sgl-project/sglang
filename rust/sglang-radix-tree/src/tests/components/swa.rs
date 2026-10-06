@@ -1831,9 +1831,12 @@ fn acquire_lock_walks_until_the_window_fills_and_stamps_the_crossing_node() {
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
     // The walk fills the 2-atom window at b; b carries the first minted uuid.
-    assert_eq!(result.component_lock_uuids[&(SWA.idx() as u8)], Some(2));
+    assert_eq!(
+        result.component_lock_uuids[&(SWA.idx() as u8)],
+        Some(100_000_000_000_001)
+    );
     assert!(result.component_host_lock_uuids.is_empty());
-    assert_eq!(node_swa_uuid(&tc, b), Some(2));
+    assert_eq!(node_swa_uuid(&tc, b), Some(100_000_000_000_001));
     assert_eq!(node_swa_uuid(&tc, c), None);
     assert_eq!(tc.swa_evictable_size(), 1);
     assert_eq!(tc.swa_protected_size(), 2);
@@ -1884,8 +1887,11 @@ fn acquire_lock_overshooting_the_window_stops_at_the_crossing_node() {
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
-    assert_eq!(result.component_lock_uuids[&(SWA.idx() as u8)], Some(2));
-    assert_eq!(node_swa_uuid(&tc, b), Some(2));
+    assert_eq!(
+        result.component_lock_uuids[&(SWA.idx() as u8)],
+        Some(100_000_000_000_001)
+    );
+    assert_eq!(node_swa_uuid(&tc, b), Some(100_000_000_000_001));
     assert_eq!(node_swa_uuid(&tc, a), None);
     assert_eq!(tc.swa_evictable_size(), 2);
     assert_eq!(tc.swa_protected_size(), 4);
@@ -2063,10 +2069,10 @@ fn acquire_host_lock_walks_until_the_window_fills_and_stamps_the_host_uuid() {
     // The window fills at b; b carries the host uuid and leaves the host LRU.
     assert_eq!(
         result.component_host_lock_uuids[&(SWA.idx() as u8)],
-        Some(2)
+        Some(100_000_000_000_001)
     );
     assert!(result.component_lock_uuids.is_empty());
-    assert_eq!(node_swa_host_uuid(&tc, b), Some(2));
+    assert_eq!(node_swa_host_uuid(&tc, b), Some(100_000_000_000_001));
     assert_eq!(node_swa_host_uuid(&tc, c), None);
     assert!(!tc.host_lru_list(SWA).in_list(Some(c)));
     assert!(!tc.host_lru_list(SWA).in_list(Some(b)));
@@ -2202,9 +2208,9 @@ fn acquire_host_lock_stamps_the_host_tier_uuid_field_only() {
     // The boundary uuid lands on the host-tier field; the device field stays clear.
     assert_eq!(
         result.component_host_lock_uuids[&(SWA.idx() as u8)],
-        Some(2)
+        Some(100_000_000_000_001)
     );
-    assert_eq!(node_swa_host_uuid(&tc, b), Some(2));
+    assert_eq!(node_swa_host_uuid(&tc, b), Some(100_000_000_000_001));
     assert_eq!(node_swa_uuid(&tc, b), None);
     assert_eq!(node_swa_host_uuid(&tc, c), None);
     assert_eq!(node_swa_uuid(&tc, c), None);
@@ -2232,10 +2238,16 @@ fn device_and_host_lock_walks_mint_independent_uuids() {
         IncLockRefResult::default(),
         /* lock_host = */ true,
     );
-    assert_eq!(device.component_lock_uuids[&(SWA.idx() as u8)], Some(2));
-    assert_eq!(host.component_host_lock_uuids[&(SWA.idx() as u8)], Some(3));
-    assert_eq!(node_swa_uuid(&tc, b), Some(2));
-    assert_eq!(node_swa_host_uuid(&tc, b), Some(3));
+    assert_eq!(
+        device.component_lock_uuids[&(SWA.idx() as u8)],
+        Some(100_000_000_000_001)
+    );
+    assert_eq!(
+        host.component_host_lock_uuids[&(SWA.idx() as u8)],
+        Some(100_000_000_000_002)
+    );
+    assert_eq!(node_swa_uuid(&tc, b), Some(100_000_000_000_001));
+    assert_eq!(node_swa_host_uuid(&tc, b), Some(100_000_000_000_002));
 }
 
 #[test]
@@ -3658,6 +3670,38 @@ fn redistribute_on_node_split_preserves_host_lock_state() {
     assert_eq!(node_swa_host_uuid(&tc, node), None);
     assert!(!tc.host_lru_list(SWA).in_list(Some(parent)));
     assert!(!tc.host_lru_list(SWA).in_list(Some(node)));
+}
+
+#[test]
+fn host_lock_receipt_releases_every_split_fragment() {
+    let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    tc.insert(&insert_params_swa(
+        &vec![1, 2, 3, 4],
+        &[10, 11, 12, 13],
+        0,
+        0,
+    ));
+    let root = tc.arena.root();
+    let node = child_of(&tc, root, &[1]);
+    set_swa_host(&mut tc, node);
+
+    let node_handle = tc.arena.node(node).id;
+    let lock = tc.inc_host_lock_ref(node_handle).expect("live test node");
+    assert!(
+        lock.component_host_lock_uuids
+            .contains_key(&(SWA.idx() as u8))
+    );
+
+    let (parent, _) = tc.split_node_(node, /* split_len = */ 2);
+    assert_eq!(tc.arena.host_lock_ref(parent, SWA), 1);
+    assert_eq!(tc.arena.host_lock_ref(node, SWA), 1);
+
+    tc.dec_host_lock_ref(node_handle, &lock.to_dec_params())
+        .expect("live test node");
+    assert_eq!(tc.arena.host_lock_ref(parent, SWA), 0);
+    assert_eq!(tc.arena.host_lock_ref(node, SWA), 0);
+    assert!(tc.host_lru_list(SWA).in_list(Some(parent)));
+    assert!(tc.host_lru_list(SWA).in_list(Some(node)));
 }
 
 #[test]

@@ -59,7 +59,7 @@ class TestSGLangRadixTreeCargo(CustomTestCase):
 
     def test_sglang_radix_tree_native_tests(self):
         build = torch_build_configuration(
-            compat_header=SGLANG_RADIX_TREE_MANIFEST.parent / "torch_2_13_compat.h",
+            compat_header=SGLANG_RADIX_TREE_MANIFEST.parent / "torch_compat.h",
             python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
         )
         self._run_cargo_test("torch", ["--features", "torch"], env=build.environment)
