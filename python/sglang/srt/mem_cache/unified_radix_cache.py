@@ -976,9 +976,6 @@ class UnifiedRadixCache(BasePrefixCache):
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
     ) -> IncLockRefResult:
-        result = self.session.try_inc_lock_ref(node_id)
-        if result is not None:
-            return result
         if self.disable:
             return IncLockRefResult()
         return self.tree_core.inc_lock_ref(node_id, skip_lock_components)
@@ -989,9 +986,6 @@ class UnifiedRadixCache(BasePrefixCache):
         params: DecLockRefParams,
         skip_swa: bool = False,
     ) -> DecLockRefResult:
-        result = self.session.try_dec_lock_ref(node_id, params)
-        if result is not None:
-            return result
         if self.disable:
             return DecLockRefResult()
         return self.tree_core.dec_lock_ref(node_id, params, skip_swa)

@@ -8,9 +8,6 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
-    DecLockRefResult,
-    IncLockRefResult,
     MatchPrefixParams,
     MatchResult,
     TreeLock,
@@ -75,16 +72,6 @@ class StreamingSession:
         return any(s.kv.holds_kv for s in self.slots.values())
 
     # -- Try-handle entries (see class docstring) --
-
-    def try_inc_lock_ref(self, node: Any) -> Optional[IncLockRefResult]:
-        """No-op lock if ``node`` is a session-internal sentinel; returns
-        None to tell the caller to run its raw tree lock path."""
-        return IncLockRefResult() if is_virtual_node(node) else None
-
-    def try_dec_lock_ref(
-        self, node: Any, params: Optional[DecLockRefParams] = None
-    ) -> Optional[DecLockRefResult]:
-        return DecLockRefResult() if is_virtual_node(node) else None
 
     def find_active_slot(self, req: Req) -> Optional[SessionSlot]:
         """A pre-aborted req (to_finish set) is detached from the session and
