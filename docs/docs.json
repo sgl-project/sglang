@@ -1608,6 +1608,14 @@
                     ]
                   },
                   {
+                    "group": "Kandinsky",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/Kandinsky/Kandinsky6",
+                      "cookbook/diffusion/Kandinsky/Kandinsky6-SR"
+                    ]
+                  },
+                  {
                     "group": "LingBot Video",
                     "tag": "NEW",
                     "pages": [
