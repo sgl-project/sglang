@@ -491,7 +491,7 @@ _SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
 # The MHA backends that read through the KV-index translator on every path a
 # draft forward takes. A fused draft region holds dense K/V rows, so a fused
 # draft runs only on these.
-TRANSLATED_MHA_RAILS = frozenset({"triton", "flashinfer", "fa3"})
+TRANSLATED_MHA_RAILS = frozenset({"triton", "flashinfer", "fa3", "trtllm_mha"})
 
 
 def _assert_spec_verify_backends(
