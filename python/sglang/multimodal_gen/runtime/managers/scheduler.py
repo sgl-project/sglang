@@ -1381,6 +1381,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if self.receiver is not None:
             logger.debug("Driver scheduler of dp replica %d listening", self.dp_replica)
 
+        release_cache_if_idle = getattr(self.worker, "release_cache_if_idle", None)
+        if release_cache_if_idle is not None:
+            self.worker.defer_cache_release = True
+
         while self._running:
             self._reap_finalizes()
 
@@ -1426,6 +1430,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             # 2: execute, make sure a reply is always sent
             items = self.get_next_batch_to_run()
             if not items:
+                if (
+                    release_cache_if_idle is not None
+                    and not self.waiting_queue
+                    and not self._inflight_finalizes
+                ):
+                    release_cache_if_idle()
                 if self.waiting_queue and self._dynamic_batching_enabled():
                     oldest_ts = self.waiting_queue[0][2]
                     elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
