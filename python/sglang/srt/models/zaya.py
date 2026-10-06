@@ -52,9 +52,13 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.zaya import ZayaConfig
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
 )
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -64,6 +68,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.utils import adds_replicated_output_to_partial
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -76,7 +81,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
+from sglang.srt.utils import add_prefix, make_pp_layers, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +123,72 @@ class ResidualScaling(nn.Module):
             residual = (residual.float() + res_bias) * res_scale
 
         return residual, hidden_states
+
+
+class _ResidualMergeRead:
+    """How a ZAYA1 stage reads its input: its ResidualScaling, when the config
+    has one, on the incoming contribution and the fp32 residual, their fp32
+    sum as the new residual, and the input norm of that sum in the model
+    dtype. The producer's update must be a plain add."""
+
+    is_plain_norm = False
+    reads_before_dp_gather = False
+
+    def __init__(self, res_scale: Optional[ResidualScaling]):
+        self.res_scale = res_scale
+
+    def _merge(self, residual, hidden_states):
+        if self.res_scale is not None:
+            residual, hidden_states = self.res_scale(residual, hidden_states)
+        if residual is None:
+            return hidden_states.float()
+        return residual.float() + hidden_states.float()
+
+    def init_residual(self, hidden_states):
+        return self._merge(None, hidden_states)
+
+    def read(self, residual, norm, quant_format="", post_residual_addition=None):
+        if quant_format or post_residual_addition is not None:
+            raise NotImplementedError(
+                f"a ZAYA1 read with {quant_format=} or a post-residual addition"
+            )
+        hidden_states = _apply_norm_with_fp32_residual(
+            norm, residual, norm.weight.dtype
+        )
+        return hidden_states, residual
+
+    def update_and_read(
+        self,
+        update,
+        hidden_states,
+        residual,
+        norm,
+        quant_format="",
+        post_residual_addition=None,
+    ):
+        if not update.is_plain_add:
+            raise NotImplementedError("a ZAYA1 read after a non-plain update")
+        return self.read(
+            self._merge(residual, hidden_states),
+            norm,
+            quant_format,
+            post_residual_addition,
+        )
+
+
+class _MergedNorm:
+    """The final norm, in the norm calling convention, read through the same
+    merge as the layers."""
+
+    def __init__(self, read: _ResidualMergeRead, norm: nn.Module):
+        self.read = read
+        self.norm = norm
+
+    def __call__(self, hidden_states, residual=None):
+        if residual is None:
+            residual = self.read.init_residual(hidden_states)
+            return self.read.read(residual, self.norm)[0]
+        return self.read.update_and_read(PLAIN_ADD, hidden_states, residual, self.norm)
 
 
 def _apply_norm_with_fp32_residual(
@@ -829,7 +900,6 @@ class ZayaAttention(nn.Module):
         # divisible by tp_size; the KV-replicated GQA-TP variant (tp_size >
         # num_k_heads) is intentionally rejected with a clear error message
         # because both per-K-head paths assume each rank holds whole K heads.
-        self.tp_rank = get_parallel().tp_rank
         self.tp_size = get_parallel().tp_size
         # The head split, the ``o_proj`` RowParallel all-reduce, and the
         # RadixAttention KV cache are all organized on the *global* TP group,
@@ -843,7 +913,7 @@ class ZayaAttention(nn.Module):
         assert attn_tp_size == self.tp_size, (
             f"ZAYA1 head-parallel attention requires the attention TP group "
             f"({attn_tp_size}) to equal the global TP group ({self.tp_size}); "
-            "DP attention (enable_dp_attention) is not supported for ZAYA1."
+            "attention DP is not supported for ZAYA1."
         )
         assert self.num_q_heads_full % self.tp_size == 0, (
             f"num_attention_heads ({self.num_q_heads_full}) must be divisible "
@@ -873,22 +943,18 @@ class ZayaAttention(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("qkv", prefix),
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
         )
 
-        # RowParallel o_proj: per-rank input is the rank's q heads, full
-        # output is replicated via the end-of-forward all-reduce.
+        # RowParallel o_proj: per-rank input is the rank's q heads; the next
+        # stage's input completes the sum.
         self.o_proj = RowParallelLinear(
             self.q_dim_full,
             self.hidden_size,
             bias=bool(getattr(config, "attention_bias", False)),
             input_is_parallel=True,
-            reduce_results=True,
+            reduce_results=False,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
         )
 
         rope_theta = float(getattr(config, "rope_theta", 1_000_000.0))
@@ -1089,37 +1155,36 @@ def mod_premask_experts(
     indices: torch.Tensor,
     num_moe_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mask the (per-rank, pre-all-reduce) expert output for the MOD skip path.
+    """Mask the (per-rank, partial) expert output for the MOD skip path.
 
     Returns ``(mod_mask, masked_experts)`` where ``mod_mask`` is ``1`` for
     tokens routed to a real expert and ``0`` for tokens routed to the skip
     slot (``indices == num_moe_experts``), and
     ``masked_experts = mod_mask * experts_out``.
 
-    The masking is applied *before* the cross-rank all-reduce so the single
-    reduction yields ``mask · sum_r(partial_r) = mask · experts_out_full``
-    without the replicated ``mod_out`` term being summed ``tp_size`` times.
-    Pairs with :func:`mod_blend`, which adds the skip-path term back after the
-    reduce. Kept as a free function so the MOD math is unit-testable without a
-    live ``torch.distributed`` group.
+    The mask is replicated, so the TP sum of the masked partials is
+    ``mask · experts_out_full``. Pairs with :func:`mod_blend`, which adds the
+    skip-path term. Kept as a free function so the MOD math is unit-testable
+    without a live ``torch.distributed`` group.
     """
     mod_mask = (indices != num_moe_experts).to(experts_out.dtype)
     return mod_mask, mod_mask * experts_out
 
 
 def mod_blend(
-    masked_experts_reduced: torch.Tensor,
+    masked_experts: torch.Tensor,
     mod_mask: torch.Tensor,
     mod_out: torch.Tensor,
 ) -> torch.Tensor:
-    """Combine the already-all-reduced masked expert output with the skip path.
+    """Add the skip path, weighted by ``(1 - mod_mask)``, to the masked expert
+    output.
 
     ``mod_out`` (the skip-expert residual, ``hidden_states * prob``) is
-    replicated on every rank, so it is folded in here -- after the reduce of
-    ``masked_experts`` -- weighted by ``(1 - mod_mask)``. See
-    :func:`mod_premask_experts`.
+    replicated on every rank. While ``masked_experts`` is still a partial TP
+    sum, only one rank may add it (:func:`adds_replicated_output_to_partial`),
+    so that the sum counts it once. See :func:`mod_premask_experts`.
     """
-    return masked_experts_reduced + (1.0 - mod_mask) * mod_out
+    return masked_experts + (1.0 - mod_mask) * mod_out
 
 
 class ZayaBlock(nn.Module):
@@ -1206,25 +1271,21 @@ class ZayaBlock(nn.Module):
 
             experts_out = self.experts(hidden_states, topk_out)
             # ``mod_out`` is computed identically on every TP rank (both
-            # ``hidden_states`` and ``probs`` are replicated). Fold the skip
-            # mask into the per-rank partial experts output *before*
-            # all-reduce so the single reduction yields:
+            # ``hidden_states`` and ``probs`` are replicated). The output is a
+            # partial TP sum that the stage boundary completes, so only one
+            # rank adds the skip path:
             #   sum_r(mask · partial_r) + (1 - mask) · mod_out
             # = mask · experts_out_full + (1 - mask) · mod_out
-            # without double-counting ``mod_out`` by tp_size. The two steps are
-            # ``mod_premask_experts`` / ``mod_blend`` so the math is testable
-            # without a live distributed group.
+            # The two steps are ``mod_premask_experts`` / ``mod_blend`` so the
+            # math is testable without a live distributed group.
             mod_out = hidden_states * probs
-            mod_mask, masked_experts = mod_premask_experts(
+            mod_mask, hidden_out = mod_premask_experts(
                 experts_out, indices, self.num_moe_experts
             )
-            if self.tp_size > 1:
-                masked_experts = tensor_model_parallel_all_reduce(masked_experts)
-            hidden_out = mod_blend(masked_experts, mod_mask, mod_out)
+            if adds_replicated_output_to_partial():
+                hidden_out = mod_blend(hidden_out, mod_mask, mod_out)
         else:
             hidden_out = self.experts(hidden_states, topk_out)
-            if self.tp_size > 1:
-                hidden_out = tensor_model_parallel_all_reduce(hidden_out)
 
         return hidden_out, router_hs_next
 
@@ -1259,6 +1320,10 @@ class ZayaDecoderATTLayer(nn.Module):
             self.res_scale = ResidualScaling(config, layer_id)
         else:
             self.res_scale = None
+        (self.attn_boundary,) = append_stages(
+            (declare_attn(read=_ResidualMergeRead(self.res_scale)), self.input_norm),
+        )
+        self.entry_boundary = self.attn_boundary
 
     @staticmethod
     def _build_norm(config: ZayaConfig) -> nn.Module:
@@ -1271,27 +1336,14 @@ class ZayaDecoderATTLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         prev_router_hidden_states: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        target_dtype = (
-            self.input_norm.weight.dtype
-            if isinstance(self.input_norm, RMSNorm)
-            else hidden_states.dtype
-        )
-        if self.res_scale is not None:
-            residual, hidden_states = self.res_scale(residual, hidden_states)
-        if residual is not None:
-            residual = residual.float() + hidden_states.float()
-        else:
-            residual = hidden_states.float()
-        hidden_states = _apply_norm_with_fp32_residual(
-            self.input_norm, residual, target_dtype
-        )
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.self_attn(hidden_states, positions, forward_batch)
-        return hidden_states, residual, prev_router_hidden_states
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        return hidden_states, prev_router_hidden_states
 
 
 class ZayaDecoderMLPLayer(nn.Module):
@@ -1319,33 +1371,31 @@ class ZayaDecoderMLPLayer(nn.Module):
             self.res_scale = ResidualScaling(config, layer_id)
         else:
             self.res_scale = None
+        (self.ffn_boundary,) = append_stages(
+            (
+                declare_ffn(
+                    sparse=True,
+                    next_layer_sparse=True,
+                    read=_ResidualMergeRead(self.res_scale),
+                ),
+                self.input_norm,
+            ),
+        )
+        self.entry_boundary = self.ffn_boundary
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         prev_router_hidden_states: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        target_dtype = (
-            self.input_norm.weight.dtype
-            if isinstance(self.input_norm, RMSNorm)
-            else hidden_states.dtype
-        )
-        if self.res_scale is not None:
-            residual, hidden_states = self.res_scale(residual, hidden_states)
-        if residual is not None:
-            residual = residual.float() + hidden_states.float()
-        else:
-            residual = hidden_states.float()
-        hidden_states = _apply_norm_with_fp32_residual(
-            self.input_norm, residual, target_dtype
-        )
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states, prev_router_hidden_states = self.zaya_block(
             hidden_states, prev_router_hidden_states
         )
-        return hidden_states, residual, prev_router_hidden_states
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        return hidden_states, prev_router_hidden_states
 
 
 # ---------------------------------------------------------------------------
@@ -1400,7 +1450,7 @@ class ZayaModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: _build_layer(
                 layer_id=idx,
@@ -1408,8 +1458,6 @@ class ZayaModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
 
@@ -1419,6 +1467,9 @@ class ZayaModel(nn.Module):
                 self.res_scale = ResidualScaling(config, config.num_hidden_layers)
             else:
                 self.res_scale = None
+            self._final_merged_norm = _MergedNorm(
+                _ResidualMergeRead(self.res_scale), self.final_norm
+            )
         else:
             self.final_norm = PPMissingLayer()
             self.res_scale = None
@@ -1436,46 +1487,27 @@ class ZayaModel(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].entry_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         prev_router_hidden_states: Optional[torch.Tensor] = None
         for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states, residual, prev_router_hidden_states = layer(
+            hidden_states, prev_router_hidden_states = self.layers[i](
                 hidden_states=hidden_states,
-                residual=residual,
                 positions=positions,
                 forward_batch=forward_batch,
                 prev_router_hidden_states=prev_router_hidden_states,
             )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-
-        if self.res_scale is not None:
-            residual, hidden_states = self.res_scale(residual, hidden_states)
-        target_dtype = (
-            self.final_norm.weight.dtype
-            if isinstance(self.final_norm, RMSNorm)
-            else hidden_states.dtype
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        return residual_batch.final_norm(
+            hidden_states, forward_batch, self._final_merged_norm
         )
-        if residual is not None:
-            merged = hidden_states.float() + residual.float()
-        else:
-            merged = hidden_states.float()
-        hidden_states = _apply_norm_with_fp32_residual(
-            self.final_norm, merged, target_dtype
-        )
-        return hidden_states
 
 
 class ZayaForCausalLM(nn.Module):

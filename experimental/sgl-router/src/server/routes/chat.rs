@@ -5,13 +5,14 @@ mod forward;
 mod preparation;
 mod reorg;
 
+use crate::buckets_reorg::BucketResolver;
 use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
-use crate::discovery::{ModelId, WorkerMode};
+use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
-use crate::policies::{ExternalPrefixSignal, Policy};
+use crate::policies::{Policy, PrefixLookupResult};
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
@@ -22,8 +23,11 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
-use forward::{forward_chat_request, SelectedWorkers};
-use preparation::{parse_routing_fields, PreparedChatRequest};
+use forward::{forward_request, RequestDurationGuard, SelectedWorkers};
+use preparation::{
+    parse_embedding_request, parse_routing_fields, PreparedRequest, CLASSIFY_PATH, EMBEDDINGS_PATH,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -40,19 +44,6 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
-    match &ctx.chat_routing {
-        ChatRouting::Legacy => chat_completions_legacy(&ctx, headers, body).await,
-        ChatRouting::Reorg(resolvers) => {
-            reorg::chat_completions(&ctx, resolvers, headers, body).await
-        }
-    }
-}
-
-async fn chat_completions_legacy(
-    ctx: &AppContext,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
     let mut fields = parse_routing_fields(&body)?;
     let model = ModelId(
@@ -61,34 +52,188 @@ async fn chat_completions_legacy(
             .take()
             .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
     );
+    let routing = ModelRouting::lookup(&ctx, &model)?;
+    let request = PreparedRequest::chat(
+        &ctx,
+        model,
+        fields,
+        body,
+        routing.needs_request_tokens(&ctx),
+    )?;
+    routing.dispatch(&ctx, request, headers, start).await
+}
 
-    let policy = ctx
-        .policies
-        .get(&model)
-        .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
+/// SGLang's native `/generate`: same request and response schema as the engine.
+/// The body names no model, so it goes to the one this router serves.
+pub async fn generate(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    let start = Instant::now();
+    let model = ModelId(ctx.config.model.id.clone());
+    let routing = ModelRouting::lookup(&ctx, &model)?;
+    let request = PreparedRequest::generate(&ctx, model, body)?;
+    routing.dispatch(&ctx, request, headers, start).await
+}
 
-    // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
-    let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
-    let candidates = resolver
-        .prefill_candidates(&model)
-        .map_err(|error| pool_error(error, &model))?;
+/// OpenAI `/v1/embeddings`, forwarded to the engine's with the same request and response.
+pub async fn embeddings(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    embedding_input(ctx, EMBEDDINGS_PATH, headers, body).await
+}
 
-    let request =
-        PreparedChatRequest::prepare(ctx, model, fields, body, policy.needs_request_tokens())?;
+/// SGLang's `/v1/classify`, which takes the same `input` as embeddings.
+pub async fn classify(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    embedding_input(ctx, CLASSIFY_PATH, headers, body).await
+}
 
-    // Pick a plain worker, or a prefill worker followed by a decode peer in PD mode.
-    let workers = select_workers(
-        ctx,
-        &request,
-        &headers,
-        policy.as_ref(),
-        &candidates,
-        &resolver,
-    )
-    .await?;
+async fn embedding_input(
+    ctx: Arc<AppContext>,
+    path: &'static str,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    let start = Instant::now();
+    let (model, value) = parse_embedding_request(&body)?;
+    let routing = ModelRouting::lookup(&ctx, &model)?;
+    require_plain_workers(&ctx, &model, path)?;
+    let request = PreparedRequest::embeddings(&ctx, path, model, body, value)?;
+    routing.dispatch(&ctx, request, headers, start).await
+}
 
-    // PD sends to both workers and returns the decode response.
-    forward_chat_request(ctx, request, workers, headers, start).await
+/// SGLang's `/v1/rerank`, forwarded as sent to the model this router serves.
+pub async fn rerank(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    let start = Instant::now();
+    let model = ModelId(ctx.config.model.id.clone());
+    let routing = ModelRouting::lookup(&ctx, &model)?;
+    require_plain_workers(&ctx, &model, "/v1/rerank")?;
+    let request = PreparedRequest::rerank(model, body)?;
+    routing.dispatch(&ctx, request, headers, start).await
+}
+
+/// Prefill and decode engines serve generation only.
+fn require_plain_workers(ctx: &AppContext, model: &ModelId, path: &str) -> Result<(), ApiError> {
+    let registered = ctx.registry.workers_for(model);
+    if registered.iter().any(|w| w.mode() != WorkerMode::Plain) {
+        return Err(ApiError::BadRequest(format!(
+            "{path} is not served by prefill-decode workers"
+        )));
+    }
+    Ok(())
+}
+
+/// A model's routing state, resolved before the request is prepared.
+enum ModelRouting<'a> {
+    Legacy(Arc<dyn Policy>),
+    Reorg(&'a BucketResolver),
+}
+
+impl<'a> ModelRouting<'a> {
+    fn lookup(ctx: &'a AppContext, model: &ModelId) -> Result<Self, ApiError> {
+        let routing = match &ctx.chat_routing {
+            ChatRouting::Legacy => ctx.policies.get(model).map(Self::Legacy),
+            ChatRouting::Reorg(resolvers) => resolvers.get(model).map(Self::Reorg),
+        };
+        routing.ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))
+    }
+
+    fn needs_request_tokens(&self, ctx: &AppContext) -> bool {
+        match self {
+            Self::Legacy(policy) => policy.needs_request_tokens() || ctx.config.model.dp_aware,
+            // The same predicate gates `--no-tokenizer` at startup,
+            // so a load-only bucket skips the body parse.
+            Self::Reorg(resolver) => resolver.needs_request_tokens(),
+        }
+    }
+
+    /// Select workers for `request` and forward it to them. An attempt that
+    /// fails before any response reaches the client is retried on workers it
+    /// has not tried, up to `--retry-max-attempts`.
+    async fn dispatch(
+        &self,
+        ctx: &AppContext,
+        mut request: PreparedRequest,
+        headers: HeaderMap,
+        start: Instant,
+    ) -> Result<Response<Body>, ApiError> {
+        let mut excluded = Vec::new();
+        let mut failed = None;
+        let mut duration = None;
+        for _ in 0..ctx.config.proxy.max_attempts.get() {
+            // A retry never starts past the request's stale deadline.
+            if failed.is_some()
+                && start.elapsed() >= ctx.router_inflight_load.stale_request_timeout()
+            {
+                break;
+            }
+            let workers = match self
+                .select_workers(ctx, &request, &headers, &excluded)
+                .await
+            {
+                Ok(workers) => workers,
+                // Every eligible worker already failed this request: report the last failure.
+                Err(error) => return failed.ok_or(error),
+            };
+            if failed.is_some() {
+                ctx.metrics.record_retry(&request.model.0);
+            }
+            let duration = duration
+                .get_or_insert_with(|| RequestDurationGuard::new(ctx, &request.model, start));
+            let attempt =
+                forward_request(ctx, &mut request, workers, headers.clone(), start, duration)
+                    .await?;
+            if attempt.retry_excluding.is_empty() {
+                return Ok(attempt.response);
+            }
+            excluded.extend(attempt.retry_excluding);
+            failed = Some(attempt.response);
+        }
+        Ok(failed.expect("at least one attempt"))
+    }
+
+    /// Pick a plain worker, or a prefill worker followed by a decode peer in PD mode,
+    /// never one in `excluded`.
+    async fn select_workers(
+        &self,
+        ctx: &AppContext,
+        request: &PreparedRequest,
+        headers: &HeaderMap,
+        excluded: &[WorkerId],
+    ) -> Result<SelectedWorkers, ApiError> {
+        match self {
+            Self::Legacy(policy) => {
+                // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
+                let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry)).excluding(excluded);
+                let candidates = resolver
+                    .prefill_candidates(&request.model)
+                    .map_err(|error| pool_error(error, &request.model))?;
+                select_workers(
+                    ctx,
+                    request,
+                    headers,
+                    policy.as_ref(),
+                    &candidates,
+                    &resolver,
+                )
+                .await
+            }
+            Self::Reorg(resolver) => {
+                reorg::select_workers(ctx, resolver, request, headers, excluded).await
+            }
+        }
+    }
 }
 
 fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {
@@ -102,7 +247,7 @@ fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {
 
 async fn select_workers(
     ctx: &AppContext,
-    request: &PreparedChatRequest,
+    request: &PreparedRequest,
     headers: &HeaderMap,
     policy: &dyn Policy,
     candidates: &[Arc<Worker>],
@@ -115,13 +260,59 @@ async fn select_workers(
         ..RoutingContext::from_headers(ctx, headers)?
     };
 
-    let prefill = pick_prefill_worker(ctx, request, policy, candidates, &routing_context)?;
-    let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context)?;
+    let candidates = prefills_with_decode(ctx, request, candidates, resolver, &routing_context);
+    let prefill = pick_prefill_worker(ctx, request, policy, &candidates, &routing_context)?;
+    let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context, true)?;
+    record_prefill_route(ctx, routing_context.prefix_matches.as_ref(), &prefill.url);
     Ok(SelectedWorkers {
         prefill,
         decode,
         track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
     })
+}
+
+/// Credit the chosen prefill with the prompt's prefix until KV events confirm
+/// it. Called only once the whole selection succeeded, so a request that is
+/// never dispatched credits nobody.
+fn record_prefill_route(ctx: &AppContext, signal: Option<&PrefixLookupResult>, prefill_url: &str) {
+    if let (Some(provider), Some(signal)) = (&ctx.radix_tree_prefix_provider, signal) {
+        provider.record_route(signal, prefill_url);
+    }
+}
+
+/// Keep prefills whose version group has a decode that fits this request, so a
+/// full group falls back to another. Decode selection has no side effects, while
+/// a discarded prefill pick would already have bound affinity.
+fn prefills_with_decode(
+    ctx: &AppContext,
+    request: &PreparedRequest,
+    candidates: &[Arc<Worker>],
+    resolver: &PdPoolResolver,
+    routing: &RoutingContext<'_>,
+) -> Vec<Arc<Worker>> {
+    let first = candidates.first().map(|p| p.version_group());
+    if candidates.iter().all(|p| Some(p.version_group()) == first) {
+        return candidates.to_vec();
+    }
+    // Try strict admission across groups before relaxing capacity in any group.
+    for allow_capacity_fallback in [false, true] {
+        let mut fits = HashMap::new();
+        let kept: Vec<_> = candidates
+            .iter()
+            .filter(|p| {
+                *fits.entry(p.version_group()).or_insert_with(|| {
+                    pick_decode_worker(ctx, request, p, resolver, routing, allow_capacity_fallback)
+                        .is_ok()
+                })
+            })
+            .cloned()
+            .collect();
+        if !kept.is_empty() {
+            return kept;
+        }
+    }
+    // With no group fitting, keep them all so the pick reports the real error.
+    candidates.to_vec()
 }
 
 fn capture_load_snapshot(
@@ -137,7 +328,7 @@ fn capture_load_snapshot(
 }
 
 struct RoutingContext<'a> {
-    prefix_matches: Option<ExternalPrefixSignal>,
+    prefix_matches: Option<PrefixLookupResult>,
     load_snapshot: Option<EngineReportedLoadSnapshot>,
     ttft_slo_ms: Option<u64>,
     tps_slo: Option<f64>,
@@ -189,7 +380,7 @@ fn nonempty_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 fn pick_prefill_worker(
     ctx: &AppContext,
-    request: &PreparedChatRequest,
+    request: &PreparedRequest,
     policy: &dyn Policy,
     candidates: &[Arc<Worker>],
     routing: &RoutingContext<'_>,
@@ -205,6 +396,7 @@ fn pick_prefill_worker(
         routing_key: routing.routing_key,
         session_id: routing.session_id,
         request_input_tokens: request.input_token_count as u64,
+        request_sequence_tokens: request.sequence_token_count as u64,
         request_tokens: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
         external_prefix: routing.prefix_matches.as_ref(),
         load_snapshot: routing.load_snapshot.as_ref(),
@@ -225,25 +417,30 @@ fn pick_prefill_worker(
 
 fn pick_decode_worker(
     ctx: &AppContext,
-    request: &PreparedChatRequest,
+    request: &PreparedRequest,
     prefill: &Worker,
     resolver: &PdPoolResolver,
     routing: &RoutingContext<'_>,
+    allow_capacity_fallback: bool,
 ) -> Result<Option<Arc<Worker>>, ApiError> {
     if prefill.mode() != WorkerMode::Prefill {
         return Ok(None);
     }
+    // Only a decode worker in the prefill's version group can receive its KV.
     let candidates = resolver
-        .decode_candidates(&request.model)
+        .decode_peers(&request.model, prefill)
         .map_err(|error| pool_error(error, &request.model))?;
     let decode = select_decode_peer(&DecodeSelectionInputs {
         decode_policy_kind: ctx.config.model.decode_policy,
+        allow_capacity_fallback,
         bucket_selector: ctx.bucket_selector.as_ref(),
         model_id: &request.model,
         prefill_url: &prefill.url,
         decode_workers: &candidates,
         request_input_tokens: request.input_token_count as u64,
-        requested_max_output_tokens: request.max_output_tokens,
+        request_sequence_tokens: request.sequence_token_count as u64,
+        requested_max_output_tokens: request.output_tokens,
+        expected_peak_sequence_tokens: request.expected_peak_sequence_tokens,
         ttft_slo_ms: routing.ttft_slo_ms,
         tps_slo: routing.tps_slo,
         load_snapshot: routing.load_snapshot.as_ref(),
@@ -257,8 +454,8 @@ fn pick_decode_worker(
 /// Ask which workers already hold a KV prefix for this prompt; not a worker pick.
 async fn lookup_prefix_matches(
     ctx: &AppContext,
-    request: &PreparedChatRequest,
-) -> Result<Option<ExternalPrefixSignal>, ApiError> {
+    request: &PreparedRequest,
+) -> Result<Option<PrefixLookupResult>, ApiError> {
     let signal = match (
         ctx.prefix_index.as_ref(),
         request.tokens.as_ref(),
@@ -277,9 +474,10 @@ async fn lookup_prefix_matches(
             } else {
                 resolve_prefix_query(index.match_prefix(hashes).await, &request.model.0)?
             };
-            Some(ExternalPrefixSignal {
+            Some(PrefixLookupResult {
                 outcome,
                 query_blocks,
+                block_hashes: None,
             })
         }
         // Without usable indexer inputs, try the in-process radix tree.
