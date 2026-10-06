@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.kernels.ops.sampling import softmax as sampler_softmax
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -263,7 +264,11 @@ class Sampler(nn.Module):
                     )
 
                 # In-place op to save memory
-                logits[:] = torch.softmax(logits, dim=-1)
+                logits[:] = (
+                    torch.softmax(logits, dim=-1)
+                    if self.enable_deterministic
+                    else sampler_softmax(logits)
+                )
                 probs = logits
 
                 batch_next_token_ids, sampling_mask_capture = self._sample_from_probs(

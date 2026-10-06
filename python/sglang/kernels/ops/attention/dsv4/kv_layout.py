@@ -20,19 +20,36 @@ class KVLayout(str, enum.Enum):
     V41 = "v41"
     # 512 e2m1 packed two per byte (even index low nibble), 32 e4m3 scales per 16 values.
     V41_FP4 = "v41_fp4"
+    # TRT-LLM only: 512 e4m3 values with a fixed external unit scale.
+    UNIFORM_FP8 = "uniform_fp8"
 
     @property
     def data_bytes(self) -> int:
-        return {KVLayout.V4: 576, KVLayout.V41: 512, KVLayout.V41_FP4: 256}[self]
+        return {
+            KVLayout.V4: 576,
+            KVLayout.V41: 512,
+            KVLayout.V41_FP4: 256,
+            KVLayout.UNIFORM_FP8: 512,
+        }[self]
 
     @property
     def scale_bytes(self) -> int:
-        return {KVLayout.V4: 8, KVLayout.V41: 16, KVLayout.V41_FP4: 32}[self]
+        return {
+            KVLayout.V4: 8,
+            KVLayout.V41: 16,
+            KVLayout.V41_FP4: 32,
+            KVLayout.UNIFORM_FP8: 0,
+        }[self]
 
     @property
     def tile_size(self) -> int:
         """Values sharing one scale."""
-        return {KVLayout.V4: 64, KVLayout.V41: 32, KVLayout.V41_FP4: 16}[self]
+        return {
+            KVLayout.V4: 64,
+            KVLayout.V41: 32,
+            KVLayout.V41_FP4: 16,
+            KVLayout.UNIFORM_FP8: 512,
+        }[self]
 
     @property
     def bytes_per_token(self) -> int:
@@ -41,7 +58,12 @@ class KVLayout(str, enum.Enum):
     @property
     def page_align(self) -> int:
         """Unit the page stride is padded to: the reader's TMA row stride."""
-        return {KVLayout.V4: 576, KVLayout.V41: 512, KVLayout.V41_FP4: 256}[self]
+        return {
+            KVLayout.V4: 576,
+            KVLayout.V41: 512,
+            KVLayout.V41_FP4: 256,
+            KVLayout.UNIFORM_FP8: 512,
+        }[self]
 
     @property
     def is_fp4(self) -> bool:
