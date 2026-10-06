@@ -179,7 +179,7 @@ class SchedulerDllmMixin:
             release_kv_cache(
                 req,
                 self.tree_cache,
-                is_insert=not self.dllm_config.requires_separate_context_encoding,
+                checkpoint=not self.dllm_config.requires_separate_context_encoding,
             )
             req.time_stats.set_completion_time()
 
@@ -200,7 +200,7 @@ class SchedulerDllmMixin:
 
         req.kv.kv_committed_len = context_len
         req.kv.kv_allocated_len = context_len
-        assert req.kv.swa_evicted_seqlen <= context_len
+        assert req.kv.max_evicted_seqlen <= context_len
         req.set_extend_range(context_len, context_len)
         self.stash_chunked_request(req)
 

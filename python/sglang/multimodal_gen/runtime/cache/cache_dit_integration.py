@@ -403,6 +403,14 @@ class CustomBlockAdapterSpec:
 
 # Custom BlockAdapter metadata for models absent from cache-dit's registry.
 _CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
+    "AnimaTransformer3DModel": CustomBlockAdapterSpec(
+        blocks_attr="transformer_blocks",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
+    "MingImageTransformer2DModel": CustomBlockAdapterSpec(
+        blocks_attr="layers",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
     "QwenImage21Transformer2DModel": CustomBlockAdapterSpec(
         blocks_attr="transformer_blocks",
         forward_pattern=ForwardPattern.Pattern_3,
@@ -857,19 +865,23 @@ def refresh_context_on_transformer(
     num_inference_steps: int,
     scm_preset: str | None = None,
     verbose: bool = False,
+    steps_computation_mask: Optional[List[int]] = None,
+    steps_computation_policy: str | None = None,
 ) -> None:
     """Refresh cache-dit context for transformer."""
-    steps_computation_mask = None
-    if scm_preset is not None:
+    if steps_computation_mask is None and scm_preset is not None:
         steps_computation_mask = cache_dit.steps_mask(
             mask_policy=scm_preset, total_steps=num_inference_steps
         )
+    policy = (
+        steps_computation_policy if steps_computation_policy is not None else scm_preset
+    )
     cache_dit.refresh_context(
         transformer,
         cache_config=DBCacheConfig().reset(
             num_inference_steps=num_inference_steps,
             steps_computation_mask=steps_computation_mask,
-            steps_computation_policy=scm_preset,
+            steps_computation_policy=policy,
         ),
         verbose=verbose,
     )

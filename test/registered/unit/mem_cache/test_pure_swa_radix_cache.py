@@ -11,10 +11,19 @@ from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class _FakeReqToTokenPool:
+    def __init__(self, req_to_token):
+        self.req_to_token = req_to_token
+
+    def write(self, indices, values):
+        self.req_to_token[indices] = values
 
 
 class _FakeAllocator:
@@ -45,8 +54,8 @@ class TestPureSWARadixCache(CustomTestCase):
         cache = PureSWARadixCache(
             CacheInitParams(
                 disable=False,
-                req_to_token_pool=SimpleNamespace(
-                    req_to_token=torch.arange(8, dtype=torch.int64).unsqueeze(0)
+                req_to_token_pool=_FakeReqToTokenPool(
+                    torch.arange(8, dtype=torch.int64).unsqueeze(0)
                 ),
                 token_to_kv_pool_allocator=allocator,
                 page_size=1,
@@ -57,14 +66,22 @@ class TestPureSWARadixCache(CustomTestCase):
         req = SimpleNamespace(
             origin_input_ids=token_ids,
             output_ids=array("q"),
+            full_untruncated_fill_ids=token_ids,
             extra_key=None,
             cache_salt=None,
-            last_node=None,
+            last_node=cache.root_node,
+            lock=None,
             priority=0,
-            kv=ReqKvInfo(req_pool_idx=0, swa_evict_floor=4, swa_evicted_seqlen=6),
+            kv=ReqKvInfo(
+                req_pool_idx=0,
+                swa_evict_floor=4,
+                component_evicted_seqlens={ComponentType.SWA: 6},
+            ),
         )
 
-        cache.cache_finished_req(req, is_insert=True, owned_kv_len=8)
+        cache.checkpoint(req, up_to=8)
+        cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, 8)])
+        cache.unlock(req.lock)
 
         # [0, 4) went into the tree; [4, 6) was window-evicted; [6, 8) is freed.
         match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))

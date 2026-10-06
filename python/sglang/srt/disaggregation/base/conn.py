@@ -141,6 +141,10 @@ class BaseKVManager(ABC):
     # role switch (release transfer resources; the scheduler owns the KV pool).
     supports_role_switch: bool = False
 
+    # Opt-in per backend: set True once the prefill acks a drained abort
+    # (ABORT_ACK carrying the sender rank). Without it a hold only ends on timeout.
+    supports_deferred_decode_kv_release: bool = False
+
     def teardown(self) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} does not support PD role switch teardown"
@@ -154,8 +158,6 @@ class BaseKVSender(ABC):
         mgr: BaseKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
-        dest_tp_ranks: List[int],
-        pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ): ...
 
@@ -177,6 +179,10 @@ class BaseKVSender(ABC):
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
         """
         ...
+
+    def mark_prefill_complete(self) -> None:
+        """Publish retained final-prefill KV for an enabled allocation policy."""
+        raise NotImplementedError
 
     def pop_decode_prefix_len(self) -> int:
         return 0
