@@ -22,6 +22,10 @@ from sglang.srt.entrypoints.openai.serving_decisions import (
     render_question,
     render_text,
 )
+from sglang.srt.entrypoints.systemone.joint_schema import (
+    encode_joint_schema,
+    joint_schema_options,
+)
 from sglang.srt.entrypoints.systemone.protocol import (
     SystemOneChoiceAnswer,
     SystemOneChoiceQuestion,
@@ -33,6 +37,8 @@ from sglang.srt.entrypoints.systemone.protocol import (
     SystemOneScoreAnswer,
     SystemOneUsage,
 )
+from sglang.srt.managers.io_struct import EmbeddingReqInput
+from sglang.srt.utils import ImageData
 
 # Beyond A to Z, every option gets a two-letter label, in this fixed order.
 _PAIR_LABELS = [a + b for a in string.ascii_uppercase for b in string.ascii_uppercase]
@@ -46,7 +52,8 @@ _DECIDER_SYSTEM = (
 
 
 class SystemOneServing(OpenAIServingDecisions):
-    """Answers System One questions with the rendering, label checks, and scoring of /v1/decisions."""
+    """Answers System One questions with the rendering, label checks, and scoring of
+    /v1/decisions, or, for a Clef checkpoint, with its joint schema head."""
 
     route = "/v1/systemone"
 
@@ -54,11 +61,35 @@ class SystemOneServing(OpenAIServingDecisions):
         return "systemone-"
 
     def _validate_request(self, request: SystemOneRequest) -> Optional[str]:
+        if self.joint_head_config is not None:
+            return self._validate_joint_schema_request(request)
         return (
             self._validate_server(request.model)
             or self._validate_images(request.images)
             or self._validate_reasoning(request.chat_template_kwargs)
         )
+
+    def _validate_joint_schema_request(
+        self, request: SystemOneRequest
+    ) -> Optional[str]:
+        """A Clef checkpoint renders its own prompt, without the chat template."""
+        route = self.route
+        if self.tokenizer_manager.tokenizer is None:
+            return f"{route} requires the server tokenizer"
+        _, adapter = self._parse_model_parameter(request.model)
+        if adapter is not None:
+            return (
+                f"model names the LoRA adapter {adapter!r}, which {route} "
+                "does not support"
+            )
+        if request.images and not self.tokenizer_manager.model_config.is_multimodal:
+            return f"{route} images require a model served with multimodal input"
+        if request.chat_template_kwargs:
+            return (
+                f"{route} renders the prompt this checkpoint's joint schema head "
+                "was trained with, which takes no chat_template_kwargs"
+            )
+        return None
 
     def _convert_to_internal_request(
         self,
@@ -69,6 +100,8 @@ class SystemOneServing(OpenAIServingDecisions):
         Tuple[SystemOneRequest, List[QuestionView]],
     ]:
         views = [_view(question) for question in request.questions.values()]
+        if self.joint_head_config is not None:
+            return self._joint_schema_request(request, views), (request, views)
         encode = (
             self._encoded_systemone_questions
             if self.decision_config is None
@@ -76,6 +109,83 @@ class SystemOneServing(OpenAIServingDecisions):
         )
         # Lazy, so the async handler can yield to other requests between questions.
         return encode(request, views), (request, views)
+
+    def _joint_schema_request(
+        self, request: SystemOneRequest, views: List[QuestionView]
+    ) -> EmbeddingReqInput:
+        """All questions in one prompt, which the joint schema head scores in one prefill."""
+        for question_id, view in zip(request.questions, views):
+            if view.kind == "score":
+                _check_legend(question_id, view)
+        tokenizer_manager = self.tokenizer_manager
+        input_ids, layout = encode_joint_schema(
+            tokenizer_manager.tokenizer,
+            request,
+            # The longest prompt the tokenizer manager accepts.
+            max_length=tokenizer_manager.context_len
+            - tokenizer_manager.num_reserved_tokens
+            - 1,
+        )
+        return EmbeddingReqInput(
+            input_ids=input_ids,
+            image_data=[
+                ImageData(url=image.url, detail=image.detail or "auto")
+                for image in request.images
+            ]
+            or None,
+            decision_layout=layout,
+        )
+
+    async def _answer_joint_schema(
+        self,
+        adapted_request: EmbeddingReqInput,
+        request: SystemOneRequest,
+        views: List[QuestionView],
+        raw_request: Request,
+    ) -> ORJSONResponse:
+        ret = await self.tokenizer_manager.generate_request(
+            adapted_request, raw_request
+        ).__anext__()
+        logits = ret["embedding"]
+        names = [
+            [name for name, _ in joint_schema_options(question)]
+            for question in request.questions.values()
+        ]
+        if len(logits) != sum(map(len, names)):
+            raise RuntimeError("the joint schema head did not score this request")
+        answers = {}
+        offset = 0
+        for question_id, view, question_names in zip(request.questions, views, names):
+            scores = logits[offset : offset + len(question_names)]
+            offset += len(question_names)
+            top = max(scores)
+            weights = [math.exp(score - top) for score in scores]
+            total = math.fsum(weights)
+            by_name = {
+                name: weight / total for name, weight in zip(question_names, weights)
+            }
+            # The head scores true then false, which the view names yes and no.
+            answers[question_id] = _answer(
+                view=view,
+                probabilities=(
+                    [by_name["true"], by_name["false"]]
+                    if view.kind == "yes_no"
+                    else [by_name[name] for name in view.names]
+                ),
+                mass=1.0,
+                question_id=question_id,
+            )
+        response = SystemOneResponse(
+            model=self.tokenizer_manager.served_model_name,
+            answers=answers,
+            usage=SystemOneUsage(input_tokens=ret["meta_info"]["prompt_tokens"]),
+        )
+        # The head scores only the allowed options, so there is no label mass.
+        return ORJSONResponse(
+            content=response.model_dump(
+                exclude={"answers": {"__all__": {"x_label_mass"}}}
+            )
+        )
 
     def _encoded_systemone_questions(
         self, request: SystemOneRequest, views: List[QuestionView]
@@ -179,6 +289,10 @@ class SystemOneServing(OpenAIServingDecisions):
         raw_request: Request,
     ) -> ORJSONResponse:
         request, views = processed
+        if self.joint_head_config is not None:
+            return await self._answer_joint_schema(
+                adapted_request, request, views, raw_request
+            )
         _, _, result = await self._score(
             adapted_request=adapted_request,
             raw_request=raw_request,

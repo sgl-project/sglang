@@ -66,6 +66,7 @@ from fastapi.routing import APIRoute
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
+from sglang.srt.configs.model_config import load_joint_head_config
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -2377,6 +2378,22 @@ def _execute_server_warmup(server_args: ServerArgs):
             get_observability().debug_tensor_dump_input_file
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
+
+    if (
+        not model_info["is_generation"]
+        and model_info.get("architectures") == ["Qwen3_5ForConditionalGeneration"]
+        and load_joint_head_config(get_model().model_path, get_model().revision)
+        is not None
+    ):
+        # A Clef checkpoint answers /v1/systemone decisions only.
+        request_name = "/v1/systemone"
+        json_data = {
+            "model": "warmup",
+            "state": "The capital city of France is Paris.",
+            "questions": {
+                "warmup": {"type": "noul", "instructions": "Is the state true?"}
+            },
+        }
 
     # Send a warmup request
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()

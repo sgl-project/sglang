@@ -159,7 +159,7 @@ The request fails with HTTP 400 for:
 - a server launched with `--enable-mis` or `--dllm-algorithm`, or one that uses a built-in conversation template, whether named with `--chat-template`, loaded from a JSON template file, or inferred from the model path
 - a model whose chat route uses a built-in encoder instead of a chat template, a tokenizer that does not encode the rendered chat text back to the same ids, or a model that is not a generation model
 - a chat template that raises an error for the question message, or a server launched with `--skip-tokenizer-init`
-- a decision checkpoint such as [pplx-decider-v1-27b](/cookbook/autoregressive/Perplexity/pplx-decider-v1-27b), which answers through `/v1/systemone`
+- a decision checkpoint such as [pplx-decider-v1-27b](/cookbook/autoregressive/Perplexity/pplx-decider-v1-27b), or a joint schema checkpoint such as [Clef](/cookbook/autoregressive/Cloudflare/clef), which answer through `/v1/systemone`
 
 Errors about one question name its id or its position in `questions`.
 
@@ -207,7 +207,7 @@ These models mix full and linear attention. Answer probabilities can move by up 
 
 ## System One compatible API
 
-`POST /v1/systemone` serves the same decisions in the request and response shape of the System One API, with a `state`, a map of `noul`, `choice`, and `score` questions keyed by your ids, and one answer per id. Clients written for that API, including the official TypeSafe SDKs, get decisions by pointing their base URL at the server, with the exceptions listed below. The route uses the same rendering, label checks, and scoring as `/v1/decisions`, and refuses the same servers, chat templates, and prompts, listed in [Errors](#errors). Its request fields are checked as described below. A decision checkpoint such as [pplx-decider-v1-27b](/cookbook/autoregressive/Perplexity/pplx-decider-v1-27b) instead gets the prompt, answer codes, and calibrated temperature it was trained with.
+`POST /v1/systemone` serves the same decisions in the request and response shape of the System One API, with a `state`, a map of `noul`, `choice`, and `score` questions keyed by your ids, and one answer per id. Clients written for that API, including the official TypeSafe SDKs, get decisions by pointing their base URL at the server, with the exceptions listed below. The route uses the same rendering, label checks, and scoring as `/v1/decisions`, and refuses the same servers, chat templates, and prompts, listed in [Errors](#errors). Its request fields are checked as described below. A decision checkpoint such as [pplx-decider-v1-27b](/cookbook/autoregressive/Perplexity/pplx-decider-v1-27b) instead gets the prompt, answer codes, and calibrated temperature it was trained with. A joint schema checkpoint such as [Clef](/cookbook/autoregressive/Cloudflare/clef) answers all questions from one prompt in one prefill, scored by its joint schema head, and does not use the chat template.
 
 ```bash Command
 pip install typesafe-sdk
@@ -241,14 +241,14 @@ What to expect from this route:
 - Any `model` name is accepted, including the SDK default `jev-latest`, unless it names a LoRA adapter after a colon, as in `base:adapter`. The response `model` is always the served model.
 - A `noul` answer is the probability of yes. A `choice` answer has the most probable option and a `score` answer the probability-weighted mean level, each with `probabilities` and `confidence`, and a score answer echoes its levels in `legend`.
 - `confidence` follows the formulas TypeSafe publishes for its adapter. It is a statistic of the returned probabilities, which are renormalized over the answer labels and ignore probability outside them. It is not calibrated, it can read 0 for a score split between distant levels, and thresholds tuned on another provider may not transfer.
-- Each answer also carries `x_label_mass`, the full-vocabulary probability of its labels, which `/v1/decisions` returns as `label_mass`. The Python SDK drops fields it does not define, so read it from `result.raw_http_response.json()`. Decision checkpoints omit it, because their readout has no full-vocabulary distribution.
+- Each answer also carries `x_label_mass`, the full-vocabulary probability of its labels, which `/v1/decisions` returns as `label_mass`. The Python SDK drops fields it does not define, so read it from `result.raw_http_response.json()`. Decision checkpoints and joint schema checkpoints omit it, because their readout or head scores only the answers.
 - A choice takes 1 to 255 options and a score 1 to 10 levels. Option names that are blank, contain control or line break characters, or repeat another name after trimming and case folding are refused, and so are blank or null levels, as on `/v1/decisions`.
 - Beyond 26 options, every option gets a two-letter label (`AA`, `AB`, and so on) checked to be one token for the served tokenizer. These labels include common words and have unequal priors, so answers above 26 options can depend on option order. More than 26 options also need a Hugging Face tokenizer that reports its added tokens, and a chat template with an added token between the message and the answer position whose following text tokenizes the same on its own, as the Qwen models do with `</think>`. Without them, a choice is limited to 26 options.
 - `instructions` are optional. A choice or score question without them drops its question line, and a `noul` question is answered from its `true` and `false` descriptions. A `noul` question with neither, such as the SDK's bare `Noul()`, is refused.
 - Unknown top-level fields are ignored. Unknown keys inside a question or inside `noul` criteria are refused, and so are the `/v1/decisions` fields `temperature`, `prompt_format_version`, and `return_prompt_token_ids` with any value other than null. `chat_template_kwargs` and `images` are accepted as SGLang extensions.
 - Unlike `/v1/decisions`, an empty `state` and empty or blank question ids are accepted, as the System One schema allows.
 - Invalid requests return 422 with the location of the error, other refusals return 400, and neither is retried by the SDKs.
-- `usage.input_tokens` counts the prompt of every question, so the state is counted once per question, and `usage.output_tokens` is 0.
+- `usage.input_tokens` counts the prompt of every question, so the state is counted once per question, or once for a joint schema checkpoint, and `usage.output_tokens` is 0.
 - The SDKs' `models.list()` and response `request_id` are not supported, because `GET /v1/models` keeps its OpenAI format and no request id header is sent.
 - The SDKs time out after 10 seconds and retry, so raise their timeout for requests with many questions over a long state. A request whose client gives up still finishes its encoding and part of its prefill, so each retry repeats at least the encoding.
 

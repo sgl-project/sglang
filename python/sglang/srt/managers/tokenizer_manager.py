@@ -64,6 +64,7 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.layers.joint_schema_head import parse_decision_layout
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -1348,6 +1349,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate Matryoshka embeddings
         if isinstance(obj, EmbeddingReqInput):
             self._validate_for_matryoshka_dim(obj)
+            self._validate_decision_layout(obj, input_ids)
 
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
@@ -1394,6 +1396,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "sampling_logprobs_mode can only be set when "
                     "return_sampling_mask=true."
                 )
+
+    def _validate_decision_layout(
+        self, obj: EmbeddingReqInput, input_ids: List[int]
+    ) -> None:
+        """A Clef checkpoint scores the spans of a decision layout, and nothing else."""
+        if getattr(self.model_config, "joint_head_config", None) is None:
+            if obj.decision_layout is not None:
+                raise ValueError(
+                    "decision_layout needs a checkpoint with a joint schema head"
+                )
+            return
+        if obj.decision_layout is None:
+            # Health checks only need a response, which is an empty embedding.
+            if isinstance(obj.rid, str) and obj.rid.startswith(HEALTH_CHECK_RID_PREFIX):
+                return
+            raise ValueError(
+                "This checkpoint answers schema decisions, send them to /v1/systemone"
+            )
+        parse_decision_layout(obj.decision_layout, len(input_ids))
 
     def _validate_mm_limits(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -1571,6 +1592,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 token_indices_to_pool=obj.token_indices_to_pool,
+                decision_layout=obj.decision_layout,
             )
 
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
