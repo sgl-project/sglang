@@ -20,6 +20,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
 from sglang.srt.managers.io_struct import (
     ElasticScaleUpdateReq,
     RecoverElasticEPReqInput,
+    RecoverElasticEPReqOutput,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
 )
@@ -72,6 +73,13 @@ def _manager() -> TokenizerManager:
     manager.elastic_ready_rank_count = 0
     manager.elastic_joining_allocation_ids = []
     manager._elastic_scale_lock = asyncio.Lock()
+    manager.elastic_recovery_operation_id = None
+    manager.elastic_recovery_topology_generation = None
+    manager.elastic_recovery_allocation_id = None
+    manager.elastic_recovery_rank_offset = None
+    manager.elastic_recovery_phase = "idle"
+    manager.elastic_recovery_succeeded = None
+    manager._elastic_recovery_lock = asyncio.Lock()
     manager.auto_create_handle_loop = MagicMock()
     manager.scale_elastic_ep_communicator = AsyncMock(
         return_value=[
@@ -87,6 +95,16 @@ def _manager() -> TokenizerManager:
     )
     manager.update_control_communicator_fan_out = MagicMock()
     manager._dispatch_to_scheduler = MagicMock()
+    manager.recover_elastic_ep_communicator = AsyncMock(
+        return_value=[
+            RecoverElasticEPReqOutput(
+                success=True,
+                message="accepted",
+                operation_id="recover-1",
+                recovery_phase="restoring",
+            )
+        ]
+    )
     return manager
 
 
@@ -597,6 +615,72 @@ class TestElasticEPRecoveryLifecycle(unittest.TestCase):
         lifecycle.advance("ready", warmup_succeeded=True)
 
         self.assertEqual(lifecycle.phase, "ready")
+
+    def test_recovery_state_requires_the_matching_warmup_operation(self):
+        operation = RecoveryOperation(
+            runtime_instance_id="runtime-1",
+            topology_generation=3,
+            operation_id="recover-1",
+            allocation_id="pod-uid-5",
+            rank_offset=2,
+        )
+        ElasticEPStateManager.request_recovery(operation)
+        ElasticEPStateManager.mark_recovery_slot_restored()
+        self.assertTrue(ElasticEPStateManager.begin_recovery_warmup("recover-1"))
+        self.assertFalse(
+            ElasticEPStateManager.complete_recovery_warmup(
+                "stale-recovery", success=True
+            )
+        )
+        self.assertEqual(self.state.recovery_phase, "warming_up")
+        self.assertFalse(
+            ElasticEPStateManager.complete_recovery_warmup(
+                "recover-1", success=False
+            )
+        )
+        self.assertEqual(self.state.recovery_phase, "warming_up")
+        self.assertTrue(
+            ElasticEPStateManager.complete_recovery_warmup(
+                "recover-1", success=True
+            )
+        )
+        self.assertEqual(self.state.recovery_phase, "ready")
+
+    def test_scheduler_warmup_completion_requires_a_successful_normal_request(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        self.state.recovery_operation_id = "recover-1"
+        self.state.recovery_phase = "warming_up"
+        finished = MagicMock(
+            rid="health-check-elastic-recovery-recover-1",
+            finished=MagicMock(return_value=True),
+            finished_reason=MagicMock(),
+        )
+        with patch(
+            "sglang.srt.managers.scheduler.HEALTH_CHECK_RID_PREFIX",
+            "health-check-",
+        ), patch(
+            "sglang.srt.managers.scheduler.get_parallel",
+            return_value=MagicMock(tp_rank=1),
+        ):
+            scheduler._maybe_complete_recovery_warmup(MagicMock(reqs=[finished]))
+        self.assertEqual(self.state.recovery_phase, "ready")
+
+    async def test_tokenizer_recovery_fanout_uses_a_submission_correlation_id(self):
+        manager = _manager()
+        result = await manager.recover_elastic_ep(
+            RecoverElasticEPReqInput(
+                operation_id="recover-1",
+                runtime_instance_id="ignored",
+                topology_generation=3,
+                allocation_id="pod-uid-5",
+                rank_offset=2,
+            )
+        )
+
+        self.assertTrue(result.success)
+        submitted = manager.recover_elastic_ep_communicator.await_args.args[0]
+        self.assertEqual(submitted.runtime_instance_id, "runtime-1")
+        self.assertIsNotNone(submitted.submission_id)
 
     def test_conflicting_pending_recovery_is_terminal(self):
         scheduler = Scheduler.__new__(Scheduler)

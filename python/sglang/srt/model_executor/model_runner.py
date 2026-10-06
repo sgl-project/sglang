@@ -2491,6 +2491,7 @@ class ModelRunner:
             )
             if recovered:
                 self.forward_pass_id = 0
+                ElasticEPStateManager.mark_recovery_slot_restored()
             return
 
         local_timeout = (
