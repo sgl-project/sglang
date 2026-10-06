@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
     request_extra_value,
     resolve_sampling_params_cls,
+    sanitize_upload_filename,
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -270,6 +271,8 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
 
     kwargs = {
         "prompt": request.prompt,
+        "task_type": request.task_type,
+        "request_data_type": DataType.VIDEO,
         "num_outputs_per_prompt": max(1, min(int(num_outputs), 10)),
         "size": request.size,
         "width": request.width,
@@ -307,6 +310,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "output_path": request.output_path,
         "quality": _extra_value(request, "quality"),
         "output_compression": request.output_compression,
+        "x264_preset": request.x264_preset,
         "output_quality": request.output_quality,
         "perf_dump_path": request.perf_dump_path,
         "profile": request.profile,
@@ -368,9 +372,13 @@ async def _save_first_input_image(
     os.makedirs(uploads_dir, exist_ok=True)
 
     filename = image.filename if hasattr(image, "filename") else "url_image"
-    target_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
+    safe_name = sanitize_upload_filename(filename, "url_image")
+    target_path = os.path.join(uploads_dir, f"{request_id}_{safe_name}")
     return await save_image_to_path(
-        image, target_path, prefer_remote_source=prefer_remote_source
+        image,
+        target_path,
+        prefer_remote_source=prefer_remote_source,
+        uploads_root=uploads_dir,
     )
 
 
@@ -475,12 +483,15 @@ async def create_video(
     video_url: Optional[str] = Form(None),
     video_path: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
+    task_type: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     num_outputs_per_prompt: Optional[int] = Form(None),
     seconds: Optional[int] = Form(None),
     size: Optional[str] = Form(None),
     fps: Optional[int] = Form(None),
     num_frames: Optional[int] = Form(None),
+    width: Optional[int] = Form(None),
+    height: Optional[int] = Form(None),
     seed: Optional[int] = Form(None),
     generator_device: Optional[str] = Form("cuda"),
     negative_prompt: Optional[str] = Form(None),
@@ -500,6 +511,7 @@ async def create_video(
     upscaling_scale: Optional[int] = Form(None),
     output_quality: Optional[str] = Form(None),
     output_compression: Optional[int] = Form(None),
+    x264_preset: Optional[str] = Form(None),
     output_path: Optional[str] = Form(None),
     perf_dump_path: Optional[str] = Form(None),
     extra_params: Optional[str] = Form(None),
@@ -509,7 +521,6 @@ async def create_video(
     request_id = generate_request_id()
 
     server_args = get_global_server_args()
-    task_type = server_args.pipeline_config.task_type
     is_multipart = "multipart/form-data" in content_type
     raw_form: Any = None
     extra_from_form: Dict[str, Any] = {}
@@ -517,14 +528,15 @@ async def create_video(
     # Parse model-specific multipart metadata before creating request-owned
     # directories or saving uploads, so malformed JSON leaves no resources.
     if is_multipart:
-        if not prompt:
+        sampling_params_cls = resolve_sampling_params_cls(server_args)
+        if not prompt and not sampling_params_cls.prompt_optional:
             raise HTTPException(status_code=400, detail="prompt is required")
         raw_form = await request.form()
         extra_from_form = _multipart_video_extras(
             raw_form,
             extra_body=extra_body,
             extra_params=extra_params,
-            sampling_params_cls=resolve_sampling_params_cls(server_args),
+            sampling_params_cls=sampling_params_cls,
         )
 
     # Resolve input upload directory (may be a temp dir when saving is disabled)
@@ -567,12 +579,6 @@ async def create_video(
             video_input_path = reference_url
             image_sources = merge_image_input_list(input_reference)
 
-        # Validate image input based on model task type
-        if task_type.requires_image_input() and not image_sources:
-            raise HTTPException(
-                status_code=400,
-                detail="input_reference or reference_url is required for image-to-video generation",
-            )
         input_path = None
         if image_sources:
             try:
@@ -608,14 +614,21 @@ async def create_video(
         }
         fps_val = form_value("fps", fps)
         num_frames_val = form_value("num_frames", num_frames)
+        width_val = form_value("width", width)
+        height_val = form_value("height", height)
 
         req = VideoGenerationsRequest(
-            prompt=prompt,
+            # ``prompt`` is a required str field on VideoGenerationsRequest; it is only
+            # ``None`` here for a prompt-optional pipeline (the gate above already
+            # rejected a missing prompt for every other one), so an empty string is the
+            # correct substitute, not a real (ignored) prompt value.
+            prompt=prompt or "",
             enhance_prompt=form_value("enhance_prompt", enhance_prompt) or False,
             input_reference=input_path,
             video_path=form_value("video_path", video_input_path),
             video_url=form_value("video_url", video_url),
             model=form_value("model", model),
+            task_type=form_text_value("task_type", task_type),
             n=form_value("n", n),
             num_outputs_per_prompt=form_value(
                 "num_outputs_per_prompt", num_outputs_per_prompt
@@ -624,6 +637,8 @@ async def create_video(
             size=form_value("size", size),
             fps=fps_val,
             num_frames=num_frames_val,
+            width=width_val,
+            height=height_val,
             seed=form_value("seed", seed),
             generator_device=form_value("generator_device", generator_device),
             negative_prompt=form_text_value("negative_prompt", negative_prompt),
@@ -652,6 +667,7 @@ async def create_video(
             ),
             upscaling_scale=form_value("upscaling_scale", upscaling_scale),
             output_compression=form_value("output_compression", output_compression),
+            x264_preset=form_value("x264_preset", x264_preset),
             output_quality=form_value("output_quality", output_quality),
             output_path=form_value("output_path", output_path),
             perf_dump_path=form_value("perf_dump_path", perf_dump_path),
@@ -688,18 +704,6 @@ async def create_video(
             if _is_probably_video_source(payload.get("input_reference")):
                 payload.setdefault("video_path", payload.get("input_reference"))
 
-            has_image_input = (
-                payload.get("reference_url")
-                and not _is_probably_video_source(payload.get("reference_url"))
-            ) or (
-                payload.get("input_reference")
-                and not _is_probably_video_source(payload.get("input_reference"))
-            )
-            if task_type.requires_image_input() and not has_image_input:
-                raise HTTPException(
-                    status_code=400,
-                    detail="input_reference or reference_url is required for image-to-video generation",
-                )
             # for non-multipart/form-data type
             if payload.get("reference_url") and not _is_probably_video_source(
                 payload.get("reference_url")
@@ -717,6 +721,8 @@ async def create_video(
                         detail=f"Failed to process image source: {str(e)}",
                     )
                 payload["input_reference"] = input_path
+            if resolve_sampling_params_cls(server_args).prompt_optional:
+                payload.setdefault("prompt", "")
             req = VideoGenerationsRequest(**payload)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")

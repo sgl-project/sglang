@@ -146,8 +146,8 @@ class ComponentLoader(ABC):
     # the list of possible name of the component in model_index.json, e.g., scheduler
     component_names: list[str] = []
 
-    # diffusers or transformers
-    expected_library: str = ""
+    # diffusers or transformers (a tuple lists several accepted spellings)
+    expected_library: str | tuple[str, ...] = ""
 
     _loaders_registered = False
 
@@ -681,7 +681,12 @@ class ComponentLoader(ABC):
         if loader_cls is not None:
             expected_library = loader_cls.expected_library
             # Assert that the library matches what's expected for this component type
-            assert transformers_or_diffusers == expected_library, (
+            allowed = (
+                (expected_library,)
+                if isinstance(expected_library, str)
+                else tuple(expected_library)
+            )
+            assert transformers_or_diffusers in allowed, (
                 f"{loader_type} must be loaded from {expected_library}, got {transformers_or_diffusers}"
             )
             loader = loader_cls()
@@ -939,7 +944,7 @@ class AutoProcessorLoader(ComponentLoader):
 class TokenizerLoader(ComponentLoader):
     """Loader for tokenizers."""
 
-    component_names = ["tokenizer", "text_tokenizer"]
+    component_names = ["tokenizer", "text_tokenizer", "t5_tokenizer"]
     expected_library = "transformers"
 
     def load_customized(

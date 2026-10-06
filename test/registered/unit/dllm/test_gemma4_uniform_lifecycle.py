@@ -39,7 +39,6 @@ class _Req:
             req_pool_idx=1,
             kv_allocated_len=context_len + block_size,
             kv_committed_len=context_len + block_size,
-            swa_evicted_seqlen=0,
         )
         self.finished_reason = None
         self.finish_on_update = False
@@ -323,7 +322,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
                 scheduler, _Batch([req]), _result([canvas])
             )
 
-        release.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+        release.assert_called_once_with(req, scheduler.tree_cache, checkpoint=False)
 
     def test_context_boundary_stops_sync_and_fdfo(self):
         block_size = 4
@@ -347,7 +346,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
 
                 self.assertTrue(req.finished())
                 release.assert_called_once_with(
-                    req, scheduler.tree_cache, is_insert=False
+                    req, scheduler.tree_cache, checkpoint=False
                 )
 
 

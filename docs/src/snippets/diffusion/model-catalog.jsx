@@ -4,6 +4,16 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "Anima",
+      modelIds: ["circlestone-labs/Anima-Base-v1.0-Diffusers"],
+      cookbook: "/cookbook/diffusion/CircleStone/Anima",
+    },
+    {
+      name: "Ming-Image",
+      modelIds: ["inclusionAI/Ming-Image-0.1-Design", "inclusionAI/Ming-Image-0.1-Design-Layer"],
+      cookbook: "/cookbook/diffusion/inclusionAI/Ming-Image",
+    },
+    {
       name: "FLUX",
       modelIds: [
         "black-forest-labs/FLUX.1-dev",
@@ -125,6 +135,24 @@ export const DiffusionModelCatalog = ({ category }) => {
   ],
   video: [
     {
+      name: "Kandinsky 6",
+      modelIds: [
+        "kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers",
+        "kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers",
+        "kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers",
+      ],
+      cookbook: "/cookbook/diffusion/Kandinsky/Kandinsky6",
+      note: "Pro and Pro-distill have full-checkpoint validation; the older Pro-sft entry remains unverified.",
+    },
+    {
+      name: "Kandinsky 6 VSR",
+      modelIds: [
+        "kandinskylab/Kandinsky-6.0-VSR-distilled2steps-5s-Diffusers",
+      ],
+      cookbook: "/cookbook/diffusion/Kandinsky/Kandinsky6-SR",
+      note: "Use VSR-distilled2steps. The non-distilled VSR output head is incompatible with the current Euler path.",
+    },
+    {
       name: "Wan 2.1",
       modelIds: [
         "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
@@ -243,6 +271,11 @@ export const DiffusionModelCatalog = ({ category }) => {
         "nvidia/Cosmos3-Edge",
       ],
       cookbook: "/cookbook/diffusion/Cosmos/Cosmos3",
+    },
+    {
+      name: "FLUX 3 Action",
+      modelIds: ["black-forest-labs/flux-3-action-droid"],
+      cookbook: "/cookbook/vla/FLUX/FLUX-3-Action",
     },
     {
       name: "LingBotWorld",
