@@ -47,7 +47,7 @@ env:
 
 jobs:
   compute-diffusion-partitions:
-    if: false  # DEBUG: only the qwen and ltx_2_5 debug jobs run
+    if: false  # DEBUG round 3: only the experiment jobs run
     runs-on: ubuntu-latest
     outputs:
       matrix-1gpu: ${{ steps.compute.outputs.matrix-1gpu }}
@@ -121,7 +121,7 @@ jobs:
           retention-days: 7
 
   multimodal-gen-test-1-5090:
-    if: false  # DEBUG: only the qwen and ltx_2_5 debug jobs run
+    if: false  # DEBUG round 3: only the experiment jobs run
     runs-on: 1-gpu-5090
     timeout-minutes: 180
     steps:
@@ -184,7 +184,7 @@ jobs:
           artifact-suffix: 1-gpu-5090
 
   bcg-diffusion:
-    if: false  # DEBUG: only the qwen and ltx_2_5 debug jobs run
+    if: false  # DEBUG round 3: only the experiment jobs run
     runs-on: 1-gpu-h100
     timeout-minutes: 90
     steps:
@@ -285,7 +285,7 @@ jobs:
           retention-days: 7
 
   multimodal-gen-component-accuracy:
-    if: false  # DEBUG: only the qwen and ltx_2_5 debug jobs run
+    if: false  # DEBUG round 3: only the experiment jobs run
     runs-on: 2-gpu-h100
     timeout-minutes: 240
     steps:
@@ -328,7 +328,7 @@ jobs:
           artifact-suffix: component-accuracy
 
   multimodal-gen-test-1-b200:
-    if: false  # DEBUG: only the qwen and ltx_2_5 debug jobs run
+    if: false  # DEBUG round 3: only the experiment jobs run
     runs-on: ${{ fromJson(inputs.runs_on_map)[inputs.runner_config] }}
     timeout-minutes: 240
     steps:
@@ -391,7 +391,7 @@ jobs:
         if: failure()
 
   multimodal-gen-unit-test:
-    if: false  # DEBUG: only the qwen and ltx_2_5 debug jobs run
+    if: false  # DEBUG round 3: only the experiment jobs run
     runs-on: 1-gpu-h100
     timeout-minutes: 120
     steps:
@@ -426,7 +426,7 @@ jobs:
             --timeout-per-file 3600
 
   diffusion-coverage-check:
-    if: false  # DEBUG: only the qwen and ltx_2_5 debug jobs run
+    if: false  # DEBUG round 3: only the experiment jobs run
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
