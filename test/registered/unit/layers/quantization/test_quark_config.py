@@ -571,12 +571,23 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
     @staticmethod
     @contextmanager
     def _online_quant_available(use_aiter=True, gfx95=True, flag=True, rocm=True):
-        """Pretend this is an aiter + gfx95 build with the opt-in flag set."""
+        """Pretend this is an aiter + gfx95 build run with
+        --enforce-shared-experts-fusion.
+
+        get_exec() is stubbed rather than published: these tests are CPU-only
+        and never build a server config, and the gate reads exactly one leaf.
+        """
         with (
             envs.SGLANG_USE_AITER.override(use_aiter),
             patch.object(quark_config_mod, "is_hip", return_value=rocm),
             patch.object(quark_config_mod, "is_gfx95_supported", return_value=gfx95),
-            envs.SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4.override(flag),
+            patch.object(
+                quark_config_mod,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(enforce_shared_experts_fusion=flag)
+                ),
+            ),
         ):
             yield
 

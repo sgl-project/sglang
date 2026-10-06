@@ -38,6 +38,7 @@ from sglang.srt.layers.quantization.quark.utils import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     get_device_capability,
     is_gfx95_supported,
@@ -299,10 +300,12 @@ _SHARED_EXPERT_BODY_PROJ_SUFFIXES: tuple[str, ...] = (
 # remap the loader hook depends on; text checkpoints report the "_text"
 # spelling, multimodal ones the bare one.
 #
-# The restriction is deliberate. can_fuse_shared_expert() is also reached from
-# quant_blocks_shared_experts_fusion() in models/deepseek_common/utils.py, and a
-# DeepSeek-family Quark MXFP4 checkpoint that excludes its shared-expert body
-# would otherwise have fusion silently enabled by this flag. That combination is
+# The restriction is deliberate, and it carries more weight now that the opt-in
+# is --enforce-shared-experts-fusion: the DeepSeek-V4 recipes pass that flag as a
+# matter of course. can_fuse_shared_expert() is also reached from
+# quant_blocks_shared_experts_fusion() in models/deepseek_common/utils.py, so
+# without this list a DeepSeek-family Quark MXFP4 checkpoint that excludes its
+# shared-expert body would silently start quantizing it. That combination is
 # unmeasured, and DeepSeek's layer 0 is a dense MLP, so the layer-0 probe below
 # would fall back to the global spec instead of reading a real MoE layer.
 _ONLINE_SHARED_EXPERT_MXFP4_MODEL_TYPES: tuple[str, ...] = (
@@ -488,8 +491,8 @@ class QuarkConfig(QuantizationConfig):
             raise NotImplementedError(
                 f"{prefix} does not use the W4A4 MXFP4 MoE scheme, which is "
                 "the only one that can quantize a BF16 shared expert into the "
-                "fused slot. Unset SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4 to "
-                "run this checkpoint with a standalone shared expert."
+                "fused slot. Drop --enforce-shared-experts-fusion to run this "
+                "checkpoint with a standalone shared expert."
             )
 
         block_fp8_config = self._get_block_fp8_config(
@@ -1108,6 +1111,10 @@ class QuarkConfig(QuantizationConfig):
     def shared_expert_online_mxfp4_supported(self) -> bool:
         """Whether a BF16 shared expert can be quantized into the fused slot.
 
+        Opt-in, because the conversion costs accuracy: --enforce-shared-experts-fusion
+        is what asks for fusion in a case the gate would otherwise refuse, and an
+        excluded shared expert is exactly such a case.
+
         Only QuarkW4A4MXFp4MoE implements it, and only for a prequantized
         checkpoint on FP4 hardware and one of the architectures it has been
         measured on, so every MoE layer has to resolve to that scheme. The
@@ -1121,7 +1128,7 @@ class QuarkConfig(QuantizationConfig):
         Every refusal warns and answers "unsupported" rather than raising, so an
         unsupported checkpoint falls back to a standalone shared expert.
         """
-        if not envs.SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4.get():
+        if not get_exec().moe.enforce_shared_experts_fusion:
             return False
 
         # is_hip() first: on a CUDA build SGLANG_USE_AITER is meaningless, and
@@ -1201,9 +1208,9 @@ class QuarkConfig(QuantizationConfig):
         without this the fallback to a standalone shared expert is silent.
         """
         logger.warning_once(
-            "SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4 is set but the shared "
-            f"expert will not be quantized or fused because {reason}. The model "
-            "runs with a standalone shared expert instead."
+            "--enforce-shared-experts-fusion was passed but the shared expert "
+            f"will not be quantized or fused because {reason}. The model runs "
+            "with a standalone shared expert instead."
         )
         return False
 
