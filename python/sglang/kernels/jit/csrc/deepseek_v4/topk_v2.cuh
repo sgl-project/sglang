@@ -661,8 +661,9 @@ struct SplitWorkspace {
   uint32_t floor;  ///< same value the host dispatched on
 };
 
-/// 12 histogram bits, the width TopKStreaming uses: a 10-bit threshold bin holds
-/// more unequal scores than kMaxNumTie can stage, and drops the rest in silence.
+/// 12 histogram bits, the width TopKStreaming uses: a 10-bit threshold bin overflows
+/// kMaxNumTie far more often, and each overflowing row costs the epilogue a
+/// refine_ties rescan of the whole row in one block.
 struct TopKSplit : impl::TopKRadixBase<12> {
   using Base = impl::TopKRadixBase<12>;
   static_assert(kHistSize % kBlockSize == 0, "the histogram is transferred kHistItems bins per thread");
@@ -769,7 +770,8 @@ struct TopKSplit : impl::TopKRadixBase<12> {
     const auto n_eq = min(smem->count_eq, kMaxNumTie);
     if (tx == 0) {
       smem->base_gt = atomicAdd(&ctr->count_gt, n_gt);
-      smem->base_eq = atomicAdd(&ctr->count_eq, n_eq);
+      // Uncapped: finish_ties needs the row's exact bin size to detect overflow and refine.
+      smem->base_eq = atomicAdd(&ctr->count_eq, smem->count_eq);
     }
     __syncthreads();
     const auto base_gt = smem->base_gt;
@@ -806,15 +808,27 @@ struct TopKSplit : impl::TopKRadixBase<12> {
   }
 
   /// Fill the slots the threshold bin has to break ties for, staging the ties
-  /// into LDS first since handle_tie's ranking pass is all-to-all.
+  /// into LDS first since handle_tie's ranking pass is all-to-all. `problem`
+  /// must be the whole row: an overflowing bin is re-derived by rescanning it.
   SGL_DEVICE static void finish_ties(const TopKProblem& problem, const impl::TieValue* ties, Smem* smem) {
     const auto tx = threadIdx.x;
-    const auto above_count = smem->total_gt;
-    const auto tie_count = min(smem->total_eq, kMaxNumTie);
+    uint32_t above_count, tie_count;
+    if (smem->total_eq > kMaxNumTie) [[unlikely]] {
+      // The global list holds an arrival-order subset. refine_ties emits after
+      // the slots every rank already took, so seed its counter with their total.
+      if (tx == 0) smem->count_gt = smem->total_gt;
+      __syncthreads();
+      refine_ties(problem, smem, smem->v_lo, smem->v_hi, smem->total_eq);
+      above_count = smem->count_gt;
+      tie_count = min(smem->count_eq, kMaxNumTie);
+    } else {
+      above_count = smem->total_gt;
+      tie_count = smem->total_eq;
+      for (uint32_t t = tx; t < tie_count; t += kBlockSize)
+        smem->tie_values[t] = ties[t];
+      __syncthreads();
+    }
     const auto remain_topk = above_count < problem.topk ? problem.topk - above_count : 0;
-    for (uint32_t t = tx; t < tie_count; t += kBlockSize)
-      smem->tie_values[t] = ties[t];
-    __syncthreads();
     handle_tie(smem->tie_values, problem, above_count, tie_count, remain_topk, &smem->tie_handle);
   }
 };

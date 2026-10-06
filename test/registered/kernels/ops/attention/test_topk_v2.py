@@ -383,12 +383,13 @@ def _narrow_seed(dist, *rest):
     not is_hip(), reason="CUDA may route these shapes to the unrefined cluster path"
 )
 @pytest.mark.parametrize("dist", NARROW_DISTRIBUTIONS)
-@pytest.mark.parametrize("batch,seq", [(6, 8192), (4, 32768)])
+@pytest.mark.parametrize("batch,seq", [(6, 8192), (4, 32768), (4, 65536)])
 @torch.inference_mode()
 def test_topk_v2_single_coarse_bin_is_exact(batch: int, seq: int, dist: str) -> None:
     """No tolerance here: the threshold bin holds the whole row at k=2048, so a
     dropped candidate is a wrong answer rather than a tie swap. Covers a
-    register-path and a streaming-path shape; tie staging is per-template.
+    register-path, a streaming-path and a ROCm split-path shape (above
+    split_floor); tie staging is per-template.
     """
     torch.manual_seed(_narrow_seed(dist, batch, seq))
     device = "cuda"
@@ -709,12 +710,12 @@ def test_topk_v2_split_duplicate_scores(batch: int, seq: int, nvals: int) -> Non
     """Duplicate-heavy rows: the cross-block tie merge must stay exact.
 
     The split path resolves the threshold bin in whichever block arrives last,
-    out of a tie list that every block appended to, so it is exact only while
-    that bin holds no more candidates than the list. Rows of ``nvals`` distinct
-    scores put ``seq / nvals`` exact duplicates at the cut, which is what fills
-    it; the shapes are long and narrow enough to reach the split gate. CUDA
-    runs its cluster path here, whose coarser histogram makes the same bin four
-    times as wide, so this is the ROCm path's test.
+    out of a tie list that every block appended to; a bin that overflows the
+    list is rescanned instead (test_topk_v2_single_coarse_bin_is_exact). Rows
+    of ``nvals`` distinct scores put ``seq / nvals`` exact duplicates at the
+    cut, which is what fills it; the shapes are long and narrow enough to reach
+    the split gate. CUDA runs its cluster path here, whose coarser histogram
+    makes the same bin four times as wide, so this is the ROCm path's test.
     """
     k = 2048
     g = torch.Generator(device="cuda").manual_seed(nvals * 7 + seq)

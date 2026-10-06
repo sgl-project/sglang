@@ -844,10 +844,10 @@ struct TopKStreaming : TopKRadixBase<12> {
 // CUDA only: thread-block clusters and distributed shared memory have no CDNA
 // equivalent.
 //
-// Still truncates an overflowing threshold bin, unlike the register and
-// streaming paths: the candidate set is split across kClusterSize ranks, so
-// refining needs cluster-wide histogram and emit counters rather than the
-// block-local ones refine_ties uses.
+// Still truncates an overflowing threshold bin, unlike the register, streaming
+// and ROCm split paths: the candidate set is split across kClusterSize ranks
+// and no single block resolves the row, so refining needs cluster-wide
+// histogram and emit counters rather than the block-local ones refine_ties uses.
 // ---------------------------------------------------------------------------
 
 #if SUPPORT_CLUSTER
