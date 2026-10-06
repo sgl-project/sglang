@@ -182,6 +182,9 @@ class KVLocPlan:
         if isinstance(cols, torch.Tensor):
             return torch.where(cols >= 0, ids[cols.clamp(min=0)], 0)
         bs = int(self.req_pool_indices.numel())
+        if bs == 1:
+            # One row: its columns are a slice of the window itself.
+            return ids[cols]
         return ids.view(bs, -1)[:, cols].reshape(-1)
 
     def swa_write_ids(self, *, cols: Optional[Cols] = None) -> Optional[torch.Tensor]:
