@@ -82,13 +82,6 @@ def page_table_live_mask(
     cols = torch.arange(width, device=seq_lens.device)
     return cols.view(1, -1) < live_pages.view(-1, 1)
 
-
-# _HAS_XPU = hasattr(torch, "xpu") and torch.xpu.is_available()
-
-
-# @unittest.skipIf(
-#     not (torch.cuda.is_available() or _HAS_XPU), "Test requires CUDA or XPU"
-# )
 @unittest.skipIf(
     not (torch.cuda.is_available() or torch.xpu.is_available()),
     "Test requires CUDA or XPU",
