@@ -961,27 +961,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         kv_xfer = _transfer_from_binding(kv_xfer)
         comp_xfers = _comp_xfers_from_binding(comp_xfers)
-        swa_xfers = comp_xfers.get(ComponentType.SWA, ())
-        if swa_xfers:
-            full_node_ids = kv_xfer.nodes_to_load or []
-            full_load_slices = {}
-            offset = 0
-            for full_node_id, count in zip(
-                full_node_ids, self._binding.get_node_key_lengths(full_node_ids)
-            ):
-                full_load_slices[full_node_id] = slice(offset, offset + count)
-                offset += count
-            for transfer in swa_xfers:
-                # SWA may have holes between resident nodes, or reload while
-                # FULL stays resident. Preserve the SWA transfer's node order.
-                transfer.anchor_index_parts = [
-                    (
-                        full_load_slices[nid]
-                        if nid in full_load_slices
-                        else self.get_component_device_value(nid, ComponentType.FULL)
-                    )
-                    for nid in transfer.nodes_to_load or ()
-                ]
         return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(

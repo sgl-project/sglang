@@ -28,7 +28,6 @@ from __future__ import annotations
 import logging
 from array import array
 from collections import deque
-from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -1291,51 +1290,6 @@ class BufferModePipeline:
             ),
             0,
         )
-        swa_entry = cc.mem_pool_host.entry_map.get(PoolName.SWA)
-        binds_swa_to_full = (
-            swa_entry is not None
-            and swa_entry.device_indices_from_anchor_fn is not None
-        )
-        repair_ranges = []
-        if binds_swa_to_full and staged_swa:
-            window_start = span_end - staged_swa
-            repair_end = min(splice_base, span_end)
-            if window_start < repair_end:
-                repair_ranges = cache.tree_core.swa_tombstone_ranges(
-                    key, window_start, repair_end
-                )
-            # Only missing SWA rows belong to this load. Existing bindings may
-            # be in use by another request and must survive allocation rollback.
-            anchor_parts = []
-            host_parts = []
-            for repair_start, repair_end_ in repair_ranges:
-                anchor_parts.append(req.prefix_indices[repair_start:repair_end_])
-                host_parts.append(
-                    slice(repair_start - window_start, repair_end_ - window_start)
-                )
-            tail_start = max(splice_base, window_start)
-            if tail_start < span_end:
-                anchor_parts.append(
-                    slice(tail_start - splice_base, span_end - splice_base)
-                )
-                host_parts.append(
-                    slice(tail_start - window_start, span_end - window_start)
-                )
-            for i, transfer in enumerate(load_xfers):
-                if transfer.name != PoolName.SWA:
-                    continue
-                # Keep the original complete host bounce for ack/drop release.
-                load_xfers[i] = replace(
-                    transfer,
-                    host_indices=(
-                        torch.cat([transfer.host_indices[part] for part in host_parts])
-                        if host_parts
-                        else transfer.host_indices[:0]
-                    ),
-                    anchor_index_parts=anchor_parts,
-                )
-            if not anchor_parts:
-                load_xfers = [t for t in load_xfers if t.name != PoolName.SWA]
 
         device_indices = cc.load(
             host_indices=f.host_indices[trim_tokens:],
@@ -1364,21 +1318,12 @@ class BufferModePipeline:
             None,
         )
         aux_device_releases: list[tuple[PoolName, torch.Tensor]] = []
-        if swa_dev is not None and binds_swa_to_full:
-            # Binding already updated the allocator's virtual-to-physical table.
-            # The tree owns virtual FULL rows, not the H2D kernel-facing IDs.
-            for repair_start, repair_end_ in repair_ranges:
-                for action in cache.tree_core.attach_swa_window(
-                    key,
-                    repair_start,
-                    repair_end_,
-                    req.prefix_indices[repair_start:repair_end_],
-                ):
-                    cache._apply_cache_action(action)
-        elif swa_dev is not None:
-            # Register the window's FULL->SWA translation now (attention reads
-            # through it). Keep SWA slots another request may still hold; their
-            # redundant H2D destinations are reclaimed at the transfer ack.
+        if swa_dev is not None:
+            # Every SWA stack loads into newly reserved slots (physical ids
+            # under unified memory). Register the window's FULL->SWA
+            # translation now (attention reads through it). Keep SWA slots
+            # another request may still hold; their redundant H2D destinations
+            # are reclaimed at the transfer ack.
             full_window = torch.cat([req.prefix_indices, device_indices])[
                 -len(swa_dev) :
             ]
