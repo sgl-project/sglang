@@ -42,7 +42,10 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
-from sglang.srt.mem_cache.pool_host.base import _WRITE_BACK_STAGING_PAGE_CHUNK
+from sglang.srt.mem_cache.pool_host.base import (
+    _WRITE_BACK_STAGING_PAGE_CHUNK,
+    explicit_host_memory_budget,
+)
 from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -374,16 +377,14 @@ def build_kv_cache(
         tp_rank=parallel.tp_rank,
         tp_group=parallel.tp_group,
     )
-    with auto_size_hicache(
-        params,
-        hicache_draft_plan,
-        enabled=enable_hierarchical_cache or retraction_backup == "host_pool",
+    host_pools = enable_hierarchical_cache or retraction_backup == "host_pool"
+    with (
+        auto_size_hicache(params, hicache_draft_plan, enabled=host_pools),
+        explicit_host_memory_budget(enabled=host_pools),
     ):
         tree_cache = create_tree_cache(tree_context)
 
-        if (
-            enable_hierarchical_cache or retraction_backup == "host_pool"
-        ) and hicache_draft_plan is not None:
+        if host_pools and hicache_draft_plan is not None:
             maybe_register_hicache_draft(
                 tree_cache=tree_cache,
                 draft_plan=hicache_draft_plan,

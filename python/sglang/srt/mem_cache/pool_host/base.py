@@ -109,6 +109,46 @@ def host_memory_budget_bytes(
     return free // ranks_per_host()
 
 
+@contextmanager
+def explicit_host_memory_budget(*, enabled: bool):
+    """Book an explicitly sized HiCache's host pools against one snapshot,
+    sampled by every local rank before any of them allocates.
+
+    Auto-sizing already does this: it samples the budget, meets the other ranks
+    in one collective, and opens a host_memory_budget_scope -- so inside it
+    there is nothing to do. An explicit --hicache-ratio/--hicache-size opens no
+    scope, and each pool then samples host memory as it is built. Ranks build
+    their pools at different times, so a rank that gets there after its peers
+    have pinned theirs divides what they left by every local rank, and is
+    refused memory that was there for it.
+
+    One collective, before any pool is built, as auto-sizing has: a rank that
+    sampled first waits in it until the last rank has sampled too. Its minimum
+    is every rank's budget. PP stages build different numbers of pools, so a
+    per-pool collective could deadlock.
+    """
+    if not enabled or _host_memory_budget.get() is not None:
+        yield
+        return
+    budget = host_memory_budget_bytes()
+    if torch.distributed.is_initialized():
+        tensor = torch.tensor([budget], dtype=torch.int64)
+        torch.distributed.all_reduce(
+            tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=get_parallel().world_group.cpu_group,
+        )
+        budget = int(tensor.item())
+    logger.info(
+        "HiCache host memory budget: %.1f GiB per rank (%d ranks on this host), "
+        "sampled before any host pool was built.",
+        budget / 1024**3,
+        ranks_per_host(),
+    )
+    with host_memory_budget_scope(budget):
+        yield
+
+
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
     """Sync fixed-size HiCache token capacity across PP ranks.
 
