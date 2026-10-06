@@ -37,6 +37,13 @@ fp32 block scale ``[ceil(N/128), K/128]``, even ``N``; ``N`` not a multiple of
 (``n_valid = N``). Activations BF16 ``[M, K]`` contiguous, no bias, output BF16
 ``[M, N]`` (``apply_into`` targets need unit column stride, an even row stride
 ``>= N`` and 4-byte alignment). Anything else runs the wrapped quant method.
+
+Co-enabling with the ``kimi_k3_mla`` decode route needs FlashInfer main at or
+above ``50a180ed0`` (flashinfer-ai/flashinfer#6126): earlier builds of the Cake
+FP8 MLA decode kernel emitted non-finite rows on requests with an attention-sink
+key once decode-M Cake projection outputs fed them, which is why this route used
+to serve prefill only (``M >= 256``) in that configuration. The default is now
+every ``M``; ``SGLANG_CAKE_K3_PROJ_MIN_M`` remains as an explicit restriction.
 """
 
 from __future__ import annotations
@@ -53,7 +60,7 @@ logger = logging.getLogger(__name__)
 
 # Diagnostic knobs (engine side only; no numerics are changed):
 #   SGLANG_CAKE_K3_PROJ_MIN_M=<int>   keep the FP8 linear for row counts below <int>
-#                                     (defaults to 256 when kimi_k3_mla is co-enabled)
+#                                     (default 0: every M takes the Cake route)
 #   SGLANG_CAKE_K3_PROJ_ONLY=a,b,...  wrap only the listed projection names
 #   SGLANG_CAKE_K3_PROJ_CHECK=1       compare every eager Cake launch with the
 #                                     wrapped FP8 linear and log anomalies
@@ -64,13 +71,6 @@ _PROJ_ONLY = frozenset(
     if s.strip()
 )
 _PROJ_CHECK = os.environ.get("SGLANG_CAKE_K3_PROJ_CHECK", "0") == "1"
-# Admission guard: with the Cake FP8 MLA decode route (``kimi_k3_mla``)
-# co-enabled, decode-M Cake projection outputs on the q/kv-side GEMMs feed
-# that kernel and it emits non-finite values in the last layers (real-weight
-# GSM8K bisect); the projection route then serves prefill only.  An explicit
-# SGLANG_CAKE_K3_PROJ_MIN_M (including 0) overrides the guard.
-_PROJ_GUARD_MIN_M = 256
-_MLA_ROUTE = "kimi_k3_mla"
 
 ROUTE = "kimi_k3_fp8_projection"
 BLOCK = 128
@@ -448,21 +448,6 @@ def install_cake_kimi_k3_fp8_projections(
     """
     if not cake_route_enabled(ROUTE):
         return []
-    global _PROJ_MIN_M
-    if (
-        cake_route_enabled(_MLA_ROUTE)
-        and "SGLANG_CAKE_K3_PROJ_MIN_M" not in os.environ
-        and _PROJ_MIN_M < _PROJ_GUARD_MIN_M
-    ):
-        _PROJ_MIN_M = _PROJ_GUARD_MIN_M
-        logger.warning(
-            "Cake %s: %s is co-enabled, so the projection route serves prefill only "
-            "(M >= %d); decode-M Cake projection outputs feeding the Cake FP8 MLA decode "
-            "kernel produce non-finite values. Set SGLANG_CAKE_K3_PROJ_MIN_M to override.",
-            ROUTE,
-            _MLA_ROUTE,
-            _PROJ_GUARD_MIN_M,
-        )
     installed = []
     for name in PROJECTIONS:
         linear = getattr(attn, name, None)

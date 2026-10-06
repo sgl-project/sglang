@@ -48,7 +48,9 @@ FlashInfer entries (all at FlashInfer ``46340689a5ab``):
   query and KV only, ``kv_lora_rank=512``, ``qk_rope_head_dim=64`` (D=576),
   page size 64 (``[pages, 64, 576]`` or ``[pages, 1, 64, 576]``), host float
   scales, BF16 ``out`` of shape ``query.shape[:-1] + (512,)``; rejects
-  ``sparse_mla_top_k``, sinks, LSE, DCP, skip-softmax, PDL.
+  ``sparse_mla_top_k``, sinks, LSE, DCP, skip-softmax, PDL. Finite output on
+  requests with an attention-sink key needs FlashInfer main at or above
+  ``50a180ed0`` (flashinfer-ai/flashinfer#6126).
 * ``flashinfer.mla.KimiK3MlaFp8PagedAttention`` (prepared; all planning at
   construction, ``launch()`` allocates nothing) and
   ``flashinfer.mla.run_cake_kimi_k3_mla_fp8_paged_attention`` (one-shot).

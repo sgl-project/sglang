@@ -335,6 +335,11 @@ project, not in this tree.
   run the registered tests on SM100/SM103 hardware. Post-baseline Cake modules become
   candidates for new adapters; removed or renamed entries lose their `KernelSpec` (no
   aliases).
+- **`kimi_k3_mla` + `kimi_k3_fp8_projection` co-enabled**: needs FlashInfer main at or above
+  `50a180ed0` (flashinfer-ai/flashinfer#6126, 2026-10-06). Earlier `cake_kimi_k3_mla` builds
+  emitted non-finite output rows on requests with an attention-sink key when decode-M Cake
+  projection outputs fed them; the engine-side prefill-only default for the projection
+  route in that configuration was removed with the fix.
 - This directory does not change SGLang's dependency pins.
 
 ## Testing
