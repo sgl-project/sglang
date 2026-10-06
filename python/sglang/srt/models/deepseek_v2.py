@@ -23,7 +23,17 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager, nullcontext
 from functools import cached_property
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 import torch.nn.functional as F
@@ -96,7 +106,6 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
     post_experts_all_reduce,
-    should_skip_post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -133,7 +142,6 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     Mxfp8RoutedInputPreQuant,
     maybe_fuse_routed_scale_and_shared_add,
     routed_hidden_size,
-    should_use_fuse_finalize_all_reduce,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -582,9 +590,33 @@ class MoEGate(nn.Module):
         return logits
 
 
-# The dedicated 4 MiB push slot fits 384 rows of 5120 BF16 values.
-# The dispatch gate also checks slot capacity and available counters.
-_FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS = 384
+class MoEOutput(NamedTuple):
+    """A MoE block's pieces, before anything merges or reduces them. ``routed`` is
+    a deferred finalize handle or the raw routed rows."""
+
+    routed: Any
+    shared: Optional[torch.Tensor]
+    experts: nn.Module
+    routed_scaling_factor: float
+    shared_is_replicated: bool
+
+    def get_merged(self) -> torch.Tensor:
+        """Merge the pieces, leaving the reduction to the caller."""
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            FlashInferTrtllmDeferredFinalizeOutput,
+            finalize_flashinfer_trtllm_deferred_output,
+        )
+
+        # NOTE: normal TP-sharded shared expert out
+        shared = None if self.shared_is_replicated else self.shared
+        if isinstance(self.routed, FlashInferTrtllmDeferredFinalizeOutput):
+            return finalize_flashinfer_trtllm_deferred_output(self.routed, shared)
+        return maybe_fuse_routed_scale_and_shared_add(
+            self.experts,
+            self.routed,
+            shared,
+            self.routed_scaling_factor,
+        )
 
 
 class DeepseekV2MoE(nn.Module):
@@ -656,12 +688,6 @@ class DeepseekV2MoE(nn.Module):
         self.routed_quant_stream = routed_quant_stream
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
-        self._fuse_finalize_all_reduce = (
-            is_deepseek_v4
-            and getattr(config, "hc_pre_from_prev_sublayer", False)
-            and get_platform().is_blackwell
-            and self.tp_size == 4
-        )
         n_hash_layers = getattr(config, "num_hash_layers", 0)
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
 
@@ -980,7 +1006,11 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
-    ) -> torch.Tensor:
+        return_moe_output: bool = False,
+    ) -> Union[torch.Tensor, MoEOutput]:
+        """``return_moe_output`` asks for the pieces unmerged, as `MoEOutput`; only
+        the TP paths honor it. Distinct from `get_forward().defer_moe_finalize`,
+        the V2/V3 layer-boundary handoff."""
         from sglang.srt.layers.moe.gluon_backend import (
             forward_gluon_moe,
             should_use_gluon_moe,
@@ -1005,7 +1035,19 @@ class DeepseekV2MoE(nn.Module):
                 skip_shared_experts=skip_shared_experts,
                 num_token_non_padded=num_token_non_padded,
             )
-            return self._finalize_normal_output(output, None)
+            if return_moe_output:
+                # Gluon returns a fully materialized rank-local result: routed
+                # scaling and the shared expert are already applied.
+                return MoEOutput(
+                    routed=output,
+                    shared=None,
+                    experts=self.experts,
+                    routed_scaling_factor=1.0,
+                    shared_is_replicated=False,
+                )
+            if self.reduce_results:
+                output = post_experts_all_reduce(output)
+            return output
 
         if should_use_mega_moe(self, hidden_states):
             return forward_mega_moe(
@@ -1040,6 +1082,7 @@ class DeepseekV2MoE(nn.Module):
                     input_ids_global=input_ids_global,
                     num_token_non_padded=num_token_non_padded,
                     use_vision_topk=use_vision_topk,
+                    return_moe_output=return_moe_output,
                 )
             else:
                 return self.forward_normal(
@@ -1050,6 +1093,7 @@ class DeepseekV2MoE(nn.Module):
                     skip_shared_experts=skip_shared_experts,
                     num_token_non_padded=num_token_non_padded,
                     use_vision_topk=use_vision_topk,
+                    return_moe_output=return_moe_output,
                 )
         else:
             return self.forward_deepep(
@@ -1064,7 +1108,8 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
         num_token_non_padded: Optional[torch.Tensor] = None,
         use_vision_topk: bool = False,
-    ) -> torch.Tensor:
+        return_moe_output: bool = False,
+    ) -> Union[torch.Tensor, MoEOutput]:
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
         # - PDL overlap: routed is the last main-stream kernel (fuses w/ residual add);
@@ -1145,22 +1190,7 @@ class DeepseekV2MoE(nn.Module):
                 )
                 ready = self.routed_quant_stream.record_event()
             routed_pre_quant_input = Mxfp8RoutedInputPreQuant(x_q, x_sf, ready)
-        # The mHC post-split consumes the reduced row without an RMSNorm.
-        use_fused_finalize_all_reduce = (
-            self._fuse_finalize_all_reduce
-            # The kernel completes the tensor-parallel sum itself.
-            and self.reduce_results
-            and has_shared_output
-            and hidden_states.shape[-1] == 5120
-            and not self._shared_expert_tp1
-            and self.tp_size > 1
-            and hidden_states.shape[0] <= _FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS
-            and not should_skip_post_experts_all_reduce(is_tp_path=True)
-            and should_use_fuse_finalize_all_reduce(
-                self.experts, hidden_states.shape[0], hidden_states.shape[-1]
-            )
-        )
-        deferred_finalize = use_fused_finalize_all_reduce or (
+        deferred_finalize = (
             has_shared_output
             and not self._shared_expert_tp1
             and topk_output.format == TopKOutputFormat.BYPASSED
@@ -1169,6 +1199,11 @@ class DeepseekV2MoE(nn.Module):
                 self._deferred_finalize_max_tokens <= 0
                 or hidden_states.shape[0] <= self._deferred_finalize_max_tokens
             )
+        )
+        # NOTE: if `return_moe_output`, always try to defer finalize
+        deferred_finalize = deferred_finalize or (
+            return_moe_output
+            and isinstance(self.experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod)
         )
         if deferred_finalize:
             final_hidden_states = self.experts.forward_deferred_finalize(
@@ -1216,91 +1251,24 @@ class DeepseekV2MoE(nn.Module):
                 reduce=sum_post_experts_output,
             )
 
-        all_reduce_done = False
+        if return_moe_output:
+            return MoEOutput(
+                routed=final_hidden_states,
+                shared=shared_output,
+                experts=self.experts,
+                routed_scaling_factor=self.routed_scaling_factor,
+                shared_is_replicated=self._shared_expert_tp1,
+            )
+
         if deferred_finalize:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 finalize_flashinfer_trtllm_deferred_output,
             )
 
-            deferred = final_hidden_states
-            if (
-                use_fused_finalize_all_reduce
-                and deferred.gemm2_out.shape[1] == hidden_states.shape[-1]
-            ):
-                from sglang.kernels.ops.communication.all_reduce_fusion import (
-                    moe_finalize_all_reduce,
-                )
-                from sglang.srt.layers.moe.mhc_post_fusion import (
-                    current_mhc_post_fusion,
-                )
-
-                mhc = current_mhc_post_fusion()
-                if mhc is not None:
-                    from sglang.kernels.ops.communication.all_reduce_mhc import (
-                        moe_finalize_all_reduce_mhc,
-                    )
-
-                    # Join the coefficients before the fused epilogue reads them.
-                    mhc.materialize_stats()
-                    if mhc.stats_stream is not None:
-                        current_stream.wait_stream(mhc.stats_stream)
-                    args = (
-                        deferred.gemm2_out,
-                        deferred.expanded_idx_to_permuted_idx,
-                        deferred.expert_weights,
-                        deferred.top_k,
-                        shared_output,
-                        mhc.residual,
-                        mhc.post,
-                        mhc.comb,
-                    )
-                    if mhc.combine_only:
-                        from sglang.kernels.ops.communication.all_reduce_mhc_combine import (
-                            moe_finalize_all_reduce_mhc_combine,
-                        )
-
-                        final_hidden_states, mhc.output, mhc.combined = (
-                            moe_finalize_all_reduce_mhc_combine(
-                                *args, mhc.pre, world_size=self.tp_size
-                            )
-                        )
-                    elif mhc.norm_weight is not None:
-                        from sglang.kernels.ops.communication.all_reduce_mhc import (
-                            moe_finalize_all_reduce_mhc_quant,
-                        )
-
-                        final_hidden_states, mhc.output, mhc.normalized, q, sf = (
-                            moe_finalize_all_reduce_mhc_quant(
-                                *args,
-                                mhc.pre,
-                                mhc.norm_weight,
-                                mhc.norm_eps,
-                                world_size=self.tp_size,
-                            )
-                        )
-                        mhc.quantized = (q, sf)
-                    else:
-                        final_hidden_states, mhc.output = moe_finalize_all_reduce_mhc(
-                            *args, world_size=self.tp_size
-                        )
-                else:
-                    final_hidden_states = moe_finalize_all_reduce(
-                        deferred.gemm2_out,
-                        deferred.expanded_idx_to_permuted_idx,
-                        deferred.expert_weights,
-                        deferred.top_k,
-                        shared_output,
-                        world_size=self.tp_size,
-                        hidden_dim=hidden_states.shape[-1],
-                        # Routing metadata must be ready before it is consumed.
-                        prefetch_metadata=False,
-                    )
-                all_reduce_done = True
-            else:
-                final_hidden_states = finalize_flashinfer_trtllm_deferred_output(
-                    deferred,
-                    shared_output,
-                )
+            final_hidden_states = finalize_flashinfer_trtllm_deferred_output(
+                final_hidden_states,
+                shared_output,
+            )
         else:
             final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
                 self.experts,
@@ -1308,61 +1276,11 @@ class DeepseekV2MoE(nn.Module):
                 None if self._shared_expert_tp1 else shared_output,
                 self.routed_scaling_factor,
             )
-
-        if not all_reduce_done and self.reduce_results:
-            if (
-                self.is_deepseek_v4
-                and self.tp_size > 1
-                and not should_skip_post_experts_all_reduce(is_tp_path=True)
-            ):
-                from sglang.srt.layers.moe.mhc_post_fusion import (
-                    current_mhc_post_fusion,
-                )
-
-                mhc = current_mhc_post_fusion()
-                if _is_hip and _hip_moe.fused_all_reduce_mhc(
-                    self, mhc, final_hidden_states
-                ):
-                    return final_hidden_states
-                if mhc is not None:
-                    mhc.start_stats_before_all_reduce()
+        if self.reduce_results:
             final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated: add them after this block's
         # all-reduce, or on TP rank 0 only when the stage boundary sums.
         if self._shared_expert_tp1 and self._adds_replicated_output():
-            final_hidden_states += shared_output
-        return final_hidden_states
-
-    def _finalize_normal_output(
-        self,
-        final_hidden_states: torch.Tensor,
-        shared_output: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if self.reduce_results:
-            if (
-                self.is_deepseek_v4
-                and self.tp_size > 1
-                and not should_skip_post_experts_all_reduce(is_tp_path=True)
-            ):
-                from sglang.srt.layers.moe.mhc_post_fusion import (
-                    current_mhc_post_fusion,
-                )
-
-                mhc = current_mhc_post_fusion()
-                if _is_hip and _hip_moe.fused_all_reduce_mhc(
-                    self, mhc, final_hidden_states
-                ):
-                    return final_hidden_states
-                if mhc is not None:
-                    mhc.start_stats_before_all_reduce()
-            final_hidden_states = post_experts_all_reduce(final_hidden_states)
-        # TP1 shared experts are replicated: add them after this block's
-        # all-reduce, or on TP rank 0 only when the stage boundary sums.
-        if (
-            shared_output is not None
-            and self._shared_expert_tp1
-            and self._adds_replicated_output()
-        ):
             final_hidden_states += shared_output
         return final_hidden_states
 
@@ -1375,7 +1293,8 @@ class DeepseekV2MoE(nn.Module):
         skip_shared_experts: bool = False,
         num_token_non_padded: Optional[torch.Tensor] = None,
         use_vision_topk: bool = False,
-    ) -> torch.Tensor:
+        return_moe_output: bool = False,
+    ) -> Union[torch.Tensor, MoEOutput]:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
@@ -1510,14 +1429,32 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
+        if return_moe_output:
+            return MoEOutput(
+                routed=final_hidden_states,
+                shared=shared_output,
+                experts=self.experts,
+                routed_scaling_factor=self.routed_scaling_factor,
+                shared_is_replicated=self._shared_expert_tp1,
+            )
+
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
             self.experts,
             final_hidden_states,
             None if self._shared_expert_tp1 else shared_output,
             self.routed_scaling_factor,
         )
-
-        return self._finalize_normal_output(final_hidden_states, shared_output)
+        if self.reduce_results:
+            final_hidden_states = post_experts_all_reduce(final_hidden_states)
+        # TP1 shared experts are replicated: add them after this block's
+        # all-reduce, or on TP rank 0 only when the stage boundary sums.
+        if (
+            shared_output is not None
+            and self._shared_expert_tp1
+            and self._adds_replicated_output()
+        ):
+            final_hidden_states += shared_output
+        return final_hidden_states
 
     def _adds_replicated_output(self) -> bool:
         """Whether this rank adds the replicated TP1 shared-expert output."""

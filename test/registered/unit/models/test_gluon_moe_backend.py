@@ -59,11 +59,28 @@ def test_gluon_backend_is_strict_and_uses_native_finalize(monkeypatch):
     backend = _Backend()
 
     bind_gluon_moe_backend(moe, backend)
-    output = forward_gluon_moe(moe, torch.zeros((2, 4), dtype=torch.bfloat16))
-    output = moe._finalize_normal_output(output, None)
+    output = moe.forward(torch.zeros((2, 4), dtype=torch.bfloat16))
 
     assert backend.bound
     torch.testing.assert_close(output, torch.full_like(output, 5))
+
+
+def test_gluon_backend_returns_materialized_moe_output(monkeypatch):
+    moe = _moe_shell()
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.utils.get_moe_runner_backend", lambda: _Gluon()
+    )
+    bind_gluon_moe_backend(moe, _Backend())
+
+    output = moe.forward(
+        torch.zeros((2, 4), dtype=torch.bfloat16), return_moe_output=True
+    )
+
+    assert isinstance(output, deepseek_v2.MoEOutput)
+    assert output.shared is None
+    assert output.routed_scaling_factor == 1.0
+    assert not output.shared_is_replicated
+    torch.testing.assert_close(output.routed, torch.full_like(output.routed, 2))
 
 
 def test_gluon_backend_missing_implementation_raises(monkeypatch):
