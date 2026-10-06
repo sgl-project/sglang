@@ -274,103 +274,19 @@ When deploying with PD Disaggregation, the prefill node can choose to enable [La
 ```
 With LayerSplit, the kv cache on each rank can be sharded over the CP attention group, and prefetched when necessary. This can reduce kv cache memory by up to 75%, thus increasing the throughput on prefill side.
 
-### 3.6 Agentic Long-Context with HiCache DRAM Offload (NVFP4, MTP)
+### 3.6 Agentic Long-Context (SemiAnalysis InferenceX AgentX)
 
-**B300 (TP8):**
-```bash Command
-python3 -m sglang.launch_server \
-  --model-path nvidia/GLM-5.2-NVFP4 \
-  --trust-remote-code \
-  --tp 8 \
-  --ep-size 1 \
-  --quantization modelopt_fp4 \
-  --kv-cache-dtype fp8_e4m3 \
-  --bf16-gemm-backend cutedsl \
-  --max-prefill-tokens 8192 \
-  --chunked-prefill-size 8192 \
-  --mem-fraction-static 0.85 \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm45 \
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --enable-hierarchical-cache \
-  --hicache-size 270 \
-  --hicache-write-policy write_back \
-  --hicache-io-backend direct \
-  --hicache-mem-layout page_first_direct
-```
+<Warning>
+These configurations are mirrored from [SemiAnalysis InferenceX](https://github.com/SemiAnalysisAI/InferenceX) AgentX submissions and have **not been verified by the SGLang team**. For launch commands the SGLang team has verified, use the [Deployment panel](#deployment) and the [Playground](#playground) above.
+</Warning>
 
-**B200 (TP8):** same command, with `--mem-fraction-static 0.83` and `--hicache-size 169`. Lower concurrency (c1/c4/c8) uses `--hicache-ratio 0.75` instead.
+[AgentX](https://inferencex.semianalysis.com/) replays multi-turn agentic-coding traces, whose long and highly reusable prefixes reward KV-cache reuse and host-memory offload. Pick a hardware platform, checkpoint, deployment shape, concurrency and router to get every process of that deployment as a raw command: infrastructure (etcd, NATS, Mooncake), each worker role, and the front door. Each configuration links back to the SemiAnalysis sweep run that measured it.
 
-**GB300 (TP4, single node):** one 4-GPU GB300 node serves the whole model. All three commands offload KV cache to host DRAM with `--hicache-size 135` (GB of host memory per rank, 540 GB per node). GLM-5.2 is a DSA model, so on Blackwell SGLang already defaults to an FP8 E4M3 KV cache and TRT-LLM DSA attention; the commands do not need to set them.
+- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks). The other router is derived by re-rendering the same recipe through [srt-slurm](https://github.com/NVIDIA/srt-slurm), and is marked as not run.
+- **What changed from the submission.** Benchmark-harness plumbing, SemiAnalysis cluster paths and caches, telemetry switches, and the synthetic speculative-decoding acceptance that InferenceX injects for comparable throughput are removed. IPs, ports and NIC names become placeholders. Engine flags and environment variables are otherwise mirrored as submitted.
+- **Container image.** Run the commands inside the image listed for each configuration. Several are SGLang nightly images, so flag names follow that image.
 
-Low-latency (TP4, MTP 5-1-6, up to 16 concurrent requests):
-```bash Command
-sglang serve \
-  --model-path nvidia/GLM-5.2-NVFP4 \
-  --trust-remote-code \
-  --tp 4 \
-  --quantization modelopt_fp4 \
-  --fp4-gemm-backend flashinfer_trtllm \
-  --max-running-requests 16 \
-  --cuda-graph-max-bs-decode 16 \
-  --chunked-prefill-size 8192 \
-  --max-prefill-tokens 8192 \
-  --mem-fraction-static 0.8 \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm45 \
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 5 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 6 \
-  --enable-hierarchical-cache \
-  --hicache-size 135 \
-  --hicache-write-policy write_back \
-  --hicache-io-backend direct
-```
+import { AgentX } from "/src/snippets/_agentx.jsx";
+import { agentx } from "/src/snippets/agentx/zai-org/glm-5.2.jsx";
 
-Balanced (DP attention, MTP 2-1-3, up to 256 concurrent requests):
-```bash Command
-sglang serve \
-  --model-path nvidia/GLM-5.2-NVFP4 \
-  --trust-remote-code \
-  --tp 4 \
-  --attn-dp-size 4 \
-  --quantization modelopt_fp4 \
-  --max-running-requests 256 \
-  --chunked-prefill-size 8192 \
-  --mem-fraction-static 0.92 \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm45 \
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 2 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 3 \
-  --enable-hierarchical-cache \
-  --hicache-size 135 \
-  --hicache-write-policy write_back \
-  --hicache-io-backend direct
-```
-
-High-throughput (DP attention, no MTP, up to 512 concurrent requests):
-```bash Command
-sglang serve \
-  --model-path nvidia/GLM-5.2-NVFP4 \
-  --trust-remote-code \
-  --tp 4 \
-  --attn-dp-size 4 \
-  --quantization modelopt_fp4 \
-  --max-running-requests 512 \
-  --chunked-prefill-size 8192 \
-  --mem-fraction-static 0.92 \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm45 \
-  --enable-hierarchical-cache \
-  --hicache-size 135 \
-  --hicache-write-policy write_back \
-  --hicache-io-backend direct
-```
-
-With `--attn-dp-size 4`, `--chunked-prefill-size` is a global budget divided across the attention DP ranks, so the balanced and high-throughput commands prefill 2048 tokens per rank per chunk.
+<AgentX data={agentx} />
