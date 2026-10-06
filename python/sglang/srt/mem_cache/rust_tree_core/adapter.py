@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
@@ -99,15 +100,16 @@ def _radix_key_buffer(key: RadixKey) -> array:
     return token_ids
 
 
-def _kv_event_from_tagged(event: tuple, lora_names: dict[str, str]):
+def _kv_event_from_tagged(event: tuple, lora_names: KvEventLoraNames):
     """Build the Python KV cache event for one of the binding's tagged tuples.
 
     Rust hashes are LoRA-agnostic; the trailing extra_key selects the LoRA
-    namespace, applied here as in KVCacheEventRecorder.
+    namespace, applied and counted here as in KVCacheEventRecorder.
     """
     tag = event[0]
     if tag == "block_stored":
         lora_name = lora_names.get(event[8])
+        lora_names.count_published(event[8], len(event[1]))
         seed = kv_event_lora_seed(lora_name)
         parent = event[2]
         return BlockStored(
@@ -125,11 +127,13 @@ def _kv_event_from_tagged(event: tuple, lora_names: dict[str, str]):
         )
     if tag == "block_removed":
         seed = kv_event_lora_seed(lora_names.get(event[3]))
+        lora_names.count_published(event[3], -len(event[1]))
         return BlockRemoved(
             block_hashes=[namespace_event_block_hash(h, seed) for h in event[1]],
             medium=StorageMedium(event[2]),
         )
     if tag == "all_blocks_cleared":
+        lora_names.clear_published()
         return AllBlocksCleared()
     raise ValueError(f"unknown kv event tag: {tag}")
 
@@ -319,7 +323,7 @@ def _fill_evict_result(binding_result, result):
 class _RustKVCacheEventRecorder:
     """Expose the Rust event queue through the Python recorder interface."""
 
-    def __init__(self, binding, enabled: bool, lora_names: dict[str, str]):
+    def __init__(self, binding, enabled: bool, lora_names: KvEventLoraNames):
         self._binding = binding
         self.enabled = enabled
         self._lora_names = lora_names
@@ -328,10 +332,12 @@ class _RustKVCacheEventRecorder:
         self._binding.record_all_cleared_event()
 
     def take(self) -> list:
-        return [
+        events = [
             _kv_event_from_tagged(event, self._lora_names)
             for event in self._binding.take_events()
         ]
+        self._lora_names.prune()
+        return events
 
 
 class RustUnifiedTreeCore(UnifiedTreeCoreInterface):

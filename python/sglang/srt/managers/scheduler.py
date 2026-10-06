@@ -296,6 +296,7 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -562,8 +563,8 @@ class Scheduler(
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
-        # extra_key -> LoRA adapter name; KV events namespace LoRA blocks by it.
-        self.kv_event_lora_names: dict[str, str] = {}
+        # LoRA adapter names that KV events namespace LoRA blocks by.
+        self.kv_event_lora_names = KvEventLoraNames()
 
         # Init cache and memory pool
         result = kv_cache_builder.build_kv_cache(
@@ -2718,8 +2719,8 @@ class Scheduler(
 
     def _record_kv_event_lora_name(self, req: Req, lora_name: Optional[str]) -> None:
         # Keyed by the final extra_key, so it must run after elastic namespacing.
-        if lora_name is not None and get_observability().kv_events_config:
-            self.kv_event_lora_names[req.extra_key] = lora_name
+        if get_observability().kv_events_config:
+            self.kv_event_lora_names.register(req, lora_name)
 
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
         if (

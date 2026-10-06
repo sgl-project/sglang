@@ -1081,8 +1081,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
-    # Adapter name; KV events namespace this request's blocks by it.
-    lora_name: Optional[str] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -1153,6 +1151,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Shape of output_token_sampling_logprobs for each output token. This is a
     # defaulted tail field so older IPC senders decode as selected mode.
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+    # LoRA adapter name; KV events namespace this request's blocks by it.
+    lora_name: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -1439,8 +1439,6 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     sampling_params: SamplingParams
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
-    # Adapter name; KV events namespace this request's blocks by it.
-    lora_name: Optional[str] = None
     # Embedding overrides to place at specific token positions.
     positional_embed_overrides: Optional[PositionalEmbeds] = None
     # For DP routing
@@ -1458,6 +1456,8 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+    # LoRA adapter name; KV events namespace this request's blocks by it.
+    lora_name: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

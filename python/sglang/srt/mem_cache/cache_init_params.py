@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.mem_cache.events import KvEventLoraNames
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -33,8 +35,10 @@ class CacheInitParams:
 
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False
-    # extra_key -> LoRA adapter name for KV events; the scheduler fills it.
-    kv_event_lora_names: dict[str, str] = dataclasses.field(default_factory=dict)
+    # LoRA names for KV events; the scheduler registers requests in it.
+    kv_event_lora_names: KvEventLoraNames = dataclasses.field(
+        default_factory=KvEventLoraNames
+    )
     enable_session_radix_cache: bool = False
 
     enable_mamba_extra_buffer: bool = False

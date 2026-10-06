@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str, release_kv_cache
+from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -470,7 +471,7 @@ def build_fixture(
     tree_page_size: Optional[int] = None,
     mamba_cache_chunk_size: Optional[int] = None,
     tree_core_backend: Optional[str] = None,
-    kv_event_lora_names: Optional[dict[str, str]] = None,
+    kv_event_lora_names: Optional[KvEventLoraNames] = None,
 ):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
 
@@ -601,7 +602,7 @@ def build_fixture(
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
-        kv_event_lora_names=kv_event_lora_names or {},
+        kv_event_lora_names=kv_event_lora_names or KvEventLoraNames(),
         enable_session_radix_cache=enable_session_radix_cache,
         eviction_policy=cfg.eviction_policy,
         is_eagle=cfg.is_eagle,
@@ -1155,6 +1156,23 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         cache.sanity_check()
 
 
+class _LoraReq:
+    """The request fields KvEventLoraNames reads."""
+
+    def __init__(self, extra_key, lora_id="lora-id"):
+        self.extra_key = extra_key
+        self.lora_id = lora_id
+
+
+def _lora_names(**names_by_extra_key):
+    """A name table plus the requests that keep its entries alive."""
+    table = KvEventLoraNames()
+    reqs = [_LoraReq(key) for key in names_by_extra_key]
+    for req in reqs:
+        table.register(req, names_by_extra_key[req.extra_key])
+    return table, reqs
+
+
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
 
@@ -1383,11 +1401,13 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
     def test_lora_name_namespaces_event_hashes(self):
         """LoRA blocks publish name-keyed hashes, the same on every worker."""
-        lora_names = {
-            "uuid-a": "adapter-a",
-            "user|uuid-a2": "adapter-a",
-            "uuid-b": "adapter-b",
-        }
+        lora_names, _reqs = _lora_names(
+            **{
+                "uuid-a": "adapter-a",
+                "user|uuid-a2": "adapter-a",
+                "uuid-b": "adapter-b",
+            }
+        )
 
         def store_then_evict(extra_key):
             cache, allocator, _ = build_fixture(
@@ -1420,11 +1440,28 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             self._event_hashes(lora_a),
         )
 
-    def test_lora_event_parentage_survives_node_split(self):
+    def test_lora_name_is_kept_until_published_blocks_are_removed(self):
+        """Removals hash like their stores after the request is gone; then the
+        name is forgotten, so the table does not grow without bound."""
+        lora_names, reqs = _lora_names(**{"uuid-a": "adapter-a"})
         cache, allocator, _ = build_fixture(
-            self.cfg,
-            enable_kv_cache_events=True,
-            kv_event_lora_names={"uuid-a": "adapter-a"},
+            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
+        )
+        cache.take_events()
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
+        del reqs
+        stored = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(lora_names.get("uuid-a"), "adapter-a")
+
+        cache.evict(EvictParams(num_tokens=4))
+        removed = self._removed_events(cache, StorageMedium.GPU)
+        self.assertEqual(self._event_hashes(removed), self._event_hashes(stored))
+        self.assertIsNone(lora_names.get("uuid-a"))
+
+    def test_lora_event_parentage_survives_node_split(self):
+        lora_names, _reqs = _lora_names(**{"uuid-a": "adapter-a"})
+        cache, allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
         )
         cache.take_events()
 
