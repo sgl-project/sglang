@@ -133,6 +133,10 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform supports a draft backend for an algorithm."""
         return False
 
+    def support_mamba_cache_extra_buffer(self) -> bool:
+        """Whether this out-of-tree platform supports Mamba cache snapshots."""
+        return False
+
     def support_cuda_graph(self) -> bool:
         """Whether this platform supports device graph capture and replay.
         Controls CUDA graph (CudaGraphRunner) for the decode path.

@@ -235,10 +235,15 @@ def validate_hicache_host_memory_mode(server_args: Any):
             "and all cached data lives in storage."
         )
     if cfg.hicache_write_policy == "write_back":
-        raise ValueError(
-            "--hicache-host-memory-mode buffer_only does not support "
-            "--hicache-write-policy write_back; use write_through or "
-            "write_through_selective."
+        # buffer_only has no host tier to write back to; pages go to storage.
+        declare_resolution(
+            server_args,
+            "_validate_hicache_host_memory_mode",
+            hicache_write_policy="write_through",
+        )
+        logger.info(
+            "--hicache-host-memory-mode buffer_only resolves "
+            "--hicache-write-policy write_back to write_through"
         )
     if cfg.disaggregation_mode == "decode":
         raise ValueError(
