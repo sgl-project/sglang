@@ -25,7 +25,7 @@ from sglang.srt.managers.io_struct import BatchTokenIDOutput  # noqa: E402
 from sglang.srt.managers.output_store import (  # noqa: E402
     OutputStore,
     OutputStoreConfig,
-    OutputStoreStash,
+    TokenReplayStash,
     maybe_create_output_store,
 )
 
@@ -200,7 +200,7 @@ class TestOutputStore(CustomTestCase):
                 store, _ = self._store(
                     replica_num=replica_num, partition="run-1", chunk_bytes=4096
                 )
-                stash = OutputStoreStash(
+                stash = TokenReplayStash(
                     routed_experts=torch.arange(4, dtype=torch.int32).reshape(2, 1, 2),
                     indexer_topk=torch.zeros((2, 3, 4), dtype=torch.int32),
                 )

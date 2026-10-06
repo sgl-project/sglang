@@ -40,7 +40,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     GenerateReqInput,
     wrap_as_pickle,
 )
-from sglang.srt.managers.output_store import OutputStoreStash  # noqa: E402
+from sglang.srt.managers.output_store import TokenReplayStash  # noqa: E402
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
     TokenizerManager,
@@ -455,7 +455,7 @@ class TestOutputStoreFinalization(unittest.IsolatedAsyncioTestCase, CustomTestCa
         state = _make_req_state(rid)
         state.obj.background = False
         if via_store:
-            state.output_store_stash = OutputStoreStash()
+            state.output_store_stash = TokenReplayStash()
         self.tm.rid_to_state[rid] = state
         return state
 
