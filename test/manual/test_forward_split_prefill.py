@@ -67,10 +67,10 @@ class TestForwardSplitPrefill(CustomTestCase):
         cls.model_config = ModelConfig.from_server_args(cls.server_args)
         bootstrap.init_parallel_runtime(
             server_args=cls.server_args,
-            model_config=cls.model_config,
             device=cls.device,
             dist_port=cls.port_args.nccl_port,
         )
+        bootstrap.init_layer_runtime(model_config=cls.model_config)
         cls.model_runner = ModelRunner(
             model_config=cls.model_config,
             mem_fraction_static=cls.server_args.mem_fraction_static,

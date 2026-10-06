@@ -222,16 +222,18 @@ def is_cpu() -> bool:
 
 @lru_cache(maxsize=1)
 def is_musa() -> bool:
+    if not hasattr(torch.version, "musa") or torch.version.musa is None:
+        return False
     try:
         import torchada  # noqa: F401
     except ImportError:
         return False
-    return hasattr(torch.version, "musa") and torch.version.musa is not None
+    return True
 
 
 @lru_cache(maxsize=1)
 def is_mps() -> bool:
-    return torch.backends.mps.is_available()
+    return hasattr(torch, "mps") and torch.mps.is_available()
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
@@ -533,7 +535,23 @@ def get_available_gpu_memory(
             free_gpu_memory = psutil.virtual_memory().available
         free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
     elif device == "mps":
-        free_gpu_memory = psutil.virtual_memory().available
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
+        num_gpus = torch.mps.device_count()
+        assert gpu_id < num_gpus
+
+        if use_mlx():
+            # Torch's allocator does not track MLX Metal allocations.
+            free_gpu_memory = psutil.virtual_memory().available
+        else:
+            if empty_cache:
+                empty_device_cache(torch.mps)
+            # Bound free memory by host RAM and Metal's working-set limit.
+            total_gpu_memory = torch.mps.recommended_max_memory()
+            metal_headroom = max(
+                0, total_gpu_memory - torch.mps.driver_allocated_memory()
+            )
+            free_gpu_memory = min(psutil.virtual_memory().available, metal_headroom)
     else:
         if not current_platform.is_out_of_tree():
             raise ValueError(
@@ -557,6 +575,13 @@ def get_available_gpu_memory(
 
 def is_pin_memory_available(device=None) -> bool:
     return current_platform.is_pin_memory_available(device)
+
+
+def async_h2d(args: List, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """A host list on ``device``; staged in pinned memory so the copy is enqueued
+    on the current stream instead of synchronizing like a pageable copy."""
+    pin = is_pin_memory_available(device)
+    return torch.tensor(args, dtype=dtype, pin_memory=pin).to(device, non_blocking=pin)
 
 
 def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
@@ -593,7 +618,12 @@ def get_device_module():
         return torch.xpu
     if is_musa():
         return torch.musa
-    return torch.get_device_module()
+    # From torch 2.14, a bare torch.get_device_module() is torch.cuda on a CUDA wheel
+    # even with no usable device; require an available accelerator instead.
+    accelerator = torch.accelerator.current_accelerator(check_available=True)
+    if accelerator is None:
+        return torch.cpu
+    return torch.get_device_module(accelerator)
 
 
 def create_device_stream(device):
@@ -860,6 +890,16 @@ def get_xpu_memory_capacity():
         raise RuntimeError("torch.xpu is not available.")
 
 
+def get_mps_memory_capacity():
+    # Metal's working-set limit is smaller than unified system RAM.
+    try:
+        if torch.mps.is_available():
+            return torch.mps.recommended_max_memory() // 1024 // 1024  # unit: MB
+        raise ValueError("No GPU memory values found.")
+    except AttributeError:
+        raise RuntimeError("torch.mps is not available.")
+
+
 def get_mtgpu_memory_capacity():
     try:
         # Run mthreads-gmi and capture the output
@@ -912,6 +952,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
         gpu_mem = get_amdgpu_memory_capacity()
+    elif device == "mps":
+        gpu_mem = get_mps_memory_capacity()
     elif device == "hpu":
         gpu_mem = get_hpu_memory_capacity()
     elif device == "npu":
@@ -930,6 +972,9 @@ def get_device_memory_capacity(device: str = None):
 
 
 def get_device_name(device_id: int = 0) -> str:
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        return torch.backends.mps.get_name()
+
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_name(device_id)
 
@@ -1030,6 +1075,12 @@ def get_device(device_id: Optional[int] = None) -> str:
 
 @lru_cache(maxsize=1)
 def get_device_count() -> int:
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        try:
+            return torch.mps.device_count()
+        except RuntimeError:
+            return 0
+
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         try:
             return torch.cuda.device_count()
@@ -1093,6 +1144,10 @@ def get_compiler_backend(mode=None) -> str:
     # OOT platforms provide their own compile backend.
     if current_platform.is_out_of_tree():
         return current_platform.get_compile_backend(mode)
+
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        # MPS has no SGLang graph runner.
+        return "eager"
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
@@ -1279,6 +1334,13 @@ class Range(NamedTuple):
     @property
     def length(self) -> int:
         return self.end - self.start
+
+
+def assert_int64_array(values: array, name: str) -> None:
+    """Require a signed int64 array suitable for zero-copy tensor views."""
+    assert (
+        isinstance(values, array) and values.typecode == "q" and values.itemsize == 8
+    ), f"{name} must be array('q') with 8-byte items"
 
 
 def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
@@ -1487,6 +1549,33 @@ def mark_end(name):
         time_infos[name].pretty_print()
 
 
+# Set while a layer another pipeline stage holds is built, only for the stage
+# boundaries it declares.
+_building_neighbour_layer = False
+
+
+def is_building_neighbour_layer() -> bool:
+    """Whether the layer under construction belongs to another pipeline stage
+    and is built here only to read the stage boundaries it declares. It is
+    built on the meta device and never loaded or run, so its constructor skips
+    the host and device resources a running layer needs: tables, streams,
+    engines and communicators."""
+    return _building_neighbour_layer
+
+
+@contextmanager
+def building_neighbour_layer():
+    """Build a pipeline neighbour layer: on the meta device, with
+    is_building_neighbour_layer() true."""
+    global _building_neighbour_layer
+    outer, _building_neighbour_layer = _building_neighbour_layer, True
+    try:
+        with torch.device("meta"):
+            yield
+    finally:
+        _building_neighbour_layer = outer
+
+
 class LayerFn(Protocol):
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
@@ -1500,9 +1589,16 @@ def make_layers(
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
-    """Make a list of layers with the given layer function"""
+    """Make a list of layers with the given layer function.
+
+    The local layers are built inside one layer stack, so layers that declare
+    stage boundaries connect in order without naming their neighbours. Across
+    a pipeline stage boundary the stack learns the neighbouring stage from the
+    layer itself, built again on the meta device.
+    """
     # circular imports
     from sglang.srt.distributed import get_pp_indices
+    from sglang.srt.layers.layer_boundary.factories import layer_stack
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
 
@@ -1516,23 +1612,71 @@ def make_layers(
         if pp_rank is not None and pp_size is not None
         else (0, num_hidden_layers)
     )
-    modules = torch.nn.ModuleList(
-        [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
-        + get_offloader().wrap_modules(
-            (
-                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-                for idx in range(start_layer, end_layer)
-            ),
-            **(offloader_kwargs or {}),
+
+    def neighbour(idx):
+        return functools.partial(
+            _build_neighbour_layer, layer_fn, idx, add_prefix(idx, prefix)
         )
-        + [
-            PPMissingLayer(return_tuple=return_tuple)
-            for _ in range(end_layer, num_hidden_layers)
-        ]
-    )
+
+    with layer_stack(
+        previous_layers=[neighbour(idx) for idx in reversed(range(start_layer))],
+        next_layers=[neighbour(idx) for idx in range(end_layer, num_hidden_layers)],
+    ):
+        modules = torch.nn.ModuleList(
+            [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
+            + get_offloader().wrap_modules(
+                (
+                    layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                    for idx in range(start_layer, end_layer)
+                ),
+                **(offloader_kwargs or {}),
+            )
+            + [
+                PPMissingLayer(return_tuple=return_tuple)
+                for _ in range(end_layer, num_hidden_layers)
+            ]
+        )
     if pp_rank is None or pp_size is None:
         return modules
     return modules, start_layer, end_layer
+
+
+def make_pp_layers(
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    prefix: str = "",
+    return_tuple: bool = False,
+    offloader_kwargs: Optional[Dict[str, Any]] = None,
+) -> Tuple[torch.nn.Module, int, int]:
+    """Make this pipeline stage's layers, and return them with the stage's range.
+
+    Layers outside ``[start_layer, end_layer)`` are ``PPMissingLayer`` stand-ins.
+    """
+    parallel = get_parallel()
+    return make_layers(
+        num_hidden_layers,
+        layer_fn,
+        pp_rank=parallel.pp_rank,
+        pp_size=parallel.pp_size,
+        prefix=prefix,
+        return_tuple=return_tuple,
+        offloader_kwargs=offloader_kwargs,
+    )
+
+
+def _build_neighbour_layer(layer_fn: LayerFn, idx: int, prefix: str) -> None:
+    """Build a layer another pipeline stage holds, only for the stage
+    boundaries it declares (see building_neighbour_layer). RoPE modules it
+    adds to the shared cache are meta, so they are dropped again."""
+    from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
+
+    cached = set(_ROPE_DICT)
+    try:
+        with building_neighbour_layer():
+            layer_fn(idx=idx, prefix=prefix)
+    finally:
+        for key in set(_ROPE_DICT) - cached:
+            del _ROPE_DICT[key]
 
 
 def set_random_seed(seed: int) -> None:
@@ -1943,7 +2087,7 @@ def _load_image(
                 )
     try:
         image = Image.open(BytesIO(image_bytes))
-    except OSError as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return _fully_load_pil_image(image)
 
@@ -1952,7 +2096,7 @@ def _fully_load_pil_image(image: Image.Image) -> Image.Image:
     """Force PIL's lazy decode while malformed input is still request-local."""
     try:
         image.load()
-    except OSError as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return image
 
@@ -2255,16 +2399,7 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
 
 
 def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
-    """
-    Check if a package is installed and meets the minimum version requirement.
-
-    Args:
-        pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.18")
-
-    Returns:
-        True if package is installed and version >= min_version, False otherwise
-    """
+    """Check if a package is installed and meets the minimum version requirement."""
     if _should_skip_kernel_pkg_version_check(pkg):
         return True
 
@@ -2400,7 +2535,7 @@ def monkey_patch_p2p_access_check():
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
-    # Suppress the warnings from this delete function when using sglang.bench_one_batch
+    # Suppress the warnings from this delete function when using sglang.benchmark.one_batch
     from sglang.srt.distributed.device_communicators.custom_all_reduce import (
         CustomAllreduce,
     )
@@ -2955,18 +3090,14 @@ def direct_register_custom_op(
         raise error
 
 
-def set_gpu_proc_affinity(
-    pp_size: int,
-    tp_size: int,
-    nnodes: int,
-    gpu_id: int,
-):
+def set_gpu_proc_affinity(gpu_id: int):
     # current process
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    nnodes_per_tp_group = max(nnodes // pp_size, 1)
-    tp_size_per_node = tp_size // nnodes_per_tp_group
+    parallel = get_parallel()
+    nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
+    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
 
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)
@@ -3955,15 +4086,22 @@ class Withable(Generic[T]):
             self._value = None
 
 
-def require_mlp_tp_gather():
+def require_mlp_tp_gather(*, moe_a2a_backend=None):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
-    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.layers.moe.utils import MoeA2ABackend, get_moe_a2a_backend
 
-    # elastic-EP scale-up rewrites dp_size on the published config
-    if get_parallel().enable_dp_attention:
-        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
+    if moe_a2a_backend is None:
+        moe_a2a_backend = get_moe_a2a_backend()
+    elif not isinstance(moe_a2a_backend, MoeA2ABackend):
+        moe_a2a_backend = MoeA2ABackend(moe_a2a_backend)
+
+    # elastic-EP scale-up widens num_dp_ranks on the published config
+    if get_parallel().attn_dp_enabled:
+        assert get_parallel().num_dp_ranks > 1, (
+            "attention DP needs more than one DP rank"
+        )
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
@@ -3977,9 +4115,9 @@ def require_mlp_tp_gather():
             return True
         elif not get_parallel().enable_dp_lm_head:
             return True
-        elif get_moe_a2a_backend().is_none():
+        elif moe_a2a_backend.is_none():
             return True
-        elif get_moe_a2a_backend().is_flashinfer():
+        elif moe_a2a_backend.is_flashinfer():
             # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
             # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
             # cuda-graph bucket must be identical across EP ranks, otherwise ranks
@@ -3989,7 +4127,7 @@ def require_mlp_tp_gather():
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
-        elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
+        elif moe_a2a_backend.is_mori() and get_bool_env_var(
             "SGLANG_MORI_RECV_BOUND", "false"
         ):
             # Same bookkeeping, for the same reason. Bounding mori's receive
@@ -4005,7 +4143,7 @@ def require_mlp_tp_gather():
         else:
             return (
                 get_parallel().moe_dense_tp_size
-                > get_parallel().tp_size // get_parallel().dp_size
+                > get_parallel().tp_size // get_parallel().num_dp_ranks
             )
     else:
         return False
@@ -4029,8 +4167,8 @@ def require_attn_tp_gather():
         not get_moe_a2a_backend().is_none()
         or get_parallel().moe_dense_tp_size is not None
     ):
-        if get_parallel().enable_dp_attention:
-            return get_parallel().dp_size < get_parallel().tp_size
+        if get_parallel().attn_dp_enabled:
+            return get_parallel().num_dp_ranks < get_parallel().tp_size
         else:
             return True
     else:
@@ -4043,7 +4181,7 @@ def require_gathered_buffer():
 
 def require_mlp_sync():
 
-    return get_parallel().enable_dp_attention or require_gathered_buffer()
+    return get_parallel().attn_dp_enabled or require_gathered_buffer()
 
 
 def get_cuda_graph_batch_size_alignment() -> int:
@@ -4052,7 +4190,8 @@ def get_cuda_graph_batch_size_alignment() -> int:
         alignment *= 2
     if require_gathered_buffer():
         alignment *= get_parallel().attn_tp_size
-    if alignment % get_parallel().attn_cp_size != 0:
+    # TODO: unverified on NVIDIA; drop the gate once validated on CUDA.
+    if not is_hip() and alignment % get_parallel().attn_cp_size != 0:
         alignment *= get_parallel().attn_cp_size
     return alignment
 
@@ -4701,7 +4840,7 @@ def get_extend_input_len_swa_limit(
     sliding_window_size: int, chunked_prefill_size: int, page_size: int
 ) -> int:
     # 1. a factor of 2x is because each prefill contains chunked_prefill_size tokens,
-    #    and between prefills, we run the tree cache's cache_unfinished_req(),
+    #    and between prefills, we run the tree cache's checkpoint(),
     #    so we unlock the previously locked nodes.
     # 2. max is to handle the case that chunked_prefill_size is larger than sliding_window_size.
     #    in that case, each prefill contains chunked_prefill_size tokens,

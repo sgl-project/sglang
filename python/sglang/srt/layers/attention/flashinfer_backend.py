@@ -1316,11 +1316,6 @@ class FlashInferAttnBackend(AttentionBackend):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
-        cache_loc = (
-            forward_batch.out_cache_loc
-            if not layer.is_cross_attention
-            else forward_batch.encoder_out_cache_loc
-        )
 
         logits_soft_cap = layer.logit_cap
 
@@ -1354,7 +1349,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 assert v is not None
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    KVWriteLoc.for_layer(
+                        forward_batch,
+                        layer,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    ),
                     k,
                     v,
                     *self._kv_write_scales(layer),
@@ -1456,7 +1455,11 @@ class FlashInferAttnBackend(AttentionBackend):
             if save_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    KVWriteLoc.for_layer(
+                        forward_batch,
+                        layer,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    ),
                     k,
                     v,
                     *self._kv_write_scales(layer),
@@ -1477,18 +1480,17 @@ class FlashInferAttnBackend(AttentionBackend):
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
-        cache_loc = (
-            forward_batch.out_cache_loc
-            if not layer.is_cross_attention
-            else forward_batch.encoder_out_cache_loc
-        )
 
         if k is not None:
             assert v is not None
             if save_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    KVWriteLoc.for_layer(
+                        forward_batch,
+                        layer,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    ),
                     k,
                     v,
                     *self._kv_write_scales(layer),
@@ -1720,7 +1722,7 @@ class FlashInferIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
     ):
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
-        # entries are already swa-side kernel-facing ids, so the in-place
+        # entries are already swa-side physical ids, so the in-place
         # full->swa translate below must not run on top of them.
         translator = self.attn_backend.kv_index_translator
         use_swa_source = use_sliding_window_kv_pool and translator.reads_are_translated
@@ -1992,6 +1994,14 @@ class FlashInferIndicesUpdaterPrefill:
                     else:
                         paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     kv_start_idx = seq_lens - paged_kernel_lens
+            elif use_ragged:
+                # Extend K/V lands after the paged pass: plan over the prefix only.
+                paged_kernel_lens = prefix_lens
+                if extend_prefix_lens_cpu is not None:
+                    paged_kernel_lens_sum = sum(extend_prefix_lens_cpu)
+                else:
+                    paged_kernel_lens_sum = prefix_lens.sum().item()
+                kv_start_idx = None
             else:
                 # full attention
                 paged_kernel_lens = seq_lens
@@ -2145,7 +2155,7 @@ class FlashInferIndicesUpdaterPrefill:
     ):
         bs = len(seq_lens)
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
-        # entries are already swa-side kernel-facing ids, so the in-place
+        # entries are already swa-side physical ids, so the in-place
         # full->swa translate below must not run on top of them.
         translator = self.attn_backend.kv_index_translator
         use_swa_source = use_sliding_window_kv_pool and translator.reads_are_translated

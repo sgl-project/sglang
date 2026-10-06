@@ -25,7 +25,6 @@ from sglang.srt.utils.common import get_device_module
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -51,9 +50,6 @@ class DynamicChunkSizer:
         max_prefill_tokens: int,
         page_size: int,
         device: str,
-        pp_group: GroupCoordinator,
-        world_group: GroupCoordinator,
-        pp_rank: int,
     ):
         self.model_runner = model_runner
         self.model_config = model_config
@@ -65,9 +61,7 @@ class DynamicChunkSizer:
         self.max_prefill_tokens = max_prefill_tokens
         self.page_size = page_size
         self.device = device
-        self.pp_group = pp_group
-        self.world_group = world_group
-        self.pp_rank = pp_rank
+        self.pp_rank = get_parallel().pp_rank
         self.predictor = ChunkSizePredictor()
 
     def profile_and_fit(self) -> bool:
@@ -75,7 +69,8 @@ class DynamicChunkSizer:
         returns whether the predictor is ready."""
         samples: Optional[Tuple[List[int], List[float]]] = None
 
-        if self.pp_group.is_first_rank:
+        parallel = get_parallel()
+        if parallel.pp_group.is_first_rank:
             try:
                 samples = self._profile_prefill_latency()
             except Exception as e:
@@ -86,8 +81,9 @@ class DynamicChunkSizer:
 
         # The samples are global, so one broadcast from global rank 0 (a PP0 rank)
         # reaches every stage and attention rank; a failure travels as None.
+        world_group = parallel.world_group
         samples = broadcast_pyobj(
-            [samples], self.world_group.rank, self.world_group.cpu_group, src=0
+            [samples], world_group.rank, world_group.cpu_group, src=0
         )[0]
 
         if samples is None:
@@ -195,8 +191,7 @@ class DynamicChunkSizer:
 
             if is_dp_attention_enabled():
                 # Profiling runs one request on this rank; other DP ranks report 0.
-                dp_size = get_parallel().attn_dp_size
-                global_num_tokens = [0] * dp_size
+                global_num_tokens = [0] * get_parallel().attn_dp_size
                 dp_rank = get_parallel().attn_dp_rank
                 global_num_tokens[dp_rank] = current_seq_len
                 batch.global_num_tokens = global_num_tokens
@@ -264,7 +259,7 @@ class DynamicChunkSizer:
 
             # Release KV and Mamba cache
             if req.kv.holds_kv:
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+                release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         logger.info(
             f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
