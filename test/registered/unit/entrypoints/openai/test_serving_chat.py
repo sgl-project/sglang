@@ -187,6 +187,7 @@ class _MockTokenizerManager:
             return_input_ids=False,
             return_output_ids=False,
             incremental_streaming_output=False,
+            grammar_backend="xgrammar",
         )
         self.model_path = self.server_args.model_path
         # The manager tracks the served name itself; a weight update rewrites it.
@@ -1796,6 +1797,10 @@ class ServingChatTestCase(CustomTestCase):
         with envs.SGLANG_RESPONSE_TEMPLATE_TURN_GRAMMAR.override(False):
             adapted, _ = self._convert_rendered_as("<|start|>assistant")
         self.assertNotIn("structural_tag", adapted.sampling_params)
+        self.tm._config_overrides["grammar_backend"] = "llguidance"
+        adapted, _ = self._convert_rendered_as("<|start|>assistant")
+        self.assertNotIn("structural_tag", adapted.sampling_params)
+        del self.tm._config_overrides["grammar_backend"]
 
         self._use_delimited_response_template("response_template")
         adapted, _ = self._convert_rendered_as("<assistant>", tools=[_WEATHER_TOOL])

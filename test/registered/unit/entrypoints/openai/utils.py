@@ -60,6 +60,7 @@ class MockTokenizerManager:
             tokenizer_metrics_allowed_custom_labels=None,
             tool_call_parser=None,
             incremental_streaming_output=False,
+            grammar_backend="xgrammar",
         )
         # Stands in for the context's resolved leaves: an override replaces the
         # field's one live value, the seed stays on server_args.

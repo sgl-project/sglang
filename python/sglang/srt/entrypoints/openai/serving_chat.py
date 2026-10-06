@@ -1543,7 +1543,8 @@ class OpenAIServingChat(OpenAIServingBase):
             and tool_detector is not None
             and issubclass(tool_detector, ResponseTemplateToolDetector)
             and tool_detector.constrains_every_turn
-            and self.tokenizer_manager.config_value("grammar_backend") != "none"
+            # Other backends cannot compile its structural tag.
+            and self.tokenizer_manager.config_value("grammar_backend") == "xgrammar"
         )
 
     def _requires_response_template_detokenization(
