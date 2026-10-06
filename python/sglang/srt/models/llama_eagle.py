@@ -25,6 +25,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.post_norm import PLAIN_READOUT
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -74,17 +75,18 @@ class LlamaModel(nn.Module):
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
         )
-        self.layers = nn.ModuleList(
-            [
-                LlamaDecoderLayer(
-                    config,
-                    i,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{i}", prefix),
-                )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
+        with layer_stack():
+            self.layers = nn.ModuleList(
+                [
+                    LlamaDecoderLayer(
+                        config,
+                        i,
+                        quant_config=quant_config,
+                        prefix=add_prefix(f"layers.{i}", prefix),
+                    )
+                    for i in range(config.num_hidden_layers)
+                ]
+            )
         self.fc = torch.nn.Linear(config.hidden_size * 2, config.hidden_size)
 
     def forward(
