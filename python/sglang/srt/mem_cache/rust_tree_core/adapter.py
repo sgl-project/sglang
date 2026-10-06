@@ -568,11 +568,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceNextNodeResult(
             node_id=binding_result.node_id,
             made_progress=binding_result.made_progress,
-            backup_kv=(
-                _cache_action_from_tagged(binding_result.backup_kv)
-                if binding_result.backup_kv is not None
-                else None
-            ),
             unbacked_tokens=binding_result.unbacked_tokens,
             mamba_backup_node_id=binding_result.mamba_backup_node_id,
             swa_backup_node_id=binding_result.swa_backup_node_id,
@@ -787,9 +782,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_hicache_enabled(self) -> None:
         self._binding.set_hicache_enabled()
-
-    def enable_swa_write_back_eviction_barrier(self) -> None:
-        self._binding.enable_swa_write_back_eviction_barrier()
 
     def set_host_memory_buffer_only(self) -> None:
         self._binding.set_host_memory_buffer_only()

@@ -508,11 +508,6 @@ pub struct ComponentState {
     /// leaf may be freed: the leaf's parent for Full, the LRU predecessor for
     /// SWA and Mamba.
     pub(crate) evict_device_cursor: Option<NodeIdx_>,
-    /// Internal node whose component value must be backed up before the walk
-    /// can tombstone it. The Controller consumes this request between steps.
-    pub(crate) evict_device_backup_node: Option<NodeIdx_>,
-    /// A resumed victim is tombstoned after its best-effort backup attempt.
-    pub(crate) evict_device_last_backup: Option<NodeIdx_>,
     /// Internal component victim waiting for the controller's host backup attempt.
     /// A generation-checked handle survives host eviction during that I/O.
     pub(crate) evict_device_pending_node: Option<NodeId>,
@@ -586,7 +581,6 @@ pub struct EvictionStepResult {
     pub tracker: HashMap<ComponentType, usize>,
     pub device_frees: HashMap<ComponentType, Vec<Tensor>>,
     pub host_frees: HashMap<ComponentType, Vec<Tensor>>,
-    pub backup_kv: Option<BackupKV>,
     /// Full device tokens freed without a host copy during this device step.
     pub unbacked_tokens: usize,
     /// Back up this internal Mamba state before resuming its device tombstone.
@@ -640,8 +634,6 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) enable_external_cache_linker: bool,
     /// Whether the cache wired a host SWA pool (HiCache).
     pub(crate) has_swa_host_pool: bool,
-    /// Whether dirty internal SWA nodes must be backed up before eviction.
-    pub(crate) swa_write_back_eviction_barrier_enabled: bool,
     /// Whether tree mutations emit BlockStored/BlockRemoved events.
     pub(crate) enable_kv_cache_events: bool,
     /// Queued placement events, drained by take_events.
@@ -754,8 +746,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         state.is_evict_device_ongoing = true;
         state.evict_device_request_cnt = request_cnt;
         state.evict_device_cursor = None;
-        state.evict_device_backup_node = None;
-        state.evict_device_last_backup = None;
         state.evict_device_pending_node = None;
         state.evict_device_pending_num_tokens = 0;
     }
@@ -770,8 +760,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
         state.is_evict_device_ongoing = false;
         state.evict_device_cursor = None;
-        state.evict_device_backup_node = None;
-        state.evict_device_last_backup = None;
         state.evict_device_pending_node = None;
         state.evict_device_pending_num_tokens = 0;
     }
@@ -840,7 +828,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             enable_storage: false,
             enable_external_cache_linker: false,
             has_swa_host_pool: params.has_swa_host_pool,
-            swa_write_back_eviction_barrier_enabled: false,
             enable_kv_cache_events: params.enable_kv_cache_events,
             kv_event_queue: Vec::new(),
             namespaced_event_hashes: HashMap::new(),
@@ -2397,15 +2384,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 &mut result.device_frees,
                 &mut result.host_frees,
             );
-        let backup_node = self
-            .component_state_mut(component_type)
-            .evict_device_backup_node
-            .take();
-        if let Some(backup_node) = backup_node {
-            assert!(node_id.is_none());
-            result.backup_kv =
-                Some(self.build_backup_kv_action_(self.arena.node(backup_node), true));
-        }
         result.unbacked_tokens = self.tracked_unbacked_tokens.take().unwrap();
         let state = self.component_state(component_type);
         if component_type == MAMBA {
@@ -3159,11 +3137,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Mark the host tier (HiCache) as wired.
     pub fn set_hicache_enabled(&mut self) {
         self.enable_hicache = true;
-    }
-
-    /// Preserve dirty internal SWA nodes before cache-mode write-back eviction.
-    pub fn enable_swa_write_back_eviction_barrier(&mut self) {
-        self.swa_write_back_eviction_barrier_enabled = true;
     }
 
     /// Mark the host tier as buffer-only; wired after the host pools are built.
