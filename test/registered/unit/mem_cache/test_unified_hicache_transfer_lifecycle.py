@@ -30,6 +30,7 @@ import contextlib
 import unittest
 from array import array
 from types import SimpleNamespace
+from typing import Optional
 from unittest import mock
 
 import torch
@@ -679,6 +680,7 @@ class _UnifiedHiCacheCase(_ConfigCase):
         write_policy: str = "write_through",
         tokens: int = 128,
         host_memory_mode: str = "cache",
+        tree_core_backend: Optional[str] = None,
     ):
         server_args = ServerArgs(
             model_path="dummy",
@@ -703,11 +705,15 @@ class _UnifiedHiCacheCase(_ConfigCase):
             disable=False,
             sliding_window_size=self.window,
             tree_components=(ComponentType.FULL, ComponentType.SWA),
+            tree_core_backend=tree_core_backend,
         )
         with mock.patch.dict(
             _TREE_CORE_REGISTRY, {"python": _python_inspector, "rust": _rust_inspector}
         ):
             cache = UnifiedRadixCache(params=params)
+        if tree_core_backend not in (None, cache._tree_core_backend):
+            # The selection falls back to Python when the Rust core cannot load.
+            self.skipTest(f"the {tree_core_backend} TreeCore is unavailable here")
         # CPU host tensors need no page-locking.
         with mock.patch.object(host_memory, "_cuda_host_register"):
             cache.init_hicache(server_args, params)
@@ -1622,8 +1628,10 @@ class TestSwaWriteBackEviction(_UnifiedHiCacheCase):
             copies,
         )
 
-    def _parent_and_child(self, *, before_insert=lambda: None):
-        self._cache(write_policy="write_back", tokens=64)
+    def _parent_and_child(self, *, before_insert=lambda: None, tree_core_backend=None):
+        self._cache(
+            write_policy="write_back", tokens=64, tree_core_backend=tree_core_backend
+        )
         before_insert()
         parent_ids, parent_expected = self._insert(list(range(1, 9)), 100)
         tokens = list(range(1, 17))
@@ -1634,7 +1642,16 @@ class TestSwaWriteBackEviction(_UnifiedHiCacheCase):
         return tokens, kept, kept_full
 
     def test_hosted_swa_window_is_dropped_without_a_full_write_back(self):
-        tokens, ids, expected_full = self._parent_and_child()
+        # The removed barrier was in the Rust TreeCore only, so pin it.
+        self._drop_hosted_swa_window(tree_core_backend="rust")
+
+    def test_python_core_drops_a_hosted_swa_window_the_same_way(self):
+        self._drop_hosted_swa_window(tree_core_backend="python")
+
+    def _drop_hosted_swa_window(self, *, tree_core_backend):
+        tokens, ids, expected_full = self._parent_and_child(
+            tree_core_backend=tree_core_backend
+        )
         parent = self.cache.tree_core.get_parent_node_id(
             self._match(tokens).last_device_node
         )
