@@ -53,6 +53,8 @@ def _score_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     pid_l = tl.program_id(2)
+    # int64: element offsets pass 2^31 for long sequences with many heads per call.
+    O += pid_l.to(tl.int64) * stride_ol
 
     offs_m = pid_m * BLK_M + tl.arange(0, BLK_M)
     offs_n = pid_n * BLK_N + tl.arange(0, BLK_N)
@@ -102,10 +104,7 @@ def _score_kernel(
     offs_o = pid_n * (BLK_N // NK) + tl.arange(0, BLK_N // NK)
     offs_q = pid_m * (BLK_M // NQR) + tl.arange(0, BLK_M // NQR)
     tl.store(
-        O
-        + pid_l * stride_ol
-        + offs_q[:, None] * stride_om
-        + offs_o[None, :] * stride_on,
+        O + offs_q[:, None] * stride_om + offs_o[None, :] * stride_on,
         out,
         mask=(offs_q[:, None] < MOUT) & (offs_o[None, :] < NOUT),
     )
@@ -175,10 +174,11 @@ def _pool_kernel(
     bf16; the PyTorch version needs an fp32 temporary plus a transpose.
     """
     cell = tl.program_id(0)
-    l = tl.program_id(1)
+    # int64: element offsets pass 2^31 for long sequences with many heads per call.
+    l = tl.program_id(1).to(tl.int64)
     b = l // H
     h = l % H
-    offs_t = cell * SUB + tl.arange(0, SUB)
+    offs_t = cell.to(tl.int64) * SUB + tl.arange(0, SUB)
     offs_d = tl.arange(0, D)
     mask = offs_t < S
     x = tl.load(
@@ -236,7 +236,8 @@ def _topk_kernel(S, OUT, G, K, BLK: tl.constexpr, ITERS: tl.constexpr):
     up with a different set than an exact top-K, but only among blocks that tie at the
     threshold -- the total selected score differs by ~1e-6 relative, which is nothing.
     """
-    row = tl.program_id(0)
+    # int64: element offsets pass 2^31 for long sequences with many heads per call.
+    row = tl.program_id(0).to(tl.int64)
     offs = tl.arange(0, BLK)
     m = offs < G
     s = tl.load(S + row * G + offs, mask=m, other=-float("inf")).to(tl.float32)

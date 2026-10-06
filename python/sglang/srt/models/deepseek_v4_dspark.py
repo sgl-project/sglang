@@ -109,8 +109,6 @@ class DSparkAttention(MqaAttentionBase):
             layer_id,
             quant_config,
             prefix,
-            attn_tp_rank=get_parallel().attn_tp_rank,
-            attn_tp_size=get_parallel().attn_tp_size,
             compress_ratio=0,
             fuse_wqa_wkv=False,
             wo_a_fp8=False,
@@ -193,6 +191,9 @@ class DSparkAttention(MqaAttentionBase):
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
+            if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
+                fused_q_norm_rope(q, q_out, None, self.freqs_cis, positions)
+                return q_out
             if self._use_fast_kernel and not _is_npu:
                 fused_rope_inplace(
                     q[..., -self.rope_head_dim :],
@@ -272,7 +273,17 @@ class DSparkAttention(MqaAttentionBase):
 
         q_padded: Optional[torch.Tensor] = None
         q_out: Optional[torch.Tensor] = None
-        if self.n_local_heads < _PAD_NUM_HEADS:
+        if (
+            pool.uniform_fp8
+            and not self.q_head_norm
+            and self.n_local_heads in (8, 16, 32, 64, 128)
+        ):
+            q_out = torch.empty(
+                (hidden_states.shape[0], self.n_local_heads, self.head_dim),
+                dtype=torch.float8_e4m3fn,
+                device=hidden_states.device,
+            )
+        elif self.n_local_heads < _PAD_NUM_HEADS:
             q_padded = hidden_states.new_empty(
                 hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
