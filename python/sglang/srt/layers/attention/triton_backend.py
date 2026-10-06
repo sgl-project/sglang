@@ -85,6 +85,27 @@ def _mla_decode_kv_splits_cap(
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
+# GQA/MHA decode uses the same split-KV flash-decoding kernel as MLA, so the
+# default ceiling of 8 starves it the same way at low batch x long context
+# (grid is batch x head_blocks x splits; B=1 on a 32q/4kv model yields only
+# 4*8 = 32 CTAs on a 108-SM part). The ceiling is tighter than the MLA one
+# because grouped-head CTAs already cover more KV per split, and the fp32
+# attn_logits buffer ([bs, heads, cap, v_head_dim]) grows with the cap —
+# which is why gfx942 later needed a pin (see the MLA branch below).
+_GQA_DECODE_MIN_BLOCK_KV = 64
+_GQA_DECODE_MAX_KV_SPLITS = 64
+
+
+def _gqa_decode_kv_splits_cap(
+    base_max_kv_splits: int, sm_count: int, max_context_len: int
+) -> int:
+    if sm_count <= 0:
+        return base_max_kv_splits
+    sm_cap = next_power_of_2(sm_count)
+    ctx_cap = next_power_of_2(triton.cdiv(max_context_len, _GQA_DECODE_MIN_BLOCK_KV))
+    return max(base_max_kv_splits, min(sm_cap, ctx_cap, _GQA_DECODE_MAX_KV_SPLITS))
+
+
 def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv):
     if not is_gfx95_supported() or topk != 1:
         return False
@@ -325,6 +346,17 @@ class TritonAttnBackend(AttentionBackend):
                 # fp32 attn_logits buffer to ~4 GiB on Kimi-K2.6 and faulting in
                 # ROCm graph replay; pin to 256 to match validated gfx950 behavior.
                 self.max_kv_splits = min(self.max_kv_splits, 256)
+        elif not _is_xpu:
+            # Mirror the MLA ceiling fix for grouped/multi-head decode: without
+            # it the heuristic in get_num_kv_splits_triton (which already decays
+            # with batch and seq len) is clamped to 8 and leaves the GPU mostly
+            # idle at low batch x long context. Only the *ceiling* changes when
+            # the user has not pinned --triton-attention-num-kv-splits.
+            self.max_kv_splits = _gqa_decode_kv_splits_cap(
+                self.max_kv_splits,
+                self.device_core_count,
+                self.max_context_len,
+            )
         if _is_cuda:
             self.use_pdl = is_arch_support_pdl()
         else:
