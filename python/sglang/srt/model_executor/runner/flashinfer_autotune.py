@@ -386,7 +386,7 @@ def maybe_flashinfer_autotune_extend(
         )
     except torch.OutOfMemoryError:
         buffers = None
-    if not _all_ranks_agree(buffers is not None, group=sync_group):
+    if not _all_ranks_agree(ok=buffers is not None, group=sync_group):
         del buffers
         torch.cuda.empty_cache()
         log_info_on_rank0(
@@ -437,7 +437,7 @@ def maybe_flashinfer_autotune_extend(
 
 
 def _all_ranks_agree(
-    ok: bool, *, group: Optional[torch.distributed.ProcessGroup]
+    *, ok: bool, group: Optional[torch.distributed.ProcessGroup]
 ) -> bool:
     if group is None:
         return ok

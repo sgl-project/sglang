@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 
 def cp_extend_forward(
-    model, forward_batch: ForwardBatch, kwargs: dict
+    *, model, forward_batch: ForwardBatch, kwargs: dict
 ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
     """CP extend: shard inputs at the model boundary, run the body on the
     rank-local slice, then gather hidden states before the logits step.

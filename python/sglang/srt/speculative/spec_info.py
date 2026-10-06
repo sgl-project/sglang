@@ -542,7 +542,7 @@ def supports_dummy_draft_extend(spec_algorithm: SpeculativeAlgorithm) -> bool:
 
 
 def create_dummy_draft_extend_input(
-    model_runner: ModelRunner, *, num_tokens: int
+    *, model_runner: ModelRunner, num_tokens: int
 ) -> SpecInput:
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sglang.srt.speculative.eagle_info import EagleDraftExtendInput

@@ -280,11 +280,11 @@ class BaseRunner(ABC):
                 "_autotune_buffers() must return a reusable buffer set for autotune"
             )
             self._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
-            maybe_flashinfer_autotune_extend(self, decode_num_tokens=batch_size)
+            maybe_flashinfer_autotune_extend(runner=self, decode_num_tokens=batch_size)
         elif should_run_flashinfer_autotune(
-            self.model_runner, for_speculative_draft=True
+            model_runner=self.model_runner, for_speculative_draft=True
         ):
-            maybe_flashinfer_autotune_extend(self, decode_num_tokens=0)
+            maybe_flashinfer_autotune_extend(runner=self, decode_num_tokens=0)
 
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
@@ -638,7 +638,7 @@ class BaseRunner(ABC):
 
         # Speculative metadata and hidden-state capture mode.
         spec_info = _create_dummy_spec_info(
-            mr,
+            mr=mr,
             is_extend_dummy=is_extend_dummy,
             custom_mask=buffers.custom_mask,
             num_tokens=num_tokens,
@@ -760,7 +760,9 @@ class BaseRunner(ABC):
                 kwargs["get_embedding"] = True
 
             if cp_active:
-                return cp_extend_forward(mr.model, forward_batch, kwargs)
+                return cp_extend_forward(
+                    model=mr.model, forward_batch=forward_batch, kwargs=kwargs
+                )
             logits_output_or_pp_proxy_tensors = mr.model.forward(
                 input_ids,
                 forward_batch.positions,
@@ -799,8 +801,8 @@ class BaseRunner(ABC):
 
 
 def _create_dummy_spec_info(
-    mr: ModelRunner,
     *,
+    mr: ModelRunner,
     is_extend_dummy: bool,
     custom_mask: Optional[torch.Tensor],
     num_tokens: int,
@@ -808,8 +810,11 @@ def _create_dummy_spec_info(
 ):
     if not is_extend_dummy:
         return create_dummy_verify_input(
-            mr.spec_algorithm, custom_mask, num_tokens_per_req, mr.is_draft_worker
+            spec_algorithm=mr.spec_algorithm,
+            custom_mask=custom_mask,
+            num_tokens_per_req=num_tokens_per_req,
+            is_draft_worker=mr.is_draft_worker,
         )
     if not mr.is_draft_worker:
         return None
-    return create_dummy_draft_extend_input(mr, num_tokens=num_tokens)
+    return create_dummy_draft_extend_input(model_runner=mr, num_tokens=num_tokens)

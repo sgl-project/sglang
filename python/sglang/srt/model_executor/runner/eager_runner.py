@@ -370,7 +370,9 @@ class EagerRunner(BaseRunner):
                         **kwargs,
                     )
             elif cp_active:
-                ret = cp_extend_forward(model_runner.model, forward_batch, kwargs)
+                ret = cp_extend_forward(
+                    model=model_runner.model, forward_batch=forward_batch, kwargs=kwargs
+                )
             else:
                 ret = model_runner.model.forward(
                     forward_batch.input_ids,
