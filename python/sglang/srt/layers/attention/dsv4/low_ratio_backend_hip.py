@@ -23,6 +23,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     FP4DecodeWorkspace,
     FP4PrefillWorkspace,
     aiter_fp4_paged_mqa_logits,
+    index_q_rope_pack_flydsl,
     index_q_rope_pack_weights_flydsl,
     indexer_head_weights,
     logits_rows_per_chunk,
@@ -91,6 +92,19 @@ def _indexer_inputs(layer, x, q_lora, pos):
             indexer.head_weight_scale,
             num_heads=indexer.n_heads,
         )
+    if (
+        indexer.n_heads % 16 == 0
+        and indexer.n_heads <= 64
+        and indexer.index_head_dim == 128
+        and indexer.rope_head_dim == 64
+        and layer.freqs_cis.dtype == torch.complex64
+    ):
+        # rows past the GEMV's cap: wq_b, then one launch for RoPE and fp4 pack
+        q, _ = indexer.wq_b(q_lora)
+        q_fp4, q_scale = index_q_rope_pack_flydsl(
+            q, layer.freqs_cis, pos, indexer.rope_head_dim, num_heads=indexer.n_heads
+        )
+        return q_fp4, q_scale, _indexer_head_weights(indexer, x)
     # [T, H, 128] fp4 grid; the RoPE launch gathers freqs_cis[pos] itself
     q = indexer.queries(q_lora, layer.freqs_cis, positions=pos)
     q_fp4, q_scale = pack_fp4_query_flydsl(q)
