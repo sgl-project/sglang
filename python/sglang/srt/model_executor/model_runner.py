@@ -76,6 +76,7 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     is_mla_cp_enabled,
 )
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
@@ -152,6 +153,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
     check_quantized_moe_compatibility,
     init_lplb_solvers,
+    prebuild_deepep_v2_buffer,
     prepare_moe_topk,
 )
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
@@ -410,10 +412,21 @@ class ModelRunner:
         if get_exec().features.enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
-        # Set device early so that TransferEngine init (e.g. Ascend NPU)
-        # can access the device context.
+        # Set the device before TransferEngine init. MPS has one implicit device.
+        is_mps_device = str(self.device).split(":", 1)[0] == "mps"
+        if is_mps_device:
+            from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
+            if not use_mlx():
+                # Direct ModelRunner construction bypasses the ServerArgs gate.
+                from sglang.srt.hardware_backend.mps.runtime import (
+                    validate_mps_runtime,
+                )
+
+                validate_mps_runtime()
         try:
-            torch.get_device_module(self.device).set_device(get_device().gpu_id)
+            if not is_mps_device:
+                torch.get_device_module(self.device).set_device(get_device().gpu_id)
         except Exception:
             import os
 
@@ -557,7 +570,7 @@ class ModelRunner:
             custom_weight_loaders=get_model().custom_weight_loader,
             get_model=lambda: self.model,
             update_model_fields=self.update_model_fields,
-            recapture_cuda_graph=self.init_decode_cuda_graph,
+            recapture_cuda_graph=self.recapture_decode_cuda_graph,
             get_model_runner=lambda: self,
         )
 
@@ -963,11 +976,7 @@ class ModelRunner:
             top_k=hisparse_top_k,
             device_buffer_size=hisparse_cfg.device_buffer_size,
             device=self.device,
-            tp_group=(
-                get_parallel().attn_tp_group.cpu_group
-                if get_parallel().attn_dp_enabled
-                else get_parallel().tp_group.cpu_group
-            ),
+            tp_group=get_dp_tp_group().cpu_group,
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
             shared_index_layers=resolve_shared_index_layers(
@@ -989,6 +998,9 @@ class ModelRunner:
             )
             self.memory_pool_config.swa_max_total_num_tokens = (
                 resize.swa_max_total_num_tokens
+            )
+            self.memory_pool_config.unified_memory_pool_bytes = (
+                resize.unified_memory_pool_bytes
             )
         if resize.capped_max_running_requests is not None:
             self.max_running_requests = resize.capped_max_running_requests
@@ -1134,6 +1146,8 @@ class ModelRunner:
             # Scheduler startup calls this path even when CUDA graphs are disabled.
             target_size = get_parallel().ep_join_rank_offset + get_parallel().tp_size
             self._finalize_elastic_ep_joiner(target_size)
+
+        prebuild_deepep_v2_buffer(model=self.model)
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
@@ -1365,8 +1379,6 @@ class ModelRunner:
             dtype=self.dtype,
             server_args=self.server_args,
             lora_backend=get_lora().lora_backend,
-            tp_size=get_parallel().tp_size,
-            tp_rank=get_parallel().tp_rank,
             max_lora_rank=get_lora().max_lora_rank,
             target_modules=get_lora().lora_target_modules,
             lora_paths=get_lora().lora_paths,
@@ -1534,6 +1546,19 @@ class ModelRunner:
         self.decode_cuda_graph_capture_bs = list(
             getattr(self.decode_cuda_graph_runner, "capture_bs", []) or []
         )
+
+    def recapture_decode_cuda_graph(self):
+        # A spec worker that captures its draft's graphs inside the draft
+        # placement scopes leaves the draft runner holding its eager runner in
+        # place of a decode graph. Recapturing here runs outside those scopes,
+        # and for a draft the capture raises after clearing the eager runner.
+        owns_no_decode_graph = (
+            self.decode_cuda_graph_runner is None
+            or self.decode_cuda_graph_runner is self.eager_runner
+        )
+        if self.is_draft_worker and owns_no_decode_graph:
+            return
+        self.init_decode_cuda_graph()
 
     def ensure_decode_cuda_graphs(self, capture_bs: Optional[list[int]] = None):
         """Idempotently capture decode CUDA graphs after startup.
