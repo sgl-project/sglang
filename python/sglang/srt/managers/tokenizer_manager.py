@@ -109,7 +109,7 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.output_store import (
     OUTPUT_STORE_REF_KEY,
     OutputStore,
-    OutputStoreStash,
+    TokenReplayStash,
     maybe_create_output_store,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -270,7 +270,7 @@ class ReqState:
     last_output_offset: int = 0
 
     # Unencoded replay outputs of a request that returns them via the output store.
-    output_store_stash: Optional[OutputStoreStash] = None
+    output_store_stash: Optional[TokenReplayStash] = None
 
     # Accumulate text lazily so incremental streaming can emit the incoming
     # delta directly without rebuilding the full output prefix.
@@ -3855,7 +3855,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             if self._uses_output_store(sub_obj):
-                state.output_store_stash = OutputStoreStash()
+                state.output_store_stash = TokenReplayStash()
             self.rid_to_state[rid] = state
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)

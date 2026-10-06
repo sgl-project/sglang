@@ -12,7 +12,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol
 
 import msgspec
 import numpy as np
@@ -70,8 +70,20 @@ class OutputStoreConfig(msgspec.Struct, frozen=True, kw_only=True):
         return msgspec.convert(values, type=cls)
 
 
-class OutputStoreStash(msgspec.Struct):
-    """Replay outputs of one request, held unencoded until its final response."""
+class OutputStoreStash(Protocol):
+    """The outputs of one response that OutputStore writes as one bundle."""
+
+    def is_empty(self) -> bool:
+        """Nothing to write; checked on the event loop before the put."""
+        ...
+
+    def to_bundle_fields(self) -> Dict[str, np.ndarray]:
+        """One array per bundle field; runs on a store worker thread, so it may copy."""
+        ...
+
+
+class TokenReplayStash(msgspec.Struct):
+    """Per-token replay outputs of one request, unencoded until its final response."""
 
     routed_experts: Optional[torch.Tensor] = None
     indexer_topk: Optional[torch.Tensor] = None
@@ -99,6 +111,25 @@ class OutputStoreStash(msgspec.Struct):
                 len(chunk.lengths) for chunk in self.sampling_mask_chunks
             )
         return meta_info
+
+    def to_bundle_fields(self) -> Dict[str, np.ndarray]:
+        fields = {}
+        if self.routed_experts is not None:
+            fields["routed_experts"] = self.routed_experts.numpy()
+        if self.indexer_topk is not None:
+            fields["indexer_topk"] = self.indexer_topk.numpy()
+        chunks = self.sampling_mask_chunks
+        if chunks is not None:
+            fields["output_token_sampling_mask_lengths"] = np.concatenate(
+                [chunk.lengths for chunk in chunks]
+            )
+            fields["output_token_sampling_mask_token_ids"] = np.concatenate(
+                [chunk.token_ids for chunk in chunks]
+            )
+            fields["output_token_sampling_logprobs"] = np.concatenate(
+                [chunk.logprobs for chunk in chunks]
+            )
+        return fields
 
 
 class OutputStore:
@@ -150,7 +181,7 @@ class OutputStore:
         future.add_done_callback(self._cleanup_completed_put)
 
     def _put(self, stash: OutputStoreStash) -> Dict[str, Any]:
-        fields = _bundle_fields(stash)
+        fields = stash.to_bundle_fields()
         ref = self._transfer.put(
             {name: [array] for name, array in fields.items()},
             type="dict",
@@ -205,26 +236,6 @@ def maybe_create_output_store(
             "--output-store-backend is not supported with PD disaggregation yet"
         )
     return OutputStore(OutputStoreConfig.from_extra_config(extra_config))
-
-
-def _bundle_fields(stash: OutputStoreStash) -> Dict[str, np.ndarray]:
-    fields = {}
-    if stash.routed_experts is not None:
-        fields["routed_experts"] = stash.routed_experts.numpy()
-    if stash.indexer_topk is not None:
-        fields["indexer_topk"] = stash.indexer_topk.numpy()
-    chunks = stash.sampling_mask_chunks
-    if chunks is not None:
-        fields["output_token_sampling_mask_lengths"] = np.concatenate(
-            [chunk.lengths for chunk in chunks]
-        )
-        fields["output_token_sampling_mask_token_ids"] = np.concatenate(
-            [chunk.token_ids for chunk in chunks]
-        )
-        fields["output_token_sampling_logprobs"] = np.concatenate(
-            [chunk.logprobs for chunk in chunks]
-        )
-    return fields
 
 
 def _parse_size(value: Any) -> int:
