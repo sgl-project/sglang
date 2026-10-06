@@ -967,14 +967,18 @@ def _fake_symm(backend):
     return fake
 
 
+@contextlib.contextmanager
 def _backend_check_env(fake_symm, fake_fi):
+    """Unresolved backend state plus substituted symmetric-memory / FlashInfer
+    backend modules (resolved through ``sys.modules`` by the route)."""
     modules = {"torch.distributed._symmetric_memory": fake_symm}
     if fake_fi is not None:
         modules[_FI_BACKEND_MODULE] = fake_fi
-    return (
+    with (
         mock.patch.object(sp_mod, "_cake_sp_symm_backend", None),
         mock.patch.dict(sys.modules, modules),
-    )
+    ):
+        yield
 
 
 def test_sp_route_runs_on_the_default_backend_flashinfer_supports(sp_env, caplog):
@@ -991,7 +995,7 @@ def test_sp_route_runs_on_the_default_backend_flashinfer_supports(sp_env, caplog
     with (
         _routes(sp_mod, "sp_all_gather_matmul"),
         _patch_sp_kernels(kernels),
-        *_backend_check_env(fake_symm, fake_fi),
+        _backend_check_env(fake_symm, fake_fi),
     ):
         out = sp_mod.column_parallel_g_matmul(linear, inp, None)
         sp_mod.column_parallel_g_matmul(linear, inp, None)
@@ -1017,7 +1021,7 @@ def test_sp_route_selects_nvshmem_for_a_flashinfer_without_the_backend_check(
     with (
         _routes(sp_mod, "sp_all_gather_matmul"),
         _patch_sp_kernels(kernels),
-        *_backend_check_env(fake_symm, types.SimpleNamespace()),
+        _backend_check_env(fake_symm, types.SimpleNamespace()),
     ):
         out = sp_mod.column_parallel_g_matmul(linear, inp, None)
         sp_mod.column_parallel_g_matmul(linear, inp, None)
@@ -1040,7 +1044,7 @@ def test_sp_route_falls_back_when_the_backend_is_not_served(sp_env, caplog):
     with (
         _routes(sp_mod, "sp_all_gather_matmul"),
         _patch_sp_kernels(kernels),
-        *_backend_check_env(fake_symm, fake_fi),
+        _backend_check_env(fake_symm, fake_fi),
     ):
         out = sp_mod.column_parallel_g_matmul(linear, inp, None)
         sp_mod.column_parallel_g_matmul(linear, inp, None)
@@ -1062,7 +1066,7 @@ def test_sp_route_falls_back_when_the_backend_is_not_served(sp_env, caplog):
     with (
         _routes(sp_mod, "sp_all_gather_matmul"),
         _patch_sp_kernels(kernels),
-        *_backend_check_env(fake_symm, types.SimpleNamespace()),
+        _backend_check_env(fake_symm, types.SimpleNamespace()),
     ):
         out = sp_mod.column_parallel_g_matmul(linear, inp, None)
         assert sp_mod._cake_sp_symm_backend is False
