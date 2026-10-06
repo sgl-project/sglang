@@ -117,6 +117,11 @@ class Spec(msgspec.Struct):
     speculative_use_rejection_sampling: A[
         bool, "Use rejection sampling for speculative decoding (requires topk=1)."
     ] = False
+    speculative_use_block_verification: A[
+        bool,
+        "Use block verification for EAGLE/EAGLE3/NEXTN on CUDA or ROCm "
+        "(requires topk=1).",
+    ] = False
     speculative_token_map: A[
         Optional[str],
         "The path of the draft model's small vocab table.",

@@ -122,6 +122,7 @@ pub enum BucketGroups {
 pub struct BucketRequest<'a> {
     pub model: &'a ModelId,
     pub input_tokens: u64,
+    pub total_input_tokens: u64,
     pub expected_peak_tokens: Option<u64>,
     pub prefix: Option<&'a crate::policies_reorg::cache_aware::PrefixMemo>,
     pub token_ids: Option<&'a [u32]>,
@@ -282,6 +283,7 @@ impl Bucket {
             stage,
             bucket: &self.id,
             input_tokens: request.input_tokens,
+            total_input_tokens: request.total_input_tokens,
             expected_peak_tokens: request.expected_peak_tokens,
             prefix: request.prefix,
             token_ids: request.token_ids,
