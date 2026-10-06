@@ -440,7 +440,9 @@ class TestHostSnapshot(unittest.TestCase):
         content = json.dumps(manifest).encode()
         path.write_bytes(content)
         with (
-            patch.object(host, "_reserve", wraps=host._reserve) as allocate,
+            patch.object(
+                host, "_reserve_encoded_cache", wraps=host._reserve_encoded_cache
+            ) as allocate,
             patch.object(
                 host, "_read_verify_payload", wraps=host._read_verify_payload
             ) as read,

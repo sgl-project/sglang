@@ -161,7 +161,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                     )
                 )
                 size += len(expected[name])
-            decoder = NvcompDecoder(device)
+            decoder = NvcompDecoder(device, "snappy-zstd")
             with torch.cuda.stream(stream):
                 workspace = decoder.allocate_workspace([frames])
             plan = decoder.prepare_batches([frames], source, workspace, stream)

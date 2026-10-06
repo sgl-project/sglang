@@ -94,7 +94,7 @@ def _identity(info):
 _CAPACITY_ALIGNMENT = 64 << 20
 
 
-def _reserve(directory, previous, size, metrics):
+def _reserve_encoded_cache(directory, previous, size, metrics):
     if previous is not None and size <= previous["capacity"]:
         return previous
     capacity = size if previous is None else 2 * size
@@ -307,7 +307,7 @@ class HostArena:
         self.directory = None
         self.tensor_order = None
 
-    def _reserve_rank(self, size, metrics):
+    def _reserve_rank_arena(self, size, metrics):
         import torch
 
         if self.capacity is not None and size <= self.capacity["capacity"]:
@@ -462,7 +462,7 @@ class HostArena:
                 )
                 metrics["host_encoded_cache_frames_validations"] = 1
                 encoded_size = sum(record["nbytes"] for record in definitions.values())
-                encoded = _reserve(
+                encoded = _reserve_encoded_cache(
                     directory,
                     previous["encoded"] if previous else None,
                     encoded_size,
@@ -515,7 +515,7 @@ class HostArena:
             )
         entries = [local_entries[i] for i in self.tensor_order]
         layout, size = _tensor_layout(entries)
-        self._reserve_rank(size, metrics)
+        self._reserve_rank_arena(size, metrics)
         _decode_arena(
             self.mapping if self.mapping is not None else memoryview(b""),
             layout,

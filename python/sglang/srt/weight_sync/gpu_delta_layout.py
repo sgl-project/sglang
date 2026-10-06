@@ -164,10 +164,6 @@ class TensorBinding:
     def view_id(self):
         return _digest({"name": self.name, "slices": self.slices})
 
-    @cached_property
-    def view_shape(self):
-        return tuple(stop - start for start, stop in self.slices)
-
     def describe(self):
         return {
             "name": self.name,
@@ -978,8 +974,8 @@ class PreparedDelta:
         self.decode_stages = backend.decode_stages
         preparation_started = time.perf_counter()
         self.timing_enabled = os.environ.get("GPU_DELTA_TIMING", "0") == "1"
-        self.layers_per_batch = int(os.environ.get("GPU_DELTA_LAYERS_PER_BATCH", "1"))
-        if self.layers_per_batch < 1:
+        layers_per_batch = int(os.environ.get("GPU_DELTA_LAYERS_PER_BATCH", "1"))
+        if layers_per_batch < 1:
             raise ValueError("GPU_DELTA_LAYERS_PER_BATCH must be positive")
         manifest_started = time.perf_counter()
         path = Path(manifest_path).resolve(strict=True)
@@ -1023,18 +1019,16 @@ class PreparedDelta:
         self.timings["host_rank_prepare_s"] = time.perf_counter() - payload_started
 
         tensors_started = time.perf_counter()
-        compressed, self.direct = [], []
+        compressed, raw_entries = [], []
         for binding in backend.layout.bindings:
             entry = entries[binding.name]
             if binding.encoding == "raw_bytes":
                 if entry["changed_bytes"]:
-                    self.direct.append((binding, entry))
+                    raw_entries.append((binding, entry))
             elif entry["frames"]:
                 compressed.append(binding)
         previous_plan = backend.batch_plan
-        self.static_plans = _plan_layers(
-            backend, compressed, entries, self.layers_per_batch
-        )
+        self.static_plans = _plan_layers(backend, compressed, entries, layers_per_batch)
         self.timings["host_batch_plan_reused"] = int(
             previous_plan is not None and backend.batch_plan is previous_plan
         )
@@ -1042,31 +1036,32 @@ class PreparedDelta:
             _plan_decode(outputs, entries, self.host_snapshot.index["tensors"])
             for outputs, _, _, _ in self.static_plans
         ]
-        self.frame_plans = [frames for frames, _ in planned]
+        frame_plans = [frames for frames, _ in planned]
         self.gaps = [gaps for _, gaps in planned]
         self.max_decoded = max((plan[1] for plan in self.static_plans), default=0)
         self.matrix_tensor_count = len(compressed)
-        self.raw_tensor_count = len(self.direct)
+        self.raw_tensor_count = len(raw_entries)
         self.timings["host_tensor_prepare_s"] = time.perf_counter() - tensors_started
 
         # Pack the small complete-target bypass once on the host. Decoded-mask
         # storage and cold tuning still wait for the actual serving pause.
         raw_started = time.perf_counter()
-        self.raw_offsets, raw_h2d_bytes = [], 0
-        for _, entry in self.direct:
+        raw_targets, raw_h2d_bytes = [], 0
+        for binding, entry in raw_entries:
             position = (raw_h2d_bytes + 7) // 8 * 8
-            self.raw_offsets.append(position)
-            raw_h2d_bytes = position + entry["nbytes"]
+            size = entry["nbytes"]
+            raw_targets.append((binding, position, size))
+            raw_h2d_bytes = position + size
         self.raw_pinned = torch.empty(
             raw_h2d_bytes, dtype=torch.uint8, device="cpu", pin_memory=True
         )
         raw_view = memoryview(self.raw_pinned.numpy())
-        for (_, entry), position in zip(self.direct, self.raw_offsets):
-            source = memoryview(self.host_snapshot.get(entry["name"]).numpy())
-            raw_view[position : position + entry["nbytes"]] = source
+        for binding, position, size in raw_targets:
+            source = memoryview(self.host_snapshot.get(binding.name).numpy())
+            raw_view[position : position + size] = source
         changed_storages = {
             pointer
-            for binding in compressed + [binding for binding, _ in self.direct]
+            for binding in compressed + [binding for binding, _ in raw_entries]
             for pointer in binding.storage_pointers
         }
         self.derived = [
@@ -1076,24 +1071,24 @@ class PreparedDelta:
         ]
         self.timings.update(
             host_raw_pack_s=time.perf_counter() - raw_started,
-            raw_tensors=len(self.direct),
-            raw_bytes=sum(entry["nbytes"] for _, entry in self.direct),
+            raw_tensors=len(raw_entries),
+            raw_bytes=sum(entry["nbytes"] for _, entry in raw_entries),
             raw_h2d_bytes=raw_h2d_bytes,
             compressed_batches=len(self.static_plans),
             decode_stages=self.decode_stages,
-            layers_per_batch=self.layers_per_batch,
+            layers_per_batch=layers_per_batch,
             compressed_tensors=self.matrix_tensor_count,
             de_host_input_bytes=sum(
-                frame.encoded_bytes for frames in self.frame_plans for frame in frames
+                frame.encoded_bytes for frames in frame_plans for frame in frames
             ),
             decoded_zero_ranges=sum(map(len, self.gaps)),
             decoded_zero_bytes=sum(size for gaps in self.gaps for _, size in gaps),
         )
-        self._prepare_gpu_metadata()
+        self._prepare_gpu_metadata(frame_plans, raw_targets)
         self.timings["host_prepare_s"] = time.perf_counter() - preparation_started
 
-    def _prepare_gpu_metadata(self):
-        """Prepare small immutable GPU inputs without allocating decoded masks."""
+    def _prepare_gpu_metadata(self, frame_plans, raw_targets):
+        """Prepare small GPU inputs; retain their leases, not wire-frame objects."""
         from sglang.srt.weight_sync.gpu_delta_codec import NvcompDecoder
 
         started = time.perf_counter()
@@ -1106,8 +1101,8 @@ class PreparedDelta:
         self.decoded_free = [torch.cuda.Event() for _ in range(self.decode_stages)]
         with torch.cuda.stream(self.stream):
             self.raw_device = self.raw_pinned.to(self.device, non_blocking=True)
-            for (binding, entry), position in zip(self.direct, self.raw_offsets):
-                payload = self.raw_device[position : position + entry["nbytes"]]
+            for binding, position, size in raw_targets:
+                payload = self.raw_device[position : position + size]
                 target = binding.storage[0]
                 source = binding.selected_bytes(payload).view(binding.torch_dtype)
                 source = source.reshape(target.shape).to(target.dtype)
@@ -1133,10 +1128,10 @@ class PreparedDelta:
                 backend.decoder = NvcompDecoder(self.device, backend.codec)
             with torch.cuda.stream(self.de_stream):
                 self.workspace = backend.decoder.allocate_workspace(
-                    self.frame_plans, slot_count=self.decode_stages
+                    frame_plans, slot_count=self.decode_stages
                 )
                 self.decode_plan = backend.decoder.prepare_batches(
-                    self.frame_plans,
+                    frame_plans,
                     backend.host_arena.tensor,
                     self.workspace,
                     self.de_stream,
@@ -1159,6 +1154,7 @@ class PreparedDelta:
         self.timings.update(
             host_metadata_prepare_s=time.perf_counter() - started,
             host_metadata_wait_s=time.perf_counter() - waiting,
+            decoder_metadata_h2d_bytes=4 * 8 * sum(map(len, frame_plans)),
             decoder_workspace_bytes=self.workspace.temporary.numel()
             if self.workspace
             else 0,
@@ -1236,7 +1232,6 @@ class PreparedDelta:
             apply_tune_cache_hits=tune_totals[3],
             apply_tune_skipped_batches=tune_totals[4],
             decoder_metadata_uploads=2 * int(bool(decoders)),
-            decoder_metadata_h2d_bytes=4 * 8 * sum(map(len, self.frame_plans)),
             apply_metadata_h2d_bytes=self.apply_metadata.numel() * 8,
             apply_groups=len(apply_groups),
             apply_grid_ctas=sum(group.grid[0] for group in apply_groups),

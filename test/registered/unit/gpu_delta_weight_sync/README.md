@@ -98,7 +98,9 @@ its reader fence. Preparation already allocates the small nvCOMP temporary
 workspace, per-slot status/size rows and descriptor slabs, and uploads immutable
 input metadata and raw targets on feature-owned streams. Relative output offsets,
 slot bounds, metadata views and status-validation callbacks are also prepared here,
-without launching decode or apply. After pause, actual output pointers are checked
+without launching decode or apply. Temporary CPU frame and raw-packing plans are
+not retained after preparation; the decode plan keeps the host/GPU buffer leases
+and metadata needed for execution. After pause, actual output pointers are checked
 and uploaded; scratch-dependent apply setup and first-use tuning remain paused.
 Slots are allocated once per update, reused across layers, and
 released after completion before resume. The

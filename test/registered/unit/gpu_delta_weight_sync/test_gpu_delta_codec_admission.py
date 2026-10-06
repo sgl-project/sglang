@@ -125,7 +125,10 @@ def test_codec_abi_and_frozen_hardware_options(
     assert decoder._options.backend == 1
     assert decoder._options.sort_before_hw_decompress == int(sorting)
     assert bytes(decoder._options)[8:] == bytes(56)
-    assert decoder._align.argtypes == [options_type, ctypes.POINTER(codec._Alignments)]
+    align_function = functions[
+        f"nvcompBatched{algorithm}DecompressGetRequiredAlignments"
+    ]
+    assert align_function.argtypes == [options_type, ctypes.POINTER(codec._Alignments)]
     assert decoder._temporary.argtypes == [
         ctypes.c_size_t,
         ctypes.c_size_t,

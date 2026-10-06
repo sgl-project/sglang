@@ -257,7 +257,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
 
 def test_rejects_frame_range_before_decode():
     device = torch.device("cuda", 0)
-    decoder = NvcompDecoder(device)
+    decoder = NvcompDecoder(device, "snappy-zstd")
     allocation = HostAllocation(256, device.index)
     host = torch.frombuffer(allocation.view, dtype=torch.uint8)[:256]
     decoded = tuple(

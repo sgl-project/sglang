@@ -122,7 +122,7 @@ class NvcompDecoder:
     decoder, algorithm substitution or software fallback.
     """
 
-    def __init__(self, device: torch.device, codec: str = "snappy-zstd"):
+    def __init__(self, device: torch.device, codec: str):
         self.device = torch.device(device)
         if self.device.type != "cuda" or self.device.index is None:
             raise ValueError("Delta decoder requires an explicit CUDA device")
@@ -157,7 +157,7 @@ class NvcompDecoder:
         self._temporary = self._bind(
             "GetTempSizeAsync", [size, size, options_type, ctypes.POINTER(size), size]
         )
-        self._align = self._bind(
+        required_alignments = self._bind(
             "GetRequiredAlignments", [options_type, ctypes.POINTER(_Alignments)]
         )
         self._decode = self._bind(
@@ -177,7 +177,7 @@ class NvcompDecoder:
             ],
         )
         self.alignments = _Alignments()
-        self._check(self._align(self._options, ctypes.byref(self.alignments)))
+        self._check(required_alignments(self._options, ctypes.byref(self.alignments)))
         self._temporary_sizes: dict[tuple[int, int, int], int] = {}
 
     def _bind(self, suffix, arguments):
