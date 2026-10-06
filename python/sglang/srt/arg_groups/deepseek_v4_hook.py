@@ -325,11 +325,21 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
 
     if cfg.enable_decoder_swa_bounded_replay:
-        # Late layers see a per-request tail slice, not the captured prefill shape.
+        # Late layers see a per-request tail slice. Only the breakable graph
+        # captures it, padded, and re-runs the switch onto it at replay.
+        prefill_graph_backend = cfg.cuda_graph_config.prefill.backend
         incompatible = (
             (
-                "the prefill CUDA graph",
-                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+                f"the {prefill_graph_backend} prefill CUDA graph",
+                prefill_graph_backend not in (Backend.DISABLED, Backend.BREAKABLE),
+            ),
+            (
+                "the prefill CUDA graph on ROCm",
+                prefill_graph_backend != Backend.DISABLED and get_platform().is_hip,
+            ),
+            (
+                "the prefill CUDA graph under context parallelism",
+                prefill_graph_backend != Backend.DISABLED and cfg.attn_cp_size > 1,
             ),
             # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
             ("DP attention", attn_dp_enabled_of(cfg)),

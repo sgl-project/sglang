@@ -686,6 +686,15 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+def _graph_break_live_rows(forward_batch: ForwardBatch) -> int:
+    """Leading rows of a prefill graph break's inputs that carry tokens: the
+    late-layer tail's while the model is on it, else the extend's."""
+    tail = get_attn_backend().forward_metadata.late_layer_tail
+    if tail is not None:
+        return sum(tail.extend_seq_lens_cpu)
+    return forward_batch.global_num_token_non_padded_cpu
+
+
 @register_custom_op(mutates_args=["output"])
 @register_split_op()
 def deepseek_v4_attention_with_output(
@@ -701,7 +710,7 @@ def deepseek_v4_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    real_num_tokens = _graph_break_live_rows(forward_batch)
 
     if real_num_tokens == 0:
         output.zero_()
@@ -745,7 +754,7 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     # The compressor and prefill indexer sync with the host, like the attention.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    real_num_tokens = _graph_break_live_rows(forward_batch)
     if real_num_tokens == 0:
         return
     get_attn_backend().forward_low_ratio_sources(
@@ -3788,18 +3797,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         state.hidden_states_mlp_output = hidden
 
 
-def _scatter_tail_rows(
-    tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
-) -> torch.Tensor:
-    # Rows outside the tail are never read (see _check_late_layer_tail_readers).
-    full = rows.new_empty((num_tokens, rows.shape[1]))
-    if tail.contiguous_start is not None:
-        full[tail.contiguous_start :].copy_(rows)
-    else:
-        full[tail.token_indices] = rows[: tail.token_indices.shape[0]]
-    return full
-
-
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -3971,8 +3968,14 @@ class DeepseekV4Model(nn.Module):
             hc_eps=self.hc_eps,
         )
 
-    def _check_late_layer_tail_readers(self, forward_batch: ForwardBatch) -> None:
-        # Rows outside the tail are never computed past the last kv_source layer.
+    def check_late_layer_tail_readers(self, forward_batch: ForwardBatch) -> None:
+        """Raises for a request that reads rows outside the late-layer tail, which
+        are never computed past the last kv_source layer."""
+        if (
+            self.late_layer_start is None
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return
         if (
             forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
             and self.dspark_layers_to_capture is None
@@ -4035,7 +4038,6 @@ class DeepseekV4Model(nn.Module):
             self.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
         saved_full = None
@@ -4386,12 +4388,8 @@ class DeepseekV4Model(nn.Module):
         if tail is not None and not capture_dspark:
             # The logits processor indexes rows by the full extend layout.
             num_tokens = input_ids.shape[0]
-            hidden_states = _scatter_tail_rows(
-                tail=tail, rows=hidden_states, num_tokens=num_tokens
-            )
-            pre_hc_head = _scatter_tail_rows(
-                tail=tail, rows=pre_hc_head, num_tokens=num_tokens
-            )
+            hidden_states = tail.scatter(hidden_states, num_tokens)
+            pre_hc_head = tail.scatter(pre_hc_head, num_tokens)
 
         if capture_dspark:
             return (hidden_states, pre_hc_head), dspark_aux_hidden_states
@@ -4666,6 +4664,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                 input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
             )
 
+        # Checked here because a prefill CUDA graph replay skips the model body.
+        self.model.check_late_layer_tail_readers(forward_batch)
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
@@ -4686,7 +4686,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             tail = get_attn_backend().tail_forward_metadata.late_layer_tail
-            input_ids = tail.rows(input_ids)
+            input_ids = tail.live_rows(tail.rows(input_ids))
+            hidden_states = tail.live_rows(hidden_states)
+            aux_hidden_states = [tail.live_rows(aux) for aux in aux_hidden_states]
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
@@ -4703,7 +4705,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             ),
         )
         if tail is not None:
-            output.hidden_states_token_indices = tail.token_indices
+            output.hidden_states_token_indices = tail.live_rows(tail.token_indices)
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
