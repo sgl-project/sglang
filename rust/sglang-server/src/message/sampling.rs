@@ -3,12 +3,9 @@
 //! `__post_init__` → `normalize` → `verify` pipeline (run in that order, as
 //! `TokenizerManager._create_tokenized_object` does).
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
+use std::collections::BTreeMap;
 
-use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
-use serde::de::{MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use super::types::OneOrMany;
 use crate::utils::{error::Error, regex::RegexPattern};
@@ -366,7 +363,6 @@ impl Default for SamplingParams {
             stop_regex_max_len: 0,
             is_normalized: false,
             ebnf_full_assistant: false,
-            explicit_fields: BTreeSet::new(),
         }
     }
 }
@@ -1219,36 +1215,5 @@ mod tests {
         let json = serde_json::json!({ "stop": stops }).to_string();
         let err = norm_err(&json).to_string();
         assert!(err.contains("at most"), "{err}");
-    }
-
-    #[test]
-    fn preferred_params_fill_only_omitted_request_fields() {
-        let preferred = serde_json::json!({
-            "temperature": 0.25,
-            "top_p": 0.75,
-            "max_new_tokens": 4096
-        });
-        let mut input: SamplingParamsInput =
-            serde_json::from_str(r#"{"temperature": 1.0, "top_p": null}"#).unwrap();
-        input.apply_preferred(&preferred).unwrap();
-        let SamplingParamsInput::One(params) = input else {
-            panic!("expected scalar params")
-        };
-        assert_eq!(params.temperature, 1.0, "explicit default wins");
-        assert_eq!(params.top_p, 1.0, "explicit null keeps the type default");
-        assert_eq!(params.max_new_tokens, Some(4096), "omitted uses preferred");
-    }
-
-    #[test]
-    fn preferred_params_apply_to_every_batched_object() {
-        let preferred = serde_json::json!({"temperature": 0.25, "top_p": 0.75});
-        let mut input: SamplingParamsInput =
-            serde_json::from_str(r#"[{"temperature": 0.5}, {"top_p": 0.9}]"#).unwrap();
-        input.apply_preferred(&preferred).unwrap();
-        let SamplingParamsInput::Many(params) = input else {
-            panic!("expected batched params")
-        };
-        assert_eq!((params[0].temperature, params[0].top_p), (0.5, 0.75));
-        assert_eq!((params[1].temperature, params[1].top_p), (0.25, 0.9));
     }
 }

@@ -3816,6 +3816,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sglang-grpc-types",
+ "sglang-api-types",
  "sglang-mm",
  "socket2",
  "thiserror",

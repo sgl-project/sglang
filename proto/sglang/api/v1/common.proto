@@ -8,10 +8,11 @@ package sglang.api.v1;
 
 import "sglang/json/v1/options.proto";
 
-// A token-id sequence. i32 matches the server's TokenIds (= Vec<i32>).
+// A token-id sequence. int64 matches the servers' token id width (Rust
+// `TokenIds = Vec<i64>`, Python `array("q")`).
 message TokenIds {
   option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
-  repeated int32 ids = 1;
+  repeated int64 ids = 1;
 }
 
 // Scalar-or-list carriers: `/generate` accepts every per-request field as one

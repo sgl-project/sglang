@@ -18,9 +18,10 @@ use super::frontend_error_status;
 use crate::frontend::{
     FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest, HealthStatus,
 };
+use crate::message::api::merge_preferred_sampling;
 #[cfg(test)]
 use crate::message::ids::Rid;
-use crate::message::request::GenerateBody;
+use crate::message::request::into_requests;
 use crate::utils::{
     environ,
     response::{error_response, error_value},
@@ -36,6 +37,7 @@ use axum::{
     },
     routing::{get, post},
 };
+use sglang_api_types::api::v1::GenerateRequest as WireGenerateRequest;
 
 /// API-local timing for one request.
 ///
@@ -162,30 +164,35 @@ async fn health_generate(
 /// message, instead of axum's default 422.
 async fn generate(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<GenerateBody>, JsonRejection>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
     let mut body = match body {
         Ok(Json(body)) => body,
         // A body that fails to parse has no readable `stream` flag, so this one
-        // can only answer unary — as Python's does (FastAPI rejects before its
+        // can only answer unary -- as Python's does (FastAPI rejects before its
         // handler runs).
         Err(rejection) => {
             return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
         }
     };
-    let stream = body.stream;
+    // Launch-time preferred sampling params fill in beneath the request's own
+    // keys before decoding, so an explicit request value (even a default or
+    // null) wins: Python TokenizerManager's precedence.
     if let Some(preferred) = &state.server_args.preferred_sampling_params
-        && let Err(error) = body.apply_preferred_sampling(&preferred.0)
+        && let Err(error) = merge_preferred_sampling(&mut body, &preferred.0)
     {
-        return native_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &error.to_string(),
-            stream,
-        );
+        return native_error(StatusCode::INTERNAL_SERVER_ERROR, &error, false);
     }
+    // The schema (sglang_api_types) is the contract: decode errors carry
+    // serde's field-level text, as Python's 400s do.
+    let body: WireGenerateRequest = match serde_json::from_value(body) {
+        Ok(body) => body,
+        Err(error) => return native_error(StatusCode::BAD_REQUEST, &error.to_string(), false),
+    };
+    let stream = body.stream.unwrap_or(false);
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
-    // payloads. `is_batch` = list form → the response is a JSON array.
-    let (payloads, is_batch) = match body.into_requests() {
+    // payloads. `is_batch` = list form -> the response is a JSON array.
+    let (payloads, is_batch) = match into_requests(body) {
         Ok(v) => v,
         // Request normalization only returns validation failures.
         Err(e) => {

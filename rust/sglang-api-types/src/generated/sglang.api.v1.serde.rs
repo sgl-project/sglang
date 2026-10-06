@@ -11,7 +11,7 @@ impl ::serde::Serialize for TokenIds {
 impl<'de> ::serde::Deserialize<'de> for TokenIds {
     fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Ok(TokenIds {
-            ids: <::prost::alloc::vec::Vec<i32> as ::serde::Deserialize>::deserialize(
+            ids: <::prost::alloc::vec::Vec<i64> as ::serde::Deserialize>::deserialize(
                 deserializer,
             )?,
         })

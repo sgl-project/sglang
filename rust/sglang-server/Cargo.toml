@@ -70,6 +70,7 @@ sglang-grpc-types = { path = "../../proto" }
 sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
 tonic = { workspace = true }
 tokio-stream = { workspace = true }
+sglang_api_types = { package = "sglang-api-types", path = "../sglang-api-types" }
 
 [dev-dependencies]
 # `Router::oneshot` for handler-level router tests.
