@@ -7,7 +7,7 @@ use super::nonempty_header;
 use super::preparation::{
     append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
 };
-use crate::discovery::{ModelId, WorkerMode};
+use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::dp_rank::select_dp_rank;
 use crate::proxy::sse::{self, StreamEnd, StreamEndReason};
 use crate::server::app_context::AppContext;
@@ -40,6 +40,14 @@ pub(super) struct SelectedWorkers {
     pub(super) track_dispatch_timestamps: bool,
 }
 
+/// One dispatch attempt's client-ready response.
+pub(super) struct Dispatched {
+    pub(super) response: Response<Body>,
+    /// The workers to avoid on a retry, set only when nothing beyond a
+    /// failure status reached the client, so another worker may serve it.
+    pub(super) retry_excluding: Vec<WorkerId>,
+}
+
 /// PD sends to both workers and returns the decode response.
 pub(super) async fn forward_request(
     ctx: &AppContext,
@@ -48,7 +56,7 @@ pub(super) async fn forward_request(
     mut headers: HeaderMap,
     request_started_at: Instant,
     duration: &Arc<RequestDurationGuard>,
-) -> Result<Response<Body>, ApiError> {
+) -> Result<Dispatched, ApiError> {
     let SelectedWorkers {
         prefill,
         decode,
@@ -75,16 +83,19 @@ pub(super) async fn forward_request(
         .and_then(|decode| select_dp_rank(decode, None, &[]));
 
     // Track worker occupancy and the prompt's contribution to active load.
+    // A retry keeps the request's stale deadline rather than starting a new one.
+    let in_flight = request_started_at.elapsed();
     let worker_load_guard = if track_dispatch_timestamps {
         prefill.timestamped_load_guard()
     } else {
         prefill.load_guard()
     };
-    let active_request_guard = ctx.router_inflight_load.register(
+    let active_request_guard = ctx.router_inflight_load.register_aged(
         prefill.id.clone(),
         prefill.url.clone(),
         request.input_token_count,
         0,
+        in_flight,
     );
     // Attribute the outcome to the worker supplying the client-visible response.
     let metrics = DispatchMetrics::new(
@@ -94,6 +105,7 @@ pub(super) async fn forward_request(
         request_started_at,
         duration,
     );
+    let pd_prefill = decode.is_some().then(|| prefill.id.clone());
     // Both PD workers receive the same bootstrap room to coordinate KV transfer.
     let pd = decode.map(|decode| {
         let bootstrap = BootstrapFields {
@@ -138,8 +150,13 @@ pub(super) async fn forward_request(
             );
             let decode_load_guards = (
                 decode.load_guard(),
-                ctx.router_inflight_load
-                    .register(decode.id.clone(), decode.url.clone(), 0, 1),
+                ctx.router_inflight_load.register_aged(
+                    decode.id.clone(),
+                    decode.url.clone(),
+                    0,
+                    1,
+                    in_flight,
+                ),
                 decode_rank.map(|rank| decode.dp_rank_guard(rank)),
             );
             let (decode_headers, decode_body) = with_dp_rank(dp_aware, headers, &body, decode_rank);
@@ -190,6 +207,18 @@ pub(super) async fn forward_request(
             (Err(ApiError::StaleRequestExpired { model }), None)
         }
     };
+    // A 2xx stream is already the client's; any other success or client error is final too.
+    let retryable = matches!(
+        dispatch_outcome(&result),
+        RequestOutcome::Error | RequestOutcome::Backpressure
+    );
+    let retry_excluding = match (&blamed_prefill, pd_prefill) {
+        _ if !retryable => Vec::new(),
+        // The other PD side may still hold a caller's rid, which an engine refuses twice.
+        (_, Some(prefill)) if request.caller_set_rid => vec![prefill, response_worker.id.clone()],
+        (Some(blame), _) => vec![blame.prefill.id.clone()],
+        (None, _) => vec![response_worker.id.clone()],
+    };
     let log_context = metrics.record_dispatch_result(&result, engine_rid, blamed_prefill.as_ref());
     // Materialize dispatch errors here so the access log retains the selected worker.
     let mut response = match result {
@@ -202,7 +231,10 @@ pub(super) async fn forward_request(
         Err(error) => error.into_response(),
     };
     response.extensions_mut().insert(log_context);
-    Ok(response)
+    Ok(Dispatched {
+        response,
+        retry_excluding,
+    })
 }
 
 /// Rank for the worker that computes the prompt; decode gets its KV from
