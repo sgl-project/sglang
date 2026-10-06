@@ -1,36 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Real (non-mocked) bf16 forward tests for Kandinsky6's dtype-sensitive maths.
-
-SGLang PR #2 review comment (anchored at ``Kandinsky6TimeEmbeddings.forward``): the
-sinusoidal timestep embedding is always fp32 (``self.freqs`` is a plain attribute, not
-a registered buffer, so it never gets cast by ``module.to(dtype)``), but under the
-default loading config the embedding's own Linear weights are bf16.
-``torch.autocast(device_type="cuda", dtype=torch.float32)`` does not bridge that gap:
-it does not cast an already-materialized bf16 weight, and it's entirely a no-op when
-there is no CUDA device (as on this CPU-only test machine), so the first Linear used
-to fail with "mat1 and mat2 must have the same dtype". ``Kandinsky6Modulation`` (the
-AdaLN projection) had the identical bug. Both now cast the fp32 input to the Linear's
-own weight dtype explicitly instead of relying on autocast, matching the diffusers
-reference's ``embed.to(get_parameter_dtype(self.timestep_embedder))``.
-
-These tests build tiny *real* Kandinsky6 modules -- random weights, no checkpoint --
-following the ``kandinsky6_sr_tiny_components.py`` / ``test_kandinsky6_sr_stages`` house
-pattern for a lightweight real-forward test, with the Linear weights actually cast to
-bf16, and run a real (unmocked) forward pass, so they would have failed exactly the way
-production failed on a bf16 checkpoint before the fix.
-
-``test_time_embeddings_forward_under_bf16_linear_weights`` and
-``test_modulation_forward_under_bf16_linear_weights`` isolate the two fixed modules
-directly and run on CPU (neither touches a fused CUDA-only kernel).
-``test_kandinsky6_dit_real_bf16_forward_does_not_crash`` runs the *full* DiT, whose
-attention blocks go through ``LayerNormScaleShift``/``RMSNormScaleShift``
-(``runtime/layers/layernorm.py``), which dispatch to a Triton kernel that hard-requires
-a real CUDA/XPU tensor on any CUDA-capable host (true of every dispatch branch of that
-op, not a bug introduced here -- see the identical note in test_kandinsky6_sr_stages.py).
-bf16 numerics only matter on real hardware anyway, so that test runs on CUDA when
-available and is skipped (not failed) otherwise, rather than forcing CPU tensors through
-a kernel that cannot accept them.
-"""
+"""BF16 forward, attention dispatch, CUDA graph and cache lifetime regressions."""
 
 from __future__ import annotations
 

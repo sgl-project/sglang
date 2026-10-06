@@ -1,21 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kandinsky6TI2VAPipeline construction / stage-wiring smoke test.
-
-Confirms the pipeline class is importable, declares the documented
-``pipeline_name`` / ``_required_config_modules``, rejects disaggregated
-deployment, and wires its stage chain in the documented order -- without
-downloading real weights or requiring a GPU. Also pins the denoising stage's
-guidance contract for the pi-Flow distilled checkpoint.
-
-Mirrors the ``ComposedPipelineBase`` test-double pattern used by
-``test_disagg_roles.py``'s ``_make_pipeline``/``_FakePipeline`` helpers and
-MiniMax-H3's own admission/contract tests
-(``test_minimax_h3_admission.py``, ``test_minimax_h3_dit_contract.py``):
-construct the pipeline via ``object.__new__`` (skipping
-``ComposedPipelineBase.__init__``, which would otherwise try to download and
-load real model weights), hand it mocked modules, and call
-``create_pipeline_stages`` directly.
-"""
+"""Pipeline wiring, residency precision and joint video/audio denoising."""
 
 from __future__ import annotations
 
@@ -271,7 +255,10 @@ def test_denoising_rejects_guidance_other_than_one_with_a_piflow_scheduler(
         stage.forward(batch, MagicMock())
 
 
-def test_distilled_denoising_calls_the_dit_once_per_step_without_guidance(monkeypatch):
+@pytest.mark.parametrize("height,width", [(32, 32), (512, 768), (768, 512)])
+def test_distilled_denoising_calls_the_dit_once_per_step_without_guidance(
+    monkeypatch, height, width
+):
     """Pro-distill: 10 steps at guidance 1.0. The DiT head is ``n_grid`` (= 10) times as
     wide as the latents, the pi-Flow step folds it back, and the returned latents keep
     the latent width. The negative prompt is never fed to the DiT."""
@@ -291,6 +278,7 @@ def test_distilled_denoising_calls_the_dit_once_per_step_without_guidance(monkey
         callable has no ``.modules()``."""
 
         def forward(self, **kwargs):
+            assert tuple(kwargs["scale_factor"]) == (1.0, 2.0, 2.0)
             text_lens.append(kwargs["encoder_hidden_states"].shape[1])
             video, audio = kwargs["hidden_states"], kwargs["hidden_states_audio"]
             video_velocity = torch.randn(*video.shape[:-1], n_grid * video_channels)
@@ -315,8 +303,8 @@ def test_distilled_denoising_calls_the_dit_once_per_step_without_guidance(monkey
         negative_prompt_embeds=[torch.randn(1, text_len + 2, 8)],
         pooled_embeds=[torch.randn(1, 3)],
         prompt_attention_mask=[torch.ones(1, text_len)],
-        height=32,
-        width=32,
+        height=height,
+        width=width,
         image_latent=None,
         is_warmup=True,
         sampling_params=Kandinsky6TI2VASamplingParams(quality="lossless"),

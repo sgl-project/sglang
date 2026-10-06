@@ -1,14 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sampler selection of Kandinsky 6 video SR on tiny random components.
-
-The ``scheduler`` component of the bundle decides the sampler: a ``PiflowScheduler``
-with ``nfe`` runs pi-Flow with exactly ``nfe`` DiT calls per tile (``num_inference_steps``
-is ignored, with a warning if set to something else), anything else runs flow-Euler with
-``num_inference_steps`` calls per tile. A sampler that does not fit the DiT head must fail
-before any tile is processed. The 64x96 clip holds 9 tiles, so the two official bundles give
-9 x 2 = 18 (distilled) and 9 x 4 = 36 (flow-matching) DiT calls, the totals of the denoising
-progress bar.
-"""
+"""Validate scheduler selection, DiT call counts and incompatible head rejection."""
 
 import os
 from typing import NamedTuple

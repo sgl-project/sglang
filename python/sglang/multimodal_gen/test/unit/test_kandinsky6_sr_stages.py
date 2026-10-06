@@ -1,11 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage-level behaviour of Kandinsky 6 video SR on tiny random components.
-
-The tiled algorithm itself is pinned against the reference in
-``test_kandinsky6_sr_reference_parity.py``; here the four model-phase stages (encode,
-latent-prep, denoising, decode) plus the output stage must reproduce the pure orchestration
-function (``tiled.super_resolve``) through ``Req`` / ``batch.extra`` hand-offs, phase by phase.
-"""
+"""Native SR stage-chain parity, component residency and video/audio hand-offs."""
 
 import copy
 import os
@@ -25,12 +19,16 @@ from kandinsky6_sr_tiny_components import (
 from sglang.multimodal_gen.configs.sample.kandinsky6_sr import (
     Kandinsky6SRSamplingParams,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.models.upsampler.kandinsky6_sr_latent_upscaler import (
     Kandinsky6SRLatentUpscalerBank,
+)
+from sglang.multimodal_gen.runtime.pipelines.kandinsky6_sr_pipeline import (
+    Kandinsky6SRPipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.decode_stage import (
@@ -109,13 +107,40 @@ def test_stage_chain_reproduces_the_pure_orchestration(bank_scales):
     video = random_video(9, 64, 128)
     batch = make_request(video, tiles_batch_size=5)
 
-    encode = make_stage(Kandinsky6SREncodeStage, server_args, vae, bank)
-    latent_prep = make_stage(
-        Kandinsky6SRLatentPrepStage, server_args, vae, dit, bank, None
-    )
-    denoise = make_stage(Kandinsky6SRDenoisingStage, server_args, dit, None)
-    decode = make_stage(Kandinsky6SRDecodeStage, server_args, vae)
-    output = make_stage(Kandinsky6SROutputStage, server_args)
+    pipeline = object.__new__(Kandinsky6SRPipeline)
+    pipeline.modules = dict(vae=vae, transformer=dit, scheduler=None)
+    if bank is not None:
+        pipeline.modules["latent_upscaler"] = bank
+    pipeline._stages, pipeline._stage_name_mapping = [], {}
+    pipeline._disagg_role = RoleType.MONOLITHIC
+    pipeline.create_pipeline_stages(server_args)
+    for stage in pipeline.stages:
+        stage.server_args = server_args
+    input_stage, encode, latent_prep, denoise, decode, output = pipeline.stages
+    assert [type(stage) for stage in pipeline.stages] == [
+        Kandinsky6SRInputStage,
+        Kandinsky6SREncodeStage,
+        Kandinsky6SRLatentPrepStage,
+        Kandinsky6SRDenoisingStage,
+        Kandinsky6SRDecodeStage,
+        Kandinsky6SROutputStage,
+    ]
+    assert [
+        (u.component_name, u.start_at_stage_entry)
+        for u in encode.component_uses(server_args)
+    ] == [("vae", False)]
+    expected_phases = [("vae", "encode_tiles")]
+    if bank is not None:
+        expected_phases.insert(0, ("latent_upscaler", "upscale_tiles"))
+    assert [
+        (u.component_name, u.phase) for u in latent_prep.component_uses(server_args)
+    ] == expected_phases
+    (dit_use,) = denoise.component_uses(server_args)
+    assert (dit_use.component_name, dit_use.phase) == ("transformer", "denoise_tiles")
+    assert dit_use.memory_intensive and dit_use.target_dtype == torch.bfloat16
+    assert [
+        (u.component_name, u.phase) for u in decode.component_uses(server_args)
+    ] == [("vae", "decode_tiles")]
 
     batch = encode.forward(batch, server_args)
     assert (SR_LR_LATENT_KEY in batch.extra) == ("2x" in bank_scales)
@@ -157,6 +182,16 @@ def test_stage_chain_reproduces_the_pure_orchestration(bank_scales):
     assert torch.equal(restored, expected)
     assert (batch.height, batch.width) == (128, 256)
     assert SR_TILES_KEY not in batch.extra and SR_PLAN_KEY not in batch.extra
+
+
+@pytest.mark.parametrize(
+    "role", [RoleType.ENCODER, RoleType.DENOISER, RoleType.DECODER]
+)
+def test_sr_rejects_disaggregation(role):
+    pipeline = object.__new__(Kandinsky6SRPipeline)
+    with pytest.raises(ValueError, match="monolithic"):
+        pipeline.validate_disagg_role(role)
+    pipeline.validate_disagg_role(RoleType.MONOLITHIC)
 
 
 def test_encode_stage_leaves_the_vae_alone_on_the_pixel_path():

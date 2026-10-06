@@ -7,8 +7,13 @@ from transformers import CLIPTextConfig, CLIPTextModel
 from sglang.multimodal_gen.configs.models.encoders import (
     CLIPTextConfig as NativeCLIPTextConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.flux import FluxPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.kandinsky6 import (
     Kandinsky6TI2VAPipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
+    StableDiffusion3PipelineConfig,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
@@ -25,7 +30,26 @@ from sglang.multimodal_gen.runtime.models.encoders.clip import (
 from sglang.multimodal_gen.runtime.pipelines.kandinsky6_pipeline import (
     Kandinsky6TI2VAPipeline,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+    _text_encoder_max_length_is_fixed,
+)
 from sglang.srt.runtime_context import get_parallel
+
+
+@pytest.mark.parametrize(
+    "config_cls,fixed",
+    [
+        (FluxPipelineConfig, [True, False]),
+        (Kandinsky6TI2VAPipelineConfig, [False, True]),
+        (Krea2PipelineConfig, [False, False]),
+        (StableDiffusion3PipelineConfig, [False, False, False]),
+    ],
+)
+def test_request_max_length_preserves_fixed_encoder_context(config_cls, fixed):
+    config = config_cls()
+    assert [
+        _text_encoder_max_length_is_fixed(config, index) for index in range(len(fixed))
+    ] == fixed
 
 
 def test_clip_uses_shared_native_loader():

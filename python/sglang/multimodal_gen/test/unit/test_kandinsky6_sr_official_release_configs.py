@@ -1,15 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The real component configs of the two official Kandinsky 6 VSR Diffusers repos (no
-weights) against the SR modules.
-
-The flow-matching repo (``kandinskylab/Kandinsky-6.0-VSR-5s-Diffusers``) and the 2-step
-pi-Flow repo (``...-VSR-distilled2steps-5s-Diffusers``) differ only in their scheduler,
-the width of the DiT head and ``sr_params``.  Each component is built on the meta device
-from the release config exactly as the loaders would, and the tensor counts / key
-groups are compared with the safetensors headers of the Hub repos (459 DiT, 378 KVAE,
-489 latent-upscaler tensors).  This keeps the port from drifting away from the official
-release without a GPU, the weights or the Hub.
-"""
+"""Validate release config shapes and component loading without downloading weights."""
 
 import copy
 import json
@@ -275,17 +265,26 @@ def test_real_latent_upscaler_config_builds_the_release_bank():
 
 
 @both_repos
+@pytest.mark.parametrize("upscaler", ["present", "missing", "null"])
 def test_real_model_index_is_accepted_by_the_module_loading_path(
-    bundle, tmp_path, monkeypatch
+    bundle, tmp_path, monkeypatch, upscaler
 ):
     """``ComposedPipelineBase.load_modules`` sees a model_index.json whose extra
     ``_kandinsky6_sr`` entry is a dict (not a ``[library, class]`` pair), next to a root
     ``sr_config.json``: only the four components of the pipeline may be requested, with
     the scheduler class of the repo."""
-    (tmp_path / "model_index.json").write_text(json.dumps(bundle.model_index))
+    model_index = dict(bundle.model_index)
+    if upscaler == "missing":
+        model_index.pop("latent_upscaler")
+    elif upscaler == "null":
+        model_index["latent_upscaler"] = None
+    (tmp_path / "model_index.json").write_text(json.dumps(model_index))
     if bundle.sr_config is not None:
         (tmp_path / "sr_config.json").write_text(json.dumps(bundle.sr_config))
-    for name in ("transformer", "vae", "scheduler", "latent_upscaler"):
+    components = ["transformer", "vae", "scheduler"]
+    if upscaler == "present":
+        components.append("latent_upscaler")
+    for name in components:
         (tmp_path / name).mkdir()
         if name != "scheduler":  # the scheduler is config-only
             (tmp_path / name / "diffusion_pytorch_model.safetensors").touch()
@@ -334,10 +333,33 @@ def test_real_model_index_is_accepted_by_the_module_loading_path(
 
     modules = pipeline.load_modules(server_args)
 
-    assert sorted(modules) == ["latent_upscaler", "scheduler", "transformer", "vae"]
-    assert requested == {
+    expected = {
         "transformer": ("diffusers", "Kandinsky6SRTransformer3DModel"),
         "vae": ("diffusers", "Kandinsky6SRVAE"),
         "latent_upscaler": ("diffusers", "Kandinsky6SRLatentUpscalerBank"),
         "scheduler": ("diffusers", bundle.scheduler_cls.__name__),
     }
+    if upscaler != "present":
+        expected.pop("latent_upscaler")
+    assert set(modules) == set(expected)
+    assert requested == expected
+    assert "latent_upscaler" in Kandinsky6SRPipeline._required_config_modules
+
+
+def test_legacy_bundle_requires_official_diffusers_layout(tmp_path):
+    (tmp_path / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "Kandinsky6SRPipeline",
+                "_diffusers_version": "0.37.0",
+                "dit": ["x", "Kandinsky6SRDiT"],
+                "vae": ["x", "Kandinsky6SRVAE"],
+            }
+        )
+    )
+    pipeline = object.__new__(Kandinsky6SRPipeline)
+    pipeline.model_path = str(tmp_path)
+    with pytest.raises(
+        ValueError, match="k6_video SR bundle.*kandinskylab/Kandinsky-6.0-VSR"
+    ):
+        pipeline.load_modules(SimpleNamespace())
