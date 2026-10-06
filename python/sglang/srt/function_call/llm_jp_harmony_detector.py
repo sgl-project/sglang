@@ -24,7 +24,6 @@ from sglang.srt.function_call.core_types import (
 )
 from sglang.srt.parser.harmony_parser import prefix_hold
 
-_CALL_HINT = "to=functions."
 _CALL_RE = re.compile(
     r"(?:<\|start\|>)?\s*(?:assistant)?\s*to=functions\.(?P<name>[^\s<]+)\s*"
     r"<\|channel\|>\s*commentary\s*(?:<\|constrain\|>\s*\w+\s*)?<\|message\|>"
@@ -53,7 +52,7 @@ class LlmJpHarmonyDetector(BaseFormatDetector):
     """
 
     def has_tool_call(self, text: str) -> bool:
-        return _CALL_HINT in text
+        return "to=functions." in text
 
     def _to_call_item(
         self, name: str, arguments: str, tools: List[Tool], tool_index: int
@@ -144,7 +143,7 @@ class LlmJpHarmonyDetector(BaseFormatDetector):
         thinking_mode: bool = False,
         parallel_tool_calls: bool = True,
     ) -> Optional[StructuralTag]:
-        # Applied after the reasoning, which the reasoning parser owns.
+        # SGLang starts this grammar when the reasoning ends at <|end|>.
         tools = tools or []
         if isinstance(tool_choice, ToolChoice):
             tools = [t for t in tools if t.function.name == tool_choice.function.name]

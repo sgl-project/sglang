@@ -118,8 +118,8 @@ class TestLlmJpHarmonyToolCalls(CustomTestCase):
         )
 
     def test_streaming_drops_an_unparseable_last_call(self):
-        # The last call ends at EOS, so only finish() can see it; it must be
-        # dropped as in non-streaming, not returned as content.
+        # The last call ends at EOS, so only finish() sees it. It is dropped,
+        # as in non-streaming.
         cut = _call("Tokyo", "")[:-3]
         no_args = _call("Tokyo", "").split("{")[0]
         unknown = _call("Tokyo", "").replace("get_weather", "get_wether")

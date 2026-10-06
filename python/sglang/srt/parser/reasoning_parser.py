@@ -1179,8 +1179,8 @@ class LlmJpHarmonyDetector(BaseReasoningFormatDetector):
                 body, self._buffer = prefix_hold(
                     self._buffer, list(_LLM_JP_HARMONY_TERMINATORS)
                 )
-        # The tokenizer's space after <|message|>; a leading space the model
-        # wrote comes as a second one.
+        # Drop the space the tokenizer adds after <|message|>. A leading space
+        # the model wrote comes as a second one.
         if self._at_body_start and body:
             self._at_body_start = False
             body = body[1:] if body.startswith(" ") else body
