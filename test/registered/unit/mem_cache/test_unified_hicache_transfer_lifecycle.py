@@ -1002,6 +1002,76 @@ class TestSwaLoadBackReservation(_UnifiedHiCacheCase):
         self.assertEqual(self.allocator.verify_byte_accounting(), [])
         self.cache.sanity_check()
 
+    def test_reservation_retries_once_after_device_eviction(self):
+        self._cache(write_policy="write_through", tokens=64)
+        swa = self.allocator.swa_attn_allocator
+        # Tree-owned rows fill the SWA end; once their backups are acked,
+        # device eviction may reclaim them.
+        fillers = []
+        while self.allocator.swa_available_size() >= 2 * PAGE:
+            base = 100 * (len(fillers) + 1)
+            tokens = list(range(base, base + PAGE))
+            fillers.append((tokens, *self._insert(tokens, base)))
+        self.cache.flush_pending_backups()
+        self.cache.writing_check()
+        placed = [self._live_pages(ids)[1] for _, ids, _ in fillers]
+        allocated = swa.allocated_count()
+        entry = self.controller.mem_pool_host.entry_map[PoolName.SWA]
+        reserve, evict = entry.device_alloc_fn, entry.device_evict_fn
+        attempts, evictions = [], []
+
+        def recorded_reserve(need_size):
+            attempts.append(reserve(need_size))
+            return attempts[-1]
+
+        def recorded_evict(need_size):
+            evictions.append(need_size)
+            return evict(need_size)
+
+        transfer = PoolTransfer(name=PoolName.SWA, host_indices=torch.arange(2 * PAGE))
+        with (
+            mock.patch.object(entry, "device_alloc_fn", side_effect=recorded_reserve),
+            mock.patch.object(entry, "device_evict_fn", side_effect=recorded_evict),
+        ):
+            result = self.controller._resolve_device_transfers(
+                [transfer], kv_device_indices=torch.empty(0, dtype=torch.int64)
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(evictions, [2 * PAGE])
+        self.assertEqual(len(attempts), 2)
+        self.assertIsNone(attempts[0])
+        reserved = transfer.device_indices
+        self.assertIs(attempts[1], reserved)
+        pages = set((reserved[::PAGE] // PAGE).tolist())
+        reclaimed = set()
+        for (tokens, ids, expected), before in zip(fillers, placed):
+            if len(self._match(tokens).device_indices) == len(tokens):
+                # Survivors keep their rows.
+                self._assert_rows(ids, expected, swa_tail=PAGE)
+                continue
+            # The evicted filler is still on host; its SWA page went back to
+            # the end and into this reservation.
+            self.assertTrue(
+                self.cache.tree_core.is_backuped(self._match(tokens).last_host_node)
+            )
+            reclaimed |= set(before.tolist())
+        self.assertTrue(reclaimed)
+        self.assertLessEqual(reclaimed, pages)
+        # Owned by the reservation alone: counted, and no virtual page maps here.
+        page_ids = torch.tensor(sorted(pages))
+        self.assertEqual(swa._pending_hicache_load_pages, 2)
+        self.assertTrue(bool((swa.physical_to_virtual[page_ids] == -1).all()))
+        self.assertFalse(bool(torch.isin(swa.virtual_to_physical, page_ids).any()))
+        self.assertEqual(swa.allocated_count(), allocated + (2 - len(reclaimed)) * PAGE)
+        self.assertEqual(self.allocator.verify_byte_accounting(), [])
+
+        swa.cancel_physical_reservation(reserved)
+        self.assertEqual(swa._pending_hicache_load_pages, 0)
+        self.assertEqual(swa.allocated_count(), allocated - len(reclaimed) * PAGE)
+        self.assertEqual(self.allocator.verify_byte_accounting(), [])
+        self.cache.sanity_check()
+
     def test_later_pool_failure_cancels_the_swa_reservation(self):
         self._cache(write_policy="write_through")
         swa = self.allocator.swa_attn_allocator
