@@ -62,7 +62,6 @@ from sglang.srt.utils import ceil_align, is_hip
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.tp_worker import BaseTpWorker
-    from sglang.srt.mem_cache.events import LoRANameTable
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

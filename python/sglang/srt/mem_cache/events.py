@@ -93,34 +93,37 @@ class KvEventLoraNames(LoRANameTable):
 
     A name is kept while a request of its namespace is alive or a block
     published under it is not yet removed, so removals hash like their stores.
+    Pruning runs only when events are taken: the Rust tree counts a block when
+    its queued event is taken, not when it is stored.
     """
 
     def __init__(self):
+        # Adapter-id registrations keep the existing Dynamo load-time lookup.
+        self._adapter_names: dict[str, str] = {}
         self._names: dict[str, str] = {}
         self._requests: dict[str, weakref.WeakSet] = {}
         self._published_blocks: Counter = Counter()
         # Namespaces that may have lost their last request or block.
         self._prune_candidates: set[str] = set()
-        self._prune_at = 64
 
     def register(self, req: Any = None, lora_name: Optional[str] = None, *, lora_id: Optional[str] = None) -> None:
         """Name ``req``'s namespace; ``req`` needs ``extra_key`` and ``lora_id``."""
         if lora_id is not None:
-            super().register(lora_id=lora_id, lora_name=lora_name)
+            self._adapter_names[lora_id] = lora_name
             return
         if req.lora_id is None or not lora_name:
             return
         self._names[req.extra_key] = lora_name
         self._requests.setdefault(req.extra_key, weakref.WeakSet()).add(req)
         self._prune_candidates.add(req.extra_key)
-        # Caches that never take events (non-publishing ranks, no radix cache)
-        # rely on this amortized prune.
-        if len(self._prune_candidates) >= self._prune_at:
-            self.prune()
-            self._prune_at = 2 * len(self._prune_candidates) + 64
 
     def get(self, extra_key: Optional[str]) -> Optional[str]:
-        return self._names.get(extra_key) or self.resolve(extra_key)
+        return self.resolve(extra_key)
+
+    def resolve(self, extra_key: Optional[str]) -> Optional[str]:
+        if not extra_key:
+            return None
+        return self._names.get(extra_key) or self._adapter_names.get(extra_key[-_LORA_ID_LEN:])
 
     def count_published(self, extra_key: Optional[str], num_blocks: int) -> None:
         if extra_key in self._names:
@@ -248,9 +251,7 @@ class KVCacheEventRecorder:
             parent_block_hash = namespaced_block_hash(
                 parent_block_hash, namespace_seed=namespace_seed
             )
-        lora_name = (
-            self.lora_names.get(node.key.extra_key)
-        )
+        lora_name = self.lora_names.get(node.key.extra_key)
 
         page_index = 0
         logical_len = len(node.key)
