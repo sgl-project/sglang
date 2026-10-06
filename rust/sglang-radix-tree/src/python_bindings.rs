@@ -11,6 +11,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tch::{Device, Kind, Tensor};
 
+use crate::components::registry::ComponentRegistry;
 use crate::components::{ComponentSet, ComponentType, FULL, MAMBA, SWA};
 use crate::node::ChildKeyType;
 use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError};
@@ -995,6 +996,14 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     /// Build a tree core for the given component types from the cache's
     /// init params.
     fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self> {
+        Self::with_component_overrides(init_params, component_types, Vec::new())
+    }
+
+    fn with_component_overrides(
+        init_params: &TreeCoreInitParamsBinding,
+        component_types: Vec<u8>,
+        component_overrides: Vec<(u8, String)>,
+    ) -> PyResult<Self> {
         let component_types = component_types
             .into_iter()
             .map(parse_component_type)
@@ -1034,8 +1043,15 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let params = init_params.to_cache_init_params()?;
         let device = params.device;
         let page_size = params.page_size;
+        let component_overrides = component_overrides
+            .into_iter()
+            .map(|(ct, name)| Ok((parse_component_type(ct)?, name)))
+            .collect::<PyResult<Vec<_>>>()?;
+        let core =
+            UnifiedTreeCore::with_component_overrides(params, component_types, component_overrides)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(TreeCoreBinding {
-            core: Mutex::new(UnifiedTreeCore::new(params, component_types)),
+            core: Mutex::new(core),
             device,
             page_size,
         })
@@ -2710,6 +2726,24 @@ macro_rules! tree_core_binding {
                 })
             }
 
+            /// Construct native component drivers from the native name registry.
+            #[staticmethod]
+            fn with_component_overrides(
+                init_params: &TreeCoreInitParamsBinding,
+                component_types: Vec<u8>,
+                component_overrides: Vec<(u8, String)>,
+            ) -> PyResult<Self> {
+                catch_native_panic(|| {
+                    Ok($name {
+                        inner: TreeCoreBinding::with_component_overrides(
+                            init_params,
+                            component_types,
+                            component_overrides,
+                        )?,
+                    })
+                })
+            }
+
             /// Drop the entire tree and reinitialize empty state.
             fn reset(&self, py: Python<'_>) -> PyResult<()> {
                 catch_native_panic(|| {
@@ -3946,9 +3980,20 @@ fn get_hash_str(
     })
 }
 
+/// Names and component types compiled into the native component registry.
+#[pyfunction]
+fn registered_component_names() -> HashMap<String, u8> {
+    ComponentRegistry::<Vec<i64>>::default()
+        .registered_names()
+        .into_iter()
+        .map(|(name, ct)| (name, component_type_to_u8(ct)))
+        .collect()
+}
+
 fn register_mem_cache_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TlruFloatConfigBinding>()?;
     m.add_function(wrap_pyfunction!(get_hash_str, m)?)?;
+    m.add_function(wrap_pyfunction!(registered_component_names, m)?)?;
     m.add_class::<TreeCoreInitParamsBinding>()?;
     m.add_class::<MatchParamsBinding>()?;
     m.add_class::<InsertParamsBinding>()?;

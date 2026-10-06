@@ -9,7 +9,7 @@ Python in these cases:
 
 - Session-aware caching.
 - C128 or other unsupported components.
-- Custom component overrides.
+- Python-only named components or legacy class overrides.
 - Non-Linux platforms.
 - PyTorch versions outside 2.11 through 2.14.
 - Devices other than CPU or CUDA.
@@ -79,3 +79,17 @@ cache suite. Production wheels do not enable it.
 Unit tests live in `src/tests/`, mirroring the source layout one file per module (wired via `#[cfg(test)] #[path = ...]`), so implementation files stay free of inline test blocks.
 
 Supported component sets are `[Full]`, `[Full, SWA]`, `[Full, Mamba]`, and `[Full, SWA, Mamba]`.
+
+## Named component overrides
+
+`CacheInitParams.component_registry_override` maps component kinds to implementation names, for example `{ComponentType.FULL: "full"}`. Three separate registries connect backend selection and component construction:
+
+- The tree-core registry selects a backend by name through `register_tree_core_backend`.
+- The Python component registry maps names to `TreeComponent` classes through `register_python_tree_component`.
+- The Rust `components::registry::ComponentRegistry` maps names to native factories; `register_rust_tree_component` declares their names and component kinds on the Python side without loading the extension.
+
+Every selected name needs a Python component for cache orchestration hooks, including when the tree core is Rust. Python tree hooks run only with the Python core; Rust tree operations use native component implementations without calling Python node hooks.
+
+Adding a native implementation requires compiling its factory into the default Rust registry and declaring the same name and kind with `register_rust_tree_component`. The Python declaration alone does not add a native implementation. The default Rust registry currently contains only `full`, `swa`, and `mamba`.
+
+A name registered only in Python selects the Python fallback. Existing class-valued overrides remain supported and also select Python. The C128 and MLX auxiliary-state components use named Python registrations and remain Python-only.

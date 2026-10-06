@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
         UnifiedTreeCoreInterface,
     )
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 TreeCoreFactory = Callable[
     ["CacheInitParams", "dict[ComponentType, TreeComponent]"],
@@ -51,7 +52,16 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
     }:
         return "the configured components require the Python TreeCore"
     if params.component_registry_override:
-        return "custom components require the Python TreeCore"
+        from sglang.srt.mem_cache.rust_tree_core.component_registry import (
+            get_rust_tree_component,
+        )
+
+        for component_type, name in params.component_registry_override.items():
+            if (
+                not isinstance(name, str)
+                or get_rust_tree_component(name) != component_type
+            ):
+                return "custom components require the Python TreeCore"
     if sys.platform != "linux":
         return "the Rust TreeCore supports Linux only"
     from sglang.srt.rust_extensions.torch_build import (
@@ -148,6 +158,41 @@ def get_tree_core_factory(name: str) -> Optional[TreeCoreFactory]:
 
 def registered_tree_core_backends() -> list[str]:
     return list(_TREE_CORE_REGISTRY.keys())
+
+
+def create_tree_components(
+    cache: UnifiedRadixCache, params: CacheInitParams
+) -> dict[ComponentType, TreeComponent]:
+    """Resolve component names to the Python implementations of cache hooks."""
+    from sglang.srt.mem_cache.unified_cache.components.registry import (
+        get_python_tree_component,
+    )
+
+    overrides = params.component_registry_override or {}
+    for component_type, name in overrides.items():
+        if isinstance(name, str) and component_type not in (
+            params.tree_components or ()
+        ):
+            raise ValueError(
+                f"component_registry_override targets inactive {component_type}"
+            )
+    components = {}
+    for component_type in params.tree_components or ():
+        name = overrides.get(component_type, component_type.name.lower())
+        if isinstance(name, str):
+            component = get_python_tree_component(name)
+            if component is None:
+                raise ValueError(f"Python tree component {name!r} is not registered")
+            if component.component_type != component_type:
+                raise ValueError(
+                    f"Python tree component {name!r} has kind "
+                    f"{component.component_type.name}, expected {component_type.name}"
+                )
+        else:
+            # Legacy class overrides remain Python-only.
+            component = name
+        components[component_type] = component(cache, params)
+    return components
 
 
 def _python_tree_core_factory(

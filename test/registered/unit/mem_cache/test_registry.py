@@ -6,6 +6,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.registry import (
@@ -18,6 +19,8 @@ from sglang.srt.mem_cache.registry import (
     register_radix_cache_backend,
     registered_radix_cache_backends,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components import registry as python_components
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.test_utils import CustomTestCase, enter_override
 
@@ -335,6 +338,60 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             result.cache_controller.layer_done_counter
         )
         self.assertIs(result, cache_class.return_value)
+
+    def test_c128_factory_registers_named_component_and_preserves_other_overrides(self):
+        from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
+            C128SidecarComponent,
+        )
+
+        ctx = _make_ctx(self)
+        ctx.params.req_to_token_pool = SimpleNamespace(req_to_c128_sidecar=object())
+        ctx.params.component_registry_override = {ComponentType.FULL: "full"}
+        with patch.dict(python_components._PYTHON_TREE_COMPONENT_REGISTRY):
+            for _ in range(2):
+                create_unified_radix_cache(ctx, cache_class=MagicMock())
+            self.assertEqual(
+                ctx.params.tree_components, (ComponentType.FULL, ComponentType.C128)
+            )
+            self.assertEqual(
+                ctx.params.component_registry_override,
+                {ComponentType.FULL: "full", ComponentType.C128: "c128_sidecar"},
+            )
+            self.assertIs(
+                python_components.get_python_tree_component("c128_sidecar"),
+                C128SidecarComponent,
+            )
+
+    def test_mlx_factory_registers_named_component_lazily(self):
+        from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+
+        ctx = _make_ctx(self, is_hybrid_ssm=True)
+        ctx.params.req_to_token_pool = SimpleNamespace()
+        with (
+            patch.dict(python_components._PYTHON_TREE_COMPONENT_REGISTRY),
+            patch("sglang.srt.mem_cache.registry.use_mlx", return_value=True),
+            patch.dict(
+                "sys.modules",
+                {
+                    "sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state": SimpleNamespace(
+                        MlxAuxiliaryStateComponent=MambaComponent
+                    )
+                },
+            ),
+        ):
+            for _ in range(2):
+                create_unified_radix_cache(ctx, cache_class=MagicMock())
+            self.assertEqual(
+                ctx.params.tree_components, (ComponentType.FULL, ComponentType.MAMBA)
+            )
+            self.assertEqual(
+                ctx.params.component_registry_override,
+                {ComponentType.MAMBA: "mlx_auxiliary_state"},
+            )
+            self.assertIs(
+                python_components.get_python_tree_component("mlx_auxiliary_state"),
+                MambaComponent,
+            )
 
     def test_pure_swa_radix_cache_when_all_swa(self):
         ctx = _make_ctx(self, is_hybrid_swa=True, full_tokens_per_layer=0)

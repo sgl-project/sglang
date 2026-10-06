@@ -14,6 +14,7 @@ use crate::unified_tree_core::{
 
 mod full;
 mod mamba;
+pub mod registry;
 mod swa;
 
 pub use full::FullComponent;

@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use tch::Tensor;
 
 use super::*;
-use crate::components::{ComponentSet, FULL, MAMBA, SWA};
+use crate::components::{ComponentSet, FULL, MAMBA, SWA, SwaComponent};
 use crate::node::{NodeAccessError, ValueSlotIdx};
 use crate::test_utils::{accumulate_step, action_kinds};
 
@@ -136,14 +136,14 @@ struct CountingComponentForTest {
     validator_calls: Arc<Mutex<usize>>,
 }
 
-impl TreeComponent<Vec<i64>> for CountingComponentForTest {
+impl<K: ChildKeyType> TreeComponent<K> for CountingComponentForTest {
     fn component_type(&self) -> ComponentType {
         SWA
     }
 
     fn refresh_lru(
         &self,
-        _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
+        _tree_core: &mut UnifiedTreeCore<K>,
         _phase: LRURefreshPhase,
         _node_id: NodeIdx_,
     ) {
@@ -151,9 +151,9 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
 
     fn create_match_validator(
         &self,
-        _tree_core: &UnifiedTreeCore<Vec<i64>>,
+        _tree_core: &UnifiedTreeCore<K>,
         _match_device_only: bool,
-    ) -> Box<dyn FnMut(&UnifiedTreeCore<Vec<i64>>, NodeIdx_) -> bool> {
+    ) -> Box<dyn FnMut(&UnifiedTreeCore<K>, NodeIdx_) -> bool> {
         let calls = Arc::clone(&self.validator_calls);
         Box::new(move |_, _| {
             *calls.lock().unwrap() += 1;
@@ -163,7 +163,7 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
 
     fn redistribute_on_node_split(
         &self,
-        _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
+        _tree_core: &mut UnifiedTreeCore<K>,
         _new_parent_id: NodeIdx_,
         _child_id: NodeIdx_,
     ) {
@@ -172,7 +172,7 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
 
     fn evict_component(
         &self,
-        _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
+        _tree_core: &mut UnifiedTreeCore<K>,
         _node_id: NodeIdx_,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
@@ -181,13 +181,13 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
         unimplemented!()
     }
 
-    fn evict_device_start(&self, _tree_core: &mut UnifiedTreeCore<Vec<i64>>, _request_cnt: usize) {
+    fn evict_device_start(&self, _tree_core: &mut UnifiedTreeCore<K>, _request_cnt: usize) {
         unimplemented!()
     }
 
     fn evict_device_next_node(
         &self,
-        _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
+        _tree_core: &mut UnifiedTreeCore<K>,
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
@@ -195,13 +195,13 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
         unimplemented!()
     }
 
-    fn evict_device_end(&self, _tree_core: &mut UnifiedTreeCore<Vec<i64>>) {
+    fn evict_device_end(&self, _tree_core: &mut UnifiedTreeCore<K>) {
         unimplemented!()
     }
 
     fn acquire_component_lock(
         &self,
-        _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
+        _tree_core: &mut UnifiedTreeCore<K>,
         _node_id: NodeIdx_,
         _result: IncLockRefResult,
         _lock_host: bool,
@@ -211,13 +211,117 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
 
     fn release_component_lock(
         &self,
-        _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
+        _tree_core: &mut UnifiedTreeCore<K>,
         _node_id: NodeIdx_,
         _params: &DecLockRefParams,
         _lock_host: bool,
     ) {
         unimplemented!()
     }
+}
+
+fn exercise_named_component_override<K: ChildKeyType>(key: K) {
+    let counter = Arc::new(CountingComponentForTest::default());
+    let factory_counter = Arc::clone(&counter);
+    let mut registry = ComponentRegistry::default();
+    registry
+        .register("counting", SWA, move |_| factory_counter.clone())
+        .unwrap();
+    let mut tc = UnifiedTreeCore::with_component_registry(
+        CacheInitParams::default(),
+        vec![FULL, SWA],
+        vec![(SWA, "counting".to_owned())],
+        &registry,
+    )
+    .unwrap();
+
+    for expected_calls in 1..=2 {
+        let values = Tensor::from_slice(&[10i64, 11]);
+        tc.add_new_node_(tc.arena.root(), key.clone(), &values, 0, None);
+        let result = tc.match_prefix(&MatchPrefixParams {
+            key: &key,
+            namespace: Default::default(),
+        });
+        assert!(result.device_indices.equal(&values));
+        assert_eq!(*counter.validator_calls.lock().unwrap(), expected_calls);
+        tc.reset();
+    }
+    assert!(
+        !ComponentRegistry::<K>::default()
+            .registered_names()
+            .contains_key("counting")
+    );
+}
+
+#[test]
+fn named_component_override_dispatches_after_reset_for_both_key_types() {
+    exercise_named_component_override(vec![1i64, 2]);
+    exercise_named_component_override(vec![(1i64, 2i64), (2, 3)]);
+}
+
+#[test]
+fn component_override_rejects_unknown_inactive_duplicate_and_wrong_kind() {
+    for (overrides, expected) in [
+        (vec![(FULL, "missing")], "unknown native component name"),
+        (vec![(SWA, "swa")], "is not enabled"),
+        (vec![(FULL, "full"), (FULL, "full")], "duplicate override"),
+        (vec![(FULL, "swa")], "has type Swa, expected Full"),
+    ] {
+        let result = UnifiedTreeCore::<Vec<i64>>::with_component_overrides(
+            CacheInitParams::default(),
+            vec![FULL],
+            overrides
+                .into_iter()
+                .map(|(ct, name)| (ct, name.to_owned()))
+                .collect(),
+        );
+        assert!(
+            result
+                .err()
+                .expect("invalid override")
+                .to_string()
+                .contains(expected)
+        );
+    }
+}
+
+#[test]
+fn component_registry_checks_names_and_produced_type() {
+    let mut registry = ComponentRegistry::<Vec<i64>>::default();
+    for name in ["", " \t", "full"] {
+        assert!(
+            registry
+                .register(name, SWA, |_| Arc::new(CountingComponentForTest::default()))
+                .is_err()
+        );
+    }
+    registry
+        .register("wrong_type", FULL, |_| {
+            Arc::new(CountingComponentForTest::default())
+        })
+        .unwrap();
+    let result = UnifiedTreeCore::with_component_registry(
+        CacheInitParams::default(),
+        vec![FULL],
+        vec![(FULL, "wrong_type".to_owned())],
+        &registry,
+    );
+    assert!(matches!(
+        result,
+        Err(ComponentRegistryError::ComponentTypeMismatch {
+            expected: FULL,
+            actual: SWA,
+            ..
+        })
+    ));
+    assert_eq!(
+        ComponentRegistry::<Vec<i64>>::default().registered_names(),
+        HashMap::from([
+            ("full".to_owned(), FULL),
+            ("swa".to_owned(), SWA),
+            ("mamba".to_owned(), MAMBA),
+        ])
+    );
 }
 
 // Swa-flavored stub driver: any dispatched call panics as unimplemented.

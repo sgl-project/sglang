@@ -131,6 +131,62 @@ def test_match_on_the_empty_tree_returns_no_indices():
     assert result.device_indices.numel() == 0
 
 
+def test_rust_component_declarations_match_compiled_factories():
+    from sglang.srt.mem_cache.rust_tree_core.component_registry import (
+        registered_rust_tree_components,
+    )
+
+    assert mem_cache.registered_component_names() == {
+        name: int(component_type)
+        for name, component_type in registered_rust_tree_components().items()
+    }
+
+
+@pytest.mark.parametrize("is_eagle", [False, True])
+def test_named_component_override_constructs_native_cache_and_matches(is_eagle):
+    from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    cache = UnifiedRadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+            is_eagle=is_eagle,
+            tree_components=(ComponentType.FULL,),
+            component_registry_override={ComponentType.FULL: "full"},
+            tree_core_backend="rust",
+        )
+    )
+    assert isinstance(cache.tree_core, RustUnifiedTreeCore)
+    assert isinstance(cache.components[ComponentType.FULL], FullComponent)
+    core = cache.tree_core
+    values = list(range(10, 14 - int(is_eagle)))
+    _insert(core, [1, 2, 3, 4], values)
+    result = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4])))
+    assert result.device_indices.tolist() == values
+
+
+@pytest.mark.parametrize("is_eagle", [False, True])
+def test_native_registry_rejects_metadata_without_a_compiled_factory(
+    monkeypatch, is_eagle
+):
+    from sglang.srt.mem_cache.rust_tree_core import component_registry
+
+    monkeypatch.setattr(
+        component_registry,
+        "_RUST_TREE_COMPONENT_REGISTRY",
+        component_registry.registered_rust_tree_components(),
+    )
+    component_registry.register_rust_tree_component("test_missing", ComponentType.FULL)
+    with pytest.raises(ValueError, match="test_missing"):
+        _tree_core(
+            is_eagle=is_eagle,
+            component_registry_override={ComponentType.FULL: "test_missing"},
+        )
+
+
 @pytest.mark.parametrize("instance_backend", [None, "rust"])
 def test_default_backend_constructs_real_rust_cpu_cache(monkeypatch, instance_backend):
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -3125,7 +3181,10 @@ def test_python_session_internal_eviction_resumes_in_partition_order(component):
     core.sanity_check([], [])
 
 
-def test_custom_swa_component_keeps_its_inline_backup_contract():
+def test_custom_swa_component_keeps_its_inline_backup_contract(monkeypatch):
+    from sglang.srt.mem_cache.unified_cache.components import (
+        registry as python_components,
+    )
     from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
@@ -3142,6 +3201,14 @@ def test_custom_swa_component_keeps_its_inline_backup_contract():
             )
 
     reference, allocator = _swa_cache(window=4, backend="python")
+    monkeypatch.setattr(
+        python_components,
+        "_PYTHON_TREE_COMPONENT_REGISTRY",
+        python_components.registered_python_tree_components(),
+    )
+    python_components.register_python_tree_component(
+        "test_auxiliary_swa", AuxiliarySWAComponent
+    )
     cache = UnifiedRadixCache(
         CacheInitParams(
             disable=False,
@@ -3151,7 +3218,7 @@ def test_custom_swa_component_keeps_its_inline_backup_contract():
             sliding_window_size=4,
             tree_components=(ComponentType.FULL, ComponentType.AUXILIARY_SWA),
             component_registry_override={
-                ComponentType.AUXILIARY_SWA: AuxiliarySWAComponent
+                ComponentType.AUXILIARY_SWA: "test_auxiliary_swa"
             },
             tree_core_backend="python",
         )

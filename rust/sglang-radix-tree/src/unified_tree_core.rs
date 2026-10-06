@@ -8,9 +8,8 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use tch::{Device, Kind, Tensor};
 
-use crate::components::{
-    self, ComponentSet, FullComponent, MambaComponent, SwaComponent, TreeComponent,
-};
+use crate::components::registry::{ComponentRegistry, ComponentRegistryError};
+use crate::components::{self, ComponentSet, TreeComponent};
 use crate::components::{
     BASE_COMPONENT_TYPE, ComponentType, FULL, MAMBA, NUM_COMPONENT_TYPES, SWA,
 };
@@ -803,6 +802,30 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self {
+        Self::with_component_overrides(params, component_types, Vec::new())
+            .expect("built-in component registration is valid")
+    }
+
+    /// Construct native drivers by name, retaining defaults for unlisted components.
+    pub fn with_component_overrides(
+        params: CacheInitParams,
+        component_types: Vec<ComponentType>,
+        component_overrides: Vec<(ComponentType, String)>,
+    ) -> Result<Self, ComponentRegistryError> {
+        Self::with_component_registry(
+            params,
+            component_types,
+            component_overrides,
+            &ComponentRegistry::default(),
+        )
+    }
+
+    pub(crate) fn with_component_registry(
+        params: CacheInitParams,
+        component_types: Vec<ComponentType>,
+        component_overrides: Vec<(ComponentType, String)>,
+        registry: &ComponentRegistry<K>,
+    ) -> Result<Self, ComponentRegistryError> {
         assert!(
             !component_types.is_empty(),
             "at least one component type is required"
@@ -812,6 +835,25 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             "the base (Full) component is required"
         );
         assert!(params.page_size >= 1, "page_size must be at least 1");
+        let mut overrides = HashMap::new();
+        for (component_type, name) in component_overrides {
+            if !component_types.contains(&component_type) {
+                return Err(ComponentRegistryError::InactiveComponent(component_type));
+            }
+            if overrides.insert(component_type, name).is_some() {
+                return Err(ComponentRegistryError::DuplicateOverride(component_type));
+            }
+        }
+        let components = component_types
+            .iter()
+            .map(|&ct| {
+                let name = overrides
+                    .get(&ct)
+                    .map(String::as_str)
+                    .unwrap_or_else(|| ComponentRegistry::<K>::default_name(ct));
+                registry.create(name, ct, &params)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let arena = NodeArena::new(component_types.clone(), params.page_size);
         let mut tree_core = UnifiedTreeCore {
             arena,
@@ -850,15 +892,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
             ongoing_insert_walk_state: None,
         };
-        for ct in &component_types {
-            let component: Arc<dyn TreeComponent<K> + Send + Sync> = match ct {
-                ComponentType::Full => Arc::new(FullComponent),
-                ComponentType::Swa => Arc::new(SwaComponent::new(&params)),
-                ComponentType::Mamba => Arc::new(MambaComponent::new(&params)),
-            };
+        for component in components {
             tree_core.register_component_(component);
         }
-        tree_core
+        Ok(tree_core)
     }
 
     /// Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
