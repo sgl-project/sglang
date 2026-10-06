@@ -54,9 +54,9 @@ def checkpoint_weights_iterator(
         )
         return
     if os.path.isfile(model_path):
-        files = [model_path] if model_path.endswith((".bin", ".pt")) else []
+        files = [model_path] if model_path.endswith((".bin", ".pt", ".pth")) else []
     else:
-        for suffix in ("*.bin", "*.pt"):
+        for suffix in ("*.bin", "*.pt", "*.pth"):
             files = filter_files_not_needed_for_inference(
                 sorted(str(path) for path in Path(model_path).glob(suffix))
             )

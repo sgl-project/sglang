@@ -96,6 +96,9 @@ class PipelineStage(StageDedupMixin, ABC):
     _component_residency_manager = None
     _registered_stage_name: str | None = None
     _profile_stage_name: str | None = None
+    # MAIN_RANK_ONLY_AND_SEND_TO_OTHERS: move the received batch's device tensors,
+    # unpickled on the sender's device index, to the receiving rank's device.
+    relocate_broadcast_batch: bool = False
 
     def __init__(self):
         self.server_args = get_global_server_args()

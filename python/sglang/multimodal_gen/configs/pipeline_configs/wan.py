@@ -1,17 +1,20 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import html
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import torch
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
-from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
+from sglang.multimodal_gen.configs.models.dits import WanS2VConfig, WanVideoConfig
 from sglang.multimodal_gen.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPVisionConfig,
     T5Config,
+    WanS2VAudioEncoderConfig,
 )
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
@@ -27,6 +30,46 @@ from sglang.multimodal_gen.runtime.utils.condition_expansion import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+try:
+    import ftfy
+except ImportError:  # pragma: no cover
+    ftfy = None
+
+
+def _wan_basic_clean(text: str) -> str:
+    if ftfy is not None:
+        text = ftfy.fix_text(text)
+    text = html.unescape(html.unescape(text))
+    return text.strip()
+
+
+def _wan_whitespace_clean(text: str) -> str:
+    text = _wan_basic_clean(text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _make_wan_s2v_text_encoder_config() -> T5Config:
+    config = T5Config()
+    arch = config.arch_config
+    arch.vocab_size = 256384
+    arch.architectures = ["UMT5EncoderModel"]
+    arch.d_model = 4096
+    arch.hidden_size = 4096
+    arch.d_kv = 64
+    arch.d_ff = 10240
+    arch.num_layers = 24
+    arch.num_attention_heads = 64
+    arch.num_heads = 64
+    arch.relative_attention_num_buckets = 32
+    arch.feed_forward_proj = "gated-gelu"
+    arch.text_len = 512
+    # The S2V stage runs T5 where its weights are, i.e. on the host under
+    # text_encoder_cpu_offload.
+    arch.reference_layer_norm = True
+    arch.__post_init__()
+    return config
 
 
 def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
@@ -301,6 +344,94 @@ class Wan2_2_I2V_A14B_Config(WanI2V720PConfig):
         )
 
 
+@dataclass
+class Wan2_2_S2V_14B_Config(WanT2V480PConfig, WanI2VCommonConfig):
+    dit_config: DiTConfig = field(default_factory=WanS2VConfig)
+    text_encoder_configs: tuple[EncoderConfig, ...] = field(
+        default_factory=lambda: (_make_wan_s2v_text_encoder_config(),)
+    )
+    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
+    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
+        default_factory=lambda: (_wan_whitespace_clean,)
+    )
+    audio_encoder_config: EncoderConfig = field(
+        default_factory=WanS2VAudioEncoderConfig
+    )
+    audio_encoder_precision: str = "fp32"
+    vae_precision: str = "bf16"
+    flow_shift: float | None = 3.0
+    task_type: ModelTaskType = ModelTaskType.S2V
+    vae_stride = (4, 8, 8)
+    max_area: int = 704 * 1024
+
+    def prepare_latent_shape(self, batch, batch_size, num_frames):
+        z_dim = self.vae_config.arch_config.z_dim
+        oh = batch.height
+        ow = batch.width
+        return (
+            batch_size,
+            z_dim,
+            num_frames,
+            oh // self.vae_stride[1],
+            ow // self.vae_stride[2],
+        )
+
+    def slice_noise_pred(self, noise, latents):
+        if isinstance(noise, (list, tuple)):
+            if len(noise) != 1:
+                raise ValueError(
+                    f"Wan S2V expected a single noise tensor, got {len(noise)} outputs"
+                )
+            noise = noise[0]
+        return noise
+
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        del rotary_emb
+        extra = batch.extra.get("wan_s2v", {})
+        return {
+            "ref_latents": extra["ref_latents"].to(device=device, dtype=dtype),
+            "motion_latents": extra["motion_latents"].to(device=device, dtype=dtype),
+            "cond_states": extra["cond_states"].to(device=device, dtype=dtype),
+            "audio_input": extra["audio_input"].to(device=device, dtype=dtype),
+            "motion_frames": extra["motion_frames"],
+            "drop_motion_frames": extra["drop_motion_frames"],
+        }
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        pos_kwargs = self.prepare_pos_cond_kwargs(batch, device, rotary_emb, dtype)
+        pos_kwargs["audio_input"] = torch.zeros_like(pos_kwargs["audio_input"])
+        return pos_kwargs
+
+    def prepare_decoding_latents(self, batch, server_args=None, vae=None):
+        del server_args, vae
+        extra = batch.extra["wan_s2v"]
+        prefix_latents = (
+            extra["ref_latents"]
+            if extra["drop_motion_frames"]
+            else extra["motion_latents"]
+        )
+        prefix_latents = prefix_latents.to(
+            device=batch.latents.device,
+            dtype=batch.latents.dtype,
+        )
+        return torch.cat([prefix_latents, batch.latents], dim=2)
+
+    def postprocess_decoded_batch(self, frames, batch, server_args):
+        del server_args
+        extra = batch.extra["wan_s2v"]
+        frames = frames[:, :, -extra["infer_frames"] :]
+        if extra["drop_motion_frames"]:
+            frames = frames[:, :, 3:]
+        return frames
+
+    def __post_init__(self) -> None:
+        self.vae_config.load_encoder = True
+        self.vae_config.load_decoder = True
+        self.vae_config.use_feature_cache = True
+        self.vae_config.use_parallel_encode = False
+        self.vae_config.use_parallel_decode = True
+
+
 # =============================================
 # ============= Causal Self-Forcing =============
 # =============================================
@@ -320,6 +451,7 @@ def register():
         Turbo_Wan2_2_I2V_A14B_SamplingParam,
         Wan2_1_Fun_1_3B_InP_SamplingParams,
         Wan2_2_I2V_A14B_SamplingParam,
+        Wan2_2_S2V_14B_SamplingParam,
         Wan2_2_T2V_A14B_SamplingParam,
         Wan2_2_TI2V_5B_SamplingParam,
         WanI2V_14B_480P_SamplingParam,
@@ -415,6 +547,11 @@ def register():
         sampling_param_cls=Wan2_2_I2V_A14B_SamplingParam,
         pipeline_config_cls=Wan2_2_I2V_A14B_Config,
         hf_model_paths=["Wan-AI/Wan2.2-I2V-A14B-Diffusers"],
+    )
+    register_configs(
+        sampling_param_cls=Wan2_2_S2V_14B_SamplingParam,
+        pipeline_config_cls=Wan2_2_S2V_14B_Config,
+        hf_model_paths=["Wan-AI/Wan2.2-S2V-14B"],
     )
     register_configs(
         sampling_param_cls=FastWanT2V480PConfig,

@@ -27,6 +27,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
 )
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
@@ -453,6 +454,7 @@ class ServerArgs(DisaggServerArgsMixin):
     offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
+    audio_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = False
     use_fsdp_inference: bool | None = None
     pin_cpu_memory: bool = True
@@ -897,6 +899,9 @@ class ServerArgs(DisaggServerArgsMixin):
             and not self.disagg_mode
             and replica_size > 1
         )
+
+        if self.pipeline_config.task_type == ModelTaskType.S2V:
+            return
 
         if fold_replica:
             mode = "replica"
@@ -2726,6 +2731,11 @@ class ServerArgs(DisaggServerArgsMixin):
             "--image-encoder-cpu-offload",
             action=StoreBoolean,
             help="Use CPU offload for image encoder. Enable if run out of memory.",
+        )
+        parser.add_argument(
+            "--audio-encoder-cpu-offload",
+            action=StoreBoolean,
+            help="Use CPU offload for audio encoder. Enable if run out of memory.",
         )
         parser.add_argument(
             "--vae-cpu-offload",

@@ -340,7 +340,10 @@ class DecodingStage(PipelineStage):
                 vae,
                 quality_allows(batch.sampling_params.quality, "lossless"),
             ):
-                frames = self.decode(batch.latents, server_args, vae_dtype=vae_dtype)
+                decode_latents = server_args.pipeline_config.prepare_decoding_latents(
+                    batch, server_args=server_args, vae=vae
+                )
+                frames = self.decode(decode_latents, server_args, vae_dtype=vae_dtype)
 
                 # decode trajectory latents if needed
                 if batch.return_trajectory_decoded:
@@ -370,10 +373,15 @@ class DecodingStage(PipelineStage):
                     trajectory_decoded = None
 
         frames = server_args.pipeline_config.post_decoding(frames, server_args)
+        frames = server_args.pipeline_config.postprocess_decoded_batch(
+            frames, batch, server_args
+        )
 
         # Update batch with decoded image
         output_batch = OutputBatch(
             output=frames,
+            audio=batch.audio,
+            audio_sample_rate=batch.audio_sample_rate,
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
             rollout_trajectory_data=batch.rollout_trajectory_data,

@@ -22,6 +22,7 @@ from sglang.multimodal_gen.configs.models.dits.sana_video import SanaVideoConfig
 from sglang.multimodal_gen.configs.models.dits.stablediffusion3 import (
     StableDiffusion3TransformerConfig,
 )
+from sglang.multimodal_gen.configs.models.dits.wan_s2v import WanS2VConfig
 from sglang.multimodal_gen.configs.models.dits.wanvideo import WanVideoConfig
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "LingBotVideoMoEConfig",
     "LongLive2VideoConfig",
     "MiniMaxH3DiTConfig",
+    "WanS2VConfig",
     "WanVideoConfig",
     "Hunyuan3DDiTConfig",
     "MOVAAudioConfig",
