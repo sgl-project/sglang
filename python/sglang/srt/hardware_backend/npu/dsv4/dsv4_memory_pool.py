@@ -9,7 +9,7 @@ rules as the GPU implementation:
 
 ``NPUCompressStatePool`` adds the contiguous 3-D view and positive dummy
 location required by the Atlas fused compressor operators. A3 uses explicit
-locations; A5 uses the same ring storage through its request-bank (cycle) ABI.
+locations; arch35 uses the same ring storage through its request-bank (cycle) ABI.
 There is no paged state allocator or ``cache_mode=1`` compatibility storage.
 """
 
@@ -42,7 +42,7 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
 
     ``npu_sparse_attn_sharedkv`` reads KV in PA_ND layout
     ``(num_pages, kernel_page_size, num_kv_heads=1, dim)`` with ``dim`` packing
-    K_nope + K_rope as bf16 before A5; A5 uses packed FP8 KV rows. C4 uses its
+    K_nope + K_rope as bf16 before arch35; arch35 uses packed FP8 KV rows. C4 uses its
     native page so its physical page id can
     be shared with the corresponding full page. C128 uses its independently
     configured physical page size; Full/SWA use the global page size.
@@ -56,7 +56,7 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         super().__init__(*args, **kwargs)
 
     @property
-    def a5_packed_kv_dim(self) -> int:
+    def arch35_packed_kv_dim(self) -> int:
         nope_dim = self.qk_nope_head_dim
         rope_dim = self.qk_rope_head_dim
         scale_dim = math.ceil(nope_dim / _NPU_ARCH35_KV_QUANT_GROUP_SIZE)
@@ -71,7 +71,7 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         if self.store_dtype != torch.bfloat16:
             return super().create_buffer(num_pages=num_pages)
         if is_npu_arch35():
-            kv_dim = self.a5_packed_kv_dim
+            kv_dim = self.arch35_packed_kv_dim
             kv_dtype = torch.float8_e4m3fn
         else:
             kv_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -341,8 +341,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
         config = self.compressed_pool_configs[ratio]
         ring_size = self.get_ring_size(ratio)
-        # A5 cache_mode=2 addresses one ring bank per request.  The A3
-        # explicit-location path can share the smaller flat pool, but the A5
+        # arch35 cache_mode=2 addresses one ring bank per request.  The A3
+        # explicit-location path can share the smaller flat pool, but the arch35
         # cycle ABI needs enough physical banks for every req_pool_idx.
         size = config.state_size
         if is_npu_arch35():
@@ -404,9 +404,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """GPU-compatible ``StateType.SWA`` component.
 
-        On pre-A5 (EXPLICIT cache_mode), SWA KV, C4 attention state and C4
+        On pre-arch35 (EXPLICIT cache_mode), SWA KV, C4 attention state and C4
         indexer state retain separate buffers but share the same SWA page/state
-        index.  On A5 (CYCLE cache_mode) the compressor addresses the C4 state
+        index.  On arch35 (CYCLE cache_mode) the compressor addresses the C4 state
         ring by ``req_pool_idx`` instead of SWA page, so C4 state is excluded
         here and registered separately via :meth:`get_c4_state_buf_infos`.
         """
@@ -468,7 +468,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:
         """FP32 ``[block_num, ring_size, 2*coff*D]`` view of this layer's
         kv+score buffer — the fused compressor op
-        (``torch.ops.custom.compressor`` on A5 and ``torch.ops.npu.compressor``
+        (``torch.ops.custom.compressor`` on arch35 and ``torch.ops.npu.compressor``
         elsewhere)'s ``state_cache`` argument."""
         return self._get_state_pool(layer_id, from_indexer).state_cache_3d
 
@@ -558,7 +558,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         # Index by PP-stage-local layer_id (see get_swa_buffer).
         buf = self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
         if is_npu_arch35():
-            self._write_a5_packed_kv(buf=buf, loc=loc, cache=cache)
+            self._write_arch35_packed_kv(buf=buf, loc=loc, cache=cache)
             return
         buf_flat = buf.flatten(0, 1)  # (num_pages * page_size, 1, dim)
         # Caller (V4 MQALayer) may hand us cache shaped (T, dim); the buffer has
@@ -567,7 +567,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             cache = cache.unsqueeze(1)
         buf_flat[loc] = cache.to(buf_flat.dtype)
 
-    def _write_a5_packed_kv(
+    def _write_arch35_packed_kv(
         self,
         *,
         buf: torch.Tensor,
@@ -577,14 +577,14 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         cache_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         if cache.shape[-1] != cache_dim:
             raise RuntimeError(
-                f"DSV4 A5 KV cache expects input last dim {cache_dim}, "
+                f"DSV4 arch35 KV cache expects input last dim {cache_dim}, "
                 f"got shape={tuple(cache.shape)}."
             )
         cache_2d = cache.reshape(-1, cache_dim).to(torch.bfloat16).contiguous()
         slot_mapping = loc.reshape(-1).contiguous()
         if cache_2d.shape[0] != slot_mapping.shape[0]:
             raise RuntimeError(
-                "DSV4 A5 KV cache write expects one slot per token, got "
+                "DSV4 arch35 KV cache write expects one slot per token, got "
                 f"{cache_2d.shape[0]} rows and {slot_mapping.shape[0]} slots."
             )
         if cache_2d.shape[0] == 0:
@@ -668,7 +668,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             # 1, kv_dim). Flatten (num_pages, page_size) and index by `loc`.
             buf = compress_pool.kv_buffer[compress_layer_id]
             if is_npu_arch35():
-                self._write_a5_packed_kv(buf=buf, loc=loc, cache=kv)
+                self._write_arch35_packed_kv(buf=buf, loc=loc, cache=kv)
                 return
             buf_flat = buf.flatten(0, 1)
             kv_view = kv.to(buf_flat.dtype)
@@ -683,7 +683,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         layer_id: int,
         from_indexer: bool,
     ) -> torch.Tensor:
-        # The indexer scale is fp16 on pre-A5 parts and fp32 on A5.
+        # The indexer scale is fp16 on pre-arch35 parts and fp32 on arch35.
         assert from_indexer, "only indexer compress pool has dequant scale"
         item = self.layer_mapping[layer_id]
         indexer_pool = self._indexer_pool(item.compress_ratio)
