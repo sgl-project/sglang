@@ -907,6 +907,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         mm_input_embeds: Optional[torch.Tensor] = None,
+        kv_loc_plan: Optional[KVLocPlan] = None,
     ):
         """
         Run draft model extend to correctly fill the KV cache.
@@ -915,6 +916,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             batch: The batch to run.
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
+            kv_loc_plan: The target prefill's plan; the draft writes the same
+                slots.
         """
         # Construct input_ids
         if not batch.forward_mode.is_idle():
@@ -966,6 +969,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=False,
+            kv_loc_plan=kv_loc_plan,
         )
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
@@ -1482,7 +1486,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
             capture_hidden_mode=target_capture_mode,
+            return_kv_loc_plan=self._draft_worker is not None,
         )
+        kv_loc_plan, batch_output.kv_loc_plan = batch_output.kv_loc_plan, None
 
         # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
         # Extend processed L prompt tokens; next verify iter expects same L.
@@ -1519,6 +1525,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch_output.logits_output.hidden_states,
                 batch_output.next_token_ids,
                 batch_output.logits_output.mm_input_embeds,
+                kv_loc_plan=kv_loc_plan,
             )
             return batch_output
 

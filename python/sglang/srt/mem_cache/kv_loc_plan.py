@@ -38,7 +38,7 @@ over its own buffers to capture or warm up with (`write_slots`).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -64,6 +64,11 @@ def window_read_extent(forward_mode, spec_info, write_ids, batch_size: int) -> i
     if forward_mode.is_decode() or forward_mode.is_draft_extend_v2():
         return write_ids.numel() // batch_size
     return 0
+
+
+# Part of a `[batch, window]` write window: a slice of its columns, or a flat
+# index into it (-1: the sink).
+Cols = Union[slice, torch.Tensor]
 
 
 def pad_with_sink(ids: Optional[torch.Tensor], n: int) -> Optional[torch.Tensor]:
@@ -120,7 +125,7 @@ class KVLocPlan:
 
     # -- writes ----------------------------------------------------------------
 
-    def bind(self, batch, reader: KVIndexTranslator, *, cols: Optional[slice] = None):
+    def bind(self, batch, reader: KVIndexTranslator, *, cols: Optional[Cols] = None):
         """Give ``batch`` (a ForwardBatch, or a view standing in for one) its
         write ids from this plan, in the space `reader`'s pool indexes, and
         the plan itself for its reads. The one way a forward gets its write
@@ -150,11 +155,13 @@ class KVLocPlan:
         batch.out_cache_loc_virtual = None
 
     def write_ids(
-        self, reader: KVIndexTranslator, *, cols: Optional[slice] = None
+        self, reader: KVIndexTranslator, *, cols: Optional[Cols] = None
     ) -> Optional[torch.Tensor]:
         """The write window as `reader`'s pool indexes it. ``cols`` selects
-        columns of a ``[batch, window]`` window, for a forward that writes only
-        part of it (a draft step ahead of the verify window it opens)."""
+        part of a ``[batch, window]`` window, for a forward that writes only
+        part of it: a slice of columns (a draft step ahead of the verify window
+        it opens), or a flat index into the window, -1 naming the sink (a
+        ragged verify's packed rows)."""
         ids = (
             self.write_physical
             if self.is_translated_for(reader)
@@ -162,19 +169,21 @@ class KVLocPlan:
         )
         return self._cols(ids, cols)
 
-    def virtual_write_ids(self, *, cols: Optional[slice] = None):
+    def virtual_write_ids(self, *, cols: Optional[Cols] = None):
         """The same columns in the virtual space: the ids the scheduler's
         bookkeeping (lazy compaction's in-flight write set, the radix tree)
         names."""
         return self._cols(self.write_virtual, cols)
 
-    def _cols(self, ids: Optional[torch.Tensor], cols: Optional[slice]):
+    def _cols(self, ids: Optional[torch.Tensor], cols: Optional[Cols]):
         if ids is None or cols is None:
             return ids
+        if isinstance(cols, torch.Tensor):
+            return torch.where(cols >= 0, ids[cols.clamp(min=0)], 0)
         bs = int(self.req_pool_indices.numel())
         return ids.view(bs, -1)[:, cols].reshape(-1)
 
-    def swa_write_ids(self, *, cols: Optional[slice] = None) -> Optional[torch.Tensor]:
+    def swa_write_ids(self, *, cols: Optional[Cols] = None) -> Optional[torch.Tensor]:
         """The sliding-window sub-pool's write ids for the same columns, or
         None when the pool has no sliding-window space. Derived once for the
         whole window, from its virtual ids: one lookup, not an inverse lookup
@@ -184,6 +193,31 @@ class KVLocPlan:
                 virtual=self.write_virtual, physical=self.write_physical
             )
         return self._cols(self._swa_write, cols)
+
+    def reads_from(
+        self,
+        source: KVIndexTranslator,
+        *,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        read_extent: int,
+    ) -> KVLocPlan:
+        """This plan's write ids, with reads planned over ``source``'s own
+        `req_to_token` rows and lengths -- a draft that reads a compact table
+        of its own while writing the iteration's window. The write ids are
+        shared, not translated again."""
+        plan = KVLocPlan(
+            source=source,
+            req_pool_indices=self.req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            write_virtual=None,
+            read_extent=read_extent,
+        )
+        plan.write_virtual = self.write_virtual
+        plan.write_physical = self.write_physical
+        plan._swa_write = self._swa_write
+        return plan
 
     # -- reads -----------------------------------------------------------------
 

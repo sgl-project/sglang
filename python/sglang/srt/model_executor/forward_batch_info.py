@@ -77,7 +77,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
-    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+    from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -948,7 +948,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         extend_position_info=None,
         spec_mrope_positions: Optional[torch.Tensor] = None,
         kv_loc_plan: Optional[KVLocPlan] = None,
-        write_cols: Optional[slice] = None,
+        write_cols: Optional[Cols] = None,
     ):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.

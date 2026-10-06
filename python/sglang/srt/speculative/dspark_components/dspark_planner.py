@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import msgspec
 import torch
@@ -65,6 +65,9 @@ class VerifyWindow(msgspec.Struct, frozen=True):
     positions_2d: torch.Tensor
     verify_cache_loc: torch.Tensor
     verify_cache_loc_2d: torch.Tensor
+    # The iteration's plan of `verify_cache_loc`: the draft block, the verify
+    # and the target-hidden KV writes all take their ids from it.
+    kv_loc_plan: Any
 
 
 class DSparkVerifyPlanner:
@@ -827,7 +830,10 @@ def alloc_verify_window(
     verify_num_draft_tokens: int,
     block_pos_offsets: torch.Tensor,
     model_runner,
+    seq_lens_cpu: Optional[torch.Tensor],
 ) -> VerifyWindow:
+    """``seq_lens_cpu``: a host bound on ``batch.seq_lens``, which sizes the
+    plan's read table."""
     prefix_lens = batch.seq_lens
     verify_w = verify_num_draft_tokens
     positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
@@ -845,6 +851,13 @@ def alloc_verify_window(
         positions_2d=positions_2d,
         verify_cache_loc=verify_cache_loc,
         verify_cache_loc_2d=verify_cache_loc_2d,
+        kv_loc_plan=model_runner.kv_index_translator.plan(
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens=prefix_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            write_virtual=verify_cache_loc,
+            read_extent=verify_w,
+        ),
     )
 
 

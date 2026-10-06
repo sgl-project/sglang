@@ -27,7 +27,8 @@
   building again;
 - only a reader of the plan's own rows reads its table (the target, a fused
   draft); a pass-through reader gathers `req_to_token`, and a draft with a
-  `req_to_token` of its own plans its own reads;
+  `req_to_token` of its own plans its own reads over the shared write ids
+  (`reads_from`);
 - `bind` gives a batch its ids, with the virtual mirror only when they were
   translated;
 - a runner's own write buffer (graph capture, warmup) is used as it is, its
@@ -301,6 +302,31 @@ class TestKVLocPlan(unittest.TestCase):
         )
         self.assertFalse(passthrough.is_translated)
         self.assertIs(passthrough.ids, self.req_to_token)
+
+    def test_a_compact_draft_reads_its_own_rows_over_the_shared_writes(self):
+        plan = self._plan()
+        compact_rows = self.req_to_token.clone()
+        compact = KVIndexTranslator(
+            req_to_token=compact_rows,
+            token_to_kv_pool_allocator=self.allocator,
+            token_to_kv_pool=self.draft_pool,
+            page_size=_PS,
+            device=_DEV,
+        )
+        lens = torch.tensor([2, 1], dtype=torch.int64)
+        derived = plan.reads_from(
+            compact, seq_lens=lens, seq_lens_cpu=lens.clone(), read_extent=1
+        )
+        # The writes are the plan's, not translated again.
+        self.assertIs(derived.write_physical, plan.write_physical)
+        self.assertIs(derived.write_ids(compact), plan.write_physical)
+        self.assertTrue(derived.is_read_by(compact))
+        reference = compact.build_index_table(
+            req_pool_indices=self.rpi,
+            seq_lens=lens + 1,
+            max_pages=derived.read_table().ids.shape[1],
+        )
+        self.assertTrue(torch.equal(derived.read_table().ids, reference.ids))
 
     def test_a_pass_through_plan_does_no_work(self):
         plan = self._plan(source=self.private_draft)

@@ -304,9 +304,9 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         req_to_token (VIRTUAL). Under fusion the draft pool takes the target's
         physical ids, so an untranslated write lands at the wrong row: the
         draft attends over the wrong KV and accept length collapses to 1.0
-        with no crash. Each writer must hand the pool translated ids and leave
-        the caller's locs virtual (the compact req_to_token rebuild re-reads
-        them)."""
+        with no crash. Both writers take the ids from the iteration's plan in
+        the draft pool's space -- the target's physical ids under fusion --
+        and write them as they are."""
         from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
         from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
             TargetHiddenKvInjector,
@@ -317,11 +317,15 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
 
             is_translating = True
 
-            def translate_full_attn_ids(self, ids, *, out=None):
-                return ids + 100
-
         virtual = torch.tensor([4, 5, 6, 9], dtype=torch.int64)
         physical = virtual + 100
+        draft_translator = _Shift()
+        # The iteration's plan: physical ids for the fused draft's translator.
+        plan = SimpleNamespace(
+            write_ids=lambda reader, cols=None: (
+                physical.clone() if reader is draft_translator else virtual.clone()
+            )
+        )
         hidden = torch.randn(4, 8)
         positions = torch.arange(4)
         commit_lens = torch.tensor([2, 1], dtype=torch.int32)
@@ -348,7 +352,7 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         worker = SimpleNamespace(
             model_runner=SimpleNamespace(device=torch.device(_DEV)),
             draft_model_runner=SimpleNamespace(
-                kv_index_translator=_Shift(), token_to_kv_pool=_DflashPool()
+                kv_index_translator=draft_translator, token_to_kv_pool=_DflashPool()
             ),
             draft_model=SimpleNamespace(
                 project_target_hidden=lambda h: h,
@@ -365,30 +369,29 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         )
 
         # Per-token writes (prefill).
-        cache_loc = virtual.clone()
+        cache_loc = DFlashWorkerV2._draft_write_ids(worker, plan)
         DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc(
             worker, target_hidden=hidden, cache_loc=cache_loc, positions=positions
         )
         self.assertTrue(writes["loc"].physical)
         torch.testing.assert_close(writes["loc"].loc, physical, rtol=0, atol=0)
-        torch.testing.assert_close(cache_loc, virtual, rtol=0, atol=0)
 
         # Prefix-valid writes (post-verify), from the 2-D view of the same ids.
-        cache_loc, cache_loc_2d = virtual.clone(), virtual.clone().view(2, 2)
+        cache_loc = DFlashWorkerV2._draft_write_ids(worker, plan)
         DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc(
             worker,
             target_hidden=hidden,
             cache_loc=cache_loc,
             positions=positions,
-            cache_loc_2d=cache_loc_2d,
+            cache_loc_2d=cache_loc.view(2, 2),
             commit_lens=commit_lens,
         )
         torch.testing.assert_close(
             writes["loc_2d"], physical.view(2, 2), rtol=0, atol=0
         )
-        torch.testing.assert_close(cache_loc_2d, virtual.view(2, 2), rtol=0, atol=0)
 
-        # DSPARK's injector, on an MHA draft pool.
+        # DSPARK's injector, on an MHA draft pool: the plan's ids for the
+        # draft's translator, written as they are.
         injected = {}
 
         def write_target_hidden_kv(**kwargs):
@@ -397,27 +400,25 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         injector = TargetHiddenKvInjector(
             draft_model=SimpleNamespace(write_target_hidden_kv=write_target_hidden_kv),
             draft_model_runner=SimpleNamespace(
-                kv_index_translator=_Shift(), token_to_kv_pool=SimpleNamespace()
+                kv_index_translator=draft_translator, token_to_kv_pool=SimpleNamespace()
             ),
             model_runner=SimpleNamespace(device=torch.device(_DEV)),
             device=torch.device(_DEV),
             verify_num_draft_tokens=2,
             block_pos_offsets=torch.arange(2),
         )
-        cache_loc, cache_loc_2d = virtual.clone(), virtual.clone().view(2, 2)
+        cache_loc = injector.ids_for(plan)
         injector.inject_target_hidden(
             target_hidden=hidden,
             cache_loc=cache_loc,
             positions=positions,
-            cache_loc_2d=cache_loc_2d,
+            cache_loc_2d=cache_loc.view(2, 2),
             commit_lens=commit_lens,
         )
         torch.testing.assert_close(injected["cache_loc"], physical, rtol=0, atol=0)
         torch.testing.assert_close(
             injected["cache_loc_2d"], physical.view(2, 2), rtol=0, atol=0
         )
-        torch.testing.assert_close(cache_loc, virtual, rtol=0, atol=0)
-        torch.testing.assert_close(cache_loc_2d, virtual.view(2, 2), rtol=0, atol=0)
 
     def test_full_flat_v2p_per_disposition(self):
         """The flat-translate accessor must hand a kernel exactly what

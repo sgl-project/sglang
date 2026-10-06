@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -52,6 +52,10 @@ class DFlashVerifyInput(SpecInput):
     live_seq_lens_cpu: Optional[torch.Tensor] = None
     # Conservative request-lifetime bound for candidate graph dispatch.
     candidate_max_seq_len_upper_bound: Optional[int] = None
+    # The iteration's plan when the caller planned the verify window, and the
+    # part of it this verify writes (`KVLocPlan.write_ids`).
+    kv_loc_plan: Optional[KVLocPlan] = None
+    kv_loc_cols: Optional[Cols] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
@@ -102,6 +106,8 @@ class DFlashVerifyInput(SpecInput):
             target_worker.model_runner,
             capture_hidden_mode=self.capture_hidden_mode,
             return_hidden_states_before_norm=False,
+            kv_loc_plan=self.kv_loc_plan,
+            write_cols=self.kv_loc_cols,
         )
 
         can_run_cuda_graph = bool(
