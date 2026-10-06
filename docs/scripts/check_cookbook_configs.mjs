@@ -20,7 +20,7 @@
 //      cell inherits an algorithm it declares incompatible, so choosing a PD
 //      role can remove that algorithm from the generated command.
 
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -152,6 +152,21 @@ for (const path of walk(CONFIGS)) {
     ? config.matchDims.map((d) => d.id)
     : LEGACY_DIMS.map((k) => ({ variants: "variant", quantizations: "quant",
         strategies: "strategy", nodesOptions: "nodes" })[k]))];
+
+  // A role-less benchmark is a wildcard: it can show aggregated measurements
+  // beside a disaggregated worker. Require an explicit role when a cookbook
+  // adds this dimension, including entries that only mark results as pending.
+  const benchmarkPath = path.replace(/\.jsx$/, "-benchmarks.jsx");
+  if (matchIds.includes("pdMode") && existsSync(benchmarkPath)) {
+    const benchmarkModule = await import("data:text/javascript," + encodeURIComponent(
+      readFileSync(benchmarkPath, "utf8")));
+    for (const [i, entry] of (benchmarkModule.benchmarks || []).entries()) {
+      if (!entry.match || entry.match.pdMode === undefined) {
+        fail(relative(join(SNIPPETS, ".."), benchmarkPath),
+          `benchmarks[${i}] needs an explicit match.pdMode; aggregated results cannot qualify PD roles`);
+      }
+    }
+  }
 
   for (const [i, cell] of (config.cells || []).entries()) {
     const keys = Object.keys(cell.match || {}).sort();

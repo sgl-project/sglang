@@ -22,6 +22,11 @@ export const config = {
   // RTX PRO 6000 and RTX 5090 (SM120 / Blackwell Desktop) are workstation and
   // consumer cards, not datacenter GPUs.
   hardware: [
+    { id: "gb300", label: "GB300", vram: "288GB", vendor: "blackwell",
+      multiNodeDockerFlags: [
+        "--device /dev/infiniband", "--cap-add IPC_LOCK",
+        "--ulimit memlock=-1", "--ulimit nofile=1048576:1048576",
+      ] },
     { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "blackwell" },
   ],
@@ -47,6 +52,38 @@ export const config = {
   nodesOptions: [
     { id: "single",  label: "Single Node" },
     { id: "multi-2", label: "Multi-Nodes" },
+  ],
+
+  // Disaggregation is a worker role, independent of the nodes in that worker.
+  // Existing URL hashes omit pdMode and keep the first (aggregated) option.
+  matchDims: [
+    { id: "variant", title: "Model Variant", options: [
+      { id: "flash", label: "Flash", subtitle: "284B" },
+      { id: "flash-official", label: "Flash Official", subtitle: "284B · 0731" },
+      { id: "flash-vision", label: "Flash Vision", subtitle: "305B · Exp" },
+      { id: "pro", label: "Pro", subtitle: "1.6T" },
+      { id: "pro-official", label: "Pro Official", subtitle: "1.6T · 0813" },
+    ] },
+    { id: "quant", title: "Quantization", options: [
+      { id: "fp8", label: "FP8" },
+      { id: "fp4", label: "FP4" },
+      { id: "nvfp4", label: "NVFP4" },
+    ] },
+    { id: "pdMode", title: "Serving mode", options: [
+      { id: "unified", label: "Aggregated" },
+      { id: "prefill", label: "Disagg Prefill" },
+      { id: "decode", label: "Disagg Decode" },
+    ] },
+    { id: "strategy", title: "Strategy", options: [
+      { id: "low-latency", label: "Low-Latency" },
+      { id: "balanced", label: "Balanced" },
+      { id: "high-throughput", label: "High-Throughput" },
+    ] },
+    { id: "nodes", title: "Nodes per worker", options: [
+      { id: "single", label: "Single Node" },
+      { id: "multi-2", label: "2 Nodes" },
+      { id: "multi-4", label: "4 Nodes" },
+    ] },
   ],
 
   modelNames: {
@@ -75,6 +112,9 @@ export const config = {
     PORT:      { target: "command", label: "Bind port",       default: "30000"    },
     NODE0_IP:  { target: "command", label: "Head node IP",    default: "<node0-ip>"   },
     NODE_RANK: { target: "command", label: "This node rank",  default: "<node-rank>"  },
+    NODE_IP: { target: "command", label: "This node fabric IP", default: "<this-node-ip>" },
+    MOONCAKE_MASTER: { target: "command", label: "Mooncake master", default: "<master-ip>:50051" },
+    MOONCAKE_METADATA: { target: "command", label: "Mooncake metadata", default: "http://<master-ip>:8080/metadata" },
     HF_TOKEN:  { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
     CURL_HOST: { target: "curl",    label: "Server host",     default: "localhost" },
     CURL_PORT: { target: "curl",    label: "Server port",     default: "30000"     },
@@ -427,6 +467,8 @@ sgl-eval run mmmu_pro \\
 
     // ----- Card 5: "PD Disaggregation" -----
     pdDisagg: {
+      // This combination chooses its role in Deployment, not in two controls.
+      modesHideWhen: { hw: ["gb300"], variant: ["pro-official"], quant: ["fp4"] },
       modes: [
         { id: "off",     label: "Off" },
         // The AMD role flags are the MI355X 1P x 1D agentic recipe. Both roles
@@ -894,10 +936,11 @@ sgl-eval run mmmu_pro \\
     // are alternatives and sglang rejects them together. Enabling this card
     // therefore strips the HiCache family from the command.
     //
-    // ROCm-only in practice: the store is MORI's buffer pool, the same
-    // transport the PD roles use, and there is no CUDA recipe for it yet.
+    // GB300 Pro Official also exposes Mooncake; the PD prefill recipe below
+    // enables it by default. Other CUDA combinations remain outside this scope.
     umbp: {
-      onlyHw: ["mi300x", "mi355x"],
+      onlyHw: ["mi300x", "mi355x", "gb300"],
+      showWhen: (s) => s.hw !== "gb300" || (s.variant === "pro-official" && s.quant === "fp4" && s.pdMode === "prefill"),
       // No `requiresDpAttention`: the linker runs under pure TP as well, and the
       // TP-only Pro Official prefill roles below are that shape.
       // DP attention is a sizing question, not a prerequisite — the linker keys
@@ -910,18 +953,35 @@ sgl-eval run mmmu_pro \\
       // in a standalone umbp_standalone_server on the prefill node (cookbook
       // §3.9), reached over the socket in UMBP_STANDALONE_ADDRESS.
       roleOverrides: [
-        { mode: "prefill",
+        { mode: "prefill", backend: "mori",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["low-latency", "balanced", "high-throughput"] },
           enable: true,
           env: ["UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp_sa/sa.grpc.sock"],
           flags: ["--hicache-storage-backend-extra-config '{\"standalone_startup_timeout_ms\":120000}'"],
           note: "Start the UMBP tier server on the prefill node first (cookbook §3.9): UMBP_DRAM_CAPACITY=1500000000000 UMBP_DRAM_USE_HUGEPAGES=1 UMBP_SSD_ENABLED=0 umbp_standalone_server unix:///tmp/umbp_sa/sa.grpc.sock" },
+        { mode: "prefill", backend: "mooncake",
+          when: { hw: ["gb300"], variant: ["pro-official"], quant: ["fp4"] },
+          enable: true,
+          env: [
+            "MOONCAKE_MASTER={{MOONCAKE_MASTER}}",
+            "MOONCAKE_TE_META_DATA_SERVER={{MOONCAKE_METADATA}}",
+            "MOONCAKE_LOCAL_HOSTNAME={{NODE_IP}}",
+            "MOONCAKE_PROTOCOL=rdma",
+            "MOONCAKE_DEVICE=mlx5_0,mlx5_1,mlx5_2,mlx5_3",
+            "MOONCAKE_GLOBAL_SEGMENT_SIZE=140gb",
+            "MOONCAKE_STANDALONE_STORAGE=0",
+            "MC_STORE_CLIENT_METRIC_INTERVAL=5",
+            "MC_ENABLE_DEST_DEVICE_AFFINITY=1",
+            "MC_TCP_BIND_ADDRESS={{NODE_IP}}",
+          ],
+          flags: ["--hicache-storage-backend-extra-config '{\"enable_group_semantics\":true}'"],
+          note: "Start the Mooncake master and four 180 GB stores per decode node first; set the master and this node's fabric IP in Env (cookbook §3.10)." },
       ],
       defaultBackend: "mori",
       backends: [
-        { id: "mori",     label: "MORI (UMBP)" },
-        { id: "mooncake", label: "Mooncake" },
+        { id: "mori", label: "MORI (UMBP)", hide: { hw: ["gb300"] } },
+        { id: "mooncake", label: "Mooncake", defaultWhen: { hw: ["gb300"] } },
       ],
     },
 
@@ -1009,7 +1069,7 @@ sgl-eval run mmmu_pro \\
     // B200 + FP4
     // ====================================================================
     {
-      match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1026,7 +1086,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1045,7 +1105,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
@@ -1060,7 +1120,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
@@ -1079,7 +1139,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -1095,7 +1155,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -1111,7 +1171,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1132,7 +1192,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096",
@@ -1156,7 +1216,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -1179,7 +1239,7 @@ sgl-eval run mmmu_pro \\
     },
 
     {
-      match: { hw: "b300", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b300", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1194,7 +1254,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1213,7 +1273,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b300", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "b300", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: false,
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
@@ -1228,7 +1288,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
@@ -1247,7 +1307,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b300", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b300", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: false,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -1263,7 +1323,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -1279,7 +1339,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1300,7 +1360,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1324,7 +1384,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -1350,7 +1410,7 @@ sgl-eval run mmmu_pro \\
     // B200 + NVFP4
     // ====================================================================
     {
-      match: { hw: "b200", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b200", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1371,7 +1431,7 @@ sgl-eval run mmmu_pro \\
     },
 
     {
-      match: { hw: "b200", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b200", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1397,7 +1457,7 @@ sgl-eval run mmmu_pro \\
     // sgl-eval; see the benchmarks entries).
     // ====================================================================
     {
-      match: { hw: "b200", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b200", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1413,7 +1473,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b200", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b200", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1433,7 +1493,7 @@ sgl-eval run mmmu_pro \\
     // B300 + NVFP4
     // ====================================================================
     {
-      match: { hw: "b300", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b300", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1452,7 +1512,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b300", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b300", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1479,7 +1539,7 @@ sgl-eval run mmmu_pro \\
     // instead of the EAGLE shape flags. NOT yet run end-to-end on this hardware.
     // ====================================================================
     {
-      match: { hw: "b300", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b300", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verificationStatus: "in-progress",
       env: [],
       flags: [
@@ -1495,7 +1555,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b300", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b300", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verificationStatus: "in-progress",
       env: [],
       flags: [
@@ -1517,7 +1577,7 @@ sgl-eval run mmmu_pro \\
     // GB200 + FP4
     // ====================================================================
     {
-      match: { hw: "gb200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: false,
       env: [],
       flags: [
@@ -1533,7 +1593,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1552,7 +1612,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "gb200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: false,
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
@@ -1567,7 +1627,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
@@ -1586,7 +1646,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "gb200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: false,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -1602,7 +1662,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -1618,7 +1678,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2" },
+      match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2", pdMode: "unified" },
       verified: true,
       env: [
         "NCCL_MNNVL_ENABLE=1",
@@ -1643,7 +1703,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2", pdMode: "unified" },
       verified: true,
       env: [
         "NCCL_MNNVL_ENABLE=1",
@@ -1668,7 +1728,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
+      match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "multi-2", pdMode: "unified" },
       verified: true,
       env: [
         "NCCL_MNNVL_ENABLE=1",
@@ -1693,7 +1753,7 @@ sgl-eval run mmmu_pro \\
     // GB200 + NVFP4
     // ====================================================================
     {
-      match: { hw: "gb200", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb200", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1712,7 +1772,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
+      match: { hw: "gb200", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1739,7 +1799,7 @@ sgl-eval run mmmu_pro \\
     // instead of the EAGLE shape flags. NOT yet run end-to-end on this hardware.
     // ====================================================================
     {
-      match: { hw: "gb200", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb200", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verificationStatus: "in-progress",
       env: [],
       flags: [
@@ -1755,7 +1815,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
+      match: { hw: "gb200", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2", pdMode: "unified" },
       verificationStatus: "in-progress",
       env: [],
       flags: [
@@ -1777,7 +1837,7 @@ sgl-eval run mmmu_pro \\
     // GB300 + FP4
     // ====================================================================
     {
-      match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1793,7 +1853,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1811,7 +1871,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
@@ -1826,7 +1886,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
@@ -1845,7 +1905,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -1861,7 +1921,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -1877,7 +1937,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1898,7 +1958,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
       flags: [
@@ -1920,7 +1980,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -1947,7 +2007,7 @@ sgl-eval run mmmu_pro \\
     // checkpoint without erroring but accepts no draft tokens.
     // ====================================================================
     {
-      match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -1965,7 +2025,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
       flags: [
@@ -1984,7 +2044,7 @@ sgl-eval run mmmu_pro \\
       // so 512 gives 128 running slots per DP rank. That is the point where both
       // the slot budget and the KV pool run full on this topology; the three
       // memory flags together are what keep the KV pool large enough to reach it.
-      match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -2009,7 +2069,7 @@ sgl-eval run mmmu_pro \\
     // bundled DSpark head. NOT yet run end-to-end on this hardware.
     // ====================================================================
     {
-      match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: false,
       env: ["SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
@@ -2028,7 +2088,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       // DSpark is incompatible with DP attention -> target-only.
-      match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: false,
       env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096", "SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
@@ -2046,7 +2106,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: false,
       env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320", "SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
@@ -2071,7 +2131,7 @@ sgl-eval run mmmu_pro \\
     // bundled DSpark head. NOT yet run end-to-end on this hardware.
     // ====================================================================
     {
-      match: { hw: "b300", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b300", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: false,
       env: [],
       flags: [
@@ -2090,7 +2150,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       // DSpark is incompatible with DP attention -> target-only.
-      match: { hw: "b300", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "b300", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: false,
       env: [],
       flags: [
@@ -2110,7 +2170,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b300", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b300", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: false,
       env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"],
       flags: [
@@ -2135,7 +2195,7 @@ sgl-eval run mmmu_pro \\
     // bundled DSpark head. NOT yet run end-to-end on this hardware.
     // ====================================================================
     {
-      match: { hw: "gb200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "multi-2" },
+      match: { hw: "gb200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "multi-2", pdMode: "unified" },
       verified: false,
       env: ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1", "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
       flags: [
@@ -2154,7 +2214,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       // DSpark is incompatible with DP attention -> target-only.
-      match: { hw: "gb200", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      match: { hw: "gb200", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "multi-2", pdMode: "unified" },
       verified: false,
       env: ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1", "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
       flags: [
@@ -2171,7 +2231,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
+      match: { hw: "gb200", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "multi-2", pdMode: "unified" },
       verified: false,
       env: ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1", "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"],
       flags: [
@@ -2193,7 +2253,7 @@ sgl-eval run mmmu_pro \\
     // bundled DSpark head. NOT yet run end-to-end on this hardware.
     // ====================================================================
     {
-      match: { hw: "h200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "h200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: false,
       env: [],
       flags: [
@@ -2208,7 +2268,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h200", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "h200", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: false,
       env: [],
       flags: [
@@ -2223,7 +2283,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h200", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "h200", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: false,
       env: [],
       flags: [
@@ -2242,7 +2302,7 @@ sgl-eval run mmmu_pro \\
     // bundled DSpark head. NOT yet run end-to-end on this hardware.
     // ====================================================================
     {
-      match: { hw: "h100", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "multi-2" },
+      match: { hw: "h100", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "multi-2", pdMode: "unified" },
       verified: false,
       env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [
@@ -2259,7 +2319,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h100", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      match: { hw: "h100", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "multi-2", pdMode: "unified" },
       verified: false,
       env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [
@@ -2276,7 +2336,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h100", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
+      match: { hw: "h100", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "multi-2", pdMode: "unified" },
       verified: false,
       env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [
@@ -2296,7 +2356,7 @@ sgl-eval run mmmu_pro \\
     // The DP + DSpark agentic path is documented in cookbook §3.7.
     // ====================================================================
     {
-      match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: false,
       env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
       flags: [
@@ -2319,7 +2379,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       // DSpark + DP Attention is documented in cookbook §3.7, not this cell.
-      match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: false,
       env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
       flags: [
@@ -2346,7 +2406,7 @@ sgl-eval run mmmu_pro \\
     {
       // DSpark + DP Attention is documented in cookbook §3.7 and in the PD roles
       // above (§3.8), not this cell.
-      match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: false,
       env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
       flags: [
@@ -2375,7 +2435,7 @@ sgl-eval run mmmu_pro \\
     // GB300 + NVFP4
     // ====================================================================
     {
-      match: { hw: "gb300", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb300", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -2394,7 +2454,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb300", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -2421,7 +2481,7 @@ sgl-eval run mmmu_pro \\
     // instead of the EAGLE shape flags. NOT yet run end-to-end on this hardware.
     // ====================================================================
     {
-      match: { hw: "gb300", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb300", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verificationStatus: "in-progress",
       env: [],
       flags: [
@@ -2437,7 +2497,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb300", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verificationStatus: "in-progress",
       env: [],
       flags: [
@@ -2459,7 +2519,7 @@ sgl-eval run mmmu_pro \\
     // H200 + FP8 (deepep, no Marlin)
     // ====================================================================
     {
-      match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: ["SGLANG_DSV4_FP4_EXPERTS=0"],
       flags: [
@@ -2475,7 +2535,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_DSV4_FP4_EXPERTS=0",
@@ -2499,7 +2559,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_DSV4_FP4_EXPERTS=0",
@@ -2519,7 +2579,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "multi-2" },
+      match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "multi-2", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_DSV4_FP4_EXPERTS=0",
@@ -2543,7 +2603,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "balanced", nodes: "multi-2" },
+      match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "balanced", nodes: "multi-2", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_DSV4_FP4_EXPERTS=0",
@@ -2567,7 +2627,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "high-throughput", nodes: "multi-2" },
+      match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "high-throughput", nodes: "multi-2", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_DSV4_FP4_EXPERTS=0",
@@ -2588,7 +2648,7 @@ sgl-eval run mmmu_pro \\
     },
 
     {
-      match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       // W4A8 (MXFP4 weights x FP8 activations, FlashInfer Humming kernels);
       // requires FlashInfer >= 0.6.18. Falls back: drop the precision flag
       // for the W4A16 path, or use --moe-runner-backend marlin.
@@ -2606,7 +2666,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       // W4A8 Humming path -- see the flash-official cell above.
       verificationStatus: "in-progress",
       env: [],
@@ -2625,7 +2685,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -2640,7 +2700,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -2657,7 +2717,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -2670,7 +2730,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -2683,7 +2743,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       // W4A8 Humming path -- see the flash-official cell above.
       verificationStatus: "in-progress",
       env: [],
@@ -2703,7 +2763,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -2721,7 +2781,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -2739,7 +2799,7 @@ sgl-eval run mmmu_pro \\
     // H100 + FP4 (Marlin runner)
     // ====================================================================
     {
-      match: { hw: "h100", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "h100", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: false,
       env: [],
       flags: [
@@ -2753,7 +2813,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -2770,7 +2830,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h100", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "h100", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: false,
       env: [],
       flags: [
@@ -2784,7 +2844,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -2801,7 +2861,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h100", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "h100", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: false,
       env: [],
       flags: [
@@ -2814,7 +2874,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -2827,7 +2887,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h100", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2" },
+      match: { hw: "h100", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2", pdMode: "unified" },
       verified: true,
       env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [
@@ -2847,7 +2907,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h100", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      match: { hw: "h100", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2", pdMode: "unified" },
       verified: true,
       env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [
@@ -2867,7 +2927,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h100", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
+      match: { hw: "h100", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "multi-2", pdMode: "unified" },
       verified: true,
       env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [
@@ -2885,7 +2945,7 @@ sgl-eval run mmmu_pro \\
     // RTX PRO 6000 (SM120 / Blackwell Desktop) — Flash + low-latency only
     // ====================================================================
     {
-      match: { hw: "rtx6000", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "rtx6000", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: false,
       env: [],
       flags: [
@@ -2900,7 +2960,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "rtx6000", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "rtx6000", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [],
       flags: [
@@ -2919,7 +2979,7 @@ sgl-eval run mmmu_pro \\
     // RTX 5090 (SM120 / Blackwell Desktop) — Flash Official + low-latency
     // ====================================================================
     {
-      match: { hw: "rtx5090", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "rtx5090", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: false,
       env: [],
       flags: [
@@ -2940,7 +3000,7 @@ sgl-eval run mmmu_pro \\
 
     // ---------- MI300X (192GB) — Flash FP8 ----------
     {
-      match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -2968,7 +3028,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3000,7 +3060,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3034,7 +3094,7 @@ sgl-eval run mmmu_pro \\
 
     // ---------- MI355X (288GB) — Flash FP4 ----------
     {
-      match: { hw: "mi355x", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "mi355x", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: false,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3059,7 +3119,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3088,7 +3148,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "mi355x", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "mi355x", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: false,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3123,7 +3183,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3162,7 +3222,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "mi355x", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "mi355x", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: false,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3197,7 +3257,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3238,7 +3298,7 @@ sgl-eval run mmmu_pro \\
 
     // ---------- MI355X (288GB) — Flash FP8 ----------
     {
-      match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3267,7 +3327,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3306,7 +3366,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3347,7 +3407,7 @@ sgl-eval run mmmu_pro \\
 
     // ---------- MI355X (288GB) — Pro FP4 ----------
     {
-      match: { hw: "mi355x", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "mi355x", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3377,7 +3437,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "mi355x", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "mi355x", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3416,7 +3476,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "mi355x", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "mi355x", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3457,7 +3517,7 @@ sgl-eval run mmmu_pro \\
 
     // ---------- MI355X (288GB) — Pro FP8 ----------
     {
-      match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3486,7 +3546,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3525,7 +3585,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
@@ -3593,7 +3653,7 @@ sgl-eval run mmmu_pro \\
     // tuning knobs; SGLANG_B12X_MAX_TOKENS must track --chunked-prefill-size;
     // expandable_segments avoids unified-memory fragmentation OOMs.
     {
-      match: { hw: "dgx-spark", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      match: { hw: "dgx-spark", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "multi-2", pdMode: "unified" },
       verified: true,
       warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build (2x GB10, TP=2 over ConnectX-7) — do not use it on other hardware. Use Docker mode: the bare Python command needs the b12x kernel package this image ships. See [DGX Spark notes](#spark-note).",
       env: [
@@ -3623,7 +3683,7 @@ sgl-eval run mmmu_pro \\
     },
 
     {
-      match: { hw: "dgx-spark", variant: "flash-official", quant: "nvfp4", strategy: "balanced", nodes: "multi-2" },
+      match: { hw: "dgx-spark", variant: "flash-official", quant: "nvfp4", strategy: "balanced", nodes: "multi-2", pdMode: "unified" },
       verified: true,
       warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build — do not use it on other hardware, and use Docker mode. NVFP4 on DGX Spark needs the three extra MoE flags shown (cutlass runner for the NVFP4 experts, b12x for the DSpark draft's MXFP4 MTP experts, shared-experts fusion off). See [DGX Spark notes](#spark-note).",
       env: [
@@ -3654,7 +3714,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "dgx-spark", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      match: { hw: "dgx-spark", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "multi-2", pdMode: "unified" },
       verified: true,
       warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build — do not use it on other hardware, and use Docker mode. Images go in as OpenAI image_url content on /v1/chat/completions (see Vision below); text-only requests work unchanged. See [DGX Spark notes](#spark-note).",
       env: [
@@ -3697,7 +3757,7 @@ sgl-eval run mmmu_pro \\
     // GB200 / H200 / H100 — final verification in progress.
     // ====================================================================
     {
-      match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: [],
@@ -3711,7 +3771,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
@@ -3727,7 +3787,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: [
@@ -3748,7 +3808,7 @@ sgl-eval run mmmu_pro \\
     // B300 / GB200 / GB300 + FP4 — Flash Vision (Exp)
     // ====================================================================
     {
-      match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: false,
       verificationStatus: "in-progress",
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
@@ -3763,7 +3823,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: false,
       verificationStatus: "in-progress",
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
@@ -3780,7 +3840,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: false,
       verificationStatus: "in-progress",
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
@@ -3798,7 +3858,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: false,
       verificationStatus: "in-progress",
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
@@ -3813,7 +3873,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: false,
       verificationStatus: "in-progress",
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
@@ -3830,7 +3890,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: false,
       verificationStatus: "in-progress",
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
@@ -3848,7 +3908,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: [],
@@ -3862,7 +3922,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
@@ -3878,7 +3938,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
       verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: [
@@ -3899,7 +3959,7 @@ sgl-eval run mmmu_pro \\
     // H200 + FP4 — Flash Vision (Exp)
     // ====================================================================
     {
-      match: { hw: "h200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "h200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
       verified: false,
       verificationStatus: "in-progress",
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
@@ -3915,7 +3975,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "h200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "h200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: false,
       verificationStatus: "in-progress",
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
@@ -3934,7 +3994,7 @@ sgl-eval run mmmu_pro \\
     // H100 + FP4 — Flash Vision (Exp)
     // ====================================================================
     {
-      match: { hw: "h100", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "h100", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
       verified: false,
       verificationStatus: "in-progress",
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
@@ -3944,6 +4004,157 @@ sgl-eval run mmmu_pro \\
         "--tp 8",
         "--moe-runner-backend marlin",
         "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // Source: SemiAnalysisAI/InferenceX#3187 @ 34d06e54c7614bb33d2a271b010ffde3ce3fa563.
+    // Run 37270628136, attempt 1. One TP8 prefill worker (2 nodes) and one
+    // TP16 decode worker (4 nodes), 4 GB300 GPUs per node. Frontend adaptation
+    // is intentionally unverified; do not inherit aggregated benchmark data.
+    {
+      match: { hw: "gb300", variant: "pro-official", quant: "fp4", pdMode: "prefill", strategy: "low-latency", nodes: "multi-2" },
+      verified: false,
+      dockerImage: "lmsysorg/sglang:nightly-dev-cu13-20260916-c9a8fba9",
+      warn: "Standalone adaptation of the InferenceX #3187 1P1D recipe. The successful source sweep used Dynamo; these SGLang server/router commands need separate GPU validation. Start the Mooncake services first (see [GB300 prerequisites](#3-10-pd-disaggregation-on-gb300-mooncake)).",
+      env: [
+        "MOONCAKE_MASTER={{MOONCAKE_MASTER}}",
+        "MOONCAKE_TE_META_DATA_SERVER={{MOONCAKE_METADATA}}",
+        "MOONCAKE_LOCAL_HOSTNAME={{NODE_IP}}",
+        "SGLANG_ENABLE_PREFILL_WAR_READ_DONE=1",
+        "SGLANG_RAGGED_VERIFY_MODE=static",
+        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT=900",
+        "SGLANG_DSV4_MHC_PREWARM=1",
+        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
+        "SGLANG_JIT_DEEPGEMM_PRECOMPILE=1",
+        "SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1",
+        "SGLANG_DEFAULT_THINKING=1",
+        "SGLANG_DSV4_REASONING_EFFORT=high",
+        "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
+        "SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1",
+        "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1",
+        "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=17408",
+        "SGLANG_OPT_USE_ONLINE_COMPRESS=0",
+        "NCCL_MNNVL_ENABLE=1",
+        "NCCL_CUMEM_ENABLE=1",
+        "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+        "MC_FORCE_MNNVL=1",
+        "NCCL_TIMEOUT=100000",
+        "NCCL_MNNVL_UUID_QUERY_TIMEOUT=100000",
+        "SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1",
+        "SGLANG_LOG_FORWARD_ITERS=1",
+        "SGLANG_LOG_MS=1",
+        "SGLANG_REQUEST_STATE_WAIT_TIMEOUT=60",
+        "SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH=1",
+        "MOONCAKE_PROTOCOL=rdma",
+        "MOONCAKE_DEVICE=mlx5_0,mlx5_1,mlx5_2,mlx5_3",
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE=140gb",
+        "MOONCAKE_STANDALONE_STORAGE=0",
+        "MC_STORE_CLIENT_METRIC_INTERVAL=5",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY=1",
+        "MC_TCP_BIND_ADDRESS={{NODE_IP}}",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--enable-metrics",
+        "--enable-cache-report",
+        "--watchdog-timeout 86400",
+        "--stream-interval 60",
+        "--tp-size 8",
+        "--dp-size 8",
+        "--ep-size 8",
+        "--enable-dp-attention",
+        "--enable-dp-lm-head",
+        "--moe-dense-tp-size 1",
+        "--moe-a2a-backend megamoe",
+        "--enable-deepseek-v4-fp4-indexer",
+        "--enable-w4a4-mxfp4-megamoe",
+        "--disaggregation-transfer-backend mooncake",
+        "--disaggregation-mode prefill",
+        "--load-balance-method total_tokens",
+        "--mem-fraction-static 0.8",
+        "--page-size 256",
+        "--swa-full-tokens-ratio 0.02",
+        "--chunked-prefill-size 131072",
+        "--disable-flashinfer-autotune",
+        "--model-loader-extra-config '{\"enable_multithread_load\":true,\"num_threads\":8}'",
+        "--speculative-algorithm DSPARK",
+        "--speculative-dspark-block-size 6",
+        "--speculative-num-steps 1",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 7",
+        "--enable-unified-cache-external-linker",
+        "--unified-cache-external-linker-backend mooncake",
+        "--hicache-storage-backend-extra-config '{\"enable_group_semantics\":true}'",
+        "--max-running-requests 256",
+        "--cuda-graph-max-bs-decode 256",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "pro-official", quant: "fp4", pdMode: "decode", strategy: "low-latency", nodes: "multi-4" },
+      verified: false,
+      dockerImage: "lmsysorg/sglang:nightly-dev-cu13-20260916-c9a8fba9",
+      warn: "Standalone adaptation of the InferenceX #3187 1P1D recipe. The successful source sweep used Dynamo; these SGLang server/router commands need separate GPU validation. Start the Mooncake services first (see [GB300 prerequisites](#3-10-pd-disaggregation-on-gb300-mooncake)).",
+      env: [
+        "SGLANG_RAGGED_VERIFY_MODE=static",
+        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT=900",
+        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
+        "SGLANG_JIT_DEEPGEMM_PRECOMPILE=1",
+        "SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1",
+        "SGLANG_DEFAULT_THINKING=1",
+        "SGLANG_DSV4_REASONING_EFFORT=high",
+        "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
+        "SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE=1",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096",
+        "SGLANG_OPT_USE_ONLINE_COMPRESS=0",
+        "NCCL_MNNVL_ENABLE=1",
+        "NCCL_CUMEM_ENABLE=1",
+        "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+        "MC_FORCE_MNNVL=1",
+        "NCCL_TIMEOUT=100000",
+        "NCCL_MNNVL_UUID_QUERY_TIMEOUT=100000",
+        "SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1",
+        "SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION=8",
+        "SGLANG_LOG_FORWARD_ITERS=1",
+        "SGLANG_LOG_MS=1",
+        "SGLANG_REQUEST_STATE_WAIT_TIMEOUT=60",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY=1",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--enable-metrics",
+        "--enable-cache-report",
+        "--watchdog-timeout 86400",
+        "--stream-interval 60",
+        "--tp-size 16",
+        "--dp-size 16",
+        "--ep-size 16",
+        "--enable-dp-attention",
+        "--enable-dp-lm-head",
+        "--moe-dense-tp-size 1",
+        "--moe-a2a-backend megamoe",
+        "--enable-deepseek-v4-fp4-indexer",
+        "--disaggregation-transfer-backend mooncake",
+        "--disaggregation-mode decode",
+        "--load-balance-method total_tokens",
+        "--mem-fraction-static 0.9",
+        "--page-size 256",
+        "--swa-full-tokens-ratio 0.02",
+        "--max-running-requests 3072",
+        "--disable-flashinfer-autotune",
+        "--model-loader-extra-config '{\"enable_multithread_load\":true,\"num_threads\":8}'",
+        "--speculative-algorithm DSPARK",
+        "--speculative-dspark-block-size 6",
+        "--speculative-num-steps 1",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 7",
+        "--cuda-graph-max-bs-decode 256",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

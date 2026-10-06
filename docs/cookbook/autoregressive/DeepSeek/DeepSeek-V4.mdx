@@ -31,7 +31,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 **NVIDIA GPUs**
 
-A single image — `lmsysorg/sglang:latest` — covers the **datacenter GPUs** in this cookbook (B200 / B300 / GB200 / GB300 / H100 / H200 / RTX PRO 6000). The one exception is **Flash Vision (Exp)**, whose support has not shipped in a release yet: its cells use the preview image `lmsysorg/sglang:dev-dsv4-flash-vision` (the command panel picks it automatically — see the [Flash Vision notes](#vision-note)). **DGX Spark** is the other exception: its three cells (Flash Official FP4, Flash Official NVFP4, Flash Vision FP4) use the DGX Spark–only preview image `lmsysorg/sglang:dev-v4f-2dgx-v2` (the command panel picks it automatically — see the [DGX Spark notes](#spark-note)); do not use that image on any other hardware.
+A single image — `lmsysorg/sglang:latest` — covers most **datacenter GPU** recipes in this cookbook (B200 / B300 / GB200 / GB300 / H100 / H200 / RTX PRO 6000). **GB300 Pro Official disaggregated roles** pin `lmsysorg/sglang:nightly-dev-cu13-20260916-c9a8fba9`, the build used by their public source recipe; see [GB300 prerequisites](#3-10-pd-disaggregation-on-gb300-mooncake). **Flash Vision (Exp)** support has not shipped in a release yet: its cells use the preview image `lmsysorg/sglang:dev-dsv4-flash-vision` (the command panel picks it automatically — see the [Flash Vision notes](#vision-note)). **DGX Spark** is another exception: its three cells (Flash Official FP4, Flash Official NVFP4, Flash Vision FP4) use the DGX Spark–only preview image `lmsysorg/sglang:dev-v4f-2dgx-v2` (the command panel picks it automatically — see the [DGX Spark notes](#spark-note)); do not use that image on any other hardware.
 
 ```bash Command
 docker pull lmsysorg/sglang:latest
@@ -92,6 +92,16 @@ import { benchmarks } from "/src/snippets/configs/deepseek-ai/deepseek-v4-benchm
 <Deployment config={config} benchmarks={benchmarks} />
 
 <Note>
+  For **GB300 → Pro Official → FP4**, **Serving mode** selects an aggregated worker,
+  disaggregated prefill, or disaggregated decode. The **1P1D** adaptation uses one
+  prefill worker across **2 nodes (TP8/DP8/EP8)** and one decode worker across
+  **4 nodes (TP16/DP16/EP16)**, with four GPUs per node. Node count describes one
+  worker, not the number of prefill or decode replicas. Choose **Low-Latency** for
+  both roles and read the [Mooncake prerequisites](#3-10-pd-disaggregation-on-gb300-mooncake)
+  before launching. The external linker is enabled on prefill and uses Mooncake.
+</Note>
+
+<Note>
   For a runnable end-to-end example, see the [DeepSeek-V4-Flash demo notebook](https://github.com/sgl-project/sglang/blob/main/docs/demo/deepseek_v4_flash.ipynb).
 </Note>
 
@@ -101,14 +111,14 @@ import { benchmarks } from "/src/snippets/configs/deepseek-ai/deepseek-v4-benchm
     <li style={{marginBottom: "0.2rem"}}><strong>Python / Docker</strong> — bare <code>sglang serve …</code> for an existing SGLang env, or a <code>docker run … sglang serve …</code> wrap against the per-hardware image from the <a href="#install">Install SGLang</a> panel above.</li>
     <li style={{marginBottom: "0.2rem"}}><strong>⧉ Copy</strong> — copies the current command (with whichever framing is active) to your clipboard.</li>
     <li style={{marginBottom: "0.2rem"}}><strong>$ cURL</strong> — a sample request against <code>localhost:30000</code> to confirm the server is up.</li>
-    <li style={{marginBottom: "0.2rem"}}><strong>⚙ Env</strong> — edits the placeholders (<code>HOST_IP</code>, <code>PORT</code>, <code>HF_TOKEN</code>, <code>NODE_RANK</code>, <code>NODE0_IP</code>) the command and cURL share. Persists in localStorage across cookbooks.</li>
-    <li><strong>Verified / Not Verified</strong> badge — green when the <code>(hw, variant, quant, strategy, nodes)</code> combo has been run end-to-end on real hardware; yellow when auto-derived from a neighbor and not yet re-checked.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>⚙ Env</strong> — edits the host, port, token, node rank, head-node address, and Mooncake endpoints the generated commands use. Persists in localStorage across cookbooks.</li>
+    <li><strong>Verified / Not Verified</strong> badge — green when the selected hardware, variant, quantization, serving mode, strategy, and node count have been run end-to-end on real hardware; yellow for an adaptation awaiting validation.</li>
   </ul>
 </div>
 
 ## Playground
 
-The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing. The base is read live from your Deploy selection — only your overrides change.
+The Playground is where you experiment with **SGLang features beyond the base recipes**. Check the Deploy panel's verification badge: some recipes are adaptations awaiting validation. The Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing. The base is read live from your Deploy selection — only your overrides change.
 
 The knobs come in two flavors:
 
@@ -1272,3 +1282,92 @@ sglang serve ... \
 ```
 
 Two further limits are worth knowing before you size a run. The pool is a per-node process, so a worker that spans nodes would shard its keyspace by node. And under PD disaggregation the §3.8 pairs run the linker on the prefill role only, so the decode worker offloads nothing; in aggregated serving the single worker offloads its own KV.
+
+### 3.10 PD disaggregation on GB300 (Mooncake)
+
+The GB300 Pro Official FP4 roles adapt the **1P1D c480** configuration from
+[InferenceX #3187](https://github.com/SemiAnalysisAI/InferenceX/pull/3187).
+The [public recipe at commit 34d06e54](https://github.com/SemiAnalysisAI/InferenceX/blob/34d06e54c7614bb33d2a271b010ffde3ce3fa563/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv4/sglang/gb300-fp4/agentx/disagg-variants.yaml)
+uses `deepseek-ai/DeepSeek-V4-Pro-0813` and
+`lmsysorg/sglang:nightly-dev-cu13-20260916-c9a8fba9`.
+Its [successful public sweep](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/37270628136)
+(attempt 1) ran throughput and GSM8K evaluation with a **Dynamo frontend** and
+session affinity. The cookbook's standalone `sglang serve` commands and SGLang
+router adaptation have **not** been separately validated on GPUs, so these cells
+are marked **Not Verified** and carry no inherited aggregated benchmark results.
+Use the linked public recipe to reproduce the tested Dynamo deployment.
+
+#### Roles and cache settings
+
+Select **GB300 → Pro Official → FP4 → Disagg Prefill → Low-Latency → 2 Nodes**,
+then launch the command on both prefill nodes with ranks 0 and 1. Select
+**Disagg Decode → 4 Nodes** and launch on all four decode nodes with ranks 0–3.
+Each node has four GB300 GPUs. Set **Head node IP** separately for each worker;
+it is the first node of that worker, not the Mooncake master.
+
+Prefill uses TP8/DP8/EP8, a 131072-token prefill chunk, a 17408-token MegaMoE
+per-rank budget, and memory fraction 0.8. Decode uses TP16/DP16/EP16, a
+4096-token MegaMoE budget, and memory fraction 0.9. Both use DSpark with block
+size 6 and draft tokens 7, page size 256, and the FP4 indexer. **W4A4 is enabled
+only on prefill**; decode retains the image's draft MoE activation precision.
+
+The **Unified Cache External Linker** card appears on the GB300 prefill recipe
+and defaults to **enabled, Mooncake**. It adds
+`--hicache-storage-backend-extra-config '{"enable_group_semantics":true}'`.
+Turning it off removes its flags and store environment. Enabling it removes
+HiCache flags because the two cache paths are mutually exclusive. The GB300
+decode recipe does not enable the linker. This UI scope reflects this recipe;
+the linker itself also supports aggregated serving.
+
+#### Mooncake prerequisites
+
+Use the pinned image for the services and workers. Start a master with HTTP
+metadata enabled before any stores or inference workers:
+
+<Accordion title="Start the Mooncake master (on the infrastructure host)">
+
+```bash Command
+mooncake_master --port=50051 \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_port=8080 \
+  --eviction_high_watermark_ratio=0.90
+```
+
+</Accordion>
+
+Start **four separate stores on each decode node**, with ports 8800–8803 and
+180 GB per store. Prefill contributes a 140 GB segment per rank, with
+`MOONCAKE_STANDALONE_STORAGE=0`. The NIC list below is the source recipe's list;
+check that those devices exist on your fabric.
+
+<Accordion title="Start one decode-node store (repeat for ports 8800–8803)">
+
+```bash Command
+export MOONCAKE_MASTER=<master-ip>:50051
+export MOONCAKE_TE_META_DATA_SERVER=http://<master-ip>:8080/metadata
+export MOONCAKE_LOCAL_HOSTNAME=<this-node-fabric-ip>
+export MC_TCP_BIND_ADDRESS=<this-node-fabric-ip>
+export MOONCAKE_PROTOCOL=rdma
+export MOONCAKE_DEVICE=mlx5_0,mlx5_1,mlx5_2,mlx5_3
+export MOONCAKE_GLOBAL_SEGMENT_SIZE=180gb
+export MC_STORE_CLIENT_METRIC_INTERVAL=5
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
+ulimit -n 1048576
+ulimit -l unlimited
+python3 -m mooncake.mooncake_store_service --port 8800
+```
+
+</Accordion>
+
+Wait for every store to be ready; the source recipe permits 600 seconds for
+cold starts. Set **Mooncake master**, **Mooncake metadata**, and **This node
+fabric IP** in the command panel's **Env** dialog on each prefill node. Advertise
+the routable fabric address explicitly: a BMC interface must not become the
+transfer-engine address. Docker output includes host networking, RDMA device
+access, and unlimited memlock.
+
+After both roles are ready, the Playground prints an SGLang router command
+targeting prefill port **30000** and decode port **30100**, with client traffic
+on **8000**. Use its cURL example to reach that frontend. Its routing behavior
+differs from the source recipe's Dynamo session affinity; a successful source
+sweep does not qualify the standalone router adaptation.
