@@ -19,13 +19,14 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
+    kv_private_swa_tokens,
+    kv_private_tokens,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_SANITY_CHECK_CACHE,
     SchedulerStageMetricsRecorder,
@@ -39,6 +40,7 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
 
 
@@ -65,7 +67,7 @@ class SchedulerInvariantChecker:
     get_running_batch: Callable
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
     # The chunked-prefill request parked between chunks is in neither batch;
-    # its uncached tokens must still be counted.
+    # it still owns its KV row.
     get_chunked_req: Callable = field(default=lambda: None)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
@@ -98,7 +100,7 @@ class SchedulerInvariantChecker:
             return False, ""
         if self.is_hybrid_swa:
             protected = self.tree_cache.full_protected_size()
-            session_held = self.pool_stats_observer.session_held_full_tokens()
+            session_held = self.pool_stats_observer.session_held_tokens()
             total = ps.full_capacity
         elif self.is_hybrid_ssm:
             # `total` is the allocator's `.size`: static for non-unified pools,
@@ -269,55 +271,38 @@ class SchedulerInvariantChecker:
         )
         return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
-    def _get_total_uncached_sizes(
-        self,
-    ) -> Tuple[int, int]:
-        """Sum uncached tokens for full and SWA pools across all active batches.
-
-        Returns (full_uncached, swa_uncached). For non-SWA models, swa_uncached is 0.
-
-        For full pool: uncached = allocated - cache_protected_len
-        For SWA pool:  uncached = allocated - max(cache_protected_len, swa_evicted_seqlen)
-        """
-        # After decode: running_batch IS last_batch (same object), count once.
-        # After prefill: they differ, both hold uncached tokens.
-        # Use identity (is / is not), not membership or ==: ScheduleBatch's
-        # dataclass __eq__ compares tensor fields and raises on ambiguous bools.
+    def _requests_owning_rows(self) -> List[Req]:
         last_batch = self.get_last_batch()
         running_batch = self.get_running_batch()
-        batches = [last_batch]
-        if (
-            running_batch is not None
-            and running_batch is not last_batch
-            and not running_batch.is_empty()
-        ):
-            batches.append(running_batch)
-
-        full_uncached = 0
-        swa_uncached = self.tree_cache.swa_transient_size()
-        counted: set[int] = set()
-        reqs = [req for batch in batches for req in batch.reqs]
+        reqs = [] if last_batch is None else list(last_batch.reqs)
+        # After decode running_batch IS last_batch. Compare by identity:
+        # ScheduleBatch's dataclass __eq__ compares tensors and raises.
+        if running_batch is not None and running_batch is not last_batch:
+            reqs += running_batch.reqs
         chunked_req = self.get_chunked_req()
         if chunked_req is not None:
             reqs.append(chunked_req)
+
+        # A request running on a session's record does not own that row.
+        session_kvs = {id(kv) for kv in self.tree_cache.session_records().values()}
+        owners, seen = [], set()
         for req in reqs:
-            if id(req) in counted:
+            if id(req) in seen:
                 continue
-            counted.add(id(req))
-            if not req.kv.holds_kv:
-                continue
+            seen.add(id(req))
+            if req.kv.holds_kv and id(req.kv) not in session_kvs:
+                owners.append(req)
+        return owners
 
-            allocated_len = req.kv.kv_allocated_len
-            if self.page_size > 1:
-                allocated_len = ceil_align(allocated_len, self.page_size)
-                assert req.kv.cache_protected_len % self.page_size == 0
-
-            full_uncached += allocated_len - req.kv.cache_protected_len
+    def _get_total_uncached_sizes(self) -> Tuple[int, int]:
+        """(full, swa) footprint of the KV rows requests own; 0 swa off hybrid-SWA."""
+        full_uncached = 0
+        swa_uncached = self.tree_cache.swa_transient_size()
+        for req in self._requests_owning_rows():
+            assert req.kv.cache_protected_len % self.page_size == 0
+            full_uncached += kv_private_tokens(req.kv, self.page_size)
             if self.is_hybrid_swa:
-                swa_uncached += allocated_len - max(
-                    req.kv.cache_protected_len,
-                    req.kv.get_evicted_seqlen(ComponentType.SWA),
-                )
+                swa_uncached += kv_private_swa_tokens(req.kv, self.page_size)
 
             if req.beam_group is not None:
                 full_uncached += req.beam_group.extra_uncached_tokens()
@@ -370,34 +355,16 @@ class SchedulerInvariantChecker:
         rtt = self.req_to_token_pool.req_to_token
         row_width = rtt.shape[1]
 
-        def _add_owner(req_or_slot, label, rpi, committed, allocated):
-            assert 0 <= committed <= allocated <= row_width
-            owners.append((label, rpi, allocated))
+        def _add_owner(label, kv):
+            assert 0 <= kv.kv_committed_len <= kv.kv_allocated_len <= row_width
+            owners.append((label, kv.req_pool_idx, kv.kv_allocated_len))
 
         owners: list[tuple[str, Optional[int], int]] = []
-        batch = self.get_last_batch()
-        if batch is not None:
-            for req in batch.reqs:
-                if not req.kv.holds_kv:
-                    continue
-                _add_owner(
-                    req,
-                    f"req {req.rid}",
-                    req.kv.req_pool_idx,
-                    req.kv.kv_committed_len,
-                    req.kv.kv_allocated_len,
-                )
-        sess = getattr(self.tree_cache, "slots", None)
-        if sess:
-            for sid, slot in sess.items():
-                if slot.kv.holds_kv:
-                    _add_owner(
-                        slot,
-                        f"slot {sid[:8]}",
-                        slot.kv.req_pool_idx,
-                        slot.kv.kv_committed_len,
-                        slot.kv.kv_allocated_len,
-                    )
+        for req in self._requests_owning_rows():
+            _add_owner(f"req {req.rid}", req.kv)
+        for sid, kv in self.tree_cache.session_records().items():
+            if kv.holds_kv:
+                _add_owner(f"slot {sid[:8]}", kv)
 
         active = [
             (label, rpi, al) for label, rpi, al in owners if rpi is not None and al > 0
