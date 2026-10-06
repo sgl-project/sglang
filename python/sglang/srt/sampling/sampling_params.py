@@ -54,6 +54,17 @@ def check_n(n: Any) -> None:
         raise ValueError(f"n must be an integer in [1, {MAX_N}], got {n}.")
 
 
+def check_beam_n(n: Any) -> None:
+    """Reject a non-positive beam n.
+
+    Beam search does not replicate the prompt, so n is not capped at MAX_N.
+    It is stored as num_return and used as a slice, so 0 drops every sequence
+    and a negative n drops from the end.
+    """
+    if type(n) is not int or n < 1:
+        raise ValueError(f"n must be an integer >= 1, got {n}.")
+
+
 def check_top_logprobs_num(value: Any, vocab_size: int) -> None:
     """Reject a top-logprobs width that torch.topk cannot serve for this vocab."""
     if type(value) is not int or not 0 <= value <= vocab_size:
@@ -255,8 +266,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                 f"top_k must be -1 (disable) or in [1, vocab_size({vocab_size})], "
                 f"got {self.top_k}."
             )
-        # Beam search does not replicate the prompt, so n is not a fan-out count.
-        if not (self.beam_width and self.beam_width > 1):
+        # A positive beam n is not a fan-out count. A non-positive one is
+        # still rejected: it becomes num_return.
+        if self.beam_width and self.beam_width > 1:
+            check_beam_n(self.n)
+        else:
             check_n(self.n)
         if not -2.0 <= self.frequency_penalty <= 2.0:
             raise ValueError(

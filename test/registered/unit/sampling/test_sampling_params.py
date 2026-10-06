@@ -245,6 +245,16 @@ class TestSamplingParamsVerify(CustomTestCase):
         """Beam search does not fan out, so n is not capped at MAX_N."""
         self._make(n=200, beam_width=256).verify(self.VOCAB_SIZE)
 
+    def test_beam_n_below_one_raises(self):
+        """A non-positive beam n is stored as num_return and slices the sequences."""
+        for n in (0, -1):
+            with self.assertRaisesRegex(ValueError, r"n must be an integer >= 1"):
+                self._make(n=n, beam_width=4).verify(self.VOCAB_SIZE)
+
+    def test_beam_n_above_beam_width_passes_verify(self):
+        """n above beam_width is the coordinator's error, not verify's."""
+        self._make(n=8, beam_width=4).verify(self.VOCAB_SIZE)
+
     def test_top_logprobs_num_boundaries_valid(self):
         check_top_logprobs_num(0, self.VOCAB_SIZE)
         check_top_logprobs_num(self.VOCAB_SIZE, self.VOCAB_SIZE)

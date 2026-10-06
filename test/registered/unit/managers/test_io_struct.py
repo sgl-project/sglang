@@ -727,6 +727,20 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req.text, "Hello")
         self.assertEqual(req.parallel_sample_num, 1)
 
+    def test_beam_n_below_one_raises_before_fan_out(self):
+        """A non-positive beam n must 400 before it can become num_return.
+
+        n == 0 would return no sequences. n == -1 would slice from the end.
+        """
+        for n in (0, -1):
+            req = GenerateReqInput(
+                text="Hello",
+                sampling_params={"n": n, "beam_width": 4},
+            )
+            with self.assertRaisesRegex(ValueError, r"n must be an integer >= 1"):
+                req.normalize_batch_and_arguments()
+            self.assertEqual(req.text, "Hello")
+
     def test_tokenized_generate_rejects_top_logprobs_past_vocab(self):
         """The tokenizer call site must reject a k torch.topk cannot serve."""
         from types import SimpleNamespace

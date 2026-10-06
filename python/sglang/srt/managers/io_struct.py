@@ -64,7 +64,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
-from sglang.srt.sampling.sampling_params import SamplingParams, check_n
+from sglang.srt.sampling.sampling_params import SamplingParams, check_beam_n, check_n
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgpack_utils import dec_hook, enc_hook, ext_hook
@@ -541,9 +541,11 @@ class GenerateReqInput:
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
 
-        # Bound n before any list replication. Beam search does not replicate
-        # the prompt, so it is not subject to the fan-out cap.
-        if self._sampling_params_beam_width() <= 1:
+        # Bound n before any list replication. A positive beam n is not a
+        # fan-out count. A non-positive one is still rejected.
+        if self._sampling_params_beam_width() > 1:
+            check_beam_n(n)
+        else:
             check_n(n)
         self.parallel_sample_num = n
 
