@@ -16,9 +16,9 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -618,19 +618,12 @@ class KimiDecoderLayer(nn.Module):
         next_sparse = layer_idx + 1 < config.num_hidden_layers and _is_sparse_layer(
             config, layer_idx + 1
         )
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(sparse=sparse, next_layer_sparse=next_sparse),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=_is_sparse_layer(config, layer_idx - 1),
-                next_layer_sparse=sparse,
-            )
-            if layer_idx != 0
-            else None,
-            terminal=layer_idx == config.num_hidden_layers - 1,
         )
 
     def forward(
