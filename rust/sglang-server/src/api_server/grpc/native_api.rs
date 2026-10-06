@@ -1,7 +1,7 @@
 //! Frontend events to `api.v1` stream items and statuses.
 //!
 //! The typed [`api::GenerateMetaInfo`] built here and the native HTTP
-//! `meta_info` JSON (`http::native_generation::meta_info_value`) read the same
+//! `meta_info` JSON (`http::frame::meta_info_value`) read the same
 //! output columns with the same gating; a column added to one is added to
 //! the other.
 
