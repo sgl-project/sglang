@@ -26,11 +26,11 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
+    get_ulysses_parallel_rank,
+    get_ulysses_parallel_world_size,
 )
-from sglang.multimodal_gen.runtime.layers.attention.layer import (
-    UlyssesAttention,
-    USPAttention,
-)
+from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
+from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
 from sglang.multimodal_gen.runtime.layers.elementwise import GatedResidual2Seg, MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
@@ -165,6 +165,51 @@ def rope_precompute(x, grid_sizes, freqs, start=None):
     return output
 
 
+def ulysses_input_a2a_with_suffix(x, num_rep):
+    """[b, s_local + num_rep, h, d] -> [b, s_global + num_rep, h_local, d].
+
+    The sharded tokens are packed destination-major in one copy and received
+    straight into the output; this rank's heads of the replicated suffix fill
+    the tail. Same values and K/V order as UlyssesAttention(replicated_*),
+    without its stacked-qkv and suffix concatenations.
+    """
+    ws, rank = get_ulysses_parallel_world_size(), get_ulysses_parallel_rank()
+    group = get_sp_group().ulysses_group
+    b, s, h, d = x.shape
+    s_local, h_local = s - num_rep, h // ws
+    send = x[:, :s_local].unflatten(2, (ws, h_local)).permute(2, 0, 1, 3, 4)
+    send = send.contiguous()
+    out = x.new_empty(b, ws * s_local + num_rep, h_local, d)
+    if b == 1:
+        recv = out[:, : ws * s_local].view(ws, 1, s_local, h_local, d)
+        torch.distributed.all_to_all_single(recv, send, group=group)
+    else:
+        recv = torch.empty_like(send)
+        torch.distributed.all_to_all_single(recv, send, group=group)
+        out[:, : ws * s_local].unflatten(1, (ws, s_local)).copy_(recv.transpose(0, 1))
+    out[:, ws * s_local :] = x[:, s_local:, rank * h_local : (rank + 1) * h_local]
+    return out
+
+
+def ulysses_output_a2a_with_suffix(x, num_rep):
+    """[b, s_global + num_rep, h_local, d] -> [b, s_local + num_rep, h, d]."""
+    ws = get_ulysses_parallel_world_size()
+    group = get_sp_group().ulysses_group
+    b, s, h_local, d = x.shape
+    s_local = (s - num_rep) // ws
+    out = x.new_empty(b, s_local + num_rep, ws * h_local, d)
+    send = x[:, : ws * s_local].unflatten(1, (ws, s_local)).transpose(0, 1)
+    send = send.contiguous()
+    recv = torch.empty_like(send)
+    torch.distributed.all_to_all_single(recv, send, group=group)
+    out[:, :s_local].unflatten(2, (ws, h_local)).copy_(recv.permute(1, 2, 0, 3, 4))
+    rep = x[:, ws * s_local :].contiguous()
+    gathered = rep.new_empty((ws,) + tuple(rep.shape))
+    all_gather_single(gathered, rep, group=group)
+    out[:, s_local:].unflatten(2, (ws, h_local)).copy_(gathered.permute(1, 2, 0, 3, 4))
+    return out
+
+
 class WanSelfAttention(nn.Module):
     def __init__(
         self,
@@ -198,12 +243,6 @@ class WanSelfAttention(nn.Module):
             supported_attention_backends=supported_attention_backends,
             skip_sequence_parallel=skip_sequence_parallel,
         )
-        self.ulysses_attn = UlyssesAttention(
-            num_heads=self.local_num_heads,
-            head_size=self.head_dim,
-            causal=False,
-            supported_attention_backends=supported_attention_backends,
-        )
 
     def forward(self, x, seq_lens, grid_sizes, freqs, num_replicated_suffix=0):
         del seq_lens
@@ -224,32 +263,22 @@ class WanSelfAttention(nn.Module):
         v = v.view(b, s, n, d)
         q = rope_apply(q, grid_sizes, freqs)
         k = rope_apply(k, grid_sizes, freqs)
+        # Ulysses + replicated suffix: the minimal-copy exchange below. Ring and
+        # K/V-gather (--kv-gather-degree > 1) take USPAttention, which serves both.
         if (
             num_replicated_suffix > 0
             and get_sp_world_size() > 1
             and get_ring_parallel_world_size() == 1
+            and self.attn.sp_attention_mode == "ulysses"
         ):
-            q_shard, q_rep = (
-                q[:, :-num_replicated_suffix],
-                q[:, -num_replicated_suffix:],
+            q, k, v = (
+                ulysses_input_a2a_with_suffix(t, num_replicated_suffix)
+                for t in (q, k, v)
             )
-            k_shard, k_rep = (
-                k[:, :-num_replicated_suffix],
-                k[:, -num_replicated_suffix:],
+            x = self.attn.attn_impl.forward(
+                q, k, v, get_forward_context().attn_metadata
             )
-            v_shard, v_rep = (
-                v[:, :-num_replicated_suffix],
-                v[:, -num_replicated_suffix:],
-            )
-            x, x_rep = self.ulysses_attn(
-                q_shard,
-                k_shard,
-                v_shard,
-                replicated_q=q_rep,
-                replicated_k=k_rep,
-                replicated_v=v_rep,
-            )
-            x = torch.cat([x, x_rep], dim=1)
+            x = ulysses_output_a2a_with_suffix(x, num_replicated_suffix)
         else:
             x = self.attn(
                 q,
