@@ -36,8 +36,8 @@ use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
     indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::api_server::frontend_error_status;
-use crate::frontend::{FrontendCall, FrontendEvent, FrontendRequest};
+use crate::api_server::core::{CoreCall, CoreEvent, CoreRequest};
+use crate::api_server::core_error_status;
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::ids::Rid;
 use crate::message::response::ChunkExtras;
@@ -204,7 +204,7 @@ async fn chat_completions(
                 .expect("chat prompt exists until the last choice")
                 .clone()
         };
-        let native = FrontendRequest {
+        let native = CoreRequest {
             rid: rid.clone(),
             text: Some(choice_prompt),
             // Rendered templates own their special tokens — the pool must not
@@ -438,7 +438,7 @@ pub(super) fn chat_sampling_params(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn unary_chat(
-    submitted: Vec<(usize, FrontendCall)>,
+    submitted: Vec<(usize, CoreCall)>,
     response_id: String,
     model: String,
     created: u32,
@@ -521,7 +521,7 @@ pub(super) async fn unary_chat(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn chat_event_stream(
-    submitted: Vec<(usize, FrontendCall)>,
+    submitted: Vec<(usize, CoreCall)>,
     response_id: String,
     model: String,
     created: u32,
@@ -582,14 +582,14 @@ pub(super) fn chat_event_stream(
         let mut events = futures::stream::select_all(streams);
         while let Some((index, event)) = events.next().await {
             let output = match event {
-                FrontendEvent::Delta(output) | FrontendEvent::Finished(output) => output,
-                FrontendEvent::Failed(error) => {
+                CoreEvent::Delta(output) | CoreEvent::Finished(output) => output,
+                CoreEvent::Failed(error) => {
                     yield Annotated {
                         data: None,
                         id: None,
                         event: None,
                         comment: None,
-                        error: Some(error_payload(frontend_error_status(&error), error.to_string()).to_string()),
+                        error: Some(error_payload(core_error_status(&error), error.to_string()).to_string()),
                     };
                     continue;
                 }

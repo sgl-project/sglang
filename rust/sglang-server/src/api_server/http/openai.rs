@@ -1,7 +1,7 @@
 //! OpenAI-compatible generation endpoints.
 //!
 //! The HTTP adapter stays deliberately thin: Dynamo owns the standard OpenAI
-//! request and response primitives. [`FrontendOutput`] remains the one backend
+//! request and response primitives. [`CoreOutput`] remains the one backend
 //! output type for both unary and streaming responses.
 
 use axum::{Router, http::StatusCode, response::Response};
@@ -22,10 +22,8 @@ pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
 
 use super::app::AppState;
 use super::frame::OutputAccumulator;
-use crate::api_server::frontend_error_status;
-use crate::frontend::{
-    FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest,
-};
+use crate::api_server::core::{CoreCall, CoreError, CoreEvent, CoreOutput, CoreRequest};
+use crate::api_server::core_error_status;
 use crate::message::config::ServerArgs;
 use crate::tokenizer_manager::tokenizer;
 use crate::utils::response::error_response;
@@ -118,17 +116,17 @@ pub(super) fn openai_error(code: StatusCode, message: impl Into<String>, stream:
 /// Drain one submitted request to its terminal output, fold frames, and map
 /// semantic failures / truncation to `(status, message)` for the OpenAI error
 /// shape. The call owns cancellation and disarms itself.
-async fn collect_output(mut call: FrontendCall) -> Result<FrontendOutput, (StatusCode, String)> {
+async fn collect_output(mut call: CoreCall) -> Result<CoreOutput, (StatusCode, String)> {
     let mut accumulator = OutputAccumulator::default();
     let output = loop {
         match call.recv().await {
-            Some(FrontendEvent::Delta(output)) => accumulator.fold(&output),
-            Some(FrontendEvent::Finished(output)) => {
+            Some(CoreEvent::Delta(output)) => accumulator.fold(&output),
+            Some(CoreEvent::Finished(output)) => {
                 accumulator.fold(&output);
                 break accumulator.into_output();
             }
-            Some(FrontendEvent::Failed(error)) => {
-                let status = frontend_error_status(&error);
+            Some(CoreEvent::Failed(error)) => {
+                let status = core_error_status(&error);
                 return Err((status, error.to_string()));
             }
             None => {
@@ -144,15 +142,15 @@ async fn collect_output(mut call: FrontendCall) -> Result<FrontendOutput, (Statu
 
 async fn submit_generation(
     state: &AppState,
-    request: FrontendRequest,
+    request: CoreRequest,
     stream: bool,
-) -> Result<FrontendCall, Response> {
-    match state.frontend.generate(request).await {
+) -> Result<CoreCall, Response> {
+    match state.core.generate(request).await {
         Ok(call) => Ok(call),
         // Same `error_response` rule: a committed stream gets 200 plus an
         // SSE error frame + `[DONE]`, not a unary 503 — but with the OpenAI
         // error shape, since this is the OpenAI frontend.
-        Err(FrontendError::Unavailable) => Err(openai_error(
+        Err(CoreError::Unavailable) => Err(openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "service unavailable",
             stream,
@@ -167,8 +165,8 @@ async fn submit_generation(
 
 fn indexed_decode_stream(
     index: usize,
-    call: FrontendCall,
-) -> futures::stream::BoxStream<'static, (usize, FrontendEvent)> {
+    call: CoreCall,
+) -> futures::stream::BoxStream<'static, (usize, CoreEvent)> {
     futures::stream::unfold((call, false), move |(mut call, finished)| async move {
         if finished {
             return None;

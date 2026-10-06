@@ -3,7 +3,7 @@
 //! Submodule tests live next to the code they cover: `chat`, `completions`,
 //! `tools`, and `reasoning` each carry their own
 //! `#[cfg(test)] mod tests`. This module keeps the fixtures they all share —
-//! frontend/call fixtures (`frontend`, `chunk`, `submitted`, `chat_submitted`) and the
+//! core/call fixtures (`core_handle`, `chunk`, `submitted`, `chat_submitted`) and the
 //! full-router harness (`server_args`, `app_state`,
 //! `oneshot`, `post_json`, `body_json`) — plus the handler-level tests that
 //! exercise [`routes`] end to end. The helpers are `pub(super)` so sibling
@@ -20,20 +20,20 @@ use serde_json::json;
 use tower::util::ServiceExt;
 
 use super::{indexed_decode_stream, openai_error, routes};
-use crate::frontend::{FrontendCall, FrontendEvent, FrontendHandle};
+use crate::api_server::core::{CoreCall, CoreEvent, CoreHandle};
 use crate::message::config::ServerArgs;
 use crate::message::response::{ChunkEvent, ResponseItem};
-pub(super) fn frontend() -> FrontendHandle {
-    FrontendHandle::new(
+pub(super) fn core_handle() -> CoreHandle {
+    CoreHandle::new(
         flume::unbounded().0,
         flume::unbounded().0,
-        crate::frontend::FrontendConfig {
+        crate::api_server::core::CoreConfig {
             response_capacity: 8,
             response_activity: Default::default(),
             startup_ready: false,
             is_disaggregation: false,
             mm_limits: Default::default(),
-            metadata: crate::frontend::FrontendMetadata::from(server_args().as_ref()),
+            metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
         },
     )
 }
@@ -76,7 +76,7 @@ pub(super) fn submitted(
             index,
             prompt_index,
             echo: String::new(),
-            call: FrontendCall::from_test_generation_parts(rid.into(), rx, flume::unbounded().0),
+            call: CoreCall::from_test_generation_parts(rid.into(), rx, flume::unbounded().0),
         },
         tx,
     )
@@ -86,15 +86,12 @@ pub(super) fn submitted(
 pub(super) fn chat_submitted(
     index: usize,
     rid: &str,
-) -> (
-    (usize, FrontendCall),
-    tokio::sync::mpsc::Sender<ResponseItem>,
-) {
+) -> ((usize, CoreCall), tokio::sync::mpsc::Sender<ResponseItem>) {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     (
         (
             index,
-            FrontendCall::from_test_generation_parts(rid.into(), rx, flume::unbounded().0),
+            CoreCall::from_test_generation_parts(rid.into(), rx, flume::unbounded().0),
         ),
         tx,
     )
@@ -107,31 +104,31 @@ pub(super) fn server_args() -> Arc<ServerArgs> {
     })
 }
 
-pub(super) fn app_state(frontend: FrontendHandle) -> Arc<super::AppState> {
+pub(super) fn app_state(core: CoreHandle) -> Arc<super::AppState> {
     Arc::new(super::AppState {
-        frontend,
+        core,
         server_args: server_args(),
         chat_formatter: None,
     })
 }
 
-pub(super) fn frontend_closed() -> FrontendHandle {
-    // Dropping the receivers makes frontend admission report the shutdown
+pub(super) fn frontend_closed() -> CoreHandle {
+    // Dropping the receivers makes core admission report the shutdown
     // state as a 503.
     let (tm_tx, tm_rx) = flume::unbounded();
     drop(tm_rx);
     let (abort_tx, abort_rx) = flume::unbounded();
     drop(abort_rx);
-    FrontendHandle::new(
+    CoreHandle::new(
         tm_tx,
         abort_tx,
-        crate::frontend::FrontendConfig {
+        crate::api_server::core::CoreConfig {
             response_capacity: 8,
             response_activity: Default::default(),
             startup_ready: false,
             is_disaggregation: false,
             mm_limits: Default::default(),
-            metadata: crate::frontend::FrontendMetadata::from(server_args().as_ref()),
+            metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
         },
     )
 }
@@ -166,13 +163,13 @@ async fn dropping_indexed_stream_aborts_its_live_call() {
 
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(8);
     let (abort_tx, abort_rx) = flume::unbounded();
-    let call = FrontendCall::from_test_generation_parts("live".into(), response_rx, abort_tx);
+    let call = CoreCall::from_test_generation_parts("live".into(), response_rx, abort_tx);
     let mut stream = indexed_decode_stream(0, call);
 
     response_tx.send(chunk("live", "x", false)).await.unwrap();
     assert!(matches!(
         stream.next().await,
-        Some((0, FrontendEvent::Delta(_)))
+        Some((0, CoreEvent::Delta(_)))
     ));
 
     drop(stream);
@@ -217,7 +214,7 @@ async fn openai_error_response_covers_unary_and_sse() {
 
 #[tokio::test]
 async fn completions_handler_validates_before_submit() {
-    let app = routes().with_state(app_state(frontend()));
+    let app = routes().with_state(app_state(core_handle()));
     let cases = [
         (json!({"model": "other", "prompt": "hi"}), "unknown model"),
         (json!({"model": "model", "prompt": "hi", "n": 0}), "n=0"),
@@ -265,7 +262,7 @@ async fn completions_handler_validates_before_submit() {
 
 #[tokio::test]
 async fn chat_handler_validates_before_submit() {
-    let app = routes().with_state(app_state(frontend()));
+    let app = routes().with_state(app_state(core_handle()));
     let cases = [
         (
             json!({"model": "other", "messages": [{"role": "user", "content": "hi"}]}),
@@ -309,7 +306,7 @@ async fn chat_handler_validates_before_submit() {
 
 #[tokio::test]
 async fn basic_openai_router_excludes_responses_api() {
-    let app = routes().with_state(app_state(frontend()));
+    let app = routes().with_state(app_state(core_handle()));
     let response = post_json(app, "/v1/responses", json!({"input": "hi"})).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }

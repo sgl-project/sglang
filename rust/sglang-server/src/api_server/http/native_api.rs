@@ -4,7 +4,7 @@
 //! `http_server.generate_request`) and `/health` + `/health_generate` (which
 //! round-trip a 1-token generate probe). Frame shaping (`meta_info`, logprob
 //! tuples, cumulative vs incremental streams) lives here; submission and
-//! request lifetime belong to the shared [`crate::frontend::FrontendHandle`].
+//! request lifetime belong to the shared [`crate::api_server::core::CoreHandle`].
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -14,11 +14,10 @@ use super::app::AppState;
 use super::frame::{
     OutputAccumulator, cumulative_frame_string, frame_value, stream_frame_string, tag_value,
 };
-use crate::api_server::frontend_error_status;
-use crate::frontend::{
-    FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest, HealthStatus,
-    recv_indexed,
+use crate::api_server::core::{
+    CoreCall, CoreError, CoreEvent, CoreOutput, CoreRequest, HealthStatus, recv_indexed,
 };
+use crate::api_server::core_error_status;
 #[cfg(test)]
 use crate::message::ids::Rid;
 use crate::message::request::into_requests;
@@ -92,8 +91,8 @@ pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Res
     error_response(code, error_value(code.as_u16(), message), stream)
 }
 
-fn native_frontend_error(error: FrontendError, stream: bool) -> Response {
-    native_error(frontend_error_status(&error), &error.to_string(), stream)
+fn native_core_error(error: CoreError, stream: bool) -> Response {
+    native_error(core_error_status(&error), &error.to_string(), stream)
 }
 
 /// `/health` + `/health_generate`. Both env knobs are resolved ONCE here, at
@@ -119,7 +118,7 @@ fn health_routes() -> Router<Arc<AppState>> {
 }
 
 async fn health_without_generation(State(state): State<Arc<AppState>>) -> Response {
-    if state.frontend.is_ready() {
+    if state.core.is_ready() {
         StatusCode::OK.into_response()
     } else {
         StatusCode::SERVICE_UNAVAILABLE.into_response()
@@ -134,19 +133,19 @@ async fn health_without_generation(State(state): State<Arc<AppState>>) -> Respon
 ///
 /// Fires a pre-tokenized 1-token probe (`input_ids = [0]`, skips the tokenizer) so
 /// an idle pipeline produces a frame, then watches the *global*
-/// frontend response-activity counter (not the probe's own rid) — so a busy
+/// core response-activity counter (not the probe's own rid) — so a busy
 /// server passes immediately and a backlog never false-503s (the analogue of
 /// Python's `last_receive_tstamp`).
 async fn health_generate(
     State(state): State<Arc<AppState>>,
     timeout: std::time::Duration,
 ) -> Response {
-    match state.frontend.probe_health(timeout).await {
+    match state.core.probe_health(timeout).await {
         Ok(HealthStatus::Healthy) => StatusCode::OK.into_response(),
         Ok(HealthStatus::NotReady | HealthStatus::Stalled) => {
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
-        Err(FrontendError::Unavailable) => native_error(
+        Err(CoreError::Unavailable) => native_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "service unavailable",
             false,
@@ -205,7 +204,7 @@ async fn generate(
     // equivalent boundary: into_requests() has normalized the body, while prefetch
     // and every downstream stage are still ahead of us.
     let timing = RequestTiming::new();
-    // Shared frontend admission performs media I/O (URL downloads, file reads)
+    // Shared core admission performs media I/O (URL downloads, file reads)
     // on this async runtime before any request reaches the MM worker pool.
     if !is_batch {
         // `into_requests` guarantees exactly one payload for a non-batch body.
@@ -223,15 +222,15 @@ async fn generate(
 /// SSE frames or fold to one unary response.
 async fn generate_single(
     state: &AppState,
-    req: FrontendRequest,
+    req: CoreRequest,
     stream: bool,
     timing: RequestTiming,
 ) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // `frame_value` just reads them — no tokenizer needed here.
-    let mut call = match state.frontend.generate(req).await {
+    let mut call = match state.core.generate(req).await {
         Ok(call) => call,
-        Err(error) => return native_frontend_error(error, stream),
+        Err(error) => return native_core_error(error, stream),
     };
     let rid = call.public_id().to_owned();
     // Cumulative frames (SGLang default) vs per-step deltas.
@@ -245,7 +244,7 @@ async fn generate_single(
             .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(s).into_response()
     } else {
-        // Unary: fold to the terminal and respond once. `FrontendCall` disarms
+        // Unary: fold to the terminal and respond once. `CoreCall` disarms
         // itself on a terminal item; truncation leaves it armed for drop cleanup.
         let (status, value) = drain_unary(&mut call, &rid, timing).await;
         (status, Json(value)).into_response()
@@ -254,18 +253,18 @@ async fn generate_single(
 
 /// Fold a unary request to its terminal HTTP result. Shared by single + batch.
 async fn drain_unary(
-    call: &mut FrontendCall,
+    call: &mut CoreCall,
     rid_str: &str,
     mut timing: RequestTiming,
 ) -> (StatusCode, serde_json::Value) {
     let mut acc = OutputAccumulator::default();
     while let Some(item) = call.recv().await {
         match item {
-            FrontendEvent::Delta(out) => {
+            CoreEvent::Delta(out) => {
                 timing.observe_first_output();
                 acc.fold(&out);
             }
-            FrontendEvent::Finished(out) => {
+            CoreEvent::Finished(out) => {
                 timing.observe_first_output();
                 timing.finish();
                 acc.fold(&out);
@@ -274,14 +273,14 @@ async fn drain_unary(
                 add_e2e_latency(&mut value, &timing);
                 return (StatusCode::OK, value);
             }
-            FrontendEvent::Failed(error) => {
+            CoreEvent::Failed(error) => {
                 timing.finish();
-                let status = frontend_error_status(&error);
+                let status = core_error_status(&error);
                 return (status, error_value(status.as_u16(), &error.to_string()));
             }
         }
     }
-    // Defensive fallback: FrontendCall normally turns premature runtime
+    // Defensive fallback: CoreCall normally turns premature runtime
     // termination into a terminal Failed event before exposing stream end.
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -297,19 +296,19 @@ async fn drain_unary(
 /// own `{ "error": … }` entry; the batch response is 200.
 async fn generate_batch(
     state: &AppState,
-    requests: Vec<FrontendRequest>,
+    requests: Vec<CoreRequest>,
     stream: bool,
     timing: RequestTiming,
 ) -> Response {
     // No cross-item rid collision to worry about: `into_requests` rejected duplicate
     // rids within this batch, and `Rid::from_client` made each one unique against
     // every other in-flight request.
-    let calls = match state.frontend.generate_batch(requests).await {
+    let calls = match state.core.generate_batch(requests).await {
         Ok(calls) => calls
             .into_iter()
             .map(|call| (call, timing.clone()))
             .collect(),
-        Err(error) => return native_frontend_error(error, stream),
+        Err(error) => return native_core_error(error, stream),
     };
 
     if stream {
@@ -340,7 +339,7 @@ async fn generate_batch(
 /// each frame (batch only), `incremental` = delta vs cumulative. Each call
 /// aborts itself if the stream is dropped while it is unfinished.
 fn generation_event_stream(
-    calls: Vec<(FrontendCall, RequestTiming)>,
+    calls: Vec<(CoreCall, RequestTiming)>,
     incremental: bool,
     with_index: bool,
 ) -> impl futures::Stream<Item = String> {
@@ -372,7 +371,7 @@ fn generation_event_stream(
         while let Some((i, call, items)) = futs.next().await {
             if items.is_empty() {
                 // Defensive fallback: a premature runtime close is normally a
-                // Failed event produced by FrontendCall. Keep this item's call
+                // Failed event produced by CoreCall. Keep this item's call
                 // armed if its semantic stream somehow ends unexpectedly.
                 yield tag_value(error_value(500, "response truncated before completion"), idx(i));
                 continue;
@@ -386,7 +385,7 @@ fn generation_event_stream(
 
             for item in items {
                 match item {
-                    FrontendEvent::Delta(out) => {
+                    CoreEvent::Delta(out) => {
                         timings[i].observe_first_output();
                         accs[i].fold(&out);
                         if incremental {
@@ -395,13 +394,13 @@ fn generation_event_stream(
                             coalesced = true;
                         }
                     }
-                    FrontendEvent::Finished(out) => {
+                    CoreEvent::Finished(out) => {
                         timings[i].observe_first_output();
                         timings[i].finish();
                         accs[i].fold(&out);
                         terminal = Some(out);
                     }
-                    FrontendEvent::Failed(error) => {
+                    CoreEvent::Failed(error) => {
                         timings[i].finish();
                         failed = Some(error);
                     }
@@ -409,7 +408,7 @@ fn generation_event_stream(
             }
 
             if let Some(error) = failed {
-                let status = frontend_error_status(&error);
+                let status = core_error_status(&error);
                 yield tag_value(error_value(status.as_u16(), &error.to_string()), idx(i));
             } else if let Some(out) = terminal {
                 // The final frame carries the full cumulative state, so any
@@ -436,7 +435,7 @@ fn generation_event_stream(
 /// Python's `e2e_latency` is `finished_time - created_time`, in seconds, and is
 /// attached only when the request finishes. The Rust native API owns the same
 /// lifecycle boundary, so it adds the value while handling the terminal egress
-/// item rather than putting API-only timing onto every shared frontend output.
+/// item rather than putting API-only timing onto every shared core output.
 fn add_e2e_latency(value: &mut serde_json::Value, timing: &RequestTiming) {
     let (time_to_first_token, e2e_latency) = timing
         .terminal_latencies()
@@ -449,7 +448,7 @@ fn add_e2e_latency(value: &mut serde_json::Value, timing: &RequestTiming) {
 /// memoized fast path; the one terminal frame uses the Value path so it can carry
 /// the request-local `e2e_latency`, exactly as Python does.
 fn terminal_stream_frame_string(
-    out: FrontendOutput,
+    out: CoreOutput,
     acc: &OutputAccumulator,
     incremental: bool,
     rid_str: &str,
@@ -500,7 +499,7 @@ mod tests {
         serde_json::from_str(s).expect("frame is JSON")
     }
 
-    fn timed_call(rid: u64, rx: mpsc::Receiver<ResponseItem>) -> (FrontendCall, RequestTiming) {
+    fn timed_call(rid: u64, rx: mpsc::Receiver<ResponseItem>) -> (CoreCall, RequestTiming) {
         timed_call_with_abort(rid, rx, flume::unbounded().0)
     }
 
@@ -508,9 +507,9 @@ mod tests {
         rid: u64,
         rx: mpsc::Receiver<ResponseItem>,
         abort_tx: flume::Sender<crate::tokenizer_manager::wiring::AbortSource>,
-    ) -> (FrontendCall, RequestTiming) {
+    ) -> (CoreCall, RequestTiming) {
         (
-            FrontendCall::from_test_generation_parts(Rid::from(rid.to_string()), rx, abort_tx),
+            CoreCall::from_test_generation_parts(Rid::from(rid.to_string()), rx, abort_tx),
             RequestTiming {
                 created_at: Instant::now() - Duration::from_millis(10),
                 time_to_first_token: None,
@@ -524,16 +523,16 @@ mod tests {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
         let state = Arc::new(AppState {
-            frontend: crate::frontend::FrontendHandle::new(
+            core: crate::api_server::core::CoreHandle::new(
                 intake_tx,
                 abort_tx,
-                crate::frontend::FrontendConfig {
+                crate::api_server::core::CoreConfig {
                     response_capacity: 8,
                     response_activity: Default::default(),
                     startup_ready: false,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
-                    metadata: crate::frontend::FrontendMetadata::default(),
+                    metadata: crate::api_server::core::CoreMetadata::default(),
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
@@ -550,20 +549,20 @@ mod tests {
     async fn unary_http_generate_round_trips_through_frontend_handle() {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
-        let frontend = crate::frontend::FrontendHandle::new(
+        let core = crate::api_server::core::CoreHandle::new(
             intake_tx,
             abort_tx,
-            crate::frontend::FrontendConfig {
+            crate::api_server::core::CoreConfig {
                 response_capacity: 8,
                 response_activity: Default::default(),
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
-                metadata: crate::frontend::FrontendMetadata::default(),
+                metadata: crate::api_server::core::CoreMetadata::default(),
             },
         );
         let state = Arc::new(AppState {
-            frontend,
+            core,
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
             chat_formatter: None,
         });
@@ -571,7 +570,7 @@ mod tests {
         let responder = tokio::spawn(async move {
             let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
             else {
-                panic!("HTTP generation must enter through frontend intake");
+                panic!("HTTP generation must enter through core intake");
             };
             assert!(admission.try_accept());
             let RequestKind::Generate(generate) = &request.kind else {
@@ -672,11 +671,8 @@ mod tests {
         }))
         .await
         .unwrap();
-        let mut call = FrontendCall::from_test_generation_parts(
-            "internal-rid".into(),
-            rx,
-            flume::unbounded().0,
-        );
+        let mut call =
+            CoreCall::from_test_generation_parts("internal-rid".into(), rx, flume::unbounded().0);
 
         let timing = RequestTiming {
             created_at: Instant::now() - Duration::from_millis(20),

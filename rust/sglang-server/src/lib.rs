@@ -12,10 +12,8 @@
 //! a `PyObject`.
 
 mod api_server;
-mod frontend;
 mod message;
 mod multi_modality;
-mod native_generation;
 mod tokenizer_manager;
 mod utils;
 

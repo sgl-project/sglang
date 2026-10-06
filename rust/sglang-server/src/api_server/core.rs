@@ -1,7 +1,7 @@
-//! Transport-neutral entry point into the Rust frontend pipeline.
+//! Transport-neutral core shared by the API adapters: the entry point into the Rust request pipeline.
 //!
-//! Wire adapters normalize their protocol into [`FrontendRequest`], submit it
-//! through [`FrontendHandle`], and render semantic [`FrontendEvent`]s for their
+//! Wire adapters normalize their protocol into [`CoreRequest`], submit it
+//! through [`CoreHandle`], and render semantic [`CoreEvent`]s for their
 //! own transport. This module owns shared preprocessing, runtime translation,
 //! capabilities, and request lifetime; it deliberately knows nothing about
 //! Axum, HTTP response shapes, Tonic, or protobuf.
@@ -31,28 +31,28 @@ mod contract;
 mod prefetch;
 
 pub(crate) use contract::{
-    FrontendError, FrontendErrorKind, FrontendEvent, FrontendOutput, FrontendRequest, HealthStatus,
-    InternalState, ModelInfo, ServerInfo,
+    CoreError, CoreErrorKind, CoreEvent, CoreOutput, CoreRequest, HealthStatus, InternalState,
+    ModelInfo, ServerInfo,
 };
 
 /// Sentinel host that makes the KV connector no-op. Parity with
 /// `sglang.srt.disaggregation.utils.FAKE_BOOTSTRAP_HOST`.
 const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
 
-pub(crate) struct FrontendConfig {
+pub(crate) struct CoreConfig {
     pub(crate) response_capacity: usize,
     pub(crate) response_activity: ActivityCounter,
     pub(crate) startup_ready: bool,
     pub(crate) is_disaggregation: bool,
     pub(crate) mm_limits: BTreeMap<String, usize>,
-    pub(crate) metadata: FrontendMetadata,
+    pub(crate) metadata: CoreMetadata,
 }
 
-/// Immutable, transport-independent metadata retained by the frontend.
+/// Immutable, transport-independent metadata retained by the core.
 /// Keeping this snapshot narrow avoids making adapters or the shared handle
 /// depend on the full launch-configuration object.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct FrontendMetadata {
+pub(crate) struct CoreMetadata {
     model_path: String,
     served_model_name: String,
     tokenizer_path: String,
@@ -67,7 +67,7 @@ pub(crate) struct FrontendMetadata {
     version: String,
 }
 
-impl From<&ServerArgs> for FrontendMetadata {
+impl From<&ServerArgs> for CoreMetadata {
     fn from(args: &ServerArgs) -> Self {
         Self {
             model_path: args.model_path.clone(),
@@ -86,12 +86,12 @@ impl From<&ServerArgs> for FrontendMetadata {
     }
 }
 
-/// Cloneable capability for submitting work to the existing frontend runtime.
+/// Cloneable capability for submitting work to the runtime pipeline.
 ///
 /// Only the runtime constructs this handle. Protocol adapters receive clones;
 /// they cannot reach the raw stage wiring directly.
 #[derive(Clone)]
-pub(crate) struct FrontendHandle {
+pub(crate) struct CoreHandle {
     inner: Arc<FrontendInner>,
 }
 
@@ -103,14 +103,14 @@ struct FrontendInner {
     startup_ready: AtomicBool,
     is_disaggregation: bool,
     mm_limits: BTreeMap<String, usize>,
-    metadata: FrontendMetadata,
+    metadata: CoreMetadata,
 }
 
-impl FrontendHandle {
+impl CoreHandle {
     pub(crate) fn new(
         intake_tx: flume::Sender<TmEvent>,
         abort_tx: flume::Sender<AbortSource>,
-        config: FrontendConfig,
+        config: CoreConfig,
     ) -> Self {
         Self {
             inner: Arc::new(FrontendInner {
@@ -141,15 +141,12 @@ impl FrontendHandle {
         self.inner.response_activity.load(Ordering::Relaxed)
     }
 
-    pub(crate) async fn generate(
-        &self,
-        mut request: FrontendRequest,
-    ) -> Result<FrontendCall, FrontendError> {
+    pub(crate) async fn generate(&self, mut request: CoreRequest) -> Result<CoreCall, CoreError> {
         self.prepare_generations(std::slice::from_mut(&mut request))
             .await?;
         self.submit(RequestKind::Generate(Box::new(request)))
             .await
-            .map(FrontendCall::new)
+            .map(CoreCall::new)
     }
 
     /// Preprocess and submit a group atomically from the adapter's perspective:
@@ -158,8 +155,8 @@ impl FrontendHandle {
     /// the already-created calls aborts those accepted requests.
     pub(crate) async fn generate_batch(
         &self,
-        mut requests: Vec<FrontendRequest>,
-    ) -> Result<Vec<FrontendCall>, FrontendError> {
+        mut requests: Vec<CoreRequest>,
+    ) -> Result<Vec<CoreCall>, CoreError> {
         self.prepare_generations(&mut requests).await?;
 
         let mut calls = Vec::with_capacity(requests.len());
@@ -167,19 +164,16 @@ impl FrontendHandle {
             calls.push(
                 self.submit(RequestKind::Generate(Box::new(request)))
                     .await
-                    .map(FrontendCall::new)?,
+                    .map(CoreCall::new)?,
             );
         }
         Ok(calls)
     }
 
-    async fn prepare_generations(
-        &self,
-        requests: &mut [FrontendRequest],
-    ) -> Result<(), FrontendError> {
+    async fn prepare_generations(&self, requests: &mut [CoreRequest]) -> Result<(), CoreError> {
         prefetch::prefetch_all(requests, &self.inner.mm_limits)
             .await
-            .map_err(FrontendError::InvalidArgument)
+            .map_err(CoreError::InvalidArgument)
     }
 
     /// Return static model metadata without exposing the full launch config.
@@ -201,8 +195,8 @@ impl FrontendHandle {
 
     /// Return public server metadata with the current scheduler metrics.
     /// Raw control bytes and the scheduler's full launch-argument dump never
-    /// cross the frontend boundary.
-    pub(crate) async fn server_info(&self) -> Result<ServerInfo, FrontendError> {
+    /// cross the core boundary.
+    pub(crate) async fn server_info(&self) -> Result<ServerInfo, CoreError> {
         let internal_state = self.internal_state().await?;
         let metadata = &self.inner.metadata;
         Ok(ServerInfo {
@@ -217,7 +211,7 @@ impl FrontendHandle {
         })
     }
 
-    async fn internal_state(&self) -> Result<InternalState, FrontendError> {
+    async fn internal_state(&self) -> Result<InternalState, CoreError> {
         let bytes = self
             .control(ControlRequest::GetInternalStateReq(
                 GetInternalStateReq::new(Rid::new().to_string()),
@@ -226,58 +220,54 @@ impl FrontendHandle {
         rmp_serde::from_slice::<InternalStateEnvelope>(&bytes)
             .map(|response| response.internal_state)
             .map_err(|error| {
-                FrontendError::InvalidResponse(format!("invalid internal-state response: {error}"))
+                CoreError::InvalidResponse(format!("invalid internal-state response: {error}"))
             })
     }
 
-    async fn control(&self, request: ControlRequest) -> Result<bytes::Bytes, FrontendError> {
+    async fn control(&self, request: ControlRequest) -> Result<bytes::Bytes, CoreError> {
         let mut call = self.submit(RequestKind::Control(Box::new(request))).await?;
         match call.recv().await {
             Some(ResponseItem::Control(bytes)) => Ok(bytes),
             Some(ResponseItem::Error(error)) => Err(translate_runtime_error(error)),
-            Some(_) => Err(FrontendError::InvalidResponse(
+            Some(_) => Err(CoreError::InvalidResponse(
                 "unexpected generation output for control request".into(),
             )),
-            None => Err(FrontendError::ResponseTruncated),
+            None => Err(CoreError::ResponseTruncated),
         }
     }
 
     /// Decode token IDs into text without exposing the runtime's byte payload.
-    pub(crate) async fn detokenize(&self, token_ids: TokenIds) -> Result<String, FrontendError> {
+    pub(crate) async fn detokenize(&self, token_ids: TokenIds) -> Result<String, CoreError> {
         let mut call = self.submit(RequestKind::Detokenize { token_ids }).await?;
         let bytes = match call.recv().await {
             Some(ResponseItem::Data(bytes)) => bytes,
             Some(ResponseItem::Error(Error::Validation(message))) => {
-                return Err(FrontendError::InvalidArgument(message));
+                return Err(CoreError::InvalidArgument(message));
             }
             Some(ResponseItem::Error(error)) => return Err(translate_runtime_error(error)),
             Some(_) => {
-                return Err(FrontendError::InvalidResponse(
+                return Err(CoreError::InvalidResponse(
                     "unexpected output for detokenize request".into(),
                 ));
             }
             None => {
-                return Err(FrontendError::Internal("reply channel closed".into()));
+                return Err(CoreError::Internal("reply channel closed".into()));
             }
         };
-        String::from_utf8(bytes.to_vec()).map_err(|_| {
-            FrontendError::InvalidResponse("detokenized prompt is not valid UTF-8".into())
-        })
+        String::from_utf8(bytes.to_vec())
+            .map_err(|_| CoreError::InvalidResponse("detokenized prompt is not valid UTF-8".into()))
     }
 
     /// Confirm that scheduler output is moving. The response heartbeat is the
     /// signal rather than this probe's own result, matching Python's
     /// `last_receive_tstamp` behavior on a busy server.
-    pub(crate) async fn probe_health(
-        &self,
-        timeout: Duration,
-    ) -> Result<HealthStatus, FrontendError> {
+    pub(crate) async fn probe_health(&self, timeout: Duration) -> Result<HealthStatus, CoreError> {
         if !self.is_ready() {
             return Ok(HealthStatus::NotReady);
         }
 
         let baseline = self.response_activity();
-        let probe = FrontendRequest {
+        let probe = CoreRequest {
             rid: Rid::new_health_check(),
             input_ids: Some(vec![0]),
             sampling_params: SamplingParams {
@@ -315,7 +305,7 @@ impl FrontendHandle {
     /// The async send preserves TokenizerManager inbox backpressure. Once the
     /// request is accepted, the returned call owns cancellation until it
     /// observes a terminal response.
-    async fn submit(&self, kind: RequestKind) -> Result<RuntimeCall, FrontendError> {
+    async fn submit(&self, kind: RequestKind) -> Result<RuntimeCall, CoreError> {
         let rid = request_rid(&kind);
         let expected_response = ExpectedResponse::for_request(&kind);
         let (response_tx, response_rx) = mpsc::channel(self.inner.response_capacity);
@@ -349,21 +339,21 @@ impl FrontendHandle {
             // Disarm before returning the transport-neutral rejection.
             call.in_flight = false;
             tracing::error!(%rid, "tm inbox closed; request rejected");
-            return Err(FrontendError::Unavailable);
+            return Err(CoreError::Unavailable);
         }
 
         Ok(call)
     }
 }
 
-fn translate_runtime_error(error: Error) -> FrontendError {
+fn translate_runtime_error(error: Error) -> CoreError {
     match error {
         Error::Validation(message) => {
-            FrontendError::InvalidArgument(format!("validation failed: {message}"))
+            CoreError::InvalidArgument(format!("validation failed: {message}"))
         }
-        Error::QueueFull => FrontendError::Overloaded("to_scheduler channel full".into()),
-        Error::Disconnected => FrontendError::Cancelled("client disconnected".into()),
-        error => FrontendError::Internal(error.to_string()),
+        Error::QueueFull => CoreError::Overloaded("to_scheduler channel full".into()),
+        Error::Disconnected => CoreError::Cancelled("client disconnected".into()),
+        error => CoreError::Internal(error.to_string()),
     }
 }
 
@@ -372,12 +362,12 @@ fn translate_runtime_error(error: Error) -> FrontendError {
 /// Runtime response variants are translated here so adapters cannot depend on
 /// scheduler/control encodings. Dropping an unfinished call retains the
 /// cancellation guarantees owned by [`RuntimeCall`].
-pub(crate) struct FrontendCall {
+pub(crate) struct CoreCall {
     runtime: RuntimeCall,
     events_finished: bool,
 }
 
-impl FrontendCall {
+impl CoreCall {
     fn new(runtime: RuntimeCall) -> Self {
         Self {
             runtime,
@@ -393,14 +383,14 @@ impl FrontendCall {
     /// Receive the next semantic event. A runtime channel that closes before a
     /// terminal response is converted into one terminal failure event; adapters
     /// never need to infer whether an empty runtime channel means success.
-    pub(crate) async fn recv(&mut self) -> Option<FrontendEvent> {
+    pub(crate) async fn recv(&mut self) -> Option<CoreEvent> {
         if self.events_finished {
             return None;
         }
 
         let event = match self.runtime.recv().await {
             Some(item) => generation_event(item),
-            None => FrontendEvent::Failed(FrontendError::Internal(
+            None => CoreEvent::Failed(CoreError::Internal(
                 "response truncated before completion".into(),
             )),
         };
@@ -410,7 +400,7 @@ impl FrontendCall {
 
     /// Append every semantic event that is ready without waiting. Channel
     /// emptiness and closure remain private runtime details.
-    pub(crate) fn drain_ready(&mut self, events: &mut Vec<FrontendEvent>) {
+    pub(crate) fn drain_ready(&mut self, events: &mut Vec<CoreEvent>) {
         while !self.events_finished {
             let event = match self.runtime.try_recv() {
                 Ok(item) => generation_event(item),
@@ -452,8 +442,8 @@ impl FrontendCall {
 /// stream was already exhausted. Shared by the HTTP and gRPC batch multiplexers.
 pub(crate) async fn recv_indexed(
     index: usize,
-    mut call: FrontendCall,
-) -> (usize, FrontendCall, Vec<FrontendEvent>) {
+    mut call: CoreCall,
+) -> (usize, CoreCall, Vec<CoreEvent>) {
     let mut items = Vec::new();
     match call.recv().await {
         Some(item) => items.push(item),
@@ -463,39 +453,39 @@ pub(crate) async fn recv_indexed(
     (index, call, items)
 }
 
-fn generation_event(item: ResponseItem) -> FrontendEvent {
+fn generation_event(item: ResponseItem) -> CoreEvent {
     match item {
-        ResponseItem::Frame(output) => FrontendEvent::Delta(output.into()),
+        ResponseItem::Frame(output) => CoreEvent::Delta(output.into()),
         ResponseItem::Done(output) => {
             if let Some((legacy_http_status, message)) = output
                 .finish_reason
                 .as_ref()
                 .and_then(|reason| reason.abort_status())
             {
-                FrontendEvent::Failed(FrontendError::from_runtime_rejection(
+                CoreEvent::Failed(CoreError::from_runtime_rejection(
                     message.to_owned(),
                     legacy_http_status,
                 ))
             } else {
-                FrontendEvent::Finished(output.into())
+                CoreEvent::Finished(output.into())
             }
         }
-        ResponseItem::Error(error) => FrontendEvent::Failed(translate_runtime_error(error)),
-        ResponseItem::Control(_) | ResponseItem::Data(_) => FrontendEvent::Failed(
-            FrontendError::InvalidResponse("unexpected non-generation response".into()),
+        ResponseItem::Error(error) => CoreEvent::Failed(translate_runtime_error(error)),
+        ResponseItem::Control(_) | ResponseItem::Data(_) => CoreEvent::Failed(
+            CoreError::InvalidResponse("unexpected non-generation response".into()),
         ),
     }
 }
 
 /// Private scheduler response envelope. This MessagePack shape is decoded at
-/// the runtime boundary and deliberately is not part of the frontend contract.
+/// the runtime boundary and deliberately is not part of the core contract.
 #[derive(serde::Deserialize)]
 struct InternalStateEnvelope {
     #[serde(default)]
     internal_state: InternalState,
 }
 
-/// Runtime-facing request guard kept private behind [`FrontendCall`].
+/// Runtime-facing request guard kept private behind [`CoreCall`].
 ///
 /// This type is the only owner of the raw response channel and admission/abort
 /// capabilities. It is also used directly by typed unary operations such as
@@ -592,7 +582,7 @@ mod tests {
     use crate::message::response::ChunkEvent;
 
     struct Harness {
-        handle: FrontendHandle,
+        handle: CoreHandle,
         intake_rx: flume::Receiver<TmEvent>,
         abort_rx: flume::Receiver<AbortSource>,
     }
@@ -613,7 +603,7 @@ mod tests {
         intake_tx: flume::Sender<TmEvent>,
         abort_tx: flume::Sender<AbortSource>,
         response_capacity: usize,
-    ) -> FrontendHandle {
+    ) -> CoreHandle {
         configured_handle(
             intake_tx,
             abort_tx,
@@ -633,17 +623,17 @@ mod tests {
         startup_ready: bool,
         is_disaggregation: bool,
         mm_limits: BTreeMap<String, usize>,
-    ) -> FrontendHandle {
-        FrontendHandle::new(
+    ) -> CoreHandle {
+        CoreHandle::new(
             intake_tx,
             abort_tx,
-            FrontendConfig {
+            CoreConfig {
                 response_capacity,
                 response_activity,
                 startup_ready,
                 is_disaggregation,
                 mm_limits,
-                metadata: FrontendMetadata::default(),
+                metadata: CoreMetadata::default(),
             },
         )
     }
@@ -717,44 +707,44 @@ mod tests {
     fn runtime_errors_become_transport_neutral_categories() {
         assert!(matches!(
             translate_runtime_error(Error::Validation("bad input".into())),
-            FrontendError::InvalidArgument(message)
+            CoreError::InvalidArgument(message)
                 if message == "validation failed: bad input"
         ));
         assert!(matches!(
             translate_runtime_error(Error::QueueFull),
-            FrontendError::Overloaded(message) if message == "to_scheduler channel full"
+            CoreError::Overloaded(message) if message == "to_scheduler channel full"
         ));
         assert!(matches!(
             translate_runtime_error(Error::Disconnected),
-            FrontendError::Cancelled(message) if message == "client disconnected"
+            CoreError::Cancelled(message) if message == "client disconnected"
         ));
 
         assert!(matches!(
             translate_runtime_error(Error::Internal("bug".into())),
-            FrontendError::Internal(message) if message == "internal error: bug"
+            CoreError::Internal(message) if message == "internal error: bug"
         ));
     }
 
     #[test]
     fn scheduler_status_is_classified_once_for_non_http_adapters() {
         for (status, expected) in [
-            (400, FrontendErrorKind::InvalidArgument),
-            (404, FrontendErrorKind::NotFound),
-            (408, FrontendErrorKind::DeadlineExceeded),
-            (412, FrontendErrorKind::FailedPrecondition),
-            (413, FrontendErrorKind::ResourceExhausted),
-            (429, FrontendErrorKind::ResourceExhausted),
-            (432, FrontendErrorKind::InvalidArgument),
-            (499, FrontendErrorKind::Cancelled),
-            (500, FrontendErrorKind::Internal),
-            (503, FrontendErrorKind::Unavailable),
-            (504, FrontendErrorKind::DeadlineExceeded),
+            (400, CoreErrorKind::InvalidArgument),
+            (404, CoreErrorKind::NotFound),
+            (408, CoreErrorKind::DeadlineExceeded),
+            (412, CoreErrorKind::FailedPrecondition),
+            (413, CoreErrorKind::ResourceExhausted),
+            (429, CoreErrorKind::ResourceExhausted),
+            (432, CoreErrorKind::InvalidArgument),
+            (499, CoreErrorKind::Cancelled),
+            (500, CoreErrorKind::Internal),
+            (503, CoreErrorKind::Unavailable),
+            (504, CoreErrorKind::DeadlineExceeded),
         ] {
-            let error = FrontendError::from_runtime_rejection("rejected".into(), status);
+            let error = CoreError::from_runtime_rejection("rejected".into(), status);
             assert_eq!(error.kind(), expected, "legacy status {status}");
             assert!(matches!(
                 error,
-                FrontendError::RuntimeRejected {
+                CoreError::RuntimeRejected {
                     legacy_http_status,
                     ..
                 } if legacy_http_status == status
@@ -794,11 +784,11 @@ mod tests {
 
         assert!(matches!(
             call.recv().await,
-            Some(FrontendEvent::Delta(FrontendOutput { text, .. })) if text == "delta"
+            Some(CoreEvent::Delta(CoreOutput { text, .. })) if text == "delta"
         ));
         assert!(matches!(
             call.recv().await,
-            Some(FrontendEvent::Finished(FrontendOutput { text, .. })) if text == "final"
+            Some(CoreEvent::Finished(CoreOutput { text, .. })) if text == "final"
         ));
         assert!(call.recv().await.is_none());
         drop(call);
@@ -833,7 +823,7 @@ mod tests {
 
         assert!(matches!(
             call.recv().await,
-            Some(FrontendEvent::Finished(FrontendOutput {
+            Some(CoreEvent::Finished(CoreOutput {
                 finish_reason: Some(_),
                 ..
             }))
@@ -872,7 +862,7 @@ mod tests {
         drop(intake_rx);
         assert!(matches!(
             submitter.await.unwrap(),
-            Err(FrontendError::Unavailable)
+            Err(CoreError::Unavailable)
         ));
 
         assert!(matches!(
@@ -908,7 +898,7 @@ mod tests {
 
         assert!(matches!(
             handle.generate(request).await,
-            Err(FrontendError::InvalidArgument(message))
+            Err(CoreError::InvalidArgument(message))
                 if message == "Image count 2 exceeds limit 1 per request."
         ));
         assert!(intake_rx.try_recv().is_err());

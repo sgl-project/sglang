@@ -1,8 +1,9 @@
-//! API server (axum / tokio). I/O-bound; own pinned multi-thread runtime. Only
-//! this module knows HTTP. Its handlers use the transport-neutral
-//! [`crate::frontend::FrontendHandle`] to enter the shared runtime pipeline.
-//! Generation handlers render semantic frontend events as unary JSON or SSE;
-//! control handlers serialize typed frontend results such as server metadata.
+//! API server (axum / tokio). I/O-bound; own pinned multi-thread runtime. The
+//! transport-neutral [`core::CoreHandle`] is the shared entry into the runtime
+//! pipeline; `http` and `grpc` are the wire adapters on top of it. Generation
+//! handlers render semantic core events as unary JSON, SSE, or gRPC frames;
+//! control handlers serialize typed core results such as server metadata.
+pub(crate) mod core;
 mod disaggregation;
 pub mod grpc;
 pub mod http;
@@ -10,12 +11,12 @@ mod log;
 
 use axum::http::StatusCode;
 
-use crate::frontend::{FrontendError, FrontendErrorKind};
+use crate::api_server::core::{CoreError, CoreErrorKind};
 
 /// Map transport-neutral failures into HTTP status codes. Response bodies and
 /// stream framing remain the responsibility of each HTTP API surface.
-pub(crate) fn frontend_error_status(error: &FrontendError) -> StatusCode {
-    if let FrontendError::RuntimeRejected {
+pub(crate) fn core_error_status(error: &CoreError) -> StatusCode {
+    if let CoreError::RuntimeRejected {
         legacy_http_status, ..
     } = error
     {
@@ -24,16 +25,16 @@ pub(crate) fn frontend_error_status(error: &FrontendError) -> StatusCode {
     }
 
     match error.kind() {
-        FrontendErrorKind::InvalidArgument => StatusCode::BAD_REQUEST,
-        FrontendErrorKind::NotFound => StatusCode::NOT_FOUND,
-        FrontendErrorKind::FailedPrecondition => StatusCode::PRECONDITION_FAILED,
+        CoreErrorKind::InvalidArgument => StatusCode::BAD_REQUEST,
+        CoreErrorKind::NotFound => StatusCode::NOT_FOUND,
+        CoreErrorKind::FailedPrecondition => StatusCode::PRECONDITION_FAILED,
         // Existing intake backpressure has historically surfaced as 503.
-        FrontendErrorKind::ResourceExhausted | FrontendErrorKind::Unavailable => {
+        CoreErrorKind::ResourceExhausted | CoreErrorKind::Unavailable => {
             StatusCode::SERVICE_UNAVAILABLE
         }
-        FrontendErrorKind::Cancelled => StatusCode::from_u16(499).expect("499 is valid"),
-        FrontendErrorKind::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
-        FrontendErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        CoreErrorKind::Cancelled => StatusCode::from_u16(499).expect("499 is valid"),
+        CoreErrorKind::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
+        CoreErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -44,24 +45,24 @@ mod tests {
     #[test]
     fn frontend_error_categories_map_at_the_http_boundary() {
         assert_eq!(
-            frontend_error_status(&FrontendError::InvalidArgument("bad".into())),
+            core_error_status(&CoreError::InvalidArgument("bad".into())),
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            frontend_error_status(&FrontendError::Unavailable),
+            core_error_status(&CoreError::Unavailable),
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(
-            frontend_error_status(&FrontendError::Overloaded("full".into())),
+            core_error_status(&CoreError::Overloaded("full".into())),
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(
-            frontend_error_status(&FrontendError::Cancelled("gone".into())).as_u16(),
+            core_error_status(&CoreError::Cancelled("gone".into())).as_u16(),
             499
         );
         assert_eq!(
-            frontend_error_status(&FrontendError::RuntimeRejected {
-                kind: FrontendErrorKind::InvalidArgument,
+            core_error_status(&CoreError::RuntimeRejected {
+                kind: CoreErrorKind::InvalidArgument,
                 message: "runtime rejected request".into(),
                 legacy_http_status: 432,
             })
@@ -69,11 +70,11 @@ mod tests {
             432
         );
         assert_eq!(
-            frontend_error_status(&FrontendError::InvalidResponse("bad reply".into())),
+            core_error_status(&CoreError::InvalidResponse("bad reply".into())),
             StatusCode::INTERNAL_SERVER_ERROR
         );
         assert_eq!(
-            frontend_error_status(&FrontendError::Internal("bug".into())),
+            core_error_status(&CoreError::Internal("bug".into())),
             StatusCode::INTERNAL_SERVER_ERROR
         );
     }

@@ -6,7 +6,7 @@
 
 use sglang_api_types::api::v1 as api;
 
-use crate::frontend::{ModelInfo, ServerInfo};
+use crate::api_server::core::{ModelInfo, ServerInfo};
 
 pub(super) fn model_info(info: ModelInfo) -> Result<api::GetModelInfoResponse, String> {
     let ModelInfo {

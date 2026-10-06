@@ -1,4 +1,4 @@
-//! Transport-neutral types shared by frontend adapters.
+//! Transport-neutral types shared by the API adapters.
 //!
 //! These types describe what an inference operation means after a wire adapter
 //! has normalized its request. They intentionally contain no Axum, HTTP, SSE,
@@ -18,19 +18,19 @@ use crate::message::types::TokenIds;
 ///
 /// The existing in-process request already contains semantic generation fields
 /// and has no Serde, Axum, Tonic, or protobuf representation attached to it.
-/// Re-exporting it through the frontend contract gives every adapter one public
+/// Re-exporting it through the core contract gives every adapter one public
 /// boundary without duplicating the runtime's request model.
-pub(crate) type FrontendRequest = GenerateRequest;
+pub(crate) type CoreRequest = GenerateRequest;
 
 /// Canonical transport-neutral output payload for generation events.
 ///
 /// The runtime correlation ID is deliberately absent: it is an implementation
 /// detail used for scheduler routing, while adapters obtain the client-visible
-/// identity from [`crate::frontend::FrontendCall::public_id`]. Runtime-only
+/// identity from [`crate::api_server::core::CoreCall::public_id`]. Runtime-only
 /// response variants such as raw control bytes are likewise hidden by
-/// [`crate::frontend::FrontendCall`].
+/// [`crate::api_server::core::CoreCall`].
 #[derive(Clone, Debug, Default)]
-pub(crate) struct FrontendOutput {
+pub(crate) struct CoreOutput {
     pub(crate) token_ids: TokenIds,
     pub(crate) finish_reason: Option<FinishReason>,
     pub(crate) prompt_tokens: u32,
@@ -39,7 +39,7 @@ pub(crate) struct FrontendOutput {
     pub(crate) extras: Option<Box<ChunkExtras>>,
 }
 
-impl From<ChunkEvent> for FrontendOutput {
+impl From<ChunkEvent> for CoreOutput {
     fn from(output: ChunkEvent) -> Self {
         let ChunkEvent {
             rid: _,
@@ -61,7 +61,7 @@ impl From<ChunkEvent> for FrontendOutput {
     }
 }
 
-impl FrontendOutput {
+impl CoreOutput {
     /// Fold one runtime delta into this cumulative native-generation output.
     ///
     /// Runtime events are always incremental. Native HTTP and `api.v1`
@@ -145,7 +145,7 @@ impl FrontendOutput {
     }
 }
 
-/// Semantic result of a deep frontend health check.
+/// Semantic result of a deep core health check.
 ///
 /// Expected lifecycle states are values rather than transport errors so each
 /// adapter can render them according to its own protocol.
@@ -158,13 +158,13 @@ pub(crate) enum HealthStatus {
 
 /// A semantic generation event before any transport-specific framing.
 #[derive(Debug)]
-pub(crate) enum FrontendEvent {
+pub(crate) enum CoreEvent {
     /// One incremental model-output update.
-    Delta(FrontendOutput),
+    Delta(CoreOutput),
     /// The final model-output update for this request.
-    Finished(FrontendOutput),
+    Finished(CoreOutput),
     /// A request-scoped failure. Other requests in a batch may continue.
-    Failed(FrontendError),
+    Failed(CoreError),
 }
 
 /// Protocol-independent error category used by transport adapters.
@@ -172,7 +172,7 @@ pub(crate) enum FrontendEvent {
 /// The set intentionally follows operation semantics rather than HTTP or gRPC
 /// status spaces. An adapter maps this category into its own wire status.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FrontendErrorKind {
+pub(crate) enum CoreErrorKind {
     InvalidArgument,
     NotFound,
     FailedPrecondition,
@@ -183,7 +183,7 @@ pub(crate) enum FrontendErrorKind {
     Internal,
 }
 
-impl FrontendEvent {
+impl CoreEvent {
     pub(crate) fn is_terminal(&self) -> bool {
         matches!(self, Self::Finished(_) | Self::Failed(_))
     }
@@ -194,11 +194,11 @@ impl FrontendEvent {
 /// HTTP and gRPC adapters map these categories into their own status spaces;
 /// neither adapter needs to understand errors emitted by runtime stages.
 #[derive(Clone, Debug, thiserror::Error)]
-pub(crate) enum FrontendError {
+pub(crate) enum CoreError {
     #[error("{0}")]
     InvalidArgument(String),
 
-    /// The frontend intake loop has shut down. A caller may retry elsewhere.
+    /// The intake loop has shut down. A caller may retry elsewhere.
     #[error("service unavailable")]
     Unavailable,
 
@@ -221,10 +221,10 @@ pub(crate) enum FrontendError {
     /// status code inside its finish reason. The semantic event is still
     /// `Failed`; retaining the legacy code only lets the HTTP adapter preserve
     /// existing behavior while another adapter maps it into its own status
-    /// space. New frontend failures should use the semantic variants above.
+    /// space. New core failures should use the semantic variants above.
     #[error("{message}")]
     RuntimeRejected {
-        kind: FrontendErrorKind,
+        kind: CoreErrorKind,
         message: String,
         legacy_http_status: u16,
     },
@@ -237,18 +237,18 @@ pub(crate) enum FrontendError {
     Internal(String),
 }
 
-impl FrontendError {
+impl CoreError {
     /// Semantic status for adapters that do not use the scheduler's legacy
     /// HTTP code space (notably the future gRPC adapter).
-    pub(crate) fn kind(&self) -> FrontendErrorKind {
+    pub(crate) fn kind(&self) -> CoreErrorKind {
         match self {
-            Self::InvalidArgument(_) => FrontendErrorKind::InvalidArgument,
-            Self::Unavailable => FrontendErrorKind::Unavailable,
-            Self::Overloaded(_) => FrontendErrorKind::ResourceExhausted,
-            Self::Cancelled(_) => FrontendErrorKind::Cancelled,
-            Self::ResponseTruncated => FrontendErrorKind::Internal,
+            Self::InvalidArgument(_) => CoreErrorKind::InvalidArgument,
+            Self::Unavailable => CoreErrorKind::Unavailable,
+            Self::Overloaded(_) => CoreErrorKind::ResourceExhausted,
+            Self::Cancelled(_) => CoreErrorKind::Cancelled,
+            Self::ResponseTruncated => CoreErrorKind::Internal,
             Self::RuntimeRejected { kind, .. } => *kind,
-            Self::InvalidResponse(_) | Self::Internal(_) => FrontendErrorKind::Internal,
+            Self::InvalidResponse(_) | Self::Internal(_) => CoreErrorKind::Internal,
         }
     }
 
@@ -257,14 +257,14 @@ impl FrontendError {
     /// status while other adapters consume [`Self::kind`].
     pub(super) fn from_runtime_rejection(message: String, legacy_http_status: u16) -> Self {
         let kind = match legacy_http_status {
-            404 => FrontendErrorKind::NotFound,
-            408 | 504 => FrontendErrorKind::DeadlineExceeded,
-            412 => FrontendErrorKind::FailedPrecondition,
-            413 | 429 => FrontendErrorKind::ResourceExhausted,
-            499 => FrontendErrorKind::Cancelled,
-            502 | 503 => FrontendErrorKind::Unavailable,
-            400..=499 => FrontendErrorKind::InvalidArgument,
-            _ => FrontendErrorKind::Internal,
+            404 => CoreErrorKind::NotFound,
+            408 | 504 => CoreErrorKind::DeadlineExceeded,
+            412 => CoreErrorKind::FailedPrecondition,
+            413 | 429 => CoreErrorKind::ResourceExhausted,
+            499 => CoreErrorKind::Cancelled,
+            502 | 503 => CoreErrorKind::Unavailable,
+            400..=499 => CoreErrorKind::InvalidArgument,
+            _ => CoreErrorKind::Internal,
         };
         Self::RuntimeRejected {
             kind,
@@ -347,7 +347,7 @@ pub(crate) struct MemoryUsage {
 
 /// The scheduler's KV-cache measurement can be a native float or a NumPy
 /// scalar stringified by the MessagePack bridge. Preserve that representation
-/// so extracting the typed frontend contract does not change public responses.
+/// so extracting the typed core contract does not change public responses.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(untagged)]
 pub(crate) enum MemoryMeasurement {

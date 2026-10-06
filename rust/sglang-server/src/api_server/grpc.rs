@@ -4,7 +4,7 @@
 //! serve: `Generate` is `/generate`, `HealthCheck` is `/health_generate`, and
 //! `GetModelInfo` / `GetServerInfo` are their HTTP namesakes. Requests decode
 //! through the shared `/generate` fan-out and responses stream through the
-//! shared [`FrontendHandle`], which owns preprocessing, admission, runtime
+//! shared [`CoreHandle`], which owns preprocessing, admission, runtime
 //! communication, and request cancellation.
 //!
 //! The thin Tonic-service structure, streamed response approach, and test
@@ -19,7 +19,7 @@ use sglang_api_types::api::v1 as api;
 use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Request, Response, Status};
 
-use crate::frontend::{FrontendHandle, HealthStatus};
+use crate::api_server::core::{CoreHandle, HealthStatus};
 use crate::message::config::{PreferredSamplingParams, ServerArgs};
 use crate::message::request::into_requests;
 use crate::message::wire::fill_preferred_sampling;
@@ -50,16 +50,16 @@ struct AdapterConfig {
     health_timeout: Duration,
 }
 
-/// Tonic-facing implementation backed by the transport-neutral Rust frontend.
+/// Tonic-facing implementation backed by the transport-neutral core.
 pub(crate) struct GrpcService {
-    frontend: FrontendHandle,
+    core: CoreHandle,
     config: AdapterConfig,
 }
 
 impl GrpcService {
-    pub(crate) fn new(frontend: FrontendHandle, server_args: &ServerArgs) -> Self {
+    pub(crate) fn new(core: CoreHandle, server_args: &ServerArgs) -> Self {
         Self {
-            frontend,
+            core,
             config: AdapterConfig {
                 preferred_sampling_params: server_args.preferred_sampling_params.clone(),
                 incremental_streaming_output: server_args.incremental_streaming_output,
@@ -73,13 +73,13 @@ impl GrpcService {
 
     #[cfg(test)]
     fn for_test(
-        frontend: FrontendHandle,
+        core: CoreHandle,
         preferred_sampling_params: Option<PreferredSamplingParams>,
         incremental_streaming_output: bool,
         response_timeout: Duration,
     ) -> Self {
         Self {
-            frontend,
+            core,
             config: AdapterConfig {
                 preferred_sampling_params,
                 incremental_streaming_output,
@@ -115,7 +115,7 @@ impl SglangService for GrpcService {
         // the same boundary here.
         let created_at = Instant::now();
         let calls = self
-            .frontend
+            .core
             .generate_batch(payloads)
             .await
             .map_err(response::status)?;
@@ -135,7 +135,7 @@ impl SglangService for GrpcService {
         &self,
         _request: Request<api::HealthCheckRequest>,
     ) -> Result<Response<api::HealthCheckResponse>, Status> {
-        match self.frontend.probe_health(self.config.health_timeout).await {
+        match self.core.probe_health(self.config.health_timeout).await {
             Ok(HealthStatus::Healthy) => {
                 Ok(Response::new(api::HealthCheckResponse { healthy: true }))
             }
@@ -153,7 +153,7 @@ impl SglangService for GrpcService {
         &self,
         _request: Request<api::GetModelInfoRequest>,
     ) -> Result<Response<api::GetModelInfoResponse>, Status> {
-        info::model_info(self.frontend.model_info())
+        info::model_info(self.core.model_info())
             .map(Response::new)
             .map_err(Status::internal)
     }
@@ -162,11 +162,7 @@ impl SglangService for GrpcService {
         &self,
         _request: Request<api::GetServerInfoRequest>,
     ) -> Result<Response<api::GetServerInfoResponse>, Status> {
-        let server_info = self
-            .frontend
-            .server_info()
-            .await
-            .map_err(response::status)?;
+        let server_info = self.core.server_info().await.map_err(response::status)?;
         info::server_info(server_info)
             .map(Response::new)
             .map_err(Status::internal)

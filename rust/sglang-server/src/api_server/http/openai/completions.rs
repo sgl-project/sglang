@@ -24,10 +24,8 @@ use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
     openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::api_server::frontend_error_status;
-use crate::frontend::{
-    FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest,
-};
+use crate::api_server::core::{CoreCall, CoreError, CoreEvent, CoreOutput, CoreRequest};
+use crate::api_server::core_error_status;
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
 use crate::message::response::ChunkExtras;
@@ -48,7 +46,7 @@ pub(super) struct SubmittedChoice {
     pub(super) index: usize,
     pub(super) prompt_index: usize,
     pub(super) echo: String,
-    pub(super) call: FrontendCall,
+    pub(super) call: CoreCall,
 }
 #[derive(Debug, Default)]
 pub(super) struct ChoiceExtensions {
@@ -82,7 +80,7 @@ async fn completions(
     if request.prompt_embeds.is_some() {
         return openai_error(
             StatusCode::BAD_REQUEST,
-            "prompt_embeds is not supported by the Rust frontend",
+            "prompt_embeds is not supported by the Rust server",
             false,
         );
     }
@@ -164,7 +162,7 @@ async fn completions(
                     Err(response) => return response,
                 };
             }
-            let native = FrontendRequest {
+            let native = CoreRequest {
                 rid: rid.clone(),
                 text: text.clone(),
                 input_ids: input_ids.clone(),
@@ -230,29 +228,29 @@ async fn completions(
 }
 
 /// Decode a token-id prompt back to text for `echo=true`, via a
-/// detokenize operation through the shared frontend handle — the
+/// detokenize operation through the shared core handle — the
 /// detok stage answers it with a single `Data` payload (the raw UTF-8 text),
 /// or an `Error` (e.g. out-of-range ids → `Validation` → 400).
 async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<String, Response> {
-    match state.frontend.detokenize(token_ids).await {
+    match state.core.detokenize(token_ids).await {
         Ok(text) => Ok(text),
         // Same rule as `submit_generation`: build the refusal in the OpenAI
         // error shape rather than forwarding the native-shaped response.
-        Err(FrontendError::Unavailable) => Err(openai_error(
+        Err(CoreError::Unavailable) => Err(openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "service unavailable",
             false,
         )),
-        Err(FrontendError::InvalidArgument(message)) => {
+        Err(CoreError::InvalidArgument(message)) => {
             Err(openai_error(StatusCode::BAD_REQUEST, &message, false))
         }
-        Err(FrontendError::InvalidResponse(message)) => Err(openai_error(
+        Err(CoreError::InvalidResponse(message)) => Err(openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             message,
             false,
         )),
         Err(error) => {
-            let status = frontend_error_status(&error);
+            let status = core_error_status(&error);
             Err(openai_error(
                 status,
                 format!("failed to decode prompt for echo: {error}"),
@@ -406,7 +404,7 @@ pub(super) async fn unary_completion(
 fn completion_choice(
     index: usize,
     text: String,
-    output: &FrontendOutput,
+    output: &CoreOutput,
     want_logprobs: bool,
     include_input_logprobs: bool,
 ) -> (Choice, ChoiceExtensions) {
@@ -521,9 +519,9 @@ pub(super) fn completion_event_stream(
 
         while let Some((index, event)) = events.next().await {
             let output = match event {
-                FrontendEvent::Delta(output) | FrontendEvent::Finished(output) => output,
-                FrontendEvent::Failed(error) => {
-                    yield error_payload(frontend_error_status(&error), error.to_string()).to_string();
+                CoreEvent::Delta(output) | CoreEvent::Finished(output) => output,
+                CoreEvent::Failed(error) => {
+                    yield error_payload(core_error_status(&error), error.to_string()).to_string();
                     continue;
                 }
             };

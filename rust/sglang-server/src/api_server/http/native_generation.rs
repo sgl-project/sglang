@@ -1,15 +1,14 @@
-//! Shared wire semantics for SGLang-native generation responses.
-//!
-//! Native HTTP places these values in a JSON `meta_info` object, while the
-//! `api.v1` gRPC adapter builds the typed `GenerateMetaInfo` from the same
-//! columns (`grpc::response`). Keeping the logical shape here prevents the
-//! sibling adapters from drifting without making either depend on the other.
+//! The JSON shape of SGLang-native generation responses: the `meta_info`
+//! object and its logprob / hidden-state members, with Python's null
+//! conventions. The `api.v1` gRPC adapter builds the typed `GenerateMetaInfo`
+//! from the same columns with the same gating (`grpc::response`); a column
+//! added to one is added to the other.
 
-use crate::frontend::FrontendOutput;
+use crate::api_server::core::CoreOutput;
 
 /// The text slot of a `[logprob, token_id, text]` tuple: the decoded token when
 /// `return_text_in_logprobs` supplied a text buffer, else `null`.
-pub(crate) fn text_slot(texts: Option<&[String]>, j: usize) -> serde_json::Value {
+pub(super) fn text_slot(texts: Option<&[String]>, j: usize) -> serde_json::Value {
     texts
         .and_then(|texts| texts.get(j))
         .map(|text| serde_json::json!(text))
@@ -17,12 +16,12 @@ pub(crate) fn text_slot(texts: Option<&[String]>, j: usize) -> serde_json::Value
 }
 
 /// A decoded-text column becomes the tuples' text source only when populated.
-pub(crate) fn opt_texts(texts: &[String]) -> Option<&[String]> {
+pub(super) fn opt_texts(texts: &[String]) -> Option<&[String]> {
     (!texts.is_empty()).then_some(texts)
 }
 
 /// The logprob slot of a tuple: a finite value, or `null` for the `NaN` sentinel.
-pub(crate) fn lp_value(value: f32) -> serde_json::Value {
+pub(super) fn lp_value(value: f32) -> serde_json::Value {
     if value.is_nan() {
         serde_json::Value::Null
     } else {
@@ -31,7 +30,7 @@ pub(crate) fn lp_value(value: f32) -> serde_json::Value {
 }
 
 /// SGLang logprob shape: a list of `[logprob, token_id, text]` tuples.
-pub(crate) fn logprob_tuples(
+pub(super) fn logprob_tuples(
     values: &[f32],
     token_ids: &[i32],
     texts: Option<&[String]>,
@@ -49,7 +48,7 @@ pub(crate) fn logprob_tuples(
 
 /// Ragged top-k / requested-token shape: one entry per position, or `null`
 /// where that position's length is zero.
-pub(crate) fn ragged_logprob_tuples(
+pub(super) fn ragged_logprob_tuples(
     values: &[f32],
     token_ids: &[i32],
     lengths: &[u32],
@@ -81,7 +80,7 @@ pub(crate) fn ragged_logprob_tuples(
 }
 
 /// Reshape flat hidden-state values and per-row lengths into nested rows.
-pub(crate) fn hidden_states_rows(values: &[f32], lengths: &[u32]) -> serde_json::Value {
+pub(super) fn hidden_states_rows(values: &[f32], lengths: &[u32]) -> serde_json::Value {
     let mut rows = Vec::with_capacity(lengths.len());
     let mut offset = 0usize;
     for &length in lengths {
@@ -96,7 +95,7 @@ pub(crate) fn hidden_states_rows(values: &[f32], lengths: &[u32]) -> serde_json:
 
 /// Build the heterogeneous native `meta_info` object before either adapter
 /// chooses its wire encoding.
-pub(crate) fn meta_info_value(out: &FrontendOutput, rid: &str) -> serde_json::Value {
+pub(super) fn meta_info_value(out: &CoreOutput, rid: &str) -> serde_json::Value {
     let mut meta = serde_json::json!({
         "id": rid,
         "prompt_tokens": out.prompt_tokens,

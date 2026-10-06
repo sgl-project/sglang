@@ -1,6 +1,6 @@
 //! Common control-plane endpoints — `/server_info`, `/get_model_info`
 //! (+ `/model_info` alias), backed by typed operations on
-//! [`crate::frontend::FrontendHandle`]. Data-plane endpoints (incl. `/health*`,
+//! [`crate::api_server::core::CoreHandle`]. Data-plane endpoints (incl. `/health*`,
 //! which round-trips a generate probe) live in the sibling `native_api` and
 //! `openai` modules; the shared `AppState` lives in the parent
 //! `api_server` module.
@@ -16,13 +16,13 @@ use std::sync::Arc;
 
 use super::app::AppState;
 use super::native_api::native_error;
-use crate::api_server::frontend_error_status;
-use crate::frontend::{FrontendError, ServerInfo};
+use crate::api_server::core::{CoreError, ServerInfo};
+use crate::api_server::core_error_status;
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        // Control-plane: the frontend performs the typed operation and this
+        // Control-plane: the core performs the typed operation and this
         // adapter renders its result as one non-streamed JSON response.
         .route("/server_info", get(server_info))
         // Static config, no scheduler round-trip. `/get_model_info` (+ `/model_info`
@@ -31,23 +31,23 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/model_info", get(model_info))
 }
 
-/// Await the frontend's complete semantic server-info result. HTTP status and
+/// Await the core's complete semantic server-info result. HTTP status and
 /// serialization stay here; scheduler control bytes stay behind the contract.
 async fn await_server_info(state: &AppState) -> Result<ServerInfo, Response> {
-    match state.frontend.server_info().await {
+    match state.core.server_info().await {
         Ok(server_info) => Ok(server_info),
-        Err(FrontendError::Unavailable) => Err(native_error(
+        Err(CoreError::Unavailable) => Err(native_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "service unavailable",
             false,
         )),
         // Preserve the established HTTP behavior for a scheduler-side control
         // stream that disappears, while non-HTTP adapters see Internal via
-        // FrontendError::kind().
-        Err(FrontendError::ResponseTruncated) => {
+        // CoreError::kind().
+        Err(CoreError::ResponseTruncated) => {
             Err((StatusCode::from_u16(499).unwrap(), "request aborted").into_response())
         }
-        Err(error @ FrontendError::InvalidResponse(_)) => {
+        Err(error @ CoreError::InvalidResponse(_)) => {
             tracing::error!(%error, "server_info: invalid runtime response");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -55,14 +55,14 @@ async fn await_server_info(state: &AppState) -> Result<ServerInfo, Response> {
             )
                 .into_response())
         }
-        Err(error) => Err((frontend_error_status(&error), error.to_string()).into_response()),
+        Err(error) => Err((core_error_status(&error), error.to_string()).into_response()),
     }
 }
 
 /// `GET /get_model_info` (+ `/model_info` alias) — serialize the shared static
 /// model metadata (no scheduler round-trip).
 async fn model_info(State(state): State<Arc<AppState>>) -> Response {
-    let info = state.frontend.model_info();
+    let info = state.core.model_info();
     (
         StatusCode::OK,
         [("content-type", "application/json")],
@@ -104,7 +104,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::frontend::{FrontendConfig, FrontendHandle, FrontendMetadata};
+    use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
     use crate::message::config::{DisaggregationMode, ModelConfig, ServerArgs};
     use crate::message::request::RequestKind;
     use crate::message::response::ResponseItem;
@@ -120,21 +120,21 @@ mod tests {
         let server_args = Arc::new(server_args);
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
-        let frontend = FrontendHandle::new(
+        let core = CoreHandle::new(
             intake_tx,
             abort_tx,
-            FrontendConfig {
+            CoreConfig {
                 response_capacity: 8,
                 response_activity: Default::default(),
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
-                metadata: FrontendMetadata::from(server_args.as_ref()),
+                metadata: CoreMetadata::from(server_args.as_ref()),
             },
         );
         (
             Arc::new(AppState {
-                frontend,
+                core,
                 server_args,
                 chat_formatter: None,
             }),

@@ -7,7 +7,7 @@ use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Code, Request};
 
 use super::GrpcService;
-use crate::frontend::{FrontendConfig, FrontendHandle, FrontendMetadata};
+use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
 use crate::message::config::PreferredSamplingParams;
 use crate::message::finish_reason::FinishReason;
 use crate::message::ids::Rid;
@@ -42,20 +42,20 @@ impl Harness {
     ) -> Self {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
-        let frontend = FrontendHandle::new(
+        let core = CoreHandle::new(
             intake_tx,
             abort_tx,
-            FrontendConfig {
+            CoreConfig {
                 response_capacity,
                 response_activity: Default::default(),
                 startup_ready,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
-                metadata: FrontendMetadata::default(),
+                metadata: CoreMetadata::default(),
             },
         );
         Self {
-            service: GrpcService::for_test(frontend, preferred, incremental, response_timeout),
+            service: GrpcService::for_test(core, preferred, incremental, response_timeout),
             intake_rx,
             abort_rx,
         }
@@ -371,19 +371,19 @@ async fn closed_intake_is_a_top_level_unavailable_status() {
     let (intake_tx, intake_rx) = flume::unbounded();
     drop(intake_rx);
     let (abort_tx, _abort_rx) = flume::unbounded();
-    let frontend = FrontendHandle::new(
+    let core = CoreHandle::new(
         intake_tx,
         abort_tx,
-        FrontendConfig {
+        CoreConfig {
             response_capacity: 1,
             response_activity: Default::default(),
             startup_ready: true,
             is_disaggregation: false,
             mm_limits: Default::default(),
-            metadata: FrontendMetadata::default(),
+            metadata: CoreMetadata::default(),
         },
     );
-    let service = GrpcService::for_test(frontend, None, false, Duration::from_secs(1));
+    let service = GrpcService::for_test(core, None, false, Duration::from_secs(1));
 
     let result = service
         .generate(Request::new(ids_request(&[1], None)))

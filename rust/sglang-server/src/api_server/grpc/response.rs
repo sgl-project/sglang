@@ -1,7 +1,7 @@
 //! Frontend events to `api.v1` stream items and statuses.
 //!
 //! The typed [`api::GenerateMetaInfo`] built here and the native HTTP
-//! `meta_info` JSON (`native_generation::meta_info_value`) read the same
+//! `meta_info` JSON (`http::native_generation::meta_info_value`) read the same
 //! output columns with the same gating; a column added to one is added to
 //! the other.
 
@@ -14,12 +14,11 @@ use sglang_api_types::api::v1::generate_stream_item::Item;
 use tonic::{Code, Status};
 
 use super::ResponseStream;
-use crate::api_server::frontend_error_status;
-use crate::frontend::{
-    FrontendCall, FrontendError, FrontendErrorKind, FrontendEvent, FrontendOutput, recv_indexed,
+use crate::api_server::core::{
+    CoreCall, CoreError, CoreErrorKind, CoreEvent, CoreOutput, recv_indexed,
 };
+use crate::api_server::core_error_status;
 use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
-use crate::native_generation::opt_texts;
 
 pub(super) struct StreamOptions {
     /// `stream` as sent: false folds each item to its one terminal frame.
@@ -36,7 +35,7 @@ pub(super) struct StreamOptions {
 /// gRPC twin of the native SSE multiplexer. Each call aborts itself if the
 /// stream is dropped while it is unfinished.
 pub(super) fn generate_stream(
-    calls: Vec<FrontendCall>,
+    calls: Vec<CoreCall>,
     options: StreamOptions,
 ) -> ResponseStream<api::GenerateStreamItem> {
     let stream = async_stream::stream! {
@@ -44,8 +43,8 @@ pub(super) fn generate_stream(
             .iter()
             .map(|call| call.public_id().to_owned())
             .collect();
-        let mut cumulative: Vec<FrontendOutput> =
-            calls.iter().map(|_| FrontendOutput::default()).collect();
+        let mut cumulative: Vec<CoreOutput> =
+            calls.iter().map(|_| CoreOutput::default()).collect();
         let index = |i: usize| options.with_index.then_some(i as u32);
 
         // Poll all receivers concurrently; re-arm a receiver's future after each
@@ -67,9 +66,9 @@ pub(super) fn generate_stream(
                 }
             };
             if events.is_empty() {
-                // Defensive fallback: FrontendCall normally turns a premature
+                // Defensive fallback: CoreCall normally turns a premature
                 // runtime close into a Failed event.
-                yield Ok(error_item(&FrontendError::ResponseTruncated, index(i)));
+                yield Ok(error_item(&CoreError::ResponseTruncated, index(i)));
                 continue;
             }
 
@@ -82,7 +81,7 @@ pub(super) fn generate_stream(
             let mut failed = None;
             for event in events {
                 match event {
-                    FrontendEvent::Delta(mut delta) => {
+                    CoreEvent::Delta(mut delta) => {
                         acc.append_delta(&delta);
                         if !options.stream {
                             continue;
@@ -96,11 +95,11 @@ pub(super) fn generate_stream(
                             coalesced = true;
                         }
                     }
-                    FrontendEvent::Finished(delta) => {
+                    CoreEvent::Finished(delta) => {
                         acc.append_delta(&delta);
                         terminal = Some(delta);
                     }
-                    FrontendEvent::Failed(error) => failed = Some(error),
+                    CoreEvent::Failed(error) => failed = Some(error),
                 }
             }
 
@@ -131,7 +130,7 @@ pub(super) fn generate_stream(
 }
 
 fn frame_item(
-    output: &FrontendOutput,
+    output: &CoreOutput,
     public_id: &str,
     index: Option<u32>,
     e2e_latency: Option<f64>,
@@ -150,19 +149,19 @@ fn frame_item(
 
 /// One item's failure inside the stream. `code` is the native error body's
 /// HTTP status, as on the SSE error frame.
-fn error_item(error: &FrontendError, index: Option<u32>) -> api::GenerateStreamItem {
+fn error_item(error: &CoreError, index: Option<u32>) -> api::GenerateStreamItem {
     api::GenerateStreamItem {
         item: Some(Item::Error(api::GenerateStreamError {
             error: Some(api::ErrorBody {
                 message: error.to_string(),
-                code: u32::from(frontend_error_status(error).as_u16()),
+                code: u32::from(core_error_status(error).as_u16()),
             }),
             index,
         })),
     }
 }
 
-fn meta_info(out: &FrontendOutput, id: &str, e2e_latency: Option<f64>) -> api::GenerateMetaInfo {
+fn meta_info(out: &CoreOutput, id: &str, e2e_latency: Option<f64>) -> api::GenerateMetaInfo {
     let mut meta = api::GenerateMetaInfo {
         id: id.to_owned(),
         prompt_tokens: out.prompt_tokens,
@@ -225,6 +224,11 @@ fn meta_info(out: &FrontendOutput, id: &str, e2e_latency: Option<f64>) -> api::G
         meta.hidden_states = hidden_state_rows(&extras.hidden_val, &extras.hidden_lens);
     }
     meta
+}
+
+/// A decoded-text column becomes the entries' text source only when populated.
+fn opt_texts(texts: &[String]) -> Option<&[String]> {
+    (!texts.is_empty()).then_some(texts)
 }
 
 fn logprob_entry(value: f32, token_id: i32, text: Option<&String>) -> api::LogprobEntry {
@@ -335,16 +339,16 @@ fn matched_value(matched: &Matched) -> api::Matched {
     api::Matched { value: Some(value) }
 }
 
-pub(super) fn status(error: FrontendError) -> Status {
+pub(super) fn status(error: CoreError) -> Status {
     let code = match error.kind() {
-        FrontendErrorKind::InvalidArgument => Code::InvalidArgument,
-        FrontendErrorKind::NotFound => Code::NotFound,
-        FrontendErrorKind::FailedPrecondition => Code::FailedPrecondition,
-        FrontendErrorKind::ResourceExhausted => Code::ResourceExhausted,
-        FrontendErrorKind::Cancelled => Code::Cancelled,
-        FrontendErrorKind::DeadlineExceeded => Code::DeadlineExceeded,
-        FrontendErrorKind::Unavailable => Code::Unavailable,
-        FrontendErrorKind::Internal => Code::Internal,
+        CoreErrorKind::InvalidArgument => Code::InvalidArgument,
+        CoreErrorKind::NotFound => Code::NotFound,
+        CoreErrorKind::FailedPrecondition => Code::FailedPrecondition,
+        CoreErrorKind::ResourceExhausted => Code::ResourceExhausted,
+        CoreErrorKind::Cancelled => Code::Cancelled,
+        CoreErrorKind::DeadlineExceeded => Code::DeadlineExceeded,
+        CoreErrorKind::Unavailable => Code::Unavailable,
+        CoreErrorKind::Internal => Code::Internal,
     };
     Status::new(code, error.to_string())
 }
@@ -358,40 +362,40 @@ mod tests {
     fn semantic_errors_map_to_canonical_grpc_codes() {
         let cases = [
             (
-                FrontendError::InvalidArgument("bad".into()),
+                CoreError::InvalidArgument("bad".into()),
                 Code::InvalidArgument,
             ),
             (
-                FrontendError::RuntimeRejected {
-                    kind: FrontendErrorKind::NotFound,
+                CoreError::RuntimeRejected {
+                    kind: CoreErrorKind::NotFound,
                     message: "missing".into(),
                     legacy_http_status: 404,
                 },
                 Code::NotFound,
             ),
             (
-                FrontendError::RuntimeRejected {
-                    kind: FrontendErrorKind::FailedPrecondition,
+                CoreError::RuntimeRejected {
+                    kind: CoreErrorKind::FailedPrecondition,
                     message: "not ready".into(),
                     legacy_http_status: 412,
                 },
                 Code::FailedPrecondition,
             ),
             (
-                FrontendError::Overloaded("full".into()),
+                CoreError::Overloaded("full".into()),
                 Code::ResourceExhausted,
             ),
-            (FrontendError::Cancelled("gone".into()), Code::Cancelled),
+            (CoreError::Cancelled("gone".into()), Code::Cancelled),
             (
-                FrontendError::RuntimeRejected {
-                    kind: FrontendErrorKind::DeadlineExceeded,
+                CoreError::RuntimeRejected {
+                    kind: CoreErrorKind::DeadlineExceeded,
                     message: "late".into(),
                     legacy_http_status: 504,
                 },
                 Code::DeadlineExceeded,
             ),
-            (FrontendError::Unavailable, Code::Unavailable),
-            (FrontendError::Internal("bug".into()), Code::Internal),
+            (CoreError::Unavailable, Code::Unavailable),
+            (CoreError::Internal("bug".into()), Code::Internal),
         ];
 
         for (error, expected) in cases {
@@ -412,7 +416,7 @@ mod tests {
             out_top_lens: vec![0, 1],
             ..Default::default()
         };
-        let output = FrontendOutput {
+        let output = CoreOutput {
             extras: Some(Box::new(extras)),
             ..Default::default()
         };

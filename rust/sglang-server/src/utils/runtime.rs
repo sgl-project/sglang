@@ -301,16 +301,16 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
 
     // One transport-neutral entrance to the runtime. Each configured listener
     // receives a clone; no listener owns or reconstructs scheduler wiring.
-    let frontend = crate::frontend::FrontendHandle::new(
+    let core = crate::api_server::core::CoreHandle::new(
         senders.tok_manager_tx.clone(),
         senders.abort_tx.clone(),
-        crate::frontend::FrontendConfig {
+        crate::api_server::core::CoreConfig {
             response_capacity: cfg.rust_server_args.stage_channel_cap,
             response_activity: response_activity.clone(),
             startup_ready: cfg.server_args.skip_server_warmup,
             is_disaggregation: cfg.server_args.is_disaggregation(),
             mm_limits: cfg.server_args.limit_mm_data_per_request.clone(),
-            metadata: crate::frontend::FrontendMetadata::from(cfg.server_args.as_ref()),
+            metadata: crate::api_server::core::CoreMetadata::from(cfg.server_args.as_ref()),
         },
     );
 
@@ -320,7 +320,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let shutdown_rx = shutdown_rx.clone();
         let grpc_server = grpc_listener.map(|listener| {
-            let service = api_server::grpc::GrpcService::new(frontend.clone(), &cfg.server_args);
+            let service = api_server::grpc::GrpcService::new(core.clone(), &cfg.server_args);
             (listener, service)
         });
         let handle = std::thread::Builder::new()
@@ -343,7 +343,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 rt.block_on(async move {
                     let http = api_server::http::app::serve(
                         http_listener,
-                        frontend,
+                        core,
                         cfg.server_args.clone(),
                         shutdown_rx.clone(),
                     );

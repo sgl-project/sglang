@@ -3,7 +3,7 @@
 //! The pre-bound socket, shared API runtime, and shutdown shape build on Rain
 //! Jiang's multi-protocol prototype in `sgl-project/sglang#36923`. The listener
 //! mounts the `api.v1` adapter on the transport-neutral
-//! [`crate::frontend::FrontendHandle`] contract.
+//! [`crate::api_server::core::CoreHandle`] contract.
 
 use sglang_api_types::api::v1::sglang_service_server::SglangServiceServer;
 use tokio_stream::wrappers::TcpListenerStream;

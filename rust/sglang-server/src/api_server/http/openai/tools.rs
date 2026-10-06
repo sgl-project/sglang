@@ -36,7 +36,7 @@ use dynamo_protocols::types::{
     Role,
 };
 
-use crate::frontend::FrontendOutput;
+use crate::api_server::core::CoreOutput;
 use crate::message::sampling::SamplingParams;
 
 /// Canonicalize a tool-call parser name onto the dynamo-parsers registry keys.
@@ -246,7 +246,7 @@ pub(super) async fn parse_chat_tool_calls(
 /// Map the scheduler's finish kind onto the OpenAI wire values. Length and
 /// content-filter keep their names; everything else (including a bare abort)
 /// reports as `stop`, matching Python's fallback.
-pub(super) fn chat_finish_reason(output: &FrontendOutput) -> Option<OpenAIFinishReason> {
+pub(super) fn chat_finish_reason(output: &CoreOutput) -> Option<OpenAIFinishReason> {
     let kind = output
         .finish_reason
         .as_ref()
@@ -264,7 +264,7 @@ mod tests {
         apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name,
         dynamo_tool_choice, parse_chat_tool_calls,
     };
-    use crate::frontend::FrontendOutput;
+    use crate::api_server::core::CoreOutput;
     use crate::message::sampling::SamplingParams;
     use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
     use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
@@ -766,7 +766,7 @@ mod tests {
 
     #[test]
     fn chat_finish_reason_maps_scheduler_kinds() {
-        let output = |finish: serde_json::Value| FrontendOutput {
+        let output = |finish: serde_json::Value| CoreOutput {
             text: "x".into(),
             token_ids: vec![1],
             prompt_tokens: 1,
@@ -794,7 +794,7 @@ mod tests {
             Some(OpenAIFinishReason::Stop)
         );
         assert_eq!(
-            chat_finish_reason(&FrontendOutput {
+            chat_finish_reason(&CoreOutput {
                 finish_reason: None,
                 ..Default::default()
             }),

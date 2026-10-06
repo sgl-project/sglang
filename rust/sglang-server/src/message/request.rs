@@ -409,7 +409,7 @@ fn pack_mm(
 #[derive(Debug)]
 pub struct Request {
     /// Runtime correlation ID. Client-provided IDs carry a private incarnation
-    /// suffix; adapters recover the public ID through `FrontendCall::public_id`.
+    /// suffix; adapters recover the public ID through `CoreCall::public_id`.
     pub rid: Rid,
     pub state: RequestState,
     /// Back-channel to the client connection for response frames.
@@ -435,7 +435,7 @@ pub enum RequestKind {
     /// Generation: tokenize (if needed) then push a `TokenizedGenerateReqInput`.
     Generate(Box<GenerateRequest>),
     /// Internal runtime control operation: no tokenization, with one serialized
-    /// result that the frontend boundary converts into a typed response.
+    /// result that the core boundary converts into a typed response.
     Control(Box<ControlRequest>),
     /// Internal service call: decode a complete token-id sequence to text. Walks
     /// the same FSM as every request (validate → register → Queued), but the
@@ -448,7 +448,7 @@ pub enum RequestKind {
 
 /// A single in-flight generation request (one item after adapter fan-out),
 /// serialized to the scheduler wire once tokenized (see `to_header_msgpack`). Not a
-/// wire type — built by frontend adapters, never (de)serialized; `input_ids` is
+/// wire type — built by the API adapters, never (de)serialized; `input_ids` is
 /// supplied by an adapter or filled by the Tokenizer stage.
 #[derive(Debug, Default)]
 pub struct GenerateRequest {
@@ -531,7 +531,7 @@ pub struct GenerateRequest {
 /// processor's input: the MM worker moves it out of the request whole, and
 /// `payload::to_mm_input` converts it to the driver's.
 ///
-/// Constructed directly only by tests: `frontend::prefetch` fills its
+/// Constructed directly only by tests: `core::prefetch` fills its
 /// `prefetched` field, everything else gets it packed inside a `GenerateRequest`.
 #[derive(Debug, Default)]
 pub struct MmData {
@@ -539,7 +539,7 @@ pub struct MmData {
     pub video_data: Vec<MmItem>,
     pub audio_data: Vec<MmItem>,
     /// Bytes of `image_data`'s I/O-backed sources, resolved by
-    /// `frontend::prefetch` in `payload::io_sources` order so MM workers
+    /// `core::prefetch` in `payload::io_sources` order so MM workers
     /// never block on I/O. Out-of-band: the values above stay as the client
     /// sent them.
     pub prefetched: Vec<bytes::Bytes>,

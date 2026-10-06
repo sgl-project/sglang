@@ -13,20 +13,20 @@ use axum::{
 };
 
 use super::{common, native_api, openai};
+use crate::api_server::core::CoreHandle;
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
 use crate::api_server::log;
-use crate::frontend::FrontendHandle;
 use crate::message::config::ServerArgs;
 
-/// HTTP adapter state: the shared frontend capability, immutable server
+/// HTTP adapter state: the shared core capability, immutable server
 /// configuration needed for HTTP request preparation, and the chat formatter.
 ///
 /// axum clones the router state into **every** request, so it is mounted as
 /// `Arc<AppState>` — one refcount bump per request instead of cloning the
-/// frontend handle and chat formatter. Deliberately not `Clone`, so it
+/// core handle and chat formatter. Deliberately not `Clone`, so it
 /// can only be shared through that `Arc`.
 pub(super) struct AppState {
-    pub(super) frontend: FrontendHandle,
+    pub(super) core: CoreHandle,
     pub(super) server_args: Arc<ServerArgs>,
     pub(super) chat_formatter: Option<openai::ChatFormatter>,
 }
@@ -46,23 +46,19 @@ async fn mark_startup_ready(
             "/generate" | "/encode" | "/v1/chat/completions"
         );
     let response = next.run(req).await;
-    record_startup_warmup_status(&state.frontend, is_startup_warmup, response.status());
+    record_startup_warmup_status(&state.core, is_startup_warmup, response.status());
     response
 }
 
-fn record_startup_warmup_status(
-    frontend: &FrontendHandle,
-    is_startup_warmup: bool,
-    status: StatusCode,
-) {
+fn record_startup_warmup_status(core: &CoreHandle, is_startup_warmup: bool, status: StatusCode) {
     if is_startup_warmup && status.is_success() {
-        frontend.mark_ready();
+        core.mark_ready();
     }
 }
 
 pub async fn serve(
     listener: std::net::TcpListener,
-    frontend: FrontendHandle,
+    core: CoreHandle,
     server_args: Arc<ServerArgs>,
     // The runtime's shutdown signal, shared with every worker stage: it fires
     // (disconnects) when `Runtime::request_shutdown` drops the sender, at
@@ -72,7 +68,7 @@ pub async fn serve(
 ) {
     let chat_formatter = openai::load_chat_support(&server_args);
     let state = Arc::new(AppState {
-        frontend,
+        core,
         server_args: server_args.clone(),
         chat_formatter,
     });
@@ -139,32 +135,32 @@ pub async fn serve(
 mod tests {
     use super::*;
 
-    fn frontend() -> FrontendHandle {
-        FrontendHandle::new(
+    fn core_handle() -> CoreHandle {
+        CoreHandle::new(
             flume::unbounded().0,
             flume::unbounded().0,
-            crate::frontend::FrontendConfig {
+            crate::api_server::core::CoreConfig {
                 response_capacity: 8,
                 response_activity: Default::default(),
                 startup_ready: false,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
-                metadata: crate::frontend::FrontendMetadata::default(),
+                metadata: crate::api_server::core::CoreMetadata::default(),
             },
         )
     }
 
     #[test]
     fn only_a_successful_recognized_warmup_marks_frontend_ready() {
-        let frontend = frontend();
+        let core = core_handle();
 
-        record_startup_warmup_status(&frontend, false, StatusCode::OK);
-        assert!(!frontend.is_ready());
+        record_startup_warmup_status(&core, false, StatusCode::OK);
+        assert!(!core.is_ready());
 
-        record_startup_warmup_status(&frontend, true, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(!frontend.is_ready());
+        record_startup_warmup_status(&core, true, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!core.is_ready());
 
-        record_startup_warmup_status(&frontend, true, StatusCode::OK);
-        assert!(frontend.is_ready());
+        record_startup_warmup_status(&core, true, StatusCode::OK);
+        assert!(core.is_ready());
     }
 }
