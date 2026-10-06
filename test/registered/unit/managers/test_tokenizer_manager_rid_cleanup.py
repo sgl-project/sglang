@@ -418,7 +418,6 @@ class _FakeOutputStore:
         self.future = concurrent.futures.Future()
         self.puts = []
         self.cleanup_futures = []
-        self.cleaned_outputs = []
 
     def submit_put(self, stash):
         self.puts.append(stash)
@@ -426,9 +425,6 @@ class _FakeOutputStore:
 
     def cleanup_after(self, future):
         self.cleanup_futures.append(future)
-
-    def cleanup_outputs(self, outputs):
-        self.cleaned_outputs.extend(outputs)
 
 
 class TestOutputStoreFinalization(unittest.IsolatedAsyncioTestCase, CustomTestCase):
@@ -543,20 +539,6 @@ class TestOutputStoreFinalization(unittest.IsolatedAsyncioTestCase, CustomTestCa
         with self.assertRaises(asyncio.CancelledError):
             await pending
         self.assertEqual(self.store.cleanup_futures, [self.store.future])
-
-    async def test_failed_batch_removes_refs_of_finished_items(self):
-        delivered = {"meta_info": {"output_store_ref": {"handle": {"h": 2}}}}
-
-        async def finished():
-            yield delivered
-
-        async def failing():
-            raise ValueError("sub-request failed")
-            yield
-
-        with self.assertRaisesRegex(ValueError, "sub-request failed"):
-            await self.tm._collect_batch_responses([finished(), failing()])
-        self.assertEqual(self.store.cleaned_outputs, [delivered])
 
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):

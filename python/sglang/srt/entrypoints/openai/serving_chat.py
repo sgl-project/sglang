@@ -2260,17 +2260,12 @@ class OpenAIServingChat(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
-        try:
-            response = self._build_chat_response(
-                request,
-                ret,
-                int(time.time()),
-            )
-        except BaseException:
-            self.tokenizer_manager.cleanup_output_store_refs(ret)
-            raise
-        if not isinstance(response, ChatCompletionResponse):
-            self.tokenizer_manager.cleanup_output_store_refs(ret)
+        response = self._build_chat_response(
+            request,
+            ret,
+            int(time.time()),
+        )
+
         return response
 
     def _build_chat_response(

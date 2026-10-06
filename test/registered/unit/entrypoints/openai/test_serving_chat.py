@@ -30,7 +30,6 @@ from sglang.srt.entrypoints.openai.chat_encoding import (
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
-    ChatCompletionResponse,
     MessageProcessingResult,
     ToolChoice,
     ToolChoiceFuncName,
@@ -720,35 +719,6 @@ class ServingChatTestCase(CustomTestCase):
             self.chat._validate_request(req),
             "return_outputs_via_store requires return_meta_info=true.",
         )
-
-    def test_undelivered_chat_response_removes_output_store_refs(self):
-        ret = {"meta_info": {"output_store_ref": {"handle": {"h": 1}}}}
-
-        async def generate(*args, **kwargs):
-            yield ret
-
-        self.tm.generate_request = generate
-        error = self.chat.create_error_response(
-            "Failed to parse reasoning content", status_code=500
-        )
-        cases = {
-            "error response": (error, [ret]),
-            "delivered response": (Mock(spec=ChatCompletionResponse), []),
-        }
-        for name, (built, expected_removed) in cases.items():
-            with self.subTest(name):
-                removed = []
-                self.tm.cleanup_output_store_refs = removed.extend
-                with patch.object(
-                    self.chat, "_build_chat_response", return_value=built
-                ):
-                    response = asyncio.run(
-                        self.chat._handle_non_streaming_request(
-                            Mock(), self.basic_req, Mock()
-                        )
-                    )
-                self.assertIs(response, built)
-                self.assertEqual(removed, expected_removed)
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(

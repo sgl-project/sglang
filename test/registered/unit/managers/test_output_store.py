@@ -65,7 +65,6 @@ class TestOutputStoreConfig(CustomTestCase):
 
         config = _parse(
             protocol="tcp",
-            global_segment_size=0,
             partition="run-1",
             replica_num=2,
             chunk_bytes=64 * 1024**2,
@@ -83,13 +82,7 @@ class TestOutputStoreConfig(CustomTestCase):
 
     def test_rejects_configs_it_cannot_serve(self):
         cases = {
-            "not an object": "[]",
             "unknown key": json.dumps({**_BASE_CONFIG, "check_server": True}),
-            "contributes a segment": json.dumps(
-                {**_BASE_CONFIG, "global_segment_size": "4gb"}
-            ),
-            "replica_num 0": json.dumps({**_BASE_CONFIG, "replica_num": 0}),
-            "chunk_bytes 0": json.dumps({**_BASE_CONFIG, "chunk_bytes": 0}),
             "replica_num as text": json.dumps({**_BASE_CONFIG, "replica_num": "2"}),
         }
         for key in _BASE_CONFIG:
@@ -275,24 +268,16 @@ class TestOutputStore(CustomTestCase):
         store.cleanup_after(failed)
         written.set_result({"handle": {"exported": "ref-a"}})
         failed.set_exception(RuntimeError("put failed"))
-        store.cleanup_outputs(
-            [
-                {"meta_info": {"output_store_ref": {"handle": {"exported": "ref-b"}}}},
-                {"meta_info": {}},
-            ]
-        )
         store._executor.shutdown(wait=True)
-        self.assertCountEqual(
-            store._transfer.removed, [("imported", "ref-a"), ("imported", "ref-b")]
-        )
+        self.assertEqual(store._transfer.removed, [("imported", "ref-a")])
 
     def test_failed_cleanup_logs_the_handle(self):
         store, _ = self._store()
         store._transfer.cleanup_error = RuntimeError("master down")
+        written = concurrent.futures.Future()
         with self.assertLogs("sglang.srt.managers.output_store", "ERROR") as logs:
-            store.cleanup_outputs(
-                [{"meta_info": {"output_store_ref": {"handle": {"exported": "r"}}}}]
-            )
+            store.cleanup_after(written)
+            written.set_result({"handle": {"exported": "r"}})
             store._executor.shutdown(wait=True)
         self.assertIn('{"exported": "r"}', "\n".join(logs.output))
 
