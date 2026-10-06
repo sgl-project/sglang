@@ -31,6 +31,7 @@ pub fn resolve_tokenizer_file(path: &str, revision: Option<&str>) -> Option<Stri
 
 /// Resolve a dedicated Hugging Face chat-template file when the template is
 /// not embedded in `tokenizer_config.json`.
+#[cfg(feature = "render")]
 pub(crate) fn resolve_chat_template_file(path: &str, revision: Option<&str>) -> Option<String> {
     let directory = model_directory(path, revision)?;
     discover_chat_template_in_dir(&directory).map(|path| path.to_string_lossy().into_owned())
@@ -92,6 +93,7 @@ fn discover_tokenizer_in_dir(directory: &Path) -> Option<PathBuf> {
     }
 }
 
+#[cfg(feature = "render")]
 fn discover_chat_template_in_dir(directory: &Path) -> Option<PathBuf> {
     for name in ["chat_template.json", "chat_template.jinja"] {
         let candidate = directory.join(name);
@@ -193,6 +195,7 @@ mod tests {
                     .into_owned()
             )
         );
+        #[cfg(feature = "render")]
         assert_eq!(
             resolve_chat_template_file(directory.to_str().unwrap(), None),
             Some(
