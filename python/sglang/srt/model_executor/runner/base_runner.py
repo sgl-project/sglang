@@ -612,19 +612,6 @@ class BaseRunner(ABC):
             extend_prefix_lens = None
             extend_start_loc = None
 
-        if get_parallel().pp_size > 1:
-            # PP0 already cp-split hidden_states before send.
-            pp_hidden_tokens = num_tokens
-            if (
-                capture_forward_mode == ForwardMode.EXTEND
-                and get_parallel().pp_rank != 0
-                and get_parallel().attn_cp_size > 1
-            ):
-                pp_hidden_tokens = num_tokens // get_parallel().attn_cp_size
-            pp_proxy_tensors = PPProxyTensors(
-                {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
-            )
-
         # TP-gather requirements for global token metadata.
         require_mlp_tp_gather_ = require_mlp_tp_gather()
         require_attn_tp_gather_ = require_attn_tp_gather()
@@ -731,6 +718,16 @@ class BaseRunner(ABC):
         cp_active = is_extend_dummy and is_cp_active(forward_batch)
         if cp_active:
             prepare_cp_forward(forward_batch)
+        if get_parallel().pp_size > 1:
+            # PP0 already cp-split hidden_states before send.
+            pp_hidden_tokens = num_tokens
+            if cp_active and get_parallel().pp_rank != 0:
+                pp_hidden_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token[
+                    get_parallel().attn_cp_rank
+                ]
+            pp_proxy_tensors = PPProxyTensors(
+                {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+            )
         with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
             mr.attn_backend.init_forward_metadata(forward_batch)
         if get_exec().features.enable_encoder_swa_bounded_replay:
