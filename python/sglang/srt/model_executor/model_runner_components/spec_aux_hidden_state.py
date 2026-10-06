@@ -7,6 +7,7 @@ import msgspec
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.runtime_context import (
+    get_exec,
     get_model,
     get_parallel,
     get_spec,
@@ -44,6 +45,8 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_target_layer_ids: Any = None
     # DFLASH draft KV bytes/token; None when unresolved.
     dflash_draft_cell_size_per_token: int | None = None
+    # Route the DFLASH-family capture to the model's DSPARK hook when it has one.
+    is_dspark: bool = False
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -53,7 +56,12 @@ def resolve_spec_aux_hidden_state_config(
     spec_algorithm: SpeculativeAlgorithm,
     is_draft_worker: bool,
 ) -> SpecAuxHiddenStateConfig:
-    config = SpecAuxHiddenStateConfig()
+    config = SpecAuxHiddenStateConfig(is_dspark=spec_algorithm.is_dspark())
+    _resolve_capture_only_aux_hidden_state(
+        config=config,
+        spec_algorithm=spec_algorithm,
+        is_draft_worker=is_draft_worker,
+    )
     _resolve_eagle_aux_hidden_state(
         config=config,
         server_args=server_args,
@@ -69,6 +77,32 @@ def resolve_spec_aux_hidden_state_config(
         is_draft_worker=is_draft_worker,
     )
     return config
+
+
+def _resolve_capture_only_aux_hidden_state(
+    *,
+    config: SpecAuxHiddenStateConfig,
+    spec_algorithm: SpeculativeAlgorithm,
+    is_draft_worker: bool,
+) -> None:
+    """--aux-hidden-state-capture: aux capture on a target that runs no draft.
+
+    No draft layer counts are set, so the KV pool reserves nothing for a draft.
+    """
+    features = get_exec().features
+    method = features.aux_hidden_state_capture
+    if method is None or is_draft_worker or not spec_algorithm.is_none():
+        return
+    layer_ids = features.aux_hidden_state_layer_ids
+    if method == "eagle3":
+        config.eagle_use_aux_hidden_state = True
+        config.eagle_aux_hidden_state_layer_ids = (
+            list(layer_ids) if layer_ids is not None else None
+        )
+    else:
+        config.dflash_use_aux_hidden_state = True
+        config.dflash_target_layer_ids = list(layer_ids)
+        config.is_dspark = method == "dspark"
 
 
 def _resolve_eagle_aux_hidden_state(

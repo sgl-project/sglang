@@ -599,6 +599,27 @@ def validate_sampling_mask_max_tokens(server_args: Any):
         )
 
 
+def validate_aux_hidden_state_capture(server_args: Any):
+    cfg = resolving_view(server_args)
+    method = cfg.aux_hidden_state_capture
+    if method is None:
+        if cfg.aux_hidden_state_layer_ids is not None:
+            raise ValueError(
+                "--aux-hidden-state-layer-ids requires --aux-hidden-state-capture."
+            )
+        return
+    if cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "--aux-hidden-state-capture cannot be combined with "
+            "--speculative-algorithm: the draft selects the captured target layers."
+        )
+    if method != "eagle3" and not cfg.aux_hidden_state_layer_ids:
+        raise ValueError(
+            f"--aux-hidden-state-capture {method} requires "
+            "--aux-hidden-state-layer-ids."
+        )
+
+
 def check_two_batch_overlap(server_args: Any):
     # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
     # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with

@@ -396,7 +396,7 @@ class ModelRunner:
 
         self.init_msprobe()
 
-        # auxiliary hidden capture mode. TODO: expose this to server args?
+        # Auxiliary hidden capture: from the draft, or --aux-hidden-state-capture.
         self.init_spec_aux_hidden_state()
 
         # Apply the rank zero filter to logger
@@ -1039,7 +1039,7 @@ class ModelRunner:
             eagle_aux_hidden_state_layer_ids=self.spec_aux_config.eagle_aux_hidden_state_layer_ids,
             dflash_use_aux_hidden_state=self.spec_aux_config.dflash_use_aux_hidden_state,
             dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
-            is_dspark=self.spec_algorithm.is_dspark(),
+            is_dspark=self.spec_aux_config.is_dspark,
         )
         # Resolve before building: backends read the pair off the runner while
         # they construct (the FlashInfer KV-access check).

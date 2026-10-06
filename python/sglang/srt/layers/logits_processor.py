@@ -223,6 +223,10 @@ class LogitsProcessorOutput:
     # Original flattened token indices when only a subset of hidden rows is captured.
     hidden_states_token_indices: Optional[torch.Tensor] = None
 
+    # Post-norm last-layer hidden states of every token, kept under full capture
+    # when `hidden_states` holds the aux hidden states (--aux-hidden-state-capture).
+    last_hidden_states: Optional[torch.Tensor] = None
+
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None
@@ -484,6 +488,9 @@ class LogitsProcessor(nn.Module):
 
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
+        self.keep_last_hidden_states = (
+            get_exec().features.aux_hidden_state_capture is not None
+        )
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
@@ -591,6 +598,9 @@ class LogitsProcessor(nn.Module):
             sample_indices,
             logits_metadata,
         )
+        last_hidden_states_to_store = self._get_last_hidden_states_to_store(
+            hidden_states, aux_hidden_states, logits_metadata
+        )
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
@@ -604,6 +614,7 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                last_hidden_states=last_hidden_states_to_store,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
             )
 
@@ -621,6 +632,7 @@ class LogitsProcessor(nn.Module):
         logits_output = LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
+            last_hidden_states=last_hidden_states_to_store,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
         logprobs_result.write_input_to(logits_output)
@@ -864,6 +876,20 @@ class LogitsProcessor(nn.Module):
             hidden_states_to_store = hidden_states_to_store_before_norm
 
         return hidden_states_to_store
+
+    def _get_last_hidden_states_to_store(
+        self,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: Optional[AuxHiddenStates],
+        logits_metadata: LogitsMetadata,
+    ) -> Optional[torch.Tensor]:
+        if (
+            self.keep_last_hidden_states
+            and aux_hidden_states is not None
+            and logits_metadata.capture_hidden_mode.is_full()
+        ):
+            return hidden_states
+        return None
 
     def _get_logits(
         self,

@@ -82,6 +82,24 @@ class ExecFeatures(msgspec.Struct):
             choices=["last", "full"],
         ),
     ] = None
+    aux_hidden_state_capture: A[
+        Optional[str],
+        Arg(
+            help="Capture auxiliary hidden states on the target model without a "
+            "speculative draft, through the model's EAGLE3, DFLASH, or DSPARK "
+            "capture hook. Hidden-state capture then stores the concatenated aux "
+            "hidden states, and full capture keeps the post-norm last-layer "
+            "hidden states alongside them. Cannot be combined with "
+            "--speculative-algorithm.",
+            choices=["eagle3", "dflash", "dspark"],
+        ),
+    ] = None
+    aux_hidden_state_layer_ids: A[
+        Optional[List[int]],
+        "Target layer ids captured by --aux-hidden-state-capture, in the "
+        "convention of a draft config's target layer ids. Required for dflash "
+        "and dspark; eagle3 defaults to the model's EAGLE3 layers.",
+    ] = None
     enable_return_routed_experts: A[
         bool, "Enable returning routed experts of each layer with responses."
     ] = False
