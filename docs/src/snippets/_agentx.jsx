@@ -182,8 +182,8 @@ export const AgentX = ({ data }) => {
       const ports = b.ports || [];
       return `Start on each of the ${b.count_nodes || 1} decode node(s)${ports.length > 1 ? `, one instance per port (${ports.join(", ")}; change --port)` : ""}.`;
     }
-    if (b.kind === "dynamo-frontend") return (b.count > 1 ? `SA ran ${b.count} frontends on separate nodes behind nginx (next tab; port 8180 each, nginx on 8000). One frontend on port 8000 also works.` : "Start once; clients connect to port 8000.") + " It finds the workers through etcd, so it can start before them.";
-    if (b.kind === "nginx") return "Optional scale-out in front of the frontends: hashes each session onto one frontend and listens on port 8000, with nginx.conf (below) in the working directory.";
+    if (b.kind === "dynamo-frontend") return (b.count > 1 ? `SA ran ${b.count} frontends on separate nodes behind nginx (previous tab; port 8180 each, nginx on 8000). One frontend on port 8000 also works.` : "Start once; clients connect to port 8000.") + " It finds the workers through etcd, so it can start before them.";
+    if (b.kind === "nginx") return "Optional scale-out in front of the frontends (next tab): hashes each session onto one frontend and listens on port 8000, with nginx.conf (below) in the working directory.";
     if (b.kind === "sglang-router") return "Start once after the workers; clients connect to port 8000.";
     return "";
   };

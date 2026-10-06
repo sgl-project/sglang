@@ -338,6 +338,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 3,
        "cmd": "python3 -m dynamo.frontend",
@@ -354,12 +360,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold-frac", "None"],
         ["--router-session-affinity-ttl-secs", "3600"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "kind": "worker",
@@ -517,6 +517,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 6,
        "cmd": "python3 -m dynamo.frontend",
@@ -533,12 +539,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold-frac", "None"],
         ["--router-session-affinity-ttl-secs", "3600"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "kind": "worker",
@@ -783,6 +783,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 8,
        "cmd": "python3 -m dynamo.frontend",
@@ -799,12 +805,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold-frac", "None"],
         ["--router-session-affinity-ttl-secs", "3600"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "ref": [1, "dynamo", 4]
@@ -939,6 +939,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 4,
        "cmd": "python3 -m dynamo.frontend",
@@ -955,12 +961,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold-frac", "None"],
         ["--router-session-affinity-ttl-secs", "3600"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "ref": [1, "dynamo", 4]
@@ -1091,6 +1091,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 9,
        "cmd": "python3 -m dynamo.frontend",
@@ -1107,12 +1113,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold-frac", "None"],
         ["--router-session-affinity-ttl-secs", "3600"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "workers": 2,
@@ -1297,6 +1297,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 3,
        "cmd": "python3 -m dynamo.frontend",
@@ -1313,12 +1319,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold-frac", "None"],
         ["--router-session-affinity-ttl-secs", "3600"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "kind": "worker",
@@ -1525,6 +1525,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 3,
        "cmd": "python3 -m dynamo.frontend",
@@ -1541,12 +1547,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold", "None"],
         ["--active-prefill-tokens-threshold-frac", "None"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "diff": {
@@ -1678,6 +1678,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 3,
        "cmd": "python3 -m dynamo.frontend",
@@ -1697,12 +1703,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold-frac", "None"],
         ["--router-session-affinity-ttl-secs", "3600"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "kind": "worker",
@@ -1980,6 +1980,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 9,
        "cmd": "python3 -m dynamo.frontend",
@@ -1996,12 +2002,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold", "None"],
         ["--active-prefill-tokens-threshold-frac", "None"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "nodes_per_worker": 2,
@@ -2195,6 +2195,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 7,
        "cmd": "python3 -m dynamo.frontend",
@@ -2211,12 +2217,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold", "None"],
         ["--active-prefill-tokens-threshold-frac", "None"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "ref": [8, "dynamo", 4]
@@ -2357,6 +2357,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 9,
        "cmd": "python3 -m dynamo.frontend",
@@ -2373,12 +2379,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold", "None"],
         ["--active-prefill-tokens-threshold-frac", "None"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "workers": 2,
@@ -3368,6 +3368,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 2,
        "cmd": "python3 -m dynamo.frontend",
@@ -3384,12 +3390,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold-frac", "None"],
         ["--router-session-affinity-ttl-secs", "3600"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "kind": "worker",
@@ -3833,6 +3833,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 4,
        "cmd": "python3 -m dynamo.frontend",
@@ -3849,12 +3855,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold", "None"],
         ["--active-prefill-tokens-threshold-frac", "None"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "kind": "worker",
@@ -4114,6 +4114,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 3,
        "cmd": "python3 -m dynamo.frontend",
@@ -4130,12 +4136,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold", "None"],
         ["--active-prefill-tokens-threshold-frac", "None"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "diff": {
@@ -4722,6 +4722,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 2,
        "cmd": "python3 -m dynamo.frontend",
@@ -4738,12 +4744,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold", "None"],
         ["--active-prefill-tokens-threshold-frac", "None"]
        ]
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "kind": "worker",
@@ -4926,6 +4926,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 2,
        "cmd": "python3 -m dynamo.frontend",
@@ -4938,12 +4944,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold-frac", "None"]
        ],
        "envRef": 0
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "kind": "worker",
@@ -5177,6 +5177,12 @@ export const agentx = {
        "args": []
       },
       {
+       "kind": "nginx",
+       "cmd": "nginx -c nginx.conf -g daemon off;",
+       "env": {},
+       "args": []
+      },
+      {
        "kind": "dynamo-frontend",
        "count": 4,
        "cmd": "python3 -m dynamo.frontend",
@@ -5189,12 +5195,6 @@ export const agentx = {
         ["--active-prefill-tokens-threshold-frac", "None"]
        ],
        "envRef": 0
-      },
-      {
-       "kind": "nginx",
-       "cmd": "nginx -c nginx.conf -g daemon off;",
-       "env": {},
-       "args": []
       },
       {
        "workers": 2,
