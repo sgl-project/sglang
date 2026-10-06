@@ -143,6 +143,8 @@ def _resolve_media(message: Any, chat: Any, media_marker: str, media_kinds: list
     if not isinstance(content, chat.Text) or not content.text.startswith(media_marker):
         return message
     index = int(content.text.removeprefix(media_marker))
+    if media_kinds[index] == "audio" and message.author.kind != chat.AuthorKind.User:
+        raise ValueError("Inkling audio input is only supported in user messages")
     prefix = (
         _IMAGE_LOCATION_PREFIX
         if media_kinds[index] == "image"

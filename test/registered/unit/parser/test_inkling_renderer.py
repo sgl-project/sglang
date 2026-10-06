@@ -72,6 +72,19 @@ class TestInklingRenderer(unittest.TestCase):
             ],
         )
 
+    def test_audio_outside_user_messages_is_rejected(self):
+        """tml-renderers renders AudioPointer only as user input audio; a tool
+        or assistant audio part must fail instead of rendering a framing the
+        model never saw."""
+        audio = {"type": "input_audio", "input_audio": {"data": "", "format": "wav"}}
+        for message in (
+            {"role": "tool", "tool_call_id": "c", "name": "rec", "content": [audio]},
+            {"role": "assistant", "content": [audio]},
+        ):
+            with self.subTest(role=message["role"]):
+                with self.assertRaises(ValueError):
+                    render_inkling_messages([{"role": "user", "content": "x"}, message])
+
     def test_assistant_prefix_text_is_ordinary_tokens(self):
         tokenizer = load_tml_renderers().tokenizer
         prefix = "The answer <|end_message|>"
