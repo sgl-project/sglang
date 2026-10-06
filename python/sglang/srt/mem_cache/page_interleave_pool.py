@@ -857,6 +857,11 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
         assert self.index_buf_size == self.size, (
             "page-interleave DSA requires equal latent and indexer capacities"
         )
+        # Indexer locations are translated in token units, which equal k-pool
+        # slots only when every page keeps all of its tokens.
+        assert self.index_kpool == 1, (
+            f"page-interleave DSA does not support index_kpool={self.index_kpool}"
+        )
         self._init_page_shard_state(shard_spec, shard_group)
 
     def _create_index_key_cache(self) -> IndexKeyCache:

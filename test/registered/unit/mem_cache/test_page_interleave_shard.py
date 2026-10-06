@@ -1779,11 +1779,12 @@ class _IndexerCacheCheck:
             PageInterleaveDSATokenToKVPool,
         )
 
+        self.group = group
         self.world = group.world_size
         self.rank = group.rank_in_group
         self.device = group.device
         self.packed = packed
-        kwargs = dict(
+        self.kwargs = kwargs = dict(
             page_size=_INDEXER_PAGE_SIZE,
             kv_lora_rank=_INDEXER_KV_LORA_RANK,
             dtype=torch.float8_e4m3fn if packed else torch.bfloat16,
@@ -1813,6 +1814,31 @@ class _IndexerCacheCheck:
         self.reference = DSATokenToKVPool(
             (_INDEXER_SIZE + _INDEXER_PAGE_SIZE) * self.world, **kwargs
         )
+
+    def rejects_kpool(self):
+        from sglang.srt.mem_cache.page_interleave import PageShardSpec
+        from sglang.srt.mem_cache.page_interleave_pool import (
+            PageInterleaveDSATokenToKVPool,
+        )
+
+        # A 128-token page with index_kpool=2 holds 64 indexer slots, so the
+        # token-unit location translation would address the wrong rows.
+        page_size = 2 * _INDEXER_PAGE_SIZE
+        with unittest.TestCase().assertRaisesRegex(
+            AssertionError, "does not support index_kpool=2"
+        ):
+            PageInterleaveDSATokenToKVPool(
+                _INDEXER_SIZE,
+                **{**self.kwargs, "page_size": page_size, "index_kpool": 2},
+                shard_spec=PageShardSpec(
+                    shard_rank=self.rank,
+                    shard_size=self.world,
+                    page_size=page_size,
+                    max_prefix_tokens=8 * self.world * page_size,
+                    chunk_tokens=8 * page_size,
+                ),
+                shard_group=self.group,
+            )
 
     def store(self, locs, layer_id, generation):
         values = _latent_values(locs, layer_id, generation)
@@ -2118,6 +2144,7 @@ def _run_indexer(rank, world, init_method):
         group = get_parallel().attn_cp_group
         for packed in (False, True):
             check = _IndexerCacheCheck(group, packed)
+            check.rejects_kpool()
             # Fragmented physical pages with a rotated cyclic ownership run.
             prefix = [
                 physical * world + (i + 1) % world
