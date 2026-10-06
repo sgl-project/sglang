@@ -469,19 +469,13 @@ if get_platform().is_blackwell and is_flashinfer_available():
     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
 
+    from sglang.srt.layers.quantization.mxfp8_dispatch_cache import (
+        maybe_cache_mxfp8_dispatch,
+    )
+
     _flashinfer_mm_mxfp8_impl = _raw_flashinfer_mm_mxfp8
     if get_bool_env_var("SGLANG_OPT_MXFP8_DISPATCH_CACHE", "true"):
-        import flashinfer
-
-        from sglang.srt.layers.quantization.mxfp8_dispatch_cache import (
-            maybe_cache_mxfp8_dispatch,
-        )
-
-        _flashinfer_mm_mxfp8_impl = maybe_cache_mxfp8_dispatch(
-            _raw_flashinfer_mm_mxfp8,
-            getattr(flashinfer.gemm, "gemm_base", None),
-            flashinfer.__version__,
-        )
+        _flashinfer_mm_mxfp8_impl = maybe_cache_mxfp8_dispatch(_raw_flashinfer_mm_mxfp8)
 
     @lru_cache(maxsize=1)
     def _get_flashinfer_groupwise_backend() -> str:

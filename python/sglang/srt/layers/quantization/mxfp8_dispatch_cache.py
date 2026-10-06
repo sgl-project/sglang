@@ -7,18 +7,25 @@ Only reuse the stateless CuTe runner and validation of identical metadata.
 from functools import lru_cache
 from inspect import Parameter, signature
 
+try:
+    from flashinfer import __version__ as flashinfer_version
+    from flashinfer.gemm import gemm_base
+except ImportError:
+    flashinfer_version = ""
+    gemm_base = None
 
-def maybe_cache_mxfp8_dispatch(raw_mm, gemm_module, version):
+
+def maybe_cache_mxfp8_dispatch(raw_mm):
     """Keep unsupported FlashInfer versions and APIs on the original path."""
-    if version.split("+", 1)[0] != "0.7.0" or not callable(
-        getattr(gemm_module, "_cute_dsl_gemm_mxfp8_runner", None)
-    ):
+    if flashinfer_version.split("+", 1)[0] != "0.7.0" or gemm_base is None:
         return raw_mm
     try:
+        if not callable(gemm_base._cute_dsl_gemm_mxfp8_runner):
+            return raw_mm
         # FlashInfer's backend-requirement decorator consumes skip_check via
         # **kwargs; following __wrapped__ would hide this supported argument.
         parameters = signature(raw_mm, follow_wrapped=False).parameters
-    except (TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         return raw_mm
     skip_check = parameters.get("skip_check")
     accepts_keyword = skip_check is not None and skip_check.kind in (
@@ -29,7 +36,7 @@ def maybe_cache_mxfp8_dispatch(raw_mm, gemm_module, version):
         p.kind == Parameter.VAR_KEYWORD for p in parameters.values()
     ):
         return raw_mm
-    return Mxfp8DispatchCache(raw_mm, gemm_module)
+    return Mxfp8DispatchCache(raw_mm, gemm_base)
 
 
 class Mxfp8DispatchCache:
