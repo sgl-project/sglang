@@ -1,19 +1,26 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
+from typing import List, Optional
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
+    cumulative,
+    plan_dsa_token_shard,
+)
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, print_info_once
 
 if is_npu():
     import torch_npu
@@ -21,6 +28,18 @@ if is_npu():
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+
+
+@lru_cache(maxsize=1)
+def _shard_indexer_queries() -> bool:
+    """Cached, not read at import, so tests can set it; see
+    ``reset_indexer_shard_flag``."""
+    return envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get()
+
+
+def reset_indexer_shard_flag() -> None:
+    """Re-read the flag. For tests; never call this while serving."""
+    _shard_indexer_queries.cache_clear()
 
 
 @lru_cache(maxsize=1)
@@ -53,6 +72,130 @@ def _quantize_npu_indexer_activation(x, hadamard, dst_type):
     return quantized.reshape(x.shape), scale.to(torch.float32).reshape(x.shape[:-1])
 
 
+def plan_indexer_query_shard(
+    prefix_lens: List[int], extend_lens: List[int], tp_size: int, tp_rank: int
+):
+    """One attention-TP rank's share of an extend batch's indexer queries.
+
+    Uses ``plan_dsa_token_shard``'s position cut, so a DSA token shard over
+    the same ranks would pick the same rows.
+
+    Returns ``(start, rows, num_real, cum_query_lens, key_lens)``.
+    """
+    plan = plan_dsa_token_shard(
+        extend_lens,
+        [p + e for p, e in zip(prefix_lens, extend_lens)],
+        tp_size,
+        tp_rank,
+    )
+    return (
+        plan.local_start,
+        plan.rows,
+        max(0, plan.local_end - plan.local_start),
+        cumulative(plan.query_lens),
+        plan.key_lens,
+    )
+
+
+@dataclass
+class _IndexerQueryShard:
+    """This rank's rows of an extend batch, and how to reassemble the top-k."""
+
+    start: int
+    rows: int
+    num_real: int
+    total: int
+    tp_size: int
+    actual_seq_lengths_q: torch.Tensor
+    actual_seq_lengths_kv: torch.Tensor
+
+    def take(self, x: torch.Tensor) -> torch.Tensor:
+        if self.num_real == self.rows:
+            return x[self.start : self.start + self.rows]
+        # Padding rows lie past actual_seq_lengths_q[-1]; gather() drops them.
+        out = x.new_zeros((self.rows, *x.shape[1:]))
+        out[: self.num_real] = x[self.start : self.start + self.num_real]
+        return out
+
+    def gather(self, topk_indices: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        """All-gather the per-rank top-k back to ``num_tokens`` rows."""
+        out = topk_indices.new_empty((self.rows * self.tp_size, topk_indices.shape[-1]))
+        attn_tp_all_gather_into_tensor(out, topk_indices.contiguous())
+        return out[:num_tokens]
+
+
+def _build_indexer_query_shard(
+    forward_batch: ForwardBatch,
+) -> Optional[_IndexerQueryShard]:
+    parallel = get_parallel()
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    extend_lens = forward_batch.extend_seq_lens_cpu
+    if (
+        parallel.attn_tp_size == 1
+        or forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        or prefix_lens is None
+        or extend_lens is None
+        or sum(extend_lens) == 0
+    ):
+        return None
+    start, rows, num_real, cum_query_lens, key_lens = plan_indexer_query_shard(
+        prefix_lens, extend_lens, parallel.attn_tp_size, parallel.attn_tp_rank
+    )
+    # Every rank logs, so a grep counts ranks; /server_info cannot show it.
+    print_info_once(
+        "DSA indexer query sharding is active: prefill indexer queries split "
+        f"across attn_tp_size={parallel.attn_tp_size}"
+    )
+    device = forward_batch.seq_lens.device
+    return _IndexerQueryShard(
+        start=start,
+        rows=rows,
+        num_real=num_real,
+        total=sum(extend_lens),
+        tp_size=parallel.attn_tp_size,
+        actual_seq_lengths_q=torch.tensor(
+            cum_query_lens, dtype=torch.int32, device=device
+        ),
+        actual_seq_lengths_kv=torch.tensor(key_lens, dtype=torch.int32, device=device),
+    )
+
+
+def _get_indexer_query_shard(
+    forward_batch: ForwardBatch, num_tokens: int
+) -> Optional[_IndexerQueryShard]:
+    """The query shard for a prefill indexer call, or None to score every row.
+
+    Every rank already holds the full index-K, so each scores 1/attn_tp_size of
+    the queries and all-gathers the top-k: 15.97x less indexer work at 1M and
+    tp16. Planned once per forward from inputs identical across the group, so
+    all ranks take the collective or none do.
+    """
+    if get_attn_tp_context().input_scattered:
+        # A scattered input is already sliced.
+        print_info_once(
+            "DSA indexer query sharding is off: the attention input "
+            "is scattered across the TP group"
+        )
+        return None
+    if not hasattr(forward_batch, "npu_indexer_query_shard"):
+        forward_batch.npu_indexer_query_shard = _build_indexer_query_shard(
+            forward_batch
+        )
+    shard = forward_batch.npu_indexer_query_shard
+    if shard is None:
+        return None
+    # SGLang pads the width to a multiple of attn_tp_size; comparing against
+    # total alone would disable sharding for 15 token counts in 16.
+    padded = shard.rows * shard.tp_size
+    if not shard.total <= num_tokens <= padded:
+        print_info_once(
+            "DSA indexer query sharding is off for this forward: "
+            f"num_tokens={num_tokens} is outside [{shard.total}, {padded}]"
+        )
+        return None
+    return shard
+
+
 class DSANPUIndexerMixin:
     def forward_npu(
         self,
@@ -76,6 +219,28 @@ class DSANPUIndexerMixin:
 
         bs = q_lora.shape[0]
 
+        # A rank that scores only its own rows projects only those (W3): wq_b is
+        # 25.2 MFLOP per token. k stays full width -- every rank writes the whole
+        # index-K, which is what lets any of them score a subset. Neox only: the
+        # other branch rotates q and k in one call. Prefill CP is excluded: its
+        # indexer below knows nothing of this shard.
+        uses_prefill_cp = (
+            self.dsa_enable_prefill_cp and forward_batch.attn_cp_metadata is not None
+        )
+        shard = (
+            _get_indexer_query_shard(forward_batch, bs)
+            if is_prefill and _shard_indexer_queries() and not uses_prefill_cp
+            else None
+        )
+        q_sliced_early = shard is not None and self.rotary_emb.is_neox_style
+        if q_sliced_early:
+            if dynamic_scale is not None:
+                dynamic_scale = shard.take(dynamic_scale)
+            q_lora = shard.take(q_lora)
+            bs_q = shard.rows
+        else:
+            bs_q = bs
+
         if self.rotary_emb.is_neox_style:
             if not hasattr(forward_batch, "npu_indexer_sin_cos_cache"):
                 cos_sin = self.rotary_emb.cos_sin_cache[positions]
@@ -86,6 +251,11 @@ class DSANPUIndexerMixin:
             else:
                 sin, cos = forward_batch.npu_indexer_sin_cos_cache
 
+            # q rotates on this rank's rows; k still needs every one of them.
+            sin_q, cos_q = (
+                (shard.take(sin), shard.take(cos)) if q_sliced_early else (sin, cos)
+            )
+
             if self.alt_stream is not None:
                 self.alt_stream.wait_stream(torch.npu.current_stream())
                 with torch.npu.stream(self.alt_stream):
@@ -94,17 +264,17 @@ class DSANPUIndexerMixin:
                     )
                     q = self.wq_b(q_lora)[
                         0
-                    ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
-                    q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+                    ]  # [rows, 1536] @ [1536, 64 * 128] = [rows, 64 * 128]
+                    q = q.view(bs_q, self.n_heads, self.head_dim)  # [rows, 64, 128]
                     q_pe, q_nope = torch.split(
                         q,
                         [self.rope_head_dim, self.head_dim - self.rope_head_dim],
                         dim=-1,
-                    )  # [bs, 64, 64 + 64]
-                    q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
-                    q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
-                        bs, self.n_heads, self.rope_head_dim
-                    )  # [bs, n, d]
+                    )  # [rows, 64, 64 + 64]
+                    q_pe = q_pe.view(bs_q, self.n_heads, 1, self.rope_head_dim)
+                    q_pe = torch_npu.npu_rotary_mul(q_pe, cos_q, sin_q).view(
+                        bs_q, self.n_heads, self.rope_head_dim
+                    )  # [rows, n, d]
                     q = torch.cat([q_pe, q_nope], dim=-1)
                     q.record_stream(self.alt_stream)
                     q_rope_event = self.alt_stream.record_event()
@@ -114,17 +284,17 @@ class DSANPUIndexerMixin:
                 )
                 q = self.wq_b(q_lora)[
                     0
-                ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
-                q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+                ]  # [rows, 1536] @ [1536, 64 * 128] = [rows, 64 * 128]
+                q = q.view(bs_q, self.n_heads, self.head_dim)  # [rows, 64, 128]
                 q_pe, q_nope = torch.split(
                     q,
                     [self.rope_head_dim, self.head_dim - self.rope_head_dim],
                     dim=-1,
-                )  # [bs, 64, 64 + 64]
-                q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
-                q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
-                    bs, self.n_heads, self.rope_head_dim
-                )  # [bs, n, d]
+                )  # [rows, 64, 64 + 64]
+                q_pe = q_pe.view(bs_q, self.n_heads, 1, self.rope_head_dim)
+                q_pe = torch_npu.npu_rotary_mul(q_pe, cos_q, sin_q).view(
+                    bs_q, self.n_heads, self.rope_head_dim
+                )  # [rows, n, d]
                 q = torch.cat([q_pe, q_nope], dim=-1)
 
             if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
@@ -324,10 +494,21 @@ class DSANPUIndexerMixin:
                 if is_prefill
                 else block_table
             )
+            query = q.view(-1, self.n_heads, self.head_dim)
+            # The full width for the gather, NOT query.shape[0] (already cut).
+            num_query_tokens = bs
+            if shard is not None:
+                if not q_sliced_early:
+                    query = shard.take(query)
+                # A late take: under _use_ag_after_qlora weights is gathered
+                # to full width above, so an earlier slice would cut twice.
+                weights = shard.take(weights)
+                actual_seq_lengths_q = shard.actual_seq_lengths_q
+                actual_seq_lengths_kv = shard.actual_seq_lengths_kv
 
             if use_quant_indexer:
                 query, query_scale = _quantize_npu_indexer_activation(
-                    q.view(-1, self.n_heads, self.head_dim),
+                    query,
                     pool.indexer_hadamard_128,
                     pool.dtype,
                 )
@@ -348,25 +529,26 @@ class DSANPUIndexerMixin:
                     sparse_mode=3,
                     query_quant_mode=0,
                     key_quant_mode=0,
-                )
-                return topk_indices.squeeze(1)
-
-            topk_indices = torch_npu.npu_lightning_indexer(
-                query=q.view(-1, self.n_heads, self.head_dim),
-                key=past_key_states,
-                weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
-                    torch.int32
-                ),
-                block_table=block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.index_topk,
-                sparse_mode=3,
-            )
+                ).squeeze(1)
+            else:
+                topk_indices = torch_npu.npu_lightning_indexer(
+                    query=query,
+                    key=past_key_states,
+                    weights=weights,
+                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
+                    actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
+                        torch.int32
+                    ),
+                    block_table=block_table,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=self.index_topk,
+                    sparse_mode=3,
+                )[0].squeeze(1)
+            if shard is not None:
+                topk_indices = shard.gather(topk_indices, num_query_tokens)
             # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
-            return topk_indices[0].squeeze(1)
+            return topk_indices
 
     def do_npu_cp_balance_indexer(
         self,
