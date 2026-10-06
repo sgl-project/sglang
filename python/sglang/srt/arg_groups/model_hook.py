@@ -145,6 +145,7 @@ def handle_model_specific_adjustments(server_args: Any):
     from sglang.srt.configs.model_config import (
         get_mimo_v2_fused_qkv_expected_tp_size,
         is_deepseek_dsa,
+        is_kimi_k3,
     )
 
     if cfg.enable_deterministic_inference:
@@ -168,11 +169,15 @@ def handle_model_specific_adjustments(server_args: Any):
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
 
-    if get_platform().is_npu and cfg.dcp_size > 1 and not is_deepseek_dsa(hf_config):
+    if (
+        get_platform().is_npu
+        and cfg.dcp_size > 1
+        and not (is_deepseek_dsa(hf_config) or is_kimi_k3(hf_config))
+    ):
         raise ValueError(
             "NPU decode context parallelism is currently implemented only for "
-            "DeepSeek DSA models; got "
-            f"{model_arch}. Set --decode-context-parallel-size=1 or use a DSA model."
+            "DeepSeek DSA and Kimi-K3 models; got "
+            f"{model_arch}. Set --decode-context-parallel-size=1 or use a supported model."
         )
 
     if model_arch == "InternS2MobiusForConditionalGeneration":
