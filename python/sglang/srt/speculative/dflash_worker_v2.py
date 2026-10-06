@@ -1157,7 +1157,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         *,
         batch_seq_lens_cpu: Optional[torch.Tensor],
         nxt_kv_lens_cpu: Optional[torch.Tensor],
-        draft_prefix_lens: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
         """Fill the seq_lens_cpu planning bound, sync-free when a host-side
@@ -1168,8 +1167,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         elif nxt_kv_lens_cpu is not None:
             self._compute_compact_draft_seq_lens_host(nxt_kv_lens_cpu, out=out)
         else:
-            # Last resort: the legacy blocking D2H copy.
-            out.copy_(draft_prefix_lens)
+            # Compact device lengths never exceed the window plus one page.
+            out.fill_(
+                int(self.draft_window_size)
+                + (self.page_size if self.page_size > 1 else 0)
+            )
 
     def _rebuild_compact_draft_cache(
         self,
@@ -2489,7 +2491,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._fill_compact_seq_lens_cpu_bound(
                 batch_seq_lens_cpu=batch.seq_lens_cpu,
                 nxt_kv_lens_cpu=draft_input.nxt_kv_lens_cpu,
-                draft_prefix_lens=draft_prefix_lens,
                 out=seq_lens_cpu,
             )
             self._rebuild_compact_draft_cache(
@@ -2517,8 +2518,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_cpu.copy_(draft_input.nxt_kv_lens_cpu)
                 draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
             else:
-                seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
-                draft_seq_lens_sum = int(prefix_lens.sum().item())
+                # Allocated lengths include the in-flight verify reservation.
+                for i, req in enumerate(batch.reqs):
+                    seq_lens_cpu[i] = req.kv.kv_allocated_len
+                draft_seq_lens_sum = int(seq_lens_cpu.sum())
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
