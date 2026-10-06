@@ -1053,9 +1053,9 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.release_pp_prefetch(req.rid)
         return self.session.try_cache_finished_req(req)
 
-    @rank_consensus(same_params=["req.rid", "inserted"])
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        if inserted:
+    @rank_consensus(same_params=["req.rid", "checkpointed"])
+    def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if checkpointed:
             return
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(req, is_finished=True)
