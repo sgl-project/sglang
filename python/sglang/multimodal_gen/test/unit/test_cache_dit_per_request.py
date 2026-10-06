@@ -6,6 +6,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
+from sglang.multimodal_gen.runtime.cache import cache_dit_integration
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     cache_dit_overrides_key,
     resolve_cache_dit_request_overrides,
@@ -16,6 +19,34 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.ideogram import (
+    Ideogram4ProgressiveDenoisingStage,
+)
+
+
+class TestIdeogramActiveCacheRefresh(unittest.TestCase):
+    def test_request_override_and_active_transformers_survive_transition(self):
+        for skip, has_unconditional in ((False, True), (True, True), (False, False)):
+            with self.subTest(skip=skip, has_unconditional=has_unconditional):
+                stage = object.__new__(Ideogram4ProgressiveDenoisingStage)
+                stage.transformer = torch.nn.Linear(2, 2)
+                stage.unconditional_transformer = (
+                    torch.nn.Linear(2, 2) if has_unconditional else None
+                )
+                stage._cache_dit_request_overrides = {"scm_preset": "none"}
+                ctx = SimpleNamespace(extra={"ideogram4_skip_unconditional": skip})
+                with patch.object(
+                    cache_dit_integration.cache_dit, "refresh_context"
+                ) as refresh:
+                    stage._refresh_cache_dit_context(
+                        4, stage._effective_scm_preset(), ctx
+                    )
+                targets = [call.args[0] for call in refresh.call_args_list]
+                expected = [stage.transformer]
+                if has_unconditional and not skip:
+                    expected.append(stage.unconditional_transformer)
+                self.assertEqual(targets, expected)
+                self.assertIsNone(stage._effective_scm_preset())
 
 
 class TestResolveCacheDitRequestOverrides(unittest.TestCase):
