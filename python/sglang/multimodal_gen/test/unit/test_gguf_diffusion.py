@@ -33,6 +33,10 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     gguf_weights_iterator,
     names_gguf_checkpoint,
     read_gguf_tensor_meta,
+    remap_gguf_tensor_meta,
+)
+from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
+    MiniMaxH3Qwen3VLEncoder,
 )
 from sglang.srt.layers.quantization.gguf import UNQUANTIZED_TYPES
 from sglang.srt.utils.hf_transformers import check_gguf_file
@@ -51,10 +55,18 @@ def _kv_string(key: str, value: str, bo: str = "<") -> bytes:
     return out
 
 
+def _kv_u64_array(key: str, values: list[int], bo: str = "<") -> bytes:
+    out = struct.pack(f"{bo}Q", len(key)) + key.encode()
+    out += struct.pack(f"{bo}IIQ", 9, 10, len(values))
+    out += b"".join(struct.pack(f"{bo}Q", value) for value in values)
+    return out
+
+
 def _write_gguf(
     path: Path,
     tensors: list[tuple[str, list[int], int, bytes]],
     byte_order: str = "<",
+    metadata: tuple[bytes, ...] = (),
 ) -> None:
     """Write a minimal GGUF v3 file containing ``tensors``.
 
@@ -65,8 +77,9 @@ def _write_gguf(
     """
     bo = byte_order
     header = b"GGUF" + struct.pack(f"{bo}I", 3)
-    header += struct.pack(f"{bo}QQ", len(tensors), 1)
+    header += struct.pack(f"{bo}QQ", len(tensors), 1 + len(metadata))
     header += _kv_string("general.architecture", "test", bo)
+    header += b"".join(metadata)
 
     # Tensor info blocks, then padded data.
     infos = b""
@@ -90,6 +103,97 @@ def _write_gguf(
         padded = (len(payload) + alignment - 1) // alignment * alignment
         body += payload + b"\0" * (padded - len(payload))
     path.write_bytes(body)
+
+
+class TestMiniMaxH3GGUFPatchEmbedding(unittest.TestCase):
+    @staticmethod
+    def _encoder(dtype=torch.float32):
+        encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
+        torch.nn.Module.__init__(encoder)
+        encoder.selected_lm_layer = 50
+        encoder.model = torch.nn.Module()
+        encoder.model.visual = torch.nn.Module()
+        encoder.model.visual.patch_embed = torch.nn.Module()
+        encoder.model.visual.patch_embed.proj = torch.nn.Conv3d(
+            3, 4, (2, 2, 2), bias=False, dtype=dtype
+        )
+        return encoder
+
+    def test_folded_patch_weight_from_gguf_matches_conv3d(self):
+        # H3 GGUF stores (out * in, temporal, height, width), without an
+        # original-shape field. Distinct channel values catch axis mixups.
+        source = torch.arange(96, dtype=torch.float32).reshape(4, 3, 2, 2, 2)
+        source = source.sub(48).div(32).to(torch.bfloat16)
+        name = "visual.patch_embed.proj.weight"
+        target_name = f"model.{name}"
+        inputs = torch.arange(3 * 4 * 5 * 6).reshape(1, 3, 4, 5, 6).float() / 100
+        expected = torch.nn.functional.conv3d(inputs, source.float())
+
+        for original_shape in (False, True):
+            with self.subTest(original_shape=original_shape):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "patch.gguf"
+                    metadata = (
+                        (
+                            _kv_u64_array(
+                                f"comfy.gguf.orig_shape.{name}", list(source.shape)
+                            ),
+                        )
+                        if original_shape
+                        else ()
+                    )
+                    _write_gguf(
+                        path,
+                        [
+                            (
+                                name,
+                                [2, 2, 2, 12],
+                                _BF16,
+                                source.view(torch.int16).numpy().tobytes(),
+                            )
+                        ],
+                        metadata=metadata,
+                    )
+                    meta = read_gguf_tensor_meta(str(path))
+                    self.assertEqual(
+                        meta[name].logical_shape,
+                        tuple(source.shape) if original_shape else (12, 2, 2, 2),
+                    )
+                    encoder = self._encoder()
+                    loaded = encoder.load_weights(
+                        gguf_weights_iterator(str(path), meta)
+                    )
+
+                self.assertEqual(loaded, {target_name})
+                projection = encoder.model.visual.patch_embed.proj
+                torch.testing.assert_close(
+                    projection.weight, source.float(), rtol=0, atol=0
+                )
+                torch.testing.assert_close(projection(inputs), expected, rtol=0, atol=0)
+
+    def test_folded_patch_weight_keeps_checkpoint_mapping(self):
+        encoder = self._encoder(torch.bfloat16)
+        encoder._keep_checkpoint_mapping = True
+        source = torch.arange(96).to(torch.bfloat16).reshape(12, 2, 2, 2)
+        encoder.load_weights([("model.visual.patch_embed.proj.weight", source)])
+        weight = encoder.model.visual.patch_embed.proj.weight
+        self.assertEqual(weight.data_ptr(), source.data_ptr())
+        torch.testing.assert_close(weight, source.reshape(4, 3, 2, 2, 2))
+
+    def test_other_equal_size_shapes_are_rejected(self):
+        for shape in ((4, 6, 2, 2), (12, 2, 4), (96,)):
+            with self.subTest(shape=shape):
+                encoder = self._encoder()
+                with self.assertRaisesRegex(RuntimeError, "checkpoint=.*parameter="):
+                    encoder.load_weights(
+                        [("visual.patch_embed.proj.weight", torch.ones(shape))]
+                    )
+
+    def test_other_conv3d_weights_are_not_reshaped(self):
+        encoder = self._encoder()
+        encoder.model.visual.other = torch.nn.Conv3d(3, 4, (2, 2, 2), bias=False)
+        with self.assertRaisesRegex(RuntimeError, "checkpoint=.*parameter="):
+            encoder.load_weights([("visual.other.weight", torch.ones(12, 2, 2, 2))])
 
 
 class TestGGUFTensorMeta(unittest.TestCase):
@@ -116,6 +220,63 @@ class TestGGUFTensorMeta(unittest.TestCase):
         self.assertEqual(meta.stored_dtype, torch.uint8)
         # The layer registers `qweight`, so that is what the iterator must yield.
         self.assertEqual(meta.param_name, "w.qweight")
+
+    def test_comfy_original_shape_restores_matrix_rows(self):
+        path = self.tmp / "comfy.gguf"
+        logical_shape = [4, 512]
+        payload = bytes(4 * 512 // _Q4_K_BLOCK * _Q4_K_TYPE_SIZE)
+        _write_gguf(
+            path,
+            [("w.weight", [256, 8], _Q4_K, payload)],
+            metadata=(_kv_u64_array("comfy.gguf.orig_shape.w.weight", logical_shape),),
+        )
+
+        meta = read_gguf_tensor_meta(str(path))["w.weight"]
+
+        self.assertEqual(meta.logical_shape, (4, 512))
+        self.assertEqual(meta.stored_shape, (4, 288))
+
+    def test_comfy_non_aligned_rows_dequantize_during_load(self):
+        path = self.tmp / "comfy-unaligned.gguf"
+        logical_shape = [2, 384]
+        payload = bytes(2 * 384 // _Q4_K_BLOCK * _Q4_K_TYPE_SIZE)
+        _write_gguf(
+            path,
+            [("vision.weight", [256, 3], _Q4_K, payload)],
+            metadata=(
+                _kv_u64_array("comfy.gguf.orig_shape.vision.weight", logical_shape),
+            ),
+        )
+
+        metadata = read_gguf_tensor_meta(str(path))
+        loaded = dict(gguf_weights_iterator(str(path), metadata))["vision.weight"]
+
+        self.assertTrue(metadata["vision.weight"].dequantize_on_load)
+        self.assertEqual(loaded.dtype, torch.bfloat16)
+        self.assertEqual(tuple(loaded.shape), (2, 384))
+
+    def test_parameter_mapping_retains_checkpoint_lookup(self):
+        meta = GGUFTensorMeta(
+            ggml_type=int(_Q4_K),
+            logical_shape=(4, 512),
+            stored_shape=(4, 288),
+            stored_dtype=torch.uint8,
+            param_name="visual.block.qkv.qweight",
+        )
+
+        remapped = remap_gguf_tensor_meta(
+            {"visual.block.qkv.weight": meta},
+            lambda name: "model.visual.block.qkv_proj.weight",
+        )
+
+        self.assertIs(
+            remapped["visual.block.qkv.weight"],
+            remapped["model.visual.block.qkv_proj.weight"],
+        )
+        self.assertEqual(
+            remapped["visual.block.qkv.weight"].param_name,
+            "model.visual.block.qkv_proj.qweight",
+        )
 
     def test_unquantized_layout_matches_logical_shape(self):
         out_features, in_features = 3, 8
@@ -702,7 +863,7 @@ class TestGGUFRejectsLoraConversion(unittest.TestCase):
     """The dynamic set_lora path must refuse before replacing any layer."""
 
     def _pipeline_with(self, layer):
-        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+        from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
             LoRAPipeline,
         )
 

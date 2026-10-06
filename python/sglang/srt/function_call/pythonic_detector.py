@@ -95,14 +95,29 @@ class PythonicDetector(BaseFormatDetector):
                     if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                         continue  # Skip unknown tools (default legacy behavior)
 
-                arguments = {}
-                for keyword in call.keywords:
-                    arguments[keyword.arg] = self._get_parameter_value(keyword.value)
+                # Convert each call on its own: an unconvertible argument used
+                # to escape to the outer handler and drop every parseable
+                # sibling call in the block.
+                try:
+                    arguments = {}
+                    for keyword in call.keywords:
+                        arguments[keyword.arg] = self._get_parameter_value(
+                            keyword.value
+                        )
+                    # allow_nan=False: a non-finite float (e.g. the literal
+                    # 1e999 overflowing to inf) would otherwise serialize as
+                    # Infinity, which is not valid JSON for downstream clients.
+                    parameters = json.dumps(
+                        arguments, ensure_ascii=False, allow_nan=False
+                    )
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Skipping tool call {function_name}: {e}")
+                    continue
                 calls.append(
                     ToolCallItem(
                         tool_index=call_index,  # Use the call index in the response, not tool position
                         name=function_name,
-                        parameters=json.dumps(arguments, ensure_ascii=False),
+                        parameters=parameters,
                     )
                 )
 
@@ -207,7 +222,14 @@ class PythonicDetector(BaseFormatDetector):
 
     def _get_parameter_value(self, val):
         if isinstance(val, ast.Constant):
-            return val.value
+            if val.value is None or isinstance(val.value, (str, int, float)):
+                return val.value
+            # bytes/Ellipsis/complex have no JSON form; raising here lets the
+            # per-call handler skip this call instead of a TypeError inside
+            # json.dumps dropping every sibling call in the block.
+            raise ValueError(
+                f"Constant has no JSON representation: {type(val.value).__name__}"
+            )
         elif isinstance(val, ast.Dict):
             return {
                 k.value: self._get_parameter_value(v)

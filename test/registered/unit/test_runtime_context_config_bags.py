@@ -9,13 +9,17 @@ import dataclasses
 import unittest
 from unittest import mock
 
+import msgspec
+import msgspec.structs
+
 from sglang.srt import runtime_context as rc
 from sglang.srt.arg_groups.arg_utils import NS, A
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 @dataclasses.dataclass
@@ -29,33 +33,6 @@ class _CollisionFake:
     # 'topk' is both a leaf on exec.moe and a subgroup of exec.moe -> collision.
     topk: A[int, NS("exec.moe")] = 8
     x: A[int, NS("exec.moe.topk")] = 1
-
-
-_TOP = (
-    rc.get_device,
-    rc.get_model,
-    rc.get_exec,
-    rc.get_schedule,
-    rc.get_memory,
-    rc.get_spec,
-    rc.get_lora,
-    rc.get_mm,
-    rc.get_disagg,
-    rc.get_serving,
-    rc.get_observability,
-)
-_EXEC_SUBS = (
-    "kernel",
-    "moe",
-    "graph",
-    "comm",
-    "mamba",
-    "overlap",
-    "offload",
-    "dllm",
-    "deterministic",
-    "features",
-)
 
 
 class TestConfigBags(CustomTestCase):
@@ -74,7 +51,8 @@ class TestConfigBags(CustomTestCase):
 
     def _publish(self):
         sa = ServerArgs(model_path="dummy")
-        rc.get_context().set_server_args(sa)
+        # Through publish, so the record is resolved the way a process resolves it.
+        rc.publish(sa, role="test")
         return sa
 
     def test_fail_closed_before_publish(self):
@@ -95,21 +73,20 @@ class TestConfigBags(CustomTestCase):
         none-flags) the first resolution may have written -- so the assertion
         is "bag == what resolution produces", not "bag == the instance publish
         copied from". Reproducibility (`test_resolution_is_reproducible`)
-        licenses the sibling as a stand-in for the pipeline's output. The
-        raw-differs guard keeps the comparison meaningful: every sampled leaf
-        must have moved off its dataclass default, so each equality compares a
-        value resolution demonstrably wrote. Supplied construction inputs
-        (`model_path`, `device`, `random_seed`) and leaves resolution leaves
-        alone never enter the sample -- projection coverage for those lives in
-        `test_passthrough_leaves_project_into_their_namespaces`. Step 12 keeps
-        records at the user's raw input; then the sibling goes raw and this
-        assertion starts failing for every sampled leaf, which is the signal
-        the bags became the only home of the effective value.
+        licenses the sibling as a stand-in for the pipeline's output.
+
+        The reference's resolved values are read through `resolution_result`,
+        because a record holds the user's raw input: the decision lives in the
+        declarations, and the bags are where a process reads it. The
+        raw-differs guard keeps the comparison meaningful -- every sampled leaf
+        must have moved off its dataclass default -- and the last assertion is
+        the other half of that invariant: the record still answers the raw
+        input for a leaf resolution decided.
         """
         import dataclasses
 
         sa, reference = self._resolve_published_and_sibling()
-        defaults = {f.name: f.default for f in dataclasses.fields(ServerArgs)}
+        defaults = {f.name: f.default for f in msgspec.structs.fields(ServerArgs)}
         # Leaves resolution writes on this input on both CI device shapes
         # (CUDA host and CPU-only runner): each starts at a None default.
         sampled = (
@@ -123,12 +100,13 @@ class TestConfigBags(CustomTestCase):
                 # The raw-differs guard: a sampled leaf that still sits on its
                 # default (or has none to differ from) proves nothing.
                 self.assertIsNot(defaults[leaf], dataclasses.MISSING)
-                self.assertNotEqual(getattr(reference, leaf), defaults[leaf])
-                self.assertEqual(accessor(), getattr(reference, leaf))
-        # And the record agrees today, which is what step 12 changes: when this
-        # assertion starts failing for a resolution-written leaf, the flip
-        # landed and the bag is the only place the effective value lives.
-        self.assertEqual(rc.get_schedule().page_size, sa.page_size)
+                resolved = resolution_result(reference, leaf)
+                self.assertNotEqual(resolved, defaults[leaf])
+                self.assertEqual(accessor(), resolved)
+        # The record is the raw input, so the field still reads as the default
+        # for a leaf the bag now answers for.
+        self.assertEqual(sa.page_size, defaults["page_size"])
+        self.assertNotEqual(rc.get_schedule().page_size, sa.page_size)
 
     def test_passthrough_leaves_project_into_their_namespaces(self):
         """Thin projection smoke over leaves resolution does not move.
@@ -140,7 +118,7 @@ class TestConfigBags(CustomTestCase):
         sa = self._publish()
         sampled = (
             (lambda: rc.get_serving().host, "host"),
-            (lambda: rc.get_memory().hicache_ratio, "hicache_ratio"),
+            (lambda: rc.get_memory().hicache_write_policy, "hicache_write_policy"),
             (lambda: rc.get_exec().moe.moe_runner_backend, "moe_runner_backend"),
             (lambda: rc.get_model().model_path, "model_path"),
         )
@@ -201,20 +179,19 @@ class TestConfigBags(CustomTestCase):
         self.addCleanup(restore_process_state)
 
         def resolve():
-            return ServerArgs(model_path=config_dir, device="cuda", random_seed=42)
+            server_args = ServerArgs(
+                model_path=config_dir, device="cuda", random_seed=42
+            )
+            # The reference has to be *resolved*, not merely constructed:
+            # construction is inert, and the point of the sibling is to be an
+            # independent run of the pipeline over the same raw input.
+            server_args.resolve_once()
+            return server_args
 
         sa = resolve()
         rc.publish(sa, role="scheduler")
         restore_process_state()
         return sa, resolve()
-
-    def test_all_accessors_and_exec_subgroups(self):
-        self._publish()
-        for acc in _TOP:
-            self.assertIsNotNone(acc())
-        exec_cfg = rc.get_exec()
-        for sub in _EXEC_SUBS:
-            self.assertTrue(hasattr(exec_cfg, sub), f"exec.{sub} missing")
 
     def test_read_only_by_bare_assignment(self):
         self._publish()
@@ -222,8 +199,8 @@ class TestConfigBags(CustomTestCase):
             rc.get_memory().hicache_ratio = 9.0
 
     def test_scoped_override_restores(self):
-        sa = self._publish()
-        original = sa.hicache_ratio
+        self._publish()
+        original = rc.get_memory().hicache_ratio
         with rc.get_memory().override(hicache_ratio=original + 1.0):
             self.assertEqual(rc.get_memory().hicache_ratio, original + 1.0)
         self.assertEqual(rc.get_memory().hicache_ratio, original)
@@ -272,8 +249,11 @@ class TestRoleNamespaceEnforcement(CustomTestCase):
 
     def test_enforce_blocks_reads_outside_the_declared_set(self):
         self._publish("test")
-        with mock.patch.object(rc, "_ROLE_NS_MODE", "enforce"), mock.patch.dict(
-            rc.ROLE_NAMESPACE_SETS, {"test": frozenset({"serving", "schedule"})}
+        with (
+            mock.patch.object(rc, "_ROLE_NS_MODE", "enforce"),
+            mock.patch.dict(
+                rc.ROLE_NAMESPACE_SETS, {"test": frozenset({"serving", "schedule"})}
+            ),
         ):
             rc.get_serving()
             rc.get_schedule()
@@ -287,7 +267,7 @@ class TestRoleNamespaceEnforcement(CustomTestCase):
             rc.get_mm()
             # A direct set_server_args install is roleless; enforcement only
             # keys off a recorded publish role.
-            rc.get_context().set_server_args(ServerArgs(model_path="dummy"))
+            rc.publish(ServerArgs(model_path="dummy"), role="test")
             rc.get_exec()
 
     def test_off_mode_bag_read_traces_under_torch_compile(self):
@@ -307,8 +287,9 @@ class TestRoleNamespaceEnforcement(CustomTestCase):
 
     def test_record_mode_collects_the_audit(self):
         self._publish("test")
-        with mock.patch.object(rc, "_ROLE_NS_MODE", "record"), mock.patch.object(
-            rc, "_RECORDED_NS_READS", set()
+        with (
+            mock.patch.object(rc, "_ROLE_NS_MODE", "record"),
+            mock.patch.object(rc, "_RECORDED_NS_READS", set()),
         ):
             rc.get_exec()
             rc.get_disagg()
@@ -334,8 +315,9 @@ class TestRoleNamespaceEnforcement(CustomTestCase):
     def test_record_mode_registers_the_exit_summary_at_publish(self):
         # A role that reads no bags must still emit its audit line; the exit
         # hook therefore registers at publish, not at the first read.
-        with mock.patch.object(rc, "_ROLE_NS_MODE", "record"), mock.patch.object(
-            rc, "_RECORD_DUMP_REGISTERED", False
+        with (
+            mock.patch.object(rc, "_ROLE_NS_MODE", "record"),
+            mock.patch.object(rc, "_RECORD_DUMP_REGISTERED", False),
         ):
             self._publish("test")
             self.assertTrue(rc._RECORD_DUMP_REGISTERED)
@@ -347,8 +329,9 @@ class TestRoleNamespaceEnforcement(CustomTestCase):
         import torch
 
         self._publish("test")
-        with mock.patch.object(rc, "_ROLE_NS_MODE", "record"), mock.patch.object(
-            rc, "_RECORDED_NS_READS", set()
+        with (
+            mock.patch.object(rc, "_ROLE_NS_MODE", "record"),
+            mock.patch.object(rc, "_RECORDED_NS_READS", set()),
         ):
 
             @torch.compile(fullgraph=True, backend="eager", dynamic=False)

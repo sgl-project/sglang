@@ -96,8 +96,13 @@ pub async fn abort_request(State(ctx): State<Arc<AppContext>>, body: Bytes) -> R
             .into_response();
     }
 
-    let (successful, failed) =
-        fan_out_abort(&workers, &ctx.proxy.client, ctx.proxy.request_timeout, body).await;
+    let (successful, failed) = fan_out_abort(
+        &workers,
+        ctx.proxy.admin_client(),
+        ctx.proxy.request_timeout,
+        body,
+    )
+    .await;
 
     // Partial failure is an operational event an operator needs to see at the
     // common production log level — match the rest of the router, which warns
@@ -109,7 +114,7 @@ pub async fn abort_request(State(ctx): State<Arc<AppContext>>, body: Bytes) -> R
             total_workers,
             succeeded = successful.len(),
             failed = failed.len(),
-            "abort_request: some workers failed to flush",
+            "abort_request: some workers failed to abort",
         );
     }
 
@@ -261,6 +266,7 @@ mod tests {
                     mode: WorkerMode::Plain,
                     model_ids: vec![ModelId("stub-model".into())],
                     bootstrap_port: None,
+                    ..Default::default()
                 })
                 .expect("worker accepted");
         }
@@ -394,6 +400,7 @@ mod tests {
                 mode: WorkerMode::Prefill,
                 model_ids: vec![ModelId("stub-model".into())],
                 bootstrap_port: Some(8998),
+                ..Default::default()
             })
             .expect("prefill accepted");
         ctx.registry
@@ -403,6 +410,7 @@ mod tests {
                 mode: WorkerMode::Decode,
                 model_ids: vec![ModelId("stub-model".into())],
                 bootstrap_port: None,
+                ..Default::default()
             })
             .expect("decode accepted");
 

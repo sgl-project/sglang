@@ -121,15 +121,14 @@ class CompilerManager:
         )
         if runtime_shape is None:
             logger.debug(
-                "Directly load the %s-th graph for dynamic shape from %s via "
-                "handle %s",
+                "Directly load the %s-th graph for dynamic shape from %s via handle %s",
                 graph_index,
                 self.compiler.name,
                 handle,
             )
         else:
             logger.debug(
-                "Directly load the %s-th graph for shape %s from %s via " "handle %s",
+                "Directly load the %s-th graph for shape %s from %s via handle %s",
                 graph_index,
                 str(runtime_shape),
                 self.compiler.name,
@@ -184,7 +183,7 @@ class CompilerManager:
                     )
             if runtime_shape is None:
                 logger.debug(
-                    "Store the %s-th graph for dynamic shape from %s via " "handle %s",
+                    "Store the %s-th graph for dynamic shape from %s via handle %s",
                     graph_index,
                     self.compiler.name,
                     handle,
@@ -352,9 +351,9 @@ model_tag: str = "backbone"
 def set_model_tag(tag: str):
     """Context manager to set the model tag."""
     global model_tag
-    assert (
-        tag != model_tag
-    ), f"Model tag {tag} is the same as the current tag {model_tag}."
+    assert tag != model_tag, (
+        f"Model tag {tag} is the same as the current tag {model_tag}."
+    )
     old_tag = model_tag
     model_tag = tag
     try:
@@ -364,7 +363,6 @@ def set_model_tag(tag: str):
 
 
 class SGLangBackend:
-
     graph_pool: Any
     _called: bool = False
     # the graph we compiled
@@ -398,7 +396,6 @@ class SGLangBackend:
         self.compile_config = config
 
     def configure_post_pass(self):
-        self.post_grad_pass_manager.configure()
         self.inductor_config["post_grad_custom_post_pass"] = self.post_grad_pass_manager
 
     def __call__(self, graph: fx.GraphModule, example_inputs) -> Callable:

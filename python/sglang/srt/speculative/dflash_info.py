@@ -49,6 +49,8 @@ class DFlashVerifyInput(SpecInput):
     # Committed/live lengths before the verify caller temporarily expands
     # batch.seq_lens_cpu to the target-attention KV lengths.
     live_seq_lens_cpu: Optional[torch.Tensor] = None
+    # Conservative request-lifetime bound for candidate graph dispatch.
+    candidate_max_seq_len_upper_bound: Optional[int] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
@@ -131,6 +133,7 @@ class DFlashVerifyInput(SpecInput):
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
         kv_start_idx: Optional[torch.Tensor] = None,
+        kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         device = req_pool_indices.device
         bs = len(req_pool_indices)
@@ -159,11 +162,18 @@ class DFlashVerifyInput(SpecInput):
         paged_kernel_lens = paged_kernel_lens + verify_lens
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
-        kv_indices = torch.empty(
-            paged_kernel_lens_sum + kv_indices_extra,
-            dtype=torch.int32,
-            device=device,
-        )
+        if kv_indices_buf is not None:
+            # Sync-free fast-plan path: write straight into the attention
+            # backend's cuda-graph kv_indices buffer (the captured kernels read
+            # it), skipping both the fresh allocation and the wrapper plan()'s
+            # device-to-device refresh copy.
+            kv_indices = kv_indices_buf
+        else:
+            kv_indices = torch.empty(
+                paged_kernel_lens_sum + kv_indices_extra,
+                dtype=torch.int32,
+                device=device,
+            )
         create_flashinfer_kv_indices_triton[(bs,)](
             req_to_token,
             req_pool_indices,

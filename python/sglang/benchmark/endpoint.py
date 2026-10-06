@@ -10,6 +10,8 @@ import os
 import time
 from typing import Callable, Optional
 
+import msgspec
+import msgspec.structs
 import requests
 
 from sglang.srt.entrypoints.http_server import launch_server
@@ -21,7 +23,7 @@ DEFAULT_TIMEOUT = 600
 
 # Field defaults of ServerArgs, used to detect when --host/--port were set
 # explicitly (and would be silently ignored in connect mode).
-_SERVER_ARGS_DEFAULTS = {f.name: f.default for f in dataclasses.fields(ServerArgs)}
+_SERVER_ARGS_DEFAULTS = {f.name: f.default for f in msgspec.structs.fields(ServerArgs)}
 
 
 def server_is_up(base_url: str, timeout: float = DEFAULT_TIMEOUT) -> bool:
@@ -48,9 +50,13 @@ def _launch_server_target(launch_server_func: Callable, server_args: ServerArgs)
 
 
 def launch_or_reuse_server(launch_server_func: Callable, server_args: ServerArgs):
+    # Resolving probes the device: the default attention backend reads the CUDA
+    # capability, and XPU reads mem_get_info. This process owns a live context after.
+    server_args.resolve_once()
+
     base_url = resolve_base_url("", server_args.host, server_args.port)
 
-    # Reuse an already-running server instead of forking a second one onto the
+    # Reuse an already-running server instead of launching a second one onto the
     # occupied port, where it would orphan, compete for the GPU, and OOM.
     if server_is_up(base_url, timeout=5):
         print(
@@ -59,7 +65,9 @@ def launch_or_reuse_server(launch_server_func: Callable, server_args: ServerArgs
         )
         return None, base_url
 
-    proc = multiprocessing.Process(
+    # Spawn, not the platform default: a fork inherits the context resolve_once()
+    # initialized above, and CUDA/XPU cannot be re-initialized in a forked child.
+    proc = multiprocessing.get_context("spawn").Process(
         target=_launch_server_target,
         args=(
             launch_server_func,
@@ -92,7 +100,8 @@ class BenchEndpoint:
     """
 
     base_url: str
-    _proc: Optional[multiprocessing.Process] = None
+    # SpawnProcess is a sibling of multiprocessing.Process, not a subclass.
+    _proc: Optional[multiprocessing.process.BaseProcess] = None
 
     def close(self) -> None:
         if self._proc is not None:

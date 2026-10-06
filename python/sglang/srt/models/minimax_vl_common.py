@@ -17,7 +17,10 @@ from sglang.srt.layers.attention.vision import (
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+    reject_attn_tp_shard_with_tp_reduce,
+)
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -83,6 +86,16 @@ class MiniMaxVLMultiModalProjector(nn.Module):
 
         tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
         tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group without attention DP; reduce over the attention-TP group so
+        # attention CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=tp_size,
+            reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
+            hint=", or --mm-enable-dp-encoder where the model supports it",
+        )
 
         self.linear_1 = ColumnParallelLinear(
             vision_hidden_size,
@@ -93,9 +106,9 @@ class MiniMaxVLMultiModalProjector(nn.Module):
             tp_size=tp_size,
             tp_rank=tp_rank,
         )
-        assert (
-            projector_hidden_act == "gelu"
-        ), f"Only gelu activation is supported, got {projector_hidden_act}"
+        assert projector_hidden_act == "gelu", (
+            f"Only gelu activation is supported, got {projector_hidden_act}"
+        )
         self.act = get_act_fn(projector_hidden_act)
         self.linear_2 = RowParallelLinear(
             mid_size,
@@ -138,6 +151,16 @@ class MiniMaxVLPatchMerger(nn.Module):
 
         tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
         tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group without attention DP; reduce over the attention-TP group so
+        # attention CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=tp_size,
+            reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
+            hint=", or --mm-enable-dp-encoder where the model supports it",
+        )
 
         self.linear_1 = ColumnParallelLinear(
             text_hidden_size * spatial_merge_size**2,
@@ -148,9 +171,9 @@ class MiniMaxVLPatchMerger(nn.Module):
             tp_size=tp_size,
             tp_rank=tp_rank,
         )
-        assert (
-            projector_hidden_act == "gelu"
-        ), f"Only gelu activation is supported, got {projector_hidden_act}"
+        assert projector_hidden_act == "gelu", (
+            f"Only gelu activation is supported, got {projector_hidden_act}"
+        )
         self.act = get_act_fn(projector_hidden_act)
         self.linear_2 = RowParallelLinear(
             mid_size,
@@ -230,9 +253,9 @@ class CLIPVisionEmbeddings(nn.Module):
         if self.patch_embedding.weight.dtype != pixel_values.dtype:
             self.patch_embedding = self.patch_embedding.to(pixel_values.dtype)
 
-        assert (
-            pixel_values.dim() == 2
-        ), f"pixel_values must be 2D, got {pixel_values.dim()}D"
+        assert pixel_values.dim() == 2, (
+            f"pixel_values must be 2D, got {pixel_values.dim()}D"
+        )
         pixel_values = pixel_values.reshape(
             pixel_values.shape[0],
             self.input_num_channels,
@@ -260,6 +283,16 @@ class CLIPEncoderLayer(nn.Module):
         self.use_data_parallel = use_data_parallel
         tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
         tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group without attention DP; reduce over the attention-TP group so
+        # attention CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=tp_size,
+            reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
+            hint=", or --mm-enable-dp-encoder where the model supports it",
+        )
 
         self.self_attn = VisionAttention(
             embed_dim=config.hidden_size,
@@ -285,9 +318,9 @@ class CLIPEncoderLayer(nn.Module):
             tp_rank=tp_rank,
         )
         hidden_act = getattr(config, "hidden_act", "gelu")
-        assert (
-            hidden_act == "gelu"
-        ), f"Only gelu activation is supported, got {hidden_act}"
+        assert hidden_act == "gelu", (
+            f"Only gelu activation is supported, got {hidden_act}"
+        )
         self.act = get_act_fn(hidden_act)
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
@@ -430,9 +463,9 @@ class MiniMaxVLVisionTransformer(nn.Module):
             workspace_buffer=workspace_buffer,
         )
 
-        assert (
-            self.config.position_embedding_type == "rope"
-        ), "Only rope position embedding is supported"
+        assert self.config.position_embedding_type == "rope", (
+            "Only rope position embedding is supported"
+        )
         assert self.config.rope_mode == "3d", "Only 3D RoPE is supported"
         rope_theta = getattr(config, "rope_theta")
         assert rope_theta is not None, "rope_theta must be set"
@@ -672,9 +705,9 @@ class MiniMaxVLVisionTransformer(nn.Module):
         cu_seq_len = self._compute_cu_seq_len(grid_thw, hidden_states.device)
         rotary_pos_emb = self._get_rope_embed_3d(grid_thw, self.spatial_merge_size)
 
-        assert (
-            rotary_pos_emb.device == hidden_states.device
-        ), "rotary_pos_emb and hidden_states must be on the same device"
+        assert rotary_pos_emb.device == hidden_states.device, (
+            "rotary_pos_emb and hidden_states must be on the same device"
+        )
 
         max_seqlen: Optional[int] = None
         sequence_lengths: Optional[torch.Tensor] = None

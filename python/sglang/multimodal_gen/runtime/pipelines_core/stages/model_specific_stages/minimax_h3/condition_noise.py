@@ -95,8 +95,7 @@ def minimax_h3_imgvid_cond_noise_aug_rows(
         full_t = target_latent_t + imgvid_cond_num_frames
         if full_t < latent_t:
             raise ValueError(
-                f"condition latent_t {latent_t} exceeds the noise draw "
-                f"length {full_t}"
+                f"condition latent_t {latent_t} exceeds the noise draw length {full_t}"
             )
         generator = torch.Generator(device="cpu").manual_seed(int(seed))
         noise = torch.randn(

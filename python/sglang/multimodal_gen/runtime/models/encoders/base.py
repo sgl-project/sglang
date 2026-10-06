@@ -2,8 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Literal
+from dataclasses import field
 
 import torch
 from torch import nn
@@ -14,11 +13,13 @@ from sglang.multimodal_gen.configs.models.encoders import (
     ImageEncoderConfig,
     TextEncoderConfig,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_encoder_call
 from sglang.multimodal_gen.runtime.distributed import (
     get_replica_group,
     get_sp_group,
     get_tp_group,
     get_world_group,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -155,32 +156,44 @@ def finalize_encoder_folding(
         config.parallel_folding_mode = None
 
 
-@dataclass(frozen=True)
-class CheckpointQuantizationCapability:
-    """Quantized-checkpoint contract implemented by a native encoder."""
-
-    backend: Literal["diffusion", "srt"]
-    methods: frozenset[str]
-
-
 class EncoderTensorParallelMixin:
     """Keep an encoder on the TP group that was used to build its shards."""
 
     _encoder_tp_group: GroupCoordinator | None = None
-    checkpoint_quantization_capability: CheckpointQuantizationCapability | None = None
-    # Some encoders own checkpoint quantization end to end because their weight
-    # states or sharding contract cannot use the generic loader lifecycle.
-    manages_checkpoint_quantization = False
+    checkpoint_quantization_backend = "diffusion"
+    packed_modules_mapping: dict[str, list[str]] = {}
+
+    @staticmethod
+    def should_materialize_checkpoint_weight(name: str) -> bool:
+        return True
+
+    @classmethod
+    def configure_component_paths(
+        cls,
+        config: EncoderConfig,
+        component_paths: dict[str, str],
+    ) -> None:
+        """Apply optional runtime components before parallel layout is resolved."""
 
     def bind_encoder_tp_group(self, tp_group: GroupCoordinator) -> None:
         self._encoder_tp_group = tp_group
 
     def __call__(self, *args, **kwargs):
         tp_group = self._encoder_tp_group
+        forward = super().__call__
+        cache_group = tp_group
+        if cache_group is None and model_parallel_is_initialized():
+            cache_group = get_tp_group()
+
+        def run():
+            return cached_encoder_call(
+                self, args, kwargs, lambda: forward(*args, **kwargs), cache_group
+            )
+
         if tp_group is None:
-            return super().__call__(*args, **kwargs)
+            return run()
         with use_tensor_parallel_group(tp_group):
-            return super().__call__(*args, **kwargs)
+            return run()
 
 
 class TextEncoder(
@@ -192,12 +205,6 @@ class TextEncoder(
     # Qwen2_5_VLCausalLMOutputWithPast). Off by default so a new encoder is
     # replicated rather than silently broken; flip it once dp is verified there.
     supports_dp_encode = False
-    # Quantized checkpoints are opt-in because an encoder must construct
-    # quantized linears and load the checkpoint's auxiliary scale parameters.
-    supported_checkpoint_quantization_methods: frozenset[str] = frozenset()
-    # Some encoders own checkpoint quantization end to end because their weight
-    # states or sharding contract cannot use the generic loader lifecycle.
-    manages_checkpoint_quantization = False
     layerwise_offload_dit_group_enabled = False
     layer_names = [
         "layers",

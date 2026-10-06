@@ -19,7 +19,7 @@ For all methods and hardware platforms, see the [official SGLang installation gu
 ```bash Command
 pip install --upgrade pip
 pip install uv
-SGLANG_BUILD_RUST_EXTS=none uv pip install 'git+https://github.com/sgl-project/sglang.git@refs/pull/33554/head#subdirectory=python'
+SGLANG_BUILD_RUST_EXTS=none uv pip install --prerelease=allow 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 ```
 
 Then run the **Python** output of the command panel below in that environment.
