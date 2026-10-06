@@ -315,7 +315,7 @@ fn handle_chunk(
     let n_tok = ev.token_ids.len() as u64;
     // Stop TOKEN: omit it from decoded text while preserving the scheduler's
     // exact output IDs for downstream protocol consumers.
-    let decode_ids = tokens_for_decode(&ev.token_ids, &matched, no_stop_trim);
+    let decode_ids = trim_matched_stop_token(&ev.token_ids, &matched, no_stop_trim);
     let stop_token_trimmed = decode_ids.len() != ev.token_ids.len();
 
     // Fully incremental: decode just this chunk's delta. `token_ids` stays in the
@@ -411,15 +411,12 @@ fn handle_chunk(
 
 /// Exclude a matched stop TOKEN while decoding text (Python
 /// `trim_matched_stop`, token branch) without changing surfaced `output_ids`.
-fn tokens_for_decode<'a>(
+fn trim_matched_stop_token<'a>(
     token_ids: &'a TokenIds,
     matched: &Option<Matched>,
     no_stop_trim: bool,
 ) -> &'a [i64] {
-    // Token id 0 is NOT a match: Python guards with `if not matched`, and 0 is
-    // falsy there, so it trims nothing. Trimming on 0 drops a real generated token
-    // for any model whose stop id happens to be 0.
-    let trim = !no_stop_trim && matches!(matched, Some(Matched::Token(t)) if *t != 0);
+    let trim = !no_stop_trim && matches!(matched, Some(Matched::Token(_)));
     &token_ids[..token_ids.len().saturating_sub(usize::from(trim))]
 }
 
@@ -649,35 +646,19 @@ mod tests {
         }
     }
 
-    /// Token id 0 is not a match: Python's `trim_matched_stop` guards with
-    /// `if not matched`, and 0 is falsy there. Trimming on it drops a real
-    /// generated token for any model whose stop id is 0.
-    #[test]
-    fn matched_token_zero_does_not_trim() {
-        let ids = vec![1, 2, 0];
-        assert_eq!(
-            tokens_for_decode(&ids, &Some(Matched::Token(0)), false),
-            [1, 2, 0],
-            "id 0 is not a matched stop"
-        );
-        // A real stop id still trims.
-        let ids = vec![1, 2, 3];
-        assert_eq!(
-            tokens_for_decode(&ids, &Some(Matched::Token(3)), false),
-            [1, 2]
-        );
-    }
-
     /// A matched stop token remains in `output_ids`; it is only omitted from
-    /// decoded text above, and the event says so.
+    /// decoded text above, and the event says so. Token id 0 is a stop token
+    /// like any other, as in Python's `trim_matched_stop`.
     #[test]
     fn stop_token_is_preserved_in_output_ids() {
-        let reason = serde_json::json!({ "type": "stop", "matched": 3 });
-        for no_stop_trim in [false, true] {
-            let output = final_chunk(no_stop_trim, reason.clone(), vec![1, 2, 3]);
-            assert_eq!(output.token_ids, vec![1, 2, 3]);
-            assert_eq!(output.completion_tokens, 3);
-            assert_eq!(output.stop_token_trimmed, !no_stop_trim);
+        for stop in [3, 0] {
+            let reason = serde_json::json!({ "type": "stop", "matched": stop });
+            for no_stop_trim in [false, true] {
+                let output = final_chunk(no_stop_trim, reason.clone(), vec![1, 2, stop]);
+                assert_eq!(output.token_ids, vec![1, 2, stop]);
+                assert_eq!(output.completion_tokens, 3);
+                assert_eq!(output.stop_token_trimmed, !no_stop_trim);
+            }
         }
     }
 
