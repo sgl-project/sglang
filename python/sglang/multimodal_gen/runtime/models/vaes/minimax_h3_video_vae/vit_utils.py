@@ -222,27 +222,30 @@ def apply_rotary_pos_emb_qk(
         and query.dtype == key.dtype
         and query.dtype in (torch.float16, torch.bfloat16)
         and query.dim() == 4
-        and query.shape[0] == 1
         and not torch.compiler.is_compiling()
     ):
         _, _, cache, positions = rotary_pos_emb
+        batch, seq_len = query.shape[:2]
         if (
             cache.is_cuda
             and cache.dtype == query.dtype
             and cache.dim() == 2
-            and cache.shape[0] == query.shape[1]
+            and cache.shape[0] == seq_len
             and cache.shape[1] <= query.shape[-1]
             and positions.is_cuda
-            and positions.shape == (query.shape[1],)
+            and positions.shape == (seq_len,)
         ):
             from sgl_kernel import rotary_embedding
 
+            # Stacked spatial tiles share one rotary table. Flatten the
+            # batch and replay that table once per tile.
             query = query.contiguous()
             key = key.contiguous()
+            token_positions = positions if batch == 1 else positions.repeat(batch)
             rotary_embedding(
-                positions,
-                query.view(query.shape[1], -1),
-                key.view(key.shape[1], -1),
+                token_positions,
+                query.view(batch * seq_len, -1),
+                key.view(batch * seq_len, -1),
                 query.shape[-1],
                 cache,
                 True,

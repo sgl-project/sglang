@@ -1035,8 +1035,16 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cache_dit_request_overrides = resolve_cache_dit_request_overrides(
             batch.sampling_params.cache_dit_params
         )
+        has_separate_cfg = (
+            requested
+            and batch.do_classifier_free_guidance
+            and not self.server_args.enable_cfg_parallel
+        )
         desired_key = (
-            cache_dit_overrides_key(self._cache_dit_request_overrides)
+            (
+                cache_dit_overrides_key(self._cache_dit_request_overrides),
+                has_separate_cfg,
+            )
             if requested
             else None
         )
@@ -1063,11 +1071,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     steps_computation_policy=scm_policy,
                 )
             else:
-                scm_preset = None if scm_preset == "none" else scm_preset
                 refresh_context_on_transformer(
                     self.transformer,
                     primary_num_steps,
-                    scm_preset=scm_preset,
+                    steps_computation_mask=steps_computation_mask,
+                    steps_computation_policy=scm_policy,
                 )
             return
 
@@ -1156,7 +1164,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 model_name="transformer",
                 sp_group=sp_group,
                 tp_group=tp_group,
-                has_separate_cfg=batch.do_classifier_free_guidance,
+                has_separate_cfg=has_separate_cfg,
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",

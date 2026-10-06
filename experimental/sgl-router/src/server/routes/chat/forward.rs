@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Plain and PD chat forwarding, including load tracking and streaming metrics.
+//! Plain and PD forwarding, including load tracking and streaming metrics.
 
 use super::nonempty_header;
 use super::preparation::{
-    generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedChatRequest,
+    append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
 };
-use crate::discovery::WorkerMode;
+use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::dp_rank::select_dp_rank;
 use crate::proxy::sse::{self, StreamEnd, StreamEndReason};
 use crate::server::app_context::AppContext;
@@ -27,7 +27,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-const CHAT_PATH: &str = "/v1/chat/completions";
 // Expose the selected decode worker to both PD workers and the client.
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
 // SGLang's DP controller dispatches to this rank; it outranks `routed_dp_rank` in the body.
@@ -41,13 +40,23 @@ pub(super) struct SelectedWorkers {
     pub(super) track_dispatch_timestamps: bool,
 }
 
-pub(super) async fn forward_chat_request(
+/// One dispatch attempt's client-ready response.
+pub(super) struct Dispatched {
+    pub(super) response: Response<Body>,
+    /// The workers to avoid on a retry, set only when nothing beyond a
+    /// failure status reached the client, so another worker may serve it.
+    pub(super) retry_excluding: Vec<WorkerId>,
+}
+
+/// PD sends to both workers and returns the decode response.
+pub(super) async fn forward_request(
     ctx: &AppContext,
-    request: PreparedChatRequest,
+    request: &mut PreparedRequest,
     workers: SelectedWorkers,
     mut headers: HeaderMap,
     request_started_at: Instant,
-) -> Result<Response<Body>, ApiError> {
+    duration: &Arc<RequestDurationGuard>,
+) -> Result<Dispatched, ApiError> {
     let SelectedWorkers {
         prefill,
         decode,
@@ -61,9 +70,12 @@ pub(super) async fn forward_chat_request(
     }
     // Only the router chooses DP ranks; a client-supplied rank is never forwarded.
     headers.remove(X_DATA_PARALLEL_RANK);
-    let dp_aware = ctx.config.model.dp_aware;
-    let prefill_rank = dp_aware
-        .then(|| prompt_dp_rank(ctx, &request, &headers, &prefill))
+    let dp_aware = ctx.config.model.dp_aware && request.accepts_dp_rank();
+    // The engine gives fan-out item i the room `room + i`, so in PD decode looks
+    // for each item on a different prefill rank; one pinned rank would break that.
+    let unpin_prefill = dp_aware && decode.is_some() && request.fans_out;
+    let prefill_rank = (dp_aware && !unpin_prefill)
+        .then(|| prompt_dp_rank(ctx, request, &headers, &prefill))
         .flatten();
     let decode_rank = decode
         .as_deref()
@@ -71,24 +83,29 @@ pub(super) async fn forward_chat_request(
         .and_then(|decode| select_dp_rank(decode, None, &[]));
 
     // Track worker occupancy and the prompt's contribution to active load.
+    // A retry keeps the request's stale deadline rather than starting a new one.
+    let in_flight = request_started_at.elapsed();
     let worker_load_guard = if track_dispatch_timestamps {
         prefill.timestamped_load_guard()
     } else {
         prefill.load_guard()
     };
-    let active_request_guard = ctx.router_inflight_load.register(
+    let active_request_guard = ctx.router_inflight_load.register_aged(
         prefill.id.clone(),
         prefill.url.clone(),
         request.input_token_count,
         0,
+        in_flight,
     );
     // Attribute the outcome to the worker supplying the client-visible response.
     let metrics = DispatchMetrics::new(
         ctx,
-        &request,
+        request,
         decode.as_deref().unwrap_or(&prefill),
         request_started_at,
+        duration,
     );
+    let pd_prefill = decode.is_some().then(|| prefill.id.clone());
     // Both PD workers receive the same bootstrap room to coordinate KV transfer.
     let pd = decode.map(|decode| {
         let bootstrap = BootstrapFields {
@@ -101,13 +118,15 @@ pub(super) async fn forward_chat_request(
         };
         (decode, bootstrap)
     });
+    let path = request.path;
     let engine_rid = request.engine_rid();
-    let body = request.into_outgoing_body(
+    let body = request.outgoing_body(
         ctx,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;
-    let prefill_headers = with_dp_rank(headers.clone(), prefill_rank);
+    let (prefill_headers, prefill_body) =
+        with_dp_rank(dp_aware, headers.clone(), &body, prefill_rank);
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
@@ -116,33 +135,46 @@ pub(super) async fn forward_chat_request(
 
     // In PD mode, prefill runs independently and decode supplies the client response.
     let stream_abort = CancellationToken::new();
-    let (response_worker, response_headers, response_load_guards, prefill_task) =
+    let (response_worker, response_headers, response_body, response_load_guards, prefill_task) =
         if let Some((decode, bootstrap)) = pd {
             let task = spawn_prefill_request(
                 ctx,
                 &metrics,
                 Arc::clone(&prefill),
+                path,
                 prefill_headers,
-                body.clone(),
+                prefill_body,
                 prefill_load_guards,
                 bootstrap.room,
                 stream_abort.clone(),
             );
             let decode_load_guards = (
                 decode.load_guard(),
-                ctx.router_inflight_load
-                    .register(decode.id.clone(), decode.url.clone(), 0, 1),
+                ctx.router_inflight_load.register_aged(
+                    decode.id.clone(),
+                    decode.url.clone(),
+                    0,
+                    1,
+                    in_flight,
+                ),
                 decode_rank.map(|rank| decode.dp_rank_guard(rank)),
             );
-            let decode_headers = with_dp_rank(headers, decode_rank);
+            let (decode_headers, decode_body) = with_dp_rank(dp_aware, headers, &body, decode_rank);
             (
                 decode,
                 decode_headers,
+                decode_body,
                 decode_load_guards,
                 Some((task, prefill)),
             )
         } else {
-            (prefill, prefill_headers, prefill_load_guards, None)
+            (
+                prefill,
+                prefill_headers,
+                prefill_body,
+                prefill_load_guards,
+                None,
+            )
         };
 
     // In PD mode, prefill can finish before decode. Watch the registration
@@ -151,8 +183,9 @@ pub(super) async fn forward_chat_request(
     let response = forward_to_response_worker(
         ctx,
         &response_worker,
+        path,
         &response_headers,
-        body,
+        response_body,
         engine_rid.as_deref(),
         response_load_guards,
         &metrics,
@@ -174,6 +207,18 @@ pub(super) async fn forward_chat_request(
             (Err(ApiError::StaleRequestExpired { model }), None)
         }
     };
+    // A 2xx stream is already the client's; any other success or client error is final too.
+    let retryable = matches!(
+        dispatch_outcome(&result),
+        RequestOutcome::Error | RequestOutcome::Backpressure
+    );
+    let retry_excluding = match (&blamed_prefill, pd_prefill) {
+        _ if !retryable => Vec::new(),
+        // The other PD side may still hold a caller's rid, which an engine refuses twice.
+        (_, Some(prefill)) if request.caller_set_rid => vec![prefill, response_worker.id.clone()],
+        (Some(blame), _) => vec![blame.prefill.id.clone()],
+        (None, _) => vec![response_worker.id.clone()],
+    };
     let log_context = metrics.record_dispatch_result(&result, engine_rid, blamed_prefill.as_ref());
     // Materialize dispatch errors here so the access log retains the selected worker.
     let mut response = match result {
@@ -186,14 +231,17 @@ pub(super) async fn forward_chat_request(
         Err(error) => error.into_response(),
     };
     response.extensions_mut().insert(log_context);
-    Ok(response)
+    Ok(Dispatched {
+        response,
+        retry_excluding,
+    })
 }
 
 /// Rank for the worker that computes the prompt; decode gets its KV from
 /// prefill, so it is placed by load alone.
 fn prompt_dp_rank(
     ctx: &AppContext,
-    request: &PreparedChatRequest,
+    request: &PreparedRequest,
     headers: &HeaderMap,
     worker: &Worker,
 ) -> Option<u32> {
@@ -217,11 +265,27 @@ fn prompt_dp_rank(
     select_dp_rank(worker, key, &prefix_depths)
 }
 
-fn with_dp_rank(mut headers: HeaderMap, rank: Option<u32>) -> HeaderMap {
+/// Under `--dp-aware` the router owns the rank: the header pins it for chat, and
+/// the body, which `/generate` reads instead, carries it or null to unpin.
+fn with_dp_rank(
+    dp_aware: bool,
+    mut headers: HeaderMap,
+    body: &Bytes,
+    rank: Option<u32>,
+) -> (HeaderMap, Bytes) {
+    if !dp_aware {
+        return (headers, body.clone());
+    }
     if let Some(rank) = rank {
         headers.insert(X_DATA_PARALLEL_RANK, HeaderValue::from(rank));
     }
-    headers
+    let rank = rank.map_or_else(|| "null".to_owned(), |rank| rank.to_string());
+    let fields = [
+        ("routed_dp_rank", rank),
+        ("data_parallel_rank", "null".into()),
+    ];
+    let body = append_fields(body, &fields).unwrap_or_else(|| body.clone());
+    (headers, body)
 }
 
 fn parse_decode_url_header(decode_url: &str) -> Option<HeaderValue> {
@@ -246,6 +310,7 @@ fn spawn_prefill_request(
     ctx: &AppContext,
     metrics: &DispatchMetrics,
     prefill_worker: Arc<Worker>,
+    path: &'static str,
     headers: HeaderMap,
     body: Bytes,
     load_guards: LoadGuards,
@@ -261,7 +326,7 @@ fn spawn_prefill_request(
                 &prefill_worker.url,
                 prefill_worker.protocol(),
                 &prefill_worker.breaker,
-                CHAT_PATH,
+                path,
                 &headers,
                 body,
                 None,
@@ -365,6 +430,7 @@ async fn forward_pd(
 async fn forward_to_response_worker(
     ctx: &AppContext,
     worker: &Worker,
+    path: &str,
     headers: &HeaderMap,
     body: Bytes,
     engine_rid: Option<&str>,
@@ -376,13 +442,13 @@ async fn forward_to_response_worker(
     if metrics.streaming {
         // Load and duration guards live until the SSE pump ends, not just until headers arrive.
         let stream_guards: Box<dyn Send + 'static> =
-            Box::new((load_guards, metrics.stream_duration_guard()));
+            Box::new((load_guards, Arc::clone(&metrics.duration)));
         ctx.proxy
             .forward_streaming_to(
                 &worker.url,
                 worker.protocol(),
                 &worker.breaker,
-                CHAT_PATH,
+                path,
                 headers,
                 body,
                 engine_rid,
@@ -401,7 +467,7 @@ async fn forward_to_response_worker(
                 &worker.url,
                 worker.protocol(),
                 &worker.breaker,
-                CHAT_PATH,
+                path,
                 headers,
                 body,
                 engine_rid,
@@ -417,14 +483,16 @@ struct DispatchMetrics {
     mode: WorkerModeLabel,
     streaming: bool,
     request_started_at: Instant,
+    duration: Arc<RequestDurationGuard>,
 }
 
 impl DispatchMetrics {
     fn new(
         ctx: &AppContext,
-        request: &PreparedChatRequest,
+        request: &PreparedRequest,
         response_worker: &Worker,
         request_started_at: Instant,
+        duration: &Arc<RequestDurationGuard>,
     ) -> Self {
         Self {
             registry: Arc::clone(&ctx.metrics),
@@ -437,6 +505,7 @@ impl DispatchMetrics {
             },
             streaming: request.streaming,
             request_started_at,
+            duration: Arc::clone(duration),
         }
     }
 
@@ -446,14 +515,6 @@ impl DispatchMetrics {
         let model = self.model.clone();
         let request_started_at = self.request_started_at;
         Box::new(move || metrics.observe_ttft(&model, request_started_at.elapsed().as_secs_f64()))
-    }
-
-    fn stream_duration_guard(&self) -> StreamDurationGuard {
-        StreamDurationGuard {
-            metrics: Arc::clone(&self.registry),
-            model: self.model.clone(),
-            request_started_at: self.request_started_at,
-        }
     }
 
     fn stream_end_callback(
@@ -510,12 +571,6 @@ impl DispatchMetrics {
                 &self.worker_url
             }
         };
-        if !self.streaming {
-            self.registry.observe_request_duration(
-                &self.model,
-                self.request_started_at.elapsed().as_secs_f64(),
-            );
-        }
         // The app middleware emits the access log and edge counters exactly once.
         RequestLogContext {
             worker_url: worker_url.clone(),
@@ -540,14 +595,26 @@ fn dispatch_outcome(result: &Result<Response<Body>, ApiError>) -> RequestOutcome
     }
 }
 
-/// Record total request duration when streaming ends or setup fails.
-struct StreamDurationGuard {
+/// Records a dispatched request's total duration once its last holder drops:
+/// the handler for JSON, the SSE pump once a stream ends, so every attempt
+/// of a request shares one observation.
+pub(super) struct RequestDurationGuard {
     metrics: Arc<MetricsRegistry>,
     model: String,
     request_started_at: Instant,
 }
 
-impl Drop for StreamDurationGuard {
+impl RequestDurationGuard {
+    pub(super) fn new(ctx: &AppContext, model: &ModelId, request_started_at: Instant) -> Arc<Self> {
+        Arc::new(Self {
+            metrics: Arc::clone(&ctx.metrics),
+            model: model.0.clone(),
+            request_started_at,
+        })
+    }
+}
+
+impl Drop for RequestDurationGuard {
     fn drop(&mut self) {
         self.metrics
             .observe_request_duration(&self.model, self.request_started_at.elapsed().as_secs_f64());
