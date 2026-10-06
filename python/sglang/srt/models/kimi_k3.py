@@ -32,7 +32,6 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
-from sglang.srt.layers.attention.linear.utils import use_flashinfer_kda_prefill
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -2113,7 +2112,7 @@ class KimiK3DeltaAttention(nn.Module):
             forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
             if (
                 not forward_batch.forward_mode.is_target_verify()
-                and not use_flashinfer_kda_prefill()
+                and not self.attn.prefill_beta_is_raw
             ):
                 beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)

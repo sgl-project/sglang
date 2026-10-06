@@ -38,7 +38,8 @@ BF16 model activations, BF16 or FP32 SSM state, equal Q/K/V head counts with
 128-D heads, and a finite negative safe-gate lower bound.
 FlashInfer validates this tensor contract when the wrapper runs, including
 during server warmup. Radix-cache checkpoints require a positive mamba chunk
-size divisible by 32; other checkpoint intervals use Triton.
+size divisible by 32. Incompatible intervals and unbounded gates are rejected
+at backend initialization; original Kimi Linear should use Triton prefill.
 
 The backend plans sequence order and radix-cache checkpoints once per batch,
 before layer execution. The adapter consumes raw gate/beta projections and
@@ -46,9 +47,11 @@ normalizes projection strides before calling FlashInfer. Packed batches may
 include single-token sequences and zero-length padding rows; only the total
 packed token count must exceed one.
 
-Unbounded-gate models (including original Kimi Linear), capture, speculative
-extend, TBO, and track points without a supported checkpoint plan use Triton.
-Both paths receive raw beta logits and apply sigmoid in their kernels.
+The model's beta input format is set once from the runner's resolved prefill
+kernel. A packed batch with only one token uses Triton with the same raw beta
+format. Invalid checkpoint metadata raises an assertion instead of changing
+kernels. TBO and full prefill CUDA graphs are rejected at initialization; BCG
+keeps linear attention eager. Verify uses its separately resolved backend.
 Untracked prefill needs no host sequence lengths.
 
 ## Production-Unsupported

@@ -14,7 +14,6 @@ from sglang.srt.distributed import (
     divide,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.attention.linear.utils import use_flashinfer_kda_prefill
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -525,7 +524,7 @@ class KimiDeltaAttention(nn.Module):
             )  # [T, H*K] -> [T, H, K]
             if (
                 not forward_batch.forward_mode.is_target_verify()
-                and not use_flashinfer_kda_prefill()
+                and not self.attn.prefill_beta_is_raw
             ):
                 beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)

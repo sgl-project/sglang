@@ -78,14 +78,6 @@ class LinearAttnBackends(msgspec.Struct, frozen=True):
     verify: LinearAttnKernelBackend
 
 
-def use_flashinfer_kda_prefill() -> bool:
-    """Whether KDA model projections should retain raw beta logits for prefill."""
-    mamba = get_exec().mamba
-    return (
-        mamba.linear_attn_prefill_backend or mamba.linear_attn_backend
-    ) == "flashinfer"
-
-
 def resolve_linear_attn_backends(
     prefill_default: Optional[str] = None,
 ) -> LinearAttnBackends:

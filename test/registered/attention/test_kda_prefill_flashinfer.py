@@ -107,7 +107,7 @@ def test_kda_prefill_checkpoints(state_dtype, layout, prefix_len):
         mamba2=False,
     )
     metadata = SimpleNamespace(track_ssm_h_batch_src=tensor(host_plan.unaligned_rows))
-    assert build_flashinfer_kda_checkpoint_plan(batch, metadata, "cuda", 64)
+    build_flashinfer_kda_checkpoint_plan(batch, metadata, "cuda", 64)
     assert metadata.state_checkpoint_cu_starts.tolist() == (
         [0, 9] if prefix_len else [0, 2, 4, 4][: len(lengths) + 1]
     )
@@ -197,10 +197,10 @@ def test_kda_prefill_checkpoints(state_dtype, layout, prefix_len):
 
 
 @pytest.mark.parametrize(
-    "lower_bound", [-5.0, None], ids=["safe_gate", "unbounded_gate"]
+    "extend_lens", [(130, 128), (1,)], ids=["tracked_prefill", "single_token"]
 )
-def test_kda_backend_prefill_dispatch_and_tracked_state(lower_bound):
-    """Raw beta must work in FlashInfer and the unbounded-gate Triton fallback."""
+def test_kda_backend_prefill_dispatch_and_tracked_state(extend_lens):
+    """Raw beta works in FlashInfer and the single-token Triton fallback."""
     with get_parallel().override(attn_dcp_rank=0, attn_dcp_size=1):
         case = KDAAttentionCase(
             name="flashinfer_kda_tracked_extend",
@@ -209,8 +209,8 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(lower_bound):
             num_k_heads=2,
             num_v_heads=2,
             page_size=16,
-            prefix_lens=(0, 0),
-            extend_lens=(130, 128),
+            prefix_lens=(0,) * len(extend_lens),
+            extend_lens=extend_lens,
         )
         fixture = build_kda_attention_fixture(
             CustomTestCase(),
@@ -221,16 +221,17 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(lower_bound):
             runner_batch_size=6,
         )
         batch = fixture.forward_batch
-        batch.mamba_track_mask = torch.tensor([True, True], device="cuda")
-        batch.mamba_track_indices = torch.tensor(
-            [4, 5], device="cuda", dtype=torch.int32
+        tracked = [n >= 64 for n in extend_lens]
+        batch.mamba_track_mask = torch.tensor(tracked, device="cuda")
+        batch.mamba_track_indices = torch.arange(
+            4, 4 + len(extend_lens), device="cuda", dtype=torch.int32
         )
         batch.mamba_track_seqlens = torch.tensor(
-            [130, 128], device="cuda", dtype=torch.int32
+            extend_lens, device="cuda", dtype=torch.int32
         )
-        batch.mamba_prefill_track_mask_cpu = [True, True]
-        batch.mamba_track_seqlens_cpu = [130, 128]
-        fixture.actual_module.attn.lower_bound = lower_bound
+        batch.mamba_prefill_track_mask_cpu = tracked
+        batch.mamba_track_seqlens_cpu = list(extend_lens)
+        fixture.actual_module.attn.lower_bound = -5.0
         cache = fixture.runner.req_to_token_pool.mamba2_layer_cache(0)
         initial_conv, initial_ssm = cache.conv[0].clone(), cache.temporal.clone()
 
@@ -242,7 +243,10 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(lower_bound):
         cache.temporal.copy_(initial_ssm)
         fixture.b = fixture.b_raw.unsqueeze(0)
         dispatcher = flashinfer_dispatcher()
-        fixture.backend.linear_attn_backend.kernel_dispatcher = dispatcher
+        backend = fixture.backend.linear_attn_backend
+        backend.kernel_dispatcher = dispatcher
+        fixture.runner.model = fixture.actual_module
+        backend._init_flashinfer_prefill(fixture.runner)
         kernel = dispatcher.extend_kernel
         with (
             patch.object(kernel, "plan", wraps=kernel.plan) as plan,
@@ -252,13 +256,7 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(lower_bound):
             ),
         ):
             flashinfer_output = run_kda_fixture_eager(fixture)
-        plan.assert_called_once()
-        wrapper = fixture.backend.linear_attn_backend.forward_metadata.flashinfer_kda_prefill_wrapper
-        with patch("torch.cuda.is_current_stream_capturing", return_value=True):
-            assert (
-                dispatcher.effective_extend_kernel(-5.0, wrapper)
-                is dispatcher.triton_kernel
-            )
+        assert plan.call_count == int(sum(extend_lens) > 1)
 
         torch.testing.assert_close(
             flashinfer_output.float(), triton_output.float(), atol=3e-2, rtol=3e-2

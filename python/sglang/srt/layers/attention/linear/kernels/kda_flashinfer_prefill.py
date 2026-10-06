@@ -23,13 +23,11 @@ def build_flashinfer_kda_checkpoint_plan(
     metadata: ForwardMetadata,
     device: torch.device,
     chunk_size: int,
-) -> bool:
-    """Plan tracked boundaries; False selects Triton for this batch.
+) -> None:
+    """Plan scheduler-generated tracked boundaries, asserting their validity.
 
     Host track metadata follows build_prefill_track_plan's unaligned-row order.
     """
-    if chunk_size <= 0 or chunk_size % 32:
-        return False
     extend_lens = forward_batch.extend_seq_lens_cpu
     track_lens = forward_batch.mamba_track_seqlens_cpu
     prefix_lens = forward_batch.extend_prefix_lens_cpu
@@ -47,13 +45,19 @@ def build_flashinfer_kda_checkpoint_plan(
         if relative_track_len % chunk_size == 0:
             continue  # The final state is copied from the live state pool.
         completed_chunks = relative_track_len // chunk_size
-        if completed_chunks == 0 or completed_chunks > checkpoint_counts[row]:
-            return False  # Triton handles a track point without a complete boundary.
+        assert 0 < completed_chunks <= checkpoint_counts[row], (
+            f"Invalid KDA checkpoint metadata: row={row}, "
+            f"relative_track_len={relative_track_len}, extend_len={extend_lens[row]}, "
+            f"chunk_size={chunk_size}"
+        )
         checkpoint_destinations[checkpoint_starts[row] + completed_chunks - 1] = (
             num_tracked_checkpoints
         )
         num_tracked_checkpoints += 1
 
+    assert num_tracked_checkpoints == metadata.track_ssm_h_batch_src.numel(), (
+        "KDA checkpoint rows disagree with the prefill tracking metadata"
+    )
     # The backend selects these same unaligned rows with build_prefill_track_plan.
     metadata.state_checkpoint_cu_starts = torch.tensor(
         checkpoint_starts, dtype=torch.int64, device=device
@@ -63,7 +67,6 @@ def build_flashinfer_kda_checkpoint_plan(
     metadata.state_checkpoint_indices = torch.tensor(
         checkpoint_destinations, dtype=torch.int32, device=device
     )
-    return True
 
 
 class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
@@ -112,6 +115,9 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         track_ssm_h_batch_src: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        assert prefill_wrapper is not None, (
+            "FlashInfer KDA prefill batch was not planned"
+        )
         needs_checkpoint = (
             return_intermediate_states and kwargs.get("track_state") is not None
         )
