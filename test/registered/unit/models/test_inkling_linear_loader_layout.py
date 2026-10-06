@@ -15,7 +15,7 @@ from sglang.srt.models.inkling_common.dense_mlp import InklingDenseMLP
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.parallel_groups import parallel_scope, publish
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -101,7 +101,7 @@ def build_attention_model(
 
 def load_attention(model, attention, *, changed=False, offset=0):
     qkvr = base(attention.qkvr)
-    rank, size = qkvr.tp_rank, qkvr.inkling_tp_size
+    rank, size = rank_size(qkvr)
     device, dtype = qkvr.weight.device, qkvr.weight.dtype
     heads, kv_heads, head_dim = (
         qkvr.inkling_num_heads,
@@ -189,7 +189,7 @@ def build_dense_model(
 
 def load_dense(model, mlp, *, mtp=False, changed=False, compatible=False, offset=0):
     projection = base(mlp.gate_up_proj)
-    rank, size = projection.tp_rank, projection.tp_size
+    rank, size = rank_size(projection)[0], rank_size(projection)[1]
     device, dtype = projection.weight.device, projection.weight.dtype
     full = values(
         (sum(projection.output_sizes), projection.input_size),
@@ -218,7 +218,7 @@ def load_dense(model, mlp, *, mtp=False, changed=False, compatible=False, offset
             ]
         )
     torch.testing.assert_close(projection.weight, expected)
-    expected_down = full_down.chunk(down.tp_size, dim=1)[down.tp_rank]
+    expected_down = full_down.chunk(rank_size(down)[1], dim=1)[rank_size(down)[0]]
     torch.testing.assert_close(down.weight, expected_down)
     expected_prefix = "model" if mtp else "llm.layers.0"
     assert loaded == {
