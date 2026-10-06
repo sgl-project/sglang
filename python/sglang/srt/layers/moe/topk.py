@@ -264,6 +264,7 @@ class TopKConfig:
     scoring_func: str = "softmax"
     # sqrtsoftplus through log1p with NaNs ranked first (DeepSeek-V4.1 routing).
     sqrtsoftplus_log1p: bool = False
+    router_stream_overlap: bool = False
     # Let the fused router also emit FlashInfer routed-MoE packed ids.
     fused_gate_packed_ids: bool = False
     # Draft-side MoE blocks set this False so they never write the target's
@@ -569,6 +570,7 @@ class TopK(BaseFusedOp):
         is_fp4_experts: bool = False,
         allow_routed_experts_capture: bool = True,
         sqrtsoftplus_log1p: bool = False,
+        router_stream_overlap: bool = False,
         fused_gate_packed_ids: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
@@ -609,6 +611,7 @@ class TopK(BaseFusedOp):
             output_format=output_format,
             scoring_func=scoring_func,
             sqrtsoftplus_log1p=sqrtsoftplus_log1p,
+            router_stream_overlap=router_stream_overlap,
             fused_gate_packed_ids=fused_gate_packed_ids,
             allow_routed_experts_capture=allow_routed_experts_capture,
         )
@@ -1442,6 +1445,7 @@ def biased_topk_jit_kernel_impl(
     sqrtsoftplus_log1p: bool = False,
     router_logits_partials: Optional[torch.Tensor] = None,
     num_shared_append: int = 0,
+    router_stream_overlap: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """num_shared_append is only workable when router_logits_partials is not None
     and it is only used by rocm_router_gate"""
@@ -1509,6 +1513,7 @@ def biased_topk_jit_kernel_impl(
             # Optional FlashInfer routed-MoE packed ids, written in the same launch.
             packed_out=packed_out,
             sqrtsoftplus_log1p=sqrtsoftplus_log1p,
+            router_stream_overlap=router_stream_overlap,
         )
         topk_weights, topk_ids = (
             topk_weights.to(torch.float32),
@@ -2684,6 +2689,8 @@ def select_experts(
                     device=hidden_states.device,
                 )
                 _packed_kwargs = dict(packed_out=packed_topk)
+            if topk_config.router_stream_overlap and not _is_xpu:
+                _packed_kwargs["router_stream_overlap"] = True
             if topk_config.sqrtsoftplus_log1p:
                 _packed_kwargs["sqrtsoftplus_log1p"] = True
             if router_logits_partials is not None:
