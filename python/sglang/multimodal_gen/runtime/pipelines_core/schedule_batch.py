@@ -82,6 +82,7 @@ class Req:
     """
 
     sampling_params: SamplingParams | None = None
+    runtime_lora_scale: float = 1.0
 
     generator: torch.Generator | list[torch.Generator] | None = None
 
@@ -487,6 +488,12 @@ class OutputBatch:
     raw_frame_metadata: dict[str, Any] | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
+    # The effective fps the worker actually produced ``output`` at (e.g. a model whose input
+    # stage resamples / resolves the request's nominal fps to a source-derived one, such as
+    # Kandinsky6 SR). ``None`` means the worker did not resolve its own fps; callers that save
+    # ``output`` client-side (return_file_paths_only=False) then fall back to the originating
+    # request's own fps field, as before this field existed.
+    fps: int | None = None
     action_pred: torch.Tensor | None = None
     action_mode: str | None = None
     action_domain_id: int | None = None
