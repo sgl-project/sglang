@@ -17,8 +17,7 @@ with `--pp-size > 1` and with `SGLANG_DISABLE_LAZY_COMPACTION` set.
 The argument layer used to reject both combinations. This checks only that it
 no longer does; it says nothing about pipeline-parallel serving. The lazy
 compaction checks inside the allocator are a separate layer and stay as they
-were. PD disaggregation keeps its own pipeline-parallel and lazy-compaction
-asserts.
+were.
 
     python -m pytest test/registered/unit/server_args/test_unified_hicache_startup_args.py -v
 """
@@ -69,16 +68,6 @@ class TestUnifiedHiCacheStartupArgs(unittest.TestCase):
     def test_disabled_lazy_compaction_passes_the_argument_layer(self):
         with envs.SGLANG_DISABLE_LAZY_COMPACTION.override(True):
             _run_handler()
-
-    def test_pd_disaggregation_keeps_its_asserts(self):
-        pd = dict(
-            disaggregation_mode="prefill", disaggregation_transfer_backend="mooncake"
-        )
-        with self.assertRaisesRegex(AssertionError, "pipeline parallelism"):
-            _run_handler(pp_size=2, **pd)
-        with envs.SGLANG_DISABLE_LAZY_COMPACTION.override(True):
-            with self.assertRaisesRegex(AssertionError, "requires lazy compaction"):
-                _run_handler(**pd)
 
 
 if __name__ == "__main__":

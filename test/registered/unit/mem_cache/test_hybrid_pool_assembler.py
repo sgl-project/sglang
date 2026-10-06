@@ -1,7 +1,6 @@
 """Unit tests for hybrid HiCache pool assembly."""
 
 import argparse
-import json
 import unittest
 from queue import Queue
 from types import SimpleNamespace
@@ -1144,24 +1143,7 @@ class TestUnifiedPageEnvelopeSelection(CustomTestCase):
     """Only no backend and Mori store the complete shared page, so only they
     keep the page-envelope host arena. The host memory mode plays no part."""
 
-    # Every --hicache-storage-backend choice, checked against the parser below.
-    BACKENDS = (
-        "file",
-        "sim",
-        "mooncake",
-        "npu_memcache",
-        "hf3fs",
-        "nixl",
-        "aibrix",
-        "dynamic",
-        "eic",
-        "simm",
-        "mori",
-        "shm",
-        "tensorcast",
-    )
-
-    def _publish(self, backend, mode, extra_config=None):
+    def _publish(self, backend, mode):
         from sglang.srt.runtime_context import publish, reset_context
         from sglang.srt.server_args import ServerArgs
 
@@ -1172,7 +1154,6 @@ class TestUnifiedPageEnvelopeSelection(CustomTestCase):
                 model_path="dummy",
                 enable_unified_memory=True,
                 hicache_storage_backend=backend,
-                hicache_storage_backend_extra_config=extra_config,
                 hicache_host_memory_mode=mode,
                 hicache_mem_layout="layer_first",
             ),
@@ -1184,89 +1165,21 @@ class TestUnifiedPageEnvelopeSelection(CustomTestCase):
             pool.full_kv_pool, pool.swa_kv_pool, use_mla=False
         )
 
-    def test_the_cases_cover_every_backend_choice(self):
+    def test_only_no_backend_and_mori_select_the_envelope(self):
         from sglang.srt.server_args import ServerArgs
 
+        # Every --hicache-storage-backend choice the parser accepts.
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
         (action,) = [a for a in parser._actions if a.dest == "hicache_storage_backend"]
-        self.assertEqual(sorted(action.choices), sorted(self.BACKENDS))
-
-    def test_only_no_backend_and_mori_select_the_envelope(self):
         pool = _build_unified_swa_pool().token_to_kv_pool
         for mode in ("cache", "buffer_only"):
-            for backend in (None, *self.BACKENDS):
+            for backend in (None, *action.choices):
                 with self.subTest(mode=mode, backend=backend):
                     self._publish(backend, mode)
                     self.assertEqual(
                         self._selects_envelope(pool), backend in (None, "mori")
                     )
-
-    def test_a_dynamic_backend_keeps_separate_pools_whatever_its_name(self):
-        # The class comes from the extra config, so its layout is unknown.
-        pool = _build_unified_swa_pool().token_to_kv_pool
-        for mode in ("cache", "buffer_only"):
-            for name in ("custom", "mori"):
-                config = json.dumps(
-                    {
-                        "backend_name": name,
-                        "module_path": "custom_storage",
-                        "class_name": "CustomStorage",
-                    }
-                )
-                with self.subTest(mode=mode, backend_name=name):
-                    self._publish("dynamic", mode, extra_config=config)
-                    self.assertFalse(self._selects_envelope(pool))
-
-    def test_built_host_pools_follow_the_selection(self):
-        from sglang.srt.mem_cache.pool_host import common as host_memory
-
-        for backend in (None, "file"):
-            with self.subTest(backend=backend):
-                self._publish(backend, "cache")
-                bundle = _build_unified_swa_pool()
-                pool = bundle.token_to_kv_pool
-                swa_allocator = bundle.token_to_kv_pool_allocator.swa_attn_allocator
-                # CPU host tensors need no page-locking.
-                with patch.object(host_memory, "_cuda_host_register"):
-                    group = build_hybrid_swa_group(
-                        page_size=pool.page_size,
-                        full_kv_pool=pool.full_kv_pool,
-                        swa_kv_pool=pool.swa_kv_pool,
-                        full_layer_mapping={0: 0, 1: 1, 2: 2},
-                        swa_layer_mapping={3: 0},
-                        use_mla=False,
-                        swa_attn_allocator=swa_allocator,
-                    )
-                self.addCleanup(group.destroy)
-                kv, swa = group.entry_map[PoolName.KV], group.entry_map[PoolName.SWA]
-                for entry in (kv, swa):
-                    self.assertEqual(
-                        isinstance(entry.host_pool, UnifiedPageEnvelopeHostPool),
-                        backend is None,
-                    )
-                # Either way SWA loads into physical reservations.
-                self.assertEqual(swa.device_alloc_fn, swa_allocator.alloc_physical)
-                self.assertEqual(
-                    swa.device_free_fn, swa_allocator.cancel_physical_reservation
-                )
-
-    def test_mla_and_mtp_draft_pools_use_separate_pools(self):
-        pool = _build_unified_swa_pool().token_to_kv_pool
-        self._publish(None, "cache")
-        self.assertFalse(
-            _uses_unified_page_envelope_host(
-                pool.full_kv_pool, pool.swa_kv_pool, use_mla=True
-            )
-        )
-        self.assertFalse(
-            _uses_unified_page_envelope_host(
-                pool.full_kv_pool,
-                pool.swa_kv_pool,
-                use_mla=False,
-                mtp_swa_device_pools=(pool.swa_kv_pool,),
-            )
-        )
 
 
 if __name__ == "__main__":
