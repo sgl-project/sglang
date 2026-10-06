@@ -5193,8 +5193,11 @@ class InklingTokenOutputTest(CustomTestCase):
 
         tokenizer = load_tml_renderers().tokenizer
         encode = tokenizer.encode_ordinary
-        stop_id = tokenizer.encode_special("content_text")
-        text_block = [tokenizer.encode_special("message_model"), stop_id]
+        stop_id = tokenizer.encode_special("content_thinking")
+        text_block = [
+            tokenizer.encode_special("message_model"),
+            tokenizer.encode_special("content_text"),
+        ]
         continued = [
             {"role": "user", "content": "First five primes?"},
             {"role": "assistant", "content": "2, 3,"},
@@ -5206,7 +5209,7 @@ class InklingTokenOutputTest(CustomTestCase):
         for name, messages, header in cases:
             for no_stop_trim, expected in (
                 (False, ("", " 5, 7")),
-                (True, ("", " 5, 7<|content_text|>")),
+                (True, ("", " 5, 7<|content_thinking|>")),
             ):
                 request = ChatCompletionRequest(
                     model="test-model",
