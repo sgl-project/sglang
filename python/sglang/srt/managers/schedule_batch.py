@@ -1054,8 +1054,6 @@ class Req(ReqDllmMixin):
         token_indices_to_pool: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
-        cache_id: Optional[str] = None,
-        load_cache_id: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -1133,11 +1131,7 @@ class Req(ReqDllmMixin):
             ) + lora_id  # lora_id is concatenated to the extra key
 
         self.extra_key = extra_key
-        self.cache_id = cache_id or None
-        self.load_cache_id = load_cache_id or None
-        # load_cache_id namespaces the radix tree lookup so a later request can
-        # reuse the KV of an earlier request that used cache_id with the same id.
-        self.cache_salt = load_cache_id or cache_id or cache_salt or None
+        self.cache_salt = cache_salt or None
         self.lora_id = lora_id
         self.routing_key = routing_key
 

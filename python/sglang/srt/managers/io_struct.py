@@ -364,9 +364,11 @@ class GenerateReqInput:
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[Union[List[str], str]] = None
-    # Explicit KV-cache namespace: save this request's prefix under this id.
+    # Explicit KV-cache namespace. `cache_id` goes on the request that makes
+    # its prefix reusable under a caller-chosen id, `load_cache_id` on a later
+    # request that reuses it. Normalization folds both into `cache_salt` (see
+    # `_resolve_cache_salt`), so nothing past the tokenizer manager sees them.
     cache_id: Optional[Union[List[str], str]] = None
-    # Explicit KV-cache namespace: load a previously saved prefix under this id.
     load_cache_id: Optional[Union[List[str], str]] = None
 
     # Versioned KV-hint envelope, set by a trusted orchestrator after worker
@@ -566,7 +568,7 @@ class GenerateReqInput:
             self.token_ids_logprob = None
         if self.return_sampling_mask is None:
             self.return_sampling_mask = False
-        for field_name in ("extra_key", "cache_salt", "cache_id", "load_cache_id"):
+        for field_name in self._CACHE_KEY_FIELDS:
             value = getattr(self, field_name)
             if value is not None and not isinstance(value, str):
                 raise ValueError(
@@ -574,19 +576,12 @@ class GenerateReqInput:
                 )
             if value == "":
                 setattr(self, field_name, None)
-        if (
-            self.cache_id is not None
-            and self.load_cache_id is not None
-            and self.cache_id != self.load_cache_id
-        ):
-            raise ValueError(
-                "cache_id and load_cache_id must be equal when both are set."
-            )
-        if self.cache_id is not None or self.load_cache_id is not None:
-            if self.session_id is not None or self.session_params is not None:
-                raise ValueError(
-                    "cache_id/load_cache_id are not compatible with session_id/session_params."
-                )
+        self.cache_salt = self._resolve_cache_salt(
+            self.cache_salt,
+            self.cache_id,
+            self.load_cache_id,
+            has_session=self._has_session(),
+        )
         if isinstance(self.kv_hints, list):
             raise ValueError("kv_hints should be a single envelope for one request.")
         self.kv_hints = (
@@ -614,10 +609,9 @@ class GenerateReqInput:
         self._normalize_logprob_params(num)
         self._normalize_return_hidden_states(num)
         self._normalize_custom_logit_processor(num)
-        self._normalize_extra_key(num)
-        self._normalize_cache_salt(num)
-        self._normalize_cache_id(num)
-        self._normalize_load_cache_id(num)
+        for field_name in self._CACHE_KEY_FIELDS:
+            self._normalize_cache_key_field(field_name, num)
+        self._resolve_batch_cache_salt(num)
         self._normalize_kv_hints(num)
         self._normalize_bootstrap_params(num)
 
@@ -845,81 +839,83 @@ class GenerateReqInput:
                 "Cannot use list custom_logit_processor with parallel_sample_num > 1"
             )
 
-    def _normalize_extra_key(self, num):
-        """Normalize extra_key for batch processing."""
-        if self.extra_key is None:
-            return
-        if isinstance(self.extra_key, str):
-            value = self.extra_key or None
-            self.extra_key = [value] * num
-        elif isinstance(self.extra_key, list):
-            if len(self.extra_key) != self.batch_size:
-                raise ValueError(
-                    "The length of extra_key should be equal to the batch size."
-                )
-            if any(not isinstance(value, str) for value in self.extra_key):
-                raise ValueError("Every extra_key should be a string.")
-            self.extra_key = [value or None for value in self.extra_key]
-            self.extra_key = self.extra_key * self.parallel_sample_num
-        else:
-            raise ValueError("extra_key should be a list or a string.")
+    # Per-request cache keys that share one normalization rule: a string for a
+    # single request, a per-item list for a batch, and "" meaning "not set".
+    _CACHE_KEY_FIELDS = ("extra_key", "cache_salt", "cache_id", "load_cache_id")
 
-    def _normalize_cache_salt(self, num):
-        """Normalize cache_salt for batch processing."""
-        if self.cache_salt is None:
-            return
-        if isinstance(self.cache_salt, str):
-            value = self.cache_salt or None
-            self.cache_salt = [value] * num
-        elif isinstance(self.cache_salt, list):
-            if len(self.cache_salt) != self.batch_size:
-                raise ValueError(
-                    "The length of cache_salt should be equal to the batch size."
-                )
-            if any(not isinstance(value, str) for value in self.cache_salt):
-                raise ValueError("Every cache_salt should be a string.")
-            self.cache_salt = [value or None for value in self.cache_salt]
-            self.cache_salt = self.cache_salt * self.parallel_sample_num
-        else:
-            raise ValueError("cache_salt should be a list or a string.")
+    def _has_session(self) -> bool:
+        return self.session_id is not None or self.session_params is not None
 
-    def _normalize_cache_id(self, num):
-        """Normalize cache_id for batch processing."""
-        if self.cache_id is None:
-            return
-        if isinstance(self.cache_id, str):
-            value = self.cache_id or None
-            self.cache_id = [value] * num
-        elif isinstance(self.cache_id, list):
-            if len(self.cache_id) != self.batch_size:
-                raise ValueError(
-                    "The length of cache_id should be equal to the batch size."
-                )
-            if any(not isinstance(value, str) for value in self.cache_id):
-                raise ValueError("Every cache_id should be a string.")
-            self.cache_id = [value or None for value in self.cache_id]
-            self.cache_id = self.cache_id * self.parallel_sample_num
-        else:
-            raise ValueError("cache_id should be a list or a string.")
+    @staticmethod
+    def _resolve_cache_salt(
+        cache_salt: Optional[str],
+        cache_id: Optional[str],
+        load_cache_id: Optional[str],
+        *,
+        has_session: bool,
+    ) -> Optional[str]:
+        """Fold one request's explicit cache_id / load_cache_id into its cache_salt.
 
-    def _normalize_load_cache_id(self, num):
-        """Normalize load_cache_id for batch processing."""
-        if self.load_cache_id is None:
+        Both ids name the same radix-tree namespace: `cache_id` on the request
+        that fills it, `load_cache_id` on a later request that reuses it. The
+        resolved value simply becomes the request's cache_salt, so the scheduler
+        and the radix cache need no knowledge of the two ids.
+        """
+        if cache_id is None and load_cache_id is None:
+            return cache_salt
+        if (
+            cache_id is not None
+            and load_cache_id is not None
+            and cache_id != load_cache_id
+        ):
+            raise ValueError(
+                "cache_id and load_cache_id must be equal when both are set."
+            )
+        if has_session:
+            raise ValueError(
+                "cache_id/load_cache_id are not compatible with session_id/session_params."
+            )
+        if cache_salt is not None:
+            raise ValueError(
+                "cache_id/load_cache_id cannot be combined with cache_salt; "
+                "the id already is the cache namespace."
+            )
+        return load_cache_id or cache_id
+
+    def _normalize_cache_key_field(self, field_name: str, num: int):
+        """Normalize one of `_CACHE_KEY_FIELDS` for batch processing."""
+        value = getattr(self, field_name)
+        if value is None:
             return
-        if isinstance(self.load_cache_id, str):
-            value = self.load_cache_id or None
-            self.load_cache_id = [value] * num
-        elif isinstance(self.load_cache_id, list):
-            if len(self.load_cache_id) != self.batch_size:
+        if isinstance(value, str):
+            setattr(self, field_name, [value or None] * num)
+        elif isinstance(value, list):
+            if len(value) != self.batch_size:
                 raise ValueError(
-                    "The length of load_cache_id should be equal to the batch size."
+                    f"The length of {field_name} should be equal to the batch size."
                 )
-            if any(not isinstance(value, str) for value in self.load_cache_id):
-                raise ValueError("Every load_cache_id should be a string.")
-            self.load_cache_id = [value or None for value in self.load_cache_id]
-            self.load_cache_id = self.load_cache_id * self.parallel_sample_num
+            if any(not isinstance(item, str) for item in value):
+                raise ValueError(f"Every {field_name} should be a string.")
+            value = [item or None for item in value]
+            setattr(self, field_name, value * self.parallel_sample_num)
         else:
-            raise ValueError("load_cache_id should be a list or a string.")
+            raise ValueError(f"{field_name} should be a list or a string.")
+
+    def _resolve_batch_cache_salt(self, num: int):
+        """Fold the per-item cache_id / load_cache_id into per-item cache_salt."""
+        if self.cache_id is None and self.load_cache_id is None:
+            return
+        has_session = self._has_session()
+        self.cache_salt = [
+            self._resolve_cache_salt(
+                cache_salt, cache_id, load_cache_id, has_session=has_session
+            )
+            for cache_salt, cache_id, load_cache_id in zip(
+                self.cache_salt or [None] * num,
+                self.cache_id or [None] * num,
+                self.load_cache_id or [None] * num,
+            )
+        ]
 
     def _normalize_kv_hints(self, num):
         """Normalize kv_hints for batch processing."""
@@ -1200,10 +1196,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
-    # Explicit KV-cache namespace: save this request's prefix under this id.
-    cache_id: Optional[str] = None
-    # Explicit KV-cache namespace: load a previously saved prefix under this id.
-    load_cache_id: Optional[str] = None
 
     # See GenerateReqInput.kv_hints. A defaulted tail field: the Rust server
     # stops emitting at disagg_prefill_dp_rank, so this slot decodes as None

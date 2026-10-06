@@ -1854,10 +1854,12 @@ class ResponsesRequest(PDRoutingFields):
         default=None, description="Cache salt for request caching"
     )
     cache_id: Optional[str] = Field(
-        default=None, description="Explicit KV-cache namespace to save this request's prefix under"
+        default=None,
+        description="Explicit KV-cache namespace to save this request's prefix under",
     )
     load_cache_id: Optional[str] = Field(
-        default=None, description="Explicit KV-cache namespace to load a previously saved prefix from"
+        default=None,
+        description="Explicit KV-cache namespace to load a previously saved prefix from",
     )
 
     # Deprecated: use routed_dp_rank instead

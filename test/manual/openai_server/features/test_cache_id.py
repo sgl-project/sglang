@@ -1,15 +1,15 @@
 """Integration test for explicit cache_id / load_cache_id KV-cache reuse.
 
-Verifies that a request with ``cache_id`` persists its prefix in the radix cache
-and a later request with ``load_cache_id`` reuses it, even when the two requests
-are separated by an unrelated prompt that would otherwise evict or branch the
-shared prefix.
+Verifies that a request with ``cache_id`` keeps its prefix in the radix cache
+under that id and a later request with ``load_cache_id`` reuses it, even when
+the two requests are separated by an unrelated prompt that would otherwise
+branch the shared prefix.
 """
 
-import platform
 import unittest
 
 import openai
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -19,10 +19,6 @@ from sglang.test.test_utils import (
 )
 
 
-@unittest.skipIf(
-    platform.system() == "Darwin",
-    "sglang serve does not accept --device on macOS; run this test on Linux/CUDA",
-)
 class TestCacheIdReuse(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -57,52 +53,50 @@ class TestCacheIdReuse(CustomTestCase):
         prompt = "_ The capital of France is"
         cache_id = "test-cache-id-france"
 
-        # First request saves the prefix under cache_id.
+        # The first request fills a fresh namespace, so nothing is cached yet.
         first = self._chat(prompt, extra_body={"cache_id": cache_id})
         first_cached = int(first.usage.prompt_tokens_details.cached_tokens)
-        # Some template tokens may already be cached; the important check is
-        # that the second request with load_cache_id caches more/equal tokens.
         print(f"first request cached_tokens: {first_cached}")
+        self.assertEqual(first_cached, 0)
 
-        # An unrelated prompt with a different cache_id should not evict the
-        # first entry because the radix tree namespaces by cache salt.
+        # An unrelated prompt under another id must not disturb the first entry:
+        # the radix tree namespaces by cache salt.
         self._chat("_ The speed of light is", extra_body={"cache_id": "other-id"})
 
-        # Second request loads the previously saved prefix. The full prompt
-        # should now be cached because the first request stored it under cache_id.
+        # The load request matches the whole saved prefix. The last prompt token
+        # is always recomputed for its logits, hence prompt_tokens - 1.
         second = self._chat(prompt, extra_body={"load_cache_id": cache_id})
         second_cached = int(second.usage.prompt_tokens_details.cached_tokens)
         second_prompt = int(second.usage.prompt_tokens)
         print(f"second request cached_tokens: {second_cached} / {second_prompt}")
-
-        self.assertGreater(
-            second_cached,
-            first_cached,
-            "load_cache_id should increase cached tokens compared to the save request",
-        )
         self.assertEqual(
             second_cached,
-            second_prompt,
+            second_prompt - 1,
             "load_cache_id should produce a full prefix cache hit",
         )
 
     def test_different_cache_ids_do_not_share(self):
         prompt = "_ The largest planet is"
-        id_a = "cache-id-a"
-        id_b = "cache-id-b"
 
-        self._chat(prompt, extra_body={"cache_id": id_a})
-        # Same prompt but a different namespace must not see a cache hit.
-        response = self._chat(prompt, extra_body={"load_cache_id": id_b})
+        self._chat(prompt, extra_body={"cache_id": "cache-id-a"})
+        # Same prompt under a different id: nothing is shared, not even the
+        # chat-template tokens, because namespaces are disjoint.
+        response = self._chat(prompt, extra_body={"load_cache_id": "cache-id-b"})
         cached = int(response.usage.prompt_tokens_details.cached_tokens)
         print(f"different cache_id cached_tokens: {cached}")
-        # Template tokens may be shared, but the user prompt itself should not
-        # be cached under the new id. We only assert no full prompt hit.
-        self.assertLess(
-            cached,
-            int(response.usage.prompt_tokens),
-            "different cache ids should not fully reuse each other's prefixes",
+        self.assertEqual(
+            cached, 0, "different cache ids should not reuse each other's prefixes"
         )
+
+    def test_plain_requests_do_not_see_explicit_namespaces(self):
+        prompt = "_ The tallest mountain is"
+
+        self._chat(prompt, extra_body={"cache_id": "cache-id-c"})
+        # A request without any id looks in the default namespace only.
+        response = self._chat(prompt)
+        cached = int(response.usage.prompt_tokens_details.cached_tokens)
+        print(f"plain request cached_tokens: {cached}")
+        self.assertLess(cached, int(response.usage.prompt_tokens) - 1)
 
 
 if __name__ == "__main__":

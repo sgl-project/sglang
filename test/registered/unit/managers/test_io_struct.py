@@ -963,79 +963,108 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                     req.normalize_batch_and_arguments()
 
     def test_cache_id_load_cache_id_normalization(self):
-        """cache_id/load_cache_id follow the same normalization rules as cache_salt."""
+        """cache_id/load_cache_id follow the same batch rules as cache_salt."""
         req = GenerateReqInput(
             text=["Hello", "World"],
             cache_id=["save-A", "save-B"],
-            load_cache_id=["load-A", "load-B"],
             sampling_params=[{}, {}],
         )
         req.normalize_batch_and_arguments()
         self.assertEqual(req.cache_id, ["save-A", "save-B"])
-        self.assertEqual(req.load_cache_id, ["load-A", "load-B"])
         self.assertEqual(req[0].cache_id, "save-A")
-        self.assertEqual(req[0].load_cache_id, "load-A")
+        self.assertEqual(req[1].cache_id, "save-B")
 
-        # Scalar broadcast and parallel sampling expansion
+        # Scalar broadcast and parallel sampling expansion.
         req = GenerateReqInput(
             text=["Hello", "World"],
-            cache_id="shared-save",
-            load_cache_id="shared-load",
+            load_cache_id="shared",
             sampling_params={"n": 2},
         )
         req.normalize_batch_and_arguments()
-        self.assertEqual(req.cache_id, ["shared-save", "shared-save"] * 2)
-        self.assertEqual(req.load_cache_id, ["shared-load", "shared-load"] * 2)
+        self.assertEqual(req.load_cache_id, ["shared", "shared"] * 2)
 
-    def test_cache_id_and_load_cache_id_mutual_exclusion(self):
-        with self.assertRaisesRegex(
-            ValueError, "cache_id and load_cache_id must be equal"
+        # "" means unset, like the other cache keys.
+        req = GenerateReqInput(text="Hello", cache_id="", load_cache_id="")
+        req.normalize_batch_and_arguments()
+        self.assertIsNone(req.cache_id)
+        self.assertIsNone(req.load_cache_id)
+        self.assertIsNone(req.cache_salt)
+
+    def test_cache_id_resolves_to_cache_salt(self):
+        """The ids become the request's cache_salt: all the scheduler ever reads."""
+        for kwargs in (
+            {"cache_id": "doc-42"},
+            {"load_cache_id": "doc-42"},
+            {"cache_id": "doc-42", "load_cache_id": "doc-42"},
         ):
+            with self.subTest(mode="single", **kwargs):
+                req = GenerateReqInput(text="Hello", **kwargs)
+                req.normalize_batch_and_arguments()
+                self.assertEqual(req.cache_salt, "doc-42")
+
+        # Batch: resolved per item; items without an id keep their own salt.
+        req = GenerateReqInput(
+            text=["A", "B", "C"],
+            cache_id=["save-A", "", ""],
+            load_cache_id=["", "load-B", ""],
+            cache_salt=["", "", "salt-C"],
+            sampling_params=[{}, {}, {}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.cache_salt, ["save-A", "load-B", "salt-C"])
+        self.assertEqual(
+            [req[i].cache_salt for i in range(3)], ["save-A", "load-B", "salt-C"]
+        )
+
+        # Parallel sampling expands the resolved salt like any other cache key.
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            cache_id="shared",
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.cache_salt, ["shared", "shared"] * 2)
+
+    def test_cache_id_and_load_cache_id_must_match(self):
+        with self.assertRaisesRegex(ValueError, "must be equal"):
             GenerateReqInput(
                 text="Hello", cache_id="a", load_cache_id="b"
             ).normalize_batch_and_arguments()
+        # The batch path applies the same rule per item.
+        with self.assertRaisesRegex(ValueError, "must be equal"):
+            GenerateReqInput(
+                text=["Hello", "World"],
+                cache_id=["same", "a"],
+                load_cache_id=["same", "b"],
+                sampling_params=[{}, {}],
+            ).normalize_batch_and_arguments()
 
     def test_cache_id_incompatible_with_session(self):
-        with self.assertRaisesRegex(
-            ValueError, "not compatible with session_id"
-        ):
+        with self.assertRaisesRegex(ValueError, "not compatible with session_id"):
             GenerateReqInput(
                 text="Hello", cache_id="a", session_id="s1"
             ).normalize_batch_and_arguments()
+        with self.assertRaisesRegex(ValueError, "not compatible with session_id"):
+            GenerateReqInput(
+                text=["Hello", "World"],
+                load_cache_id="a",
+                session_id="s1",
+                sampling_params=[{}, {}],
+            ).normalize_batch_and_arguments()
 
-    def test_cache_id_maps_to_cache_salt_in_req(self):
-        """Req.cache_salt is derived from load_cache_id then cache_id."""
-        from sglang.srt.managers.schedule_batch import Req
-
-        save_req = Req(
-            "rid-1",
-            "hello",
-            array("q", [1, 2, 3]),
-            SamplingParams(),
-            cache_id="my-cache",
-        )
-        self.assertEqual(save_req.cache_salt, "my-cache")
-        self.assertEqual(save_req.cache_id, "my-cache")
-
-        load_req = Req(
-            "rid-2",
-            "hello",
-            array("q", [1, 2, 3]),
-            SamplingParams(),
-            load_cache_id="my-cache",
-        )
-        self.assertEqual(load_req.cache_salt, "my-cache")
-        self.assertEqual(load_req.load_cache_id, "my-cache")
-
-        both_req = Req(
-            "rid-3",
-            "hello",
-            array("q", [1, 2, 3]),
-            SamplingParams(),
-            cache_id="my-cache",
-            load_cache_id="my-cache",
-        )
-        self.assertEqual(both_req.cache_salt, "my-cache")
+    def test_cache_id_incompatible_with_explicit_cache_salt(self):
+        """An explicit cache_salt is never silently replaced by the id."""
+        with self.assertRaisesRegex(ValueError, "cannot be combined with cache_salt"):
+            GenerateReqInput(
+                text="Hello", cache_id="a", cache_salt="tenant"
+            ).normalize_batch_and_arguments()
+        with self.assertRaisesRegex(ValueError, "cannot be combined with cache_salt"):
+            GenerateReqInput(
+                text=["Hello", "World"],
+                load_cache_id=["", "a"],
+                cache_salt=["tenant", "tenant"],
+                sampling_params=[{}, {}],
+            ).normalize_batch_and_arguments()
 
     def test_logprob_parameters_normalization(self):
         """Test normalization of logprob-related parameters."""
