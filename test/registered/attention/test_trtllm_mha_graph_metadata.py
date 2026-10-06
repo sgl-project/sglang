@@ -583,7 +583,13 @@ def _graph_batch(seq_lens, forward_mode, spec_info, tokens_per_req):
     )
 
 
-def _replay_and_check_every_read(monkeypatch, backend, batch, bind_plan):
+def _replay_and_check_every_read(
+    monkeypatch,
+    backend,
+    batch,
+    bind_plan,
+    replays=([5, 9], [300, 3], [129, 700]),
+):
     # The recorded kernel writes cache_seqlens = seq_lens + offset only when the
     # graph runs, which is after replay-prep has refilled the page table.
     def recorded_kernel(**kwargs):
@@ -601,7 +607,7 @@ def _replay_and_check_every_read(monkeypatch, backend, batch, bind_plan):
     backend.init_forward_metadata_out_graph(capture, in_capture=True)
     backend.init_forward_metadata_in_graph(capture)
     # Rows grow across page boundaries and trade lengths between replays.
-    for n, seq_lens in enumerate(([5, 9], [300, 3], [129, 700]), start=1):
+    for n, seq_lens in enumerate(replays, start=1):
         _move_every_page(v2p, n)
         replay = batch(seq_lens)
         bind_plan(backend.kv_index_translator, replay)
@@ -665,6 +671,98 @@ def test_unified_eager_table_must_be_packed():
     translator.copy_page_table(forward_batch.kv_loc_plan, out=captured[:2])
     with pytest.raises(AssertionError, match="packed rows"):
         backend.init_forward_metadata(forward_batch)
+
+
+def _bind_iteration_plan(translator, forward_batch, window=4):
+    """The plan a speculative worker builds once per iteration: its reads reach
+    the whole draft window past the committed lengths."""
+    translator.plan(
+        req_pool_indices=forward_batch.req_pool_indices,
+        seq_lens=forward_batch.seq_lens,
+        seq_lens_cpu=forward_batch.seq_lens_cpu,
+        write_virtual=forward_batch.out_cache_loc,
+        read_extent=window,
+    ).bind(forward_batch, translator)
+
+
+@pytest.mark.parametrize(
+    "forward_mode,spec_info,step_id,tokens_per_req",
+    [
+        (ForwardMode.DECODE, SimpleNamespace(), 1, 1),
+        (ForwardMode.TARGET_VERIFY, SimpleNamespace(ragged_verify_layout=None), 0, 4),
+        (ForwardMode.DRAFT_EXTEND_V2, SimpleNamespace(num_tokens_per_req=4), 0, 4),
+    ],
+    ids=["draft_decode", "target_verify", "draft_extend"],
+)
+def test_unified_spec_replay_reads_only_this_replays_pages(
+    monkeypatch, forward_mode, spec_info, step_id, tokens_per_req
+):
+    """A speculative replay reads past seq_lens: a draft step reads back its
+    earlier steps, a verify the drafts it scores."""
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    backend.speculative_step_id = step_id
+
+    def batch(seq_lens):
+        return _graph_batch(seq_lens, forward_mode, spec_info, tokens_per_req)
+
+    # 127 committed tokens plus the drafts reach a page the prefix does not.
+    _replay_and_check_every_read(
+        monkeypatch,
+        backend,
+        batch,
+        _bind_iteration_plan,
+        replays=([5, 9], [127, 300], [129, 700]),
+    )
+
+
+def test_unified_ragged_verify_reads_only_this_replays_pages(monkeypatch):
+    # Ragged verify writes per-row lengths before the refill; its geometry needs
+    # GPU kernels, so this stand-in writes the same lengths the real one does.
+    verify_lens = torch.tensor([1, 7], dtype=torch.int32)
+
+    def write_ragged(metadata, forward_batch, ragged_layout, bs, in_capture=False):
+        metadata.cache_seqlens_int32[:bs].copy_(
+            forward_batch.seq_lens[:bs] + verify_lens
+        )
+
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    backend.is_xqa_impl = False
+    monkeypatch.setattr(backend, "_write_ragged_verify_graph_metadata", write_ragged)
+    spec_info = SimpleNamespace(ragged_verify_layout=object())
+
+    def batch(seq_lens):
+        return _graph_batch(seq_lens, ForwardMode.TARGET_VERIFY, spec_info, 8)
+
+    # 123 + 7 crosses a page boundary that 123 plus the uniform draft width does not.
+    _replay_and_check_every_read(
+        monkeypatch,
+        backend,
+        batch,
+        lambda translator, fb: _bind_iteration_plan(translator, fb, window=8),
+        replays=([5, 123], [300, 3]),
+    )
+
+
+@pytest.mark.parametrize(
+    "forward_mode,spec_info,step_id,tokens_per_req",
+    [
+        (ForwardMode.DECODE, SimpleNamespace(), 1, 1),
+        (ForwardMode.TARGET_VERIFY, SimpleNamespace(ragged_verify_layout=None), 0, 4),
+    ],
+    ids=["draft_decode", "target_verify"],
+)
+def test_unified_eager_spec_table_covers_every_page_read(
+    forward_mode, spec_info, step_id, tokens_per_req
+):
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    backend.speculative_step_id = step_id
+    v2p = _translate_through_a_moving_page_map(backend)
+    _move_every_page(v2p, 1)
+    # 127 committed tokens plus the drafts reach a page the prefix does not.
+    forward_batch = _eager_batch([127, 3], forward_mode, spec_info, tokens_per_req)
+    _bind_iteration_plan(backend.kv_index_translator, forward_batch)
+    backend.init_forward_metadata(forward_batch)
+    _assert_reads_only_current_pages(backend, v2p)
 
 
 def test_hybrid_wrappers_forward_in_graph_hook():

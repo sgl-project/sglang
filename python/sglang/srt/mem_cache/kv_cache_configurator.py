@@ -1003,9 +1003,7 @@ class KVCacheConfigurator:
             {draft_backend} if draft_backend else set(attention_backends()) - {None}
         )
         # A fused draft reads its rows through the KV-index translator, which
-        # other backends miss on some draft path: trtllm_mha's graph replay
-        # refills its page table from stale lengths, and its eager build does
-        # not widen the table by the draft block.
+        # other backends miss on some draft path.
         if not draft_backends <= TRANSLATED_MHA_RAILS:
             return FusedDraftDecision(
                 declined=(
@@ -1141,7 +1139,7 @@ class KVCacheConfigurator:
         would sit on top of it unbudgeted: an EAGLE-family or DFLASH draft that
         does not fuse is refused. A DSPARK draft that does not fuse keeps its
         private pool, unpriced, so DSPARK still boots where its draft declines
-        fusion (as the Kimi-Linear default, a trtllm_mha draft, does)."""
+        fusion."""
         decision = self._fused_draft_decision()
         placement = self._fused_draft_for_pool_factory(decision)
         if (
