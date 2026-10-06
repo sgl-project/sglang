@@ -5,56 +5,68 @@ FlashInfer entries: ``flashinfer.gemm.prepare_group_gemm_fp8_nt_groupwise_contig
 ``flashinfer.jit.gemm.cake_grouped_fp8_gemm``) and
 ``flashinfer.gemm.prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant``
 (module ``flashinfer.gemm.cake_grouped_fp8_fused_silu_quant``, JIT registry
-``flashinfer.jit.gemm.cake_grouped_fp8_fused_silu_quant``). Both are
-prepared-runner factories: the returned object binds the *weight* operands
-(``b``, ``b_scale``) and records the shapes / dtypes / strides / device of the
-per-token operands; ``launch()`` submits the kernel(s) on the current stream.
+``flashinfer.jit.gemm.cake_grouped_fp8_fused_silu_quant``).  Both are
+prepared-runner factories; both run on SM100a (B200) and SM103a (B300).
 
-Plain GEMM contract (block-scaled FlashInfer, the ``alignment`` keyword):
+Plain GEMM contract (FlashInfer main, PR #6048 "block-scaled UE8M0 family with
+native -1 padding and per-call operand binding"):
 
-* ``a`` E4M3 ``(M, K)`` with ``K % 128 == 0``; ``b`` E4M3 ``(G, N, K)``;
-  ``m_indices`` int32 ``(M,)`` nondecreasing over valid rows; ``out`` BF16
-  ``(M, N)`` (a 2-byte but not 16-byte aligned ``out`` selects the scalar-store
-  route).
+* ``a`` E4M3 ``(M, K)`` contiguous, 16-byte aligned, ``M > 0``, ``K % 128 == 0``;
+  ``b`` E4M3 ``(G, N, K)`` contiguous, 16-byte aligned, ``N % 128 == 0``;
+  ``m_indices`` int32 ``(M,)`` contiguous, 16-byte aligned, nondecreasing over
+  routed rows; ``out`` BF16 ``(M, N)`` contiguous (a 2-byte but not 16-byte
+  aligned ``out`` selects the FP32 family's scalar-store route).
 * **Block-scaled family** (``a_scale`` and ``b_scale`` both int32 packed UE8M0,
   one int32 = four consecutive 128-wide K-block exponents, byte 0 = lowest
-  block): ``a_scale`` ``(M, ceil(K/512))`` with any strides (the DeepGEMM
-  MN-major ``(1, M)`` layout included); ``b_scale`` ``(G, N, ceil(K/512))``
-  (row-repeated, ``transform_scale_ue8m0``) or ``(G, N/128, ceil(K/512))``;
-  ``N % 16 == 0``.  ``-1`` rows of ``m_indices`` are skipped natively per
-  32-row sub-block (a sub-block that starts with padding is never written;
-  padding rows sharing a sub-block with an expert's rows are computed from
-  their own operands and never read back; ``fill_padding`` must be ``False``).  Every
-  expert's run must start on a multiple of ``alignment`` rows (``alignment`` a
-  multiple of 32; multiples of 128 run the fast single-run schedule, other
-  values a slower multi-run fallback).
+  block): ``a_scale`` ``(M, cols)`` with ``4 * cols >= K / 128``, 16-byte
+  aligned, contiguous *or* the transpose of a contiguous tensor (DeepGEMM's
+  MN-major ``(1, M)`` layout is read in place); ``b_scale`` ``(G, N, cols)``
+  (row-repeated, ``transform_scale_ue8m0``) or ``(G, N/128, cols)``, same
+  alignment and layout rule; ``out`` 16-byte aligned.  ``-1`` rows of
+  ``m_indices`` are padding: a 32-row sub-block whose leading entry is ``-1``
+  is skipped and its output rows left untouched; ``-1`` rows sharing a
+  sub-block with routed rows receive finite values of no meaning
+  (``fill_padding`` must be ``False``).  Every expert's run must start on a
+  multiple of ``alignment`` rows (a positive multiple of 32; multiples of 128
+  run the single-run schedule, other values the slower multi-run schedule).
 * **FP32 family** (both scales FP32): ``a_scale`` ``(M, K/128)`` and
-  ``b_scale`` ``(G, N/128, K/128)`` contiguous, arbitrary values,
-  ``N % 128 == 0``; ``-1`` rows only with ``fill_padding=True``.
-* ``.launch(a=None, a_scale=None, m_indices=None, out=None)`` rebinds the
-  per-token operands (same shapes / dtypes / strides / device as prepared).
-  ``prepare`` runs no device work, ``launch`` allocates nothing and is
-  CUDA-graph capturable from the first launch.
+  ``b_scale`` ``(G, N/128, K/128)`` contiguous, arbitrary values; ``-1`` rows
+  only with ``fill_padding=True`` (two small forward-fill kernels per launch).
+* ``prepare`` binds the problem shape and the expert weights and runs no
+  device work.  ``.launch(a=None, a_scale=None, m_indices=None, out=None)``
+  rebinds the per-token operands for that call (same shape / dtype / device /
+  packed-scale layout / output alignment class as prepared), allocates
+  nothing, submits exactly one kernel (plus the forward-fill pair with
+  ``fill_padding``) and is CUDA-graph capturable from the first launch.
+  ``.release_prepared_operands()`` drops the references to the per-token
+  tensors given at ``prepare`` so a long-lived runner pins no batch buffers;
+  afterwards every ``launch`` must pass all four operands.
+* ``validate_indices=True`` checks sortedness / range with one device-to-host
+  transfer (never inside graph capture).
 
-FlashInfer pins without the ``alignment`` keyword (``0.7.0.post1`` and
-earlier, see ``flashinfer_python`` in ``python/pyproject.toml``) only offer the
-FP32 family with no ``-1`` support and a non-capturable first launch;
-:func:`block_scaled_contract_available` reports which contract is installed and
-the ``supports_*`` checks reject int32 scales / ``fill_padding`` / ``alignment``
-on the old contract so callers fall back to their default kernel.
+The ``flashinfer_python`` pin in ``python/pyproject.toml`` (``0.7.0.post1``)
+predates this contract: that release only offers the FP32 family, rejects
+``-1`` rows, has no ``alignment`` / ``fill_padding`` keywords, no per-call
+``launch`` operands and a non-capturable first launch.
+:func:`block_scaled_contract_available` detects which contract is installed
+and the ``supports_*`` checks reject int32 scales, ``fill_padding`` and
+``alignment`` on the old contract so callers fall back to their default kernel.
 
-Fused gate_up GEMM + SwiGLU + per-128-column FP8 quant (FP32 scales only):
-``a`` E4M3 ``(M, K)`` with ``0 < M <= 8192`` and ``K % 512 == 0``; ``b`` E4M3
-``(G, 2H, K)`` (gate rows ``[0, H)`` then up) with ``2H % 256 == 0``; every
-*internal* expert boundary of ``m_indices`` must be a multiple of 128 rows
-(only checked with ``validate_indices=True``); outputs ``out_q`` E4M3 ``(M, H)``
-and ``out_s`` FP32 ``(M, H/128)`` = ``max(absmax, 1e-10) / 448``.  Bitwise equal
-to CuTe grouped GEMM + ``silu_and_mul`` + ``per_token_group_quant_8bit``.
-``validate_indices=True`` performs a device synchronization at prepare time.
+Fused gate_up GEMM + SwiGLU + per-128-column FP8 quant: FlashInfer main's
+version (PR #6049 not merged) still binds *all* operands at ``prepare`` --
+``launch()`` takes no arguments -- accepts FP32 scales only and rejects ``-1``
+rows, so a caller with DeepGEMM's packed UE8M0 scales or the compact ``-1``
+layout cannot use it without staging copies.  Contract: ``a`` E4M3 ``(M, K)``
+with ``0 < M <= 8192`` and ``K % 512 == 0``; ``b`` E4M3 ``(G, 2H, K)`` (gate rows
+``[0, H)`` then up) with ``2H % 256 == 0``; every *internal* expert boundary of
+``m_indices`` a multiple of 128 rows (checked only with ``validate_indices=True``,
+one device-to-host transfer); outputs ``out_q`` E4M3 ``(M, H)`` and ``out_s``
+FP32 ``(M, H/128)`` = ``max(absmax, 1e-10) / 448``.  Bitwise equal to CuTe
+grouped GEMM + ``silu_and_mul`` + ``per_token_group_quant_8bit``.
 
-Not supported here (keep the existing SGLang path): SM90 / SM103 / SM12x
-devices, non-E4M3 operands, mixed FP32 / int32 scale dtypes, masked (padded)
-grouped layouts, outputs other than BF16 (plain) / E4M3 + FP32 scales (fused),
+Not supported here (keep the existing SGLang path): SM90 / SM12x devices,
+non-E4M3 operands, mixed FP32 / int32 scale dtypes, masked (padded) grouped
+layouts, outputs other than BF16 (plain) / E4M3 + FP32 scales (fused),
 K or N outside the multiples above.
 """
 
@@ -66,6 +78,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from sglang.kernels.cake_kernels._support import (
     SM100,
+    SM103,
     cuda_tensor_on,
     flashinfer_module_available,
 )
@@ -77,12 +90,12 @@ FI_MODULE = "flashinfer.gemm.cake_grouped_fp8_gemm"
 FI_JIT_MODULE = "flashinfer.jit.gemm.cake_grouped_fp8_gemm"
 FI_SILU_MODULE = "flashinfer.gemm.cake_grouped_fp8_fused_silu_quant"
 FI_SILU_JIT_MODULE = "flashinfer.jit.gemm.cake_grouped_fp8_fused_silu_quant"
-ARCHS = (SM100,)
+ARCHS = (SM100, SM103)
 K_BLOCK = 128
 B_SCALE_BLOCK_N = 128
 # Block-scaled (packed UE8M0 int32) family: one int32 packs four K blocks.
 UE8M0_BLOCKS_PER_INT32 = 4
-BLOCK_SCALED_N_MULTIPLE = 16
+PACKED_SCALE_ALIGNMENT = 16
 ALIGNMENT_MULTIPLE = 32
 FAST_ALIGNMENT = 128
 SILU_K_MULTIPLE = 512
@@ -160,6 +173,7 @@ def alignment_ok(alignment: Optional[int]) -> bool:
     """``None`` (FlashInfer default) or a positive multiple of 32."""
     return alignment is None or (
         isinstance(alignment, int)
+        and not isinstance(alignment, bool)
         and alignment > 0
         and alignment % ALIGNMENT_MULTIPLE == 0
     )
@@ -167,6 +181,15 @@ def alignment_ok(alignment: Optional[int]) -> bool:
 
 def _aligned_contiguous(tensor: torch.Tensor, alignment: int = 16) -> bool:
     return tensor.is_contiguous() and tensor.data_ptr() % alignment == 0
+
+
+def _packed_layout_ok(tensor: torch.Tensor) -> bool:
+    """FlashInfer reads packed UE8M0 scales in place when the tensor is contiguous
+    or the transpose of a contiguous tensor (DeepGEMM's MN-major layout), with
+    16-byte aligned storage."""
+    return tensor.data_ptr() % PACKED_SCALE_ALIGNMENT == 0 and (
+        tensor.is_contiguous() or tensor.mT.is_contiguous()
+    )
 
 
 def _scales_ok(
@@ -181,8 +204,8 @@ def _scales_ok(
     allow_block_scaled: bool,
 ) -> bool:
     """Both scales FP32 (``(M, K/128)`` / ``(G, N/128, K/128)`` contiguous) or
-    both int32 packed UE8M0 (``(M, ceil(K/512))`` any strides /
-    ``(G, N, ceil(K/512))`` or ``(G, N/128, ceil(K/512))``)."""
+    both int32 packed UE8M0 (``(M, cols)`` / ``(G, N | N/128, cols)`` with
+    ``4 * cols >= K/128``, each contiguous or transpose-contiguous)."""
     import torch
 
     if a_scale.device != device or b_scale.device != device:
@@ -202,14 +225,19 @@ def _scales_ok(
         and block_scaled_contract_available()
     ):
         return False
-    cols = -(-k_blocks // UE8M0_BLOCKS_PER_INT32)
-    if tuple(a_scale.shape) != (m, cols) or a_scale.data_ptr() % 4:
+    if a_scale.ndim != 2 or int(a_scale.shape[0]) != m:
+        return False
+    if UE8M0_BLOCKS_PER_INT32 * int(a_scale.shape[1]) < k_blocks:
+        return False
+    if not _packed_layout_ok(a_scale):
         return False
     if b_scale.ndim != 3 or int(b_scale.shape[0]) != groups:
         return False
     if int(b_scale.shape[1]) not in (n, n // B_SCALE_BLOCK_N):
         return False
-    return int(b_scale.shape[2]) == cols and b_scale.data_ptr() % 4 == 0
+    if UE8M0_BLOCKS_PER_INT32 * int(b_scale.shape[2]) < k_blocks:
+        return False
+    return _packed_layout_ok(b_scale)
 
 
 def _common_operands_ok(
@@ -228,12 +256,7 @@ def _common_operands_ok(
         return False
     m, k = (int(v) for v in a.shape)
     groups, n = (int(v) for v in b.shape[:2])
-    if m <= 0 or groups <= 0 or n <= 0 or k <= 0 or k % K_BLOCK:
-        return False
-    if a_scale.dtype == torch.int32 and allow_block_scaled:
-        if n % BLOCK_SCALED_N_MULTIPLE:
-            return False
-    elif n % n_block:
+    if m <= 0 or groups <= 0 or n <= 0 or k <= 0 or k % K_BLOCK or n % n_block:
         return False
     device = a.device
     return (
@@ -275,9 +298,10 @@ def supports_group_gemm_fp8_nt_groupwise_contiguous(
 
     int32 (packed UE8M0) scales, ``fill_padding`` and ``alignment`` need the
     block-scaled FlashInfer contract (:func:`block_scaled_contract_available`);
-    ``fill_padding`` is only valid for FP32 scales.  Index sortedness / range /
-    run alignment are data properties FlashInfer checks only with
-    ``validate_indices=True``; they are not inspected here.
+    ``fill_padding`` is only valid for FP32 scales; the block-scaled family
+    needs a 16-byte aligned ``out``.  Index sortedness / range / run alignment
+    are data properties FlashInfer checks only with ``validate_indices=True``;
+    they are not inspected here.
     """
     import torch
 
@@ -300,13 +324,14 @@ def supports_group_gemm_fp8_nt_groupwise_contiguous(
         fill_padding or alignment is not None
     ) and not block_scaled_contract_available():
         return False
-    if fill_padding and a_scale.dtype != torch.float32:
+    block_scaled = a_scale.dtype == torch.int32
+    if fill_padding and block_scaled:
         return False
     if out is not None and not (
         out.device == a.device
         and out.dtype == torch.bfloat16
         and tuple(out.shape) == (int(a.shape[0]), int(b.shape[1]))
-        and _aligned_contiguous(out, alignment=2)
+        and _aligned_contiguous(out, alignment=16 if block_scaled else 2)
     ):
         return False
     return _programs_registered(a.device.index, False)
@@ -323,8 +348,10 @@ def supports_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
 ) -> bool:
     """Admission check mirroring the FlashInfer contract; never raises.
 
-    The 128-row alignment of internal expert boundaries is a data property
-    FlashInfer checks only with ``validate_indices=True``; not inspected here.
+    FP32 scales only; ``-1`` rows are rejected by FlashInfer at ``prepare``
+    (``validate_indices=True``) or undefined otherwise.  The 128-row alignment
+    of internal expert boundaries is a data property FlashInfer checks only
+    with ``validate_indices=True``; not inspected here.
     """
     import torch
 
@@ -376,7 +403,8 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
 
     ``.launch(a=None, a_scale=None, m_indices=None, out=None)`` runs the GEMM,
     rebinding the per-token operands when given, and returns the BF16 ``(M, N)``
-    output.  ``fill_padding`` / ``alignment`` are only forwarded on the
+    output; ``.release_prepared_operands()`` drops the per-token tensors bound
+    here.  ``fill_padding`` / ``alignment`` are only forwarded on the
     block-scaled FlashInfer contract; on the old contract they are not
     expressible and raise ``TypeError`` when set to non-default values
     (``supports_*`` already rejects those requests).
@@ -421,9 +449,9 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
 ) -> Any:
     """Forward to FlashInfer; returns a ``PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant``.
 
-    ``.launch()`` returns ``(out_q, out_s)``. The mixed-schedule route is only
-    reachable with ``validate_indices=True``. First launch is not CUDA-graph
-    capturable.
+    ``.launch()`` takes no operands (all tensors are bound here) and returns
+    ``(out_q, out_s)``.  The mixed-schedule route is only reachable with
+    ``validate_indices=True`` (one device-to-host transfer at prepare).
     """
     from flashinfer.gemm.cake_grouped_fp8_fused_silu_quant import (
         prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant as prepare,
