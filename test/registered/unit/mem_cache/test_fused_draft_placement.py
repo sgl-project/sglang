@@ -224,13 +224,13 @@ class TestFusedDraftDecision(CustomTestCase):
 
     def test_a_draft_off_the_translated_rails_keeps_the_private_pool(self):
         """A fused draft reads its rows through the KV-index translator, which
-        only triton, flashinfer and fa3 carry on every draft path. The draft's
-        backend is the published one, a model hook's declaration included;
-        otherwise it is what the draft runner inherits from the target."""
-        # Kimi-Linear + DSPARK on SM100, where a model hook declares trtllm_mha.
-        declined = self._decide(algorithm="DSPARK", draft_backend="trtllm_mha")
+        only triton, flashinfer, fa3 and trtllm_mha carry on every draft path.
+        The draft's backend is the published one, a model hook's declaration
+        included; otherwise it is what the draft runner inherits from the
+        target."""
+        declined = self._decide(algorithm="DSPARK", draft_backend="fa4")
         self.assertIsNone(declined.placement)
-        self.assertIn("trtllm_mha", declined.declined)
+        self.assertIn("fa4", declined.declined)
         # A DFLASH-family draft runs the target's prefill backend, or the
         # platform default when that is not a draft backend.
         for target_backends, fuses in (
@@ -242,6 +242,17 @@ class TestFusedDraftDecision(CustomTestCase):
             self.assertEqual(decision.placement is not None, fuses, target_backends)
         # An EAGLE draft with no backend of its own runs the target's pair.
         self.assertIsNone(self._decide(target_backends=("fa3", "flashmla")).placement)
+
+    def test_a_trtllm_mha_draft_fuses(self):
+        """trtllm_mha refills its graph page table to what each replay reads
+        and widens its eager table by the draft block, so its draft fuses."""
+        # Kimi-Linear + DSPARK on SM100, where a model hook declares trtllm_mha.
+        for algorithm in ("EAGLE", "DFLASH", "DSPARK"):
+            decision = self._decide(algorithm=algorithm, draft_backend="trtllm_mha")
+            self.assertIsNotNone(decision.placement, algorithm)
+        # A draft with no backend of its own inherits the target's trtllm_mha.
+        decision = self._decide(target_backends=("trtllm_mha", "trtllm_mha"))
+        self.assertIsNotNone(decision.placement)
 
     def test_dcp_keeps_the_private_pool(self):
         """Under --dcp-size > 1 each rank's host rows hold only its share of
