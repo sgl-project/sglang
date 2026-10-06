@@ -334,13 +334,32 @@ def _cake_sp_symmetric_backend_ready(device: torch.device) -> bool:
             )
 
             supported = symmetric_memory_backend_support(device)
+            selected_by_route = False
             if supported is None:  # FlashInfer before CAKE-1053: NVSHMEM only
                 if str(symm_mem.get_backend(device) or "").upper() != "NVSHMEM":
                     symm_mem.set_backend("NVSHMEM")
+                    selected_by_route = True
                 supported = str(symm_mem.get_backend(device) or "").upper() == "NVSHMEM"
             name = str(symm_mem.get_backend(device) or "").upper()
             _cake_sp_symm_backend = name if supported else False
-            if not supported:
+            if supported:
+                logger.info(
+                    "%s %s: torch symmetric-memory backend %r is served by "
+                    "FlashInfer's Cake all-gather matmul (%s)",
+                    _CAKE_LOG_PREFIX,
+                    CAKE_ROUTE_SP_ALL_GATHER_MATMUL,
+                    name,
+                    (
+                        "selected by the route for a FlashInfer without the backend "
+                        "check; torch fused symm-mem SP ops disabled for this process"
+                        if selected_by_route
+                        else "the process backend; torch fused symm-mem SP ops "
+                        "disabled for this process"
+                        if name == "NVSHMEM"
+                        else "the process default; torch fused symm-mem SP ops stay on"
+                    ),
+                )
+            else:
                 _log_cake_sp_once(
                     "fallback",
                     f"torch symmetric-memory backend {name!r} is not served by "

@@ -1006,6 +1006,8 @@ def test_sp_route_runs_on_the_default_backend_flashinfer_supports(sp_env, caplog
     assert len(launchers) == 1 and launchers[0].call_count == 2
     assert torch.all(out == 2.0)
     assert "fallback to stock" not in caplog.text
+    assert "backend 'CUDA' is served by FlashInfer" in caplog.text
+    assert "torch fused symm-mem SP ops stay on" in caplog.text
 
 
 def test_sp_route_selects_nvshmem_for_a_flashinfer_without_the_backend_check(
@@ -1031,6 +1033,8 @@ def test_sp_route_selects_nvshmem_for_a_flashinfer_without_the_backend_check(
             assert not sp_mod.sp_fused_matmul_eligible(linear)
     assert len(launchers) == 1 and launchers[0].call_count == 2
     assert torch.all(out == 2.0)
+    assert "backend 'NVSHMEM' is served by FlashInfer" in caplog.text
+    assert "selected by the route" in caplog.text
 
 
 def test_sp_route_falls_back_when_the_backend_is_not_served(sp_env, caplog):
