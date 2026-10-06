@@ -86,12 +86,24 @@ RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
 _ROUTED_EXPERT_KEY_RE = re.compile(
     r"\.experts\.\d+\.(?:w[123]|down_proj|up_proj|gate_proj)\.weight$"
 )
+# HF KDA checkpoints store separate ``q/k/v_conv1d.weight`` tensors; SGLang
+# fuses them as ``qkv_conv1d``. Match either spelling.
+_KDA_CONV_WEIGHT_KEY_RE = re.compile(r"(?:qkv|[qkv])_conv1d\.weight$")
+_SAFETENSORS_DTYPE_TO_TORCH = {
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+}
+_KDA_CONV_DTYPE_CACHE: dict[str, torch.dtype] = {}
 
 
-def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
-    """Return the safetensors dtype string (e.g. ``F8_E4M3``, ``U8``) of one
-    routed-expert weight tensor, or ``None`` if the checkpoint is remote or has
-    no matching key. Reads only the safetensors header of the relevant shard.
+def probe_safetensors_tensor_dtype(
+    model_path: str, key_pattern: re.Pattern
+) -> Optional[str]:
+    """Return the safetensors dtype string of the first tensor whose name
+    matches ``key_pattern``, or ``None`` if the checkpoint is remote or has no
+    matching key. Reads only the safetensors header of the relevant shard.
     """
     if not os.path.isdir(model_path):
         return None
@@ -105,7 +117,7 @@ def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
             index = json.load(f)
         weight_map = index.get("weight_map", {}) or {}
         for k, shard in weight_map.items():
-            if _ROUTED_EXPERT_KEY_RE.search(k):
+            if key_pattern.search(k):
                 target_key = k
                 target_shard_path = os.path.join(model_path, shard)
                 break
@@ -128,9 +140,65 @@ def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
     for k, meta in header.items():
         if k == "__metadata__" or not isinstance(meta, dict):
             continue
-        if _ROUTED_EXPERT_KEY_RE.search(k):
+        if key_pattern.search(k):
             return meta.get("dtype")
     return None
+
+
+def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
+    """Return the safetensors dtype string (e.g. ``F8_E4M3``, ``U8``) of one
+    routed-expert weight tensor, or ``None`` if the checkpoint is remote or has
+    no matching key. Reads only the safetensors header of the relevant shard.
+    """
+    return probe_safetensors_tensor_dtype(model_path, _ROUTED_EXPERT_KEY_RE)
+
+
+def _try_get_published_model_path() -> Optional[str]:
+    try:
+        from sglang.srt.runtime_context import get_model
+
+        return get_model().model_path
+    except Exception:
+        return None
+
+
+def resolve_kda_conv_params_dtype(
+    model_path: Optional[str] = None,
+) -> torch.dtype:
+    """Dtype for KDA short-conv (``qkv_conv1d``) weights.
+
+    Probe the checkpoint so native-bf16 Kimi-Linear / GLM-5.3-Flash / Ling
+    stay bf16, while Kimi-K3's native-fp32 convs stay fp32. Fall back to the
+    current default (model) dtype when the header is unreadable -- never
+    force fp32. Must be resolved before module construction: KDA captures a
+    view of ``qkv_conv1d.weight`` in ``__init__``.
+    """
+    if model_path is None:
+        model_path = _try_get_published_model_path()
+    if not model_path:
+        return torch.get_default_dtype()
+
+    local_path = (
+        model_path if os.path.isdir(model_path) else find_local_repo_dir(model_path)
+    )
+    if not local_path or not os.path.isdir(local_path):
+        return torch.get_default_dtype()
+
+    cached = _KDA_CONV_DTYPE_CACHE.get(local_path)
+    if cached is not None:
+        return cached
+
+    try:
+        tag = probe_safetensors_tensor_dtype(local_path, _KDA_CONV_WEIGHT_KEY_RE)
+    except Exception as e:
+        logger.warning("Failed to probe KDA conv dtype for %s: %s", model_path, e)
+        return torch.get_default_dtype()
+
+    dtype = _SAFETENSORS_DTYPE_TO_TORCH.get(tag) if tag else None
+    if dtype is None:
+        return torch.get_default_dtype()
+    _KDA_CONV_DTYPE_CACHE[local_path] = dtype
+    return dtype
 
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).
