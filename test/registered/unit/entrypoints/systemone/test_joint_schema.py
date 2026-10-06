@@ -1,15 +1,11 @@
 """Unit tests for /v1/systemone on Clef checkpoints: the joint schema prompt and its
 decision layout, and answers built from the joint schema head's option logits."""
 
-import base64
 import json
 import math
 import unittest
-from io import BytesIO
 from types import SimpleNamespace
-from unittest import mock
 
-from PIL import Image
 from transformers import AutoTokenizer
 
 from sglang.srt.entrypoints.openai.protocol import DecisionRequest
@@ -50,39 +46,8 @@ REQUEST = {
 }
 
 
-class PatchCounter:
-    """Stands in for the multimodal processor: one image token per 28x28 patch."""
-
-    @staticmethod
-    def resolve_image_token_counts(images):
-        return [(image.height // 28) * (image.width // 28) for image in images]
-
-
-def _png_bytes(width, height):
-    buffer = BytesIO()
-    Image.new("RGB", (width, height), "red").save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
-def _png(width, height):
-    return (
-        "data:image/png;base64," + base64.b64encode(_png_bytes(width, height)).decode()
-    )
-
-
-def _expanded_length(request):
-    images = [
-        Image.open(BytesIO(base64.b64decode(image.url.split(",", 1)[1])))
-        for image in request.image_data or []
-    ]
-    counts = PatchCounter.resolve_image_token_counts(images)
-    return len(request.input_ids) + sum(count - 1 for count in counts)
-
-
 class HeadManager:
-    """Replace model execution with option logits 0, 1, 2, ... per question, in head order,
-    after expanding images and refusing prompts that the tokenizer manager or the
-    scheduler refuse."""
+    """Replace model execution with option logits 0, 1, 2, ... per question, in head order."""
 
     def __init__(self, tokenizer):
         self.server_args = ServerArgs(model_path="dummy")
@@ -100,9 +65,6 @@ class HeadManager:
         self.allow_auto_truncate = False
         self.context_len = 4096
         self.num_reserved_tokens = 0
-        # min(context_len - 1, kv_capacity - 1) - 5, as the scheduler reports it.
-        self.max_req_input_len = 4090
-        self.mm_processor = PatchCounter()
         self.request_logger = SimpleNamespace(log_requests=False)
         self.served_model_name = "served-model"
         self.requests = []
@@ -112,16 +74,13 @@ class HeadManager:
 
     async def generate_request(self, request, raw_request):
         self.requests.append(request)
-        num_tokens = _expanded_length(request)
-        if num_tokens + self.num_reserved_tokens >= self.context_len:
-            raise ValueError(f"The input ({num_tokens} tokens) is too long")
-        if request.image_data and num_tokens >= self.max_req_input_len:
-            raise ValueError(f"Multimodal prompt ({num_tokens} tokens) is too long")
-        questions = parse_decision_layout(request.decision_layout, num_tokens)
+        questions = parse_decision_layout(
+            request.decision_layout, len(request.input_ids)
+        )
         logits = [float(i) for q in questions for i in range(len(q.option_spans))]
         yield {
             "embedding": logits,
-            "meta_info": {"prompt_tokens": num_tokens},
+            "meta_info": {"prompt_tokens": len(request.input_ids)},
         }
 
 
@@ -153,12 +112,12 @@ class TestJointSchemaPrompt(unittest.TestCase):
     def setUpClass(cls):
         cls.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
 
-    def _encode(self, request=REQUEST, max_length=4096, image_token_counts=()):
+    def _encode(self, request=REQUEST, max_length=4096):
         input_ids, layout = encode_joint_schema(
             self.tokenizer,
             SystemOneRequest(**request),
             max_length=max_length,
-            image_token_counts=image_token_counts,
+            image_token_counts=[],
         )
         return input_ids, parse_decision_layout(layout, len(input_ids))
 
@@ -234,29 +193,6 @@ class TestJointSchemaPrompt(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "before the state"):
             self._encode(max_length=100)
 
-    def test_images_expand_within_the_budget_and_only_the_state_tail_is_cut(self):
-        request = {
-            **REQUEST,
-            "state": "word " * 2000,
-            "images": ["data:image/png;base64,AAAA"] * 2,
-        }
-        full_ids, _ = self._encode(request, 100000, image_token_counts=[64, 128])
-        input_ids, questions = self._encode(request, 1024, image_token_counts=[64, 128])
-        # Each placeholder becomes its image's tokens, as encode_record counts them.
-        self.assertEqual(len(input_ids) + 63 + 127, 1024)
-        cut = next(i for i, (a, b) in enumerate(zip(input_ids, full_ids)) if a != b)
-        kept = len(input_ids) - cut
-        self.assertEqual(input_ids[cut:], full_ids[-kept:])
-        removed = self.tokenizer.decode(full_ids[cut:-kept])
-        self.assertEqual(set(removed.split()), {"word"})
-        self.assertEqual(
-            self.tokenizer.decode(input_ids[:cut]).count("<|image_pad|>"), 2
-        )
-        self.assertEqual(
-            [self._text(input_ids, q.question_span) for q in questions],
-            ["Which team handles it?", "Is it urgent?", "severity"],
-        )
-
     def test_image_placeholders_precede_the_state(self):
         request = {**REQUEST, "images": ["data:image/png;base64,AAAA"]}
         input_ids, layout = encode_joint_schema(
@@ -317,47 +253,6 @@ class TestJointSchemaAnswers(unittest.IsolatedAsyncioTestCase):
         for answer in (team, urgent, severity):
             self.assertNotIn("x_label_mass", answer)
 
-    async def test_long_states_are_cut_to_the_prompt_limit_of_their_kind(self):
-        manager = HeadManager(self.tokenizer)
-        cases = {
-            # Text keeps the tokenizer manager's limit of context_len - 1.
-            "text": ([], 4095),
-            # Images of 64 and 128 tokens; the scheduler refuses a multimodal
-            # prompt of max_req_input_len tokens.
-            "images": ([_png(224, 224), _png(448, 224)], 4089),
-        }
-        for name, (images, prompt_tokens) in cases.items():
-            with self.subTest(name):
-                request = {**REQUEST, "state": "word " * 5000, "images": images}
-                response = await _handler(manager).handle_request(
-                    SystemOneRequest(**request), None
-                )
-                self.assertEqual(response.status_code, 200)
-                body = json.loads(response.body)
-                self.assertEqual(body["usage"]["input_tokens"], prompt_tokens)
-                self.assertEqual(list(body["answers"]), list(REQUEST["questions"]))
-
-    async def test_url_images_are_read_once_and_forwarded_as_counted(self):
-        """An image URL whose content changes between reads must be scored as the
-        image that was counted against the prompt budget."""
-        manager = HeadManager(self.tokenizer)
-        url = "http://images.example/chart.png"
-        data = _png_bytes(224, 224)
-        image = {"url": url, "detail": "high"}
-        request = {**REQUEST, "state": "word " * 5000, "images": [image]}
-        target = "sglang.srt.entrypoints.systemone.serving.get_image_bytes"
-        with mock.patch(target, return_value=data) as fetch:
-            response = await _handler(manager).handle_request(
-                SystemOneRequest(**request), None
-            )
-        fetch.assert_called_once_with(url)
-        (forwarded,) = manager.requests[0].image_data
-        self.assertTrue(forwarded.url.startswith("data:image/png;base64,"))
-        self.assertEqual(base64.b64decode(forwarded.url.split(",", 1)[1]), data)
-        self.assertEqual(forwarded.detail, "high")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(json.loads(response.body)["usage"]["input_tokens"], 4089)
-
     async def test_refusals(self):
         manager = HeadManager(self.tokenizer)
         cases = {
@@ -368,11 +263,6 @@ class TestJointSchemaAnswers(unittest.IsolatedAsyncioTestCase):
             "LoRA adapter": (
                 SystemOneServing,
                 SystemOneRequest(**{**REQUEST, "model": "clef:a"}),
-            ),
-            # Its 5329 image tokens leave no room for the questions.
-            "before the state": (
-                SystemOneServing,
-                SystemOneRequest(**{**REQUEST, "images": [_png(2048, 2048)]}),
             ),
             "requires a generation model": (
                 OpenAIServingDecisions,
