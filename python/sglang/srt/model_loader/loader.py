@@ -1302,7 +1302,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         return (
             hasattr(model, "original_weights_rebuild_keys")
             and hasattr(model, "recorded_loader")
-            and getattr(model, "flash_rl_initial_load_complete", False)
+            and getattr(model, "flash_rl_initial_load_complete", False) is True
         )
 
     @staticmethod
