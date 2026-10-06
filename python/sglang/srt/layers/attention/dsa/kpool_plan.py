@@ -637,7 +637,9 @@ def update_pooled_paged_mqa_metadata(
         return
 
     if forward_mode.is_target_verify():
-        metadata.pooled_real_page_table.copy_(metadata.real_page_table[:, ::pool_size])
+        metadata.pooled_real_page_table.copy_(
+            build_pooled_page_table_64(metadata.real_page_table, pool_size)
+        )
         return
 
     if (
