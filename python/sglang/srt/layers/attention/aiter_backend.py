@@ -1563,9 +1563,7 @@ class AiterAttnBackend(AttentionBackend):
             device = local_kv_lens.device
             qo = torch.arange(n_rows + 1, dtype=torch.int32, device=device)
             kv_indptr = torch.zeros(n_rows + 1, dtype=torch.int32, device=device)
-            kv_indices = torch.empty(
-                n_rows * cols, dtype=torch.int32, device=device
-            )
+            kv_indices = torch.empty(n_rows * cols, dtype=torch.int32, device=device)
             kv_last = torch.ones(n_rows, dtype=torch.int32, device=device)
             (
                 work_metadata,
