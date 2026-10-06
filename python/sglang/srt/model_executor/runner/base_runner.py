@@ -27,6 +27,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.cp.utils import is_cp_active, prepare_cp_forward
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -47,6 +48,7 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
+from sglang.srt.model_executor.runner_utils import cp_extend_forward
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -92,12 +94,17 @@ def _allocate_decode_buffers(
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
     allocate_logits_buffer: bool = True,
+    allocate_input_embeds: bool = True,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
     parallel = get_parallel()
     with torch.device(device):
         input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
-        input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
+        input_embeds = (
+            torch.zeros((max_num_token, hidden_size), dtype=dtype)
+            if allocate_input_embeds
+            else None
+        )
         req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
         seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int64)
         out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
@@ -412,6 +419,7 @@ class BaseRunner(ABC):
         *,
         num_tokens_per_req: int = 1,
         allocate_logits_buffer: bool = True,
+        allocate_input_embeds: bool = True,
     ):
         """Allocate one static decode-buffer set for a dummy forward, sized to
         (max_bs, max_bs * num_tokens_per_req).
@@ -451,6 +459,7 @@ class BaseRunner(ABC):
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
             allocate_logits_buffer=allocate_logits_buffer,
+            allocate_input_embeds=allocate_input_embeds,
         )
 
     def _dummy_run(
@@ -707,6 +716,7 @@ class BaseRunner(ABC):
                 buffers.num_token_non_padded if enable_num_token_non_padded() else None
             ),
             global_forward_mode=capture_forward_mode,
+            is_extend_in_batch=is_extend_dummy,
             lora_ids=lora_ids,
         )
 
@@ -718,6 +728,9 @@ class BaseRunner(ABC):
             mr.lora_manager.prepare_lora_batch(forward_batch)
 
         forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
+        cp_active = is_extend_dummy and is_cp_active(forward_batch)
+        if cp_active:
+            prepare_cp_forward(forward_batch)
         with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
             mr.attn_backend.init_forward_metadata(forward_batch)
         if get_exec().features.enable_encoder_swa_bounded_replay:
@@ -734,7 +747,9 @@ class BaseRunner(ABC):
                 forward_batch.dp_padding_mode.is_max_len(),
                 global_num_tokens_cpu,
             )
-            set_is_extend_in_batch(False)
+            set_is_extend_in_batch(is_extend_dummy)
+            if cp_active:
+                prepare_cp_forward(forward_batch)
 
             kwargs = {}
             if (
@@ -747,6 +762,8 @@ class BaseRunner(ABC):
             if not mr.is_generation:
                 kwargs["get_embedding"] = True
 
+            if cp_active:
+                return cp_extend_forward(mr.model, forward_batch, kwargs)
             logits_output_or_pp_proxy_tensors = mr.model.forward(
                 input_ids,
                 forward_batch.positions,

@@ -375,11 +375,25 @@ def maybe_flashinfer_autotune_extend(
     batch_size = (num_tokens + per_req - 1) // per_req
     num_tokens = batch_size * per_req
 
-    buffers = runner._alloc_dummy_decode_buffers(
-        batch_size,
-        num_tokens_per_req=per_req,
-        allocate_logits_buffer=False,
-    )
+    sync_group = _autotune_tactic_sync_group(get_parallel().tp_group)
+    try:
+        buffers = runner._alloc_dummy_decode_buffers(
+            batch_size,
+            num_tokens_per_req=per_req,
+            allocate_logits_buffer=False,
+            allocate_input_embeds=False,
+        )
+    except torch.OutOfMemoryError:
+        buffers = None
+    if not _all_ranks_agree(buffers is not None, group=sync_group):
+        del buffers
+        torch.cuda.empty_cache()
+        log_info_on_rank0(
+            logger,
+            "FlashInfer extend autotune skipped: not enough free memory "
+            f"for {num_tokens}-token dummy buffers.",
+        )
+        return
     canary_run_ctx = (
         c.with_active_single_forward_manager(0)
         if (c := mr.canary_manager) is not None
@@ -403,7 +417,7 @@ def maybe_flashinfer_autotune_extend(
     try:
         run_flashinfer_autotune_forward(mr, forward_fn, run_lm_head=False)
     except torch.OutOfMemoryError:
-        if _autotune_tactic_sync_group(get_parallel().tp_group) is not None:
+        if sync_group is not None:
             # Tuning is collective: this rank has stopped reducing while its
             # peers wait on the next tactic, so skipping the pass would hang
             # them. Fail instead of degrading alone.
@@ -419,3 +433,13 @@ def maybe_flashinfer_autotune_extend(
         # release dummy buffers before capture measures free memory
         del forward_fn, buffers
         torch.cuda.empty_cache()
+
+
+def _all_ranks_agree(
+    ok: bool, *, group: Optional[torch.distributed.ProcessGroup]
+) -> bool:
+    if group is None:
+        return ok
+    flag = torch.tensor([int(ok)], dtype=torch.int32)
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN, group=group)
+    return bool(flag.item())
