@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
@@ -78,6 +79,7 @@ from sglang.srt.entrypoints.engine import (
     init_tokenizer_manager,
     run_detokenizer_process,
     run_scheduler_process,
+    rust_listener_ports_on_node,
 )
 from sglang.srt.entrypoints.ollama.protocol import (
     OllamaChatRequest,
@@ -2215,18 +2217,22 @@ def _get_vlm_warmup_image_base64(model_info: dict) -> str:
 
 
 async def _send_disaggregation_warmup_requests(
-    url: str,
+    urls: List[str],
+    dp_ranks_per_url: int,
     headers: Dict[str, str],
     ssl_verify: Union[bool, str],
     timeout: int,
 ) -> List[int]:
+    """Send one fake-bootstrap request to each DP rank behind each URL."""
     ssl_context = (
         ssl_verify
         if isinstance(ssl_verify, bool)
         else ssl.create_default_context(cafile=ssl_verify)
     )
 
-    async def send_request(session: aiohttp.ClientSession, dp_rank: int) -> int:
+    async def send_request(
+        session: aiohttp.ClientSession, url: str, dp_rank: int
+    ) -> int:
         json_data = {
             "sampling_params": {
                 "temperature": 0.0,
@@ -2250,21 +2256,27 @@ async def _send_disaggregation_warmup_requests(
     ) as session:
         return await asyncio.gather(
             *(
-                send_request(session, dp_rank)
-                for dp_rank in range(get_parallel().num_dp_ranks)
+                send_request(session, url, dp_rank)
+                for url in urls
+                for dp_rank in range(dp_ranks_per_url)
             )
         )
 
 
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
-    url = server_args.url()
     if get_serving().api_key:
         headers["Authorization"] = f"Bearer {get_serving().api_key}"
     if envs.SGLANG_RUST_SERVER.get():
         # The Rust listener binds before this request so /model_info is
         # available, but health stays 503 until this marked request succeeds.
         headers["x-sglang-startup-warmup"] = "1"
+        # Each DP rank on this node has its own listener and readiness.
+        urls = [server_args.url(port) for port in rust_listener_ports_on_node()]
+        dp_ranks_per_url = 1
+    else:
+        urls = [server_args.url()]
+        dp_ranks_per_url = get_parallel().num_dp_ranks
 
     ssl_verify = ssl_verify_of(server_args)
 
@@ -2273,10 +2285,11 @@ def _execute_server_warmup(server_args: ServerArgs):
     for _ in range(120):
         time.sleep(1)
         try:
-            res = requests.get(
-                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
-            )
-            assert res.status_code == 200, f"{res=}, {res.text=}"
+            for url in urls:
+                res = requests.get(
+                    url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
+                )
+                assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break
         except (AssertionError, requests.exceptions.RequestException):
@@ -2315,11 +2328,9 @@ def _execute_server_warmup(server_args: ServerArgs):
         },
     }
     if get_serving().skip_tokenizer_init:
-        json_data["input_ids"] = [
-            [10, 11, 12] for _ in range(get_parallel().num_dp_ranks)
-        ]
+        json_data["input_ids"] = [[10, 11, 12] for _ in range(dp_ranks_per_url)]
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().num_dp_ranks == 1:
+        if dp_ranks_per_url == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
     elif (
         is_vlm
@@ -2363,11 +2374,9 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0.0,
         }
     else:
-        json_data["text"] = [
-            "The capital city of France is"
-        ] * get_parallel().num_dp_ranks
+        json_data["text"] = ["The capital city of France is"] * dp_ranks_per_url
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().num_dp_ranks == 1:
+        if dp_ranks_per_url == 1:
             json_data["text"] = json_data["text"][0]
 
     # Config debug dumping
@@ -2382,14 +2391,19 @@ def _execute_server_warmup(server_args: ServerArgs):
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if get_disagg().disaggregation_mode == "null":
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=warmup_timeout if warmup_timeout > 0 else 600,
-                verify=ssl_verify,
-            )
-            assert res.status_code == 200, f"{res.text}"
+
+            def post_warmup(url: str) -> requests.Response:
+                return requests.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=headers,
+                    timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                    verify=ssl_verify,
+                )
+
+            with ThreadPoolExecutor(max_workers=len(urls)) as pool:
+                for res in pool.map(post_warmup, urls):
+                    assert res.status_code == 200, f"{res.text}"
             # Skip server_status update for Rust server
             if not envs.SGLANG_RUST_SERVER.get():
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
@@ -2398,7 +2412,8 @@ def _execute_server_warmup(server_args: ServerArgs):
             logger.info(f"Start of pd disaggregation warmup ...")
             status_codes = asyncio.run(
                 _send_disaggregation_warmup_requests(
-                    url=url,
+                    urls=urls,
+                    dp_ranks_per_url=dp_ranks_per_url,
                     headers=headers,
                     ssl_verify=ssl_verify,
                     timeout=warmup_timeout if warmup_timeout > 0 else 1800,
@@ -2407,8 +2422,8 @@ def _execute_server_warmup(server_args: ServerArgs):
             failed_status_codes = [code for code in status_codes if code != 200]
             if not failed_status_codes:
                 logger.info(
-                    "Disaggregation warmup requests completed for all %s DP ranks",
-                    get_parallel().num_dp_ranks,
+                    "Disaggregation warmup requests completed for %s DP ranks",
+                    len(status_codes),
                 )
                 logger.info("End of disaggregation warmup")
             else:

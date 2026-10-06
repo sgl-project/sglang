@@ -4,7 +4,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from sglang.srt import rust_extensions
-from sglang.srt.entrypoints.engine import node_hosts_rust_server
+from sglang.srt.entrypoints.engine import (
+    node_hosts_rust_server,
+    rust_listener_ports_on_node,
+)
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.rust_server import config as rust_config
 from sglang.srt.rust_server import server as rust_server
@@ -56,20 +59,27 @@ def test_typed_config_only_forwards_native_grpc_port(legacy_args, expected):
 
 
 @pytest.mark.parametrize(
-    "nnodes,tp_size,attn_dp_size,ep_join_mode,ranks,expected",
+    "nnodes,node_rank,tp_size,attn_dp_size,ep_join_mode,ranks,expected",
     [
-        (2, 4, 4, None, (0, 1, 2, 3), [0, 1, 0, 1]),
-        (4, 4, 2, None, (0, 2), [0, 0]),
-        (2, 2, 2, "scale", (0, 1), [0, 1]),
+        (2, 0, 4, 4, None, (0, 1), [0, 1]),
+        (2, 1, 4, 4, None, (2, 3), [0, 1]),
+        (4, 2, 4, 2, None, (2,), [0]),
+        (2, 1, 2, 2, "scale", (0, 1), [0, 1]),
     ],
-    ids=["multiple-listeners-per-node", "dp-spans-nodes", "scale-joiner"],
+    ids=[
+        "multiple-listeners-node0",
+        "multiple-listeners-node1",
+        "dp-spans-nodes",
+        "scale-joiner",
+    ],
 )
 def test_dp_leaders_reuse_node_local_ports(
-    nnodes, tp_size, attn_dp_size, ep_join_mode, ranks, expected
+    nnodes, node_rank, tp_size, attn_dp_size, ep_join_mode, ranks, expected
 ):
     with (
         get_context().override_server_args(
             nnodes=nnodes,
+            node_rank=node_rank,
             tp_size=tp_size,
             attn_dp_size=attn_dp_size,
             ep_join_mode=ep_join_mode,
@@ -82,14 +92,14 @@ def test_dp_leaders_reuse_node_local_ports(
     ):
         parallel = get_parallel()
         ports = []
-        for dp_rank, tp_rank in enumerate(ranks):
+        for tp_rank in ranks:
             scheduler = SimpleNamespace(
                 server_args=SimpleNamespace(),
                 model_config=SimpleNamespace(is_multimodal=False),
             )
             with parallel.override(
                 tp_rank=tp_rank,
-                attn_dp_rank=dp_rank,
+                attn_dp_rank=tp_rank // parallel.attn_tp_size,
                 attn_tp_rank=tp_rank % parallel.attn_tp_size,
                 attn_cp_rank=0,
             ):
@@ -97,8 +107,9 @@ def test_dp_leaders_reuse_node_local_ports(
 
         calls = extension.return_value.Server.call_args_list
         assert [c.kwargs["port_offset"] for c in calls] == expected
-        # P/D bootstrap must register against the same ports Rust binds.
+        # P/D bootstrap and startup warmup must use the same ports Rust binds.
         assert ports == [30000 + offset for offset in expected]
+        assert rust_listener_ports_on_node() == ports
 
 
 @pytest.mark.parametrize(
