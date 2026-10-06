@@ -1693,3 +1693,175 @@ async fn test_conversation_items_multi_conversation_sharing() {
     .await;
     assert_eq!(get_resp.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn http_responses_preserve_worker_payloads() {
+    use std::{sync::Arc, time::Duration};
+
+    use axum::{body::Body, http::Request, response::IntoResponse, routing::post, Json, Router};
+    use serde_json::{json, Value};
+    use smg::{
+        core::{BasicWorkerBuilder, Worker, WorkerType as CoreWorkerType},
+        routers::router_manager::{router_ids, RouterManager},
+    };
+    use tokio::{sync::mpsc, time::timeout};
+    use tower::ServiceExt;
+
+    let call = json!({
+        "type": "function_call", "call_id": "call_weather",
+        "name": "get_weather", "namespace": "weather", "arguments": "{}"
+    });
+    let bodies = [
+        json!({"model": "test-model", "input": "hello", "store": false, "extension": {"enabled": true}}),
+        json!({
+            "model": "test-model",
+            "stream": true,
+            "tools": [{"type": "namespace", "name": "weather", "tools": [
+                {"type": "function", "name": "get_weather", "parameters": {"type": "object"}}
+            ]}],
+            "input": [
+                {"role": "user", "content": "Weather?"},
+                call.clone(),
+                {"type": "function_call_output", "call_id": "call_weather",
+                 "output": [{"type": "input_text", "text": "Sunny"}]}
+            ]
+        }),
+        json!({
+            "model": "test-model",
+            "input": [
+                {"type": "additional_tools", "role": "developer", "tools": [
+                    {"type": "custom", "name": "exec", "format": {"type": "text"}}
+                ]},
+                {"type": "agent_message", "author": "helper", "content": "Check the action."},
+                {"role": "user", "content": "Return the decision."}
+            ],
+            "text": {"format": {"type": "json_schema", "name": "decision",
+                "schema": {"type": "object", "properties": {"outcome": {"type": "string"}}}}}
+        }),
+    ];
+    for pd in [false, true] {
+        let config = if pd {
+            RouterConfig::builder().prefill_decode_mode(vec![], vec![])
+        } else {
+            RouterConfig::builder().regular_mode(vec![])
+        }
+        .round_robin_policy()
+        .disable_retries()
+        .build_unchecked();
+        let context = crate::common::create_test_context(config).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let roles = if pd {
+            vec![
+                CoreWorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                },
+                CoreWorkerType::Decode,
+            ]
+        } else {
+            vec![CoreWorkerType::Regular]
+        };
+        let mut servers = Vec::new();
+        let reply = json!({"status": "completed", "output": [call.clone()]});
+        for role in &roles {
+            let tx = tx.clone();
+            let reply = reply.clone();
+            let app = Router::new().route(
+                "/v1/responses",
+                post(move |Json(body): Json<Value>| {
+                    let tx = tx.clone();
+                    let reply = reply.clone();
+                    async move {
+                        let streaming = body["stream"] == true;
+                        tx.send(body).unwrap();
+                        if streaming {
+                            (
+                                [("content-type", "text/event-stream")],
+                                format!("data: {reply}\n\ndata: [DONE]\n\n"),
+                            )
+                                .into_response()
+                        } else {
+                            Json(reply).into_response()
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker =
+                BasicWorkerBuilder::new(format!("http://{}", listener.local_addr().unwrap()))
+                    .worker_type(role.clone())
+                    .build();
+            worker.set_healthy(true);
+            context.worker_registry.register(Arc::new(worker));
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+        }
+        let router = RouterFactory::create_router(&context).await.unwrap();
+        let manager = Arc::new(RouterManager::new(context.worker_registry.clone()));
+        manager.register_router(
+            if pd {
+                router_ids::HTTP_PD
+            } else {
+                router_ids::HTTP_REGULAR
+            },
+            Arc::from(router),
+        );
+        let app = crate::common::test_app::create_test_app_with_context(manager, context);
+        let send = |body: &Value| {
+            app.clone().oneshot(
+                Request::post("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+        };
+        for body in &bodies {
+            let response = send(body).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "pd={pd}, body={body}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            if body["stream"] == true {
+                assert_eq!(
+                    bytes.as_ref(),
+                    format!("data: {reply}\n\ndata: [DONE]\n\n").as_bytes()
+                );
+            } else {
+                assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), reply);
+            }
+            for _ in &roles {
+                let mut forwarded = timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if pd {
+                    let object = forwarded.as_object_mut().unwrap();
+                    for key in ["bootstrap_host", "bootstrap_port", "bootstrap_room"] {
+                        assert!(object.remove(key).is_some(), "missing {key}");
+                    }
+                }
+                assert_eq!(&forwarded, body);
+            }
+        }
+        for invalid in [
+            json!([]),
+            json!({"input": "hello", "stream": "true"}),
+            json!({"input": "hello", "model": 42}),
+        ] {
+            let response = send(&invalid).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(rx.try_recv().is_err());
+        }
+        if pd {
+            let response =
+                send(&json!({"model": "test-model", "input": "hello", "background": true}))
+                    .await
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(rx.try_recv().is_err());
+        }
+        for server in servers {
+            server.abort();
+        }
+    }
+}
