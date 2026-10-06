@@ -266,6 +266,62 @@ class TestKVLocPlan(unittest.TestCase):
         self.assertTrue(torch.equal(verify.out_cache_loc, plan.write_physical))
         self.assertIs(extend.out_cache_loc, verify.out_cache_loc)
 
+    def test_the_first_stream_reader_builds_the_table_in_the_same_launch(self):
+        builds, fused = [], []
+        real_build = kv_index_translator.build_kv_read_table
+        real_fused = kv_index_translator.build_kv_read_table_and_stream
+
+        def counting_build(**kwargs):
+            builds.append(kwargs["v2p"])
+            return real_build(**kwargs)
+
+        def counting_fused(**kwargs):
+            fused.append(kwargs["v2p"])
+            return real_fused(**kwargs)
+
+        bs = int(self.rpi.numel())
+        # A captured wrapper's lanes: the batch's, then one padded lane.
+        lens = torch.tensor([3, 2, 1], dtype=torch.int64)
+        indptr = torch.tensor([0, 3, 5, 6], dtype=torch.int32)
+        out = torch.full((8,), -7, dtype=torch.int32)
+        with (
+            patch.object(kv_index_translator, "build_kv_read_table", counting_build),
+            patch.object(
+                kv_index_translator, "build_kv_read_table_and_stream", counting_fused
+            ),
+        ):
+            plan = self._plan(read_extent=1)
+            self.assertTrue(
+                self.fused_draft.pack_read_stream(
+                    plan,
+                    req_pool_indices=self.rpi,
+                    seq_lens=lens,
+                    indptr=indptr,
+                    out=out,
+                )
+            )
+            table = plan.read_table(rows=bs + 1)
+        # One launch for the full space (table and stream), one for the swa.
+        self.assertEqual(fused, [self.allocator.full_v2p_page_table])
+        self.assertEqual(len(builds), 1)
+        self.assertTrue(plan.has_read_table)
+        for b in range(bs):
+            row = self.req_to_token[int(self.rpi[b]), : int(lens[b])].to(torch.int64)
+            want = self.allocator.translate_write_loc(row)
+            got = out[int(indptr[b]) : int(indptr[b + 1])].to(torch.int64)
+            self.assertTrue(torch.equal(got, want))
+        self.assertEqual(int(out[5]), 0)  # the padded lane reads the sink
+        self.assertTrue(bool((out[6:] == -7).all()))
+        reference = _reference(
+            self.req_to_token,
+            self.rpi,
+            self.seq_lens + 1,
+            self.allocator.full_v2p_page_table,
+            table.ids.shape[1],
+        )
+        self.assertTrue(torch.equal(table.ids[:bs], reference))
+        self.assertEqual(int(table.ids[bs:].abs().sum()), 0)
+
     def test_a_verify_reads_the_window_it_writes(self):
         def own_plan(mode, spec_info):
             return self.target.own_plan(

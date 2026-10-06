@@ -253,6 +253,92 @@ class TestBlockTable(unittest.TestCase):
                 self.assertTrue(torch.equal(gpu[b, :live], want[b, :live]))
                 self.assertTrue(bool((gpu[b, live:max_pages] == 0).all()))
 
+    def test_table_and_stream_in_one_launch(self):
+        """One launch fills a fresh table -- live rows, the sink past them,
+        padded rows all sink -- and the token stream of the same rows, each
+        lane from its window start, padded lanes reading the sink. The CUDA
+        kernel agrees with the CPU path and with a table build plus a packed
+        build of the same rows."""
+        from sglang.kernels.ops.kvcache.kv_read_table import (
+            build_kv_read_table,
+            build_kv_read_table_and_stream,
+            build_kv_read_table_packed,
+        )
+
+        for page_size in (1, 32):
+            rt, rpi, sl, v2p = self._make_batch(page_size)
+            live = rpi.shape[0]
+            rows = live + 2
+            max_pages = int((sl.max().item() + page_size - 1) // page_size) + 2
+            starts = torch.tensor([0, 1, page_size, 2, 0], dtype=torch.int64)[:live]
+            lens = (sl.cpu().to(torch.int64) - starts).clamp(min=0)
+            stream_lens = torch.cat([lens, torch.tensor([3, 1])])
+            stream_starts = torch.cat([starts, torch.zeros(2, dtype=torch.int64)])
+            indptr = torch.zeros(rows + 1, dtype=torch.int32)
+            indptr[1:] = torch.cumsum(stream_lens, 0)
+            total = int(indptr[-1])
+
+            def fill(device):
+                # Guard column / tail past the outputs catch a spill.
+                table = torch.full(
+                    (rows, max_pages + 1), 7, dtype=torch.int32, device=device
+                )
+                stream = torch.full((total + 4,), 7, dtype=torch.int32, device=device)
+                build_kv_read_table_and_stream(
+                    req_to_token=rt.to(device),
+                    req_pool_indices=rpi.to(device),
+                    seq_lens=sl.to(device=device, dtype=torch.int64),
+                    v2p=v2p.to(device),
+                    page_size=page_size,
+                    max_pages=max_pages,
+                    out=table,
+                    stream_lens=stream_lens.to(device),
+                    stream_indptr=indptr.to(device),
+                    stream_out=stream,
+                    stream_kv_start_idx=stream_starts.to(device),
+                    seq_len_delta=1,
+                )
+                return table.cpu(), stream.cpu()
+
+            (gt, gs), (ct, cs) = fill(_DEV), fill("cpu")
+            self.assertTrue(torch.equal(gt, ct), f"ps={page_size} table")
+            self.assertTrue(torch.equal(gs, cs), f"ps={page_size} stream")
+            self.assertTrue(bool((gt[:, max_pages] == 7).all()), "table spilled")
+            self.assertTrue(bool((gs[total:] == 7).all()), "stream spilled")
+            self.assertTrue(bool((gt[live:, :max_pages] == 0).all()))
+
+            want_table = torch.empty((live, max_pages), dtype=torch.int32, device=_DEV)
+            build_kv_read_table(
+                req_to_token=rt,
+                req_pool_indices=rpi,
+                seq_lens=sl.to(torch.int64),
+                v2p=v2p,
+                page_size=page_size,
+                max_pages=max_pages,
+                out=want_table,
+                seq_len_delta=1,
+                zero_tail=True,
+            )
+            self.assertTrue(torch.equal(gt[:live, :max_pages], want_table.cpu()))
+            want_stream = torch.zeros(total, dtype=torch.int32, device=_DEV)
+            build_kv_read_table_packed(
+                req_to_token=rt,
+                req_pool_indices=rpi,
+                seq_lens=lens.to(_DEV),
+                v2p=v2p,
+                indptr=indptr.to(_DEV),
+                page_size=page_size,
+                max_tokens=total,
+                out=want_stream,
+                kv_start_idx=starts.to(_DEV),
+            )
+            n_live = int(indptr[live])
+            self.assertTrue(torch.equal(gs[:n_live], want_stream[:n_live].cpu()))
+            for b in range(live, rows):
+                lo, hi = int(indptr[b]), int(indptr[b + 1])
+                pos = torch.arange(hi - lo, dtype=torch.int32)
+                self.assertTrue(torch.equal(gs[lo:hi], pos % page_size))
+
     def test_static_kernel_matches_reference(self):
         """The stripped (id-space-free) flashmla kernel is byte-identical to the
         plain token//ps reference -- guards the v2p-arg removal itself."""

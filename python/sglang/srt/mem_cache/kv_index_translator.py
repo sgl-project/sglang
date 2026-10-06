@@ -38,7 +38,8 @@ which answers "what do I gather from, and which row is mine?" with a
 
 Backends call their own copy a *page table* (fa3) or a *block table*
 (trtllm); here it is the **index table**. `read_source` hands a gather kernel
-the table, `pack_read_stream` packs a CSR stream from it, and
+the table, `pack_read_stream` packs a CSR stream from it (the table's first
+reader gets its stream from the launch that builds the table), and
 `copy_page_table` copies it into a captured graph's table.
 
 Converting only ever rewrites the page number and keeps the in-page offset, so
@@ -62,7 +63,10 @@ import torch
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
-from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
+from sglang.kernels.ops.kvcache.kv_read_table import (
+    build_kv_read_table,
+    build_kv_read_table_and_stream,
+)
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWAAllocatorBase,
 )
@@ -85,6 +89,17 @@ class KVIndexTable(msgspec.Struct, frozen=True):
     entry_page_size: int  # what one entry covers: 1 = a token, N = a page of N
     is_translated: bool  # entries are already physical ids
     sliding_window_ids: Optional[torch.Tensor]  # SWA models: the parallel swa array
+
+
+class KVReadStream(msgspec.Struct, frozen=True):
+    """A CSR stream a paged wrapper plans over: ``seq_lens[b]`` ids of lane
+    ``b`` from ``kv_start_idx[b]``, landing at ``indptr[b]`` in ``out``."""
+
+    seq_lens: torch.Tensor
+    indptr: torch.Tensor
+    out: torch.Tensor
+    kv_start_idx: Optional[torch.Tensor]
+    sliding_window: bool
 
 
 class KVIndexTranslator:
@@ -277,12 +292,14 @@ class KVIndexTranslator:
         *,
         rows: Optional[int],
         previous: Optional[KVIndexTable],
+        stream: Optional[KVReadStream] = None,
     ) -> KVIndexTable:
         """A plan's page table: the passthrough where reads stay virtual, else
         one build per id space over ``[0, seq_lens + read_extent)``. Rows past
         the plan's batch (a captured graph's padded lanes) read the sink; a
         second, wider request copies the built rows instead of building them
-        again."""
+        again. ``stream``, from the reader the build is for, is packed by the
+        same launch as its id space's table."""
         if not self.reads_are_translated:
             return KVIndexTable(
                 ids=self.req_to_token,
@@ -295,6 +312,7 @@ class KVIndexTranslator:
         bs = int(plan.req_pool_indices.numel())
         rows = max(bs, rows or 0)
         if previous is not None:
+            assert stream is None, "a stream is packed by the table's first build"
             width = previous.ids.shape[1]
             out_full = torch.zeros((rows, width), dtype=torch.int32, device=self.device)
             out_full[: previous.ids.shape[0]].copy_(previous.ids)
@@ -316,14 +334,17 @@ class KVIndexTranslator:
             out_swa = (
                 torch.empty_like(out_full) if self._swa_v2p_table is not None else None
             )
-            for v2p, out in (
-                (self._full_v2p_table, out_full),
-                (self._swa_v2p_table, out_swa),
+            assert stream is None or not stream.sliding_window or out_swa is not None, (
+                "no sliding-window table here"
+            )
+            for v2p, out, sliding_window in (
+                (self._full_v2p_table, out_full, False),
+                (self._swa_v2p_table, out_swa, True),
             ):
-                if out is not None:
-                    if rows > bs:
-                        out[bs:].zero_()
-                    build_kv_read_table(
+                if out is None:
+                    continue
+                if stream is not None and stream.sliding_window == sliding_window:
+                    build_kv_read_table_and_stream(
                         req_to_token=self.req_to_token,
                         req_pool_indices=plan.req_pool_indices,
                         seq_lens=plan.seq_lens,
@@ -331,9 +352,26 @@ class KVIndexTranslator:
                         page_size=self.page_size,
                         max_pages=width,
                         out=out,
-                        zero_tail=True,
+                        stream_lens=stream.seq_lens,
+                        stream_indptr=stream.indptr,
+                        stream_out=stream.out,
+                        stream_kv_start_idx=stream.kv_start_idx,
                         seq_len_delta=plan.read_extent,
                     )
+                    continue
+                if rows > bs:
+                    out[bs:].zero_()
+                build_kv_read_table(
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=plan.req_pool_indices,
+                    seq_lens=plan.seq_lens,
+                    v2p=v2p,
+                    page_size=self.page_size,
+                    max_pages=width,
+                    out=out,
+                    zero_tail=True,
+                    seq_len_delta=plan.read_extent,
+                )
         return KVIndexTable(
             ids=out_full,
             row_ids=self._rows[:rows],
@@ -373,12 +411,18 @@ class KVIndexTranslator:
             return self._plan_table(plan, rows=rows)
         return self._passthrough_table(plan.req_pool_indices)
 
-    def _plan_table(self, plan: KVLocPlan, *, rows: Optional[int] = None):
+    def _plan_table(
+        self,
+        plan: KVLocPlan,
+        *,
+        rows: Optional[int] = None,
+        stream: Optional[KVReadStream] = None,
+    ):
         assert plan.is_read_by(self), (
             "a translating reader must read through the plan of its own "
             "req_to_token rows"
         )
-        return plan.read_table(rows=rows)
+        return plan.read_table(rows=rows, stream=stream)
 
     def _passthrough_table(self, req_pool_indices: torch.Tensor) -> KVIndexTable:
         return KVIndexTable(
@@ -409,6 +453,21 @@ class KVIndexTranslator:
         can pass its full->swa table as ``token_mapping`` to fuse that
         translation into the gather."""
         bs = int(seq_lens.numel())
+        if self.reads_are_translated and not plan.has_read_table:
+            # The plan's first reader: the build that makes its table packs
+            # this stream from the same gather, in the same launch.
+            self._plan_table(
+                plan,
+                rows=bs,
+                stream=KVReadStream(
+                    seq_lens=seq_lens,
+                    indptr=indptr,
+                    out=out,
+                    kv_start_idx=kv_start_idx,
+                    sliding_window=sliding_window,
+                ),
+            )
+            return True
         src = self.read_source(plan, req_pool_indices=req_pool_indices, bs=bs)
         assert token_mapping is None or not src.is_translated
         ids = src.sliding_window_ids if sliding_window else src.ids

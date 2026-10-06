@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv_index_translator import (
         KVIndexTable,
         KVIndexTranslator,
+        KVReadStream,
     )
 
 
@@ -221,20 +222,34 @@ class KVLocPlan:
 
     # -- reads -----------------------------------------------------------------
 
-    def read_table(self, *, rows: Optional[int] = None) -> KVIndexTable:
+    @property
+    def has_read_table(self) -> bool:
+        """Whether a reader has had the table built yet."""
+        return self._read_table is not None
+
+    def read_table(
+        self,
+        *,
+        rows: Optional[int] = None,
+        stream: Optional[KVReadStream] = None,
+    ) -> KVIndexTable:
         """The rows' page table over ``[0, seq_lens + read_extent)``, built on
         first use and shared by every reader of the iteration. ``rows`` past
         the plan's batch (a captured graph's padded lanes) are appended reading
         the sink, by copying, never by translating again. On a pool that reads
         virtual ids (static, or DCP, where the producing kernel selects this
-        rank's share) it is the ``req_to_token`` passthrough."""
+        rank's share) it is the ``req_to_token`` passthrough. ``stream`` is the
+        first reader's CSR stream (`has_read_table` False), packed by the
+        launch that builds the table."""
         table = self._read_table
         if table is None or (
             table.is_translated and rows is not None and table.ids.shape[0] < rows
         ):
             self._read_table = table = self._source._build_iteration_table(
-                self, rows=rows, previous=table
+                self, rows=rows, previous=table, stream=stream
             )
+        else:
+            assert stream is None, "a stream is packed by the table's first build"
         return table
 
     def is_read_by(self, reader: KVIndexTranslator) -> bool:
