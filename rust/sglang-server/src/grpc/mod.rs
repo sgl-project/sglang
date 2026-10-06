@@ -111,12 +111,10 @@ fn unimplemented_rpc(name: &'static str) -> Status {
 
 #[tonic::async_trait]
 impl SglangService for GrpcService {
-    type TextGenerateStream = ResponseStream<proto::TextGenerateResponse>;
-
     async fn text_generate(
         &self,
         request: Request<proto::TextGenerateRequest>,
-    ) -> Result<Response<Self::TextGenerateStream>, Status> {
+    ) -> Result<Response<ResponseStream<proto::TextGenerateResponse>>, Status> {
         if self.openai.server_args.skip_tokenizer_init {
             return Err(Status::unimplemented(
                 "text generation requires a tokenizer",
@@ -139,12 +137,10 @@ impl SglangService for GrpcService {
         )))
     }
 
-    type GenerateStream = ResponseStream<proto::GenerateResponse>;
-
     async fn generate(
         &self,
         request: Request<proto::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<ResponseStream<proto::GenerateResponse>>, Status> {
         let request = convert::generate(
             request.into_inner(),
             self.config.preferred_sampling_params.as_ref(),
@@ -303,12 +299,10 @@ impl SglangService for GrpcService {
         Err(unimplemented_rpc("pause_generation"))
     }
 
-    type WatchEngineStateStream = ResponseStream<proto::EngineStateSnapshot>;
-
     async fn watch_engine_state(
         &self,
         _request: Request<proto::WatchEngineStateRequest>,
-    ) -> Result<Response<Self::WatchEngineStateStream>, Status> {
+    ) -> Result<Response<ResponseStream<proto::EngineStateSnapshot>>, Status> {
         Err(unimplemented_rpc("watch_engine_state"))
     }
 
@@ -319,21 +313,17 @@ impl SglangService for GrpcService {
         Err(unimplemented_rpc("continue_generation"))
     }
 
-    type ChatCompleteStream = ResponseStream<proto::OpenAiStreamChunk>;
-
     async fn chat_complete(
         &self,
         request: Request<proto::OpenAiRequest>,
-    ) -> Result<Response<Self::ChatCompleteStream>, Status> {
+    ) -> Result<Response<ResponseStream<proto::OpenAiStreamChunk>>, Status> {
         self.openai_rpc(request.into_inner(), true).await
     }
-
-    type CompleteStream = ResponseStream<proto::OpenAiStreamChunk>;
 
     async fn complete(
         &self,
         request: Request<proto::OpenAiRequest>,
-    ) -> Result<Response<Self::CompleteStream>, Status> {
+    ) -> Result<Response<ResponseStream<proto::OpenAiStreamChunk>>, Status> {
         self.openai_rpc(request.into_inner(), false).await
     }
 
