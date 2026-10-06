@@ -36,10 +36,10 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
     is_dense_ffn_fully_dp,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -55,6 +55,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.utils import is_deepep_class_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -443,11 +444,10 @@ class MiMoV2MoE(nn.Module):
         )
 
         # todo : implement tbo forward needed
-        if (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_ascend_fuseep()
-        ):
+        self._enable_a2a_moe = (
+            is_deepep_class_backend() or get_moe_a2a_backend().is_ascend_fuseep()
+        )
+        if self._enable_a2a_moe:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
@@ -461,12 +461,6 @@ class MiMoV2MoE(nn.Module):
                 if self.gate.e_score_correction_bias is not None
                 else None
             )
-
-        self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_ascend_fuseep()
-        )
 
     def get_moe_weights(self):
         return [
@@ -826,7 +820,6 @@ class MiMoV2DecoderLayer(nn.Module):
             )
 
         self.is_layer_sparse = self.is_moe_layer(layer_id)
-        is_previous_layer_sparse = self.is_moe_layer(layer_id - 1)
         is_next_layer_sparse = self.is_moe_layer(layer_id + 1)
 
         if self.is_layer_sparse:
@@ -857,7 +850,7 @@ class MiMoV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.layernorm_epsilon
         )
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -866,12 +859,6 @@ class MiMoV2DecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(

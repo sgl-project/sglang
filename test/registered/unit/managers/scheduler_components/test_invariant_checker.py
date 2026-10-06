@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.session.streaming_session import SessionSlot
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -156,8 +157,6 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             full_tokens_per_layer=None,
             swa_tokens_per_layer=None,
             max_total_num_tokens=self.allocator.size,
-            get_last_batch=lambda: self.last_batch,
-            get_running_batch=lambda: self.running_batch,
         )
         return SchedulerInvariantChecker(
             is_hybrid_swa=False,
@@ -285,6 +284,25 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                 leak, msg = checker._check_full_pool(stats, uncached=uncached)
                 self.assertFalse(leak, msg)
                 self.assertNotIn("slack_allowed", msg)
+                with envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(False):
+                    checker.self_check_during_busy()
+
+    def test_session_record_is_counted_once_by_its_owner(self):
+        checker = self._make_checker()
+        req = self._active_partial_page(checker)
+        # The session owns the row: session-held whether the turn is in a batch
+        # or parked between prefill chunks, never also uncached.
+        self.cache.session.slots["s"] = SessionSlot(kv=req.kv)
+        for parked in (False, True):
+            with self.subTest(parked=parked):
+                self.chunked_req = req
+                if parked:
+                    self.last_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
+                    self.running_batch = self.last_batch
+                self.assertEqual(checker._get_total_uncached_sizes(), (0, 0))
+                self.assertEqual(
+                    checker.pool_stats_observer.session_held_tokens(), self.PAGE_SIZE
+                )
                 with envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(False):
                     checker.self_check_during_busy()
 

@@ -711,10 +711,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     conv_states,
                     layer.conv_weights,
                     layer.bias,
-                    cache_indices,
-                    qkv_dim=layer.q_dim + layer.k_dim + layer.v_dim,
-                    v_dim=layer.v_dim,
-                    num_v_heads=layer.num_v_heads,
                     activation=layer.activation,
                 )
             )
@@ -823,8 +819,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         )
                 conv_already_applied = True
             else:
-                # Explicit correctness fallback for an unexpected runtime
-                # tensor/state contract. This still returns Z to the model.
                 if not _fused_decode_proj_conv_fallback_logged:
                     rank0_log(
                         "Falling back from fused GDN decode projection/Conv1D: "

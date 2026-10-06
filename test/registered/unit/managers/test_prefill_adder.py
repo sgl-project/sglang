@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefResult,
     IncLockRefResult,
+    TreeLock,
 )
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_spec
 from sglang.srt.mem_cache.prefill_budget import (
@@ -69,6 +70,13 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.disable = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
+        # Route lock/unlock through inc/dec_lock_ref so tests can hook those.
+        tree_cache.lock.side_effect = lambda node: TreeLock(
+            node, tree_cache.inc_lock_ref(node).to_dec_params()
+        )
+        tree_cache.unlock.side_effect = lambda lock: (
+            lock is not None and tree_cache.dec_lock_ref(lock.node, lock.receipt)
+        )
         tree_cache.buffer_pipeline = None
         return tree_cache
 

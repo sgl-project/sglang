@@ -5,11 +5,18 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.utils import is_gfx95_supported, is_hip, is_sm90_supported
+from sglang.srt.utils import (
+    get_device_sm,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    is_sm90_supported,
+)
 
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
 _is_sm90 = is_sm90_supported()
+_is_sm103 = is_cuda() and get_device_sm() == 103
 
 
 def _select_recurrent_launch_config(
@@ -20,8 +27,10 @@ def _select_recurrent_launch_config(
     v: int,
     is_kda: bool,
     target_verify: bool = False,
+    *,
+    cache_steps: int = 0,
 ) -> tuple[int, int]:
-    """Select the value tile and warp count for recurrent GDN."""
+    """Select the value tile and warp count for recurrent GDN/KDA."""
     if (
         _is_hip
         and _is_gfx95
@@ -45,6 +54,14 @@ def _select_recurrent_launch_config(
         # BV=4 and n <= 64 measured on H100/H200. SM90 only: Blackwell is faster
         # with narrow tiles but not bit-identical to BV=32. Only the dense
         # intermediate-state verify sets target_verify; cache_ring keeps BV=32.
+        return 4, 1
+    if (
+        _is_sm103
+        and is_kda
+        and target_verify
+        and (n, h, hv, k, v, cache_steps) == (1, 8, 8, 128, 128, 8)
+    ):
+        # GLM TP8 DFlash verification: 256 CTAs instead of 32.
         return 4, 1
     return min(triton.next_power_of_2(v), 32), 1
 
@@ -419,11 +436,15 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             if MATCH_CUTEDSL_DECODE:
                 q_sum_sq = _cutedsl_qk_sum_squares(b_q, BK)
                 k_sum_sq = _cutedsl_qk_sum_squares(b_k, BK)
-                b_q *= tl.rsqrt(q_sum_sq + 1e-6)
-                b_k *= tl.rsqrt(k_sum_sq + 1e-6)
+                q_rsqrt = tl.rsqrt(q_sum_sq + 1e-6)
+                k_rsqrt = tl.rsqrt(k_sum_sq + 1e-6)
             else:
-                b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
-                b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+                q_sum_sq = tl.sum(b_q * b_q)
+                k_sum_sq = tl.sum(b_k * b_k)
+                q_rsqrt = 1.0 / tl.sqrt(q_sum_sq + 1e-6)
+                k_rsqrt = 1.0 / tl.sqrt(k_sum_sq + 1e-6)
+            b_q *= q_rsqrt
+            b_k *= k_rsqrt
 
         b_q = b_q * scale
 
@@ -452,6 +473,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Update hidden state: h += k[:, None] * v[None, :]
         if MATCH_CUTEDSL_DECODE:
             b_h = tl.fma(b_k[:, None], b_v[None, :], b_h)
+        elif IS_KDA and V == 128 and BV == 4:
+            # The narrow KDA tile keeps the separate FP32 multiply/add rounding.
+            b_h = tl.inline_asm_elementwise(
+                "add.rn.f32 $0, $1, $2;",
+                constraints="=f,f,f",
+                args=[b_h, b_k[:, None] * b_v[None, :]],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
         else:
             b_h += b_k[:, None] * b_v[None, :]
 
@@ -606,6 +637,12 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_a = a.stride()[1] if a.ndim == 4 else a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
+    use_pdl = is_arch_support_pdl()
+    target_verify = (
+        disable_state_update and not match_cutedsl_decode
+        if is_kda
+        else intermediate_states_buffer is not None
+    )
     BV, num_warps = _select_recurrent_launch_config(
         N,
         H,
@@ -616,8 +653,9 @@ def fused_sigmoid_gating_delta_rule_update(
         # The lossless tuple verify must tile exactly like the dense one it
         # replaces, so its outputs stay bit-identical on every arch.
         target_verify=(
-            intermediate_states_buffer is not None or u_states_buffer is not None
+            target_verify or u_states_buffer is not None
         ),
+        cache_steps=cache_steps,
     )
     BK = triton.next_power_of_2(K)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
@@ -683,7 +721,7 @@ def fused_sigmoid_gating_delta_rule_update(
     # PDL (sm90+): chain this kernel behind its producer conv1d_update, which
     # already launches dependents. Bit-exact (scheduling only) — benefits both
     # KDA and GDN recurrent paths.
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if use_pdl else {}
 
     # CuTeDSL specializes on the persisted state dtype. Its BF16 decode path
     # writes BF16 after every token and reloads FP32 for the next recurrence;
