@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     MatchPrefixParams,
     MatchResult,
+    TreeLock,
 )
 from sglang.srt.utils.common import ceil_align, is_npu
 
@@ -41,25 +42,20 @@ class SessionSlot:
     # KV pool state
     kv: ReqKvInfo = field(default_factory=ReqKvInfo)
 
-    # Tree lock on the session's tree-owned prefix, and its receipt.
-    last_node: Any = None
-    lock_receipt: DecLockRefParams = field(default_factory=DecLockRefParams)
-    # Whether the SWA part of that lock was released early.
-    swa_prefix_lock_released: bool = False
+    # Tree lock on the session's tree-owned prefix.
+    lock: Optional[TreeLock] = None
     # Until the first turn finishes or is retracted, its checkpoints publish
     # the prompt into the tree and move the lock onto the deepest published node.
     publishes_prompt: bool = False
 
 
+def is_virtual_node(node: Any) -> bool:
+    """A slot's stand-in node: locking it is a no-op."""
+    return isinstance(node, _VirtualNode)
+
+
 def _is_streaming(req: Optional[Req]) -> bool:
     return req is not None and req.session is not None and req.session.streaming
-
-
-def _move_tree_lock(src: Any, dst: Any) -> None:
-    """Hand the tree lock ``src`` holds (a request or a slot) to ``dst``."""
-    dst.last_node = src.last_node
-    dst.lock_receipt = src.lock_receipt
-    dst.swa_prefix_lock_released = src.swa_prefix_lock_released
 
 
 class StreamingSession:
@@ -83,16 +79,12 @@ class StreamingSession:
     def try_inc_lock_ref(self, node: Any) -> Optional[IncLockRefResult]:
         """No-op lock if ``node`` is a session-internal sentinel; returns
         None to tell the caller to run its raw tree lock path."""
-        if isinstance(node, _VirtualNode):
-            return IncLockRefResult()
-        return None
+        return IncLockRefResult() if is_virtual_node(node) else None
 
     def try_dec_lock_ref(
         self, node: Any, params: Optional[DecLockRefParams] = None
     ) -> Optional[DecLockRefResult]:
-        if isinstance(node, _VirtualNode):
-            return DecLockRefResult()
-        return None
+        return DecLockRefResult() if is_virtual_node(node) else None
 
     def find_active_slot(self, req: Req) -> Optional[SessionSlot]:
         """A pre-aborted req (to_finish set) is detached from the session and
@@ -186,7 +178,7 @@ class StreamingSession:
         if isinstance(req.finished_reason, FINISH_ABORT):
             # Hand the record and the tree lock back; the caller releases them.
             del self.slots[req.session.session_id]
-            _move_tree_lock(slot, req)
+            req.lock = slot.lock
             req.session.abort_req()
             return False
 
@@ -217,7 +209,7 @@ class StreamingSession:
         if slot is None:
             return False
         if slot.publishes_prompt:
-            _move_tree_lock(slot, req)
+            req.lock, slot.lock = slot.lock, None
             self.cache.checkpoint_into_tree(req, up_to=up_to, **kwargs)
             self._lock_to_slot(req, slot)
             return True
@@ -255,7 +247,6 @@ class StreamingSession:
         if slot is None:
             return
         protected_len = slot.kv.cache_protected_len
-        lock_node = slot.last_node
         tokens_freed = (
             max(0, slot.kv.kv_allocated_len - protected_len) if slot.kv.holds_kv else 0
         )
@@ -263,11 +254,7 @@ class StreamingSession:
             "Session KV released: %s (%d tokens freed)", session_id, tokens_freed
         )
 
-        if lock_node is not None:
-            # skip_swa is an SWA-cache extension kwarg; a slot can only have
-            # early-released when the cache supports SWA locks.
-            skip = {"skip_swa": True} if slot.swa_prefix_lock_released else {}
-            self.cache.dec_lock_ref(lock_node, slot.lock_receipt, **skip)
+        self.cache.unlock(slot.lock)
 
         if slot.kv.holds_kv:
             self.cache.free_kv_row(slot.kv, [(protected_len, slot.kv.kv_allocated_len)])
@@ -292,11 +279,9 @@ class StreamingSession:
 
     def _lock_to_slot(self, req: Req, slot: SessionSlot) -> None:
         """Move the request's tree lock to the slot; the request is left on the
-        slot's virtual node, where locking is a no-op."""
-        _move_tree_lock(req, slot)
+        slot's virtual node and holds no lock of its own."""
+        slot.lock, req.lock = req.lock, None
         req.last_node = slot.virtual_node
-        req.lock_receipt = DecLockRefParams()
-        req.swa_prefix_lock_released = False
 
     def _free_tail(self, kv: ReqKvInfo, prefix_len: int) -> None:
         """Free [prefix_len, allocated) before alloc_for_extend overwrites it:

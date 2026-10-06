@@ -83,8 +83,8 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
-    DecLockRefParams,
     EvictParams,
+    TreeLock,
 )
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
@@ -147,7 +147,7 @@ def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     req.last_node = tree_cache.root_node_handle(req.extra_key)
     req.last_host_node = req.last_node
     req.best_match_node = req.last_node
-    req.lock_receipt = DecLockRefParams()
+    req.lock = None
     req.kv.cache_protected_len = 0
     req.kv.cache_inserted_len = 0
     req.num_matched_prefix_tokens = 0
@@ -351,9 +351,8 @@ class DecodeRequest:
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
-    hicache_restored_node: Any = None
-    # Receipt for the inc_lock_ref held on hicache_restored_node.
-    hicache_restore_lock_receipt: Optional[DecLockRefParams] = None
+    # The lock held on the restored node until the commit hands it to the req.
+    hicache_restore_lock: Optional[TreeLock] = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
@@ -504,11 +503,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _release_matched_prefix_lock(self, req: Req) -> None:
-        if req.swa_prefix_lock_released:
-            self.tree_cache.dec_lock_ref(req.last_node, req.lock_receipt, skip_swa=True)
-            req.swa_prefix_lock_released = False
-        else:
-            self.tree_cache.dec_lock_ref(req.last_node, req.lock_receipt)
+        self.tree_cache.unlock(req.lock)
+        req.lock = None
 
     def _reclaim_swa_tail_capacity(
         self, swa_tail_len: int, req_id: str, *, full_len: int = 0
@@ -801,12 +797,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             include_req=True,
             max_prefix_len=max_prefix_len,
         )
-        # Keep aggregated scheduling semantics while preserving the SWA lock
-        # boundary needed for the matching dec_lock_ref; the full receipt
-        # travels on the req so every later release mirrors this acquire.
-        req.lock_receipt = self.tree_cache.inc_lock_ref(
-            result.last_device_node
-        ).to_dec_params()
+        req.lock = self.tree_cache.lock(result.last_device_node)
         return self._build_decode_prefix_match(
             req, result, max_prefix_len=max_prefix_len
         )
@@ -1436,12 +1427,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if (
                     uses_swa_tail_prealloc
                     and prefix_match.l1_prefix_len > 0
-                    and hasattr(self.tree_cache, "dec_swa_lock_only")
+                    and hasattr(self.tree_cache, "release_swa")
                 ):
-                    self.tree_cache.dec_swa_lock_only(
-                        decode_req.req.last_node, decode_req.req.lock_receipt
-                    )
-                    decode_req.req.swa_prefix_lock_released = True
+                    self.tree_cache.release_swa(decode_req.req.lock)
 
                 required_alloc_tokens = self._required_alloc_tokens(
                     fill_len=fill_len, prefix_len=prefix_len

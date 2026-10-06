@@ -1039,8 +1039,7 @@ class PrefillAdder:
         self._account_prefill_cache_admission(req, prefix_len)
 
     def _req_inc_lock_ref(self, req: Req):
-        # Persist the release receipt.
-        req.lock_receipt = self.tree_cache.inc_lock_ref(req.last_node).to_dec_params()
+        req.lock = self.tree_cache.lock(req.last_node)
 
     def _kv_shard_reserve_scratch(self, prefix_len: int, extend_len: int) -> bool:
         """Reserve scratch or return False to defer; no-op when sharding is off.
@@ -1205,13 +1204,11 @@ class PrefillAdder:
             else None
         )
         try:
-            # Replay the acquire's receipt (SWA boundary uuid, mamba flag) so the
-            # release takes back exactly what this temporary lock took.
-            dec_lock_params = self.tree_cache.inc_lock_ref(last_node).to_dec_params()
+            lock = self.tree_cache.lock(last_node)
             try:
                 yield None
             finally:
-                self.tree_cache.dec_lock_ref(last_node, dec_lock_params)
+                self.tree_cache.unlock(lock)
         finally:
             if host_lock_params is not None:
                 self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)

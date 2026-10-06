@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     IncLockRefResult,
     MatchResult,
+    TreeLock,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
@@ -63,9 +64,7 @@ class _FakeInnerCache:
         self.token_to_kv_pool_allocator = allocator
         self.page_size = page_size
         self.match_results = list(match_results or [])
-        self.dec_lock_ref_calls = []
-        self.dec_lock_ref_params = []
-        self.dec_lock_ref_skip_swa = []
+        self.unlocked = []
         self.session = StreamingSession(self)
 
     def checkpoint(self, req, *, up_to):
@@ -82,12 +81,9 @@ class _FakeInnerCache:
             raise AssertionError("Unexpected match_prefix call")
         return self.match_results.pop(0)
 
-    def dec_lock_ref(self, node, *args, **kwargs):
-        if self.session.try_dec_lock_ref(node) is not None:
-            return
-        self.dec_lock_ref_calls.append(node)
-        self.dec_lock_ref_params.append(args[0] if args else kwargs.get("params"))
-        self.dec_lock_ref_skip_swa.append(kwargs.get("skip_swa", False))
+    def unlock(self, lock):
+        if lock is not None:
+            self.unlocked.append(lock)
 
 
 class _FakeReq:
@@ -113,8 +109,7 @@ class _FakeReq:
         self.cache_salt = None
         self.last_node = None
         self.swa_branching_seqlen = None
-        self.lock_receipt = DecLockRefParams()
-        self.swa_prefix_lock_released = False
+        self.lock = None
         self.to_finish = None
         self.finished_reason = None
         self.finished_len = None
@@ -227,8 +222,7 @@ def test_release_session_preserves_component_lock_receipt(uuid):
             kv_allocated_len=50,
             cache_protected_len=0,
         ),
-        last_node=lock_node,
-        lock_receipt=acquired.to_dec_params(),
+        lock=TreeLock(lock_node, acquired.to_dec_params()),
     )
 
     acquired.set_lock_uuid(ComponentType.SWA, 99)
@@ -237,9 +231,9 @@ def test_release_session_preserves_component_lock_receipt(uuid):
     acquired.set_lock_uuid(ComponentType.AUXILIARY_SWA, 99, lock_host=True)
     tree_cache.session.release_session("session-a")
 
-    assert inner.dec_lock_ref_calls == [lock_node]
-    params = inner.dec_lock_ref_params[0]
-    assert params is not None
+    (lock,) = inner.unlocked
+    assert lock.node is lock_node
+    params = lock.receipt
     assert params.skipped_lock_components == (ComponentType.MAMBA,)
     assert params.get_lock_uuid(ComponentType.SWA) == uuid
     assert params.get_lock_uuid(ComponentType.SWA, lock_host=True) == 19
@@ -250,7 +244,6 @@ def test_release_session_preserves_component_lock_receipt(uuid):
             params.get_lock_uuid(ComponentType.MAMBA, lock_host=lock_host)
         with pytest.raises(KeyError):
             DecLockRefParams().get_lock_uuid(ComponentType.SWA, lock_host=lock_host)
-    assert inner.dec_lock_ref_skip_swa == [False]
 
 
 def test_trim_overshoot_postcondition():
