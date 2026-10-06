@@ -556,6 +556,28 @@ nothing re-registers. So a worker registered over h2c that later stops serving
 it (a proxy interposed on its port, say) is not detected until it
 is re-registered; its circuit breaker will open in the meantime.
 
+## Native gRPC
+
+`--grpc-port` serves the engine's own gRPC API, `sglang.runtime.v1.SglangService`
+(`proto/sglang/runtime/v1/sglang.proto`), so a gRPC client can point at the
+router or at an engine. A call is routed exactly like its HTTP route and sent to
+the same RPC on the selected engine's native gRPC server, which engines run
+beside HTTP with their own `--grpc-port`; the router reads that port from each
+worker's `/server_info`. HTTP requests are unaffected and still reach engines
+over HTTP.
+
+| RPC | Routed like |
+|---|---|
+| `ChatComplete` | `/v1/chat/completions`: same rendering, `input_ids` forwarding, PD and DP-rank handling |
+
+Every other RPC answers `UNIMPLEMENTED`. Request metadata and `trace_headers`
+act as HTTP headers for routing and forwarding, and a cancelled call aborts the
+engine request. Router errors arrive as a gRPC status carrying the HTTP path's
+message and an `x-router-error-code` trailer; an engine's status passes through
+unchanged. An engine without `--grpc-port` (including one launched with
+`--api-key`, which native gRPC rejects) cannot serve gRPC calls: the router warns
+when it registers, and calls routed to it fail with `UNAVAILABLE`.
+
 ## Upgrading from `cache_aware_zmq`
 
 The `cache_aware_zmq` policy has been removed. Configurations using it should

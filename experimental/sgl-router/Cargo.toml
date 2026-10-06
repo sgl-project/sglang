@@ -52,6 +52,9 @@ tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "request-id", "catch-panic"] }
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "http2"], default-features = false }
 sgl-kv-indexer = { path = "sgl-kv-indexer" }
+# Native SglangService gRPC types, shared with the engine (proto/sglang/runtime/v1).
+sglang-grpc-types = { path = "../../proto" }
+tonic = { version = "0.14.6", features = ["transport"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -115,7 +118,9 @@ serde_json = "1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1.42", features = ["test-util"] }
-tonic = { version = "0.14.6", features = ["transport"] }
+# The hand-rolled mock engine in tests/proxy/grpc_chat.rs.
+prost = "0.14"
+tonic-prost = "0.14.6"
 # Low-level msgpack encoder used to hand-construct wire bytes in
 # kv_events golden-bytes tests (decode-only path uses rmp-serde).
 rmp = "0.8"

@@ -3302,6 +3302,7 @@ dependencies = [
  "kube",
  "minijinja",
  "parking_lot",
+ "prost",
  "rand 0.8.8",
  "reqwest",
  "rmp",
@@ -3310,6 +3311,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sgl-kv-indexer",
+ "sglang-grpc-types",
  "sha2",
  "tempfile",
  "thiserror 2.0.20",
@@ -3317,6 +3319,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tonic",
+ "tonic-prost",
  "tower",
  "tower-http",
  "tracing",
@@ -3324,6 +3327,18 @@ dependencies = [
  "url",
  "uuid",
  "zeromq",
+]
+
+[[package]]
+name = "sglang-grpc-types"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]
@@ -3738,6 +3753,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "h2",
  "http",
  "http-body",

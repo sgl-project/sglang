@@ -255,6 +255,8 @@ impl std::fmt::Display for StickyFallbackKind {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Native gRPC listener on `host`; `None` disables it.
+    pub grpc_port: Option<u16>,
     /// Pause after SIGTERM with `/readyz` returning 503 before stopping accepts.
     /// Allows endpoint removal or readiness-probe failures to reach load balancers.
     /// Leave time in the pod grace period for in-flight draining; 0 disables the pause.
@@ -290,6 +292,7 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
+            grpc_port: None,
             shutdown_drain_secs: default_shutdown_drain_secs(),
             termination_grace_secs: None,
             worker_auth: None,

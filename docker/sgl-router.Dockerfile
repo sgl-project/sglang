@@ -32,9 +32,13 @@ ARG DEBIAN_VERSION=bookworm
 ######################## STAGE 1 — chef recipe ##########################
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS chef
 RUN cargo install cargo-chef --locked --version ^0.1
-WORKDIR /work/sgl-router
+WORKDIR /work/experimental/sgl-router
 COPY experimental/sgl-router/Cargo.toml experimental/sgl-router/Cargo.lock ./
 COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
+# The shared gRPC types crate (`../../proto`) and the rust/ workspace manifest it
+# inherits from; the repo layout is kept so the path dependency resolves.
+COPY proto /work/proto
+COPY rust/Cargo.toml /work/rust/Cargo.toml
 # Stub a minimal src tree so cargo can see the workspace targets, then
 # prepare the chef recipe.
 RUN mkdir -p src sgl-kv-indexer/src/bin \
@@ -52,7 +56,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler \
     && rm -rf /var/lib/apt/lists/* \
     && cargo install cargo-chef --locked --version ^0.1
-WORKDIR /work/sgl-router
+WORKDIR /work/experimental/sgl-router
 
 # `dynamo-tokenizers` pulls in `pcre2-sys`, whose build.rs links the SYSTEM
 # libpcre2-8 whenever pkg-config finds it (it does here — the rust:bookworm
@@ -62,8 +66,10 @@ WORKDIR /work/sgl-router
 # it statically, keeping the runtime self-contained.
 ENV PCRE2_SYS_STATIC=1
 
-COPY --from=chef /work/sgl-router/recipe.json ./recipe.json
+COPY --from=chef /work/experimental/sgl-router/recipe.json ./recipe.json
 COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
+COPY proto /work/proto
+COPY rust/Cargo.toml /work/rust/Cargo.toml
 
 # Cook (compile + cache) the dep graph from the recipe. The recipe carries every
 # workspace member's manifest and the lockfile, so chef recreates the Indexer's
@@ -85,7 +91,7 @@ RUN touch sgl-kv-indexer/build.rs \
 ######################## STAGE 3 — runtime ##############################
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
-COPY --from=builder /work/sgl-router/target/release/sgl-router /usr/local/bin/sgl-router
+COPY --from=builder /work/experimental/sgl-router/target/release/sgl-router /usr/local/bin/sgl-router
 
 # Default config path; mount your own via `-v <host-path>:/etc/sgl-router`.
 ENV SGL_ROUTER_CONFIG=/etc/sgl-router/sgl-router.yaml

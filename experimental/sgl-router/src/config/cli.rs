@@ -126,6 +126,11 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = default_port())]
     pub port: u16,
 
+    /// Port for the native gRPC server (`sglang.runtime.v1.SglangService`, which
+    /// engines serve with `--grpc-port`); requests reach engines over their gRPC port.
+    #[arg(long)]
+    pub grpc_port: Option<u16>,
+
     /// Keep serving after SIGTERM with /readyz returning 503 before stopping accepts.
     /// Leave time in the pod grace period for in-flight requests; cover readiness
     /// probe failureThreshold * periodSeconds when probe-driven. 0 disables the pause.
@@ -560,6 +565,7 @@ impl Cli {
             server: ServerConfig {
                 host: self.server.host,
                 port: self.server.port,
+                grpc_port: self.server.grpc_port,
                 shutdown_drain_secs: self.server.shutdown_drain_secs,
                 termination_grace_secs: self.server.termination_grace_secs,
                 worker_auth,
