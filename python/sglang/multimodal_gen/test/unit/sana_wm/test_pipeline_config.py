@@ -1457,6 +1457,8 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
                     trajectory_timesteps=None,
                     trajectory_latents=None,
                     rollout_trajectory_data=None,
+                    audio=None,
+                    audio_sample_rate=None,
                     metrics=None,
                     usage=None,
                 )
