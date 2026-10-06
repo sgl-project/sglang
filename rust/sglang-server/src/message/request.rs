@@ -7,13 +7,13 @@ use std::sync::LazyLock;
 use bytes::Bytes;
 use itertools::izip;
 
-use super::api;
 use super::buffers::Buffer;
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
 use super::multimodal::{self, MmItem};
 use super::response::ResponseSink;
 use super::sampling::SamplingParams;
 use super::types::{OneOrMany, OneOrManyItem, TokenIds};
+use super::wire;
 use crate::message::ids::Rid;
 use crate::utils::fsm::RequestState;
 use crate::utils::{environ::env_i64, error::Error};
@@ -53,7 +53,7 @@ const JSON_TO_HEAP_FACTOR: usize = 8;
 /// batch is [`Error::Validation`], which the HTTP adapter surfaces as 400.
 ///
 /// The wire type is the generated `sglang_api_types` request (the schema is
-/// the contract); its carriers become the internal ones through `message::api`
+/// the contract); its carriers become the internal ones through `message::wire`
 /// on the way in.
 pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateRequest>, bool), Error> {
     let api_v1::GenerateRequest {
@@ -80,29 +80,29 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
         video_data,
         audio_data,
     } = req;
-    let rid = rid.and_then(api::string_or_list);
-    let text = text.and_then(api::string_or_list);
-    let input_ids = input_ids.and_then(api::token_ids_or_list);
+    let rid = rid.and_then(wire::string_or_list);
+    let text = text.and_then(wire::string_or_list);
+    let input_ids = input_ids.and_then(wire::token_ids_or_list);
     let stream = stream.unwrap_or(false);
     let sampling_params = sampling_params
-        .map(api::sampling_params_or_list)
+        .map(wire::sampling_params_or_list)
         .transpose()
         .map_err(Error::Validation)?
         .flatten();
-    let return_logprob = return_logprob.and_then(api::bool_or_list);
-    let logprob_start_len = logprob_start_len.and_then(api::int64_or_list);
-    let top_logprobs_num = top_logprobs_num.and_then(api::int64_or_list);
-    let token_ids_logprob = token_ids_logprob.and_then(api::token_ids_or_list);
-    let return_hidden_states = return_hidden_states.and_then(api::bool_or_list);
-    let bootstrap_host = bootstrap_host.and_then(api::optional_string_or_list);
-    let bootstrap_port = bootstrap_port.and_then(api::optional_int64_or_list);
-    let bootstrap_room = bootstrap_room.and_then(api::optional_int64_or_list);
-    let bootstrap_pair_key = bootstrap_pair_key.and_then(api::optional_string_or_list);
-    let decode_tp_size = decode_tp_size.and_then(api::optional_int64_or_list);
-    let image_data = image_data.map(api::media_input).transpose()?;
-    let video_data = video_data.map(api::media_input).transpose()?;
-    let audio_data = audio_data.map(api::media_input).transpose()?;
-    let mm_hashes = mm_hashes.and_then(api::string_list_or_list);
+    let return_logprob = return_logprob.and_then(wire::bool_or_list);
+    let logprob_start_len = logprob_start_len.and_then(wire::int64_or_list);
+    let top_logprobs_num = top_logprobs_num.and_then(wire::int64_or_list);
+    let token_ids_logprob = token_ids_logprob.and_then(wire::token_ids_or_list);
+    let return_hidden_states = return_hidden_states.and_then(wire::bool_or_list);
+    let bootstrap_host = bootstrap_host.and_then(wire::optional_string_or_list);
+    let bootstrap_port = bootstrap_port.and_then(wire::optional_int64_or_list);
+    let bootstrap_room = bootstrap_room.and_then(wire::optional_int64_or_list);
+    let bootstrap_pair_key = bootstrap_pair_key.and_then(wire::optional_string_or_list);
+    let decode_tp_size = decode_tp_size.and_then(wire::optional_int64_or_list);
+    let image_data = image_data.map(wire::media_input).transpose()?;
+    let video_data = video_data.map(wire::media_input).transpose()?;
+    let audio_data = audio_data.map(wire::media_input).transpose()?;
+    let mm_hashes = mm_hashes.and_then(wire::string_list_or_list);
 
     // Cap the batch BEFORE the columns below allocate anything. Reading the
     // declared length off the input costs nothing; the previous placement (after
@@ -169,7 +169,7 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
     // A list is per-item; a single object broadcasts to every item.
     let sps: Vec<SamplingParams> = match sampling_params {
         None => vec![SamplingParams::default(); n],
-        Some(api::SamplingInput::Many(v)) => {
+        Some(wire::SamplingInput::Many(v)) => {
             if v.len() != n {
                 return Err(Error::Validation(format!(
                     "sampling_params list length {} does not match batch size {n}",
@@ -178,7 +178,7 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
             }
             v
         }
-        Some(api::SamplingInput::One(sp)) => {
+        Some(wire::SamplingInput::One(sp)) => {
             // Broadcasting deep-clones the client's params once per prompt,
             // heap and all — `stop`, `logit_bias` and `custom_params` (arbitrary
             // JSON) are still unnormalized client data here. The blow-up is

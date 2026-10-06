@@ -18,10 +18,10 @@ use super::frontend_error_status;
 use crate::frontend::{
     FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest, HealthStatus,
 };
-use crate::message::api::merge_preferred_sampling;
 #[cfg(test)]
 use crate::message::ids::Rid;
 use crate::message::request::into_requests;
+use crate::message::wire::merge_preferred_sampling;
 use crate::utils::{
     environ,
     response::{error_response, error_value},

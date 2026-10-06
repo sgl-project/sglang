@@ -123,7 +123,7 @@ mod tests {
     fn parse(json: &str) -> Result<MmDataInput, String> {
         let wire: sglang_api_types::api::v1::MediaInput =
             serde_json::from_str(json).map_err(|e| e.to_string())?;
-        crate::message::api::media_input(wire).map_err(|e| e.to_string())
+        crate::message::wire::media_input(wire).map_err(|e| e.to_string())
     }
 
     fn src(s: &str) -> MmItem {
