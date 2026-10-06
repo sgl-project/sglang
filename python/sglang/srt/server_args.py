@@ -272,6 +272,12 @@ class ServerArgs:
                     requested_device is None and get_platform().is_mps
                 ):
                     validate_mps_runtime()
+                    if envs.SGLANG_ENABLE_MLX_WHOLE_REGION.get():
+                        from sglang.srt.hardware_backend.mlx.region_runtime import (
+                            validate_mlx_region_runtime,
+                        )
+
+                        validate_mlx_region_runtime()
 
             run_resolution_pipeline(self)
 
