@@ -501,6 +501,8 @@ impl CacheAwareBlocks {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheAwareDecision {
     CacheHit,
+    /// Affinity to an owned ancestor below an unowned structural suffix.
+    AncestorHit,
     LoadImbalance,
     NoWorkers,
     RequestBodyUnavailable,
@@ -556,6 +558,7 @@ impl CacheAwareDecision {
     fn as_str(self) -> &'static str {
         match self {
             Self::CacheHit => "cache_hit",
+            Self::AncestorHit => "ancestor_hit",
             Self::LoadImbalance => "load_imbalance",
             Self::NoWorkers => "no_workers",
             Self::RequestBodyUnavailable => "request_body_unavailable",

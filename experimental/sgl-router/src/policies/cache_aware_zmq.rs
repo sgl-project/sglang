@@ -493,6 +493,9 @@ impl CacheAwareZmqPolicy {
             if owned_rate > self.config.cache_threshold {
                 for (w, tiers) in matched.tiers {
                     let depth = matched.owned_matched_blocks;
+                    // A nonempty owner set always comes from a positive depth.
+                    // Its first URL occurrence must therefore insert both maps.
+                    debug_assert!(depth > 0);
                     let gap = matched.matched_blocks - depth;
                     let old_depth = owner_depths.get(&w.url).copied().unwrap_or(0);
                     if depth > old_depth {
@@ -599,7 +602,8 @@ impl CacheAwareZmqPolicy {
     /// With two modes, re-query because a selected URL may also hold a deeper
     /// prefix in a mode that did not contribute it to the owner set.
     ///
-    /// Otherwise re-descends per mode and takes the deepest: the request goes
+    /// For other destinations or multiple modes, walk each chain and take
+    /// the deepest prefix held by that URL: the request goes
     /// to one worker, whose engine hashes with its own family, so a worker warm
     /// under either family can serve it from cache. This stays within
     /// `matched_blocks` only because [`Self::match_request`] breaks rate ties by
@@ -648,15 +652,26 @@ impl CacheAwareZmqPolicy {
             return;
         };
         let selected = self.selected_overlap(outcome, chosen.url.as_str()) as u64;
+        let ancestor_gap = outcome
+            .owner_depth_gaps
+            .get(chosen.url.as_str())
+            .copied()
+            .filter(|_| {
+                outcome.owner_depths.get(chosen.url.as_str()).copied() == Some(selected as usize)
+            })
+            .unwrap_or(0);
+        // Split ordinary affinity hits without hiding queue/admission outcomes.
+        // Every counter below uses the same effective decision.
+        let decision = if matches!(decision, CacheAwareDecision::CacheHit) && ancestor_gap > 0 {
+            CacheAwareDecision::AncestorHit
+        } else {
+            decision
+        };
         m.record_cache_aware_decision(model_id, decision);
         m.observe_overlap_blocks(model_id, outcome.matched_blocks as u64);
         m.observe_owned_overlap_blocks(model_id, outcome.owned_matched_blocks as u64);
-        if outcome.owner_depths.get(chosen.url.as_str()).copied() == Some(selected as usize) {
-            if let Some(&gap) = outcome.owner_depth_gaps.get(chosen.url.as_str()) {
-                if gap > 0 {
-                    m.observe_ancestor_fallback_blocks(model_id, gap as u64);
-                }
-            }
+        if ancestor_gap > 0 {
+            m.observe_ancestor_fallback_blocks(model_id, ancestor_gap as u64);
         }
         m.add_cache_aware_blocks(
             model_id,
@@ -4077,11 +4092,19 @@ mod tests {
         assert_eq!(chosen.url, "http://w0:30000");
         let rendered = metrics.render();
         assert_eq!(
-            block_counter(&rendered, "matched_overlap_blocks_total", "cache_hit"),
+            block_counter(&rendered, "cache_aware_query_blocks_total", "ancestor_hit"),
+            5
+        );
+        assert!(!rendered.contains("decision=\"cache_hit\""));
+        assert!(rendered.contains(
+            "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"ancestor_hit\"} 1"
+        ));
+        assert_eq!(
+            block_counter(&rendered, "matched_overlap_blocks_total", "ancestor_hit"),
             5
         );
         assert_eq!(
-            block_counter(&rendered, "selected_overlap_blocks_total", "cache_hit"),
+            block_counter(&rendered, "selected_overlap_blocks_total", "ancestor_hit"),
             3
         );
         assert!(rendered.contains("sgl_router_owned_overlap_blocks_sum{model_id=\"tiny\"} 3"));
@@ -4156,6 +4179,43 @@ mod tests {
             assert_eq!(m.owner_depth_gaps["http://w1:30000"], 0);
             assert_eq!(policy.selected_overlap(&m, "http://w1:30000"), 5);
         }
+    }
+
+    #[test]
+    fn ancestor_accounting_preserves_gate_decisions() {
+        let (tree, tokens) = ancestor_fixture(false);
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy(
+            queue_cfg(4),
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let outcome = policy.match_request(&tokens, 4, false, false);
+        let chosen = worker("http://w0:30000", "tiny");
+        for decision in [
+            CacheAwareDecision::CacheHitAllQueued,
+            CacheAwareDecision::CacheWorkerQueued,
+        ] {
+            policy.record_match_outcome("tiny", decision, &outcome, &chosen);
+        }
+        let rendered = metrics.render();
+        for decision in ["cache_hit_all_queued", "cache_worker_queued"] {
+            assert_eq!(
+                block_counter(&rendered, "cache_aware_query_blocks_total", decision),
+                5
+            );
+            assert_eq!(
+                block_counter(&rendered, "matched_overlap_blocks_total", decision),
+                5
+            );
+            assert_eq!(
+                block_counter(&rendered, "selected_overlap_blocks_total", decision),
+                3
+            );
+        }
+        assert!(!rendered.contains("decision=\"ancestor_hit\""));
     }
 
     #[test]

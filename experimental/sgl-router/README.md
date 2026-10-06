@@ -25,9 +25,22 @@ with the `model_id` label distinguish usable ownership from empty paths:
   ancestor owner is selected. Its `_count` counts those selections; `_sum`
   counts skipped blocks, **not** recovered engine cache hits.
 
+Ordinary affinity selections that fall back to an ancestor use
+`decision="ancestor_hit"` for the decision counter and all three
+query/matched/selected block counters. Queue and admission outcomes keep their
+existing decision labels; the ancestor histogram can also include those picks.
+
 Use `sgl_router_selected_overlap_blocks_total` for the selected destination's
 prefix depth. Actual cache-hit and TTFT gains require an engine replay A/B;
 router ownership does not guarantee that an SWA window is still available.
+
+Unowned interior nodes remain in the tree while they have descendants. This
+fallback does not establish why their ownership disappeared or reconcile
+stale owners. R3 must separately verify event continuity, restart cleanup,
+and occupancy accounting; an ancestor owner can also be stale. The optional
+absolute-length affinity threshold is deferred pending measured owned-depth
+distributions. Roll out router changes separately after engine configuration
+changes stabilize so their effects can be distinguished.
 
 ## Building
 
