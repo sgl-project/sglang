@@ -51,8 +51,9 @@ suite. The registered `test_gpu_delta_layout_cuda.py` compares layouts and deriv
 scale buffers with the existing SGLang/FlashInfer loader helpers and checks MLA
 source views, failure gating and destination addresses across CUDA graph replay.
 
-Preparation checks compressed artifact SHA-256 and unwraps outer Zstd once per
-host sharing domain. Each rank maps the retained shared inner-codec/raw allocation for CPU and GPU access.
+Preparation reads, validates and hashes encoded publication files once per engine-host.
+Each rank unwraps only its local tensors directly into its own retained, original
+DE-capable host allocation for CPU and GPU access.
 Preparation constructs CPU descriptors without reading weights or stopping serving;
 it prepares small GPU metadata/workspace and raw-target inputs, but never
 allocates large decoded-mask slots or runs DE/model application.
@@ -84,7 +85,7 @@ non-layer groups hold embeddings, the language-model head, and remaining standal
 weights, in that order; empty groups are omitted.
 `GPU_DELTA_LAYERS_PER_BATCH` defaults to 1; positive values group that many active
 layers in model order, even when unchanged layers are absent. Each complete batch
-must fit HBM; there is no intra-layer streaming. DE reads the compressed frames directly from the shared host arena into HBM;
+must fit HBM; there is no intra-layer streaming. DE reads the compressed frames directly from the rank-owned host arena into HBM;
 there is no encoded HBM ring, compressed H2D copy or transfer-stage selector.
 Two decoded slots each fit the largest batch, including non-layer groups. A dedicated DE stream
 decodes the next batch while the apply stream validates and applies the current
@@ -169,8 +170,8 @@ Protocol 4 carries the selected `codec` and explicit `frame_bytes` (64 KiB or
 redundant codec/file fields. Each natural tensor's outer descriptor names one
 immutable owner file and independent Zstd chunks of at most 1 MiB output, exactly
 covering its aligned inner-codec arena. LZ4 uses raw byte blocks with bitshuffle
-disabled. The sender computes both the inner codec and outer Zstd on GPU; the receiver always unwraps Zstd on CPU directly into a host-shared arena,
-maps each process's allocation for CPU/GPU access, then decodes model-layer batches
+disabled. The sender computes both the inner codec and outer Zstd on GPU; the receiver unwraps Zstd on CPU directly into each rank's original host arena,
+then decodes model-layer batches
 directly from host for in-place apply. Natural tensor boundaries remain unchanged
 in the publication format.
 There is no GPU outer decoder, legacy protocol or automatic fallback.
@@ -181,27 +182,22 @@ Sorting executes inside the paused decode call; preparation does not sort or
 reorder the frames. The codec extension and sorting options await native GPU
 qualification and matched benchmarks; existing Snappy results do not measure LZ4.
 
-`GPU_DELTA_CPU_WORKERS` defaults to 32 (bounded to 1–32) per engine-host.
-One creator uses that many reusable CPU workers, each with its own Zstd context;
-its other ranks attach to the completed arena. Natural tensors are grouped into
-at most four times as many tasks as workers, preserving strict per-frame checks
-and direct writes into the shared arena. Two EP4 engines therefore use two
-independent pools: up to 64 decode workers plus two SHA workers on that host.
-Workers touch only CPU buffers; CUDA setup remains on each rank's original
-preparation thread.
+`GPU_DELTA_CPU_WORKERS` defaults to 32 (bounded to 1–32) per rank.
+Each rank uses reusable workers with independent Zstd contexts. Local tensors
+are grouped into at most four times as many tasks as workers, preserving strict
+per-frame checks and direct writes into the rank arena. Two EP4 engines therefore
+have up to eight pools of 32 decode workers. Workers touch only CPU buffers;
+CUDA setup remains on each rank's preparation thread.
 
 `GPU_DELTA_HOST_CACHE_DIR` defaults to `/dev/shm/sglang-gpu-delta-<uid>` and
-must be a private, user-owned directory on tmpfs with enough space for wrapped
-payload staging. The larger decoded Snappy/raw arena is CUDA-owned host RAM,
-not a tmpfs mapping. Ranks of one engine on the
-same physical host must see the same directory and IPC/mount namespace; across
-containers, explicitly mount the same host tmpfs there. Engine IDs select separate
-subdirectories and advertised `host_cache_id` values. Independent engines
-deliberately duplicate CPU buffers and work; they share no build locks or release
-lifecycle. Container hostname is not used to infer sharing.
-Miles negotiates the canonical tensor-name union per cache ID and sends it in
-`host_tensor_names`. This negotiated union covers each receiver's local names; foreign
-experts outside that union are not decoded.
+must be a private, user-owned tmpfs directory large enough for encoded publication
+files. The decoded inner-codec/raw arenas are CUDA-owned host RAM, outside tmpfs.
+Ranks of one engine on the same physical host must see the same cache directory;
+across containers, explicitly mount the same host tmpfs there. Engine IDs select
+separate subdirectories and advertised `host_cache_id` values. Independent engines
+share no cache locks or release lifecycle. Container hostname does not infer sharing.
+Miles still sends the negotiated `host_tensor_names` union. Each receiver checks
+that it covers its local bindings, then decodes only those local tensor names.
 
 Each rank qualifies its local views while admitting the canonical tensor/view
 plan and retains only detached static definitions. Later publications compare
@@ -213,43 +209,35 @@ publication-specific. Private arena index/state records use `orjson`; atomic
 replacement and canonical namespace/publication digests are unchanged.
 
 One creator per engine-host validates all publication frame metadata, including
-foreign experts, then copies owner files into retained tmpfs mappings and checks source
-identity/extent across the read. One dedicated worker SHA-256 checks those exact
-retained bytes while CPU workers decode independent canonical tensors directly
-into one shared Snappy arena; raw targets are copied beside them. No second
-payload read, full decoded temporary or per-rank Snappy copy is needed.
-Aliased bindings and ranks within that engine reuse the same physical bytes. The
-namespace and its build/release mutex bind the original engine participants, delta
-stream and host tensor union; publication metadata
-binds the canonical manifest path, digest, session and versions. READY is published
-only after SHA verification, every decode task and exact chunk/window/output
-check passes. Hash and decode are both joined on failure before ownership is
-dropped; unverified bytes never become available for GPU use.
+foreign experts, copies owner files into retained tmpfs mappings, checks source
+identity/extent across the read, and SHA-256 checks those retained bytes. The
+namespace and build/release mutex bind the original engine participants and delta
+stream; publication metadata binds the manifest path, digest, session and versions.
+READY certifies the encoded cache only after verification succeeds. Ranks then
+release the cache lock and independently decode local tensors into their own
+arenas; raw targets are copied beside the inner-codec frames. There is no second
+source-file read, full decoded temporary or intermediate decoded host copy.
+Each rank drains all submitted decode tasks before returning or raising.
 
-The decoded Snappy/raw arena uses CUDA 13 `cuMemCreate` with `HOST_NUMA`,
-`PINNED`, `CU_MEM_CREATE_USAGE_HW_DECOMPRESS` and a POSIX export handle. Ordinary
-`cudaHostAlloc`/`cudaHostRegister` memory is insufficient for this contract. A
-feature-owned Unix socket transfers the actual descriptor with `SCM_RIGHTS`;
-peers import/map it at their own addresses and establish local CPU/GPU access.
-Each mapping is admitted with `CU_POINTER_ATTRIBUTE_IS_HW_DECOMPRESS_CAPABLE`.
-There is no per-rank copy of the full Snappy arena, new compiled extension or
-software-decompression fallback. The allocation owner remains alive with its
-engine cohort. See [NVIDIA's DE requirements](https://docs.nvidia.com/cuda/nvcomp/decompression_engine_faq.html).
+Each rank's arena uses CUDA 13 `cuMemCreate` with `HOST_NUMA`, `PINNED` and
+`CU_MEM_CREATE_USAGE_HW_DECOMPRESS`, without export handles. The original mapping
+is admitted with `CU_POINTER_ATTRIBUTE_IS_HW_DECOMPRESS_CAPABLE`. There is no
+CUDA memory import, FD broker, compiled extension or software inner-decoder fallback.
+Ordinary `cudaHostAlloc`/`cudaHostRegister` memory does not establish this contract.
+See [NVIDIA's DE requirements](https://docs.nvidia.com/cuda/nvcomp/decompression_engine_faq.html).
 
-The initial host allocation reserves the required extent, rounded to its capacity
-granularity. Later growth reserves twice the required extent. Fitting updates
-reuse the same allocation and mappings; growth creates a new immutable capacity
-generation. Encoded publication staging separately retains its tmpfs mapping.
-Independent engines have independent allocations, build locks and release
-lifecycles.
+Both the rank arena and shared encoded cache reserve the required extent for the
+initial capacity, rounded to their allocation granularity. Later growth reserves
+twice the required extent; fitting updates reuse the allocation. Each rank owns
+its DE allocation and frees it after its streams drain. Encoded tmpfs capacity is
+owned by the engine-host cache and has its own generation.
 
 Miles sends resume only after all original ranks of that engine have applied.
-Successful resume authorizes shared-arena reuse. The session queues release and
-view cleanup on its existing FIFO executor, ahead of the next prepare. Apply,
-abort and failure cannot release a shared publication. Late old releases cannot
-release newer bytes. BUILDING is recorded before overwrite; failed/aborted
-publications remain nonreusable. Backend teardown closes the allocation broker
-and mappings; retained evidence requires explicit cleanup.
+Successful resume authorizes encoded-cache reuse. The session queues release and
+view cleanup on its FIFO executor ahead of the next prepare. Apply, abort and
+failure cannot release a publication. Late old releases cannot release newer
+bytes. BUILDING is recorded before overwrite; failed or aborted publications
+remain nonreusable. Retained encoded files require explicit cleanup.
 
 Canonical rank-0/rank-1 tensors instead negotiate `raw_bytes`: complete target
 values with no XOR, frames or compression envelope. Unchanged values omit their
@@ -264,7 +252,7 @@ packed path rather than being split into layer batches.
 `host_raw_pack_s` is preparation CPU packing; raw H2D also occurs in preparation.
 
 Preparation reports manifest loading/parsing (`host_manifest_read_parse_s`), plan
-validation (`host_plan_validate_s`), frame validation (`host_frames_validate_s`),
+validation (`host_plan_validate_s`), frame validation (`host_encoded_cache_frames_validate_s`),
 local tensor planning (`host_tensor_prepare_s`) and full preparation
 (`host_prepare_s`). `host_metadata_prepare_s` covers small GPU input setup,
 including its own stream waits (`host_metadata_wait_s`). `paused_setup_host_s`
@@ -286,15 +274,14 @@ raw apply and derived refresh on the apply stream. `paused_gpu_pipeline` exclude
 setup. These spans overlap and must not be summed. nvCOMP can wait inside an Async
 call, so host enqueue durations can contain GPU backpressure.
 
-`host_payload_cache_created`/`host_payload_cache_reused` distinguish the one
-creator from followers. Creator-only `host_payload_read_s`, `host_payload_sha256_s`,
-`host_payload_hash_files` and `host_payload_hash_bytes` expose once-host read/hash;
-`host_payload_read_sha256_s` is their work sum, not a sequential critical path.
-SHA overlaps decode: `host_payload_decode_hash_s` measures the combined wall span,
-and `host_payload_hash_wait_s` is the hash tail waited after decoding. Do not add
-SHA duration to decode wall time. Followers report zero work for these counters.
-`host_shared_prepare_s` includes cache wait/attachment or construction;
-`host_payload_cache_wait_s` isolates the build/attachment mutex wait.
+`host_encoded_cache_created`/`host_encoded_cache_reused` identify the creator
+and followers. Creator-only `host_encoded_cache_read_s`, `sha256_s`, `hash_files`,
+`hash_bytes` and `frames_validations` (with the same prefix) count shared work once.
+`host_encoded_cache_read_sha256_s` is the read-plus-hash duration; verification
+finishes before local decode starts. `host_encoded_cache_wait_s` isolates the
+cache mutex wait. `host_encoded_cache_build_s` repeats the cached build duration
+on followers and must not be summed across ranks. `host_rank_prepare_s` includes
+cache access, rank allocation and local outer decode.
 
 `host_plan_cache_reused` reports whether the canonical plan's static definitions
 were already qualified. Every publication still authenticates its manifest and
@@ -302,24 +289,23 @@ checks names, shapes, dtypes, encodings, byte counts and rank views against the
 admitted plan, then validates all changing payload/frame extents. The cache holds
 only detached static definitions, not an old manifest or payload.
 
-Creator-only `host_outer_zstd_decode_s` is CPU task submission/join wall time
-(including raw copies). `host_outer_zstd_validate_s` and
-`host_outer_zstd_worker_decode_sum_s` sum worker durations, not critical-path time.
-The `host_outer_zstd_encoded_bytes`, `decoded_bytes`, `tensors` and `frames`
-counters count each reconstructed host tensor/chunk once.
-`host_shared_build_s` is the same cached build duration for all consumers and must
-not be summed across ranks. `host_shared_arena_bytes` is the publication's used extent; capacity/generation
-and mapping-reuse counters distinguish cold, fitting and growing allocations.
-Creator-only `host_shared_allocation_{s,calls,bytes}` and
-`host_encoded_allocation_{s,calls,bytes}` report decoded host and encoded staging
-allocations separately. `host_outer_zstd_cpu_workers` records the creator pool.
+Each rank reports `host_rank_outer_zstd_decode_s` for CPU task submission/join
+wall time, including raw copies. `host_rank_outer_zstd_validate_s` and
+`host_rank_outer_zstd_worker_decode_sum_s` sum worker durations, not critical-path
+time. The same prefix's `encoded_bytes`, `decoded_bytes`, `tensors` and `frames`
+count that rank's local outer decode work. Rank arenas report
+`host_rank_{arena_bytes,capacity_bytes,capacity_generation,mapping_reused}` and
+`host_rank_allocation_{s,calls,bytes}`. Shared encoded storage separately reports
+`host_encoded_cache_capacity_{bytes,generation}` and creator-only
+`host_encoded_cache_allocation_{s,calls,bytes}`. `host_rank_cpu_workers` records
+each rank's pool size.
 
 Preparation can contend for host bandwidth and performs small GPU input work
-on its own streams while rollout continues. It never reserves the large decoded
-mask slots or runs DE/application/cold scratch tuning before pause. The manual two-process
-CUDA test must qualify actual handle import, CPU/GPU visibility, direct-host DE,
-warm mapping reuse and growth. CPU mocks establish control/byte semantics only;
-CUDA IPC capability, hardware DE and overlap require native validation.
+while rollout continues. It never reserves large decoded-mask slots or runs
+DE/application/cold scratch tuning before pause. The manual two-engine, two-rank
+CUDA test checks private original allocations, local exact-byte DE, once-per-engine
+encoded verification, warm reuse and growth. CPU mocks establish control and byte
+semantics only; hardware capability, DE and overlap require native validation.
 
 Runtime updates do not hash weights or build a custom compiled extension. Exact
 weight-content comparisons are confined to tests. State/version checks prevent

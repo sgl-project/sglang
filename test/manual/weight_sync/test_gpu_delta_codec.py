@@ -19,7 +19,7 @@ from sglang.srt.weight_sync.gpu_delta_layout import (
     _plan_decode,
     _PreparedBatch,
 )
-from sglang.srt.weight_sync.gpu_delta_memory import SharedHostAllocation
+from sglang.srt.weight_sync.gpu_delta_memory import HostAllocation
 
 
 def _encode(values, codec, offsets=None):
@@ -63,7 +63,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
     # exercise views whose row stride is the complete metadata slab's width.
     payload_b, frames_b = _encode(values[1], codec, [128, 128 + (64 << 10) + 256])
     input_b = (len(payload_a) + 15) // 16 * 16
-    allocation = SharedHostAllocation(input_b + len(payload_b), device.index)
+    allocation = HostAllocation(input_b + len(payload_b), device.index)
     host = torch.frombuffer(allocation.view, dtype=torch.uint8)
     host[: len(payload_a)].numpy()[:] = memoryview(payload_a)
     host[input_b : input_b + len(payload_b)].numpy()[:] = memoryview(payload_b)
@@ -229,7 +229,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
 def test_rejects_frame_range_before_decode():
     device = torch.device("cuda", 0)
     decoder = NvcompDecoder(device)
-    allocation = SharedHostAllocation(256, device.index)
+    allocation = HostAllocation(256, device.index)
     host = torch.frombuffer(allocation.view, dtype=torch.uint8)[:256]
     decoded = tuple(
         torch.empty(256, dtype=torch.uint8, device=device) for _ in range(2)

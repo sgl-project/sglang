@@ -1,9 +1,6 @@
-"""CUDA host-allocation ABI/lifetime mocks and real Unix FD transfer."""
+"""Original CUDA host-allocation ABI, admission and cleanup mocks."""
 
 import ctypes
-import os
-import tempfile
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -15,11 +12,10 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class Driver:
-    def __init__(self, capable=True):
+    def __init__(self, failure=None):
         self.calls = []
         self.backing = ctypes.create_string_buffer(8192)
-        self.capable = capable
-        self.fd = None
+        self.failure = failure
 
     def cuDeviceGetAttribute(self, result, attribute, device):
         result._obj.value = 1 if attribute == 141 else 7
@@ -29,7 +25,7 @@ class Driver:
         value = properties._obj
         assert (value.type, value.requestedHandleTypes, value.location.type) == (
             1,
-            1,
+            0,
             3,
         )
         assert value.location.id == 7 and value.allocFlags.usage == 2
@@ -40,19 +36,6 @@ class Driver:
         assert size == 8192 and flags == 0
         handle._obj.value = 11
         self.calls.append("create")
-        return 0
-
-    def cuMemExportToShareableHandle(self, result, handle, kind, flags):
-        assert (handle, kind, flags) == (11, 1, 0)
-        self.fd = os.open(os.devnull, os.O_RDONLY)
-        result._obj.value = self.fd
-        return 0
-
-    def cuMemImportFromShareableHandle(self, handle, fd, kind):
-        assert isinstance(fd, ctypes.c_void_p) and kind == 1
-        os.fstat(fd.value)  # Import takes the received FD value, not int*.
-        handle._obj.value = 12
-        self.calls.append("import")
         return 0
 
     def cuMemGetAllocationPropertiesFromHandle(self, properties, handle):
@@ -68,7 +51,7 @@ class Driver:
 
     def cuMemMap(self, address, size, offset, handle, flags):
         self.calls.append("map")
-        return 0
+        return 1 if self.failure == "map" else 0
 
     def cuMemSetAccess(self, address, size, descriptors, count):
         assert count == 2
@@ -81,7 +64,8 @@ class Driver:
 
     def cuPointerGetAttribute(self, capable, attribute, address):
         assert attribute == 21
-        capable._obj.value = self.capable
+        capable._obj.value = self.failure != "capability"
+        self.calls.append("capability")
         return 0
 
     def cuMemUnmap(self, address, size):
@@ -97,43 +81,27 @@ class Driver:
         return 0
 
 
-@pytest.mark.parametrize("capable", [True, False])
-def test_host_vmm_properties_fd_import_and_cleanup(capable):
-    driver = Driver(capable)
-    with tempfile.TemporaryDirectory() as directory:
-        # Filesystem sockets allow the CPU oracle to run on macOS too. Native
-        # Linux uses an abstract address and validates the connecting peer UID.
-        with (
-            patch.object(memory, "_driver", return_value=driver),
-            patch.object(
-                memory,
-                "_socket_address",
-                side_effect=lambda name: str(Path(directory) / name[-32:]),
-            ),
-            patch.object(memory, "_same_user", return_value=True),
-        ):
-            if not capable:
-                with pytest.raises(
-                    RuntimeError, match="not hardware-decompression capable"
-                ):
-                    memory.SharedHostAllocation(4097, 2)
-            else:
-                owner = memory.SharedHostAllocation(4097, 2)
-                assert owner.capacity == 8192
-                owner.view[:4] = b"test"
-                imported = memory.SharedHostAllocation(
-                    owner.capacity, 2, owner.shareable
-                )
-                assert bytes(imported.view[:4]) == b"test"
-                assert driver.calls.count("create") == 1
-                assert driver.calls.count("import") == 1
-                imported.close()
-                assert bytes(owner.view[:4]) == b"test"
-                owner.close()
-                owner.close()
-    assert driver.calls[-3:] == ["unmap", "free_address", "release"]
-    with pytest.raises(OSError):
-        os.fstat(driver.fd)
+@pytest.mark.parametrize("failure", [None, "map", "capability"])
+def test_original_host_vmm_admission_and_cleanup(failure):
+    driver = Driver(failure)
+    with patch.object(memory, "_driver", return_value=driver):
+        if failure:
+            error = (
+                "cuMemMap" if failure == "map" else "not hardware-decompression capable"
+            )
+            with pytest.raises(RuntimeError, match=error):
+                memory.HostAllocation(4097, 2)
+        else:
+            allocation = memory.HostAllocation(4097, 2)
+            assert allocation.capacity == 8192
+            allocation.view[:4] = b"test"
+            assert bytes(driver.backing[:4]) == b"test"
+            allocation.close()
+            allocation.close()
+    expected = ["create", "reserve", "map"]
+    if failure != "map":
+        expected += ["access", "capability", "unmap"]
+    assert driver.calls == expected + ["free_address", "release"]
 
 
 def test_cuda13_allocation_struct_layout():

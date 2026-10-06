@@ -1,8 +1,8 @@
-"""Two engines each share one host-DE arena between two independent CUDA ranks.
+"""Two engines verify encoded files once and decode into private rank DE arenas.
 
 Manual-only: Linux, two Blackwell CUDA GPUs, Torch, Snappy and Zstandard are required.
 The test barriers coordinate the oracle only; production preparation has no
-collectives. Both 4- and 8-worker creator pools exercise the same exact bytes.
+collectives. Both 4- and 8-worker rank pools exercise the same exact bytes.
 """
 
 import ctypes
@@ -115,6 +115,9 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
     records = []
     try:
         identity = host.host_cache_id(engine)
+        names = {f"tensor-{i}" for i in range(4 * (rank % 2), 4 * (rank % 2 + 1))} | {
+            "raw"
+        }
         for version, (path, digest, expected) in enumerate(publications, 1):
             metadata = dict(
                 stream_id="native-shared-stream",
@@ -133,7 +136,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                 path,
                 digest,
                 manifest,
-                sorted(expected),
+                sorted(names),
                 pool,
                 metrics,
                 metadata,
@@ -142,6 +145,8 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
             frames, offsets, size = [], {}, 0
             for entry in manifest["tensors"]:
                 name = entry["name"]
+                if name not in names:
+                    continue
                 if name == "raw":
                     assert bytes(snapshot.get(name).numpy()) == expected[name]
                     continue
@@ -206,7 +211,8 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                 dict(
                     version=version,
                     host_cache_id=identity,
-                    arena_identity=arena.identity,
+                    arena_identity=arena.capacity["identity"],
+                    local_names=sorted(names),
                     mapping_pointer=arena.tensor.data_ptr(),
                     metrics=metrics,
                     exact_host_de_bytes=True,
@@ -273,39 +279,45 @@ def test_two_engines_reuse_host_de_capacity_and_grow(workers):
             assert len(engine_records) == 2
             for version in range(3):
                 rows = [record["updates"][version] for record in engine_records]
-                assert rows[0]["arena_identity"] == rows[1]["arena_identity"]
+                assert rows[0]["arena_identity"] != rows[1]["arena_identity"]
+                assert set(rows[0]["local_names"]) & set(rows[1]["local_names"]) == {
+                    "raw"
+                }
                 assert (
-                    sum(row["metrics"]["host_payload_cache_created"] for row in rows)
+                    sum(row["metrics"]["host_encoded_cache_created"] for row in rows)
                     == 1
                 )
                 assert (
-                    sum(row["metrics"]["host_payload_hash_files"] for row in rows) == 1
+                    sum(row["metrics"]["host_encoded_cache_hash_files"] for row in rows)
+                    == 1
                 )
                 assert (
-                    sum(row["metrics"]["host_frames_validations"] for row in rows) == 1
+                    sum(
+                        row["metrics"]["host_encoded_cache_frames_validations"]
+                        for row in rows
+                    )
+                    == 1
                 )
                 assert (
-                    sum(row["metrics"]["host_outer_zstd_tensors"] for row in rows) == 8
+                    sum(row["metrics"]["host_rank_outer_zstd_tensors"] for row in rows)
+                    == 8
                 )
                 assert sum(
-                    row["metrics"]["host_shared_allocation_calls"] for row in rows
-                ) == (0 if version == 1 else 1)
+                    row["metrics"]["host_rank_allocation_calls"] for row in rows
+                ) == (0 if version == 1 else 2)
                 assert all(
-                    row["metrics"]["host_shared_mapping_reused"] == int(version == 1)
+                    row["metrics"]["host_rank_mapping_reused"] == int(version == 1)
                     for row in rows
                 )
         assert len({record["updates"][0]["host_cache_id"] for record in records}) == 2
-        assert (
-            len({tuple(record["updates"][0]["arena_identity"]) for record in records})
-            == 2
-        )
+        assert len({record["updates"][0]["arena_identity"] for record in records}) == 4
         for record in records:
             a, b, c = record["updates"]
             for row, multiplier in ((a, 1), (c, 2)):
                 alignment = max(1 << 20, row["allocation_granularity"])
-                assert row["metrics"]["host_shared_capacity_bytes"] == (
+                assert row["metrics"]["host_rank_capacity_bytes"] == (
                     (
-                        multiplier * row["metrics"]["host_shared_arena_bytes"]
+                        multiplier * row["metrics"]["host_rank_arena_bytes"]
                         + alignment
                         - 1
                     )
@@ -315,12 +327,12 @@ def test_two_engines_reuse_host_de_capacity_and_grow(workers):
             assert a["arena_identity"] == b["arena_identity"] != c["arena_identity"]
             assert a["mapping_pointer"] == b["mapping_pointer"] != c["mapping_pointer"]
             assert [
-                row["metrics"]["host_shared_capacity_generation"]
+                row["metrics"]["host_rank_capacity_generation"]
                 for row in record["updates"]
             ] == [1, 1, 2]
             assert all(
-                row["metrics"]["host_shared_arena_bytes"]
-                <= row["metrics"]["host_shared_capacity_bytes"]
+                row["metrics"]["host_rank_arena_bytes"]
+                <= row["metrics"]["host_rank_capacity_bytes"]
                 for row in record["updates"]
             )
             assert record["final_unmapped"]

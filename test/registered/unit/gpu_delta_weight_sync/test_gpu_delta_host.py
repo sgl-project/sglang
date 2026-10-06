@@ -1,8 +1,7 @@
-"""Shared publication bytes, engine-host deduplication, and failure lifetimes."""
+"""Shared verified encoded bytes, rank-local decode, and failure lifetimes."""
 
 import hashlib
 import json
-import mmap
 import multiprocessing
 import os
 import tempfile
@@ -131,28 +130,14 @@ def fake_fallocate(fd, offset, length):
 
 
 class FakeHostAllocation:
-    """CPU backing only; allocator ABI/FD transfer is tested separately."""
+    """Rank-private CPU backing; CUDA allocator admission is tested separately."""
 
-    directory = None
-
-    def __init__(self, capacity, device, shared=None):
+    def __init__(self, capacity, device):
         self.capacity = capacity
-        if shared is None:
-            fd, shared = tempfile.mkstemp(dir=self.directory)
-            os.ftruncate(fd, capacity)
-        else:
-            fd = os.open(shared, os.O_RDWR)
-        self.shareable = shared
-        try:
-            self.mapping = mmap.mmap(fd, capacity)
-        finally:
-            os.close(fd)
-        self.view = memoryview(self.mapping)
+        self.view = memoryview(bytearray(capacity))
 
     def close(self):
         self.view.release()
-        # Mock call histories/exception tracebacks can retain drained views.
-        self.mapping = None
 
 
 def metadata(version=1, engine="a"):
@@ -185,7 +170,7 @@ def _child(root, path, digest, manifest, names, barrier, output):
                 for name, row in snapshot.index["tensors"].items()
             }
             output.put(
-                (identity, metrics, values, snapshot.index["shared"]["identity"])
+                (identity, metrics, values, snapshot.index["rank_arena"]["identity"])
             )
             snapshot.close()  # Abort/ordinary close never authorizes overwrite.
     finally:
@@ -193,18 +178,17 @@ def _child(root, path, digest, manifest, names, barrier, output):
         pool.close()
 
 
-class TestSharedHostSnapshot(unittest.TestCase):
+class TestHostSnapshot(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.cache = self.root / "cache"
         self.cache.mkdir()
-        FakeHostAllocation.directory = self.cache
         for replacement in (
             patch.object(host, "_cache_base", return_value=self.cache),
             patch.object(host, "_CAPACITY_ALIGNMENT", 1024),
-            patch.object(host, "SharedHostAllocation", FakeHostAllocation),
+            patch.object(host, "HostAllocation", FakeHostAllocation),
             patch.object(
                 os, "posix_fallocate", side_effect=fake_fallocate, create=True
             ),
@@ -219,25 +203,17 @@ class TestSharedHostSnapshot(unittest.TestCase):
         self.addCleanup(arena.close)
         return arena
 
-    def test_decode_overlaps_hash_but_ready_waits_for_verified_snapshot(self):
+    def test_verified_cache_precedes_local_decode_and_retains_immutable_bytes(self):
         path, digest, manifest, expected = fixture(self.root)
         arena, metrics = self.arena(), {}
-        hash_entered, decode_completed, release_hash, finished = [
-            threading.Event() for _ in range(4)
-        ]
+        entered, release, finished = [threading.Event() for _ in range(3)]
         snapshots, errors = [], []
-        original_hash, original_decode = host._hash_payloads, self.pool.decode
+        original_hash = host._hash_payloads
 
         def delayed_hash(files, definitions):
-            hash_entered.set()
-            assert release_hash.wait(5)
+            entered.set()
+            assert release.wait(5)
             return original_hash(files, definitions)
-
-        def decode(payload, chunks, destination):
-            assert hash_entered.wait(5)
-            result = original_decode(payload, chunks, destination)
-            decode_completed.set()
-            return result
 
         def build():
             try:
@@ -259,128 +235,83 @@ class TestSharedHostSnapshot(unittest.TestCase):
 
         with (
             patch.object(host, "_hash_payloads", side_effect=delayed_hash),
-            patch.object(self.pool, "decode", side_effect=decode),
+            patch.object(self.pool, "decode", wraps=self.pool.decode) as decode,
         ):
             builder = threading.Thread(target=build)
             builder.start()
             try:
-                self.assertTrue(decode_completed.wait(5))
+                self.assertTrue(entered.wait(5))
                 self.assertFalse(finished.is_set())
+                decode.assert_not_called()
+                self.assertIsNone(arena.allocation)
                 state = json.loads(next(self.cache.glob("*/*/state.json")).read_text())
                 self.assertEqual(state["state"], "BUILDING")
-                # Both jobs consume the stable copied bytes, even if the source
-                # file changes after its read/fstat checks completed.
-                (self.root / "owner.bin").write_bytes(b"changed after snapshot")
+                (self.root / "owner.bin").write_bytes(b"changed after retained read")
             finally:
-                release_hash.set()
+                release.set()
                 builder.join(5)
         self.assertFalse(builder.is_alive())
         self.assertEqual(errors, [])
-        self.assertEqual(metrics["host_payload_hash_files"], 1)
+        self.assertEqual(metrics["host_encoded_cache_hash_files"], 1)
         snapshot = snapshots[0]
         self.assertEqual(
-            {
-                name: bytes(
-                    arena.mapping[row["offset"] : row["offset"] + row["nbytes"]]
-                )
-                for name, row in snapshot.index["tensors"].items()
-            },
-            expected,
+            {name: bytes(snapshot.get(name).numpy()) for name in expected}, expected
         )
-        self.assertEqual(
-            json.loads((snapshot.directory / "state.json").read_text())["state"],
-            "READY",
+        follower_metrics = {}
+        follower = self.arena().prepare(
+            path, digest, manifest, ["dense"], self.pool, follower_metrics, metadata()
         )
+        self.assertEqual(bytes(follower.get("dense").numpy()), expected["dense"])
+        self.assertEqual(follower_metrics["host_encoded_cache_hash_files"], 0)
+        self.assertEqual(follower_metrics["host_rank_outer_zstd_tensors"], 1)
+        follower.close()
         snapshot.close()
 
-    def test_hash_and_decode_failures_drain_the_other_job_before_poison_return(self):
+    def test_hash_failure_poison_and_rank_decode_failure_never_release_cache(self):
         path, digest, manifest, expected = fixture(self.root)
-        original_hash, original_decode = host._hash_payloads, self.pool.decode
-        for failure in ("hash", "decode"):
-            with self.subTest(failure=failure):
-                arena = self.arena()
-                other_entered, failure_raised, release_other, finished = [
-                    threading.Event() for _ in range(4)
-                ]
-                errors = []
-                request = metadata() | {"stream_id": failure}
-                current = json.loads(json.dumps(manifest))
-                if failure == "hash":
-                    # Real hash rejection with valid Zstd bytes isolates integrity
-                    # failure from decoder failure.
-                    current["files"][0]["sha256"] = "0" * 64
-                current_path = self.root / f"manifest-{failure}.json"
-                content = json.dumps(current).encode()
-                current_path.write_bytes(content)
-                current_digest = hashlib.sha256(content).hexdigest()
-
-                def controlled_hash(files, definitions):
-                    if failure == "hash":
-                        assert other_entered.wait(5)
-                        failure_raised.set()
-                        return original_hash(files, definitions)
-                    other_entered.set()
-                    assert release_other.wait(5)
-                    return original_hash(files, definitions)
-
-                def controlled_decode(payload, chunks, destination):
-                    if failure == "decode":
-                        assert other_entered.wait(5)
-                        failure_raised.set()
-                        raise ValueError("injected decode failure")
-                    other_entered.set()
-                    assert release_other.wait(5)
-                    return original_decode(payload, chunks, destination)
-
-                def build():
-                    try:
-                        arena.prepare(
-                            current_path,
-                            current_digest,
-                            current,
-                            sorted(expected),
-                            self.pool,
-                            {},
-                            request,
-                        )
-                    except BaseException as error:
-                        errors.append(error)
-                    finally:
-                        finished.set()
-
-                with (
-                    patch.object(host, "_hash_payloads", side_effect=controlled_hash),
-                    patch.object(self.pool, "decode", side_effect=controlled_decode),
-                ):
-                    builder = threading.Thread(target=build)
-                    builder.start()
-                    try:
-                        self.assertTrue(failure_raised.wait(5))
-                        self.assertFalse(finished.is_set())
-                    finally:
-                        release_other.set()
-                        builder.join(5)
-                self.assertFalse(builder.is_alive())
-                self.assertEqual(len(errors), 1)
-                self.assertIn(
-                    "SHA256" if failure == "hash" else "injected decode failure",
-                    str(errors[0]),
+        manifest["files"][0]["sha256"] = "0" * 64
+        with patch.object(self.pool, "decode", wraps=self.pool.decode) as decode:
+            with self.assertRaisesRegex(ValueError, "SHA256"):
+                self.arena().prepare(
+                    path, digest, manifest, sorted(expected), self.pool, {}, metadata()
                 )
-                with self.assertRaisesRegex(ValueError, "failed or already released"):
-                    arena.prepare(
-                        current_path,
-                        current_digest,
-                        current,
-                        sorted(expected),
-                        self.pool,
-                        {},
-                        request,
-                    )
+            decode.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "failed or already released"):
+            self.arena().prepare(
+                path, digest, manifest, sorted(expected), self.pool, {}, metadata()
+            )
+        # A different engine's authenticated bytes can still have invalid Zstd.
+        # Encoded READY proves hash/metadata only; local failure cannot release it.
+        manifest["files"][0]["sha256"] = hashlib.sha256(
+            (self.root / "owner.bin").read_bytes()
+        ).hexdigest()
+        arena = self.arena("bad-decode")
+        with self.assertRaisesRegex(ValueError, "standard Zstd frame"):
+            arena.prepare(
+                path,
+                digest,
+                manifest,
+                ["foreign"],
+                self.pool,
+                {},
+                metadata(engine="bad-decode"),
+            )
+        with self.assertRaisesRegex(ValueError, "engine APPLIED release"):
+            arena.prepare(
+                path,
+                digest,
+                manifest,
+                ["foreign"],
+                self.pool,
+                {},
+                metadata(2, "bad-decode"),
+            )
 
-    def test_engine_rank_processes_verify_once_and_never_reread_retained_bytes(self):
+    def test_engine_ranks_verify_once_but_decode_only_their_local_tensors(self):
         path, digest, manifest, expected = fixture(self.root)
         context = multiprocessing.get_context("fork")
         barrier, output = context.Barrier(2), context.Queue()
+        names = [["dense", "raw"], ["expert", "raw"]]
         children = [
             context.Process(
                 target=_child,
@@ -389,12 +320,12 @@ class TestSharedHostSnapshot(unittest.TestCase):
                     path,
                     digest,
                     manifest,
-                    sorted(expected),
+                    selected,
                     barrier,
                     output,
                 ),
             )
-            for _ in range(2)
+            for selected in names
         ]
         for child in children:
             child.start()
@@ -403,37 +334,27 @@ class TestSharedHostSnapshot(unittest.TestCase):
             child.join(timeout=15)
             self.assertEqual(child.exitcode, 0)
         self.assertEqual(len({row[0] for row in records}), 1)
-        self.assertEqual(records[0][3], records[1][3])
+        self.assertNotEqual(records[0][3], records[1][3])
+        for field in ("created", "hash_files", "frames_validations"):
+            self.assertEqual(
+                sum(row[1]["host_encoded_cache_" + field] for row in records), 1
+            )
+        self.assertTrue(
+            all(row[1]["host_rank_outer_zstd_tensors"] == 1 for row in records)
+        )
         self.assertEqual(
-            sum(row[1]["host_payload_cache_created"] for row in records), 1
+            {tuple(sorted(row[2])) for row in records},
+            {tuple(sorted(n)) for n in names},
         )
-        self.assertEqual(sum(row[1]["host_payload_hash_files"] for row in records), 1)
-        self.assertEqual(sum(row[1]["host_frames_validations"] for row in records), 1)
-        self.assertEqual(sum(row[1]["host_outer_zstd_tensors"] for row in records), 2)
-        self.assertTrue(all(row[2] == expected for row in records))
-        (self.root / "owner.bin").write_bytes(b"corrupted original")
-        arena, timings = self.arena(), {}
-        snapshot = arena.prepare(
-            path, digest, manifest, sorted(expected), self.pool, timings, metadata()
-        )
-        self.assertEqual(timings["host_payload_hash_files"], 0)
-        self.assertEqual(timings["host_frames_validations"], 0)
-        self.assertEqual(timings["host_frames_validate_s"], 0)
-        row = snapshot.index["tensors"]["dense"]
-        self.assertEqual(
-            bytes(arena.mapping[row["offset"] : row["offset"] + row["nbytes"]]),
-            expected["dense"],
-        )
-        snapshot.close()
+        for row in records:
+            self.assertEqual(row[2], {name: expected[name] for name in row[2]})
         with self.assertRaisesRegex(ValueError, "engine APPLIED release"):
-            arena.prepare(
+            self.arena().prepare(
                 path, digest, manifest, sorted(expected), self.pool, {}, metadata(2)
             )
 
-    def test_invalid_foreign_frame_metadata_fails_before_allocation_or_decode(self):
+    def test_invalid_foreign_metadata_fails_before_allocation_read_or_decode(self):
         path, _, manifest, expected = fixture(self.root)
-        # Foreign contents are never decoded, but their authenticated span must
-        # still be well formed before the host marks any publication READY.
         manifest["tensors"][-1]["outer"]["frames"][0]["decoded_bytes"] = 11
         content = json.dumps(manifest).encode()
         path.write_bytes(content)
@@ -457,10 +378,9 @@ class TestSharedHostSnapshot(unittest.TestCase):
         decode.assert_not_called()
         self.assertEqual(list(self.cache.glob("*/*/state.json")), [])
 
-    def test_separate_engine_and_incarnation_builds_do_not_wait_for_each_other(self):
+    def test_local_decode_does_not_hold_engine_encoded_cache_lock(self):
         path, digest, manifest, expected = fixture(self.root)
-        first, other = self.arena("a"), self.arena("b")
-        incarnation = self.arena("a")
+        first, follower, other = self.arena(), self.arena(), self.arena("b")
         slow_pool = OuterZstdPool(2)
         self.addCleanup(slow_pool.close)
         entered, release = threading.Event(), threading.Event()
@@ -476,13 +396,7 @@ class TestSharedHostSnapshot(unittest.TestCase):
             try:
                 snapshots.append(
                     first.prepare(
-                        path,
-                        digest,
-                        manifest,
-                        sorted(expected),
-                        slow_pool,
-                        {},
-                        metadata(),
+                        path, digest, manifest, ["dense"], slow_pool, {}, metadata()
                     )
                 )
             except BaseException as error:
@@ -493,35 +407,22 @@ class TestSharedHostSnapshot(unittest.TestCase):
             thread.start()
             try:
                 self.assertTrue(entered.wait(5))
-                second = other.prepare(
+                metrics = {}
+                second = follower.prepare(
+                    path, digest, manifest, ["expert"], self.pool, metrics, metadata()
+                )
+                third = other.prepare(
                     path,
                     digest,
                     manifest,
-                    sorted(expected),
+                    ["expert"],
                     self.pool,
                     {},
                     metadata(engine="b"),
                 )
-                next_identity = metadata() | {
-                    "participants": [{"engine_id": "a", "rank": 99}]
-                }
-                third = incarnation.prepare(
-                    path,
-                    digest,
-                    manifest,
-                    sorted(expected),
-                    self.pool,
-                    {},
-                    next_identity,
-                )
+                self.assertEqual(metrics["host_encoded_cache_reused"], 1)
                 self.assertFalse(release.is_set())
-                self.assertNotEqual(host.host_cache_id("a"), host.host_cache_id("b"))
                 self.assertNotEqual(second.directory, third.directory)
-                second.mark_reusable()
-                self.assertEqual(
-                    json.loads((third.directory / "state.json").read_text())["state"],
-                    "READY",
-                )
                 second.close()
                 third.close()
             finally:
@@ -529,14 +430,9 @@ class TestSharedHostSnapshot(unittest.TestCase):
                 thread.join(5)
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
-        self.assertNotEqual(snapshots[0].directory, third.directory)
-        self.assertEqual(
-            json.loads((snapshots[0].directory / "state.json").read_text())["state"],
-            "READY",
-        )
         snapshots[0].close()
 
-    def test_capacity_reuse_growth_and_late_release_do_not_alias_publications(self):
+    def test_rank_capacity_reuse_growth_and_late_encoded_release(self):
         path, digest, manifest, expected = fixture(self.root)
         arena, first_metrics = self.arena(), {}
         first = arena.prepare(
@@ -548,35 +444,32 @@ class TestSharedHostSnapshot(unittest.TestCase):
             first_metrics,
             metadata(),
         )
-        original_inode = first.index["shared"]["identity"]
+        original = first.index["rank_arena"]
         self.assertEqual(
-            first.index["shared"]["capacity"],
-            (first.index["arena_bytes"] + 1023) // 1024 * 1024,
+            original["capacity"], (first.index["arena_bytes"] + 1023) // 1024 * 1024
         )
         self.assertEqual(
             first.index["encoded"]["capacity"],
             (manifest["files"][0]["nbytes"] + 1023) // 1024 * 1024,
         )
-        first.mark_reusable()  # Oracle substitutes the production engine proof.
+        first.mark_reusable()
         first.close()
         warm = {}
         second = arena.prepare(
             path, digest, manifest, sorted(expected), self.pool, warm, metadata(2)
         )
-        self.assertEqual(second.index["shared"]["identity"], original_inode)
-        self.assertEqual(warm["host_shared_allocation_calls"], 0)
-        self.assertEqual(warm["host_encoded_allocation_calls"], 0)
-        self.assertEqual(warm["host_payload_hash_files"], 1)
-        first.mark_reusable()  # Late cleanup must not release generation 2.
+        self.assertEqual(second.index["rank_arena"], original)
+        self.assertEqual(warm["host_rank_allocation_calls"], 0)
+        self.assertEqual(warm["host_encoded_cache_allocation_calls"], 0)
+        self.assertEqual(warm["host_rank_mapping_reused"], 1)
+        first.mark_reusable()
         with self.assertRaisesRegex(ValueError, "engine APPLIED release"):
             arena.prepare(
                 path, digest, manifest, sorted(expected), self.pool, {}, metadata(3)
             )
         second.mark_reusable()
         second.close()
-        # Force growth through a larger raw target; old inode is never resized.
-        before_capacity = second.index["shared"]["capacity"]
-        large = bytes(before_capacity * 2 + 1)
+        large = bytes(original["capacity"] * 2 + 1)
         payload = (self.root / "owner.bin").read_bytes() + large
         raw = manifest["tensors"][2]
         raw.update(nbytes=len(large), changed_bytes=len(large))
@@ -598,63 +491,21 @@ class TestSharedHostSnapshot(unittest.TestCase):
             growth,
             metadata(3),
         )
-        self.assertNotEqual(third.index["shared"]["identity"], original_inode)
-        self.assertEqual(third.index["shared"]["generation"], 2)
-        self.assertEqual(growth["host_shared_allocation_calls"], 1)
+        self.assertNotEqual(third.index["rank_arena"]["identity"], original["identity"])
+        self.assertEqual(third.index["rank_arena"]["generation"], 2)
+        self.assertEqual(growth["host_rank_allocation_calls"], 1)
         self.assertEqual(
-            third.index["shared"]["capacity"],
+            third.index["rank_arena"]["capacity"],
             (2 * third.index["arena_bytes"] + 1023) // 1024 * 1024,
         )
         self.assertEqual(
-            third.index["encoded"]["capacity"],
-            (2 * len(payload) + 1023) // 1024 * 1024,
+            third.index["encoded"]["capacity"], (2 * len(payload) + 1023) // 1024 * 1024
         )
-        self.assertEqual(original_inode[-1], before_capacity)
-        self.assertLessEqual(
-            third.index["arena_bytes"], third.index["shared"]["capacity"]
-        )
-        third.close()  # Aborted third update cannot release its slot.
+        third.close()
         with self.assertRaisesRegex(ValueError, "engine APPLIED release"):
             arena.prepare(
                 path, digest, manifest, sorted(expected), self.pool, {}, metadata(4)
             )
-
-    def test_host_union_binding_and_corrupt_zstd_do_not_publish_ready(self):
-        path, digest, manifest, expected = fixture(self.root)
-        arena = self.arena()
-        subset = arena.prepare(
-            path, digest, manifest, ["dense"], self.pool, {}, metadata()
-        )
-        self.assertEqual(set(subset.index["tensors"]), {"dense"})
-        with self.assertRaisesRegex(ValueError, "tensor union changed"):
-            arena.prepare(
-                path, digest, manifest, sorted(expected), self.pool, {}, metadata()
-            )
-        blob = bytearray((self.root / "owner.bin").read_bytes())
-        outer = manifest["tensors"][0]["outer"]
-        blob[outer["encoded_offset"] + outer["encoded_bytes"] - 1] ^= 1
-        (self.root / "owner.bin").write_bytes(blob)
-        manifest["files"][0]["sha256"] = hashlib.sha256(blob).hexdigest()
-        path.write_text(json.dumps(manifest))
-        with self.assertRaises(zstd.ZstdError):
-            self.arena().prepare(
-                path,
-                hashlib.sha256(path.read_bytes()).hexdigest(),
-                manifest,
-                sorted(expected),
-                self.pool,
-                {},
-                metadata(),
-            )
-        states = [
-            json.loads(p.read_text())["state"]
-            for p in self.cache.glob("*/*/state.json")
-        ]
-        self.assertEqual(sorted(states), ["BUILDING", "READY"])
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 def decode_fixture():
@@ -720,7 +571,7 @@ def test_bounded_jobs_decode_raw_and_compressed_bytes_exactly():
                 memoryview(destination), layout, files, entries, pool, metrics
             )
         assert submit.call_count == 4 * pool.workers
-        assert metrics["host_outer_zstd_tensors"] == 97
+        assert metrics["host_rank_outer_zstd_tensors"] == 97
         for name, row in layout.items():
             assert (
                 destination[row["offset"] : row["offset"] + row["nbytes"]]
@@ -788,3 +639,9 @@ def test_failed_tensor_drains_other_groups_before_releasing_views():
     pool.executor.shutdown(wait=True)
     assert finished.is_set() and errors == ["intentional bad frame"]
     assert sorted(attempted) == [i for i in range(20) if i not in {8, 16}]
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

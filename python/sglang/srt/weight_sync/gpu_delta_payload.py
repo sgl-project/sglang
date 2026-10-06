@@ -229,9 +229,6 @@ class OuterZstdPool:
         self.executor = ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="gpu-delta-zstd"
         )
-        self.hash_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="gpu-delta-sha256"
-        )
         self.local = threading.local()
 
     def decode(self, payload, chunks, destination):
@@ -269,4 +266,3 @@ class OuterZstdPool:
 
     def close(self):
         self.executor.shutdown(wait=True)
-        self.hash_executor.shutdown(wait=True)

@@ -409,7 +409,7 @@ class GpuDeltaLayout:
             binding = self._bind(name, meta)
             if binding is not None:
                 self.bindings.append(binding)
-        # Layer and expert order matches the shared host arena. Each canonical
+        # Layer and expert order matches the rank-owned host arena. Each canonical
         # tensor still owns its full decoded byte extent, including TP shards.
         self.bindings.sort(key=lambda b: _natural_key(b.name))
         for prefix, layer in self._moe_layers.items():
@@ -996,9 +996,10 @@ class PreparedDelta:
         entries, reused_plan = _qualify_canonical_plan(backend, manifest)
         self.timings["host_plan_validate_s"] = time.perf_counter() - plan_started
         self.timings["host_plan_cache_reused"] = int(reused_plan)
+        local_names = [binding.name for binding in backend.layout.bindings]
         host_names = metadata["host_tensor_names"][backend.identity["host_cache_id"]]
         if (
-            not {binding.name for binding in backend.layout.bindings} <= set(host_names)
+            not set(local_names) <= set(host_names)
             or not set(host_names) <= entries.keys()
         ):
             raise ValueError(
@@ -1009,15 +1010,16 @@ class PreparedDelta:
             path,
             manifest_sha256,
             manifest,
-            host_names,
+            local_names,
             backend.outer_pool,
             self.timings,
             metadata,
         )
-        self.timings["host_payload_read_sha256_s"] = (
-            self.timings["host_payload_read_s"] + self.timings["host_payload_sha256_s"]
+        self.timings["host_encoded_cache_read_sha256_s"] = (
+            self.timings["host_encoded_cache_read_s"]
+            + self.timings["host_encoded_cache_sha256_s"]
         )
-        self.timings["host_shared_prepare_s"] = time.perf_counter() - payload_started
+        self.timings["host_rank_prepare_s"] = time.perf_counter() - payload_started
 
         tensors_started = time.perf_counter()
         compressed, self.direct = [], []

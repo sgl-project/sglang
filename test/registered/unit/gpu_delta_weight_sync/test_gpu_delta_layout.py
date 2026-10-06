@@ -53,7 +53,7 @@ def cpu_host_snapshot(backend, metadata, directory):
 
     class CpuHostAllocation:
         def __init__(self, capacity, device):
-            self.capacity, self.shareable = capacity, "cpu-allocation"
+            self.capacity = capacity
             self.view = memoryview(bytearray(capacity))
 
         def close(self):
@@ -68,7 +68,7 @@ def cpu_host_snapshot(backend, metadata, directory):
                 side_effect=lambda fd, offset, size: os.ftruncate(fd, offset + size),
                 create=True,
             ),
-            patch.object(host, "SharedHostAllocation", CpuHostAllocation),
+            patch.object(host, "HostAllocation", CpuHostAllocation),
             patch.object(host, "_CAPACITY_ALIGNMENT", 64),
         ):
             yield
@@ -797,9 +797,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 prepared = layout.PreparedDelta(
                     backend, path, layout.hashlib.sha256(content).hexdigest(), metadata
                 )
-                self.assertEqual(prepared.timings["host_payload_cache_created"], 1)
-                self.assertEqual(prepared.timings["host_outer_zstd_tensors"], 8)
-                self.assertEqual(prepared.timings["host_outer_zstd_frames"], 8)
+                self.assertEqual(prepared.timings["host_encoded_cache_created"], 1)
+                self.assertEqual(prepared.timings["host_rank_outer_zstd_tensors"], 8)
+                self.assertEqual(prepared.timings["host_rank_outer_zstd_frames"], 8)
                 self.assertEqual(streams.call_count, 2)
                 self.assertEqual(events.call_count, 6)
                 self.assertIsNotNone(backend.decoder)

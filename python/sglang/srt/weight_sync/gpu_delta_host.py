@@ -11,10 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Engine-local verified publication bytes in shared DE-compatible host memory.
+"""Verified engine-host encoded cache and rank-owned direct-DE host arenas.
 
-Ranks of one engine share a CUDA HOST_NUMA arena. Tmpfs holds encoded-file
-staging and publication records. Separate engines have separate lifetimes.
+Encoded publication files are shared through tmpfs. Every scheduler
+decodes its local tensors into its own original CUDA HOST_NUMA allocation.
 """
 
 import fcntl
@@ -30,7 +30,7 @@ from pathlib import Path
 
 import orjson
 
-from sglang.srt.weight_sync.gpu_delta_memory import SharedHostAllocation
+from sglang.srt.weight_sync.gpu_delta_memory import HostAllocation
 from sglang.srt.weight_sync.gpu_delta_payload import validate_outer_entries
 
 
@@ -94,7 +94,7 @@ def _identity(info):
 _CAPACITY_ALIGNMENT = 64 << 20
 
 
-def _reserve(directory, prefix, previous, size, metrics):
+def _reserve(directory, previous, size, metrics):
     if previous is not None and size <= previous["capacity"]:
         return previous
     capacity = size if previous is None else 2 * size
@@ -104,17 +104,17 @@ def _reserve(directory, prefix, previous, size, metrics):
         * _CAPACITY_ALIGNMENT
     )
     generation = previous["generation"] + 1 if previous else 1
-    path = directory / f"{prefix}-{generation}.bin"
+    path = directory / f"encoded-{generation}.bin"
     started = time.perf_counter()
     with path.open("xb+") as target:
         if capacity:
-            # Reserve pages once per capacity generation. Reusing a registered
-            # mmap never truncates/resizes its inode or frees its backing pages.
+            # Reserve pages once per capacity generation; fitting updates never
+            # truncate or resize the retained encoded-cache inode.
             os.posix_fallocate(target.fileno(), 0, capacity)
         identity = _identity(os.fstat(target.fileno()))
-    metrics[f"host_{prefix}_allocation_s"] += time.perf_counter() - started
-    metrics[f"host_{prefix}_allocation_calls"] += 1
-    metrics[f"host_{prefix}_allocation_bytes"] += capacity
+    metrics["host_encoded_cache_allocation_s"] += time.perf_counter() - started
+    metrics["host_encoded_cache_allocation_calls"] += 1
+    metrics["host_encoded_cache_allocation_bytes"] += capacity
     return {
         "file": path.name,
         "generation": generation,
@@ -183,12 +183,12 @@ def _tensor_layout(entries):
 
 
 _DECODE_METRICS = (
-    "host_outer_zstd_validate_s",
-    "host_outer_zstd_worker_decode_sum_s",
-    "host_outer_zstd_encoded_bytes",
-    "host_outer_zstd_decoded_bytes",
-    "host_outer_zstd_tensors",
-    "host_outer_zstd_frames",
+    "host_rank_outer_zstd_validate_s",
+    "host_rank_outer_zstd_worker_decode_sum_s",
+    "host_rank_outer_zstd_encoded_bytes",
+    "host_rank_outer_zstd_decoded_bytes",
+    "host_rank_outer_zstd_tensors",
+    "host_rank_outer_zstd_frames",
 )
 
 
@@ -203,12 +203,12 @@ def _decode_group(jobs, destination, files, pool):
             outer["frames"],
             destination[start : start + count],
         )
-        metrics["host_outer_zstd_validate_s"] += validate_s
-        metrics["host_outer_zstd_worker_decode_sum_s"] += decode_s
-        metrics["host_outer_zstd_encoded_bytes"] += outer["encoded_bytes"]
-        metrics["host_outer_zstd_decoded_bytes"] += outer["decoded_bytes"]
-        metrics["host_outer_zstd_tensors"] += 1
-        metrics["host_outer_zstd_frames"] += len(outer["frames"])
+        metrics["host_rank_outer_zstd_validate_s"] += validate_s
+        metrics["host_rank_outer_zstd_worker_decode_sum_s"] += decode_s
+        metrics["host_rank_outer_zstd_encoded_bytes"] += outer["encoded_bytes"]
+        metrics["host_rank_outer_zstd_decoded_bytes"] += outer["decoded_bytes"]
+        metrics["host_rank_outer_zstd_tensors"] += 1
+        metrics["host_rank_outer_zstd_frames"] += len(outer["frames"])
     return metrics
 
 
@@ -246,36 +246,60 @@ def _decode_arena(destination, layout, files, entries, pool, metrics):
         except BaseException as exc:  # noqa: BLE001 - drain peers before re-raise
             if error is None:
                 error = exc
-    metrics["host_outer_zstd_decode_s"] = time.perf_counter() - started
+    metrics["host_rank_outer_zstd_decode_s"] = time.perf_counter() - started
     if error is not None:
         raise error
 
 
-class HostArena:
-    """Backend-owned shared host mapping, retained across updates.
+def _map_files(directory, encoded, definitions):
+    with (directory / encoded["file"]).open("r+b") as source:
+        if _identity(os.fstat(source.fileno())) != encoded["identity"]:
+            raise ValueError("encoded cache inode or extent changed")
+        mapping = mmap.mmap(source.fileno(), 0) if encoded["capacity"] else None
+    files, position = {}, 0
+    for name, record in definitions.items():
+        end = position + record["nbytes"]
+        files[name] = (
+            memoryview(mapping)[position:end]
+            if mapping is not None
+            else memoryview(b"")
+        )
+        position = end
+    # Each view owns its mmap. Failed decode tracebacks may retain drained views;
+    # their mapping must remain valid until those last references are released.
+    return files
 
-    A namespace binds the original engine ranks, delta stream and host tensor union.
-    Miles sends resume after all engine ranks apply; it releases the generation.
-    Abort/failure retains its bytes and cannot recycle the slot automatically.
+
+class HostArena:
+    """Persistent rank-owned DE storage with an engine-host encoded cache.
+
+    The original engine cohort shares only verified encoded files. Successful
+    all-rank apply/resume permits the next publication to overwrite that cache;
+    aborted/failed preparation never grants release.
     """
 
     def __init__(self, engine_id, device):
         self.engine_id, self.device = engine_id, device
-        self.allocation = None
-        self.mapping = self.tensor = None
-        self.identity = None
+        self.allocation = self.mapping = self.tensor = None
+        self.capacity = None
         self.directory = None
         self.tensor_order = None
 
-    def _attach(self, shared, allocation=None):
+    def _reserve_rank(self, size, metrics):
         import torch
 
-        if self.identity == shared["identity"]:
-            return True
-        if allocation is None and shared["capacity"]:
-            allocation = SharedHostAllocation(
-                shared["capacity"], self.device, shared["handle"]
-            )
+        if self.capacity is not None and size <= self.capacity["capacity"]:
+            metrics["host_rank_mapping_reused"] = 1
+            return
+        previous = self.capacity
+        capacity = size if previous is None else 2 * size
+        capacity = (
+            (capacity + _CAPACITY_ALIGNMENT - 1)
+            // _CAPACITY_ALIGNMENT
+            * _CAPACITY_ALIGNMENT
+        )
+        started = time.perf_counter()
+        allocation = HostAllocation(capacity, self.device) if capacity else None
         self.close()
         self.allocation = allocation
         self.mapping = allocation.view if allocation is not None else None
@@ -284,34 +308,15 @@ class HostArena:
             if self.mapping is not None
             else torch.empty(0, dtype=torch.uint8)
         )
-        self.identity = shared["identity"]
-        return False
-
-    def _reserve_shared(self, previous, size, metrics):
-        if previous is not None and size <= previous["capacity"]:
-            self._attach(previous)
-            return previous
-        capacity = size if previous is None else 2 * size
-        capacity = (
-            (capacity + _CAPACITY_ALIGNMENT - 1)
-            // _CAPACITY_ALIGNMENT
-            * _CAPACITY_ALIGNMENT
-        )
-        started = time.perf_counter()
-        allocation = SharedHostAllocation(capacity, self.device) if capacity else None
-        capacity = allocation.capacity if allocation is not None else 0
         generation = previous["generation"] + 1 if previous else 1
-        shared = {
+        self.capacity = {
             "generation": generation,
-            "capacity": capacity,
-            "identity": [uuid.uuid4().hex, generation, capacity],
-            "handle": allocation.shareable if allocation is not None else None,
+            "capacity": allocation.capacity if allocation is not None else 0,
+            "identity": uuid.uuid4().hex,
         }
-        self._attach(shared, allocation)
-        metrics["host_shared_allocation_s"] += time.perf_counter() - started
-        metrics["host_shared_allocation_calls"] += 1
-        metrics["host_shared_allocation_bytes"] += capacity
-        return shared
+        metrics["host_rank_allocation_s"] = time.perf_counter() - started
+        metrics["host_rank_allocation_calls"] = int(allocation is not None)
+        metrics["host_rank_allocation_bytes"] = self.capacity["capacity"]
 
     def prepare(
         self, manifest_path, manifest_sha256, manifest, names, pool, timings, metadata
@@ -324,14 +329,11 @@ class HostArena:
                 metadata["participants"],
                 key=lambda value: json.dumps(value, sort_keys=True),
             ),
-            "host_tensor_names": names,
         }
         key = hashlib.sha256(json.dumps(namespace, sort_keys=True).encode()).hexdigest()
         directory = root / key
         if self.directory is not None and self.directory != directory:
-            raise ValueError(
-                "host arena original cohort, stream, or tensor union changed"
-            )
+            raise ValueError("host cache original cohort or stream changed")
         definitions = {}
         for record in manifest["files"]:
             name, size = record["name"], record["nbytes"]
@@ -358,41 +360,31 @@ class HostArena:
         metrics = {
             name: 0
             for name in (
-                "host_payload_read_s",
-                "host_payload_sha256_s",
-                "host_payload_hash_wait_s",
-                "host_payload_decode_hash_s",
-                "host_payload_hash_bytes",
-                "host_payload_hash_files",
-                "host_payload_cache_created",
-                "host_payload_cache_reused",
-                "host_frames_validate_s",
-                "host_frames_validations",
-                "host_outer_zstd_validate_s",
-                "host_outer_zstd_decode_s",
-                "host_outer_zstd_worker_decode_sum_s",
-                "host_outer_zstd_encoded_bytes",
-                "host_outer_zstd_decoded_bytes",
-                "host_outer_zstd_tensors",
-                "host_outer_zstd_frames",
-                "host_shared_allocation_s",
-                "host_shared_allocation_calls",
-                "host_shared_allocation_bytes",
-                "host_encoded_allocation_s",
-                "host_encoded_allocation_calls",
-                "host_encoded_allocation_bytes",
+                "host_encoded_cache_read_s",
+                "host_encoded_cache_sha256_s",
+                "host_encoded_cache_hash_bytes",
+                "host_encoded_cache_hash_files",
+                "host_encoded_cache_created",
+                "host_encoded_cache_reused",
+                "host_encoded_cache_frames_validate_s",
+                "host_encoded_cache_frames_validations",
+                "host_encoded_cache_allocation_s",
+                "host_encoded_cache_allocation_calls",
+                "host_encoded_cache_allocation_bytes",
+                "host_rank_allocation_s",
+                "host_rank_allocation_calls",
+                "host_rank_allocation_bytes",
+                "host_rank_mapping_reused",
+                *_DECODE_METRICS,
             )
         }
         waiting = time.perf_counter()
-        # The mutex covers CPU construction/attachment, including host VMM setup.
-        # It never encloses GPU stream work or inference collectives.
-        # Original participant identities also scope the lock: unrelated engine
-        # incarnations may reuse the same controller-assigned engine name.
         directory.mkdir(mode=0o700, exist_ok=True)
-        previous_identity = self.identity
+        # Only encoded-cache construction is serialized. Rank-local Zstd and
+        # CUDA host allocation occur afterward, without holding this mutex.
         with (directory / ".lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            metrics["host_payload_cache_wait_s"] = time.perf_counter() - waiting
+            metrics["host_encoded_cache_wait_s"] = time.perf_counter() - waiting
             index_path = directory / "index.json"
             previous = (
                 orjson.loads(index_path.read_bytes()) if index_path.exists() else None
@@ -403,16 +395,19 @@ class HostArena:
                 else None
             )
             if previous and previous["namespace"] != namespace:
-                raise ValueError("host arena namespace differs")
+                raise ValueError("encoded cache namespace differs")
             if previous and previous["publication"] == expected:
                 if state != {
                     "token": token,
                     "state": "READY",
-                    "generation": previous["shared"]["generation"],
+                    "generation": previous["encoded"]["generation"],
                 }:
-                    raise ValueError("host publication is failed or already released")
+                    raise ValueError(
+                        "encoded publication is failed or already released"
+                    )
                 index = previous
-                metrics["host_payload_cache_reused"] = 1
+                files = _map_files(directory, index["encoded"], definitions)
+                metrics["host_encoded_cache_reused"] = 1
             else:
                 if previous and (
                     state["state"] != "REUSABLE"
@@ -421,46 +416,24 @@ class HostArena:
                     != expected["base_version"]
                 ):
                     raise ValueError(
-                        "host arena requires prior engine APPLIED release "
-                        "before overwrite"
+                        "encoded cache requires prior engine APPLIED release before overwrite"
                     )
                 build_started = time.perf_counter()
                 frames_started = time.perf_counter()
-                # READY certifies this exact immutable manifest for all local
-                # consumers. Validate every tensor, including foreign EP data,
-                # once before any arena sizing, allocation or payload access.
+                # Validate the entire immutable publication once, including
+                # foreign tensors whose compressed contents this rank skips.
                 validate_outer_entries(
                     manifest["tensors"],
                     {name: record["nbytes"] for name, record in definitions.items()},
                     manifest["frame_bytes"],
                 )
-                metrics["host_frames_validate_s"] = time.perf_counter() - frames_started
-                metrics["host_frames_validations"] = 1
-                entries_by_name = {
-                    entry["name"]: entry for entry in manifest["tensors"]
-                }
-                if self.tensor_order is None:
-                    # Keep each layer's compressed tensors adjacent, with expert
-                    # numbers in natural order. Raw targets use a separate pass.
-                    # The namespace fixes this inventory for the arena lifetime.
-                    self.tensor_order = sorted(
-                        names,
-                        key=lambda name: (
-                            entries_by_name[name]["encoding"] == "raw_bytes",
-                            _natural_key(name),
-                        ),
-                    )
-                entries = [entries_by_name[name] for name in self.tensor_order]
-                layout, size = _tensor_layout(entries)
-                encoded_size = sum(record["nbytes"] for record in definitions.values())
-                shared = self._reserve_shared(
-                    previous["shared"] if previous else None,
-                    size,
-                    metrics,
+                metrics["host_encoded_cache_frames_validate_s"] = (
+                    time.perf_counter() - frames_started
                 )
+                metrics["host_encoded_cache_frames_validations"] = 1
+                encoded_size = sum(record["nbytes"] for record in definitions.values())
                 encoded = _reserve(
                     directory,
-                    "encoded",
                     previous["encoded"] if previous else None,
                     encoded_size,
                     metrics,
@@ -469,13 +442,9 @@ class HostArena:
                     "namespace": namespace,
                     "publication": expected,
                     "token": token,
-                    "shared": shared,
                     "encoded": encoded,
-                    "arena_bytes": size,
-                    "tensors": layout,
                 }
-                # Publish the nonreusable state before the first overwrite. An
-                # exception leaves this generation poisoned, including on abort.
+                # A failed read/hash leaves BUILDING and cannot authorize reuse.
                 _write_record(directory, "index", index)
                 _write_record(
                     directory,
@@ -483,61 +452,23 @@ class HostArena:
                     {
                         "token": token,
                         "state": "BUILDING",
-                        "generation": shared["generation"],
+                        "generation": encoded["generation"],
                     },
                 )
-                files = {}
-                with (directory / encoded["file"]).open("r+b") as source:
-                    encoded_map = (
-                        mmap.mmap(source.fileno(), 0) if encoded_size else None
-                    )
-                position = 0
+                files = _map_files(directory, encoded, definitions)
                 for name, record in definitions.items():
                     source = (publication.parent / name).resolve(strict=True)
                     if source.parent != publication.parent:
                         raise ValueError("delta payload escapes immutable publication")
-                    end = position + record["nbytes"]
-                    view = (
-                        memoryview(encoded_map)[position:end]
-                        if encoded_map is not None
-                        else memoryview(b"")
+                    metrics["host_encoded_cache_read_s"] += _read_payload(
+                        source, files[name], record
                     )
-                    metrics["host_payload_read_s"] += _read_payload(
-                        source, view, record
-                    )
-                    files[name] = view
-                    position = end
-                decode_hash_started = time.perf_counter()
-                hash_future = pool.hash_executor.submit(
-                    _hash_payloads, files, definitions
+                metrics["host_encoded_cache_sha256_s"] = _hash_payloads(
+                    files, definitions
                 )
-                try:
-                    _decode_arena(
-                        self.mapping if self.mapping is not None else memoryview(b""),
-                        layout,
-                        files,
-                        entries,
-                        pool,
-                        metrics,
-                    )
-                finally:
-                    # Decode drains its tasks. Always join the independent hash
-                    # before releasing views; hash failure takes precedence.
-                    hash_wait_started = time.perf_counter()
-                    metrics["host_payload_sha256_s"] = hash_future.result()
-                    metrics["host_payload_hash_wait_s"] = (
-                        time.perf_counter() - hash_wait_started
-                    )
-                    metrics["host_payload_decode_hash_s"] = (
-                        time.perf_counter() - decode_hash_started
-                    )
-                    metrics["host_payload_hash_bytes"] = encoded_size
-                    metrics["host_payload_hash_files"] = len(definitions)
-                files.clear()
-                index.update(
-                    cpu_workers=pool.workers,
-                    build_s=time.perf_counter() - build_started,
-                )
+                metrics["host_encoded_cache_hash_bytes"] = encoded_size
+                metrics["host_encoded_cache_hash_files"] = len(definitions)
+                index["build_s"] = time.perf_counter() - build_started
                 _write_record(directory, "index", index)
                 _write_record(
                     directory,
@@ -545,41 +476,59 @@ class HostArena:
                     {
                         "token": token,
                         "state": "READY",
-                        "generation": shared["generation"],
+                        "generation": encoded["generation"],
                     },
                 )
-                # Each imported CUDA handle retains its old physical pages
-                # until that rank attaches the new capacity generation.
-                if previous:
-                    if previous["encoded"]["file"] != index["encoded"]["file"]:
-                        (directory / previous["encoded"]["file"]).unlink()
-                metrics["host_payload_cache_created"] = 1
-            self._attach(index["shared"])
-        reused_mapping = previous_identity == self.identity
+                if previous and previous["encoded"]["file"] != encoded["file"]:
+                    (directory / previous["encoded"]["file"]).unlink()
+                metrics["host_encoded_cache_created"] = 1
         self.directory = directory
+        entries_by_name = {entry["name"]: entry for entry in manifest["tensors"]}
+        if self.tensor_order is None:
+            self.tensor_order = sorted(
+                names,
+                key=lambda name: (
+                    entries_by_name[name]["encoding"] == "raw_bytes",
+                    _natural_key(name),
+                ),
+            )
+        entries = [entries_by_name[name] for name in self.tensor_order]
+        layout, size = _tensor_layout(entries)
+        self._reserve_rank(size, metrics)
+        _decode_arena(
+            self.mapping if self.mapping is not None else memoryview(b""),
+            layout,
+            files,
+            entries,
+            pool,
+            metrics,
+        )
         metrics.update(
-            host_shared_arena_bytes=index["arena_bytes"],
-            host_shared_capacity_bytes=index["shared"]["capacity"],
-            host_shared_capacity_generation=index["shared"]["generation"],
-            host_shared_mapping_reused=int(reused_mapping),
-            host_encoded_capacity_bytes=index["encoded"]["capacity"],
-            host_encoded_capacity_generation=index["encoded"]["generation"],
-            host_shared_build_s=index["build_s"],
-            host_outer_zstd_cpu_workers=index["cpu_workers"],
+            host_rank_arena_bytes=size,
+            host_rank_capacity_bytes=self.capacity["capacity"],
+            host_rank_capacity_generation=self.capacity["generation"],
+            host_rank_cpu_workers=pool.workers,
+            host_encoded_cache_capacity_bytes=index["encoded"]["capacity"],
+            host_encoded_cache_capacity_generation=index["encoded"]["generation"],
+            host_encoded_cache_build_s=index["build_s"],
         )
         timings.update(metrics)
-        return HostDecodedSnapshot(self, index)
+        return HostDecodedSnapshot(
+            self,
+            index
+            | {"tensors": layout, "arena_bytes": size, "rank_arena": self.capacity},
+        )
 
     def close(self):
         self.tensor = self.mapping = None
         if self.allocation is not None:
             self.allocation.close()
             self.allocation = None
-        self.identity = None
+        self.capacity = None
 
 
 class HostDecodedSnapshot:
-    """One immutable publication's views over a backend-owned capacity arena."""
+    """One publication's local views, retaining backend-owned DE host storage."""
 
     def __init__(self, arena, index):
         self.arena, self.index = arena, index
@@ -590,19 +539,19 @@ class HostDecodedSnapshot:
         return self.arena.tensor[record["offset"] : record["offset"] + record["nbytes"]]
 
     def mark_reusable(self):
-        # Called only by queued successful engine-resume cleanup. A late release
-        # from the prior generation must never release newly prepared bytes.
+        # Miles sends resume only after every original engine rank applied. A
+        # stale callback cannot release a newer encoded-cache publication.
         with (self.directory / ".lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             state = orjson.loads((self.directory / "state.json").read_bytes())
             if state == {
                 "token": self.index["token"],
                 "state": "READY",
-                "generation": self.index["shared"]["generation"],
+                "generation": self.index["encoded"]["generation"],
             }:
                 state["state"] = "REUSABLE"
                 _write_record(self.directory, "state", state)
 
     def close(self):
-        # Backend retains host pages; caller has already fenced all DE readers.
+        # Backend retains this rank's host pages after all DE readers drain.
         self.arena = None
