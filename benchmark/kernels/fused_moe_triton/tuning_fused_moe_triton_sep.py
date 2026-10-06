@@ -664,6 +664,13 @@ class BenchmarkWorker:
         ep_size: int = 1,
         enable_up_tma: bool = False,
     ) -> Dict[str, int]:
+        if (use_fp8_w8a8 or use_int8_w8a8) and block_shape and all(block_shape):
+            search_space = [
+                c for c in search_space if block_shape[1] % c["BLOCK_SIZE_K"] == 0
+            ]
+            if not search_space:
+                raise ValueError("No valid K tiles for the quantization block shape")
+
         topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
 
         if not enable_up_tma:
