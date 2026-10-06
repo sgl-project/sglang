@@ -116,6 +116,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.deferred_output import DeferredOutputSource
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -453,6 +454,9 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
+    # Sources holding finished responses (see deferred_output); a class-level
+    # default keeps the streaming and idle gates valid before any registration.
+    deferred_output_sources: Tuple[DeferredOutputSource, ...] = ()
 
     def __init__(
         self,
@@ -2480,6 +2484,25 @@ class Scheduler(
 
     def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:
         return SchedulerOutputStreamer
+
+    def register_deferred_output_source(self, source: DeferredOutputSource) -> None:
+        """Let ``source`` hold finished requests' responses; see deferred_output."""
+        self.deferred_output_sources = (*self.deferred_output_sources, source)
+        self.output_streamer.defer_outputs = True
+
+    def stream_released_deferred_outputs(self) -> None:
+        for source in self.deferred_output_sources:
+            reqs = source.poll()
+            if not reqs:
+                continue
+            for req in reqs:
+                req.defer_output = False
+            self.output_streamer.stream_output(
+                reqs, any(req.return_logprob for req in reqs)
+            )
+
+    def has_pending_deferred_outputs(self) -> bool:
+        return any(source.has_pending() for source in self.deferred_output_sources)
 
     def init_beam_coordinator(self) -> None:
         self.beam_coordinator = BeamCoordinator(
@@ -4718,7 +4741,10 @@ class Scheduler(
         logits_output = result.logits_output
         if (
             logits_output is None
-            or logits_output.auxiliary_device_output is None
+            or (
+                logits_output.auxiliary_device_output is None
+                and result.forward_auxiliary_output is None
+            )
             or result.auxiliary_host_output is not None
         ):
             return
@@ -4779,6 +4805,8 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if getattr(self, "deferred_output_sources", ()):
+            self.stream_released_deferred_outputs()
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -4928,6 +4956,9 @@ class Scheduler(
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         self.dp_attn_adapter.drop_sync_wait_carry()
+        deferred_output_sources = getattr(self, "deferred_output_sources", ())
+        if deferred_output_sources:
+            self.stream_released_deferred_outputs()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
@@ -4952,9 +4983,11 @@ class Scheduler(
                 self.enable_hicache_storage
                 or self.disaggregation_mode != DisaggregationMode.NULL
                 or self.enable_lmcache
+                or deferred_output_sources
             ):
-                # Storage and transfer workers need the GIL between I/O calls.
-                # Singleton PD polls no longer yield through a collective.
+                # Storage, transfer, and deferred-output workers need the GIL
+                # between I/O calls. Singleton PD polls no longer yield through
+                # a collective.
                 time.sleep(0)
             return
         self.metrics_reporter.record_scheduler_idle()
@@ -5053,6 +5086,9 @@ class Scheduler(
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
+            # Held responses are not on the GPU, but their requests are not done.
+            if getattr(self, "deferred_output_sources", ()):
+                idle &= not self.has_pending_deferred_outputs()
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0

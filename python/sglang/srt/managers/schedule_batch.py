@@ -1147,6 +1147,8 @@ class Req(ReqDllmMixin):
         self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
+        # Set by a DeferredOutputSource holding this finished request's response.
+        self.defer_output = False
         # If we want to abort the request in the middle of the event loop,
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond

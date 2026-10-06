@@ -62,6 +62,8 @@ class SchedulerOutputStreamer:
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
+    # Set once a DeferredOutputSource is registered; see deferred_output.
+    defer_outputs: bool = False
     _test_stream_output_count: int = 0
 
     def __post_init__(self) -> None:
@@ -123,6 +125,9 @@ class SchedulerOutputStreamer:
         skip_req: Optional[Req] = None,
     ):
         """Stream the output to detokenizer."""
+        if self.defer_outputs:
+            # A held request streams once its DeferredOutputSource releases it.
+            reqs = [req for req in reqs if not req.defer_output]
         if self.is_generation:
             self._stream_output_generation(reqs, return_logprob, skip_req)
         else:  # embedding or reward model
