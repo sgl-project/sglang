@@ -54,8 +54,8 @@ def check_shifted_mega_mhc_prefill(tokens):
             1e-6,
             20,
         )
-        # BF16 post rounding can be amplified by the carried collapse. These
-        # match the existing vLLM Mega mHC BF16 tolerances; stats stay FP32.
+        # BF16 post rounding can be amplified by the carried collapse;
+        # FP32 mixing statistics use tighter tolerances.
         for actual, expected in zip(
             (actual_residual, actual_norm), (expected_residual, expected_norm)
         ):

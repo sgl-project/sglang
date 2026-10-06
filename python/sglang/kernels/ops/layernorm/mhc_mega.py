@@ -1,4 +1,8 @@
-"""Experimental DSv4.1 prefill boundary using DeepGEMM's shifted Mega mHC."""
+"""SGLang DSv4.1 prefill integration of Mega mHC.
+
+Credit: DeepSeek's DeepGEMM project provides the fused Mega mHC kernel.
+https://github.com/deepseek-ai/DeepGEMM
+"""
 
 import torch
 
