@@ -620,6 +620,76 @@ class ServingChatTestCase(CustomTestCase):
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
+    def test_text_only_prompt_reuses_rendered_token_ids(self):
+        self.tm.model_config.is_multimodal = True
+        self.chat.chat_encoding_spec = None
+        self.template_manager.chat_template_name = None
+        self.chat._tokenizer_auto_adds_specials = False
+        self.chat._prompt_text_round_trip_is_lossy = False
+        processed = MessageProcessingResult(
+            prompt="rendered prompt",
+            prompt_ids=[11, 22, 33],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+
+        with patch.object(self.chat, "_process_messages", return_value=processed):
+            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+
+        self.assertEqual(adapted.input_ids, [11, 22, 33])
+        self.assertIsNone(adapted.text)
+
+    def test_prompt_reuse_keeps_media_path(self):
+        self.tm.model_config.is_multimodal = True
+        self.chat.chat_encoding_spec = None
+        self.template_manager.chat_template_name = None
+        self.chat._tokenizer_auto_adds_specials = False
+        self.chat._prompt_text_round_trip_is_lossy = False
+        processed = MessageProcessingResult(
+            prompt="rendered prompt",
+            prompt_ids=[11, 22, 33],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+        processed.image_data = ["image"]
+
+        with patch.object(self.chat, "_process_messages", return_value=processed):
+            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+
+        self.assertEqual(adapted.text, "rendered prompt")
+        self.assertIsNone(adapted.input_ids)
+
+    def test_prompt_reuse_keeps_always_on_processor_path(self):
+        self.tm.model_config.is_multimodal = True
+        self.tm.model_config.hf_config.architectures = [
+            "MossVLForConditionalGeneration"
+        ]
+        self.chat.chat_encoding_spec = None
+        self.template_manager.chat_template_name = None
+        self.chat._tokenizer_auto_adds_specials = False
+        self.chat._prompt_text_round_trip_is_lossy = False
+        processed = MessageProcessingResult(
+            prompt="rendered prompt",
+            prompt_ids=[11, 22, 33],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+
+        with patch.object(self.chat, "_process_messages", return_value=processed):
+            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+
+        self.assertEqual(adapted.text, "rendered prompt")
+        self.assertIsNone(adapted.input_ids)
+
     def test_chat_applies_pd_header_overrides(self):
         request = ChatCompletionRequest(
             model="x",
@@ -1161,6 +1231,23 @@ class ServingChatTestCase(CustomTestCase):
         expected_tools = [tool.model_dump() for tool in req.tools]
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertEqual(kwargs["tools"], expected_tools)
+
+    def test_glm47_without_tools_has_no_tool_call_constraint(self):
+        """A plain GLM47 chat must not get the full-assistant EBNF: its
+        terminal state finishes the request even under ignore_eos."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.tool_call_parser = "glm47"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        processed = self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertIsNone(processed.tool_call_constraint)
 
     def test_jinja_tool_schema_fallback_to_flat_function(self):
         """Fallback to function-only schema when template rejects OpenAI wrapper."""
