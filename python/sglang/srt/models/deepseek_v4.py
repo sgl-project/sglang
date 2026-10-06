@@ -777,8 +777,9 @@ bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_i
 
 
 class MqaAttentionBase(nn.Module):
-    # Class-level default for subclasses that read it without running __init__.
+    # Class-level defaults for subclasses that read them without running __init__.
     wo_a_fp8: bool = False
+    _trtllm_attn: bool = False
 
     def __init__(
         self,
