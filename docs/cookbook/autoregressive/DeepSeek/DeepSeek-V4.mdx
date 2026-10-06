@@ -1285,17 +1285,9 @@ Two further limits are worth knowing before you size a run. The pool is a per-no
 
 ### 3.10 PD disaggregation on GB300 (Mooncake)
 
-The GB300 Pro Official FP4 roles adapt the **1P1D c480** configuration from
-[InferenceX #3187](https://github.com/SemiAnalysisAI/InferenceX/pull/3187).
-The [public recipe at commit 34d06e54](https://github.com/SemiAnalysisAI/InferenceX/blob/34d06e54c7614bb33d2a271b010ffde3ce3fa563/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv4/sglang/gb300-fp4/agentx/disagg-variants.yaml)
-uses `deepseek-ai/DeepSeek-V4-Pro-0813` and
-`lmsysorg/sglang:nightly-dev-cu13-20260916-c9a8fba9`.
-Its [successful public sweep](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/37270628136)
-(attempt 1) ran throughput and GSM8K evaluation with a **Dynamo frontend** and
-session affinity. The cookbook's standalone `sglang serve` commands and SGLang
-router adaptation have **not** been separately validated on GPUs, so these cells
-are marked **Not Verified** and carry no inherited aggregated benchmark results.
-Use the linked public recipe to reproduce the tested Dynamo deployment.
+The GB300 Pro Official FP4 recipes provide separate prefill and decode roles.
+Both selections are marked **Not Verified** because the standalone SGLang
+workers and router configuration have not been validated on GPUs.
 
 #### Roles and cache settings
 
@@ -1304,12 +1296,6 @@ then launch the command on both prefill nodes with ranks 0 and 1. Select
 **Disagg Decode → 4 Nodes** and launch on all four decode nodes with ranks 0–3.
 Each node has four GB300 GPUs. Set **Head node IP** separately for each worker;
 it is the first node of that worker, not the Mooncake master.
-
-Prefill uses TP8/DP8/EP8, a 131072-token prefill chunk, a 17408-token MegaMoE
-per-rank budget, and memory fraction 0.8. Decode uses TP16/DP16/EP16, a
-4096-token MegaMoE budget, and memory fraction 0.9. Both use DSpark with block
-size 6 and draft tokens 7, page size 256, and the FP4 indexer. **W4A4 is enabled
-only on prefill**; decode retains the image's draft MoE activation precision.
 
 The **Unified Cache External Linker** card appears on the GB300 prefill recipe
 and defaults to **enabled, Mooncake**. It adds
