@@ -418,8 +418,8 @@ class SchedulerMetricsReporter:
                 prefill_lengths.add(len(req.origin_input_ids))
             num_prefill_requests = stats.num_new_seqs if stats else len(prefill_reqs)
             sum_prefill_tokens = stats.log_input_tokens if stats else 0
-            # Prefill reqs lead batch.reqs, so they own the head of prefix_lens. Read
-            # the scheduled prefix: result processing already advanced each req's.
+            # Prefill reqs lead batch.reqs, so they own the head of prefix_lens;
+            # each req's own prefix was already advanced by result processing.
             sum_prefill_kv_tokens = sum(batch.prefix_lens[: len(prefill_reqs)])
 
         decode_kv = WelfordAccumulator()
