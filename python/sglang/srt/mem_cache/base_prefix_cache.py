@@ -32,7 +32,7 @@ from sglang.srt.runtime_context import get_observability, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -516,14 +516,18 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
+    def maybe_hand_to_session(self, req: Req) -> None:
+        """A cache that keeps records across requests (a streaming session) takes
+        the just-allocated row and the request's tree lock; the request borrows it."""
+
     def claim_kv_row(self, req: Req) -> bool:
         """A streaming session keeps the request's kv row for the next turn.
         Return True after taking the row; the caller then releases nothing."""
         return False
 
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        """The row is freed and the lock dropped; ``inserted`` says whether the
-        KV went into the tree first. Drop per-request state kept outside the tree."""
+    def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        """The row is freed and the lock dropped; ``checkpointed`` says whether
+        the KV went into the tree first. Drop per-request state kept outside the tree."""
 
     def evictable_size(self):
         return 0
@@ -651,20 +655,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def release_radix_session(self, session_id: str) -> None:
         pass
 
-    def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
+    def session_records(self) -> dict[str, ReqKvInfo]:
+        """The KV records sessions own, by session id. Pool accounting counts them
+        as session-held, including while a request runs on one."""
+        return {}
 
     def supports_prefix_sharing(self) -> bool:
         """Whether a request's prefix stays in the cache for other requests to

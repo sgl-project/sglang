@@ -12,7 +12,7 @@ use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
-use crate::policies::{ExternalPrefixSignal, Policy};
+use crate::policies::{Policy, PrefixLookupResult};
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
@@ -229,11 +229,7 @@ async fn select_workers(
 /// Credit the chosen prefill with the prompt's prefix until KV events confirm
 /// it. Called only once the whole selection succeeded, so a request that is
 /// never dispatched credits nobody.
-fn record_prefill_route(
-    ctx: &AppContext,
-    signal: Option<&ExternalPrefixSignal>,
-    prefill_url: &str,
-) {
+fn record_prefill_route(ctx: &AppContext, signal: Option<&PrefixLookupResult>, prefill_url: &str) {
     if let (Some(provider), Some(signal)) = (&ctx.radix_tree_prefix_provider, signal) {
         provider.record_route(signal, prefill_url);
     }
@@ -287,7 +283,7 @@ fn capture_load_snapshot(
 }
 
 struct RoutingContext<'a> {
-    prefix_matches: Option<ExternalPrefixSignal>,
+    prefix_matches: Option<PrefixLookupResult>,
     load_snapshot: Option<EngineReportedLoadSnapshot>,
     ttft_slo_ms: Option<u64>,
     tps_slo: Option<f64>,
@@ -414,7 +410,7 @@ fn pick_decode_worker(
 async fn lookup_prefix_matches(
     ctx: &AppContext,
     request: &PreparedRequest,
-) -> Result<Option<ExternalPrefixSignal>, ApiError> {
+) -> Result<Option<PrefixLookupResult>, ApiError> {
     let signal = match (
         ctx.prefix_index.as_ref(),
         request.tokens.as_ref(),
@@ -433,7 +429,7 @@ async fn lookup_prefix_matches(
             } else {
                 resolve_prefix_query(index.match_prefix(hashes).await, &request.model.0)?
             };
-            Some(ExternalPrefixSignal {
+            Some(PrefixLookupResult {
                 outcome,
                 query_blocks,
                 block_hashes: None,

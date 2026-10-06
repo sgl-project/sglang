@@ -1772,6 +1772,7 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_npu": "is_npu",
     "is_xpu": "is_xpu",
     "is_musa": "is_musa",
+    "is_mps": "is_mps",
     "is_sm90": "is_sm90_supported",
     "is_sm100": "is_sm100_supported",
     "is_sm100_or_sm110": "is_sm100_or_sm110_supported",
@@ -1991,13 +1992,12 @@ def exports_expert_balancedness_to_prometheus() -> bool:
 
 
 def cutedsl_moe_max_num_tokens() -> int:
-    """The CuteDSL A2A per-rank token budget.
+    """Largest token count one forward routes through a CuteDSL MoE layer on one
+    DP rank; sizes the standard-allgather wrapper, MegaMoE, and AR fusion buffers.
 
     Every input is a published leaf (``spec``, ``schedule``, ``exec.graph``), so
-    this derives from the bags and follows a post-publish override;
-    ``overrides.cutedsl_moe_max_num_tokens`` is the pre-publish equivalent the
-    resolution pipeline uses. Max over the prefill bound, the piecewise-prefill
-    capture, and the decode/verify bound.
+    this follows a post-publish override. Max over the prefill bound, the
+    piecewise-prefill capture, and the decode/verify bound.
     """
     from sglang.srt.model_executor.cuda_graph_config import Backend
 

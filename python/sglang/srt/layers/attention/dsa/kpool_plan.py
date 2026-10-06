@@ -373,8 +373,9 @@ def _kpool_plan_to_gpu(
             pool_pool_id_t, slots_per_page, rounding_mode="floor"
         )
         token_page_row = pool_page_group * pool_size
-        packed_page = full_real_page_table[pool_batch_idx_t, token_page_row].to(
-            torch.int64
+        packed_page = (
+            full_real_page_table[pool_batch_idx_t, token_page_row].to(torch.int64)
+            // pool_size
         )
         pool_write_locs = packed_page * slots_per_page + torch.remainder(
             pool_pool_id_t, slots_per_page
