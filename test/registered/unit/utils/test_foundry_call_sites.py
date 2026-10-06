@@ -50,6 +50,12 @@ _CALL_SITES = [
      "get_foundry_adapter().capture_scope", "any"),
     (_PREFILL, "PrefillCudaGraphRunner.capture",
      "get_foundry_adapter().capture_scope", "any"),
+    (_DECODE, "DecodeCudaGraphRunner._capture_graphs",
+     "get_foundry_adapter().run_capture_loop", "any"),
+    (_PREFILL, "PrefillCudaGraphRunner._capture_graphs",
+     "get_foundry_adapter().run_capture_loop", "any"),
+    ("layers/moe/token_dispatcher/standard.py", "StandardDispatcher.dispatch",
+     "self.prepare_local_expert_mapping", "any"),
     ("model_executor/runner_backend/full_cuda_graph_backend.py",
      "FullCudaGraphBackend.capture_one", "foundry.capture_one",
      "before:self._cuda_graph_runner"),
@@ -197,17 +203,74 @@ class TestFoundryCallSites(CustomTestCase):
                 "pool": "self._pool",
                 "stream": "self._capture_stream",
                 "prefill_req_slots": "self._prefill_req_slots()",
+                "post_warmup_hook": "post_warmup_hook",
+                "tp_group": "self._tp_group",
             },
         )
+        # The warm-up pass returns None: SGLang stores only a real result.
         assign = next(
             n for n in ast.walk(fn) if isinstance(n, ast.Assign) and n.value is call
         )
+        result = ast.unparse(assign.targets[0])
+        stores = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Assign)
+            and isinstance(n.value, ast.Name)
+            and n.value.id == result
+        ]
+        self.assertEqual(len(stores), 1)
         self.assertEqual(
-            [ast.unparse(t) for t in assign.targets[0].elts],
+            [ast.unparse(t) for t in stores[0].targets[0].elts],
             ["self._graphs[shape_key]", "self._outputs[shape_key]"],
         )
+        guard = next(
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.If) and stores[0] in n.body
+        )
+        self.assertEqual(ast.unparse(guard.test), f"{result} is not None")
         # Nothing hands Foundry the backend itself.
         self.assertNotIn("self", [ast.unparse(a) for a in call.args])
+
+    def test_both_passes_run_inside_the_capture_session(self):
+        """run_capture_loop gets the per-shape loop itself, called inside the
+        backend's capture session, so both passes share it."""
+        for path, cls in (
+            (_DECODE, "DecodeCudaGraphRunner"),
+            (_PREFILL, "PrefillCudaGraphRunner"),
+        ):
+            with self.subTest(runner=cls):
+                fn = _find(path, f"{cls}._capture_graphs")
+                call = next(
+                    n
+                    for n in ast.walk(fn)
+                    if isinstance(n, ast.Call)
+                    and ast.unparse(n.func) == "get_foundry_adapter().run_capture_loop"
+                )
+                self.assertEqual(
+                    [ast.unparse(a) for a in call.args],
+                    ["self", "self._capture_one_stream"],
+                )
+                session = next(
+                    n
+                    for n in ast.walk(fn)
+                    if isinstance(n, ast.With)
+                    and "capture_session" in ast.unparse(n.items[0].context_expr)
+                )
+                self.assertIn(call, list(ast.walk(session)))
+
+    def test_flashinfer_decode_wrappers_are_reused(self):
+        """A shape prepared twice keeps its wrappers (the second pass must not
+        allocate replacement workspaces)."""
+        fn = _find(
+            "layers/attention/flashinfer_backend.py",
+            "FlashInferAttnBackend._create_decode_wrappers",
+        )
+        self.assertIn("self.decode_cuda_graph_metadata.get(bs)", ast.unparse(fn))
+        first = _body(fn)[1]
+        self.assertIsInstance(first, ast.If)
+        self.assertIsInstance(first.body[0], ast.Return)
 
     def test_capture_scope_wraps_the_whole_capture_loop(self):
         """Foundry's scope must bracket warmup and every shape: the runner's

@@ -49,6 +49,7 @@ A process is persistence-enabled from its first activation or not at all. Foundr
 ## What it changes
 
 - Decode graphs use the `full` backend; prefill graphs are `full` or `disabled` (default `disabled`). Other backends are rejected.
+- Each runner's per-shape capture loop runs twice. On `save`, the first pass runs the usual two warm-up forwards per shape inside a private CUDA memory pool, so compilation and autotuning happen before capture; the pool is released before the second pass captures. On `load`, the first pass only prepares each shape and no forward runs. Because of this, per-shape capture preparation has to be idempotent: FlashInfer reuses its decode wrappers for a batch size it already prepared.
 - Flags and environment variables that select state a restored graph cannot replay (custom all-reduce IPC buffers, NCCL symmetric memory / NVLS / buffer registration, MSCCL++, two-batch overlap, the memory saver, graph-pool borrow / precarve, the metadata glue graph) are pinned; each pin prints a `[Foundry] pin:` line, and an explicit contrary value stops the launch with the reason.
 - Speculative decoding, LoRA, PD multiplexing, elastic-EP graph recapture and post-capture KV sizing are not supported.
 

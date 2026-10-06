@@ -74,6 +74,12 @@ def _fake_api(
         "configure_subprocess", server_args
     )
     api.capture_scope = lambda runner: scope("capture_scope", runner)
+
+    def run_capture_loop(runner, loop_fn):
+        api.calls.append(("run_capture_loop", (runner,), {}))
+        return loop_fn()
+
+    api.run_capture_loop = run_capture_loop
     return api
 
 
@@ -110,6 +116,12 @@ class TestFoundryAdapter(CustomTestCase):
             self.assertIsNone(adapter.replay_saved_memory_pool_config())
             with adapter.capture_scope(object()), adapter.configure_subprocess():
                 pass
+            # The capture loop runs exactly once without Foundry.
+            runs = []
+            self.assertEqual(
+                adapter.run_capture_loop(object(), lambda: runs.append(1) or "r"), "r"
+            )
+            self.assertEqual(runs, [1])
 
     def test_flag_without_foundry_raises_with_install_hint(self):
         with (
@@ -192,16 +204,31 @@ class TestFoundryAdapter(CustomTestCase):
             adapter.after_alloc_memory_pool(runner)
             with adapter.capture_scope(runner):
                 pass
+            self.assertEqual(adapter.run_capture_loop(runner, lambda: "looped"), "looped")
+            hook, group = object(), object()
             self.assertEqual(
                 adapter.capture_one(
-                    "key", None, pool="pool", stream="stream", prefill_req_slots=4
+                    "key",
+                    None,
+                    pool="pool",
+                    stream="stream",
+                    prefill_req_slots=4,
+                    post_warmup_hook=hook,
+                    tp_group=group,
                 ),
                 ("graph", "out"),
             )
             name, args, kwargs = api.calls[-1]
             self.assertEqual((name, args), ("capture_one", ("key", None)))
             self.assertEqual(
-                kwargs, {"pool": "pool", "stream": "stream", "prefill_req_slots": 4}
+                kwargs,
+                {
+                    "pool": "pool",
+                    "stream": "stream",
+                    "prefill_req_slots": 4,
+                    "post_warmup_hook": hook,
+                    "tp_group": group,
+                },
             )
         called = [name for name, _, _ in api.calls]
         methods = [
