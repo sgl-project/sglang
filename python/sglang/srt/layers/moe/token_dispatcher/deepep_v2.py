@@ -41,7 +41,7 @@ try:
     from deep_ep import ElasticBuffer
 
     use_deepep_v2 = True
-except (ImportError, OSError) as exc:
+except Exception as exc:  # deep_ep's import-time host checks; see deepep.py
     use_deepep_v2 = False
     _deepep_v2_import_error = exc
 
