@@ -849,12 +849,9 @@ class Dots3AttentionMLA(nn.Module):
         weight_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if weight.dtype == torch.float8_e4m3fn:
-            import deep_gemm
-
             assert weight_scale is not None
             lhs_fp8 = per_token_group_quant_einsum_fp8(lhs)
-            deep_gemm.fp8_einsum(
-                "bhr,hdr->bhd",
+            deep_gemm_wrapper.einsum_bhr_hdr_bhd_f8f8bf16(
                 lhs_fp8,
                 (weight, weight_scale),
                 out,

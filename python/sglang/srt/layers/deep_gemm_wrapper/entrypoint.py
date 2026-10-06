@@ -277,6 +277,31 @@ def gemm_nt_bf16bf16f32(
         deep_gemm.bf16_gemm_nt(lhs, rhs, out)
 
 
+def einsum_bhr_hdr_bhd_f8f8bf16(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    recipe: Tuple[int, int, int] = (1, 128, 128),
+):
+    """Grouped FP8 matmul ``out[b, h, d] = sum_r lhs[b, h, r] * rhs[h, d, r]``."""
+    if not ENABLE_JIT_DEEPGEMM:
+        # Callers select the FP8 einsum independently of JIT DeepGEMM (e.g.
+        # SGL_USE_DEEPGEMM_BMM), so keep the direct call without the warmup hook.
+        import deep_gemm as _deep_gemm
+
+        _deep_gemm.fp8_einsum("bhr,hdr->bhd", lhs, rhs, out, recipe=recipe)
+        return
+
+    m, num_groups, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.EINSUM_BHR_HDR_BHD_F8F8BF16
+
+    with compile_utils.deep_gemm_execution_hook(
+        m, n, k, num_groups, kernel_type, recipe=recipe
+    ):
+        deep_gemm.fp8_einsum("bhr,hdr->bhd", lhs, rhs, out, recipe=recipe)
+
+
 def tf32_hc_prenorm_gemm(
     x: torch.Tensor,
     fn: torch.Tensor,
