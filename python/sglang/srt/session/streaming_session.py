@@ -178,7 +178,7 @@ class StreamingSession:
         if isinstance(req.finished_reason, FINISH_ABORT):
             # Hand the record and the tree lock back; the caller releases them.
             del self.slots[req.session.session_id]
-            req.lock = slot.lock
+            req.lock, slot.lock = slot.lock, None
             req.session.abort_req()
             return False
 

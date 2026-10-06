@@ -10051,12 +10051,7 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
             (
                 "dec_swa_lock_only",
                 lambda: make(DecSwaLockOnlyResult),
-                lambda: cache.release_swa(
-                    TreeLock(
-                        node,
-                        DecLockRefParams(component_lock_uuids={ComponentType.SWA: 1}),
-                    )
-                ),
+                lambda: cache.release_swa(TreeLock(node, DecLockRefParams())),
                 None,
             ),
         ]

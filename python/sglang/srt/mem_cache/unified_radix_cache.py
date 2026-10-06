@@ -1011,14 +1011,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.dec_lock_ref(lock.node, lock.receipt, skip_swa=lock.swa_released)
 
     def release_swa(self, lock: Optional[TreeLock]) -> None:
-        """Release the SWA part of ``lock`` early, once; a no-op when the lock
-        holds no SWA part."""
-        if (
-            self.disable
-            or lock is None
-            or lock.swa_released
-            or lock.receipt.component_lock_uuids.get(ComponentType.SWA) is None
-        ):
+        """Release the SWA part of ``lock`` early, once."""
+        if self.disable or lock is None or lock.swa_released:
             return
         result = self.tree_core.dec_swa_lock_only(lock.node, lock.receipt)
         self._free_values(result.device_frees, result.host_frees)
@@ -1027,7 +1021,12 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_swa_prefix_lock(self, req: Req) -> None:
         """The request's window has moved past its prefix: leave the prefix's
         SWA evictable. A session turn releases its slot's lock, once per session."""
-        self.release_swa((self.session.borrowed_slot(req) or req).lock)
+        lock = (self.session.borrowed_slot(req) or req).lock
+        if (
+            lock is not None
+            and lock.receipt.component_lock_uuids.get(ComponentType.SWA) is not None
+        ):
+            self.release_swa(lock)
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         if self.disable:
