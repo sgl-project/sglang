@@ -442,6 +442,11 @@ class UnifiedRadixCache(BasePrefixCache):
             ) = HybridCacheController.parse_storage_backend_extra_config(
                 get_memory().hicache_storage_backend_extra_config
             )
+            if server_args.file_storage_path:
+                storage_extra_config = dict(storage_extra_config or {})
+                storage_extra_config.setdefault(
+                    "file_storage_path", server_args.file_storage_path
+                )
         storage_prefetch_threshold = (
             self._storage_attachment.resolve_prefetch_threshold(
                 storage_prefetch_threshold
@@ -558,6 +563,9 @@ class UnifiedRadixCache(BasePrefixCache):
         result = self.session.try_match_prefix(params)
         if result is not None:
             return result
+        return self._match_tree(params)
+
+    def _match_tree(self, params: MatchPrefixParams) -> MatchResult:
         if self.disable:
             return self.tree_core.empty_match_result
         result = self.tree_core.match_prefix(params)
@@ -1007,6 +1015,19 @@ class UnifiedRadixCache(BasePrefixCache):
         result = self.tree_core.dec_swa_lock_only(node_id, params)
         self._free_values(result.device_frees, result.host_frees)
 
+    def release_swa_prefix_lock(self, req: Req) -> None:
+        """The request's window has moved past its prefix: leave the prefix's
+        SWA evictable. A session turn releases its slot's lock, once per session."""
+        holder = self.session.borrowed_slot(req) or req
+        if (
+            holder.swa_prefix_lock_released
+            or holder.last_node is None
+            or holder.lock_receipt.component_lock_uuids.get(ComponentType.SWA) is None
+        ):
+            return
+        self.dec_swa_lock_only(holder.last_node, holder.lock_receipt)
+        holder.swa_prefix_lock_released = True
+
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult()
@@ -1019,6 +1040,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
+    def maybe_hand_to_session(self, req: Req) -> None:
+        self.session.take(req)
+
     def claim_kv_row(self, req: Req) -> bool:
         # Retraction also enters here: retain its ticket until actual finish.
         if (
@@ -1029,9 +1053,9 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.release_pp_prefetch(req.rid)
         return self.session.try_cache_finished_req(req)
 
-    @rank_consensus(same_params=["req.rid", "inserted"])
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        if inserted:
+    @rank_consensus(same_params=["req.rid", "checkpointed"])
+    def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if checkpointed:
             return
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(req, is_finished=True)
@@ -1040,6 +1064,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
         if self.session.try_checkpoint(req, up_to=up_to, **kwargs):
             return
+        self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
+
+    def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
+        """Insert ``[cache_protected_len, up_to)`` of the request's record and
+        move its tree lock onto the node the insert ended on."""
         # A finished request hands its component state (mamba) to the tree
         # instead of forking it, and the tree frees what the request still held.
         is_finished = req.finished()
@@ -1163,7 +1192,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
+        # The tree's own walk: a session slot must not answer for the insert.
+        match_result = self._match_tree(MatchPrefixParams(key=radix_key, req=req))
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
@@ -3635,7 +3665,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         # Skip when streaming sessions hold tree locks: the check asserts
         # all nodes are unlocked during idle, which streaming sessions break
-        # by design (they hold a first-turn lock across turns).
+        # by design (each slot holds a lock on its prefix across turns).
         if self.session.any_holding_kv():
             return
 

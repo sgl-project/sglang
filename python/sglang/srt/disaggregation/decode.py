@@ -1719,7 +1719,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ]
             for decode_req in failed_reqs:
                 if decode_req.req.kv.holds_mamba and not decode_req.req.kv.holds_kv:
-                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                    release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -2221,6 +2221,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
         req.set_extend_range(total_prefix_len, req.kv.kv_committed_len)
+        self.tree_cache.maybe_hand_to_session(req)
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
@@ -2621,7 +2622,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             discard_kv_cache_backup(decode_req.req, self.tree_cache, "host_pool")
             if decode_req.host_staged:
                 return
-        release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+        release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
@@ -3125,7 +3126,7 @@ class SchedulerDisaggregationDecodeMixin:
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         )
         self.output_streamer.stream_output([req], req.return_logprob)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        release_kv_cache(req, self.tree_cache, checkpoint=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
 
