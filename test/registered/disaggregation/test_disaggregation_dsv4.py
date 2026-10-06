@@ -21,6 +21,10 @@ DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":9
 DSV4_FLASH_ENV = {
     "SGLANG_DSV4_FP4_EXPERTS": "0",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
+    "SGLANG_OPT_DSV4_NONPAGED_INDEXER": "1",
+    # Exercise the non-paged gather on single-request prefill even with the
+    # server's 2048-token chunks; the default 8192-row threshold skips it.
+    "SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS": "1",
 }
 
 _EAGLE_SPEC_ARGS = [

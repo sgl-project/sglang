@@ -5,12 +5,14 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4IndexerPool,
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
     _CompressedPoolConfig,
@@ -24,6 +26,80 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDSV4CompressedPools(CustomTestCase):
+    def test_fp8_indexer_pool_shared_accessor_gathers_physical_pages(self):
+        """DSv4's non-paged gather must read keys/scales across index pages.
+
+        #42178 made the shared accessor require a DSA-only page-size field,
+        so real DSv4 pools crashed even though mocked indexer dispatch passed.
+        """
+
+        def gather_on_cpu(
+            *,
+            buf,
+            page_indices,
+            seq_lens,
+            seq_len_sum,
+            max_seq_len,
+            page_size,
+            index_head_dim,
+        ):
+            # Replace only the device kernel; keep pool construction, accessor
+            # dispatch, and page-size selection on their production paths.
+            key_bytes = page_size * index_head_dim
+            pages = buf[page_indices.flatten()]
+            keys = pages[:, :key_bytes].reshape(-1, index_head_dim)
+            scales = pages[:, key_bytes:].reshape(-1, 4)
+            return keys[:seq_len_sum], scales[:seq_len_sum]
+
+        for page_size in (64, 128):
+            with self.subTest(page_size=page_size):
+                pool = DeepSeekV4IndexerPool(
+                    size=512,
+                    page_size=page_size,
+                    dtype=torch.uint8,
+                    index_head_dim=128,
+                    layer_num=1,
+                    device="cpu",
+                    enable_memory_saver=False,
+                    use_fp4_indexer=False,
+                    global_page_size=256,
+                )
+                seq_len = page_size + 5
+                expected_k = (
+                    torch.arange(seq_len * 128).reshape(seq_len, 128) % 251
+                ).to(torch.uint8)
+                expected_s = torch.arange(seq_len, dtype=torch.float32).reshape(-1, 1)
+                # Non-sequential page ids and a partial final page catch using
+                # the 256-token logical page instead of the index storage page.
+                page_ids = torch.tensor([[3, 1]], dtype=torch.int32)
+                buf = pool.get_index_k_with_scale_buffer(0)
+                for page, start in zip(page_ids.flatten(), (0, page_size)):
+                    count = min(page_size, seq_len - start)
+                    buf[page, : count * 128] = expected_k[
+                        start : start + count
+                    ].flatten()
+                    scale_start = page_size * 128
+                    buf[page, scale_start : scale_start + count * 4] = (
+                        expected_s[start : start + count].view(torch.uint8).flatten()
+                    )
+
+                with (
+                    patch.object(index_buf_accessor, "_use_aiter_preshuffle", False),
+                    patch.object(
+                        index_buf_accessor, "_get_k_and_s_triton", gather_on_cpu
+                    ),
+                ):
+                    keys, scales = pool.get_index_k_scale_buffer(
+                        0,
+                        seq_len_tensor=torch.tensor([seq_len], dtype=torch.int32),
+                        page_indices=page_ids,
+                        seq_len_sum=seq_len,
+                        max_seq_len=seq_len,
+                    )
+
+                torch.testing.assert_close(keys, expected_k)
+                torch.testing.assert_close(scales.view(torch.float32), expected_s)
+
     def test_swa_key_page_size_uses_physical_paged_size(self):
         pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
         pool.request_window = None
