@@ -40,6 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.mimo_v2 import (
@@ -343,7 +344,9 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                 if name in params_dict.keys():
                     param = params_dict[name]
                     if "attention_sink_bias" in name:
-                        projection = self.get_submodule(name.rsplit(".", 1)[0]).qkv_proj
+                        projection = unwrap_lora_layer(
+                            self.get_submodule(name.rsplit(".", 1)[0]).qkv_proj
+                        )
                         start = (
                             get_group_rank_size(projection.tp_group)[0] * param.numel()
                         )

@@ -2,12 +2,13 @@
 
 import unittest
 from contextlib import nullcontext
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.configs.dots3 import Dots3Config
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.lora.layers import BaseLayerWithLoRA, unwrap_lora_layer
 from sglang.srt.models.dots3_common.modeling import (
     Dots3AttentionMLA,
     Dots3LanguageModelForCausalLM,
@@ -156,7 +157,7 @@ def load_fused(
     with loading_scope(changed), patch.object(model, "post_load_weights") as post:
         model.load_weights(weights, is_nextn=nextn)
         post.assert_called_once()
-    owner = attention.q_b_proj
+    owner = unwrap_lora_layer(attention.q_b_proj)
     gate = parts["g_proj.weight"].chunk(rank_size(owner)[1], 0)[rank_size(owner)[0]]
 
     def pad(t, target):
@@ -204,7 +205,7 @@ class TestDotsFusedGateLoaderLayout(CustomTestCase):
         self.addCleanup(torch.set_default_dtype, original)
         torch.set_default_dtype(torch.bfloat16)
 
-    def check_loads(self, changed, nextn=False):
+    def check_loads(self, changed, nextn=False, wrapped=False):
         for dp in (1, 2):
             for rank in range(4):
                 reset_context()
@@ -219,6 +220,10 @@ class TestDotsFusedGateLoaderLayout(CustomTestCase):
                     for layer in ("full_attention", "sliding_attention"):
                         for fp8 in (False, True):
                             model, attention = build_model(gate, layer, fp8, nextn)
+                            if wrapped:
+                                attention.q_b_proj = BaseLayerWithLoRA(
+                                    attention.q_b_proj, Mock()
+                                )
                             for offset in (0, 11):
                                 for reverse in (False, True):
                                     with self.subTest(
@@ -247,6 +252,9 @@ class TestDotsFusedGateLoaderLayout(CustomTestCase):
 
     def test_mtp_checkpoint_mapping_after_scope_exit(self):
         self.check_loads(True, nextn=True)
+
+    def test_wrapped_gate_owner_after_scope_exit(self):
+        self.check_loads(True, wrapped=True)
 
     def test_gate_keeps_rank_when_width_is_unchanged(self):
         publish(

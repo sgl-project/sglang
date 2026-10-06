@@ -3,9 +3,11 @@
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.lora.layers import BaseLayerWithLoRA, unwrap_lora_layer
 from sglang.srt.models.interns1pro import (
     InternS1ProForConditionalGeneration,
     InternS1ProTextAttention,
@@ -100,7 +102,7 @@ def load_coefficients(model, attention, *, changed=False, offset=0, top_level=Fa
             % 37
             - 18
         ).float().reshape(shape) / 64
-        owner = attention.qkv_proj
+        owner = unwrap_lora_layer(attention.qkv_proj)
         first = (
             rank_size(owner)[0]
             // max(1, rank_size(owner)[1] // shape[0])
@@ -134,7 +136,7 @@ class TestInternS1ProFopeLoaderLayout(CustomTestCase):
         self.addCleanup(torch.set_default_dtype, original)
         torch.set_default_dtype(torch.bfloat16)
 
-    def check_loads(self, changed, top_level=False):
+    def check_loads(self, changed, top_level=False, wrapped=False):
         for dp in (1, 2):
             for rank in range(4):
                 reset_context()
@@ -148,6 +150,10 @@ class TestInternS1ProFopeLoaderLayout(CustomTestCase):
                 for kv_heads in (1, 2, 8):
                     for head_dim in (8, 16):
                         model, attention = build_model(kv_heads, head_dim)
+                        if wrapped:
+                            attention.qkv_proj = BaseLayerWithLoRA(
+                                attention.qkv_proj, Mock()
+                            )
                         for offset in (0, 13):
                             with self.subTest(
                                 dp=dp,
@@ -172,6 +178,9 @@ class TestInternS1ProFopeLoaderLayout(CustomTestCase):
 
     def test_checkpoint_name_mapping_after_scope_exit(self):
         self.check_loads(True, top_level=True)
+
+    def test_wrapped_projection_coefficients_after_scope_exit(self):
+        self.check_loads(True, top_level=True, wrapped=True)
 
     def test_coefficient_shards_keep_rank_when_width_is_unchanged(self):
         publish(

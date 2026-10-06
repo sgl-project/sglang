@@ -67,6 +67,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -106,6 +107,7 @@ def load_mimo_v2_qkv_proj_weight(
     *,
     qkv_proj: QKVParallelLinear,
 ):
+    qkv_proj = unwrap_lora_layer(qkv_proj)
     tp_rank, tp_size = get_group_rank_size(qkv_proj.tp_group)
     ckpt_tp = expected_fused_tp_size if expected_fused_tp_size is not None else tp_size
 
@@ -210,7 +212,7 @@ def _resolve_deferred_qkv_scale_inv(
                 f"weight {weight_name} not found"
             )
 
-        qkv_proj = model.get_submodule(weight_name.rsplit(".", 1)[0])
+        qkv_proj = unwrap_lora_layer(model.get_submodule(weight_name.rsplit(".", 1)[0]))
         tp_rank, tp_size = get_group_rank_size(qkv_proj.tp_group)
         shards_per_rank = ckpt_tp // tp_size
         weight_param = params_dict[weight_name]
@@ -1604,9 +1606,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     if name in params_dict.keys():
                         param = params_dict[name]
                         if "attention_sink_bias" in name:
-                            projection = self.get_submodule(
-                                name.rsplit(".", 1)[0]
-                            ).qkv_proj
+                            projection = unwrap_lora_layer(
+                                self.get_submodule(name.rsplit(".", 1)[0]).qkv_proj
+                            )
                             start = (
                                 get_group_rank_size(projection.tp_group)[0]
                                 * param.numel()

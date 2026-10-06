@@ -92,6 +92,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
@@ -1945,7 +1946,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             *,
             q_b_proj: ColumnParallelLinear,
         ):
-            group = q_b_proj.tp_group
+            group = unwrap_lora_layer(q_b_proj).tp_group
             attn_tp_rank = group.rank_in_group if group is not None else 0
             attn_tp_size = group.world_size if group is not None else 1
             assert weight.ndim > cat_dim, (

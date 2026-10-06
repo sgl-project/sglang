@@ -3,11 +3,13 @@
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.lora.layers import BaseLayerWithLoRA, unwrap_lora_layer
 from sglang.srt.models.mimo_v2 import (
     MiMoV2ForCausalLM,
     _resolve_deferred_qkv_scale_inv,
@@ -90,6 +92,8 @@ def values(shape, dtype, offset=0):
 
 
 def load_fused(projection, *, changed=False, ckpt_tp=None, sharded=False, offset=0):
+    destination = projection
+    projection = unwrap_lora_layer(projection)
     weight = projection.weight
     full = values(
         (weight.shape[0] * rank_size(projection)[1], weight.shape[1]),
@@ -100,13 +104,15 @@ def load_fused(projection, *, changed=False, ckpt_tp=None, sharded=False, offset
     data = shards[rank_size(projection)[0]] if sharded else full
     with loading_scope(changed):
         load_mimo_v2_qkv_proj_weight(
-            WEIGHT_NAME, weight, data, ckpt_tp, qkv_proj=projection
+            WEIGHT_NAME, weight, data, ckpt_tp, qkv_proj=destination
         )
     torch.testing.assert_close(weight, shards[rank_size(projection)[0]], rtol=0, atol=0)
     return weight
 
 
 def load_deferred(model, projection, *, changed=False, offset=0):
+    destination = projection
+    projection = unwrap_lora_layer(projection)
     ckpt_tp = 8
     rows = projection.weight.shape[0] * rank_size(projection)[1]
     full = values((rows, 128), torch.float8_e4m3fn, offset)
@@ -117,7 +123,7 @@ def load_deferred(model, projection, *, changed=False, offset=0):
     deferred = {}
     with loading_scope(changed):
         load_mimo_v2_qkv_proj_weight(
-            WEIGHT_NAME, projection.weight, full, ckpt_tp, qkv_proj=projection
+            WEIGHT_NAME, projection.weight, full, ckpt_tp, qkv_proj=destination
         )
         load_mimo_v2_qkv_proj_weight(
             SCALE_NAME,
@@ -125,12 +131,12 @@ def load_deferred(model, projection, *, changed=False, offset=0):
             scale,
             ckpt_tp,
             deferred_scale_inv=deferred,
-            qkv_proj=projection,
+            qkv_proj=destination,
         )
     assert SCALE_NAME in deferred
     assert deferred[SCALE_NAME].data_ptr() != scale.data_ptr()
     torch.testing.assert_close(deferred[SCALE_NAME], scale, rtol=0, atol=0)
-    params = dict(model.named_parameters())
+    params = {WEIGHT_NAME: projection.weight, SCALE_NAME: projection.weight_scale_inv}
     config = SimpleNamespace(
         num_attention_heads=64, num_key_value_heads=32, head_dim=32, v_head_dim=16
     )
@@ -184,7 +190,7 @@ class TestMiMoFusedQkvLoaderLayout(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
 
-    def check_loads(self, changed):
+    def check_loads(self, changed, wrapped=False):
         for dp in (1, 2):
             for rank in range(4):
                 reset_context()
@@ -201,11 +207,13 @@ class TestMiMoFusedQkvLoaderLayout(CustomTestCase):
                 )
                 for dtype in (torch.float32, torch.bfloat16):
                     _, projection = build_projection(dtype)
+                    if wrapped:
+                        projection = BaseLayerWithLoRA(projection, Mock())
                     for ckpt_tp, sharded in (
                         (None, True),
                         (None, False),
-                        (rank_size(projection)[1], True),
-                        (rank_size(projection)[1], False),
+                        (rank_size(unwrap_lora_layer(projection))[1], True),
+                        (rank_size(unwrap_lora_layer(projection))[1], False),
                         (8, False),
                     ):
                         for offset in (0, 11):
@@ -217,6 +225,9 @@ class TestMiMoFusedQkvLoaderLayout(CustomTestCase):
                                 offset=offset,
                             )
                 model, projection = build_projection(fp8=True)
+                if wrapped:
+                    projection = BaseLayerWithLoRA(projection, Mock())
+                    model.model.layers[0].self_attn.qkv_proj = projection
                 for offset in (0, 11):
                     load_deferred(model, projection, changed=changed, offset=offset)
 
@@ -226,7 +237,10 @@ class TestMiMoFusedQkvLoaderLayout(CustomTestCase):
     def test_native_projection_after_scope_exit(self):
         self.check_loads(True)
 
-    def test_main_and_mtp_callers_pass_the_native_projection(self):
+    def test_wrapped_projection_and_deferred_scales_after_scope_exit(self):
+        self.check_loads(True, wrapped=True)
+
+    def check_main_and_mtp_callers(self, wrapped=False):
         for dp in (1, 2):
             for rank in range(4):
                 reset_context()
@@ -249,6 +263,10 @@ class TestMiMoFusedQkvLoaderLayout(CustomTestCase):
                     model.quant_config = None
                     model._is_multimodal = False
                     model.model = root.model
+                    if wrapped:
+                        model.model.layers[0].self_attn.qkv_proj = BaseLayerWithLoRA(
+                            projection, Mock()
+                        )
                     name = WEIGHT_NAME
                     if model_type is MiMoV2MTP:
                         model.model.mtp_block = model.model.layers[0]
@@ -264,6 +282,12 @@ class TestMiMoFusedQkvLoaderLayout(CustomTestCase):
                         torch.testing.assert_close(
                             projection.weight, expected, rtol=0, atol=0
                         )
+
+    def test_main_and_mtp_callers_pass_the_native_projection(self):
+        self.check_main_and_mtp_callers()
+
+    def test_main_and_mtp_callers_unwrap_the_projection(self):
+        self.check_main_and_mtp_callers(wrapped=True)
 
     def test_rank_change_without_changing_partition_width(self):
         publish(

@@ -3,10 +3,11 @@
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.lora.layers import BaseLayerWithLoRA, unwrap_lora_layer
 from sglang.srt.models import gpt_oss
 from sglang.srt.models.gpt_oss import GptOssAttention, GptOssForCausalLM
 from sglang.srt.models.mimo_v2 import MiMoV2Attention, MiMoV2ForCausalLM
@@ -113,7 +114,7 @@ def load_sinks(
     source = (
         torch.arange(source_heads, device=param.device, dtype=torch.float32) + offset
     ) / 16
-    start = rank_size(attention.qkv_proj)[0] * param.numel()
+    start = rank_size(unwrap_lora_layer(attention.qkv_proj))[0] * param.numel()
     expected = source[start : start + param.numel()].to(param.dtype)
     if cpu_padding and expected.numel() < param.numel():
         expected = torch.cat(
@@ -138,7 +139,7 @@ class TestAttentionSinkLoaderLayout(CustomTestCase):
         original = torch.get_default_dtype()
         self.addCleanup(torch.set_default_dtype, original)
 
-    def check_loads(self, changed):
+    def check_loads(self, changed, wrapped=False):
         for dp in (1, 2):
             for rank in range(4):
                 for dtype in (torch.float32, torch.bfloat16):
@@ -160,6 +161,10 @@ class TestAttentionSinkLoaderLayout(CustomTestCase):
                     for kind in ("gpt", "mimo", "mtp"):
                         for kv_heads in (1, 4):
                             model, attention, name = build_model(kind, dtype, kv_heads)
+                            if wrapped:
+                                attention.qkv_proj = BaseLayerWithLoRA(
+                                    attention.qkv_proj, Mock()
+                                )
                             for offset in (0, 11):
                                 load_sinks(
                                     model,
@@ -174,6 +179,9 @@ class TestAttentionSinkLoaderLayout(CustomTestCase):
 
     def test_native_model_loaders_after_scope_exit(self):
         self.check_loads(True)
+
+    def test_wrapped_attention_sinks_after_scope_exit(self):
+        self.check_loads(True, wrapped=True)
 
     def test_gpt_cpu_checkpoint_tail_padding(self):
         # Exercise the CPU checkpoint branch with real CPU parameters/tensors.
