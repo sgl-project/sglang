@@ -1,3 +1,4 @@
+# Created by OpenAI
 # fmt: off
 """GLM-5.2 TP8 MTP fused MoE for selected M=24..768 product shapes."""
 

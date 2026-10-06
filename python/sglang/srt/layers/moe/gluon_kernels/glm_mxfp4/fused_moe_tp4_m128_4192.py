@@ -1,3 +1,4 @@
+# Created by OpenAI
 # fmt: off
 """Shared TP4 fused-MoE specialization for active batches M=128 through M=4192."""
 

@@ -1,3 +1,4 @@
+# Created by OpenAI
 # fmt: off
 """GLM-5.2 TP8 fused MoE specialization for M=32..128."""
 

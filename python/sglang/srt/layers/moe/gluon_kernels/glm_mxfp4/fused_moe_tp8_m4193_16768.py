@@ -1,3 +1,4 @@
+# Created by OpenAI
 # fmt: off
 """Experimental GLM-5.2 TP8 fused MoE with runtime M and bucketed codegen."""
 

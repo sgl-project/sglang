@@ -1,3 +1,4 @@
+# Created by OpenAI
 """TP4/EP1 large-prefill adapter for the shared full-expert kernel family."""
 
 from .fused_moe_tp8_m4193_16768 import fused_moe as _fused_moe
