@@ -82,9 +82,7 @@ struct TopKPagedParams {
   const PlanItem* __restrict__ metadata;  // [0]=GlobalMetadata, [1+i]=PlanItem
   int64_t score_stride;
   int64_t page_table_stride;
-  // Row stride of `page_indices` in elements. Equals `topk` for a dense
-  // output; larger when the caller aims the kernel at a column slice of a
-  // wider table (e.g. the trtllm combined [SWA | topk] table tail).
+  // Row stride of `page_indices` in elements; > topk when writing a column slice of a wider table.
   int64_t out_stride;
   uint32_t topk;
   uint32_t page_bits;
@@ -1023,8 +1021,7 @@ struct TopKKernel {
       page_table_ptr = static_cast<const int32_t*>(page_table.value().data_ptr());
       page_table_stride = (page_table.value()).stride(0);
     }
-    // A row stride larger than topk means the output is a column slice of a
-    // wider table (trtllm combined-table tail); rows must still be unit-stride.
+    // page_indices may be a column slice of a wider table; rows stay unit-stride.
     auto O = SymbolicSize{"out_stride"};
     TensorMatcher({B, K})  // page_indices
         .with_strides({O, 1})

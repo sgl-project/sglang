@@ -198,9 +198,7 @@ def fused_q_norm_rope(
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = q_input.shape[-1]
     rope_dim = freqs_real.shape[-1]
-    # An e4m3 q_output selects the fp8-store kernel variant (the trtllm-gen
-    # backend consumes q as fp8; storing it directly removes the separate
-    # per-layer cast pass). Bits match dtype-store -> .to(float8_e4m3fn).
+    # An e4m3 q_output selects the fp8-store variant (bits match dtype store + .to(e4m3)).
     fp8_out = q_output.dtype == torch.float8_e4m3fn
     if _is_xpu:
         assert eps is not None

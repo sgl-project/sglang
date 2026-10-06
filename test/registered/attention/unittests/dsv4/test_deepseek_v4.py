@@ -813,9 +813,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertTrue(torch.all(output[:6] == 7))
         self.assertTrue(torch.all(output[6:] == 0))
 
-        # The tail is zeroed once per (buffer, rows, real rows): the kernel only
-        # ever writes [:real rows], so the other layers of the step skip the
-        # memset. A different shape re-zeroes.
+        # Tail zeroed once per (buffer, rows, real rows); a different shape re-zeroes.
         output[6:] = 3
         again = backend._padded_output_buffer(num_rows=8, num_real_rows=6, num_heads=2)
         self.assertTrue(torch.all(again[6:] == 3))
