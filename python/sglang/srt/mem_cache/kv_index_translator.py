@@ -297,7 +297,7 @@ class KVIndexTranslator:
         as it is; its reads plan over the runner's own rows and lengths."""
         self.own_plan(forward_batch, runner_slots=True).bind(forward_batch, self)
 
-    def _build_iteration_table(
+    def build_iteration_table(
         self,
         plan: KVLocPlan,
         space: IdSpace,
@@ -305,13 +305,17 @@ class KVIndexTranslator:
         rows: Optional[int],
         previous: Optional[KVIndexTable],
         stream: Optional[KVReadStream] = None,
+        into: Optional[torch.Tensor] = None,
     ) -> KVIndexTable:
-        """A plan's page table in one sub-pool: the passthrough where its reads
-        stay virtual, else one build over ``[0, seq_lens + read_extent)``
-        through its page table. Rows past the plan's batch (a captured graph's
-        padded lanes) read the sink; a second, wider request copies the built
-        rows instead of building them again. ``stream``, from the reader the
-        build is for, is packed by the same launch."""
+        """A plan's page table in one sub-pool (`KVLocPlan.read_table` builds
+        through here): the passthrough where its reads stay virtual, else one
+        build over ``[0, seq_lens + read_extent)`` through its page table.
+        Rows past the plan's batch (a captured graph's padded lanes) read the
+        sink; a second, wider request copies the built rows instead of
+        building them again. ``stream``, from the reader the build is for, is
+        packed from the same gather. ``into``, a reader's own capture-stable
+        table, is built in place when it is wide enough, and then serves the
+        plan's other readers: no table of the plan's own, no copy."""
         if space.read_v2p is None:
             return self._passthrough_table(plan.req_pool_indices)
         bs = int(plan.req_pool_indices.numel())
@@ -330,9 +334,15 @@ class KVIndexTranslator:
                 width = min(max(-(-max_seq // self.page_size), 1), row_pages)
             else:
                 width = row_pages
-            # A fresh table: the build writes every column of the batch's rows,
-            # the sink past each row's live prefix included.
-            out = torch.empty((rows, width), dtype=torch.int32, device=self.device)
+            if into is not None and into.shape[0] >= rows and into.shape[1] >= width:
+                # The build writes every column up to `width`, the sink past
+                # each live prefix included, so the plan's other readers find
+                # in this view the table a fresh one would be.
+                out = into[:rows, :width]
+            else:
+                # A fresh table: the build writes every column of the batch's
+                # rows, the sink past each row's live prefix included.
+                out = torch.empty((rows, width), dtype=torch.int32, device=self.device)
             if stream is not None:
                 build_kv_read_table_and_stream(
                     req_to_token=self.req_to_token,
@@ -416,12 +426,13 @@ class KVIndexTranslator:
         kind: IdSpaceKind,
         rows: Optional[int] = None,
         stream: Optional[KVReadStream] = None,
+        into: Optional[torch.Tensor] = None,
     ):
         assert plan.is_read_by(self), (
             "a translating reader must read through the plan of its own "
             "req_to_token rows"
         )
-        return plan.read_table(kind=kind, rows=rows, stream=stream)
+        return plan.read_table(kind=kind, rows=rows, stream=stream, into=into)
 
     def _passthrough_table(self, req_pool_indices: torch.Tensor) -> KVIndexTable:
         return KVIndexTable(
@@ -453,7 +464,7 @@ class KVIndexTranslator:
         bs = int(seq_lens.numel())
         if self._reads_translated(kind) and not plan.has_read_table(kind):
             # The plan's first reader: the build that makes its table packs
-            # this stream from the same gather, in the same launch.
+            # this stream from the same gather.
             self._plan_table(
                 plan,
                 kind=kind,
@@ -490,17 +501,25 @@ class KVIndexTranslator:
         out: torch.Tensor,
         kind: IdSpaceKind = IdSpaceKind.FULL,
     ) -> None:
-        """Copy the plan's page table in the ``kind`` sub-pool into ``out``, a
-        capture-stable table a captured graph reads (one row per lane, padded
-        lanes reading the sink). Columns past a row's live prefix keep stale
-        values, which the kernels never read past their own lengths."""
+        """Fill ``out``, a capture-stable table a captured graph reads (one row
+        per lane, padded lanes reading the sink), with the plan's page table in
+        the ``kind`` sub-pool. The plan's first reader has the table built
+        straight into ``out``, which then serves the plan's other readers this
+        iteration; a later one copies it. Columns past the plan's width keep
+        their values, which the kernels never read past their own lengths."""
         assert self._reads_translated(kind), (
             "copy_page_table: reads stay virtual here (a non-unified pool, or "
             "DCP, where the caller selects this rank's share itself)"
         )
-        table = self._plan_table(plan, kind=kind, rows=out.shape[0])
+        rows = out.shape[0]
+        first = not plan.has_read_table(kind)
+        table = self._plan_table(
+            plan, kind=kind, rows=rows, into=out if first else None
+        )
+        if table.ids.data_ptr() == out.data_ptr():
+            return  # built in place, or this very buffer is the plan's table
         width = min(out.shape[1], table.ids.shape[1])
-        out[:, :width].copy_(table.ids[: out.shape[0], :width])
+        out[:, :width].copy_(table.ids[:rows, :width])
 
     # -- dispositions ----------------------------------------------------------
 

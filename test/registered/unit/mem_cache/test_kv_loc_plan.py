@@ -404,6 +404,45 @@ class TestKVLocPlan(unittest.TestCase):
         self.assertEqual(own_plan(ForwardMode.EXTEND, spec).read_extent, 0)
         self.assertEqual(own_plan(ForwardMode.DECODE, None).read_extent, 0)
 
+    def test_a_captured_first_reader_holds_the_table(self):
+        """When the plan's first reader is a captured table, the table is built
+        in that buffer -- no table of the plan's own, no copy -- and serves the
+        plan's other readers; the same buffer again is left alone, and another
+        captured reader copies it rather than building again."""
+        builds = []
+        real = kv_index_translator.build_kv_read_table
+
+        def counting(**kwargs):
+            builds.append(kwargs["out"])
+            return real(**kwargs)
+
+        bs = int(self.rpi.numel())
+        captured = torch.full((bs + 1, 8), 7, dtype=torch.int32)
+        with patch.object(kv_index_translator, "build_kv_read_table", counting):
+            plan = self._plan(read_extent=1)
+            self.target.copy_page_table(plan, out=captured)
+            self.assertEqual(len(builds), 1)
+            self.assertEqual(builds[0].data_ptr(), captured.data_ptr())
+            table = plan.read_table(rows=bs + 1)
+            self.assertEqual(table.ids.data_ptr(), captured.data_ptr())
+            self.assertEqual(table.row_stride, captured.stride(0))
+            width = table.ids.shape[1]
+            reference = _reference(
+                self.req_to_token,
+                self.rpi,
+                self.seq_lens + 1,
+                self.allocator.full_v2p_page_table,
+                width,
+            )
+            self.assertTrue(torch.equal(captured[:bs, :width], reference))
+            self.assertEqual(int(captured[bs, :width].abs().sum()), 0)  # padded lane
+            self.assertTrue(bool((captured[:, width:] == 7).all()))  # past the width
+            self.target.copy_page_table(plan, out=captured)
+            other = torch.full_like(captured, 5)
+            self.target.copy_page_table(plan, out=other)
+            self.assertEqual(len(builds), 1)
+            self.assertTrue(torch.equal(other[:, :width], captured[:, :width]))
+
     def test_read_table_is_built_once_and_padded_by_copy(self):
         builds = []
         real = kv_index_translator.build_kv_read_table

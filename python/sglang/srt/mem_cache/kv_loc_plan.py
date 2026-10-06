@@ -288,6 +288,7 @@ class KVLocPlan:
         kind: IdSpaceKind = IdSpaceKind.FULL,
         rows: Optional[int] = None,
         stream: Optional[KVReadStream] = None,
+        into: Optional[torch.Tensor] = None,
     ) -> KVIndexTable:
         """The rows' page table in the ``kind`` sub-pool over ``[0, seq_lens +
         read_extent)``, built on first use and shared by every reader of the
@@ -296,18 +297,22 @@ class KVLocPlan:
         again. On a sub-pool whose reads stay virtual (static, or DCP, where the
         producing kernel selects this rank's share) it is the `req_to_token`
         passthrough. ``stream`` is the first reader's CSR stream (no table yet),
-        packed by the launch that builds the table."""
+        packed from the gather that builds the table; ``into``, the first
+        reader's own capture-stable table, built in place to serve as the
+        plan's for this iteration."""
         space = self._source.space(kind)
         table = self._read_tables.get(space.key)
         if table is None or (
             table.is_translated and rows is not None and table.ids.shape[0] < rows
         ):
-            table = self._source._build_iteration_table(
-                self, space, rows=rows, previous=table, stream=stream
+            table = self._source.build_iteration_table(
+                self, space, rows=rows, previous=table, stream=stream, into=into
             )
             self._read_tables[space.key] = table
         else:
-            assert stream is None, "a stream is packed by the table's first build"
+            assert stream is None and into is None, (
+                "a stream or a destination goes to the table's first build"
+            )
         return table
 
     def is_read_by(self, reader: KVIndexTranslator) -> bool:
