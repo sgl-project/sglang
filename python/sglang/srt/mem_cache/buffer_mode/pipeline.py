@@ -1319,11 +1319,9 @@ class BufferModePipeline:
         )
         aux_device_releases: list[tuple[PoolName, torch.Tensor]] = []
         if swa_dev is not None:
-            # Every SWA stack loads into newly reserved slots (physical ids
-            # under unified memory). Register the window's FULL->SWA
-            # translation now (attention reads through it). Keep SWA slots
-            # another request may still hold; their redundant H2D destinations
-            # are reclaimed at the transfer ack.
+            # SWA loads into fresh reservations. Register the window's FULL->SWA
+            # translation now (attention reads through it); slots another request
+            # still holds are kept, and their redundant destinations freed at ack.
             full_window = torch.cat([req.prefix_indices, device_indices])[
                 -len(swa_dev) :
             ]

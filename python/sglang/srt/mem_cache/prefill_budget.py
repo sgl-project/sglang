@@ -62,8 +62,7 @@ def estimate_swa_kv_tokens(
 class PrefillBudget:
     """Fixed token pool. Offsets include pending allocations and decode headroom."""
 
-    # Whether prepare_load_back acts on full_tokens. Without it the admission
-    # passes the host hit length, an upper bound on the FULL slots a load adds.
+    # When False, admission skips the FULL spec and passes the host hit length.
     load_back_needs_full_tokens = False
 
     def __init__(self, allocator, tree_cache, *, num_mixed_decode_tokens: int = 0):

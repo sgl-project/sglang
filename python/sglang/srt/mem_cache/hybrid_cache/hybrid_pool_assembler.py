@@ -274,8 +274,7 @@ def _swa_allocation_callbacks(allocator) -> dict:
     from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 
     if isinstance(allocator, MultiEndedAllocator):
-        # Every unified SWA sub-allocator: H2D targets are physical
-        # reservations that are bound into the tree before the copy is queued.
+        # Unified SWA loads into physical reservations, bound before the H2D.
         return dict(
             device_alloc_fn=allocator.alloc_physical,
             device_free_fn=allocator.cancel_physical_reservation,

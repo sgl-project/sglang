@@ -242,8 +242,7 @@ class TestFloatSwaReservation(_ConfigCase):
         moves = []
         _record_moves(allocator, moves)
 
-        # What `HybridCacheController.load` reads, with the production SWA and
-        # Mamba callbacks of the tri-pool.
+        # Only what `HybridCacheController.load` reads, with production callbacks.
         controller = object.__new__(HybridCacheController)
         controller.mem_pool_device_allocator = allocator
         controller.device = "cpu"
@@ -313,13 +312,9 @@ class TestAllocationAndTransferOrder(_ConfigCase):
 
 
 class _UnifiedHiCacheCase(_ConfigCase):
-    """A FULL+SWA `UnifiedRadixCache` with HiCache over the unified pool.
-
-    With no storage backend the host side is the shared page-envelope pool,
-    whose copies run on CPU; the controller, tree and allocator are real. The
-    TreeCore is whichever backend the environment selects (Rust when its
-    extension loads, else Python), wrapped by the suite's read-only inspector.
-    """
+    """A FULL+SWA `UnifiedRadixCache` with HiCache over the unified pool and no
+    storage backend, so the host side is the shared page-envelope pool. The
+    TreeCore is whichever backend loads (Rust, else Python)."""
 
     window = 2 * PAGE
 

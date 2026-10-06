@@ -2012,13 +2012,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._pending_hicache_load_pages = 0
 
     def _wait_hicache_transfers(self) -> None:
-        """Order the current stream after outstanding HiCache copies.
-
-        Only paths that move or free pages call this. Allocation does not: it
-        takes pages no copy uses. A D2H source stays locked, or is drained, until
-        its finish event has been observed, and an H2D target stays owned by its
-        load or request until then, so neither is a hole while its copy runs.
-        """
+        """Order the current stream after outstanding HiCache copies. Only moves
+        and frees need this: a copy's source and target are not free pages until
+        its finish event is observed, so allocation never reuses them."""
         if not self._hicache_transfer_done_events:
             return
         current_stream = torch.cuda.current_stream()
