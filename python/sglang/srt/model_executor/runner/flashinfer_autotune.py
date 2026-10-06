@@ -366,14 +366,10 @@ def maybe_flashinfer_autotune_extend(
 
     if mr.attn_backend.extend_dummy_seqs_capped_by_req_pool:
         pool_size = mr.req_to_token_pool.size
-        num_tokens_per_req = (num_tokens + pool_size - 1) // pool_size
+        per_req = (num_tokens + pool_size - 1) // pool_size
     else:
-        # Packed dummies tune measurably worse tactics for the same token
-        # bucket, so pack only where the backend would otherwise crash. None
-        # (not 1) keeps the backend's own seq_len_fill_value in _dummy_run.
-        num_tokens_per_req = None
-    per_req = num_tokens_per_req or 1
-    batch_size = (num_tokens + per_req - 1) // per_req
+        per_req = 1
+    batch_size = num_tokens // per_req
     num_tokens = batch_size * per_req
 
     sync_group = _autotune_tactic_sync_group(get_parallel().tp_group)
@@ -407,7 +403,7 @@ def maybe_flashinfer_autotune_extend(
         buffers=buffers,
         run_ctx=canary_run_ctx,
         forward_mode_override=ForwardMode.EXTEND,
-        extend_num_tokens_per_req=num_tokens_per_req,
+        extend_num_tokens_per_req=per_req,
     )
 
     log_info_on_rank0(

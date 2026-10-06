@@ -53,6 +53,7 @@ _validate_mamba_replay_state_indices = (
 
 class MambaAttnBackendBase(AttentionBackend):
     supports_mis: bool = False
+    extend_dummy_seqs_capped_by_req_pool: bool = True
 
     @classmethod
     def validate_mis_support(cls, server_args) -> None:
