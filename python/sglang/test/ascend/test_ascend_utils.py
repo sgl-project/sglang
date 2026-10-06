@@ -59,6 +59,9 @@ DEEPSEEK_V3_2_EXP_W8A8_WEIGHTS_PATH = os.path.join(
 DEEPSEEK_V3_2_W8A8_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "vllm-ascend/DeepSeek-V3.2-W8A8"
 )
+DEEPSEEK_V4_FLASH_BF16_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "deepseek-ai/DeepSeek-V4-Flash-BF16"
+)
 DEEPSEEK_CODER_V2_LITE_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 )
@@ -87,6 +90,7 @@ GEMMA_4_26B_A4B_IT_WEIGHTS_PATH = os.path.join(
 GEMMA_4_31B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "google/gemma-4-31B-it")
 GLM_4_9B_CHAT_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/glm-4-9b-chat")
 GLM_5_1_W4A8_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Eco-Tech/GLM-5.1-w4a8")
+GLM_5_2_BF16_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/GLM-5.2")
 GPT_OSS_120B_BF16_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "eigen-ai-labs/gpt-oss-120b-bf16"
 )

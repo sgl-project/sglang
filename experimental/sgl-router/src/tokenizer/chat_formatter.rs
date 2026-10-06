@@ -49,7 +49,11 @@ pub struct ChatFormatter {
 impl ChatFormatter {
     /// Load model files and select a template or native formatter from dynamo-render.
     pub fn load(model_id: &str, tokenizer_path: &str) -> Result<Option<Self>> {
-        let files = super::adapter::ModelFiles::open(tokenizer_path);
+        Self::load_from(model_id, &super::adapter::ModelFiles::open(tokenizer_path))
+    }
+
+    /// [`Self::load`] over already opened model files.
+    pub fn load_from(model_id: &str, files: &super::adapter::ModelFiles) -> Result<Option<Self>> {
         let config = files.json("config.json")?.unwrap_or_default();
         let mut model_type = config["model_type"].as_str().map(str::to_owned);
         // SGLang also recognizes V4.1 checkpoints that retain a V4 model_type.
@@ -68,7 +72,7 @@ impl ChatFormatter {
             Some(t) if t.starts_with("deepseek_v4") => {
                 let mut formatter = Self::deepseek_native(model_type.as_deref(), model_id);
                 if let Some(formatter) = &mut formatter {
-                    formatter.configure_deepseek(&files, &config)?;
+                    formatter.configure_deepseek(files, &config)?;
                 }
                 return Ok(formatter);
             }
@@ -81,7 +85,7 @@ impl ChatFormatter {
         let mut formatter = Self::from_tokenizer_config(cfg, jinja.as_deref())?
             .or_else(|| Self::deepseek_native(model_type.as_deref(), model_id));
         if let Some(formatter) = &mut formatter {
-            formatter.configure_deepseek(&files, &config)?;
+            formatter.configure_deepseek(files, &config)?;
         }
         Ok(formatter)
     }
@@ -229,6 +233,15 @@ impl ChatFormatter {
             is_kimi_k3: false,
             worker_defaults: ChatTemplateKwargs::new(),
         })
+    }
+
+    /// DeepSeek-V4 is fixture-verified against SGLang for every text chat; V4.1 stays disabled.
+    pub fn forwarding_scope(&self) -> super::ForwardingScope {
+        match self.deepseek {
+            Some(super::deepseek::Encoder::V4(_)) => super::ForwardingScope::AllText,
+            Some(super::deepseek::Encoder::V41) => super::ForwardingScope::Never,
+            None => super::ForwardingScope::Guarded,
+        }
     }
 
     /// Apply the workers' `--default-chat-template-kwargs`; they fill keys the

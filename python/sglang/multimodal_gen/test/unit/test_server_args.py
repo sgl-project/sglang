@@ -4,7 +4,9 @@ import sys
 import tempfile
 import unittest
 from contextlib import ExitStack, contextmanager
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import zmq
 
 from sglang.cli.utils import get_is_diffusion_model
 from sglang.multimodal_gen.configs.models.fsdp import (
@@ -165,6 +167,67 @@ class _CudaPlatformTestCase(unittest.TestCase):
         stack = ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(_mock_cuda_platform())
+
+
+class TestSchedulerEndpoints(unittest.TestCase):
+    def test_host_normalization_preserves_replica_ports(self):
+        args = _from_dict_without_model_resolution({"model_path": "test/model"})
+        args.dp_size = 2
+        args.scheduler_port = 23000
+        for host, expected_host in (
+            (None, "127.0.0.1"),
+            ("localhost", "127.0.0.1"),
+            ("::", "127.0.0.1"),
+            ("::1", "127.0.0.1"),
+            ("2001:db8::1", "127.0.0.1"),
+            ("0.0.0.0", "127.0.0.1"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("192.0.2.1", "192.0.2.1"),
+            ("scheduler.example", "scheduler.example"),
+        ):
+            for ports in (None, [23100, 23200]):
+                with self.subTest(host=host, ports=ports):
+                    args.host = host
+                    args.scheduler_ports = ports
+                    expected = [
+                        f"tcp://{expected_host}:{port}"
+                        for port in (ports or [23000, 23001])
+                    ]
+                    self.assertEqual(args.scheduler_endpoint, expected[0])
+                    self.assertEqual(args.scheduler_endpoints, expected)
+                    for replica, endpoint in enumerate(expected):
+                        self.assertEqual(args.scheduler_endpoint_for(replica), endpoint)
+
+    def test_wildcard_and_ipv6_http_hosts_allow_internal_zmq_round_trip(self):
+        args = _from_dict_without_model_resolution({"model_path": "test/model"})
+        args.scheduler_port = 0
+        args.scheduler_ports = None
+        for host, http_host in (
+            ("0.0.0.0", "127.0.0.1"),
+            ("::", "[::1]"),
+            ("::1", "[::1]"),
+        ):
+            with self.subTest(host=host), zmq.Context() as context:
+                args.host = host
+                args.scheduler_port = 0
+                self.assertEqual(args.url(), f"http://{http_host}:{args.port}")
+                with (
+                    context.socket(zmq.REP) as receiver,
+                    context.socket(zmq.REQ) as sender,
+                ):
+                    for socket in (receiver, sender):
+                        socket.setsockopt(zmq.LINGER, 0)
+                        socket.setsockopt(zmq.RCVTIMEO, 2000)
+                        socket.setsockopt(zmq.SNDTIMEO, 2000)
+                    receiver.bind(args.scheduler_endpoint)
+                    bound_endpoint = receiver.getsockopt_string(zmq.LAST_ENDPOINT)
+                    self.assertTrue(bound_endpoint.startswith("tcp://127.0.0.1:"))
+                    args.scheduler_port = int(bound_endpoint.rsplit(":", 1)[1])
+                    sender.connect(args.scheduler_endpoint)
+                    sender.send(b"ping")
+                    self.assertEqual(receiver.recv(), b"ping")
+                    receiver.send(b"pong")
+                    self.assertEqual(sender.recv(), b"pong")
 
 
 class TestServerArgsPathExpansion(_CudaPlatformTestCase):
@@ -632,7 +695,7 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
             server_args.component_attention_backends,
         )
         self.assertEqual(
-            {"text_encoder": "kitchen_int8", "transformer": "fp8"},
+            {"text_encoder": "convrot_int8", "transformer": "fp8"},
             server_args.component_quantizations,
         )
         self.assertEqual(
@@ -992,6 +1055,7 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         *,
         memory_gb=80,
         available_memory_gb=None,
+        dit_parameter_count=None,
         kwargs=None,
     ):
         def get_available_gpu_memory(device_id=0, **_kwargs):
@@ -1003,6 +1067,14 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
 
         with (
             patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.auto_tune.dit_parameter_count",
+                (
+                    dit_parameter_count
+                    if isinstance(dit_parameter_count, Mock)
+                    else Mock(return_value=dit_parameter_count)
+                ),
+            ),
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
                 return_value=False,
@@ -2078,6 +2150,108 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
 
         self.assertTrue(args.dit_cpu_offload)
 
+    def test_auto_wan2_1_14b_streams_a_dit_that_overflows_the_card(self):
+        """With no placement flags, a Wan2.1 14B DiT OOMed on 24 GB cards."""
+        i2v_path = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+        for pipeline_config, model_path, kwargs in (
+            (WanT2V720PConfig(), "Wan-AI/Wan2.1-T2V-14B-Diffusers", {}),
+            (WanI2V480PConfig(), i2v_path, {}),
+            (
+                WanI2V480PConfig(),
+                i2v_path,
+                {"num_gpus": 8, "enable_cfg_parallel": True, "ulysses_degree": 4},
+            ),
+        ):
+            with self.subTest(model_path=model_path, **kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    pipeline_config,
+                    memory_gb=24,
+                    dit_parameter_count=16_000_000_000,
+                    kwargs={
+                        "model_path": model_path,
+                        "performance_mode": "auto",
+                        **kwargs,
+                    },
+                )
+
+                self.assertEqual(args.residency_mode("transformer"), LAYERWISE_OFFLOAD)
+                self.assertEqual(args.layerwise_offload_components[0], "dit")
+
+    def test_auto_sizes_the_dit_at_the_precision_it_loads_in(self):
+        # 16B parameters fit a 48 GB card in BF16 but not in FP32
+        for pipeline_config, kwargs in (
+            (WanI2V480PConfig(dit_precision="fp32"), {}),
+            (WanI2V480PConfig(), {"component_precisions": {"dit": "fp32"}}),
+        ):
+            with self.subTest(kwargs=kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    pipeline_config,
+                    memory_gb=48,
+                    dit_parameter_count=16_000_000_000,
+                    kwargs={
+                        "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+                        "performance_mode": "auto",
+                        **kwargs,
+                    },
+                )
+
+                self.assertEqual(args.layerwise_offload_components[0], "dit")
+
+    def test_auto_sizes_a_dit_whose_config_has_no_precision_field(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMPipelineConfig(),
+            memory_gb=24,
+            dit_parameter_count=16_000_000_000,
+            kwargs={
+                "model_path": "/models/SANA-WM-Diffusers",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertEqual(args.layerwise_offload_components[0], "dit")
+
+    def test_auto_does_not_size_a_dit_it_cannot_or_need_not_size(self):
+        for pipeline_config, memory_gb, model_path in (
+            # above the model's keep-resident threshold
+            (WanI2V480PConfig(), 80, "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"),
+            # an overlay's source repo
+            (SanaWMPipelineConfig(), 24, "Efficient-Large-Model/SANA-WM_bidirectional"),
+        ):
+            with self.subTest(model_path=model_path):
+                sizer = Mock(return_value=40_000_000_000)
+                args = self._from_dict_with_pipeline_config(
+                    pipeline_config,
+                    memory_gb=memory_gb,
+                    dit_parameter_count=sizer,
+                    kwargs={"model_path": model_path, "performance_mode": "auto"},
+                )
+
+                sizer.assert_not_called()
+                self.assertNotIn("dit", args.layerwise_offload_components or [])
+
+    def test_auto_keeps_the_dit_placement_when_streaming_is_not_needed(self):
+        for memory_gb, params, kwargs in (
+            (24, 1_400_000_000, {}),
+            (48, 16_000_000_000, {}),
+            (24, None, {}),
+            (24, 16_000_000_000, {"num_gpus": 2, "tp_size": 2}),
+            (24, 16_000_000_000, {"quantization": "fp8"}),
+            (24, 16_000_000_000, {"component_quantizations": {"transformer": "fp8"}}),
+        ):
+            with self.subTest(memory_gb=memory_gb, params=params, **kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    WanI2V480PConfig(),
+                    memory_gb=memory_gb,
+                    dit_parameter_count=params,
+                    kwargs={
+                        "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+                        "performance_mode": "auto",
+                        **kwargs,
+                    },
+                )
+
+                self.assertNotIn("dit", args.layerwise_offload_components or [])
+
     def test_memory_wan_layerwise_offload_is_enabled_without_fsdp(self):
         args = self._from_dict_with_pipeline_config(
             WanT2V480PConfig(),
@@ -2110,6 +2284,49 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
         self.assertTrue(args.use_fsdp_inference)
+
+    def test_explicit_multi_gpu_fsdp_keeps_the_dit_out_of_component_offload(self):
+        """Explicit multi-GPU FSDP shards the DiT unless its placement is set explicitly."""
+        for dit_cpu_offload in (None, True):
+            with self.subTest(dit_cpu_offload=dit_cpu_offload):
+                kwargs = {
+                    "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+                    "num_gpus": 2,
+                    "performance_mode": "auto",
+                    "use_fsdp_inference": True,
+                }
+                if dit_cpu_offload is not None:
+                    kwargs["dit_cpu_offload"] = dit_cpu_offload
+                args = self._from_dict_with_pipeline_config(
+                    WanI2V480PConfig(), memory_gb=24, kwargs=kwargs
+                )
+
+                self.assertTrue(args.use_fsdp_inference)
+                self.assertEqual(args.dit_cpu_offload, dit_cpu_offload is True)
+                self.assertEqual(
+                    args.should_use_fsdp_for_component("transformer"),
+                    dit_cpu_offload is None,
+                )
+
+    def test_explicit_fsdp_keeps_the_dit_offload_default_where_it_cannot_shard(self):
+        for kwargs in (
+            {"dp_size": 2},
+            {"transformer_weights_path": "/models/wan-14b-q4.gguf"},
+        ):
+            with self.subTest(**kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    WanI2V480PConfig(),
+                    memory_gb=24,
+                    kwargs={
+                        "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+                        "num_gpus": 2,
+                        "performance_mode": "auto",
+                        "use_fsdp_inference": True,
+                        **kwargs,
+                    },
+                )
+
+                self.assertTrue(args.dit_cpu_offload)
 
     def test_auto_wan_layerwise_offload_preserves_explicit_dit_cpu_offload(self):
         args = self._from_dict_with_pipeline_config(
@@ -3469,7 +3686,7 @@ class TestSchedulerEndpointBinding(unittest.TestCase):
         )
         self.assertEqual(args.scheduler_endpoint_for(0), "tcp://10.1.2.3:5555")
 
-    def test_explicit_ipv6_host_is_bracketed(self):
+    def test_explicit_ipv6_host_uses_ipv4_loopback(self):
         args = self._args(
             {
                 "model_path": "/fake/model",
@@ -3477,7 +3694,7 @@ class TestSchedulerEndpointBinding(unittest.TestCase):
                 "scheduler_port": 5555,
             }
         )
-        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://[::1]:5555")
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://127.0.0.1:5555")
 
     def test_replica_ports_increment_on_loopback(self):
         args = self._args(
@@ -3510,7 +3727,7 @@ class TestSchedulerEndpointBinding(unittest.TestCase):
             }
         )
         args.scheduler_ports = [6100, 6200]
-        self.assertEqual(args.scheduler_endpoint_for(1), "tcp://[::1]:6200")
+        self.assertEqual(args.scheduler_endpoint_for(1), "tcp://127.0.0.1:6200")
 
 
 class TestLayerwiseResidencyLifetime(unittest.TestCase):
