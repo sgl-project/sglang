@@ -148,11 +148,14 @@ REMESH_TARGET_FACES = 40000
 
 def mesh_simplify(mesh: Any, target_faces: int = REMESH_TARGET_FACES) -> Any:
     """Quadric-decimate mesh to at most target_faces faces (Hunyuan3D-2.1 remesh)."""
+    from fast_simplification import simplify
+
     if isinstance(mesh, trimesh.Scene):
         mesh = mesh.dump(concatenate=True)
     if len(mesh.faces) <= target_faces:
         return mesh
-    return mesh.simplify_quadric_decimation(face_count=target_faces)
+    vertices, faces = simplify(mesh.vertices, mesh.faces, target_count=target_faces)
+    return trimesh.Trimesh(vertices=vertices, faces=faces)
 
 
 def mesh_uv_wrap(mesh: Any) -> Any:
