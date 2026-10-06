@@ -55,6 +55,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.utils import is_deepep_class_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -443,11 +444,10 @@ class MiMoV2MoE(nn.Module):
         )
 
         # todo : implement tbo forward needed
-        if (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_ascend_fuseep()
-        ):
+        self._enable_a2a_moe = (
+            is_deepep_class_backend() or get_moe_a2a_backend().is_ascend_fuseep()
+        )
+        if self._enable_a2a_moe:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
@@ -461,12 +461,6 @@ class MiMoV2MoE(nn.Module):
                 if self.gate.e_score_correction_bias is not None
                 else None
             )
-
-        self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_ascend_fuseep()
-        )
 
     def get_moe_weights(self):
         return [
@@ -1332,16 +1326,11 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         )
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, hidden_states_before_norm, aux_hidden_states = self.model(
-                input_ids,
-                positions,
-                forward_batch,
-                input_embeds,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-        elif self._is_multimodal:
-            hidden_states, hidden_states_before_norm = general_mm_embed_routine(
+        # Multimodal embedding must run even when aux hidden states are captured
+        # (DFLASH/MTP). Taking the capture branch first skipped image/audio
+        # feature placement and left placeholder tokens as plain text embeddings.
+        if self._is_multimodal:
+            model_out = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
                 language_model=self.model,
@@ -1350,13 +1339,17 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         else:
-            hidden_states, hidden_states_before_norm = self.model(
+            model_out = self.model(
                 input_ids,
                 positions,
                 forward_batch,
                 input_embeds,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+        if self.capture_aux_hidden_states:
+            hidden_states, hidden_states_before_norm, aux_hidden_states = model_out
+        else:
+            hidden_states, hidden_states_before_norm = model_out
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
