@@ -6,12 +6,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.model_executor.forward_batch_context import (
-    get_forward_batch,
-    set_forward_batch,
-)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     breakable_cuda_graph as bcg,
+)
+from sglang.srt.model_executor.runner_utils.forward_batch import (
+    get_forward_batch,
+    set_forward_batch,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
