@@ -47,6 +47,7 @@ def cpu_host_snapshot(backend, metadata, directory):
     backend.outer_pool = OuterZstdPool(2)
     backend.host_arena = host.HostArena("cpu-engine", 0)
     backend.apply_stream = backend.de_stream = backend.decoder = None
+    backend.decode_stages = getattr(backend, "decode_stages", 2)
     metadata.update(session_id="cpu-1", participants=[backend.identity])
     cache = Path(directory) / "cache"
     cache.mkdir()
@@ -588,7 +589,12 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         self.assertTrue(torch.all(layer.w13_input_scale == 7))
         self.assertTrue(torch.all(layer.w2_input_scale == 11))
 
-    def test_host_direct_batches_defer_outputs_and_reuse_two_decoded_slots(self):
+    def test_host_direct_batches_defer_outputs_and_reuse_decoded_slots(self):
+        for stages in (2, 3, 4):
+            with self.subTest(stages=stages):
+                self._check_host_direct_batches(stages)
+
+    def _check_host_direct_batches(self, stages):
         import zstandard as zstd
 
         targets = [
@@ -682,6 +688,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             _canonical_plan=None,
             batch_plan=None,
             codec="snappy-zstd",
+            decode_stages=stages,
             device=torch.device("cpu"),
             layout=SimpleNamespace(
                 bindings=local,
@@ -722,7 +729,8 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 assert codec == backend.codec
                 self.device = device
 
-            def allocate_workspace(self, batches):
+            def allocate_workspace(self, batches, slot_count):
+                assert slot_count == stages
                 return SimpleNamespace(temporary=torch.empty(0))
 
             def prepare_batches(self, batches, host, workspace, stream):
@@ -746,7 +754,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
 
             def _prepare(self, index, frames, host, decoded_slots):
                 def enqueue():
-                    decoded = decoded_slots[index % 2]
+                    decoded = decoded_slots[index % stages]
                     operations.append(("decode", index))
                     decoded_batches.append((index, decoded.data_ptr(), frames))
                     for frame in frames:
@@ -808,7 +816,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 self.assertEqual(prepared.timings["host_rank_outer_zstd_tensors"], 8)
                 self.assertEqual(prepared.timings["host_rank_outer_zstd_frames"], 8)
                 self.assertEqual(streams.call_count, 2)
-                self.assertEqual(events.call_count, 6)
+                self.assertEqual(events.call_count, 2 * stages + 2)
                 self.assertIsNotNone(backend.decoder)
                 self.assertEqual(slots, [])
                 self.assertFalse(any(row[0] == "wait_stream" for row in operations))
@@ -830,8 +838,10 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     any(row[0] == "prepare_check" for row in operations[before_apply:])
                 )
                 self.assertEqual(streams.call_count, 2)
-                self.assertEqual(result["timings"]["decoded_buffers"], 2)
-                self.assertEqual(result["timings"]["decoded_scratch_bytes"], 56)
+                self.assertEqual(result["timings"]["decoded_buffers"], stages)
+                self.assertEqual(
+                    result["timings"]["decoded_scratch_bytes"], 28 * stages
+                )
                 self.assertEqual(
                     result["h2d_bytes"], 8 * 32
                 )  # Descriptor metadata only.
@@ -850,12 +860,12 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 )
                 self.assertEqual(
                     [pointer for _, pointer, _ in decoded_batches],
-                    [slots[index % 2].data_ptr() for index in range(7)],
+                    [slots[index % stages].data_ptr() for index in range(7)],
                 )
                 # Every reuse waits for the preceding apply on that same slot;
                 # the next decode is submitted only after current status/apply.
-                for index in range(2, 7):
-                    event = prepared.decoded_free[index % 2]
+                for index in range(stages, 7):
+                    event = prepared.decoded_free[index % stages]
                     position = operations.index(("decode", index))
                     self.assertEqual(
                         operations[position - 1], ("wait", prepared.de_stream, event)

@@ -42,6 +42,31 @@ _DECOMPRESS_OPTIONS = {
     "snappy-zstd": ("Snappy", _SnappyOptions),
     "lz4-zstd": ("LZ4", _Lz4Options),
 }
+_MAX_FRAME_BYTES = 1 << 20
+
+
+def _require_hardware_device(device: torch.device, algorithm: str) -> None:
+    from sglang.srt.weight_sync.gpu_delta_memory import _driver
+
+    driver = _driver()
+    mask, maximum = ctypes.c_int(), ctypes.c_int()
+    for attribute, result in ((136, mask), (137, maximum)):
+        status = driver.cuDeviceGetAttribute(
+            ctypes.byref(result), attribute, device.index
+        )
+        if status:
+            raise RuntimeError(f"GPU-delta DE device admission failed: CUDA {status}")
+    # CUDA's CUmemDecompressAlgorithm bits, not compute-capability inference.
+    if not mask.value & {"Snappy": 1 << 1, "LZ4": 1 << 2}[algorithm]:
+        raise RuntimeError(f"Device has no hardware {algorithm} decompressor")
+    # HARDWARE does not enforce its device limit inside nvCOMP. Admit both the
+    # output limit and the publication's conservative compressed-input bound.
+    required = 32 + _MAX_FRAME_BYTES + _MAX_FRAME_BYTES // 6
+    if maximum.value < required:
+        raise RuntimeError(
+            f"Hardware decompression limit {maximum.value} is below "
+            f"the GPU-delta frame envelope {required}"
+        )
 
 
 class _Alignments(ctypes.Structure):
@@ -123,8 +148,7 @@ class NvcompDecoder:
         if codec == "lz4-zstd":
             self._options.data_type = 0  # NVCOMP_TYPE_CHAR
             self._options.bitshuffle_mode = 0  # NVCOMP_BITSHUFFLE_NONE
-        if torch.cuda.get_device_capability(self.device)[0] < 10:
-            raise RuntimeError("GPU deltas require Blackwell hardware decompression")
+        _require_hardware_device(self.device, self._algorithm)
         _require_hardware_allocator(self.device)
         self._library = ctypes.CDLL(
             str(distribution.locate_file("nvidia/libnvcomp/lib64/libnvcomp.so.5"))
@@ -196,22 +220,28 @@ class NvcompDecoder:
         return size.value
 
     def allocate_workspace(
-        self, batches: Sequence[Sequence[DecodeFrame]]
+        self, batches: Sequence[Sequence[DecodeFrame]], slot_count: int = 2
     ) -> DecodeWorkspace:
         """Allocate small workspace during prepare; retain the decoder to cache queries.
 
         DE submissions use one stream and share temporary storage. Status and
-        actual-size rows belong to the two decoded slots until apply consumes them.
+        actual-size rows belong to each decoded slot until apply consumes them.
         """
         from sglang.srt.weight_sync.gpu_delta_memory import require_de_capable
 
+        if slot_count not in (2, 3, 4):
+            raise ValueError("nvCOMP requires 2, 3 or 4 decoded output slots")
         maximum_count = max((len(batch) for batch in batches), default=0)
         temporary = max((self.temporary_bytes(batch) for batch in batches), default=0)
         with torch.cuda.device(self.device):
             workspace = DecodeWorkspace(
                 torch.empty(temporary, dtype=torch.uint8, device=self.device),
-                torch.empty((2, maximum_count), dtype=torch.int64, device=self.device),
-                torch.empty((2, maximum_count), dtype=torch.int32, device=self.device),
+                torch.empty(
+                    (slot_count, maximum_count), dtype=torch.int64, device=self.device
+                ),
+                torch.empty(
+                    (slot_count, maximum_count), dtype=torch.int32, device=self.device
+                ),
             )
             for tensor in (
                 workspace.temporary,
@@ -268,22 +298,28 @@ class NvcompDecoder:
                 or tensor.dtype != dtype
                 or not tensor.is_contiguous()
                 or tensor.ndim != 2
-                or tensor.shape[0] != 2
+                or tensor.shape[0] not in (2, 3, 4)
                 or tensor.shape[1] < maximum_count
             ):
                 raise ValueError("Invalid per-slot status/actual-size capacity")
+        slot_count = workspace.statuses.shape[0]
+        if workspace.actual_sizes.shape[0] != slot_count:
+            raise ValueError("Status and actual-size slot counts differ")
         if (
             workspace.temporary.numel()
             and workspace.temporary.data_ptr() % self.alignments.temp
         ):
             raise ValueError("Misaligned decoder workspace")
         input_base, input_bytes = host_input.data_ptr(), host_input.numel()
-        output_bounds, output_remainders = [0, 0], [None, None]
+        output_bounds, output_remainders = [0] * slot_count, [None] * slot_count
         for index, frames in enumerate(batches):
-            slot = index % 2
+            slot = index % slot_count
             prior_output_end = 0
             for frame in frames:
-                if not 0 < frame.decoded_bytes <= 1 << 20 or frame.encoded_bytes <= 0:
+                if (
+                    not 0 < frame.decoded_bytes <= _MAX_FRAME_BYTES
+                    or frame.encoded_bytes <= 0
+                ):
                     raise ValueError(
                         "Direct-delta frames require positive lengths and <=1 MiB output"
                     )
@@ -329,7 +365,7 @@ class NvcompDecoder:
 
 
 class PreparedDecodePlan:
-    """Publication metadata and two output leases, bound only while paused."""
+    """Publication metadata and output leases, bound only while paused."""
 
     def __init__(
         self,
@@ -347,6 +383,7 @@ class PreparedDecodePlan:
         self.decoder, self.stream = decoder, stream
         self.host_metadata, self.metadata = host_metadata, metadata
         self.output_bounds, self.output_remainders = output_bounds, output_remainders
+        self.slot_count = len(output_bounds)
         # Every batch retains this same list. Binding fills it only after all
         # output checks pass; dropping the plan alone cannot free in-flight slots.
         self.decoded_slots = []
@@ -357,7 +394,7 @@ class PreparedDecodePlan:
             workspace.temporary.numel(),
         )
         for index, frames in enumerate(batches):
-            count, slot = len(frames), index % 2
+            count, slot = len(frames), index % self.slot_count
             rows = metadata[:, offset : offset + count]
             host_rows = host_metadata[:, offset : offset + count]
             statuses = workspace.statuses[slot, :count]
@@ -398,7 +435,7 @@ class PreparedDecodePlan:
     def bind_outputs(
         self, decoded_slots: Sequence[torch.Tensor]
     ) -> list[PreparedDecode]:
-        """Check two paused allocations, fill output pointers, upload just row 3.
+        """Check paused allocations, fill output pointers, upload just row 3.
 
         Slot bounds and relative pointer alignment were computed during prepare.
         The caller waits for prior apply readers before reusing each output and
@@ -406,8 +443,8 @@ class PreparedDecodePlan:
         """
         from sglang.srt.weight_sync.gpu_delta_memory import require_de_capable
 
-        if len(decoded_slots) != 2:
-            raise ValueError("nvCOMP requires two decoded output slots")
+        if len(decoded_slots) != self.slot_count:
+            raise ValueError("Decoded output count differs from prepared slots")
         for tensor in decoded_slots:
             if (
                 tensor.device != self.decoder.device
@@ -419,7 +456,13 @@ class PreparedDecodePlan:
                 )
         bases = [tensor.data_ptr() for tensor in decoded_slots]
         capacities = [tensor.numel() for tensor in decoded_slots]
-        if max(bases) < min(base + size for base, size in zip(bases, capacities)):
+        ranges = sorted(
+            (base, base + size) for base, size in zip(bases, capacities) if size
+        )
+        if any(
+            start < previous_end
+            for (_, previous_end), (start, _) in zip(ranges, ranges[1:])
+        ):
             raise ValueError("Decoded output slots must not overlap")
         for base, capacity, bound, remainder in zip(
             bases, capacities, self.output_bounds, self.output_remainders
@@ -437,7 +480,9 @@ class PreparedDecodePlan:
                     require_de_capable(base)
             for index, batch in enumerate(self.batches):
                 np.add(
-                    batch.output_offsets, bases[index % 2], out=batch.output_pointers
+                    batch.output_offsets,
+                    bases[index % self.slot_count],
+                    out=batch.output_pointers,
                 )
             if self.metadata.numel():
                 self.metadata[3].copy_(self.host_metadata[3], non_blocking=True)

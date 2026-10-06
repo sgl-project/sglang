@@ -45,7 +45,7 @@ The codec suite is manual-only because registered CI does not provision its
 prebuilt nvCOMP dependency. It requires Blackwell, `nvidia-libnvcomp-cu13==5.3.0.16`,
 `zstandard`, `python-snappy` and `lz4` (the last two are CPU test oracles). It
 checks hardware Snappy and LZ4 decoding with sorting off/on against known input
-bytes from a DE-capable host allocation, reusing two decoded HBM slots. No malformed compressed
+bytes from a DE-capable host allocation, reusing decoded HBM slots. No malformed compressed
 streams are sent to nvCOMP. Missing hardware or dependencies fail the manual
 suite. The registered `test_gpu_delta_layout_cuda.py` compares layouts and derived
 scale buffers with the existing SGLang/FlashInfer loader helpers and checks MLA
@@ -87,13 +87,13 @@ weights, in that order; empty groups are omitted.
 layers in model order, even when unchanged layers are absent. Each complete batch
 must fit HBM; there is no intra-layer streaming. DE reads the compressed frames directly from the rank-owned host arena into HBM;
 there is no encoded HBM ring, compressed H2D copy or transfer-stage selector.
-Two decoded slots each fit the largest batch, including non-layer groups. A dedicated DE stream
+Decoded slots each fit the largest batch, including non-layer groups. A dedicated DE stream
 decodes the next batch while the apply stream validates and applies the current
 batch. One nvCOMP call handles all retained frames in a batch. Slot reuse waits
 for its previous apply event, including consumption of that slot's size/status
 rows. Temporary DE workspace is shared because DE submissions are ordered.
 
-The two large decoded-mask slots are allocated only after scheduler pause and
+The large decoded-mask slots are allocated only after scheduler pause and
 its reader fence. Preparation already allocates the small nvCOMP temporary
 workspace, per-slot status/size rows and descriptor slabs, and uploads immutable
 input metadata and raw targets on feature-owned streams. Relative output offsets,
@@ -184,6 +184,14 @@ Sorting executes inside the paused decode call; preparation does not sort or
 reorder the frames. The codec extension and sorting options await native GPU
 qualification and matched benchmarks; existing Snappy results do not measure LZ4.
 
+`GPU_DELTA_DECODE_STAGES` accepts 2 (default), 3 or 4 and is frozen at backend
+initialization. Each extra stage adds one largest-batch decoded HBM buffer and
+small status/size rows, allocated at the same preparation/pause boundaries.
+Batch i reuses slot i modulo the depth only after that slot's prior apply finishes.
+DE submissions still share one ordered stream/workspace, and apply i is queued
+before the host submits DE i+1. More slots can defer a reuse wait but do not remove
+nvCOMP's calling-stream wait or guarantee lower pause latency.
+
 `GPU_DELTA_CPU_WORKERS` defaults to 32 (bounded to 1–32) per rank.
 Each rank uses reusable workers with independent Zstd contexts. Local tensors
 are grouped into at most four times as many tasks as workers, preserving strict
@@ -267,7 +275,8 @@ and scratch release, but the scheduler's full `blocked_s` remains the pause metr
 `de_host_input_bytes` counts compressed bytes read directly by DE. `h2d_bytes`
 counts explicit raw-target and metadata transfers; it no longer counts an encoded
 Snappy copy. These are different traffic categories, not a throughput estimate.
-`decoded_scratch_bytes` is the total of the two decoded slots;
+`decode_stages` reports the configured depth; `decoded_buffers` counts actual slots.
+`decoded_scratch_bytes` is their total allocation;
 `decoder_workspace_bytes` is temporary DE workspace. Neither is peak HBM usage.
 `decoded_zero_ranges`/`decoded_zero_bytes` count omitted canonical bytes cleared
 before decode. Batch/group/contract/grid and cold tuning counters retain their

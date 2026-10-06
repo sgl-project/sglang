@@ -744,6 +744,9 @@ class GpuDeltaBackend:
         )
 
         self.codec = configured_codec()
+        self.decode_stages = int(os.environ.get("GPU_DELTA_DECODE_STAGES", "2"))
+        if self.decode_stages not in (2, 3, 4):
+            raise ValueError("GPU_DELTA_DECODE_STAGES must be 2, 3 or 4")
         _require_fixed_moe_topology(get_exec().moe)
         self.identity = dict(identity)
         self._canonical_plan = None
@@ -972,6 +975,7 @@ class PreparedDelta:
         self.events, self.timings = {}, {}
         self.status_checks = []
         self.backend, self.device = backend, backend.device
+        self.decode_stages = backend.decode_stages
         preparation_started = time.perf_counter()
         self.timing_enabled = os.environ.get("GPU_DELTA_TIMING", "0") == "1"
         self.layers_per_batch = int(os.environ.get("GPU_DELTA_LAYERS_PER_BATCH", "1"))
@@ -1076,6 +1080,7 @@ class PreparedDelta:
             raw_bytes=sum(entry["nbytes"] for _, entry in self.direct),
             raw_h2d_bytes=raw_h2d_bytes,
             compressed_batches=len(self.static_plans),
+            decode_stages=self.decode_stages,
             layers_per_batch=self.layers_per_batch,
             compressed_tensors=self.matrix_tensor_count,
             de_host_input_bytes=sum(
@@ -1097,8 +1102,8 @@ class PreparedDelta:
             backend.apply_stream = torch.cuda.Stream(device=self.device)
             backend.de_stream = torch.cuda.Stream(device=self.device)
         self.stream, self.de_stream = backend.apply_stream, backend.de_stream
-        self.decoded_ready = [torch.cuda.Event() for _ in range(2)]
-        self.decoded_free = [torch.cuda.Event() for _ in range(2)]
+        self.decoded_ready = [torch.cuda.Event() for _ in range(self.decode_stages)]
+        self.decoded_free = [torch.cuda.Event() for _ in range(self.decode_stages)]
         with torch.cuda.stream(self.stream):
             self.raw_device = self.raw_pinned.to(self.device, non_blocking=True)
             for (binding, entry), position in zip(self.direct, self.raw_offsets):
@@ -1127,7 +1132,9 @@ class PreparedDelta:
             if backend.decoder is None:
                 backend.decoder = NvcompDecoder(self.device, backend.codec)
             with torch.cuda.stream(self.de_stream):
-                self.workspace = backend.decoder.allocate_workspace(self.frame_plans)
+                self.workspace = backend.decoder.allocate_workspace(
+                    self.frame_plans, slot_count=self.decode_stages
+                )
                 self.decode_plan = backend.decoder.prepare_batches(
                     self.frame_plans,
                     backend.host_arena.tensor,
@@ -1158,14 +1165,14 @@ class PreparedDelta:
         )
 
     def _allocate_paused(self):
-        """Allocate two reusable decoded outputs, then bind their pointers."""
+        """Allocate reusable decoded outputs, then bind their pointers."""
         started = time.perf_counter()
         self.stream.wait_stream(torch.cuda.default_stream(self.device))
         with torch.cuda.stream(self.stream):
             self.decoded = (
                 [
                     torch.empty(self.max_decoded, dtype=torch.uint8, device=self.device)
-                    for _ in range(2)
+                    for _ in range(self.decode_stages)
                 ]
                 if self.static_plans
                 else []
@@ -1178,7 +1185,7 @@ class PreparedDelta:
             apply_groups = []
             for index, (_, _, group, _) in enumerate(self.static_plans):
                 if group is not None:
-                    scratch = self.decoded[index % 2]
+                    scratch = self.decoded[index % self.decode_stages]
                     tune_totals = [
                         total + value
                         for total, value in zip(
@@ -1193,7 +1200,7 @@ class PreparedDelta:
             for index, ((_, _, group, transformed), decode) in enumerate(
                 zip(self.static_plans, decoders)
             ):
-                scratch = self.decoded[index % 2]
+                scratch = self.decoded[index % self.decode_stages]
                 apply = None
                 if group is not None:
                     count = 2 * len(group.sources)
@@ -1274,7 +1281,7 @@ class PreparedDelta:
             self._allocate_paused()
             with torch.cuda.stream(self.stream):
                 with self._phase("paused_gpu_pipeline"):
-                    # Setup/tuning may touch both slots. This one fence also
+                    # Setup/tuning may touch every slot. This one fence also
                     # places the enclosing timing event before initial DE.
                     if self.batches:
                         self.de_stream.wait_stream(self.stream)
@@ -1285,9 +1292,10 @@ class PreparedDelta:
                             torch._foreach_copy_(targets, sources)
                     matrices_started = time.perf_counter()
                     for index, batch in enumerate(self.batches):
-                        self.stream.wait_event(self.decoded_ready[index % 2])
+                        slot = index % self.decode_stages
+                        self.stream.wait_event(self.decoded_ready[slot])
                         self._apply_batch(batch)
-                        self.decoded_free[index % 2].record(self.stream)
+                        self.decoded_free[slot].record(self.stream)
                         # nvCOMP may wait for prior work on its calling stream.
                         # Queue apply BEFORE the next DE call to retain overlap.
                         if index + 1 < len(self.batches):
@@ -1337,13 +1345,14 @@ class PreparedDelta:
 
     def _decode_batch(self, batch, index):
         with torch.cuda.stream(self.de_stream):
-            if index >= 2:
-                self.de_stream.wait_event(self.decoded_free[index % 2])
+            slot = index % self.decode_stages
+            if index >= self.decode_stages:
+                self.de_stream.wait_event(self.decoded_free[slot])
             with self._phase("decode", self.de_stream):
                 if batch.zero_ranges:
                     torch._foreach_zero_(batch.zero_ranges)
                 batch.decoder.enqueue()
-            self.decoded_ready[index % 2].record(self.de_stream)
+            self.decoded_ready[slot].record(self.de_stream)
 
     def _apply_batch(self, batch):
         # Sticky status and every consumer of it are ordered on the apply
