@@ -571,21 +571,16 @@ NON_FINITE_CASES = get_ci_test_range(
 
 
 @pytest.mark.parametrize("poison,scale_ue8m0,masked", NON_FINITE_CASES)
-def test_non_finite_inputs_are_sanitized(poison, scale_ue8m0, masked):
-    """CUDA-graph capture warmup runs the model on reused, uninitialized
-    buffers, so quant inputs can contain NaN/Inf bit patterns. The v1/v2/Triton
-    kernels clamp before converting (IEEE fminf/fmaxf drop the NaN operand),
-    quantizing non-finite values to +-fp8_max; emitting fp8 NaN codes instead
-    poisons the downstream GEMM and trips the sampler NaN check
-    (TestTBOWithTPAttn H100 CI). Pin the sanitizing behavior."""
+def test_fp16_non_finite_inputs_are_sanitized(poison, scale_ue8m0, masked):
+    """FP16 scaling can overflow for finite inputs; retain its sanitization."""
     torch.manual_seed(0)
     if masked:
-        x = torch.randn(4, 32, 512, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(4, 32, 512, device="cuda", dtype=torch.float16)
         x[1, 3, 100] = poison
         x[2, 0, 300] = poison
         masked_m = torch.tensor([32, 16, 4, 0], device="cuda", dtype=torch.int32)
     else:
-        x = torch.randn(16, 512, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(16, 512, device="cuda", dtype=torch.float16)
         x[3, 100] = poison
         x[7, 500] = poison
         masked_m = None
@@ -604,6 +599,95 @@ def test_non_finite_inputs_are_sanitized(poison, scale_ue8m0, masked):
     else:
         written = x_q
     assert not torch.isnan(written.float()).any(), "quant emitted fp8 NaN codes"
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["plain", "fused"])
+@pytest.mark.parametrize("scale_ue8m0", [False, True])
+@pytest.mark.parametrize("masked", [False, True])
+def test_bf16_nan_inputs_are_preserved(fused, scale_ue8m0, masked):
+    torch.manual_seed(0)
+    hidden = 384
+    shape = (4, 32, hidden) if masked else (17, hidden)
+    input_shape = (*shape[:-1], hidden * (2 if fused else 1))
+    x = torch.randn(input_shape, device="cuda", dtype=torch.bfloat16)
+    if masked:
+        x[0, 0, :G] = float("nan")
+        x[1, 3, 100:102] = float("nan")
+        x[1, 3, 103] = 0.0
+        x[2, 2, -1] = float("nan")
+        if fused:
+            x[1, 2, hidden + G + 17] = float("nan")
+        masked_m = torch.tensor([31, 17, 3, 0], device="cuda", dtype=torch.int32)
+        for e, m in enumerate(masked_m.tolist()):
+            x[e, m:] = float("nan")
+    else:
+        x[0, :G] = float("nan")
+        x[3, 100:102] = float("nan")
+        x[3, 103] = 0.0
+        x[7, -1] = float("nan")
+        if fused:
+            x[5, hidden + G + 17] = float("nan")
+        masked_m = None
+
+    x_q = torch.zeros(shape, device="cuda", dtype=fp8_dtype)
+    x_s = _alloc_scale(shape, column_major=True, scale_ue8m0=scale_ue8m0)
+    per_token_group_quant(
+        x,
+        x_q,
+        x_s,
+        G,
+        scale_ue8m0=scale_ue8m0,
+        masked_m=masked_m,
+        fuse_silu_and_mul=fused,
+    )
+    quant_input = _ref_silu_mul(x, hidden) if fused else x
+    expected_nan = torch.isnan(quant_input)
+    if masked:
+        for e, m in enumerate(masked_m.tolist()):
+            expected_nan[e, m:] = False
+            assert torch.all(x_q[e, m:].view(torch.int8) == 0), "padding codes touched"
+            assert torch.all(x_s[e, m:] == 0), "padding scales touched"
+    assert torch.equal(torch.isnan(x_q.float()), expected_nan), "NaN positions changed"
+
+
+@pytest.mark.parametrize(
+    "capture_nan", [False, True], ids=["finite-capture", "dirty-capture"]
+)
+@pytest.mark.parametrize("scale_ue8m0", [False, True])
+def test_bf16_nan_inputs_are_preserved_on_graph_replay(scale_ue8m0, capture_nan):
+    x = torch.ones((17, 384), device="cuda", dtype=torch.bfloat16)
+    x_q = torch.empty_like(x, dtype=fp8_dtype)
+    x_s = _alloc_scale(x.shape, column_major=True, scale_ue8m0=scale_ue8m0)
+
+    def quantize():
+        per_token_group_quant(x, x_q, x_s, G, scale_ue8m0=scale_ue8m0)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        quantize()
+    torch.cuda.current_stream().wait_stream(stream)
+    finite_codes = x_q.view(torch.int8).clone()
+    finite_scales = x_s.clone()
+    if capture_nan:
+        x[3, 100] = float("nan")
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        quantize()
+    graph.replay()
+    assert torch.equal(torch.isnan(x_q.float()), torch.isnan(x))
+
+    x[3, 100] = float("nan")
+    graph.replay()
+    assert torch.equal(torch.isnan(x_q.float()), torch.isnan(x))
+
+    x.fill_(1.0)
+    graph.replay()
+    assert torch.equal(x_q.view(torch.int8), finite_codes), (
+        "finite codes changed after replay"
+    )
+    assert torch.equal(x_s, finite_scales), "finite scales changed after replay"
 
 
 def test_mn_major_tma_aligned_transform_keeps_ownership():

@@ -47,15 +47,10 @@ template <>
 struct WeightTrait<fp8_e4m3_t> {
   using packed2_t = fp8x2_e4m3_t;
   static constexpr float kMaxValue = DTypeTrait<fp8_e4m3_t>::kFloatMax;
-  // SATFINITE saturates +-inf / out-of-range values, but converts NaN to an
-  // fp8 NaN code. A single upper clamp is enough to sanitize: IEEE fminf
-  // returns the non-NaN operand, so NaN / +inf quantize to +448, and -inf
-  // passes through for SATFINITE to saturate to -448 -- non-finite inputs
-  // never reach an fp8 NaN code, matching the v1/v2/Triton kernels.
-  // CUDA-graph capture warmup runs the model on whatever the (reused,
-  // uninitialized) buffers contain, and relies on this: an fp8 NaN code would
-  // poison the downstream GEMM and trip the sampler NaN check. For finite
-  // inputs the clamp is bit-identical to bare SATFINITE.
+  // Keep the existing sanitization for FP16 and FP32 inputs. BF16 uses the
+  // saturating FP8 conversion directly so NaNs remain observable downstream.
+  // SATFINITE already saturates infinities and out-of-range finite values;
+  // the upper clamp additionally maps NaN to +448.
   SGL_DEVICE static packed2_t quant(const float2 v) {
     return packed2_t{float2{fminf(v.x, kMaxValue), fminf(v.y, kMaxValue)}};
   }
@@ -306,15 +301,18 @@ struct QuantTrait {
       scale_inv = static_cast<uint8_t>(exp);
       const float quant_scale = inv_scale_ue8m0(exp);
       const auto scale2 = cast<T2>(float2{quant_scale, quant_scale});
-      // Finite scaled values already lie in +-448 (2^exp >= amax/448), so the
-      // single __hmin2 only sanitizes NaN / +inf (it returns the non-NaN
-      // operand); -inf saturates to -448 via the SATFINITE fp8 cast (see
-      // WeightTrait<fp8_e4m3_t>).
+      // BF16 can represent the multiplier, so preserve NaNs instead of hiding
+      // them as +448. FP16 retains sanitization because its multiplier can
+      // overflow even for finite inputs (including zero * inf).
       const auto max_clip = cast<T>(kMaxValue);
       const auto max_clip2 = T2{max_clip, max_clip};
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        out[i] = static_cast<Q2>(__hmin2(__hmul2(in[i], scale2), max_clip2));
+        if constexpr (std::is_same_v<T, bf16_t>) {
+          out[i] = static_cast<Q2>(__hmin2_nan(__hmul2(in[i], scale2), max_clip2));
+        } else {
+          out[i] = static_cast<Q2>(__hmin2(__hmul2(in[i], scale2), max_clip2));
+        }
       }
     } else {
       // fp32 scale: multiply in fp32 (hmul2 brings too much precision loss)
@@ -323,7 +321,12 @@ struct QuantTrait {
       const float2 quant_scale2 = {quant_scale, quant_scale};
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        out[i] = WTrait::quant(detail::mul2(cast<float2>(in[i]), quant_scale2));
+        const auto scaled = detail::mul2(cast<float2>(in[i]), quant_scale2);
+        if constexpr (std::is_same_v<T, bf16_t> && std::is_same_v<Q, fp8_e4m3_t>) {
+          out[i] = Q2{scaled};
+        } else {
+          out[i] = WTrait::quant(scaled);
+        }
       }
     }
 
