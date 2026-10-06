@@ -85,6 +85,56 @@ impl SwaComponent {
         Some(new_parent)
     }
 
+    /// Cap the part of a live, unlocked SWA node that a lock walk pins at what
+    /// the trailing window still needs (device tier). Mirrors Python
+    /// `_maybe_split_for_window_lock`: the node keeps its id and becomes the
+    /// in-window tail, so a lock receipt anchored on it stays valid.
+    fn maybe_split_for_window_lock_<K: ChildKeyType>(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+        uncovered: usize,
+    ) {
+        let (is_root, already_locked, has_device_value, write_through_pending, node_len) = {
+            let node = tree_core.arena.node(node_id);
+            (
+                node.is_root(),
+                node.device_lock_ref(SWA) > 0,
+                node.has_device_value(SWA),
+                node.write_through_pending_id.is_some(),
+                node.key.atom_len(),
+            )
+        };
+        if is_root || already_locked || !has_device_value || write_through_pending {
+            return;
+        }
+        let page_size = tree_core.page_size;
+        // Smallest page-aligned size that still covers the remaining window.
+        let tail_size = uncovered.div_ceil(page_size) * page_size;
+        if node_len <= tail_size {
+            return;
+        }
+        let split_at = node_len - tail_size;
+        if page_size > 1
+            && (!split_at.is_multiple_of(page_size) || !node_len.is_multiple_of(page_size))
+        {
+            return;
+        }
+        let (_, action) = tree_core.split_node_(node_id, split_at);
+        assert!(
+            action.is_none(),
+            "a node without write-through cannot return an action"
+        );
+    }
+
+    /// The window-only lock split is on by default, matching Python
+    /// `SGLANG_SWA_LOCK_WINDOW_ONLY` (an EnvBool defaulting to True).
+    fn swa_lock_window_only() -> bool {
+        std::env::var("SGLANG_SWA_LOCK_WINDOW_ONLY")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
+            .unwrap_or(true)
+    }
+
     // Tier-selected SWA slot reads for the lock walks; `host` picks the host slot.
     fn has_value<K: ChildKeyType>(node: &Node<K>, host: bool) -> bool {
         if host {
@@ -1182,6 +1232,14 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             if node.is_root() || covered >= sliding_window_size {
                 break;
             }
+            // Cap what the walk pins of a long live SWA ancestor at the
+            // trailing window (device tier). Split before locking: the guard
+            // requires the node to be unlocked. `cur` keeps its id as the
+            // in-window tail, so the walk continues into the split-off parent.
+            if !lock_host && Self::swa_lock_window_only() {
+                self.maybe_split_for_window_lock_(tree_core, cur, sliding_window_size - covered);
+            }
+            let node = tree_core.arena.node_mut(cur);
             let parent = node.parent();
             let key_len = node.key.atom_len();
             let has_value = Self::has_value(node, lock_host);

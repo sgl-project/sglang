@@ -1878,8 +1878,11 @@ fn acquire_lock_overshooting_the_window_stops_at_the_crossing_node() {
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    // The 2-atom nodes overshoot the 3-atom window at b (2 -> 4): the walk
-    // stops there, stamps b, and leaves a untouched.
+    // The 2-atom nodes overshoot the 3-atom window at b (2 -> 4). The walk
+    // stops there and stamps b; the window-only split (SGLANG_SWA_LOCK_WINDOW_ONLY)
+    // first splits b into a 1-atom prefix and its 1-atom in-window tail, so
+    // the crossing node pins only the tail the window still needs and a
+    // stays untouched (mirrors Python _maybe_split_for_window_lock in #41580).
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
@@ -1889,8 +1892,8 @@ fn acquire_lock_overshooting_the_window_stops_at_the_crossing_node() {
     );
     assert_eq!(node_swa_uuid(&tc, b), Some(100_000_000_000_001));
     assert_eq!(node_swa_uuid(&tc, a), None);
-    assert_eq!(tc.swa_evictable_size(), 2);
-    assert_eq!(tc.swa_protected_size(), 4);
+    assert_eq!(tc.swa_evictable_size(), 3);
+    assert_eq!(tc.swa_protected_size(), 3);
 }
 
 #[test]
@@ -6433,4 +6436,43 @@ fn insert_reports_whether_it_reached_the_branch_boundary() {
             "swa_branching_seqlen={branching_seqlen:?}"
         );
     }
+}
+
+#[test]
+fn swa_lock_walk_splits_a_long_live_ancestor_to_one_window() {
+    // #41579: a match that ends just short of the window leaves a short
+    // endpoint, so the lock walk reaches a long live-SWA ancestor (e.g. a
+    // finished request's untrimmed last chunk) and would pin all of it.
+    // The window-only split caps the pinned amount at one page-aligned window.
+    // Page size 1: 32-token live ancestor + 7-token endpoint + 8-token window
+    // pins 8 tokens (the endpoint plus a 1-token ancestor tail) instead of 39.
+    let mut tc = swa_core(8, 1);
+    let ancestor = tc
+        .arena
+        .alloc_child(tc.arena.root(), (1..=32).collect(), 0, None)
+        .unwrap();
+    let endpoint = tc
+        .arena
+        .alloc_child(ancestor, (33..=39).collect(), 0, None)
+        .unwrap();
+    store_swa_device(&mut tc, ancestor);
+    store_swa_device(&mut tc, endpoint);
+
+    let result = tc
+        .inc_lock_ref(tc.arena.node(endpoint).id, ComponentSet::EMPTY)
+        .expect("live test node");
+    // The ancestor is split at its tail: the original id is now 1 token long.
+    assert_eq!(tc.arena.node(ancestor).key.atom_len(), 1);
+    assert_eq!(tc.arena.device_lock_ref(endpoint, SWA), 1);
+    assert_eq!(tc.arena.device_lock_ref(ancestor, SWA), 1);
+    assert_eq!(tc.swa_protected_size(), 8);
+    assert!(result.component_lock_uuids[&(SWA.idx() as u8)].is_some());
+
+    // The split is topology only: the release round-trips through the same
+    // segment and everything unlocks.
+    tc.dec_lock_ref(tc.arena.node(endpoint).id, &result.to_dec_params(), false)
+        .expect("live test node");
+    assert_eq!(tc.arena.device_lock_ref(endpoint, SWA), 0);
+    assert_eq!(tc.arena.device_lock_ref(ancestor, SWA), 0);
+    assert_eq!(tc.swa_protected_size(), 0);
 }
