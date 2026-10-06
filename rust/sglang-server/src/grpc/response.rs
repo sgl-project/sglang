@@ -35,12 +35,13 @@ pub(super) fn generate_stream(
     call: FrontendCall,
     incremental: bool,
     response_timeout: Duration,
+    return_text: bool,
 ) -> ResponseStream<proto::GenerateResponse> {
     generation_stream(
         call,
         incremental,
         response_timeout,
-        |output, meta_info, finished| {
+        move |output, meta_info, finished| {
             Ok(proto::GenerateResponse {
                 output_ids: output
                     .token_ids
@@ -53,6 +54,7 @@ pub(super) fn generate_stream(
                     })?,
                 meta_info,
                 finished,
+                text: Some(&output.text).filter(|_| return_text).cloned(),
             })
         },
     )

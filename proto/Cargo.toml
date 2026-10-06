@@ -19,8 +19,8 @@ include = [
 prost = { workspace = true }
 prost-types = { workspace = true }
 tonic = { workspace = true }
+tonic-prost = { workspace = true }
 
 [build-dependencies]
-prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
-tonic-build = { workspace = true }
+tonic-prost-build = { workspace = true }

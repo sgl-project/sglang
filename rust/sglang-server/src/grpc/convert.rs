@@ -130,6 +130,8 @@ pub(super) fn generate(
         require_reasoning,
         max_thinking_tokens,
         kv_hints,
+        // Applied to the response stream by the caller.
+        return_text: _,
     } = request;
 
     reject_unsupported([
