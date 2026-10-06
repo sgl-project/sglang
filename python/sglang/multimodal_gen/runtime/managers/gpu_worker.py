@@ -118,6 +118,10 @@ from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
 
+# How long the scheduler must stay idle before the allocator cache goes back
+# to the driver; back-to-back and concurrent requests never wait this long.
+_IDLE_CACHE_RELEASE_S = 1.0
+
 
 def _device_has_allocator_cache() -> bool:
     return (
@@ -283,6 +287,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
         self._deferred_finalize: Callable[[], None] | None = None
         self._deferred_save_stream = None
+        # Set by a scheduler loop that calls release_cache_if_idle(); others
+        # keep releasing the allocator cache after every request.
+        self.defer_cache_release = False
+        self._cache_release_due: float | None = None
         # per-rank memory measurements of server warmup forwards; consumed by
         # the auto-residency placement decision before the server turns ready
         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
@@ -840,16 +848,20 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         ):
             self.do_mem_analysis(output_batch)
 
-        # Deferred finalize keeps the allocator cache: releasing it while the
-        # next request is mid-forward causes cudaFree/cudaMalloc churn.
         if (
-            not deferred
-            and not current_platform.is_cpu()
+            not current_platform.is_cpu()
             and output_batch.output is None
             and not req.return_raw_frames
         ):
-            with maybe_record_function("EMPTY_CACHE"):
-                torch.get_device_module().empty_cache()
+            if self.defer_cache_release:
+                # Between back-to-back requests a release only makes the next
+                # one grow the pool back, so wait until the scheduler idles.
+                self._cache_release_due = time.monotonic() + _IDLE_CACHE_RELEASE_S
+            elif not deferred:
+                # Deferred finalize keeps the allocator cache: releasing it while
+                # the next request is mid-forward causes cudaFree/cudaMalloc churn.
+                with maybe_record_function("EMPTY_CACHE"):
+                    torch.get_device_module().empty_cache()
 
         if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
             if not req.is_warmup:
@@ -899,6 +911,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     deferred=True,
                 )
             stream.synchronize()
+
+    def release_cache_if_idle(self) -> None:
+        """Release the allocator cache once no request has finished for a while.
+
+        The scheduler calls this only with nothing queued or in flight.
+        """
+        due = self._cache_release_due
+        if due is None or time.monotonic() < due:
+            return
+        self._cache_release_due = None
+        with maybe_record_function("EMPTY_CACHE"):
+            torch.get_device_module().empty_cache()
 
     def take_deferred_finalize(self) -> Callable[[], None] | None:
         deferred = self._deferred_finalize
@@ -1672,20 +1696,24 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
 OOM_MSG = """
 OOM detected. Possible solutions:
-  - If the OOM occurs during loading:
+  - If the OOM occurs during loading, or on the first request with a component on
+    CPU offload (which moves the whole component onto the GPU when it runs):
     1. Check available memory on every selected GPU, not only total capacity.
        In multi-GPU runs, the least-free selected GPU is the bottleneck.
-    2. For single-GPU deployment, use `--performance-mode memory`, component CPU offload,
-       or `--dit-layerwise-offload` for supported Wan/MOVA DiTs.
-    3. For multi-GPU deployment, keep the default `--performance-mode auto` or set
-       `--use-fsdp-inference true` to shard DiT weights with FSDP. FSDP is not a
-       single-GPU substitute for CPU offload.
+    2. For single-GPU deployment, stream weights layer by layer by listing components
+       in `--layerwise-offload-components`, e.g. `dit,text_encoder,image_encoder,vae`.
+       `--dit-layerwise-offload` streams only the DiT, and `--performance-mode memory`
+       streams the DiT only for models that validate it. Component CPU offload helps
+       only when each component fits on its own.
+    3. For multi-GPU deployment, set `--use-fsdp-inference true` to shard DiT weights
+       with FSDP. FSDP is not a single-GPU substitute for offload.
   - If the OOM occurs during runtime:
     1. Reduce resolution, `--num-frames`, or batch size.
     2. Use `--performance-mode memory` for lower memory usage.
     3. Enable SP/Ulysses/Ring for sequence-heavy workloads in multi-GPU setups.
     4. Use FSDP, with CFG parallelism when supported, for validated multi-GPU workloads.
     5. Use a lower-memory attention backend or quantization when available.
+  Tested launch commands per model: https://docs.sglang.io/cookbook
   Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
 """
 

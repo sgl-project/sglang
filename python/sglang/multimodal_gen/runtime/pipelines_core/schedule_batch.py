@@ -82,6 +82,7 @@ class Req:
     """
 
     sampling_params: SamplingParams | None = None
+    runtime_lora_scale: float = 1.0
 
     generator: torch.Generator | list[torch.Generator] | None = None
 
