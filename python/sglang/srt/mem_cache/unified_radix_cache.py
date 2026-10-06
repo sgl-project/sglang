@@ -163,6 +163,10 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    # check_hicache_events reads this on stubs built with object.__new__ in unit tests;
+    # init_hicache sets the real value.
+    _l3_write_on_host_evict: bool = False
+
     def __init__(
         self,
         params: CacheInitParams,
