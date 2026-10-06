@@ -6,7 +6,15 @@ import threading
 import time
 from dataclasses import replace
 from queue import Queue
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Iterator,
+    NamedTuple,
+    Optional,
+    Sequence,
+    TypeVar,
+)
 
 import torch
 
@@ -614,17 +622,33 @@ class UnifiedRadixCache(BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         return self._evict(params)
 
-    @rank_consensus(same_params=True, same_results=True)
-    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
+    @rank_consensus(
+        same_params=["params", "allocation_reclaim_satisfied is not None"],
+        same_results=True,
+    )
+    def evict_for_alloc(
+        self,
+        params: EvictParams,
+        *,
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
+    ) -> EvictResult:
         """Evict until the requested component allocations become feasible.
 
         ``params`` contains allocator shortfalls, not absolute eviction quotas.
         A component eviction can cascade to its peers; with a shared memory pool,
         those collateral frees can satisfy the original allocation before the
         triggering component's requested count is reached.
+
+        A joint-reclaim predicate instead pairs with cumulative eviction quotas,
+        and bypasses component-local availability targets. It is pure and may
+        include capacity that the allocator must prepare after the walk.
         """
         if self.disable:
             return EvictResult()
+        if allocation_reclaim_satisfied is not None:
+            return self._evict(
+                params, allocation_reclaim_satisfied=allocation_reclaim_satisfied
+            )
 
         request_by_type = self._evict_request_by_type(params)
         available_size_targets = {
@@ -716,6 +740,8 @@ class UnifiedRadixCache(BasePrefixCache):
         available_size_targets: Optional[
             dict[ComponentType, tuple[ComponentType, int]]
         ] = None,
+        *,
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
     ) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -727,6 +753,7 @@ class UnifiedRadixCache(BasePrefixCache):
             request_by_type,
             tracker,
             available_size_targets=available_size_targets,
+            allocation_reclaim_satisfied=allocation_reclaim_satisfied,
         )
 
         if (
@@ -877,6 +904,8 @@ class UnifiedRadixCache(BasePrefixCache):
         available_size_targets: Optional[
             dict[ComponentType, tuple[ComponentType, int]]
         ] = None,
+        *,
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
     ) -> None:
         # Buffer mode: eviction always wins over queued backup intents — a
         # destroyed victim's intent is stale-swept and the content rewrites
@@ -886,6 +915,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         def target_reached(component_type: ComponentType) -> bool:
             nonlocal last_mamba_donor_check, mamba_donor_prepared
+            if allocation_reclaim_satisfied is not None:
+                return allocation_reclaim_satisfied()
             if available_size_targets is None:
                 return False
             target = available_size_targets.get(component_type)

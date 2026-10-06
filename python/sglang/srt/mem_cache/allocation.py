@@ -187,8 +187,15 @@ def alloc_paged_token_slots_extend(
     # availability floor must cover every request's ceil(K_i/N) rounding,
     # matching the N*ps per-request admission reserve).
     allocator = tree_cache.token_to_kv_pool_allocator
-    num_tokens = extend_num_tokens + len(seq_lens_cpu) * (
-        allocator.page_size * page_interleave_shard_size(allocator)
+    shard_size = page_interleave_shard_size(allocator)
+    conservative_num_tokens = extend_num_tokens + len(seq_lens_cpu) * (
+        allocator.page_size * shard_size
+    )
+    num_tokens = allocator.get_extend_allocation_demand(
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        conservative_num_tokens=conservative_num_tokens,
+        shard_size=shard_size,
     )
     evict_from_tree_cache(tree_cache, num_tokens)
 
