@@ -1417,7 +1417,7 @@ class TestDecodeRadixRetraction(_UnifiedHiCacheCase):
 class TestLoadBackAdmission(_UnifiedHiCacheCase):
     """PrefillAdder load-back admission over the real cache and shared budget."""
 
-    def _adder(self):
+    def _adder(self, num_mixed_decode_tokens: int = 0):
         running = mock.MagicMock()
         running.reqs = []
         return PrefillAdder(
@@ -1428,7 +1428,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
             new_token_ratio=1.0,
             rem_input_tokens=10_000,
             rem_chunk_tokens=None,
-            num_mixed_decode_tokens=0,
+            num_mixed_decode_tokens=num_mixed_decode_tokens,
             priority_scheduling_preemption_threshold=0,
         )
 
@@ -1566,12 +1566,12 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         self.assertEqual(self._match(tokens).host_hit_length, 16)
         self.cache.sanity_check()
 
-    def _resident_full_behind_host_swa(self):
+    def _resident_full_behind_host_swa(self, *, tokens: int = 64):
         """FULL stays resident under a host-only SWA window, so the host hit
         overstates the FULL slots a load adds."""
-        self._cache(write_policy="write_through", tokens=64)
+        self._cache(write_policy="write_through", tokens=tokens)
         tokens = list(range(1, 17))
-        self._insert(tokens, 100)
+        _, self.expected = self._insert(tokens, 100)
         self.cache.flush_pending_backups()
         self.cache.writing_check()
         self.cache.evict(EvictParams(swa_num_tokens=len(tokens)))
@@ -1611,18 +1611,61 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
             )
         return verdict, full_specs, full_tokens
 
-    def test_shared_budget_counts_only_the_full_slots_a_load_adds(self):
-        req, new_full = self._resident_full_behind_host_swa()
-        adder = self._adder()
+    def test_shared_budget_reclaims_for_the_load_and_pending_demand(self):
+        req, new_full = self._resident_full_behind_host_swa(tokens=80)
+        # A running request locks its whole path; only its SWA past the window
+        # can be reclaimed.
+        running = list(range(5000, 5040))
+        running_ids, running_expected = self._insert(running, 500)
+        self.cache.flush_pending_backups()
+        self.cache.writing_check()
+        running_node = self._match(running).last_device_node
+        pin = self.cache.inc_lock_ref(running_node).to_dec_params()
+        reclaimable_swa = self.cache.swa_evictable_size()
+        self.assertGreater(reclaimable_swa, 0)
+        # The batch's decode tokens are pending demand on both bands. With
+        # them, the load fits the shared gap only after that SWA is reclaimed.
+        decode = 6 * PAGE
+        adder = self._adder(num_mixed_decode_tokens=decode)
         extend = len(req.full_untruncated_fill_ids) - req.host_hit_length
+        moves = []
+        _record_moves(self.allocator, moves)
 
         verdict, full_specs, full_tokens = self._admit_recording(adder, req)
 
         self.assertIs(verdict, AddReqResult.CONTINUE)
+        # The FULL ask counts only the slots the load adds; the budget itself
+        # adds the pending demand.
         self.assertEqual(len(full_specs), 1)
         self.assertEqual(full_tokens, [new_full + extend + PAGE + PAGE])
+        # The queued load blocks every page move. The batch's own extend and
+        # the pending decode tokens still fit.
+        self.assertEqual(len(self.controller.load_queue), 1)
+        self.assertTrue(self.allocator.full_attn_allocator.moves_blocked())
+        moved = len(moves)
+        own = self.allocator.alloc(PAGE)
+        pending = self.allocator.alloc(decode)
+        self.assertIsNotNone(own)
+        self.assertIsNotNone(pending)
+        self.assertEqual(len(moves), moved)
+        # That room came from reclaiming the running request's out-of-window
+        # SWA; its FULL rows and its window stay.
+        self.assertLess(self.cache.swa_evictable_size(), reclaimable_swa)
+        self._assert_rows(running_ids, running_expected, swa_tail=self.window)
+
         self.cache.ready_to_load_host_cache()
         self.cache.loading_check()
+        full, swa = self.rows.read(req.prefix_indices)
+        self.assertTrue(torch.equal(full, self.expected[0]))
+        self.assertTrue(
+            torch.equal(swa[-self.window :], self.expected[1][-self.window :])
+        )
+        self._assert_rows(running_ids, running_expected, swa_tail=self.window)
+        # Only the request's own device lock is left once the load is acked.
+        self.assertEqual(self._locks(req.best_match_node), (1, 0, 0))
+        self.allocator.free(torch.cat([own, pending]))
+        self.cache.dec_lock_ref(running_node, pin)
+        self.assertEqual(self.allocator.verify_byte_accounting(), [])
         self.cache.sanity_check()
 
     def test_budgets_without_full_tokens_skip_the_full_spec(self):
