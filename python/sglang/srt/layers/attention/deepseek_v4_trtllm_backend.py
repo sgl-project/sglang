@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
 )
 from sglang.srt.layers.attention.dsv4.metadata import copy_unless_aliased
 from sglang.srt.runtime_context import (
-    get_buffer,
+    get_context,
     get_exec,
     get_parallel,
     get_schedule,
@@ -638,6 +638,9 @@ class DeepseekV4TrtllmMultiStepBackend(
 
 
 def is_dsv4_trtllm_attn_enabled() -> bool:
+    # Model construction outside a server (unit tests) has no published exec config.
+    if not get_context().is_config_namespace_published("exec"):
+        return False
     return get_exec().kernel.dsv4_attn_backend == "trtllm"
 
 
