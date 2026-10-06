@@ -11,9 +11,9 @@ from triton.language.extra import libdevice
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -496,7 +496,7 @@ class IQuestQ1DecoderLayer(nn.Module):
         # Intentional: layer 0 adds the raw input and an FFN output norm, later layers
         # add the normalized input without one; the MTP draft follows layer 0.
         moe = _is_moe_layer(config, layer_id)
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(
                     read=UNFUSED_NORM_READOUT
@@ -515,12 +515,6 @@ class IQuestQ1DecoderLayer(nn.Module):
                 ),
                 self.feed_forward_norm,
             ),
-            previous=declare_ffn(
-                sparse=_is_moe_layer(config, layer_id - 1), next_layer_sparse=moe
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def _attn_output(self, attn_output: torch.Tensor) -> torch.Tensor:
