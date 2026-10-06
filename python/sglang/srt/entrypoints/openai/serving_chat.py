@@ -68,6 +68,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     SglExt,
     Tool,
     ToolCall,
+    ToolCallConstraint,
     ToolCallProcessingResult,
     ToolChoice,
     TopLogprob,
@@ -281,6 +282,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.config_value("tool_call_parser")
         self.reasoning_parser = self.tokenizer_manager.config_value("reasoning_parser")
+        self.grammar_backend = self.tokenizer_manager.config_value("grammar_backend")
         self.default_chat_template_kwargs = (
             get_serving().default_chat_template_kwargs or {}
         )
@@ -1332,6 +1334,33 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return adapted_request, request
 
+    def _tool_call_or_response_format_constraint(
+        self, request: ChatCompletionRequest, parser: FunctionCallParser
+    ) -> Optional[ToolCallConstraint]:
+        """Under tool_choice="auto" with a JSON response_format, let the model
+        either call a tool or answer in the schema."""
+        # Only xgrammar compiles the "or" structural tag format.
+        if (
+            request.tool_choice != "auto"
+            or self.grammar_backend != "xgrammar"
+            or request.regex
+            or request.ebnf
+            or request.response_format_schema(
+                renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3"
+            )
+            is None
+        ):
+            return None
+        # The schema branch has no reasoning prefix, so the tool branch must not either.
+        constraint = parser.get_structure_constraint(
+            "required",
+            parallel_tool_calls=request.parallel_tool_calls,
+            thinking_mode=False,
+        )
+        if constraint is None or constraint[0] != "structural_tag":
+            return None
+        return ("structural_tag_or_response_format", constraint[1])
+
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
@@ -1408,9 +1437,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                     thinking_mode=xgrammar_reasoning,
                 )
+                tool_call_constraint = (
+                    self._tool_call_or_response_format_constraint(
+                        request=request, parser=parser
+                    )
+                    or tool_call_constraint
+                )
                 if (
                     tool_call_constraint is not None
-                    and tool_call_constraint[0] == "structural_tag"
+                    and tool_call_constraint[0]
+                    in ("structural_tag", "structural_tag_or_response_format")
                     and self._reasoning_detector is not None
                 ):
                     # Same ownership rule: the reasoning parser handles think

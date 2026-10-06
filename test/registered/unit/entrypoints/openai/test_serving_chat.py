@@ -22,8 +22,10 @@ from pathlib import Path
 from typing import Optional
 from unittest.mock import Mock, patch
 
+import xgrammar as xgr
 from fastapi import Request
 from transformers.utils.chat_template_utils import _compile_jinja_template
+from xgrammar.testing import _is_grammar_accept_string
 
 from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.chat_encoding import (
@@ -55,6 +57,13 @@ from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+
+_ANSWER_SCHEMA = {
+    "type": "object",
+    "properties": {"answer": {"type": "string"}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
 
 # Every spec resolve_chat_encoding_spec can return; pinned by the guard below.
 _ALL_CHAT_ENCODING_SPECS = ("dsv41", "dsv4", "dsv32", "inkling", "kimi_k3")
@@ -2463,6 +2472,83 @@ class ServingChatTestCase(CustomTestCase):
             tool_call_constraint=("structural_tag", None),
         )
         self.assertEqual(sampling_params["json_schema"], '{"type": "object"}')
+
+    def _auto_tools_with_response_format_sampling_params(self, grammar_backend):
+        self.tm._config_overrides["grammar_backend"] = grammar_backend
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        },
+                    },
+                }
+            ],
+            tool_choice="auto",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "schema": _ANSWER_SCHEMA},
+            },
+        )
+        processed = self.chat._process_messages(request, is_multimodal=False)
+        return request.to_sampling_params(
+            stop=[],
+            model_generation_config={},
+            tool_call_constraint=processed.tool_call_constraint,
+        )
+
+    def test_auto_tool_choice_with_response_format_allows_tool_call_or_schema(self):
+        """tool_choice="auto" plus a JSON response_format must let the model
+        either call a tool or answer in the schema; the schema grammar alone
+        made every tool call impossible."""
+        tool_calls = {
+            "hermes": '<tool_call>{"name":"get_weather", "arguments":'
+            '{"city": "Paris"}}</tool_call>',
+            "qwen3_coder": "<tool_call>\n<function=get_weather>\n"
+            "<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+        }
+        for parser_name, tool_call in tool_calls.items():
+            with self.subTest(parser=parser_name):
+                self.tm._config_overrides["tool_call_parser"] = parser_name
+                sampling_params = self._auto_tools_with_response_format_sampling_params(
+                    "xgrammar"
+                )
+
+                if sampling_params.get("structural_tag"):
+                    grammar = xgr.Grammar.from_structural_tag(
+                        sampling_params["structural_tag"]
+                    )
+                else:
+                    grammar = xgr.Grammar.from_json_schema(
+                        sampling_params["json_schema"]
+                    )
+                self.assertTrue(_is_grammar_accept_string(grammar, tool_call))
+                self.assertTrue(
+                    _is_grammar_accept_string(grammar, '{"answer": "sunny"}')
+                )
+                self.assertFalse(_is_grammar_accept_string(grammar, "It is sunny."))
+                self.assertFalse(_is_grammar_accept_string(grammar, '{"other": 1}'))
+
+    def test_auto_tool_choice_with_response_format_keeps_schema_off_xgrammar(self):
+        """Only xgrammar compiles the "or" structural tag; other grammar
+        backends must keep the plain response_format schema."""
+        sampling_params = self._auto_tools_with_response_format_sampling_params(
+            "llguidance"
+        )
+
+        self.assertNotIn("structural_tag", sampling_params)
+        self.assertEqual(json.loads(sampling_params["json_schema"]), _ANSWER_SCHEMA)
 
     def test_kimi_k2_streaming_tool_call_id_with_history(self):
         """Ensure streaming first chunk tool_call.id increase with tool calls history for kimi_k2 parser."""

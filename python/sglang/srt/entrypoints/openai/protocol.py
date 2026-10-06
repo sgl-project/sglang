@@ -71,6 +71,7 @@ try:
 except:
     StructuralTag = Any
 
+from sglang.srt.constrained.utils import structural_tag_format
 from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
@@ -256,10 +257,30 @@ StructuralTagResponseFormat: TypeAlias = Union[
 
 ToolCallConstraint: TypeAlias = Union[
     Tuple[Literal["structural_tag"], StructuralTagResponseFormat],
+    # A required-mode tool-call tag, ORed with the response_format schema.
+    Tuple[Literal["structural_tag_or_response_format"], StructuralTagResponseFormat],
     Tuple[Literal["json_schema"], Any],  # json_schema can be dict/str/None
     Tuple[Literal["ebnf"], str],
     Tuple[Literal["full_assistant_ebnf"], str],
 ]
+
+
+def _or_structural_tag(
+    tool_tag: StructuralTagResponseFormat, json_schema: Dict[str, object]
+) -> str:
+    """A structural tag that accepts either a tool call or a schema-shaped answer."""
+    return convert_json_schema_to_str(
+        {
+            "type": "structural_tag",
+            "format": {
+                "type": "or",
+                "elements": [
+                    structural_tag_format(tool_tag.model_dump(by_alias=True)),
+                    {"type": "json_schema", "json_schema": json_schema},
+                ],
+            },
+        }
+    )
 
 
 class FileRequest(BaseModel):
@@ -1099,6 +1120,25 @@ class ChatCompletionRequest(PDRoutingFields):
 
         return values
 
+    def response_format_schema(
+        self, renderer_handles_response_format: bool = False
+    ) -> Optional[Dict[str, object]]:
+        """The JSON schema that response_format constrains decoding to, if any."""
+        if self.response_format is None:
+            return None
+        if self.response_format.type == "json_object":
+            return {"type": "object"}
+        if self.response_format.type != "json_schema":
+            return None
+        # strict=false may only go unconstrained when the renderer forwards
+        # response_format to the model; plain chat templates never see it.
+        if (
+            self.response_format.json_schema.strict is False
+            and renderer_handles_response_format
+        ):
+            return None
+        return self.response_format.json_schema.schema_
+
     def to_sampling_params(
         self,
         stop: List[str],
@@ -1151,22 +1191,27 @@ class ChatCompletionRequest(PDRoutingFields):
             "spaces_between_special_tokens": spaces_between_special_tokens,
         }
 
-        if self.response_format and self.response_format.type == "json_schema":
-            # strict=false may only go unconstrained when the renderer forwards
-            # response_format to the model; plain chat templates never see it.
-            if (
-                self.response_format.json_schema.strict is not False
-                or not renderer_handles_response_format
-            ):
-                sampling_params["json_schema"] = convert_json_schema_to_str(
-                    self.response_format.json_schema.schema_
-                )
-        elif self.response_format and self.response_format.type == "json_object":
-            sampling_params["json_schema"] = '{"type": "object"}'
+        response_schema = self.response_format_schema(
+            renderer_handles_response_format=renderer_handles_response_format
+        )
+        if response_schema is not None:
+            sampling_params["json_schema"] = convert_json_schema_to_str(response_schema)
         elif self.response_format and self.response_format.type == "structural_tag":
             sampling_params["structural_tag"] = convert_json_schema_to_str(
                 self.response_format.model_dump(by_alias=True)
             )
+
+        if (
+            tool_call_constraint is not None
+            and tool_call_constraint[0] == "structural_tag_or_response_format"
+        ):
+            # Sent only when response_schema is set and regex/ebnf are not, so
+            # the OR replaces the json_schema constraint.
+            del sampling_params["json_schema"]
+            sampling_params["structural_tag"] = _or_structural_tag(
+                tool_tag=tool_call_constraint[1], json_schema=response_schema
+            )
+            tool_call_constraint = None
 
         # Check if there are already existing output constraints
         has_existing_constraints = (
