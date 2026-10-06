@@ -44,6 +44,8 @@ class HiCacheStorageConfig:
 
 @dataclass
 class HiCacheStorageExtraInfo:
+    # Page hashes preceding the call's keys, from the sequence start;
+    # prefix_keys + keys is one contiguous chain for KV batches and sidecars.
     prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
 
@@ -380,7 +382,11 @@ class HiCacheFile(HiCacheStorage):
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
-        self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
+        self.file_path = (
+            envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get()
+            or (storage_config.extra_config or {}).get("file_storage_path")
+            or file_path
+        )
 
         tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
             storage_config.tp_rank,

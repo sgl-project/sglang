@@ -67,6 +67,59 @@ def _perf_record(memory_snapshots: dict[str, dict]) -> RequestPerfRecord:
     )
 
 
+@pytest.mark.parametrize("is_output_rank", [False, True])
+@pytest.mark.parametrize("is_warmup", [False, True])
+def test_worker_perf_dump_has_one_writer_per_replica(
+    is_output_rank, is_warmup, monkeypatch, tmp_path
+):
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.is_output_rank = is_output_rank
+    worker.server_args = SimpleNamespace(model_path="test-model")
+    worker._realtime_sessions = SimpleNamespace(attach=Mock())
+    worker._release_warmup_pool = Mock()
+    worker._materialize_output_transport = Mock()
+    worker._record_output_peak_memory = Mock()
+    worker._record_replica_peak_memory = Mock()
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
+    monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
+    monkeypatch.setattr(PerformanceLogger, "log_request_summary", Mock())
+
+    path = tmp_path / "perf.json"
+    path.write_text('{"writer": "output-rank"}')
+    metrics = RequestMetrics("request")
+    output = OutputBatch(metrics=metrics)
+    req = SimpleNamespace(
+        request_id="request",
+        is_warmup=is_warmup,
+        extra={},
+        suppress_logs=True,
+        perf_dump_path=str(path),
+    )
+    result = worker._execute_forward_common(
+        req,
+        forward_fn=lambda: output,
+        log_reqs=[],
+        return_req=False,
+        save_output_paths=Mock(),
+        error_context="test",
+    )
+
+    assert result is output
+    assert result.error is None
+    report = json.loads(path.read_text())
+    if is_output_rank and not is_warmup:
+        assert report["request_id"] == "request"
+        assert report["tag"] == "server_perf_dump"
+        assert report["meta"] == {"model": "test-model"}
+    else:
+        assert report == {"writer": "output-rank"}
+    # non-output ranks must still participate in the replica's memory reduction
+    if is_warmup:
+        worker._record_replica_peak_memory.assert_not_called()
+    else:
+        worker._record_replica_peak_memory.assert_called_once_with([metrics])
+
+
 def test_request_metrics_attributes_steps_and_iterations_to_active_stage():
     metrics = RequestMetrics("request")
     metrics.active_stage_name = "ShapeStage"
@@ -186,10 +239,19 @@ def test_worker_records_replica_load_and_runtime_peaks():
     worker._runtime_peak_allocated_mb = 0.0
     output = OutputBatch()
     metrics = RequestMetrics("request")
-    replica_group = Mock()
-    replica_group.all_reduce.return_value = torch.tensor(
-        [5120.0, 3584.0, 6144.0, 3500.0, 2560.0], dtype=torch.float64
-    )
+    replica_group = SimpleNamespace(world_size=2, cpu_group=object())
+    reduced = []
+
+    def all_reduce(tensor, op, group):
+        # five host counters over the gloo group, never a device collective
+        assert tensor.device.type == "cpu"
+        assert op == torch.distributed.ReduceOp.MAX
+        assert group is replica_group.cpu_group
+        reduced.append(tensor.tolist())
+        tensor.copy_(
+            torch.tensor([5120.0, 3584.0, 6144.0, 3500.0, 2560.0], dtype=torch.float64)
+        )
+
     snapshots = [
         MemorySnapshot(0.0, 0.0, 2048.0, 3072.0),
         MemorySnapshot(0.0, 0.0, 2048.0, 3072.0),
@@ -205,6 +267,9 @@ def test_worker_records_replica_load_and_runtime_peaks():
         patch.object(
             gpu_worker_module, "get_replica_group", return_value=replica_group
         ),
+        patch.object(
+            gpu_worker_module.torch.distributed, "all_reduce", side_effect=all_reduce
+        ),
     ):
         worker._record_output_peak_memory(output)
         worker._record_replica_peak_memory([metrics])
@@ -218,6 +283,7 @@ def test_worker_records_replica_load_and_runtime_peaks():
     assert metrics.memory_snapshots["load_peak"].peak_allocated_mb == 3500.0
     assert metrics.memory_snapshots["runtime_peak"].peak_allocated_mb == 2560.0
     assert metrics.memory_snapshots["warmup_peak"].peak_reserved_mb == 6144.0
+    assert reduced == [[4096.0, 3072.0, 0.0, 3000.0, 2048.0]]
 
 
 def test_server_warmup_preserves_peak_after_managed_stage_timeline():
@@ -344,6 +410,7 @@ def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):
     assert scenario.runtime_peak_allocated_mb == 2000.5
     assert config.tolerances.load_peak_vram == 0.01
     assert config.tolerances.runtime_peak_vram == 0.02
+    assert config.tolerances.load is None
 
 
 def test_peak_vram_validation_uses_independent_tolerances():

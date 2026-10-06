@@ -22,6 +22,7 @@ from torch import nn
 
 from sglang.kernels.ops.attention.vision_rope import (
     apply_fused_qk_complex_rope,
+    can_use_fused_qk_complex_rope,
     precompile_fused_qk_complex_rope,
 )
 from sglang.srt.environ import envs
@@ -110,32 +111,6 @@ def apply_rope(
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2)
     return xq_out.type_as(xq), xk_out.type_as(xk)
-
-
-def _can_use_fused_rope(hidden_states: torch.Tensor, freqs_cis: torch.Tensor) -> bool:
-    return _can_use_fused_rope_for_shape(
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
-        freqs_cis=freqs_cis,
-    )
-
-
-def _can_use_fused_rope_for_shape(
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-    freqs_cis: torch.Tensor,
-) -> bool:
-    if not (
-        device.type == "cuda"
-        and freqs_cis.is_cuda
-        and device == freqs_cis.device
-        and dtype in (torch.bfloat16, torch.float16)
-        and freqs_cis.dtype == torch.complex64
-    ):
-        return False
-    major, _ = torch.cuda.get_device_capability(device)
-    return major >= 9
 
 
 def sdpa_varlen_attention(
@@ -681,7 +656,7 @@ class MoonViT3dEncoder(nn.Module):
             segment_bounds=tuple(zip(cumulative_lengths[:-1], cumulative_lengths[1:])),
             rope_freqs_cis=rope_freqs_cis,
             attention=attention,
-            use_fused_rope=_can_use_fused_rope_for_shape(
+            use_fused_rope=can_use_fused_qk_complex_rope(
                 dtype=dtype,
                 device=device,
                 freqs_cis=rope_freqs_cis,
@@ -704,12 +679,6 @@ class MoonViT3dEncoder(nn.Module):
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
                 grid_thw_list=grid_thw_list,
-            )
-            forward_metadata = replace(
-                forward_metadata,
-                use_fused_rope=_can_use_fused_rope(
-                    hidden_states, forward_metadata.rope_freqs_cis
-                ),
             )
         attention = forward_metadata.attention
         cu_seqlens = attention.cu_seqlens

@@ -47,6 +47,11 @@ def _build_server_args(
         "prefill": ext.DisaggregationMode.Prefill,
         "decode": ext.DisaggregationMode.Decode,
     }[get_disagg().disaggregation_mode]
+    grpc_port = (
+        None
+        if get_serving().smg_grpc_mode or get_serving().grpc_mode
+        else get_serving().grpc_port
+    )
     return ext.ServerArgs(
         model_path=get_model().model_path,
         served_model_name=get_serving().served_model_name,
@@ -56,6 +61,9 @@ def _build_server_args(
         weight_version=get_serving().weight_version,
         host=get_serving().host,
         port=get_serving().port,
+        # The shared field is also populated for legacy SMG mode; only forward
+        # it when it selects SGLang's native gRPC transport.
+        grpc_port=grpc_port,
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
         chat_template=get_serving().chat_template,

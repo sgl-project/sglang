@@ -11,7 +11,7 @@
 //!
 //! * A plain text chat request forwards `input_ids` AND retains `messages`,
 //!   even though sticky never consults the tokens for routing.
-//! * A request carrying `tools` / multimodal content omits `input_ids` — the
+//! * A request carrying multimodal content omits `input_ids` — the
 //!   same safe-to-forward predicate applies regardless of policy.
 //! * Same-session-header requests still pin to a single worker (O(1) sticky
 //!   routing is unchanged by the added tokenization).
@@ -53,11 +53,15 @@ fn config() -> Config {
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: MODEL.into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy: PolicyKind::Sticky,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
+            reorg_buckets: None,
+            reorg_admission: Default::default(),
             circuit_breaker: None,
             cache_aware: None,
             // Push eviction far out so the background sweeper never fires
@@ -72,6 +76,7 @@ fn config() -> Config {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
@@ -99,7 +104,7 @@ fn build_ctx(worker_urls: &[String]) -> Arc<AppContext> {
             url: url.clone(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId(MODEL.into())],
-            bootstrap_port: None,
+            ..Default::default()
         });
     }
     // Sticky needs no cache-aware deps, so the defaults registry is fine — the
@@ -156,55 +161,6 @@ async fn sticky_plain_chat_forwards_input_ids_and_keeps_messages() {
     assert!(
         body.get("messages").is_some(),
         "messages must be retained alongside input_ids; got {body}"
-    );
-}
-
-#[tokio::test]
-async fn sticky_tool_request_omits_input_ids() {
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(std::slice::from_ref(&mock.url));
-    let status = send(
-        ctx,
-        "alice",
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "f"}}],
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = captured(&mock);
-    assert!(
-        body.get("input_ids").is_none(),
-        "tool requests must not forward input_ids even under sticky; got {body}"
-    );
-}
-
-#[tokio::test]
-async fn sticky_thinking_request_omits_input_ids() {
-    // `chat_template_kwargs` steers engine-side thinking mode the router's
-    // encoder renders in the default mode only — the safe-to-forward predicate
-    // is policy-independent, so sticky must omit ids here too.
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(std::slice::from_ref(&mock.url));
-    let status = send(
-        ctx,
-        "alice",
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hi"}],
-            "chat_template_kwargs": {"enable_thinking": true},
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = captured(&mock);
-    assert!(
-        body.get("input_ids").is_none(),
-        "thinking-mode requests must not forward input_ids under sticky; got {body}"
     );
 }
 

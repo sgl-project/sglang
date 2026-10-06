@@ -2423,7 +2423,7 @@ class TestDumperE2E:
                 "moe_tp_size",
                 "moe_dp_rank",
                 "moe_dp_size",
-                "enable_dp_attention",
+                "attn_dp_enabled",
                 "attn_tp_rank",
                 "attn_tp_size",
                 "attn_dp_rank",

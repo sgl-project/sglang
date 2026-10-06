@@ -83,6 +83,7 @@ class TestHiddenStateGraphRecapture(CustomTestCase):
             batch_size=1,
             input_embeds=None,
             replace_embeds=None,
+            contains_mm_inputs=lambda: False,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=capture_hidden_mode,
             spec_info=SimpleNamespace(capture_hidden_mode=spec_capture_hidden_mode),

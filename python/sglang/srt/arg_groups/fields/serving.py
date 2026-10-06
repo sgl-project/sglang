@@ -170,6 +170,10 @@ class Serving(msgspec.Struct):
         Optional[str],
         "The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
     ] = None
+    trust_request_chat_template: A[
+        bool,
+        "Allow a request to override the server chat template via its chat_template_kwargs. Off by default for safety.",
+    ] = False
     hf_chat_template_name: A[
         Optional[str],
         "When the HuggingFace tokenizer has multiple chat templates (e.g., 'default', 'tool_use', 'rag'), specify which named template to use. If not set, the first available template is used.",
@@ -179,9 +183,9 @@ class Serving(msgspec.Struct):
         "The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.",
     ] = None
     file_storage_path: A[
-        str,
+        Optional[str],
         "The path of the file storage in backend.",
-    ] = "sglang_storage"
+    ] = None
     enable_cache_report: A[
         bool,
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",

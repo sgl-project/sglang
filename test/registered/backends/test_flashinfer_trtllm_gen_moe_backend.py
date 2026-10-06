@@ -170,8 +170,7 @@ class FlashinferTrtllmGenMoeBackendMXFP8A2ABase:
             other_args=[
                 "--quantization",
                 "mxfp8",
-                "--enable-dp-attention",
-                "--dp-size",
+                "--attn-dp-size",
                 "4",
                 "--tp-size",
                 "4",

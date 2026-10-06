@@ -7,14 +7,14 @@ use std::time::Instant;
 use futures::future::BoxFuture;
 use rand::Rng;
 
-use crate::policies::admission::{compare_decode_pressure, compare_prefill_pressure};
+use crate::state::load_monitor::engine_ranking::{compare_decode_engines, compare_prefill_engines};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::workers::Worker;
 
 use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
 use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
 
-/// Samples two distinct engines and selects the one with lower stage pressure.
+/// Samples two distinct engines and selects the better-ranked one for its stage.
 /// Checks admission only on the selected engine; rejection never resamples.
 #[derive(Debug)]
 pub struct PowerOfTwoPolicy {
@@ -54,13 +54,13 @@ impl Policy for PowerOfTwoPolicy {
                         j += 1;
                     }
                     let (left, right) = (&engines[i], &engines[j]);
-                    let pressure = match request.stage {
+                    let ordering = match request.stage {
                         Stage::Plain | Stage::Prefill => {
-                            compare_prefill_pressure(left, right, Some(&load))
+                            compare_prefill_engines(left, right, Some(&load))
                         }
-                        Stage::Decode => compare_decode_pressure(left, right, Some(&load)),
+                        Stage::Decode => compare_decode_engines(left, right, Some(&load)),
                     };
-                    Arc::clone(if pressure.is_gt() { right } else { left })
+                    Arc::clone(if ordering.is_gt() { right } else { left })
                 }
             };
             let metrics = EngineMetrics::observe(&engine, &load);

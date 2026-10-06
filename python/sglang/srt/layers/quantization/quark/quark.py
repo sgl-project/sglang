@@ -419,6 +419,15 @@ class QuarkConfig(QuantizationConfig):
             packed_modules_mapping=packed_modules_mapping,
         )
 
+    def is_linear_unquantized(self, prefix: str) -> bool:
+        # get_quant_method registers every non-excluded prefix as an
+        # online-quantized layer, so answer from the exclude list instead.
+        return self.excluded_fp8_config is None and should_ignore_layer(
+            prefix,
+            ignore=self.exclude_layers,
+            fused_mapping=self.packed_modules_mapping,
+        )
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:

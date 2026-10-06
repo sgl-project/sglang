@@ -6,6 +6,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
+from sglang.multimodal_gen.runtime.cache import cache_dit_integration
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     cache_dit_overrides_key,
     resolve_cache_dit_request_overrides,
@@ -16,6 +19,34 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.ideogram import (
+    Ideogram4ProgressiveDenoisingStage,
+)
+
+
+class TestIdeogramActiveCacheRefresh(unittest.TestCase):
+    def test_request_override_and_active_transformers_survive_transition(self):
+        for skip, has_unconditional in ((False, True), (True, True), (False, False)):
+            with self.subTest(skip=skip, has_unconditional=has_unconditional):
+                stage = object.__new__(Ideogram4ProgressiveDenoisingStage)
+                stage.transformer = torch.nn.Linear(2, 2)
+                stage.unconditional_transformer = (
+                    torch.nn.Linear(2, 2) if has_unconditional else None
+                )
+                stage._cache_dit_request_overrides = {"scm_preset": "none"}
+                ctx = SimpleNamespace(extra={"ideogram4_skip_unconditional": skip})
+                with patch.object(
+                    cache_dit_integration.cache_dit, "refresh_context"
+                ) as refresh:
+                    stage._refresh_cache_dit_context(
+                        4, stage._effective_scm_preset(), ctx
+                    )
+                targets = [call.args[0] for call in refresh.call_args_list]
+                expected = [stage.transformer]
+                if has_unconditional and not skip:
+                    expected.append(stage.unconditional_transformer)
+                self.assertEqual(targets, expected)
+                self.assertIsNone(stage._effective_scm_preset())
 
 
 class TestResolveCacheDitRequestOverrides(unittest.TestCase):
@@ -68,10 +99,11 @@ def _batch(
     enable_cache_dit=None,
     cache_dit_params=None,
     is_warmup=False,
+    do_classifier_free_guidance=False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         is_warmup=is_warmup,
-        do_classifier_free_guidance=False,
+        do_classifier_free_guidance=do_classifier_free_guidance,
         sampling_params=SimpleNamespace(
             enable_cache_dit=enable_cache_dit,
             cache_dit_params=cache_dit_params,
@@ -85,6 +117,7 @@ class TestPerRequestCacheDitTransitions(unittest.TestCase):
         self.stage.server_args = SimpleNamespace(
             enable_breakable_cuda_graph=False,
             enable_torch_compile=False,
+            enable_cfg_parallel=False,
         )
         self.stage.transformer = object()
         self.stage.transformer_2 = None
@@ -96,9 +129,12 @@ class TestPerRequestCacheDitTransitions(unittest.TestCase):
         self.enable_calls = []
         self.disable_calls = []
         self.refresh_calls = []
+        self.cfg_modes = []
+        self.refresh_options = []
 
         def fake_enable(transformer, config, **kwargs):
             self.enable_calls.append(config)
+            self.cfg_modes.append(kwargs["has_separate_cfg"])
             return transformer
 
         def fake_disable(transformer):
@@ -107,6 +143,7 @@ class TestPerRequestCacheDitTransitions(unittest.TestCase):
 
         def fake_refresh(transformer, num_inference_steps, scm_preset=None, **kwargs):
             self.refresh_calls.append(num_inference_steps)
+            self.refresh_options.append(kwargs)
 
         patchers = [
             patch.object(denoising_module, "enable_cache_on_transformer", fake_enable),
@@ -126,7 +163,42 @@ class TestPerRequestCacheDitTransitions(unittest.TestCase):
         self.stage._maybe_enable_cache_dit(8, _batch(enable_cache_dit=True))
         self.assertEqual(len(self.enable_calls), 1)
         self.assertTrue(self.stage._cache_dit_enabled)
-        self.assertEqual(self.stage._cache_dit_active_key, cache_dit_overrides_key({}))
+        self.assertEqual(
+            self.stage._cache_dit_active_key, (cache_dit_overrides_key({}), False)
+        )
+
+    def test_cfg_change_remounts_and_parallel_cfg_has_one_branch_per_rank(self):
+        self.stage._maybe_enable_cache_dit(8, _batch(enable_cache_dit=True))
+        cfg_batch = _batch(enable_cache_dit=True, do_classifier_free_guidance=True)
+        self.stage._maybe_enable_cache_dit(8, cfg_batch)
+        self.stage.server_args.enable_cfg_parallel = True
+        self.stage._maybe_enable_cache_dit(8, cfg_batch)
+        self.assertEqual(self.cfg_modes, [False, True, False])
+        self.assertEqual(len(self.disable_calls), 2)
+
+    def test_repeated_custom_scm_request_keeps_mask_and_policy(self):
+        batch = _batch(
+            enable_cache_dit=True,
+            cache_dit_params={
+                "scm_compute_bins": [2, 2],
+                "scm_cache_bins": [2, 2],
+                "scm_policy": "static",
+            },
+        )
+        self.stage._maybe_enable_cache_dit(8, batch)
+        self.stage._maybe_enable_cache_dit(8, batch)
+        self.assertEqual(len(self.enable_calls), 1)
+        self.assertEqual(
+            self.refresh_options,
+            [
+                {
+                    "steps_computation_mask": self.enable_calls[
+                        0
+                    ].steps_computation_mask,
+                    "steps_computation_policy": "static",
+                }
+            ],
+        )
 
     def test_server_default_off_unmounts_after_request_enable(self):
         self.stage._maybe_enable_cache_dit(8, _batch(enable_cache_dit=True))

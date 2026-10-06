@@ -239,7 +239,7 @@ def test_sana_wm_realtime_camera_state_uses_sana_normalizer():
 
 
 def test_sana_wm_realtime_adapter_preserves_requested_size():
-    async def fake_save_image_to_path(image, target_path):
+    async def fake_save_image_to_path(image, target_path, *, uploads_root):
         return target_path
 
     old_save_image_to_path = realtime_adapter.save_image_to_path

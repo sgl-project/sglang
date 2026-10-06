@@ -49,6 +49,7 @@ class ToleranceConfig:
     load_peak_vram: float = 0.01
     runtime_peak_vram: float = 0.02
     host_anon: float = 0.02
+    load: float | None = None
 
     @classmethod
     def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
@@ -102,6 +103,7 @@ class ToleranceConfig:
                 )
             ),
             host_anon=float(tol_data.get("host_anon", 0.02)),
+            load=float(tol_data["load"]) if "load" in tol_data else None,
         )
 
 
@@ -447,6 +449,28 @@ PI05_ACTION_CI_sampling_params = DiffusionSamplingParams(
         "enable_cuda_graph": True,
         "action_max_abs_diff_threshold": 0.05,
         "action_mean_abs_diff_threshold": 0.005,
+    },
+)
+
+
+# DROID policy: three fixed-name 360x640 cameras, 8-dim state and actions,
+# the package recipe (4 steps, CFG on video). Noise comes from the seed.
+FLUX3_ACTION_CI_sampling_params = DiffusionSamplingParams(
+    prompt="put the marker in the cup",
+    extras={
+        "action_horizon": 32,
+        "action_dim": 8,
+        "state_dim": 8,
+        "image_height": 360,
+        "image_width": 640,
+        "camera_order": ("wrist", "left", "right"),
+        "num_inference_steps": 4,
+        "seed": 0,
+        "enable_prefix_cache": False,
+        # Same path is bit-exact across runs and GPUs. Kernel swaps move actions
+        # by up to max 0.064 / mean 0.020 (eager QK-norm+RoPE in every block).
+        "action_max_abs_diff_threshold": 0.2,
+        "action_mean_abs_diff_threshold": 0.05,
     },
 )
 

@@ -128,24 +128,37 @@ def topk_softmax(
     )
 
 
-__all__ = ["moe_align_block_size", "topk_softmax"]
+def situ_and_mul_masked_post_quant(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    quant_group_size: int,
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: float,
+    scale_ue8m0: bool = False,
+    topk: int = 8,
+    transposed: bool = False,
+    swizzle: bool = False,
+) -> None:
+    from ._jit_situ_and_mul_quant import situ_and_mul_masked_post_quant as impl
 
-
-# Fused MoE-LoRA Triton kernels migrated into this group (from lora/triton_ops);
-# registered for inventory. Import them from their modules.
-_TRITON_KERNELS = [
-    ("fused_moe_lora_kernel", "fused_moe_lora"),
-    ("virtual_experts", "merged_experts_fused_moe_lora_add"),
-]
-for _mod, _fn in _TRITON_KERNELS:
-    register_kernel(
-        KernelSpec(
-            op=f"moe.{_fn}",
-            backend=KernelBackend.TRITON,
-            target=f"sglang.kernels.ops.moe.{_mod}:{_fn}",
-        )
+    return impl(
+        input,
+        output,
+        output_scale,
+        quant_group_size,
+        masked_m,
+        beta,
+        linear_beta,
+        scale_ue8m0,
+        topk,
+        transposed,
+        swizzle,
     )
-del _mod, _fn
+
+
+__all__ = ["situ_and_mul_masked_post_quant", "moe_align_block_size", "topk_softmax"]
 
 
 # Triton kernels migrated from srt/layers/moe (RFC #29630, Phase 2.5);
@@ -202,5 +215,82 @@ register_kernel(
         target="sglang.kernels.ops.moe.shuffle_rows_with_scales:shuffle_rows_with_scales",
         capabilities=_CUDA,
         description="Row gather of quantized values plus their scales, one launch.",
+    )
+)
+
+
+# Kernels introduced with Kimi-K3, inventoried by logical operator group.
+register_kernel(
+    KernelSpec(
+        op="moe.situ_and_mul_masked_post_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe._jit_situ_and_mul_quant:situ_and_mul_masked_post_quant",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+
+
+# Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="moe.gemma_routing_post_topk",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.gemma4_routing:gemma_routing_post_topk",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.gemma4_fused_routing",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.gemma4_routing:gemma4_fused_routing",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.mask_topk_ids",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.dsv4:mask_topk_ids",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.hash_topk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.dsv4:hash_topk",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.mega_moe_pre_dispatch",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.dsv4:mega_moe_pre_dispatch",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.silu_and_mul_clamp",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.dsv4:silu_and_mul_clamp",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.silu_and_mul_masked_post_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.dsv4:silu_and_mul_masked_post_quant",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.silu_and_mul_contig_post_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.dsv4:silu_and_mul_contig_post_quant",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )

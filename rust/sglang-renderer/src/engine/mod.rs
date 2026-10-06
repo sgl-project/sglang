@@ -5,13 +5,11 @@ use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 use crate::{GenerateRequest, ResponseError};
 
 mod decode;
-#[cfg(feature = "http")]
 mod http;
 pub(crate) mod response;
 mod types;
 
 pub(crate) use decode::TokenDecoder;
-#[cfg(feature = "http")]
 pub(crate) use http::HttpGenerateClient;
 pub(crate) use types::{
     GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,

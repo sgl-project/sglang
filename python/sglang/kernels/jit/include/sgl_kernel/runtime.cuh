@@ -8,6 +8,8 @@
 
 #include <sgl_kernel/utils.cuh>
 
+#include <tvm/ffi/container/tensor.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -29,6 +31,12 @@
 #endif
 #ifndef cudaDevAttrComputeCapabilityMinor
 #define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
+#endif
+#ifndef cudaDevAttrMaxSharedMemoryPerBlock
+#define cudaDevAttrMaxSharedMemoryPerBlock hipDeviceAttributeMaxSharedMemoryPerBlock
+#endif
+#ifndef cudaDevAttrMaxSharedMemoryPerBlockOptin
+#define cudaDevAttrMaxSharedMemoryPerBlockOptin hipDeviceAttributeSharedMemPerBlockOptin
 #endif
 #ifndef cudaRuntimeGetVersion
 #define cudaRuntimeGetVersion hipRuntimeGetVersion
@@ -67,8 +75,13 @@ inline void* get_device_accessible_ptr(const tvm::ffi::TensorView& tensor) {
   return device_ptr;
 }
 
-namespace details {
-
+/**
+ * \brief Memo for a per-device driver query, keyed by device ordinal.
+ *
+ * \tparam T        Cached value type.
+ * \tparam kDefault The "not queried yet" sentinel. A query that can legally
+ *         return it would be re-run on every call, so pick one it cannot.
+ */
 template <typename T, T kDefault>
 struct DeviceCacheMap {
  public:
@@ -99,8 +112,6 @@ struct DeviceCacheMap {
   T m_data[kNumStaticMaxDevice];
 };
 
-}  // namespace details
-
 // Return the maximum number of active blocks per SM for the given kernel
 template <typename T>
 inline auto get_blocks_per_sm(T&& kernel, int32_t block_dim, std::size_t dynamic_smem = 0) -> uint32_t {
@@ -111,7 +122,7 @@ inline auto get_blocks_per_sm(T&& kernel, int32_t block_dim, std::size_t dynamic
 
 // Return the number of SMs for the given device
 inline auto get_sm_count(int device_id, bool use_cache = true) -> uint32_t {
-  static details::DeviceCacheMap<uint32_t, 0> sm_count_cache;
+  static DeviceCacheMap<uint32_t, 0> sm_count_cache;
   return sm_count_cache.get_cached(device_id, use_cache, [](int32_t device_id) {
     int sm_count;
     CHECK_CUDA(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id));
@@ -121,7 +132,7 @@ inline auto get_sm_count(int device_id, bool use_cache = true) -> uint32_t {
 
 // Return the Major compute capability for the given device
 inline auto get_cc_major(int device_id, bool use_cache = true) -> int {
-  static details::DeviceCacheMap<int, -1> cc_major_cache;
+  static DeviceCacheMap<int, -1> cc_major_cache;
   return cc_major_cache.get_cached(device_id, use_cache, [](int32_t device_id) {
     int cc_major;
     CHECK_CUDA(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device_id));
@@ -131,7 +142,7 @@ inline auto get_cc_major(int device_id, bool use_cache = true) -> int {
 
 // Return the Minor compute capability for the given device
 inline auto get_cc_minor(int device_id, bool use_cache = true) -> int {
-  static details::DeviceCacheMap<int, -1> cc_minor_cache;
+  static DeviceCacheMap<int, -1> cc_minor_cache;
   return cc_minor_cache.get_cached(device_id, use_cache, [](int32_t device_id) {
     int cc_minor;
     CHECK_CUDA(cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, device_id));
@@ -157,6 +168,26 @@ inline auto get_available_dynamic_smem_per_block(T&& kernel, int num_blocks, int
   std::size_t smem_size;
   CHECK_CUDA(cudaOccupancyAvailableDynamicSMemPerBlock(&smem_size, kernel, num_blocks, block_size));
   return smem_size;
+}
+
+/**
+ * \brief Shared memory one block may use on the given device, in bytes.
+ *
+ * \param device_id CUDA device ordinal.
+ * \param opt_in    True for the larger limit a kernel reaches by setting
+ *        `cudaFuncAttributeMaxDynamicSharedMemorySize`, false for the default
+ *        cap that needs no opt-in.
+ * \param use_cache False re-queries the driver instead of reading the memo.
+ */
+inline auto get_max_smem_per_block(int device_id, bool opt_in = true, bool use_cache = true) -> std::size_t {
+  /// NOTE: we all know this is no larger than 1MB for all GPU, so use uint32_t
+  static DeviceCacheMap<uint32_t, 0> smem_cache[2];
+  const auto attr = opt_in ? cudaDevAttrMaxSharedMemoryPerBlockOptin : cudaDevAttrMaxSharedMemoryPerBlock;
+  return smem_cache[opt_in].get_cached(device_id, use_cache, [attr](int32_t device_id) {
+    int value = 0;
+    CHECK_CUDA(cudaDeviceGetAttribute(&value, attr, device_id));
+    return value;
+  });
 }
 
 }  // namespace host::runtime

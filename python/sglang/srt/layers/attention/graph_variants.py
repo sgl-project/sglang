@@ -44,10 +44,19 @@ class DsaGraphVariants:
 
 
 def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariants]:
-    from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+    from sglang.srt.configs.model_config import (
+        get_dsa_index_kpool,
+        get_dsa_index_topk,
+        is_deepseek_dsa,
+    )
     from sglang.srt.utils import is_hip
 
     if is_hip() and is_deepseek_dsa(hf_config):
+        # KPool has no dense-skip path: both variants run the full indexer.
+        # Capture it once, keeping the regular DSA dense/sparse split intact.
+        if get_dsa_index_kpool(hf_config) > 1:
+            return None
+
         index_topk = get_dsa_index_topk(hf_config)
         logger.info(
             "[dense-decode] DSA dual-graph enabled: capturing "
@@ -98,7 +107,7 @@ def create_dsv41_candidate_graph_variants(
     import torch
 
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang.srt.utils import is_hip
+    from sglang.srt.utils import is_gfx95_supported, is_hip
 
     text_config = model_runner.model_config.hf_text_config
     dspark_target_verify = (
@@ -110,8 +119,11 @@ def create_dsv41_candidate_graph_variants(
     if not (
         (capture_forward_mode == ForwardMode.DECODE or dspark_target_verify)
         and model_runner.device == "cuda"
-        and not is_hip()
-        and torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
+        and (
+            is_gfx95_supported()
+            if is_hip()
+            else torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
+        )
         and getattr(text_config, "model_type", None) == "deepseek_v41"
         and getattr(text_config, "candidate_source_layer_id", -1) >= 0
     ):

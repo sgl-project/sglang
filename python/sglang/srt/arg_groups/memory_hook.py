@@ -17,7 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
@@ -361,14 +361,14 @@ def reserve_for_graph_mb(server_args: Any) -> float:
         reserved_mem += decode_cuda_graph_config.max_bs * 2
 
     if (
-        resolved_view(server_args).enable_dp_attention
+        attn_dp_enabled_of(resolved_view(server_args))
         and cfg.disaggregation_mode != "prefill"
     ):
         # DP attention needs more padding for some operations, and much more for large
         # cuda graph max bs (torch allocator / implementation inefficiencies).
-        reserved_mem += decode_cuda_graph_config.max_bs * cfg.dp_size * 3
+        reserved_mem += decode_cuda_graph_config.max_bs * cfg.attn_dp_size * 3
         if decode_cuda_graph_config.max_bs > 300:
-            reserved_mem += decode_cuda_graph_config.max_bs * cfg.dp_size * 1.5
+            reserved_mem += decode_cuda_graph_config.max_bs * cfg.attn_dp_size * 1.5
 
     if (
         cfg.disaggregation_mode != "decode"

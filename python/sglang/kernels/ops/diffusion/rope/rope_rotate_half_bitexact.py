@@ -83,32 +83,6 @@ def _rope_rotate_half_kernel(
         tl.store(out_ptr + toff, tail, mask=tmask)
 
 
-def can_use_fused_rope_rotate_half(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> bool:
-    if x.dtype is not torch.bfloat16 or not x.is_cuda:
-        return False
-    if x.dim() != 4 or not x.is_contiguous():
-        return False
-    rows = x.shape[0] * x.shape[1]
-    rot = cos.shape[-1]
-    return (
-        cos.dtype is torch.bfloat16
-        and sin.dtype is torch.bfloat16
-        and cos.is_cuda
-        and cos.device == x.device
-        and sin.device == x.device
-        and cos.shape == (rows, rot)
-        and sin.shape == (rows, rot)
-        and cos.is_contiguous()
-        and sin.is_contiguous()
-        and rot % 2 == 0
-        and 0 < rot <= x.shape[-1]
-    )
-
-
 def _fake_rope_rotate_half(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -129,15 +103,36 @@ def fused_rope_rotate_half_bitexact(
 ) -> torch.Tensor:
     """Rotate-half RoPE over the leading ``cos.shape[-1]`` columns of ``x``.
 
-    ``x`` is ``(B, S, H, D)``; ``cos``/``sin`` are ``(B * S, rot_dim)`` rows.
+    ``x`` is ``(B, S, H, D)``; ``cos``/``sin`` are contiguous
+    ``(B * S, rot_dim)`` rows or ``(B, S, 1, rot_dim)`` broadcast tables.
     Bit-exact vs the eager chunk/neg/cat/mul/add chain.
     """
+    if not (
+        x.is_cuda and x.dtype is torch.bfloat16 and x.ndim == 4 and x.is_contiguous()
+    ):
+        raise RuntimeError("rotate-half RoPE expects contiguous BF16 CUDA [B, S, H, D]")
     batch, seq_len, heads, head_dim = x.shape
+    if cos.ndim not in (2, 4):
+        raise RuntimeError("cos must have shape [B * S, rot_dim] or [B, S, 1, rot_dim]")
     rot = cos.shape[-1]
+    if not (0 < rot <= head_dim and rot % 2 == 0):
+        raise RuntimeError("rot_dim must be positive, even and no larger than head_dim")
+    table_shape = (batch * seq_len, rot) if cos.ndim == 2 else (batch, seq_len, 1, rot)
+    device = x.device
+    for name, tensor in (("cos", cos), ("sin", sin)):
+        if not (
+            tensor.dtype is torch.bfloat16
+            and tensor.device == device
+            and tensor.shape == table_shape
+            and tensor.is_contiguous()
+        ):
+            raise RuntimeError(
+                f"{name} must be contiguous {table_shape} with x's dtype/device"
+            )
     half = rot // 2
     out = torch.empty_like(x)
     tail = head_dim - rot
-    with torch.cuda.device(x.device):
+    with torch.cuda.device(device):
         _rope_rotate_half_kernel[(batch * seq_len,)](
             out,
             x,

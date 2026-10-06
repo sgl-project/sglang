@@ -74,7 +74,9 @@ jobs:
           node-version: "20"
 
       - name: Check cookbook authoring contracts
-        run: node docs/scripts/check_cookbook_configs.mjs
+        run: |
+          node docs/scripts/check_cookbook_configs.mjs
+          node --test docs/scripts/tests/*.test.mjs
 
       - name: Test PR health action
         run: node --test .github/actions/check-pr-test-health/action.test.cjs

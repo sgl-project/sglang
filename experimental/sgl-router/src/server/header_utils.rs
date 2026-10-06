@@ -11,7 +11,13 @@ pub fn should_forward_request_header(name: &HeaderName) -> bool {
     let n = name.as_str();
     matches!(
         n,
-        "authorization" | "x-request-id" | "x-correlation-id" | "traceparent" | "tracestate"
+        "authorization"
+            | "x-request-id"
+            | "x-correlation-id"
+            | "traceparent"
+            | "tracestate"
+            // Set by `--dp-aware`; chat dispatch strips the client's copy.
+            | "x-data-parallel-rank"
     ) || n.starts_with("x-request-id-")
         || n.starts_with("x-sgl-")
 }

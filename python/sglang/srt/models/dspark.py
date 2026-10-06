@@ -14,6 +14,7 @@ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_ga
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
@@ -802,9 +803,10 @@ class DSparkDraftMixin:
                     attn.attn.v_scale,
                 )
             else:
+                # The draft pool is static, so its slot ids are physical.
                 pool.set_kv_buffer(
                     attn.attn,
-                    cache_loc,
+                    KVWriteLoc(cache_loc, physical=True),
                     k,
                     v,
                     attn.attn.k_scale,

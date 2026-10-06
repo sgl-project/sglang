@@ -64,7 +64,6 @@ class OlmoeMoE(nn.Module):
         intermediate_size: int,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        tp_size: Optional[int] = None,
         layer_id: int = 0,
         prefix: str = "",
     ):
@@ -82,6 +81,7 @@ class OlmoeMoE(nn.Module):
 
         self.topk = TopK(
             top_k=top_k,
+            layer_id=layer_id,
             renormalize=False,
         )
 

@@ -152,7 +152,9 @@ class SDPAImpl(AttentionImpl):
         ):
             # Keep the existing Flash SDPA arithmetic while consuming all
             # packed windows in one call, including ragged and empty windows.
-            return torch_varlen_attn(
+            # Call the Flash op directly: from torch 2.14, varlen_attn silently
+            # routes sm90/sm100 to cuDNN, which changes outputs versus the Flash path.
+            output, *_ = torch.ops.aten._flash_attention_forward(
                 query,
                 key,
                 value,
@@ -160,9 +162,14 @@ class SDPAImpl(AttentionImpl):
                 cu_seqlens,
                 max_seqlen,
                 max_seqlen,
+                0.0,
+                self.causal,
+                return_debug_mask=False,
                 scale=self.softmax_scale,
-                window_size=(-1, 0) if self.causal else (-1, -1),
+                window_size_left=-1,
+                window_size_right=0 if self.causal else -1,
             )
+            return output
         bounds = (
             cu_seqlens_host
             if cu_seqlens_host is not None
@@ -309,7 +316,7 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             except RuntimeError as e:
                 # cuDNN raises "No available kernel" for some shapes; pin the
                 # FA fail-safe path for this layer and keep going.
-                logger.warning(
+                logger.warning_once(
                     "cuDNN SDPA failed (%s); falling back to FlashAttention for %s.",
                     e,
                     type(self).__name__,

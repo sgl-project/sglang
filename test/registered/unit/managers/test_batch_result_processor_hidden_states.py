@@ -5,7 +5,11 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    SamplingMaskOutput,
+    SamplingMaskStatus,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -55,7 +59,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
     def test_selected_and_support_modes_share_one_batch(self):
         output = LogitsProcessorOutput(
             next_token_logits=None,
-            sampling_mask_output=SimpleNamespace(
+            sampling_mask_output=SamplingMaskOutput(
                 token_ids=torch.tensor([[7, 8], [9, 10]], dtype=torch.int32),
                 lengths=torch.tensor([2, 2]),
                 selected_logprobs=torch.tensor([-0.5, -0.25]),
@@ -76,16 +80,19 @@ class TestSamplingMaskMaterialization(CustomTestCase):
             ],
             output=output,
         )
-        self.assertEqual(output.next_token_sampling_mask_idx, [[7, 8], [9, 10]])
         self.assertEqual(
-            output.next_token_sampling_logprobs,
-            [-0.5, [-0.25, -1.5]],
+            [row.tolist() for row in output.next_token_sampling_mask_idx],
+            [[7, 8], [9, 10]],
+        )
+        self.assertEqual(
+            [row.tolist() for row in output.next_token_sampling_logprobs],
+            [[-0.5], [-0.25, -1.5]],
         )
 
     def test_selected_mode_does_not_require_support_tensor(self):
         output = LogitsProcessorOutput(
             next_token_logits=None,
-            sampling_mask_output=SimpleNamespace(
+            sampling_mask_output=SamplingMaskOutput(
                 token_ids=torch.tensor([[7, 8]], dtype=torch.int32),
                 lengths=torch.tensor([2]),
                 selected_logprobs=torch.tensor([-0.5]),
@@ -102,7 +109,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
             ],
             output=output,
         )
-        self.assertEqual(output.next_token_sampling_logprobs, [-0.5])
+        self.assertEqual(output.next_token_sampling_logprobs[0].tolist(), [-0.5])
 
     def test_packed_ids_are_copied_before_per_request_slicing(self):
         """Non-overlap capture must not perform one device copy per request."""
@@ -111,7 +118,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         packed_ids.cpu.return_value = torch.tensor([[7, 8, 0], [9, 0, 0]])
         output = LogitsProcessorOutput(
             next_token_logits=None,
-            sampling_mask_output=SimpleNamespace(
+            sampling_mask_output=SamplingMaskOutput(
                 token_ids=packed_ids,
                 lengths=torch.tensor([2, 1]),
                 selected_logprobs=torch.tensor([-0.5, -0.25]),
@@ -130,9 +137,18 @@ class TestSamplingMaskMaterialization(CustomTestCase):
             output=output,
         )
         packed_ids.cpu.assert_called_once_with()
-        self.assertEqual(output.next_token_sampling_mask_idx, [[7, 8], None, [9]])
         self.assertEqual(
-            output.next_token_sampling_logprobs,
+            [
+                None if row is None else row.tolist()
+                for row in output.next_token_sampling_mask_idx
+            ],
+            [[7, 8], None, [9]],
+        )
+        self.assertEqual(
+            [
+                None if row is None else row.tolist()
+                for row in output.next_token_sampling_logprobs
+            ],
             [[-0.5, -0.75], None, [-0.25]],
         )
         self.assertIsNone(output.sampling_mask_output)
@@ -241,7 +257,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                 with (
                     patch(
                         "sglang.srt.managers.scheduler_components."
-                        "batch_result_processor.maybe_cache_unfinished_req"
+                        "batch_result_processor.checkpoint_kv_cache"
                     ),
                     patch(
                         "sglang.srt.managers.scheduler_components."
@@ -363,7 +379,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
         self.assertEqual(req.to_finish.status_code, 400)
         req.update_finish_state.assert_called_once_with(0)
         processor.model_worker.prepare_for_kv_cache_release.assert_called_once_with(req)
-        release.assert_called_once_with(req, processor.tree_cache, is_insert=False)
+        release.assert_called_once_with(req, processor.tree_cache, checkpoint=False)
         processor.output_streamer.stream_output.assert_called_once_with([req], False)
 
     def test_overflow_and_invalid_have_distinct_http_errors(self):

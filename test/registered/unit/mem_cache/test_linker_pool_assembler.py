@@ -312,9 +312,13 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                     swa_page_size=3,
                     c4_indexer_kv_pool=indexer,
                     unified_region_buffers=Mock(side_effect=regions.__getitem__),
+                    # bf16 unified rows are a single pool: no rope sibling.
+                    unified_rope_region_buffers=Mock(return_value=None),
                 )
                 group = _build_deepseek_v4_device_pool_group(kvcache, page_size=2)
 
+                # expected carries no *_ROPE entry, so this also pins that the
+                # bf16 layout ships exactly what it did before.
                 self.assertEqual(set(group.entry_map), set(expected))
                 self.assertEqual(set(group.sources.values()), {PoolName.KV})
                 self.assertTrue(group.rank_replicated)
@@ -338,6 +342,74 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                     ]
                 )
                 self.assertEqual({t.name for t in resolved}, set(expected))
+
+    def test_unified_deepseek_v4_fp8_ships_the_rope_half(self):
+        """fp8 rows are two pools; shipping nope alone leaves stale rope."""
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4LayerItem
+
+        c4 = [torch.zeros((4, width), dtype=torch.uint8) for width in (5, 7)]
+        c128 = [torch.zeros((4, 11), dtype=torch.uint8)]
+        c4_rope = [torch.zeros((4, 3), dtype=torch.uint8) for _ in range(2)]
+        c128_rope = [torch.zeros((4, 3), dtype=torch.uint8)]
+        indexer = [torch.zeros((4, width), dtype=torch.uint8) for width in (13, 17)]
+        regions = {4: (c4, 7), 128: (c128, 11)}
+        rope_regions = {4: (c4_rope, 3), 128: (c128_rope, 3)}
+        kvcache = SimpleNamespace(
+            _unified_kv=True,
+            start_layer=0,
+            end_layer=3,
+            layer_mapping=[
+                DeepSeekV4LayerItem(4, 1),
+                DeepSeekV4LayerItem(128, 0),
+                DeepSeekV4LayerItem(4, 0),
+            ],
+            swa_kv_pool=None,
+            c4_kv_pool=None,
+            c128_kv_pool=None,
+            swa_page_size=3,
+            c4_indexer_kv_pool=SimpleNamespace(index_k_with_scale_buffer=indexer),
+            unified_region_buffers=Mock(side_effect=regions.__getitem__),
+            unified_rope_region_buffers=Mock(side_effect=rope_regions.__getitem__),
+        )
+        group = _build_deepseek_v4_device_pool_group(kvcache, page_size=2)
+
+        expected_rope = {
+            PoolName.DEEPSEEK_V4_C4_ROPE: c4_rope,
+            PoolName.DEEPSEEK_V4_C128_ROPE: c128_rope,
+        }
+        self.assertTrue(set(expected_rope).issubset(group.entry_map))
+        for name, buffers in expected_rope.items():
+            actual = group.entry_map[name].components[0]
+            self.assertEqual(len(actual), len(buffers))
+            for got, want in zip(actual, buffers):
+                self.assertEqual(got.data_ptr(), want.data_ptr())
+                self.assertEqual(got.shape, want.shape)
+        self.assertEqual(
+            kvcache.unified_rope_region_buffers.call_args_list, [call(4), call(128)]
+        )
+
+        # One row index addresses both halves: same layer mapping, same source.
+        for rope_name, nope_name in (
+            (PoolName.DEEPSEEK_V4_C4_ROPE, PoolName.DEEPSEEK_V4_C4),
+            (PoolName.DEEPSEEK_V4_C128_ROPE, PoolName.DEEPSEEK_V4_C128),
+        ):
+            self.assertEqual(
+                group.entry_map[rope_name].layer_mapping,
+                group.entry_map[nope_name].layer_mapping,
+            )
+            self.assertEqual(group.sources[rope_name], group.sources[nope_name])
+
+        # One KV transfer must expand to both halves.
+        resolved = group.resolve_transfers(
+            [
+                PoolTransfer(
+                    name=PoolName.KV,
+                    keys=["page-0"],
+                    device_indices=torch.tensor([0, 1]),
+                )
+            ]
+        )
+        self.assertTrue(set(expected_rope).issubset({t.name for t in resolved}))
 
     def test_deepseek_v4_still_rejects_hisparse(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import HiSparseC4DevicePool

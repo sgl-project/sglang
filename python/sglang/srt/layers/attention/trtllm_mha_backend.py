@@ -42,6 +42,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -395,6 +396,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             raise ValueError(
                 "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS must be at least 1, "
                 f"got {self.decode_seq_len_splits}"
+            )
+        self._xqa_spec_dec_mask = None
+        if self.is_xqa_impl and self.speculative_num_draft_tokens:
+            draft_len = self.speculative_num_draft_tokens
+            max_bs = model_runner.max_running_requests + 1
+            words_per_row = (draft_len + 31) // 32 * 2
+            row = torch.arange(draft_len, dtype=torch.int32)[:, None]
+            word = torch.arange(words_per_row, dtype=torch.int32)[None, :]
+            bits = (row + 1 - 16 * word).clamp(0, 16)
+            mask = ((1 << bits) - 1).to(torch.uint16)
+            self._xqa_spec_dec_mask = (
+                mask.unsqueeze(0).expand(max_bs, -1, -1).contiguous().to(self.device)
             )
 
     def _check_decode_kv_access(self) -> None:
@@ -1302,11 +1315,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         layer: RadixAttention,
         head_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, head_dim
+        k_cache = paged_kv_view(
+            k_cache, self.page_size, layer.tp_k_head_num, head_dim
         ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, head_dim
+        v_cache = paged_kv_view(
+            v_cache, self.page_size, layer.tp_v_head_num, head_dim
         ).permute(0, 2, 1, 3)
         if layer.tp_k_head_num == 1:
             k_cache = canonicalize_stride(k_cache)
@@ -1333,6 +1346,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_cache_sf=None,
         out: Optional[torch.Tensor] = None,
         out_dtype: Optional[torch.dtype] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run decode, optionally sorting and splitting requests by KV length."""
 
@@ -1346,6 +1360,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             kwargs = {}
             if q_len_per_req != 1:
                 kwargs["q_len_per_req"] = q_len_per_req
+            if mask is not None:
+                kwargs["mask"] = mask[: group_seq_lens.shape[0]]
             return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=group_query,
                 kv_cache=kv_cache,
@@ -1438,7 +1454,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
-        cache_loc = forward_batch.out_cache_loc
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(
             save_kv_cache, k, forward_batch
@@ -1458,7 +1473,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if save_kv_cache and k is not None:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    KVWriteLoc.for_batch(
+                        forward_batch,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    ),
                     k,
                     v,
                     *self._kv_write_scales(layer),
@@ -1536,7 +1554,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
-        cache_loc = forward_batch.out_cache_loc
         cp_active = is_cp_active(forward_batch)
         uses_native_fp4 = self._forward_extend_uses_native_fp4(forward_batch)
         if uses_native_fp4 and cp_active:
@@ -1574,21 +1591,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        KVWriteLoc.for_batch(
+                            forward_batch,
+                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        ),
                         k,
                         v,
                         *self._kv_write_scales(layer),
                     )
+
+        uses_decode_kernel = (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        )
 
         q_scale = 1.0
         if uses_native_fp4:
             q = q.to(torch.float8_e4m3fn)
         elif (
             self.data_type == torch.float8_e4m3fn
-            and (
-                not self.is_xqa_impl
-                or not forward_batch.forward_mode.is_target_verify()
-            )
+            and (not self.is_xqa_impl or not uses_decode_kernel)
             and not use_fused_qkv
         ):
             q = q.to(torch.float8_e4m3fn)
@@ -1596,11 +1618,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         else:
             q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-
-        is_decode_mode = (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        )
 
         if uses_native_fp4:
             kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
@@ -1611,17 +1628,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             k_cache_raw, v_cache_raw = self.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
-            if not self.use_fmha_v2 or is_decode_mode:
+            if not self.use_fmha_v2 or uses_decode_kernel:
                 # Decode and SM100 batch_context kernels require HND layout.
                 k_cache, v_cache = self._reshape_paged_kv_cache(
                     k_cache_raw, v_cache_raw, layer, layer.head_dim
                 )
             else:
-                k_cache = k_cache_raw.view(
-                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                k_cache = paged_kv_view(
+                    k_cache_raw, self.page_size, layer.tp_k_head_num, layer.head_dim
                 )
-                v_cache = v_cache_raw.view(
-                    -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+                v_cache = paged_kv_view(
+                    v_cache_raw, self.page_size, layer.tp_v_head_num, layer.head_dim
                 )
 
             kv_cache = (k_cache, v_cache)
@@ -1638,7 +1655,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         page_table = self._get_layer_page_table(layer, forward_batch)
         native_out = self._nvfp4_output_view(q) if uses_native_fp4 else None
 
-        if is_decode_mode:
+        if uses_decode_kernel:
             if (
                 forward_batch.forward_mode.is_target_verify()
                 and layer.attn_type == AttentionType.ENCODER_ONLY
@@ -1694,6 +1711,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
             else:
+                mask = (
+                    self._xqa_spec_dec_mask
+                    if self.forward_metadata.max_seq_len_q > 1
+                    else None
+                )
                 o = self._run_fixed_q_len_decode(
                     q,
                     kv_cache,
@@ -1707,6 +1729,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     out_dtype=(None if uses_native_fp4 else self.q_data_type),
                     kv_cache_sf=kv_cache_block_scales,
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
+                    mask=mask,
                 )
         elif self.use_fmha_v2 and not cp_active:
             # CP must go through cp_strategy.run_attention (per-shard

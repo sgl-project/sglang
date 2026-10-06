@@ -2,7 +2,8 @@
 
 These tests require:
   - A kind cluster named 'sgl-router-kind'
-  - The sgl-router:e2e and sgl-router-fake-worker:e2e images loaded into kind
+  - The sgl-router:e2e, sgl-router-fake-worker:e2e and
+    sgl-router-fake-kv-worker:e2e images loaded into kind
   - kubectl configured to use the kind-sgl-router-kind context
 
 Setup:  ./tests/e2e/k8s_integration/setup.sh

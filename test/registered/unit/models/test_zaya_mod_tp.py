@@ -1,11 +1,11 @@
 """Numerical correctness test for ZAYA1 MoE + MOD under TP>1.
 
-Background: the MOD (mixture-of-depths) skip-expert residual blend must be
-combined with the experts output on the correct side of the cross-rank
-all-reduce. ``mod_out = hidden_states * prob`` is replicated on every TP rank,
-so all-reducing it would multiply it by ``tp_size``. The model therefore masks
-the *per-rank partial* experts output before the reduce and only adds the
-replicated ``mod_out`` afterwards:
+Background: the MOD (mixture-of-depths) skip-expert residual blend must not
+be counted once per TP rank. ``mod_out = hidden_states * prob`` is replicated
+on every TP rank, while the experts output is a partial sum that the stage
+boundary all-reduces. The model therefore masks each rank's partial experts
+output and adds the replicated ``mod_out`` on one rank only, so the single
+reduction yields:
 
     sum_r(mask · partial_r) + (1 - mask) · mod_out
   = mask · experts_out_full   + (1 - mask) · mod_out
@@ -50,17 +50,18 @@ def _real_tp_blend(
     partial_experts_per_rank: list[torch.Tensor],  # one [T, H] per rank
     num_moe_experts: int,
 ) -> torch.Tensor:
-    """Production path: ``mod_premask_experts`` per rank -> simulated all-reduce
-    (sum) -> ``mod_blend``. Uses the exact helpers ``ZayaBlock.forward`` calls.
+    """Production path: ``mod_premask_experts`` per rank, ``mod_blend`` on rank
+    0 only -> simulated all-reduce (sum). Uses the exact helpers
+    ``ZayaBlock.forward`` calls.
     """
     mod_out = hidden_states * probs
     reduced = None
-    mod_mask = None
-    for partial in partial_experts_per_rank:
+    for rank, partial in enumerate(partial_experts_per_rank):
         mask, masked = mod_premask_experts(partial, indices, num_moe_experts)
-        mod_mask = mask
+        if rank == 0:
+            masked = mod_blend(masked, mask, mod_out)
         reduced = masked if reduced is None else reduced + masked
-    return mod_blend(reduced, mod_mask, mod_out)
+    return reduced
 
 
 def _buggy_old_tp_blend(

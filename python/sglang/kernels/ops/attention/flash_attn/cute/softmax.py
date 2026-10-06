@@ -317,15 +317,26 @@ class SoftmaxSm100(Softmax):
 
     @cute.jit
     def update_row_max(
-        self, acc_S_row: cute.TensorSSA, is_first: int
+        self,
+        acc_S_row: cute.TensorSSA,
+        is_first: int,
+        tile_row_max: Float32 | None = None,
     ) -> Tuple[Float32, Float32]:
+        # tile_row_max: max of acc_S_row computed elsewhere (e.g. by the sm_103
+        # tcgen05.ld.red TMEM load), used instead of reducing acc_S_row here.
         if cutlass.const_expr(is_first):
-            row_max_new = self._compute_row_max(acc_S_row)
+            if cutlass.const_expr(tile_row_max is None):
+                row_max_new = self._compute_row_max(acc_S_row)
+            else:
+                row_max_new = tile_row_max
             row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
             acc_scale = 0.0
         else:
             row_max_old = self.row_max[0]
-            row_max_new = self._compute_row_max(acc_S_row, init_val=row_max_old)
+            if cutlass.const_expr(tile_row_max is None):
+                row_max_new = self._compute_row_max(acc_S_row, init_val=row_max_old)
+            else:
+                row_max_new = utils.fmax(tile_row_max, row_max_old)
             row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
             acc_scale_ = (row_max_old - row_max_safe) * self.scale_log2
             acc_scale = cute.math.exp2(acc_scale_, fastmath=True)

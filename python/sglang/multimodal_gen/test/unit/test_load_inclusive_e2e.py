@@ -24,6 +24,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 @pytest.fixture
 def validator(monkeypatch):
     monkeypatch.setenv("SGLANG_GEN_BASELINE", "0")
+    monkeypatch.setattr(utils.current_platform, "is_hip", lambda: False)
     scenario = ScenarioConfig.from_dict(
         {
             "stages_ms": {},
@@ -46,6 +47,19 @@ def test_slow_loading_fails_even_when_inference_passes(validator):
 
 def test_fast_loading_cannot_hide_inference_regression(validator):
     summary = PerformanceSummary(2000, 0, 0, {}, [], {}, {}, load_time_ms=1000)
+    validator.validate_load(summary)
+    with pytest.raises(AssertionError, match="E2E Latency"):
+        validator.validate_e2e(summary)
+
+
+def test_load_tolerance_widens_only_the_load_check(validator):
+    """A profile's load tolerance widens the load check alone; without one, load
+    stays on the E2E tolerance."""
+    summary = PerformanceSummary(1300, 0, 0, {}, [], {}, {}, load_time_ms=5500)
+    with pytest.raises(AssertionError, match="Load Latency"):
+        validator.validate_load(summary)
+
+    validator.tolerances = ToleranceConfig(0.25, 0, 0, 0, 0, load=0.4)
     validator.validate_load(summary)
     with pytest.raises(AssertionError, match="E2E Latency"):
         validator.validate_e2e(summary)

@@ -1,5 +1,4 @@
 import importlib.util
-import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -69,22 +68,6 @@ class TestGetVersionTag(unittest.TestCase):
                 self.assertIn(DESCRIBE_COMMAND, content)
                 self.assertNotIn(TAG_ONLY_DESCRIBE_COMMAND, content)
                 self.assertIn(FALLBACK_VERSION, content)
-
-    def test_tag_only_cli_mode_remains_available_for_callers_that_need_latest_tag(self):
-        with (
-            patch.object(sys, "argv", ["get_version_tag.py", "--tag-only"]),
-            patch.object(
-                self.version_helper, "get_latest_version_tag", return_value="v0.5.10"
-            ),
-            patch.object(
-                self.version_helper, "get_version_describe"
-            ) as version_describe,
-            patch("builtins.print") as print_mock,
-        ):
-            self.version_helper.main()
-
-        version_describe.assert_not_called()
-        print_mock.assert_called_once_with("v0.5.10")
 
 
 if __name__ == "__main__":

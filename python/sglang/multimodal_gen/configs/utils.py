@@ -31,7 +31,12 @@ def expand_path_fields(obj) -> None:
 
 
 def update_config_from_args(
-    config: Any, args_dict: dict[str, Any], prefix: str = "", pop_args: bool = False
+    config: Any,
+    args_dict: dict[str, Any],
+    prefix: str = "",
+    pop_args: bool = False,
+    *,
+    exclude: tuple[str, ...] = (),
 ) -> bool:
     """
     Update configuration object from arguments dictionary.
@@ -50,7 +55,7 @@ def update_config_from_args(
     args_to_remove = []
     if prefix.strip() == "":
         for key, value in args_dict.items():
-            if hasattr(config, key) and value is not None:
+            if key not in exclude and hasattr(config, key) and value is not None:
                 if key == "text_encoder_precisions" and isinstance(value, list):
                     setattr(config, key, tuple(value))
                 else:
@@ -63,6 +68,8 @@ def update_config_from_args(
         for key, value in args_dict.items():
             if key.startswith(prefix_with_dot) and value is not None:
                 attr_name = key[len(prefix_with_dot) :]
+                if attr_name in exclude:
+                    continue
                 if hasattr(config, attr_name):
                     setattr(config, attr_name, value)
                 if pop_args:

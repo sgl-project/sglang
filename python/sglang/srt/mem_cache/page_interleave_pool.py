@@ -656,11 +656,12 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
     def set_mla_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
         layer_id_override: Optional[int] = None,
     ):
+        loc, _, _ = unwrap_write_loc(loc_info)
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )

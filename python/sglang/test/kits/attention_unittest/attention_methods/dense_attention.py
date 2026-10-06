@@ -331,9 +331,6 @@ class MockModelRunner(ModelRunner):
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
-        self.tp_size = 1
-        self.dp_size = 1
-        self.pp_size = 1
         self.is_draft_worker = False
         self.max_running_requests = pool_batch_size
         # trtllm_mha __init__ scans model.modules() for ENCODER_ONLY layers;
@@ -370,7 +367,6 @@ class MockModelRunner(ModelRunner):
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             dp_size=1,
-            enable_dp_attention=False,
             enable_deterministic_inference=False,
             enable_mis=False,
             is_embedding=False,
@@ -410,7 +406,6 @@ class MockModelRunner(ModelRunner):
             get_kvcache=lambda: self.token_to_kv_pool,
         )
         self.init_kv_index_translator()
-        self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False

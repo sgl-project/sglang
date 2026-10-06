@@ -197,3 +197,18 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
             auto_enable_cfg_parallel=False,
             supports_cfg_parallel=False,
         )
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
+        SenseNovaU1SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=SenseNovaU1SamplingParams,
+        pipeline_config_cls=SenseNovaU1PipelineConfig,
+        hf_model_paths=[
+            "sensenova/SenseNova-U1.5-8B-MoT",
+        ],
+    )

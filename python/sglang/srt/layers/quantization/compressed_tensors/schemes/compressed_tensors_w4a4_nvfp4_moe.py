@@ -368,10 +368,6 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
-                moe_ep_size=layer.moe_ep_size,
-                moe_ep_rank=layer.moe_ep_rank,
-                moe_tp_size=layer.moe_tp_size,
-                moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=False,
             )
             return self.runner.run(dispatch_output, quant_info)

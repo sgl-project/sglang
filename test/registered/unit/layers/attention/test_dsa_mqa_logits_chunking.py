@@ -19,8 +19,8 @@ torch = pytest.importorskip("torch")
 
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool  # noqa: E402
 from sglang.srt.layers.attention.mqa_logits_utils import (  # noqa: E402
-    MQA_LOGITS_BYTES_PER_ELEM,
     MQA_LOGITS_MAX_BYTES_ROCM,
+    mqa_logits_row_bytes,
     mqa_logits_should_chunk,
 )
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
@@ -102,9 +102,10 @@ def _kpool_mqa_logits(num_q, num_k, cap_bytes):
 
 def test_kpool_splits_the_query_rows_to_stay_under_the_aiter_cap():
     """Above 2 GiB of logits the aiter kernel abort()s the process instead of
-    raising, so the k-pool wrapper must never hand it a larger tensor."""
+    raising, so the k-pool wrapper must never hand it a larger tensor. aiter
+    pads each row to 256 columns, so the cap counts padded rows."""
     num_q, num_k = 8, 4
-    row_bytes = num_k * MQA_LOGITS_BYTES_PER_ELEM
+    row_bytes = mqa_logits_row_bytes(num_k)
     logits, rows_per_call = _kpool_mqa_logits(num_q, num_k, 3 * row_bytes + 1)
 
     assert rows_per_call == [3, 3, 2]

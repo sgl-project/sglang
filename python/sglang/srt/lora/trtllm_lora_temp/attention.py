@@ -42,8 +42,10 @@ def qkv_proj_lora_forward(self, input_: torch.Tensor):
     ):
         return get_original_qkv_forward()(self, input_)
 
-    from sglang.kernels.ops.gemm.trtllm_lora_temp.qkv_lora_b import qkv_lora_b_fwd
-    from sglang.kernels.ops.gemm.trtllm_lora_temp.sgemm_lora_a import sgemm_lora_a_fwd
+    from sglang.kernels.ops.lora.dense.trtllm_lora_temp.qkv_lora_b import qkv_lora_b_fwd
+    from sglang.kernels.ops.lora.dense.trtllm_lora_temp.sgemm_lora_a import (
+        sgemm_lora_a_fwd,
+    )
 
     bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
     side_stream = get_lora_side_stream()
@@ -121,10 +123,10 @@ def row_parallel_lora_forward(
     _alloc = lora_overlap_alloc_stream()  # capture MAIN stream here (before the fork)
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
-        from sglang.kernels.ops.gemm.trtllm_lora_temp.sgemm_lora_a import (
+        from sglang.kernels.ops.lora.dense.trtllm_lora_temp.sgemm_lora_a import (
             sgemm_lora_a_fwd,
         )
-        from sglang.kernels.ops.gemm.trtllm_lora_temp.sgemm_lora_b import (
+        from sglang.kernels.ops.lora.dense.trtllm_lora_temp.sgemm_lora_b import (
             sgemm_lora_b_fwd,
         )
 
@@ -189,10 +191,10 @@ def column_parallel_lora_forward(self, input_: torch.Tensor):
     _alloc = lora_overlap_alloc_stream()  # capture MAIN stream here (before the fork)
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
-        from sglang.kernels.ops.gemm.trtllm_lora_temp.sgemm_lora_a import (
+        from sglang.kernels.ops.lora.dense.trtllm_lora_temp.sgemm_lora_a import (
             sgemm_lora_a_fwd,
         )
-        from sglang.kernels.ops.gemm.trtllm_lora_temp.sgemm_lora_b import (
+        from sglang.kernels.ops.lora.dense.trtllm_lora_temp.sgemm_lora_b import (
             sgemm_lora_b_fwd,
         )
 
@@ -245,10 +247,10 @@ def replicated_lora_forward(self, x: torch.Tensor):
     _alloc = lora_overlap_alloc_stream()  # capture MAIN stream here (before the fork)
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
-        from sglang.kernels.ops.gemm.trtllm_lora_temp.sgemm_lora_a import (
+        from sglang.kernels.ops.lora.dense.trtllm_lora_temp.sgemm_lora_a import (
             sgemm_lora_a_fwd,
         )
-        from sglang.kernels.ops.gemm.trtllm_lora_temp.sgemm_lora_b import (
+        from sglang.kernels.ops.lora.dense.trtllm_lora_temp.sgemm_lora_b import (
             sgemm_lora_b_fwd,
         )
 
@@ -267,7 +269,9 @@ def replicated_lora_forward(self, x: torch.Tensor):
     if first_dim == 0:
         output = sgemm_lora_b_fwd(lora_a_output, self.B_buffer, sgemm_info, output)
     else:
-        from sglang.kernels.ops.gemm.trtllm_lora_temp.qkv_lora_b import qkv_lora_b_fwd
+        from sglang.kernels.ops.lora.dense.trtllm_lora_temp.qkv_lora_b import (
+            qkv_lora_b_fwd,
+        )
 
         output = qkv_lora_b_fwd(
             lora_a_output,

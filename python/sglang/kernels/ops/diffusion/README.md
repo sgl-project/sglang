@@ -80,18 +80,41 @@ GEMM in FP32. The default path still promotes Q/K/V before both GEMMs.
 
 ## Entry-point protocol
 
-Every public kernel is a **predicate + kernel** pair:
+Keep backend selection separate from input validation.
 
-```python
-if can_use_<op>(...):
-    out = <op>(...)
-else:
-    out = <reference chain>
-```
+- Select a backend using properties that distinguish supported implementations:
+  device family, dtype, layout, alignment, architecture, and numerical contract.
+  A shape restriction belongs here only when it is a real specialization, such
+  as a fixed head dimension or an unsupported broadcast mode.
+  Use the input's device when selecting CPU versus CUDA: a CUDA-capable
+  process can still receive CPU tensors. A CPU fallback must not disable a
+  process-wide GPU fusion gate.
+- Validate the selected implementation's inputs before launching. For JIT CUDA,
+  use `TensorMatcher` and `CHECK_HOST` in the C++ launcher; keep dtype checks in
+  the cached module factory. For Triton, validate in the Python launch wrapper.
+  Mismatched shapes or devices are errors, not reasons to silently try another
+  backend. Preserve tensor dimensions until they have been validated.
+- Add a `can_use_*` predicate only when a caller needs a backend choice. A direct
+  kernel entry point does not need a second copy of the same predicate. Keep
+  fallback selection in one wrapper when several callers share it.
+- Let errors from a selected implementation propagate. Do not catch every
+  exception and permanently disable a kernel for later requests. First-use
+  numerical verification in `sites/` is a separate policy: retain its reference
+  comparison when exactness depends on a library's reduction or rounding order.
 
-The kernel raises on an unsupported input. It does not return `None` — a
-silent `None` is too easy to forget to check, and the failure mode is a
-wrong-looking image rather than an exception.
+For example, Helios selects JIT CUDA RoPE on NVIDIA GPUs unless it uses TP
+RMSNorm. The launcher validates the original batched Q/K and frequencies,
+including shape relationships, dtype, device, layout and pair alignment.
+There is no Python `can_use_helios_qk_rope` scan before the call.
+
+A numerical specialization query should take configuration values, not a list
+of tensors. For example, `can_use_fused_rmsnorm_scale_shift(dtype, hidden)`
+selects BF16 with width 2048 or 4096 because those are the FlashInfer reduction
+trees the kernel reproduces. Its launcher validates weight, scale and shift.
+
+Existing `try_*` entry points return `None` for an unsupported specialization.
+Keep that convention explicit at their call sites; do not add it to direct
+kernel entry points.
 
 ## Selection matrix
 
@@ -127,13 +150,16 @@ Several norms look interchangeable and are not. Start here.
 
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
-| `residual_gate_add` | KDA (JIT CUDA) | bit-exact `residual + update * gate` | contiguous tensors, or a transposed-dense `[B, tokens, hidden]` residual/output with contiguous update and row-broadcast gate (SANA-Video) |
+| `residual_gate_add` | JIT CUDA (contiguous), Triton (transposed) | bit-exact `residual + update * gate` | contiguous tensors, or a transposed-dense `[B, tokens, hidden]` residual/output with contiguous update and row-broadcast gate (SANA-Video) |
+| `residual_gate_fp32` | Triton | separate FP32 multiply/add, then cast to input dtype | contiguous `[B,S,D]`, strided `[B or 1,1,D]` gate; Kandinsky6 |
 
-The transposed-dense path uses a shared-memory tile to read the update in
-logical row-major order while keeping residual reads and output writes
-coalesced in their `[B, hidden, tokens]` backing layout. Do not insert a
-`.contiguous()` merely to reach the ordinary path; that restores an entire
-tensor copy per residual site.
+These contracts differ: `residual_gate_fp32` does not round the product to
+BF16/FP16, and disables FMA to preserve the eager FP32 rounding boundary.
+
+The transposed-dense path tiles along the physical stride-1 token dimension
+for coalesced residual reads and output writes. The contiguous layouts use
+JIT CUDA. Do not insert a `.contiguous()` to reach that path: it adds a full
+tensor copy at each residual site.
 
 ### RoPE / QK-norm
 
@@ -146,7 +172,8 @@ tensor copy per residual site.
 | `try_fused_qwen_qkv_epilogue` | JIT CUDA | bit-exact vs the selected BF16 chain | Qwen-Image QK RMSNorm + RoPE + joint QKV writes; SM90+ |
 | `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
 | `fused_complex_rope` | Triton | preserves CUDA complex64 multiply rounding for contiguous BSHD inputs; Qwen-Image 2.1 verifies its first call against eager |
-| `rmsnorm_preserve_reduction` | Triton + aten | preserves the FP32 mean reduction and cast-before-weight rounding; fuses only pointwise work for contiguous FP16/BF16 inputs; Qwen-Image 2.1 verifies its first call |
+| `rmsnorm_preserve_reduction` | Triton + aten | preserves the FP32 mean reduction and cast-before-weight rounding; fuses only pointwise work for FP16/BF16 inputs and materializes strided inputs as contiguous; Qwen-Image 2.1 verifies its first call |
+| `qknorm_complex_rope_cuda` / `qknorm_complex_rope_pack_` | JIT CUDA | bit-exact vs `RMSNorm(cast_x_before_out_mul=True)` + complex64 RoPE for head_dim 128; both accept token-strided views of a packed QKV buffer; the pack variant normalizes Q and K in place behind a prefix and copies prefix K/V (and optionally V) in the same launch; Qwen-Image 2.1 verifies its first call |
 | `fused_interleaved_rope_fp64` | JIT CUDA | bit-exact vs paired SANA-Video fp64 RoPE |
 | `fused_inplace_helios_qk_rope` | JIT CUDA | bit-exact paired in-place RoPE for Helios' transposed frequency layout |
 | `ltx2_qknorm_split_rope_cuda` | KDA (JIT CUDA) | close; **validated on B200** |
@@ -217,7 +244,8 @@ inspecting model modules is its whole job.
    with its source revision and any JIT CUDA source files.
 2. Export it from `__init__.py` (`_EXPORTS`) and register a `KernelSpec`
    (`_SPECS`).
-3. Give it a `can_use_*` predicate; raise, don't return `None`.
+3. Keep selection and validation separate as described above. Reuse an existing
+   wrapper when the fallback policy is shared.
 4. State the numerical contract in the module docstring, including which
    shapes it was verified on.
 5. If it is not bit-exact, gate it through `sites/`. It must mount for both

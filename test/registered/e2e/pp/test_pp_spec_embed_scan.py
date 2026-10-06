@@ -88,16 +88,21 @@ class TestDraftEmbedScan(CustomTestCase):
 
     def test_bailing_nextn_embedding_is_found(self):
         from sglang.srt.models.bailing_moe_nextn import BailingMoeForCausalLMNextN
-        from sglang.srt.speculative.eagle_worker_v2 import _find_draft_input_embedding
+        from sglang.srt.speculative.pp_draft_embedding import (
+            find_draft_embedding_param,
+        )
 
         config = PretrainedConfig.from_dict(dict(_BAILING_CONFIG))
         with torch.device("cuda"):
             model = BailingMoeForCausalLMNextN(config)
-        self.assertIs(_find_draft_input_embedding(model), model.model.word_embeddings)
+        _, param = find_draft_embedding_param(model)
+        self.assertIs(param, model.model.word_embeddings.weight)
 
     def test_mistral_eagle_embedding_is_found(self):
         from sglang.srt.models.mistral_eagle import MistralForCausalLMEagle
-        from sglang.srt.speculative.eagle_worker_v2 import _find_draft_input_embedding
+        from sglang.srt.speculative.pp_draft_embedding import (
+            find_draft_embedding_param,
+        )
 
         config = MistralConfig(
             vocab_size=1024,
@@ -109,16 +114,17 @@ class TestDraftEmbedScan(CustomTestCase):
         )
         with torch.device("cuda"):
             model = MistralForCausalLMEagle(config)
-        self.assertIs(_find_draft_input_embedding(model), model.model.embed_tokens)
+        _, param = find_draft_embedding_param(model)
+        self.assertIs(param, model.model.embed_tokens.weight)
 
     def test_name_table_matches_published_checkpoints(self):
-        from sglang.srt.speculative.eagle_worker_v2 import _EMBED_TENSOR_NAMES
+        from sglang.srt.speculative.pp_draft_embedding import EMBED_KEY_CANDIDATES
 
         # External-source literals: the embedding tensor's spelling in each
         # family's published target checkpoint (inclusionAI/Ling-*-2.0
         # model.safetensors.index.json; Mistral-Large-3 consolidated index).
-        self.assertIn("model.word_embeddings.weight", _EMBED_TENSOR_NAMES)
-        self.assertIn("tok_embeddings.weight", _EMBED_TENSOR_NAMES)
+        self.assertIn("model.word_embeddings.weight", EMBED_KEY_CANDIDATES)
+        self.assertIn("tok_embeddings.weight", EMBED_KEY_CANDIDATES)
 
 
 if __name__ == "__main__":

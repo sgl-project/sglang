@@ -73,6 +73,10 @@ impl MockWorker {
         // "tiny" model the tests register a tokenizer + policy under.
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat))
+            .route("/generate", post(generate))
+            .route("/v1/embeddings", post(embeddings))
+            .route("/v1/classify", post(classify))
+            .route("/v1/rerank", post(rerank))
             .route("/server_info", get(serve_tiny_server_info))
             .route("/abort_request", abort_request_route(abort_log.clone()))
             .with_state(state);
@@ -94,6 +98,19 @@ impl MockWorker {
             captured,
             abort_log,
             _shutdown: tx,
+        }
+    }
+
+    /// The last request body as JSON, polled because a PD prefill is dispatched in the background.
+    #[allow(dead_code)] // Only used by some test files.
+    pub async fn captured_json(&self) -> Value {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(body) = self.captured.lock().unwrap().last_body.clone() {
+                return serde_json::from_slice(&body).unwrap();
+            }
+            assert!(start.elapsed() < Duration::from_secs(2), "no body captured");
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -422,32 +439,43 @@ async fn serve_tiny_server_info() -> Json<Value> {
 }
 
 #[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
-async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
-    {
-        let mut g = s.captured.lock().unwrap();
-        g.last_body = Some(body.clone());
-        for (k, v) in headers.iter() {
-            g.seen.insert(k.as_str().to_string());
-            if let Ok(val) = v.to_str() {
-                g.headers.insert(k.as_str().to_string(), val.to_string());
-            }
+fn capture_request(s: &MockWorkerState, headers: &HeaderMap, body: &Bytes) -> Value {
+    let mut g = s.captured.lock().unwrap();
+    g.last_body = Some(body.clone());
+    for (k, v) in headers.iter() {
+        g.seen.insert(k.as_str().to_string());
+        if let Ok(val) = v.to_str() {
+            g.headers.insert(k.as_str().to_string(), val.to_string());
         }
     }
-    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    let streaming = v.get("stream").and_then(|x| x.as_bool()).unwrap_or(false);
-    if streaming {
-        let chunks: Vec<_> = s
-            .stream_chunks
-            .iter()
-            .map(|c| Ok::<_, std::io::Error>(Bytes::from(*c)))
-            .collect();
-        let body = Body::from_stream(futures::stream::iter(chunks));
-        let mut r = Response::new(body);
-        *r.status_mut() = StatusCode::OK;
-        r.headers_mut().insert(
-            HeaderName::from_static("content-type"),
-            "text/event-stream".parse().unwrap(),
-        );
+    serde_json::from_slice(body).unwrap_or(Value::Null)
+}
+
+/// `Some` SSE response of `stream_chunks` when the request asked to stream.
+#[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
+fn stream_response(s: &MockWorkerState, request: &Value) -> Option<Response<Body>> {
+    if request.get("stream").and_then(|x| x.as_bool()) != Some(true) {
+        return None;
+    }
+    let chunks: Vec<_> = s
+        .stream_chunks
+        .iter()
+        .map(|c| Ok::<_, std::io::Error>(Bytes::from(*c)))
+        .collect();
+    let body = Body::from_stream(futures::stream::iter(chunks));
+    let mut r = Response::new(body);
+    *r.status_mut() = StatusCode::OK;
+    r.headers_mut().insert(
+        HeaderName::from_static("content-type"),
+        "text/event-stream".parse().unwrap(),
+    );
+    Some(r)
+}
+
+#[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
+async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    let v = capture_request(&s, &headers, &body);
+    if let Some(r) = stream_response(&s, &v) {
         return r;
     }
     let resp = serde_json::json!({
@@ -461,4 +489,59 @@ async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes)
         }]
     });
     Json(resp).into_response()
+}
+
+/// SGLang's native `/generate` response shape, echoing the request's `rid`.
+#[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
+async fn generate(
+    State(s): State<MockWorkerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    let v = capture_request(&s, &headers, &body);
+    if let Some(r) = stream_response(&s, &v) {
+        return r;
+    }
+    Json(serde_json::json!({
+        "text": "ok",
+        "output_ids": [1, 2],
+        "meta_info": {"id": v["rid"], "finish_reason": {"type": "stop"}},
+    }))
+    .into_response()
+}
+
+/// An OpenAI embeddings response.
+#[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
+async fn embeddings(
+    State(s): State<MockWorkerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    capture_request(&s, &headers, &body);
+    let data = [serde_json::json!({"object": "embedding", "embedding": [0.5], "index": 0})];
+    Json(serde_json::json!({"object": "list", "data": data, "model": "tiny"})).into_response()
+}
+
+/// A classify response for one prompt.
+#[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
+async fn classify(
+    State(s): State<MockWorkerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    capture_request(&s, &headers, &body);
+    let data =
+        [serde_json::json!({"index": 0, "label": "LABEL_0", "probs": [1.0], "num_classes": 1})];
+    Json(serde_json::json!({"object": "list", "data": data, "model": "tiny"})).into_response()
+}
+
+/// A rerank response, a list of scored documents.
+#[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
+async fn rerank(
+    State(s): State<MockWorkerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    capture_request(&s, &headers, &body);
+    Json(serde_json::json!([{"score": 0.5, "index": 0}])).into_response()
 }

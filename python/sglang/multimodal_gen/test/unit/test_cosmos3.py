@@ -140,6 +140,24 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
     def test_hopper_dense_mlp_disabled(self):
         self.assertFalse(self._can_enable(is_hopper=True, hidden_act="relu2"))
 
+    def test_hopper_super_t2i_tp2_enabled(self):
+        self.assertTrue(self._can_enable(is_hopper=True, hidden_size=5120, tp_size=2))
+
+    def test_hopper_super_t2i_unsupported_topologies_disabled(self):
+        for overrides in (
+            {"hidden_act": "relu2"},
+            {"hidden_act": "gelu"},
+            {"hidden_size": 4096},
+            {"tp_size": 4},
+            {"sp_size": 2},
+            {"is_compiled": True},
+            {"is_hopper": False},
+        ):
+            with self.subTest(overrides=overrides):
+                settings = dict(is_hopper=True, hidden_size=5120, tp_size=2)
+                settings.update(overrides)
+                self.assertFalse(self._can_enable(**settings))
+
     def test_hopper_edge_single_gpu_enabled(self):
         self.assertTrue(
             self._can_enable(is_hopper=True, hidden_act="relu2", hidden_size=2048)
@@ -162,7 +180,7 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
             self._can_enable(is_hopper=True, hidden_act="relu2", hidden_size=4096)
         )
 
-    def test_hopper_tensor_parallel_disabled(self):
+    def test_hopper_other_tensor_parallel_shapes_disabled(self):
         self.assertFalse(self._can_enable(is_hopper=True, tp_size=2))
 
     def test_hopper_sequence_parallel_disabled(self):

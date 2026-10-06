@@ -125,7 +125,7 @@ dsv4pro-fp4-mi355x-sglang:
 #   * -dp8ep8     : DP-attention 8 + narrow within-node EP8
 #   * -dp8ep8-mtp : DP8 + narrow EP8 + EAGLE MTP
 # launch_mi355x.sh reads expert-/data-parallel-size and the `mtp:` section to
-# append --ep-size / --enable-dp-attention --dp-size / --speculative-* flags.
+# append --ep-size / --attn-dp-size / --speculative-* flags.
 
 dsv4flash-fp8-mi355x-mtp-sglang:
   model: sgl-project/DeepSeek-V4-Flash-FP8

@@ -65,6 +65,9 @@ class RequestMetrics:
         self.active_stage_name: str | None = None
         self.total_duration_ms: float = 0.0
         self.suppress_stage_breakdown: bool = False
+        # Set on the first request after a failed request-based warmup: its
+        # timing includes first-use cost the warmup was meant to absorb.
+        self.warmup_failed: bool = False
         # memory tracking: {checkpoint_name: MemorySnapshot}
         self.memory_snapshots: Dict[str, MemorySnapshot] = {}
 
@@ -116,6 +119,7 @@ class RequestMetrics:
             "denoising_stages": sorted(self.denoising_stages),
             "steps": self.steps,
             "total_duration_ms": self.total_duration_ms,
+            "warmup_failed": self.warmup_failed,
             "memory_snapshots": {
                 name: snapshot.to_dict()
                 for name, snapshot in self.memory_snapshots.items()
@@ -445,8 +449,11 @@ class PerformanceLogger:
         try:
             abs_path = os.path.abspath(file_path)
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-            with open(abs_path, "w", encoding="utf-8") as f:
+            # readers poll for this file: never let them see a partial write
+            tmp_path = f"{abs_path}.{os.getpid()}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2)
+            os.replace(tmp_path, abs_path)
             logger.info(f"Metrics dumped to: {CYAN}{abs_path}{RESET}")
         except IOError as e:
             logger.error(f"Failed to dump metrics to {abs_path}: {e}")

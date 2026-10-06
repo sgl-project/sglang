@@ -43,8 +43,8 @@ from sglang.kernels.ops.attention.kda_fused_decode import (
     _CONV_STATE_W,
     covered,
 )
-from sglang.srt.mem_cache.layout.page_major import (
-    build_page_major_mamba_views,
+from sglang.srt.mem_cache.layout.token_major import (
+    build_mamba_entry_views,
     mamba_entry_bytes,
 )
 
@@ -85,7 +85,7 @@ def _make_strided_temporal_view(heads: int):
         temporal_dtype=_TEMPORAL_DTYPE,
     )
     raw = torch.zeros(_SLOTS * entry, dtype=torch.uint8, device=_DEV)
-    _conv_views, temporal = build_page_major_mamba_views(
+    _conv_views, temporal = build_mamba_entry_views(
         raw,
         layer_num=_LAYERS,
         conv_state_shapes=_CONV_SHAPES,

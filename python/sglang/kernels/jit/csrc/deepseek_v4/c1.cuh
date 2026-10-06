@@ -191,8 +191,8 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
   if (out_loc <= 0) return;
   const auto kv_row = Paged::row(params.kvcache, out_loc);
 
-  if constexpr (kLayout == KVLayout::V41) {
-    // fp8 with one ue8m0 scale per 32 elements over the whole row, RoPE included.
+  if constexpr (kLayout == KVLayout::V41 || kLayout == KVLayout::UNIFORM_FP8) {
+    // FP8 over the whole row, RoPE included; the layout selects the scaling.
     return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, data);
   }
 
@@ -267,7 +267,7 @@ struct FlashCompress1Kernel {
 
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({N, kHeadDim})  //
         .with_dtype<bf16_t>()

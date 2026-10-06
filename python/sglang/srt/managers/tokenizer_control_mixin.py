@@ -164,6 +164,15 @@ def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOut
     )
 
 
+def _lora_load_needs_cleanup(results: List[LoRAUpdateOutput], lora_name: str) -> bool:
+    # Rank replies include pre-existing adapters, not only the attempted ID.
+    # Callers must exclude registered names before checking for partial loads.
+    return any(
+        result.success or lora_name in (result.loaded_adapters or {})
+        for result in results
+    )
+
+
 class TokenizerControlMixin:
     """Mixin for TokenizerManager's control-plane operations (weights, cache, lora,
     profile, internal state, etc.) -- everything that talks to the scheduler via
@@ -177,7 +186,7 @@ class TokenizerControlMixin:
             mode = spec[2] if len(spec) > 2 else "queueing"
             comm = FanOutCommunicator(
                 self._dispatch_to_scheduler,
-                get_parallel().dp_size,
+                get_parallel().num_dp_ranks,
                 mode,
             )
             setattr(self, f"{name}_communicator", comm)
@@ -186,7 +195,7 @@ class TokenizerControlMixin:
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (
-            get_parallel().enable_dp_attention
+            get_parallel().attn_dp_enabled
             and not get_parallel().enable_dp_attention_local_control_broadcast
         )
         if primary_group_control:
@@ -435,8 +444,8 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-            "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+        assert get_parallel().dp_size == 1, (
+            "data-parallel replicas are not supported for update weights from distributed"
         )
 
         results = await self.init_weights_update_group_communicator(obj)
@@ -448,8 +457,8 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-            "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
+        assert get_parallel().dp_size == 1, (
+            "data-parallel replicas are not supported for destroy parameter update group"
         )
 
         results = await self.destroy_weights_update_group_communicator(obj)
@@ -493,8 +502,8 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-            "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+        assert get_parallel().dp_size == 1, (
+            "data-parallel replicas are not supported for update weights from distributed"
         )
 
         if obj.abort_all_requests:
@@ -526,8 +535,8 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         # TODO: support DP
-        assert get_parallel().dp_size == 1, (
-            "dp_size must be 1 for init_weights_send_group_for_remote_instance"
+        assert get_parallel().num_dp_ranks == 1, (
+            "init_weights_send_group_for_remote_instance requires a single DP rank"
         )
         result = (
             await self.init_weights_send_group_for_remote_instance_communicator(obj)
@@ -541,8 +550,8 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         # TODO: support DP
-        assert get_parallel().dp_size == 1, (
-            "dp_size must be 1 for send_weights_to_remote_instance"
+        assert get_parallel().num_dp_ranks == 1, (
+            "send_weights_to_remote_instance requires a single DP rank"
         )
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
         return result.success, result.message
@@ -553,8 +562,8 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-            "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
+        assert get_parallel().dp_size == 1, (
+            "data-parallel replicas are not supported for update weights from tensor"
         )
 
         if obj.abort_all_requests:
@@ -591,8 +600,8 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         try:
             # For now, we only support single data parallel instance
-            assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-                "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
+            assert get_parallel().dp_size == 1, (
+                "data-parallel replicas are not supported for update weights from IPC"
             )
             logger.info("Starting IPC weight update")
 
@@ -626,9 +635,11 @@ class TokenizerControlMixin:
             "self.lora_update_lock must be locked in order for self._unload_lora_adapter_locked() to be called"
         )
 
-        # Unregister the LoRA adapter from the registry to stop new requests for this adapter
-        # from being started.
-        lora_id = await self.lora_registry.unregister(obj.lora_name)
+        lora_id = self.pending_lora_unloads.get(obj.lora_name)
+        if lora_id is None:
+            # Stop new requests from using this adapter before unloading it.
+            lora_id = await self.lora_registry.unregister(obj.lora_name)
+            self.pending_lora_unloads[obj.lora_name] = lora_id
         obj.lora_id = lora_id
 
         # Initiate the actual unloading operation at the backend processes only after all
@@ -637,7 +648,8 @@ class TokenizerControlMixin:
         result = _merge_lora_update_results(
             await self.update_lora_adapter_communicator(obj)
         )
-
+        if result.success:
+            self.pending_lora_unloads.pop(obj.lora_name)
         return result
 
     async def load_lora_adapter(
@@ -653,8 +665,8 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
-            assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-                "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+            assert get_parallel().dp_size == 1, (
+                "data-parallel replicas are not supported for dynamic lora loading"
             )
             logger.info(
                 "Start load Lora adapter. Lora name=%s, path=%s",
@@ -663,6 +675,12 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                if obj.lora_name in self.pending_lora_unloads:
+                    raise ValueError(
+                        f"LoRA adapter '{obj.lora_name}' has an incomplete unload. "
+                        "Retry the unload before loading it again."
+                    )
+
                 # Generate new uniquely identifiable LoRARef object.
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
@@ -672,14 +690,16 @@ class TokenizerControlMixin:
 
                 # Trigger the actual loading operation at the backend processes.
                 obj.lora_id = new_adapter.lora_id
-                result = _merge_lora_update_results(
-                    await self.update_lora_adapter_communicator(obj)
-                )
-
-                # Register the LoRA adapter only after loading is successful.
+                rank_results = await self.update_lora_adapter_communicator(obj)
+                result = _merge_lora_update_results(rank_results)
                 if result.success:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
+                elif (
+                    obj.lora_name not in self.lora_registry.get_all_adapters()
+                    and _lora_load_needs_cleanup(rank_results, obj.lora_name)
+                ):
+                    self.pending_lora_unloads[obj.lora_name] = new_adapter.lora_id
 
                 if get_lora().max_loaded_loras is not None:
                     while (
@@ -731,8 +751,8 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
-            assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-                "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+            assert get_parallel().dp_size == 1, (
+                "data-parallel replicas are not supported for dynamic lora loading"
             )
             logger.info(
                 "Start load Lora adapter from tensors. Lora name=%s",
@@ -744,19 +764,29 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                if obj.lora_name in self.pending_lora_unloads:
+                    raise ValueError(
+                        f"LoRA adapter '{obj.lora_name}' has an incomplete unload. "
+                        "Retry the unload before loading it again."
+                    )
+
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
                     lora_path="__tensor__",
                     pinned=obj.pinned,
                 )
                 obj.lora_id = new_adapter.lora_id
-                result = _merge_lora_update_results(
-                    await self.update_lora_adapter_communicator(obj)
-                )
-
+                rank_results = await self.update_lora_adapter_communicator(obj)
+                result = _merge_lora_update_results(rank_results)
                 if result.success:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
+                elif (
+                    obj.lora_name not in self.lora_registry.get_all_adapters()
+                    and _lora_load_needs_cleanup(rank_results, obj.lora_name)
+                ):
+                    self.pending_lora_unloads[obj.lora_name] = new_adapter.lora_id
+
                 if get_lora().max_loaded_loras is not None:
                     while (
                         self.lora_registry.num_registered_loras
@@ -811,8 +841,8 @@ class TokenizerControlMixin:
                 "lora_name must be provided to unload LoRA adapter"
             )
 
-            assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-                "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+            assert get_parallel().dp_size == 1, (
+                "data-parallel replicas are not supported for dynamic lora loading"
             )
             logger.info(
                 "Start unload Lora adapter. Lora name=%s",
@@ -832,7 +862,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         results = await self.get_weights_by_name_communicator(obj)
         all_parameters = [r.parameter for r in results]
-        if get_parallel().dp_size == 1:
+        if get_parallel().num_dp_ranks == 1:
             return all_parameters[0]
         else:
             return all_parameters

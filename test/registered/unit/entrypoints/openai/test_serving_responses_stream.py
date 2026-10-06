@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -26,6 +27,106 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class NonHarmonyStreamTestCase(CustomTestCase):
+    def test_reasoning_content_part_lifecycle_matches_terminal_output(self):
+        for finish_reason, status, suffix in (
+            ({"type": "stop"}, "completed", "</think>answer"),
+            ({"type": "length"}, "incomplete", ""),
+            (
+                {"type": "abort", "status_code": 503, "message": "Worker unavailable"},
+                "failed",
+                "",
+            ),
+        ):
+            with self.subTest(status=status):
+                serving = make_serving()
+                serving.reasoning_parser = "deepseek-v41"
+                serving.tool_call_parser = None
+                request = ResponsesRequest(
+                    model="x", input="hi", stream=True, store=False
+                )
+                chunks = [engine_chunk("<think>wo"), engine_chunk("<think>work")]
+                terminal_chunk = engine_chunk("<think>work" + suffix, 4, finish=True)
+                terminal_chunk["meta_info"]["finish_reason"] = finish_reason
+                chunks.append(terminal_chunk)
+                events = StreamFixture(serving, request, require_reasoning=True).run(
+                    chunks
+                )
+                payloads = event_payloads(events)
+                self.assertEqual(payloads[-1]["type"], f"response.{status}")
+                output = payloads[-1]["response"]["output"]
+                reasoning = output[0]
+                self.assertEqual(reasoning["type"], "reasoning")
+                item_events = [
+                    p for p in payloads if p.get("item_id") == reasoning["id"]
+                ]
+                types = [p["type"] for p in item_events]
+                self.assertEqual(types[0], "response.content_part.added")
+                self.assertEqual(
+                    types[-2:],
+                    ["response.reasoning_text.done", "response.content_part.done"],
+                )
+                self.assertEqual(types.count("response.content_part.added"), 1)
+                self.assertEqual(types.count("response.content_part.done"), 1)
+                self.assertEqual(
+                    item_events[0]["part"], {"type": "reasoning_text", "text": ""}
+                )
+                self.assertEqual(item_events[-1]["part"], reasoning["content"][0])
+                self.assertEqual(item_events[-2]["text"], "work")
+                self.assertEqual(
+                    "".join(
+                        p["delta"]
+                        for p in item_events
+                        if p["type"] == "response.reasoning_text.delta"
+                    ),
+                    "work",
+                )
+                self.assertTrue(
+                    all(
+                        p["output_index"] == 0 and p["content_index"] == 0
+                        for p in item_events
+                    )
+                )
+                done = [
+                    p["item"]
+                    for p in payloads
+                    if p["type"] == "response.output_item.done"
+                ]
+                self.assertEqual(done, output)
+                self.assertEqual(
+                    [p["sequence_number"] for p in payloads], list(range(len(payloads)))
+                )
+
+    def test_reasoning_summary_keeps_its_own_part_events(self):
+        serving = make_serving()
+        serving.reasoning_parser = "deepseek-v41"
+        serving.tool_call_parser = None
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+            reasoning={"summary": "auto"},
+        )
+        events = StreamFixture(serving, request, require_reasoning=True).run(
+            [engine_chunk("<think>work</think>answer", 4, finish=True)]
+        )
+        payloads = event_payloads(events)
+        reasoning = find_completed_event(events)["response"]["output"][0]
+        parts = [p for p in payloads if p.get("item_id") == reasoning["id"]]
+        self.assertEqual(
+            [p["type"] for p in parts],
+            [
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+            ],
+        )
+        self.assertEqual(parts[-1]["part"], reasoning["summary"][0])
+        self.assertEqual(
+            reasoning["content"], [{"type": "reasoning_text", "text": "work"}]
+        )
+
     def test_reasoning_parser_uses_processed_reasoning_state(self):
         serving = make_serving()
         serving.reasoning_parser = "deepseek-r1"
@@ -252,6 +353,55 @@ class NonHarmonyStreamTestCase(CustomTestCase):
                     if p["type"] == "response.function_call_arguments.delta"
                 )
                 self.assertEqual(deltas, full_item.arguments)
+
+    def test_detector_selected_tool_parser_matches_full_and_streamed_arguments(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = "iquest_q1"
+        arguments = '{"city":"北京"}'
+        for choice, raw in (
+            ({"type": "function", "name": "get_weather"}, arguments),
+            ("required", '[{"name":"get_weather","parameters":' + arguments + "}]"),
+        ):
+            with self.subTest(choice=choice):
+                request = ResponsesRequest(
+                    model="x",
+                    input="weather?",
+                    stream=True,
+                    store=False,
+                    tool_choice=choice,
+                    tools=[
+                        {
+                            "type": "function",
+                            "name": "get_weather",
+                            "parameters": {"type": "object"},
+                        }
+                    ],
+                )
+                (full_item,) = serving._make_response_output_items(
+                    request,
+                    raw,
+                    serving.tokenizer_manager.tokenizer,
+                    require_reasoning=False,
+                )
+                events = StreamFixture(serving, request).run(
+                    [
+                        engine_chunk(raw[:i], i, finish=i == len(raw))
+                        for i in range(1, len(raw) + 1)
+                    ]
+                )
+                (stream_item,) = find_completed_event(events)["response"]["output"]
+                for item in (full_item.model_dump(), stream_item):
+                    self.assertEqual(item["type"], "function_call")
+                    self.assertEqual(item["name"], "get_weather")
+                    self.assertEqual(json.loads(item["arguments"]), {"city": "北京"})
+                    self.assertTrue(item["call_id"])
+                deltas = "".join(
+                    p["delta"]
+                    for p in event_payloads(events)
+                    if p["type"] == "response.function_call_arguments.delta"
+                )
+                self.assertEqual(deltas, stream_item["arguments"])
 
     def test_final_output_preserves_text_tool_text_order(self):
         from sglang.srt.function_call.core_types import (

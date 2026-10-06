@@ -67,14 +67,14 @@ def _run_activation_inplace(
 
 @register_custom_op(mutates_args=["out"])
 def _run_activation_with_rounding_inplace(
-    op_name: str, input: torch.Tensor, out: torch.Tensor
+    op_name: str, input: torch.Tensor, out: torch.Tensor, clamp_limit: float = 0.0
 ) -> None:
     hidden_size = input.shape[-1] // 2
     # Fast-math changes FP16 SiLU at eager rounding boundaries on SM90.
     module = activation_module(input.dtype, fast_math=False)
     input_2d = input.view(-1, hidden_size * 2)
     out_2d = out.view(-1, hidden_size)
-    module.run_activation_with_rounding(input_2d, out_2d, op_name)
+    module.run_activation_with_rounding(input_2d, out_2d, op_name, clamp_limit)
 
 
 @register_custom_op(mutates_args=["input"])
@@ -184,11 +184,13 @@ def silu_and_mul(
 def silu_and_mul_with_activation_rounding(
     input: torch.Tensor,
     out: Optional[torch.Tensor] = None,
+    *,
+    clamp_limit: float = 0.0,
 ) -> torch.Tensor:
     hidden_size = input.shape[-1] // 2
     if out is None:
         out = input.new_empty(*input.shape[:-1], hidden_size)
-    _run_activation_with_rounding_inplace("silu", input, out)
+    _run_activation_with_rounding_inplace("silu", input, out, clamp_limit)
     return out
 
 

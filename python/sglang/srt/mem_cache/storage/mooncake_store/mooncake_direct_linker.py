@@ -123,6 +123,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             get_memory().hicache_storage_backend_extra_config
         )
+        # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
+        # `dp_rank`. Aligning the storage-config producers changes persisted
+        # storage keys, so it waits for a storage-key format change.
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
             tp_size=tp_size,

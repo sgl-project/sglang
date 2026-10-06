@@ -37,8 +37,10 @@ def _backend(declared: SharedReadEnds):
     [
         # The backend's declaration decides where the record lands.
         (SharedReadEnds.IN_REPLAY, True, SharedReadEnds.IN_REPLAY),
-        # Nowhere to record in-graph -> fall back to the pre-replay record.
-        (SharedReadEnds.IN_REPLAY, False, SharedReadEnds.PRE_REPLAY),
+        # No external-event support (e.g. HIP): IN_REPLAY cannot be recorded
+        # in-graph, and a PRE_REPLAY fence would not cover the replay reads.
+        # The sound fallback is POST_REPLAY.
+        (SharedReadEnds.IN_REPLAY, False, SharedReadEnds.POST_REPLAY),
         # Only an in-graph declaration is demoted; the rest pass through.
         (SharedReadEnds.POST_REPLAY, False, SharedReadEnds.POST_REPLAY),
     ],

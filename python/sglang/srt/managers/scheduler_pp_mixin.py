@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
@@ -53,6 +54,14 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
+
+
+def _pp_snapshot_forward_batch(batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+    if batch.spec_algorithm.is_none():
+        return None
+    fwd_batch = batch.copy()
+    fwd_batch.req_pool_indices = batch.req_pool_indices.clone()
+    return fwd_batch
 
 
 def _pp_exchange_outputs_before_forward(
@@ -592,7 +601,7 @@ class SchedulerPPMixin:
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
         self._pp_spec_relay = (
-            envs.SGLANG_ENABLE_PP_SPEC.get()
+            pp_spec_stable_rows_enabled()
             and get_parallel().pp_size > 1
             and not self.spec_algorithm.is_none()
         )
@@ -879,12 +888,8 @@ class SchedulerPPMixin:
             tensor_dict["spec_accept_lens"] = result.accept_lens
             tensor_dict["spec_new_seq_lens"] = result.new_seq_lens
             tensor_dict["spec_bonus_tokens"] = result.next_draft_input.bonus_tokens
-            if (
-                result.accept_index is not None
-                and get_spec().speculative_eagle_topk > 1
-            ):
-                # Only a tree needs it: a chain's accepted path is already the
-                # front of each block, so compacting it is an identity.
+            if result.accept_index is not None:
+                # Relayed recurrent commits also need chain accept indices.
                 tensor_dict["spec_accept_index"] = result.accept_index
             if result.next_verify_chain is not None:
                 # Tail-drafted tree for the next verify round (root = bonus),
@@ -1093,7 +1098,7 @@ class SchedulerPPMixin:
             new_seq_lens = pp_outputs["spec_new_seq_lens"]
             fwd_rids = [req.rid for req in fwd_batch.reqs]
             live_rids = [req.rid for req in batch.reqs]
-            self._pp_spec_compact_accept_kv(
+            self._pp_spec_commit_relayed_accept(
                 batch,
                 fwd_batch,
                 fwd_rids,
@@ -1229,7 +1234,7 @@ class SchedulerPPMixin:
     ):
         self.process_batch_result(batch, output_result)
 
-    def _pp_spec_compact_accept_kv(
+    def _pp_spec_commit_relayed_accept(
         self: Scheduler,
         batch: ScheduleBatch,
         fwd_batch: ScheduleBatch,
@@ -1238,47 +1243,60 @@ class SchedulerPPMixin:
         verify_out_cache_loc: Optional[torch.Tensor],
         pp_outputs,
     ) -> None:
-        """Move this stage's accepted-path KV to the front of each request block.
+        """Commit relayed recurrent state, then compact tree KV when present.
 
-        The verify forward writes one KV slot per tree node, in node order. The
-        committed prefix that every later read assumes is the accepted path laid
-        out contiguously, so the two have to be reconciled once per round -- and
-        each stage has to do it for its own layers, since KV is not relayed.
-        The last stage does it inside verify (_finalize_accept_tree_path); this
-        is the same step for the stages that only ran the target forward.
-
-        Must run before seq_lens advances: the move writes into the block that
-        starts at the pre-advance length.
+        Must run before the live batch advances ``seq_lens``.
         """
         accept_index = pp_outputs.tensors.get("spec_accept_index")
         if accept_index is None or fwd_batch.forward_mode.is_idle():
             return
-        if verify_out_cache_loc is None:
-            return
         from sglang.srt.speculative.spec_utils import (
+            commit_mamba_states_after_verify,
             move_accept_tokens_to_target_kvcache,
         )
 
-        # The destination base is the length each request had when the forward
-        # ran. ScheduleBatch.copy() drops seq_lens but keeps seq_lens_cpu, and
-        # that snapshot is already in the forward's row order -- the live batch
-        # may have been filtered or merged since, and reindexing it would skip
-        # exactly the rounds whose composition changed.
-        device = verify_out_cache_loc.device
+        # Preserve the forward batch's row order after live-batch recomposition.
+        device = (
+            verify_out_cache_loc.device
+            if verify_out_cache_loc is not None
+            else batch.seq_lens.device
+        )
         if fwd_batch.seq_lens_cpu is not None:
             seq_lens = fwd_batch.seq_lens_cpu.to(device=device, dtype=torch.int64)
         elif live_rids == fwd_rids:
             seq_lens = batch.seq_lens
         else:
-            return
+            raise RuntimeError(
+                "PP-spec delayed relay cannot commit a recomposed micro-batch "
+                "without its forward-time seq_lens_cpu snapshot"
+            )
         fwd_batch.seq_lens = seq_lens
+        # copy() drops tree_cache, which the tracking-grid commit needs.
+        fwd_batch.tree_cache = batch.tree_cache
+        accept_index = accept_index.to(device)
+        accept_lens = pp_outputs["spec_accept_lens"].to(device)
+
+        # The last stage already commits inside run_eagle_verify.
+        if not self.pp_group.is_last_rank:
+            commit_mamba_states_after_verify(
+                self.tp_worker,
+                fwd_batch,
+                accept_lens,
+                accept_index,
+                get_spec().speculative_num_draft_tokens,
+            )
+
+        if verify_out_cache_loc is None:
+            return
         fwd_batch.out_cache_loc = verify_out_cache_loc
-        move_accept_tokens_to_target_kvcache(
-            fwd_batch,
-            accept_index.to(device),
-            pp_outputs["spec_accept_lens"].to(device) - 1,
-            self.token_to_kv_pool_allocator,
-        )
+
+        if get_spec().speculative_eagle_topk > 1:
+            move_accept_tokens_to_target_kvcache(
+                fwd_batch,
+                accept_index,
+                accept_lens - 1,
+                self.token_to_kv_pool_allocator,
+            )
 
     def _pp_spec_adopt_relayed_tree(
         self: Scheduler,
@@ -1733,11 +1751,7 @@ class SchedulerPPMixin:
                 )
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
-                    fwd_batch=(
-                        cur_batch.copy()
-                        if not cur_batch.spec_algorithm.is_none()
-                        else None
-                    ),
+                    fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
                 )
                 event = self.device_module.Event()

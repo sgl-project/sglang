@@ -3,10 +3,12 @@ from __future__ import annotations
 import logging
 import math
 from enum import IntEnum
+from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
@@ -566,14 +568,17 @@ def eagle_prepare_for_verify(
         # Uniform variant: end offsets (= start + draft_token_num) are computed
         # inside the kernel, keeping the eager `seq_lens + N` add off the host
         # critical path (bs=1 MTP inter-phase seam).
-        batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=req_to_token_pool.req_to_token,
-            start_offset=batch.seq_lens,
-            batch_size=bs,
-            draft_token_num=verify_input.draft_token_num,
-            device=device,
-        )
+        if verify_input.prepared_out_cache_loc is not None:
+            batch.out_cache_loc = verify_input.prepared_out_cache_loc
+        else:
+            batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                batch_size=bs,
+                draft_token_num=verify_input.draft_token_num,
+                device=device,
+            )
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
@@ -601,6 +606,7 @@ def eagle_prepare_for_verify(
         target_worker.model_runner,
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
+        spec_mrope_positions=verify_input.prepared_mrope_positions,
     )
 
     # Run attention backend plan and cuda graph preparation
@@ -739,8 +745,6 @@ def eagle_sample(
     Verify and find accepted tokens based on logits output and batch
     (which contains spec decoding information).
     """
-    import torch.nn.functional as F
-
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
@@ -895,6 +899,8 @@ def eagle_sample(
         # branch not taken, and HIP only reaches here with rejection sampling on.
         if use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton
+            if get_spec().speculative_use_block_verification:
+                sampling_fn = partial(sampling_fn, block_verification=True)
         else:
             if _is_cuda:
                 from sglang.kernels.ops.speculative.sampling import (
@@ -923,8 +929,8 @@ def eagle_sample(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
         )  # (bs * num_draft_tokens, 1)
 
-        target_probs = F.softmax(
-            next_token_logits / expanded_temperature, dim=-1
+        target_probs = sampling_softmax(
+            next_token_logits, temperatures=expanded_temperature
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         if sampling_info.need_top_k_sampling:
@@ -1049,8 +1055,6 @@ def eagle_sample(
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
-
-    bs = batch.batch_size()
 
     # Accumulate penalty
     # This is a relaxed version of penalties for speculative decoding.

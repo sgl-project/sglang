@@ -16,7 +16,7 @@ from sglang.srt.model_loader.loader import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     dynamic_import,
@@ -42,14 +42,18 @@ def _unsupported_derived_weight_cache_error(
 ) -> Optional[str]:
     """Reject online weight updates that derived-weight caches cannot survive.
 
-    The HPC-Ops bf16xfp32 GEMM caches the fp32 weight split; in-place loader
-    writes are invisible to it, so an update would silently keep serving the
-    old weights. The check is startup-determined and rank-uniform, so an
-    update never proceeds on some workers while rejected on others.
+    Compensated mHC projections and HPC-Ops bf16xfp32 GEMM retain derived
+    weight splits that in-place loader writes do not refresh. Model-owned
+    caches can also declare this constraint via ``_derived_weight_cache_error``.
+    Reject before writing weights to avoid serving stale cached values,
+    including references retained by captured CUDA graphs. These constraints
+    must be startup-determined and rank-uniform so all workers reject together.
     """
     if model is not None and any(
         getattr(module, "_hc_attn_tf32_parts", None) is not None
         or getattr(module, "_hc_ffn_tf32_parts", None) is not None
+        or getattr(module, "_hc_attn_bf16_parts", None) is not None
+        or getattr(module, "_hc_ffn_bf16_parts", None) is not None
         for module in model.modules()
     ):
         return (
@@ -66,7 +70,7 @@ def _unsupported_derived_weight_cache_error(
             reason = getattr(module, "_derived_weight_cache_error", None)
             if reason is not None:
                 return reason
-    from sglang.kernels.ops.attention.dsv4.gemm import hpc_bf16xfp32_gemm_enabled
+    from sglang.kernels.ops.gemm.bf16_fp32 import hpc_bf16xfp32_gemm_enabled
 
     if hpc_bf16xfp32_gemm_enabled():
         return (
@@ -357,8 +361,12 @@ class WeightUpdater:
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
 
+        # The payload lists one entry per deployment TP rank. An
+        # attention-owning draft records its narrowed rank at init, so read the
+        # deployment rank here, on the scheduler thread outside any draft scope.
+        tp_rank = get_parallel().tp_rank
         named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
+            (name, _unwrap_tensor(tensor, tp_rank=tp_rank, device=infered_device))
             for name, tensor in named_tensors
         ]
         if load_format == "direct":

@@ -1,12 +1,49 @@
 from unittest.mock import patch
 
+import pytest
+
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
     IpcA2AState,
     _peer_cuda_device,
+    _Unsupported,
     ipc_a2a_ready,
 )
 
 _IPC = "sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a"
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("nvlink", [False, True])
+def test_ipc_requires_nvlink_before_mapping_peer_memory(monkeypatch, rank, nvlink):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,1")
+    state = IpcA2AState()
+    with (
+        patch(f"{_IPC}.dist.get_rank", return_value=rank),
+        patch(f"{_IPC}.torch.cuda.current_device", return_value=rank),
+        patch(f"{_IPC}._peer_cuda_device", return_value=1 - rank),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_full_nvlink",
+            return_value=nvlink,
+        ) as topology,
+        patch(f"{_IPC}.torch.cuda.can_device_access_peer", return_value=True) as peer,
+        patch("ctypes.CDLL") as cudart,
+        patch(f"{_IPC}.load_ipc_a2a_sync") as kernels,
+        patch(f"{_IPC}.torch.zeros"),
+        patch.object(state, "_share"),
+    ):
+        if nvlink:
+            state.init(object())
+            assert state.inited
+            peer.assert_called_once_with(rank, 1 - rank)
+            kernels.assert_called_once()
+        else:
+            with pytest.raises(_Unsupported, match="NVLink"):
+                state.init(object())
+            assert not state.inited
+            peer.assert_not_called()
+            cudart.assert_not_called()
+            kernels.assert_not_called()
+        topology.assert_called_once_with([1, 3])
 
 
 def test_reinitializes_ipc_transport_for_replaced_process_group():

@@ -47,6 +47,30 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         cls.eager_on_graph = staticmethod(eager_on_graph)
         cls.device = torch.device("cuda:0")
 
+    def test_qsa_indexer_uses_live_lengths(self):
+        from sglang.srt.models import qwen4_exp
+
+        context = SimpleNamespace(forward_batch=SimpleNamespace(rows=8))
+        layer = SimpleNamespace(_qsa_prefill_topk_bridge=None)
+        layer._compute_qsa_topk_indices_eager = (
+            lambda hidden_states, forward_batch, **kw: hidden_states[
+                : forward_batch.rows
+            ]
+        )
+        x = torch.zeros((8, 2), dtype=torch.int32, device=self.device)
+        inputs = dict(layer=layer, positions=None)
+        graph = self.BreakableCUDAGraph()
+        with patch.object(
+            qwen4_exp, "get_tc_piecewise_forward_context", return_value=context
+        ):
+            with self.BreakableCUDAGraphCapture(graph, stream=torch.cuda.Stream()):
+                result = qwen4_exp._breakable_qsa_indexer(hidden_states=x + 1, **inputs)
+            for n in (3, 8):
+                context.forward_batch = SimpleNamespace(rows=n)
+                x.fill_(2)
+                graph.replay()
+                self.assertEqual(result.tolist(), [[3, 3]] * n + [[0, 0]] * (8 - n))
+
     def test_no_break_capture_replay(self):
         """Capture and replay without any graph breaks should work like normal CUDA graph."""
         x = torch.zeros(4, device=self.device)

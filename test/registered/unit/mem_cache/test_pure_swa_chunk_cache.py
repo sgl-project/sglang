@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.chunk_cache import PureSWAChunkCache
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -36,12 +37,14 @@ class _FakeAllocator:
 
 def _make_req():
     return SimpleNamespace(
+        last_node=None,
+        lock=None,
         kv=ReqKvInfo(
             req_pool_idx=0,
             cache_protected_len=2,
             swa_evict_floor=3,
-            swa_evicted_seqlen=6,
-        )
+            component_evicted_seqlens={ComponentType.SWA: 6},
+        ),
     )
 
 
@@ -58,7 +61,10 @@ class TestPureSWAChunkCache(CustomTestCase):
         cache = self._make_cache()
 
         # protected 2, floor 3, cursor 6: [2, 3) and [6, 8) go back, [3, 6) is dead
-        cache.cache_finished_req(_make_req(), owned_kv_len=8)
+        req = _make_req()
+        cache.checkpoint(req, up_to=8)
+        cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, 8)])
+        cache.unlock(req.lock)
 
         self.assertEqual(cache.token_to_kv_pool_allocator.freed, [2, 6, 7])
         self.assertEqual(cache.token_to_kv_pool_allocator.skipped, [3, 4, 5])

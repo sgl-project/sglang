@@ -552,8 +552,9 @@ html.dark table tbody tr:nth-child(even) td,
 }
 .sgd-builder-messages { margin-top: 12px; padding: 8px 10px; border-radius: 6px; background: color-mix(in oklch, var(--sgdb-warn) 9%, transparent); color: color-mix(in oklch, var(--sgdb-warn) 75%, var(--sgdb-ink)); }
 .sgd-builder-messages[data-state="error"] { background: color-mix(in oklch, var(--sgdb-error) 9%, transparent); color: color-mix(in oklch, var(--sgdb-error) 78%, var(--sgdb-ink)); }
-.sgd-builder-messages p { margin: 0; font-size: 11px; line-height: 1.45; }
-.sgd-builder-messages p + p { margin-top: 5px; }
+/* Mintlify can render snippet paragraphs as span[data-as="p"]. */
+.sgd-builder-messages :is(p, [data-as="p"]) { display: block; margin: 0; font-size: 11px; line-height: 1.45; }
+.sgd-builder-messages :is(p, [data-as="p"]) + :is(p, [data-as="p"]) { margin-top: 5px; }
 
 .sgd-builder-setting-layout, .sgd-builder-setting-list, .sgd-builder-setting-item { min-width: 0; }
 .sgd-builder-setting-item { border-bottom: 1px solid var(--sgdb-line); }
@@ -587,11 +588,11 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-context--rail { display: none; }
 .sgd-builder-context-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
 .sgd-builder-context-heading > div > span { font-size: 13px; font-weight: 590; }
-.sgd-builder-context-heading p { margin: 4px 0 0; color: var(--sgdb-muted); font-size: 11px; line-height: 1.45; }
+.sgd-builder-context-heading :is(p, [data-as="p"]) { display: block; margin: 4px 0 0; color: var(--sgdb-muted); font-size: 11px; font-weight: 400; line-height: 1.45; }
 .sgd-builder-context-heading > small { flex: none; color: var(--sgdb-muted); font-size: 10px; }
 .sgd-builder-context-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
 .sgd-builder-context-note { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--sgdb-line); }
-.sgd-builder-context-note p { margin: 0; color: var(--sgdb-muted); font-size: 11px; line-height: 1.5; }
+.sgd-builder-context-note :is(p, [data-as="p"]) { display: block; margin: 0; color: var(--sgdb-muted); font-size: 11px; line-height: 1.5; }
 .sgd-builder-context-note a {
   display: inline-flex;
   margin-top: 8px;

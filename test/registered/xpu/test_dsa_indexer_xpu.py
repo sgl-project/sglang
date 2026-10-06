@@ -236,7 +236,6 @@ class TestDSAIndexerXPU(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         server_args = ServerArgs(model_path="dummy")
-        server_args.enable_dp_attention = False
         server_args.dsa_prefill_backend = "intel_xpu"
         server_args.dsa_decode_backend = "intel_xpu"
         server_args.dsa_topk_backend = "torch"

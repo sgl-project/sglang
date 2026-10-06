@@ -17,7 +17,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
-    can_use_helios_qk_rope,
     fused_inplace_helios_qk_rope,
     mark_helios_gated_residual_site,
     try_helios_gated_residual,
@@ -58,7 +57,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+_is_cuda = current_platform.is_cuda()
 
 logger = init_logger(__name__)
 
@@ -297,12 +299,8 @@ class HeliosSelfAttention(nn.Module):
         k: torch.Tensor,
         rotary_emb: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.tp_rmsnorm and can_use_helios_qk_rope(q, k, rotary_emb):
-            fused_inplace_helios_qk_rope(
-                q.view(-1, q.shape[-2], q.shape[-1]),
-                k.view(-1, k.shape[-2], k.shape[-1]),
-                rotary_emb.view(-1, rotary_emb.shape[-1]),
-            )
+        if not self.tp_rmsnorm and _is_cuda and q.is_cuda:
+            fused_inplace_helios_qk_rope(q, k, rotary_emb)
             return q, k
         return (
             apply_rotary_emb_transposed(q, rotary_emb),

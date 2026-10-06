@@ -112,6 +112,86 @@ def rust_mm_family_for(
     )
 
 
+class _ModalityTable(dict):
+    """``mm.meta`` modality names -> scheduler ``Modality``, resolved lazily so
+    this module keeps its light import footprint."""
+
+    def __missing__(self, name):
+        from sglang.srt.managers.schedule_batch import Modality
+
+        self.update(
+            {"image": Modality.IMAGE, "video": Modality.VIDEO, "audio": Modality.AUDIO}
+        )
+        # An unknown name must raise here, not recurse.
+        if name not in self:
+            raise KeyError(name)
+        return dict.__getitem__(self, name)
+
+
+_MODALITIES = _ModalityTable()
+
+
+def settle_shm_buffers(buffers, *, admitted: bool) -> None:
+    """Decide the unlink duty for every segment a drained request parked in
+    POSIX shm (any buffer that is not an inline numpy array is the Rust
+    extension's ``ShmBuffer``, whatever its name). Admitted: Rust hands the
+    duty to the ``ShmPointerMMData`` stubs, which unlink after the
+    post-broadcast open on every rank. Rejected: unlink now. Both are
+    idempotent on the Rust side. This is the drain loop's job, never a
+    wrapper's, so a package's own ``_wrap_mm_result`` needs no knowledge of it."""
+    import numpy as np
+
+    for value in buffers.values():
+        if isinstance(value, np.ndarray):
+            continue
+        if admitted:
+            value.release()
+        else:
+            value.discard()
+
+
+class MmTransportStats:
+    """Zero-copy accounting at the Rust-to-Python multimodal hand-off.
+
+    A feature tensor crosses in one of two shapes: ``inline`` -- a numpy array
+    that owns the Rust vector, viewed by ``torch.from_numpy`` -- or ``shm`` -- a
+    POSIX segment the worker wrote, named in the request so every TP rank maps
+    it after the broadcast."""
+
+    __slots__ = (
+        "inline_features",
+        "inline_bytes",
+        "shm_features",
+        "shm_bytes",
+        "copies",
+    )
+
+    def __init__(self) -> None:
+        self.inline_features = 0
+        self.inline_bytes = 0
+        self.shm_features = 0
+        self.shm_bytes = 0
+        self.copies = 0
+
+    def record_inline(self, array, tensor) -> None:
+        self.inline_features += 1
+        self.inline_bytes += array.nbytes
+        if array.flags["OWNDATA"] or tensor.data_ptr() != array.ctypes.data:
+            self.copies += 1
+
+    def record_shm(self, stub) -> None:
+        import numpy as np
+
+        self.shm_features += 1
+        self.shm_bytes += int(np.prod(stub.shape)) * np.dtype(stub.dtype).itemsize
+
+    def snapshot(self) -> Dict[str, int]:
+        return {name: getattr(self, name) for name in self.__slots__}
+
+
+MM_TRANSPORT_STATS = MmTransportStats()
+
+
 class RustMmProcessor:
     """Builds and validates the Rust MM pipeline for one model.
 
@@ -249,76 +329,104 @@ class RustMmProcessor:
         )
 
     @staticmethod
-    def wrap_encoded(spec: RustMmSpec, encoded):
-        """Drain-time adapter: wrap the Rust-produced buffers of one
-        ``MmEncodedResult`` into the scheduler's ``MultimodalProcessorOutput``.
-        Wrapping only — load, resize, patchify, token expansion and M-RoPE all
-        ran in Rust.
+    def wrap_encoded(spec: RustMmSpec, buffers):
+        """Drain-time adapter: wrap one request's ``mm.*`` buffers (a
+        ``{name: numpy array | ShmBuffer}`` mapping from ``recv_requests``) into
+        the scheduler's ``MultimodalProcessorOutput``. Wrapping only -- load,
+        resize, patchify, token expansion and M-RoPE all ran in Rust.
+
+        The buffers are ``mm.feature.{i}`` per item (shaped ``[rows,
+        feature_dim]`` f32, inline or shm), ``mm.mrope`` (``[3, seq_len]``
+        int64), and ``mm.meta``, a msgpack sidecar decoding to ``{"items":
+        [{"modality", "hash", "offsets", "model_specific_data"}, ...],
+        "token_ids", "mrope_delta"}`` with the items in buffer order. External
+        model packages receive the same layout and wrap it their own way.
 
         Runs on the scheduler loop, so it must stay copy-free *and* hash-free:
-        ``take_mm_result``'s numpy arrays own the Rust buffers, ``torch.from_numpy`` just
+        the inline numpy arrays own the Rust buffers, ``torch.from_numpy`` just
         views them, and each item's ``hash`` is worker-precomputed so
         ``set_pad_value`` skips ``hash_feature``. Any per-byte work here — memcpy,
         sha256, tens of MB per image-heavy request — measurably inflates every
         running request's inter-token latency."""
+        import msgspec
         import torch
 
-        from sglang.srt.managers.mm_utils import ShmPointerMMData
         from sglang.srt.managers.schedule_batch import (
-            Modality,
-            MultimodalDataItem,
             MultimodalProcessorOutput,
         )
 
-        shm_names = encoded.shm_names
-        if shm_names is None:
-            features = torch.from_numpy(encoded.features.reshape(-1, spec.feature_dim))
-        items = []
-        row = 0
-        for index, ((t, h, w), item_hash, offset) in enumerate(
-            zip(encoded.grids, encoded.hashes, encoded.offsets)
-        ):
-            n = t * h * w
-            if shm_names is None:
-                feature = features[row : row + n]
-            else:
-                # The worker parked this item's buffer in a named POSIX
-                # segment (see `_use_feature_shm`). Build the stub in its
-                # post-`__setstate__` form: rank 0 never pickle-roundtrips its
-                # own copy, and `materialize()` needs the mapped view.
-                # Ownership of the unlink moved here with `take_mm_result`.
-                feature = ShmPointerMMData.__new__(ShmPointerMMData)
-                feature.__setstate__(
-                    {
-                        "shm_name": shm_names[index],
-                        "shape": (n, spec.feature_dim),
-                        "dtype": torch.float32,
-                        "precomputed_hash": item_hash,
-                    }
+        # Ownership of the segments is not decided here: the drain loop
+        # releases or discards every `ShmBuffer` once it knows whether the
+        # request is admitted (`settle_shm_buffers`). A failure part-way only
+        # has to close the stubs built so far, which hold an open mapping each.
+        stubs: list = []
+        try:
+            # Decoded straight from the numpy buffer (a memoryview over the
+            # Rust-owned bytes), not from a `.tobytes()` copy of it.
+            meta = msgspec.msgpack.decode(memoryview(buffers["mm.meta"]))
+            items = [
+                RustMmProcessor._wrap_item(
+                    index=index, item=item, buffers=buffers, stubs=stubs
                 )
-            items.append(
-                MultimodalDataItem(
-                    modality=Modality.IMAGE,
-                    feature=feature,
-                    hash=item_hash,
-                    offsets=[tuple(offset)],
-                    model_specific_data={
-                        "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)
-                    },
-                )
+                for index, item in enumerate(meta["items"])
+            ]
+            if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
+                for item in items:
+                    item.set_pad_value()
+            output = MultimodalProcessorOutput(
+                mm_items=items,
+                im_token_id=spec.image_token_id,
+                im_start_id=spec.vision_start_token_id,
+                im_end_id=spec.vision_end_token_id,
+                video_token_id=spec.video_token_id,
+                mrope_positions=torch.from_numpy(buffers["mm.mrope"]),
+                mrope_position_delta=torch.tensor(
+                    [[meta["mrope_delta"]]], dtype=torch.long
+                ),
             )
-            row += n
-        if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
-            for item in items:
-                item.set_pad_value()
-        return MultimodalProcessorOutput(
-            mm_items=items,
-            im_token_id=spec.image_token_id,
-            im_start_id=spec.vision_start_token_id,
-            im_end_id=spec.vision_end_token_id,
-            video_token_id=spec.video_token_id,
-            mrope_positions=torch.from_numpy(encoded.mrope.reshape(3, -1)),
-            mrope_position_delta=torch.tensor(
-                [[encoded.mrope_delta]], dtype=torch.long
-            ),
+        except BaseException:
+            for stub in stubs:
+                stub.close_and_unlink()
+            raise
+        return output
+
+    @staticmethod
+    def _wrap_item(*, index: int, item: dict, buffers, stubs: list):
+        import numpy as np
+        import torch
+
+        from sglang.srt.managers.mm_utils import ShmPointerMMData
+        from sglang.srt.managers.schedule_batch import MultimodalDataItem
+
+        feature = buffers[f"mm.feature.{index}"]
+        if isinstance(feature, np.ndarray):
+            array = feature
+            feature = torch.from_numpy(array)
+            MM_TRANSPORT_STATS.record_inline(array=array, tensor=feature)
+        else:
+            MM_TRANSPORT_STATS.record_shm(stub=feature)
+            # The worker placed this item's buffer in a named POSIX segment
+            # (see `_use_feature_shm`). Build the stub in its
+            # post-`__setstate__` form: rank 0 never pickle-roundtrips its
+            # own copy, and `materialize()` needs the mapped view.
+            stub = ShmPointerMMData.__new__(ShmPointerMMData)
+            stub.__setstate__(
+                {
+                    "shm_name": feature.name,
+                    "shape": tuple(feature.shape),
+                    "dtype": torch.float32,
+                    "precomputed_hash": item["hash"],
+                }
+            )
+            stubs.append(stub)
+            feature = stub
+        t, h, w = item["model_specific_data"]["image_grid_thw"]
+        return MultimodalDataItem(
+            modality=_MODALITIES[item["modality"]],
+            feature=feature,
+            hash=item["hash"],
+            offsets=[tuple(span) for span in item["offsets"]],
+            model_specific_data={
+                "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)
+            },
         )

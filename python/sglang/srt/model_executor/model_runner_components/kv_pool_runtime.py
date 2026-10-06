@@ -43,6 +43,7 @@ class PostCaptureKVResize(msgspec.Struct, frozen=True, kw_only=True):
     max_total_num_tokens: int
     full_max_total_num_tokens: Optional[int]
     swa_max_total_num_tokens: Optional[int]
+    unified_memory_pool_bytes: Optional[int]
     capped_max_running_requests: Optional[int]
 
 
@@ -169,5 +170,6 @@ def compute_post_capture_kv_resize(
         max_total_num_tokens=config.max_total_num_tokens,
         full_max_total_num_tokens=config.full_max_total_num_tokens,
         swa_max_total_num_tokens=config.swa_max_total_num_tokens,
+        unified_memory_pool_bytes=config.unified_memory_pool_bytes,
         capped_max_running_requests=capped_max_running_requests,
     )

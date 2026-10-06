@@ -323,7 +323,6 @@ class MockGDNModelRunner(ModelRunner):
             get_kvcache=lambda: self.token_to_kv_pool,
         )
         self.init_kv_index_translator()
-        self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False

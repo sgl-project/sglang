@@ -199,7 +199,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-        if tree_cache is None or tree_cache.is_chunk_cache():
+        if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
         full_shortfall = max(0, num_tokens - self.full_available_size())
         swa_shortfall = max(0, num_tokens - self.swa_available_size())

@@ -9,10 +9,8 @@ from sglang.benchmark.deepseek_utils import (
     get_weight_shapes,
     per_block_cast_to_fp8,
 )
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    sglang_per_token_group_quant_fp8,
-    w8a8_block_fp8_matmul_deepgemm,
-)
+from sglang.kernels.ops.gemm.fp8_kernel import w8a8_block_fp8_matmul_deepgemm
+from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.fp8_utils import requant_weight_ue8m0
 
 BLOCK_SIZE = 128

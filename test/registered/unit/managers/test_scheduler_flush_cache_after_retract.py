@@ -48,6 +48,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.grammar_queue = []
         scheduler.enable_hierarchical_cache = False
+        scheduler.enable_lmcache = False
         scheduler.enable_hisparse = False
         scheduler.tree_cache = MagicMock()
         scheduler.req_to_token_pool = MagicMock()

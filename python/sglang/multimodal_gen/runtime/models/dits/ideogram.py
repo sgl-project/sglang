@@ -9,7 +9,6 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_fused_silu_mul,
     fused_gate_rmsnorm_active,
     fused_rmsnorm_scale,
     fused_rmsnorm_tanh_residual,
@@ -54,8 +53,13 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+_is_cuda = current_platform.is_cuda()
 
 logger = init_logger(__name__)
 
@@ -65,35 +69,6 @@ LLM_TOKEN_INDICATOR = 3
 _IDEOGRAM_ROPE = BitExactFusionGate("Ideogram fused RoPE")
 _IDEOGRAM_SWIGLU = BitExactFusionGate("Ideogram fused SiLU-mul")
 _IDEOGRAM_ZERO_SHIFTS: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
-
-
-def _can_use_fused_rope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> bool:
-    # cos/sin are full-span (B, S, 1, D) rows broadcast over heads.
-    expected = (q.shape[0], q.shape[1], 1, q.shape[-1])
-    return (
-        q.dtype is torch.bfloat16
-        and k.dtype is torch.bfloat16
-        and q.is_cuda
-        and q.dim() == 4
-        and q.is_contiguous()
-        and k.shape == q.shape
-        and k.is_contiguous()
-        and k.device == q.device
-        and cos.dtype is torch.bfloat16
-        and sin.dtype is torch.bfloat16
-        and cos.device == q.device
-        and sin.device == q.device
-        and cos.shape == expected
-        and sin.shape == expected
-        and cos.is_contiguous()
-        and sin.is_contiguous()
-        and q.shape[-1] % 2 == 0
-    )
 
 
 def _ideogram_rope(
@@ -113,14 +88,15 @@ def _ideogram_rope(
     verified = _IDEOGRAM_ROPE.verified
     if (
         not _IDEOGRAM_ROPE.disabled
-        and _can_use_fused_rope(q, k, cos, sin)
+        and q.is_cuda
+        and q.dtype is torch.bfloat16
+        and q.is_contiguous()
+        and k.is_contiguous()
         and (verified or _IDEOGRAM_ROPE.can_attempt_once())
     ):
         try:
-            cos_rows = cos.reshape(-1, cos.shape[-1])
-            sin_rows = sin.reshape(-1, sin.shape[-1])
-            q_fused = fused_rope_rotate_half_bitexact(q, cos_rows, sin_rows)
-            k_fused = fused_rope_rotate_half_bitexact(k, cos_rows, sin_rows)
+            q_fused = fused_rope_rotate_half_bitexact(q, cos, sin)
+            k_fused = fused_rope_rotate_half_bitexact(k, cos, sin)
         except Exception as exc:
             _IDEOGRAM_ROPE.on_exception(exc, logger=logger)
         else:
@@ -144,7 +120,9 @@ def _ideogram_swiglu(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     verified = _IDEOGRAM_SWIGLU.verified
     if (
         not _IDEOGRAM_SWIGLU.disabled
-        and can_use_fused_silu_mul(a, b)
+        and _is_cuda
+        and a.is_cuda
+        and a.dtype is torch.bfloat16
         and (verified or _IDEOGRAM_SWIGLU.can_attempt_once())
     ):
         try:

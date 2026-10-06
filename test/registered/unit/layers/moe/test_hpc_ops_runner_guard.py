@@ -156,20 +156,35 @@ def test_deepep_v2_runner_backstop(_moe_flags):
 
 def test_deepep_v2_registration_uses_primary_architecture_and_rejects_conflicts():
     from sglang.srt.configs.moe_model_registry import (
+        model_deepep_v2_prefill_dispatch_tokens,
         model_requires_fp32_silu_mul,
         model_supports_deepep_v2,
         register_deepep_v2_model,
     )
 
-    register_deepep_v2_model("TestRoutewiseMoe", silu_mul_keep_fp32=True)
+    def prefill_dispatch_tokens(cfg, tokens):
+        return tokens // cfg.tp_size
+
+    register_deepep_v2_model(
+        "TestRoutewiseMoe",
+        silu_mul_keep_fp32=True,
+        prefill_dispatch_tokens=prefill_dispatch_tokens,
+    )
     config = SimpleNamespace(architectures=["TestRoutewiseMoe"])
+    cfg = SimpleNamespace(tp_size=8)
     assert model_supports_deepep_v2(config)
     assert model_requires_fp32_silu_mul(config)
+    # The callback sizes the ceiling; the default only applies without one.
+    sizing = dict(ceiling=32768, default_tokens=2048)
+    assert model_deepep_v2_prefill_dispatch_tokens(config, cfg, **sizing) == 4096
     config.architectures = ["UnsupportedMoe", "TestRoutewiseMoe"]
     assert not model_supports_deepep_v2(config)
     assert not model_requires_fp32_silu_mul(config)
+    assert model_deepep_v2_prefill_dispatch_tokens(config, cfg, **sizing) == 2048
     with pytest.raises(ValueError, match="Conflicting"):
         register_deepep_v2_model("TestRoutewiseMoe", silu_mul_keep_fp32=False)
+    with pytest.raises(ValueError, match="Conflicting"):
+        register_deepep_v2_model("TestRoutewiseMoe", silu_mul_keep_fp32=True)
 
 
 @pytest.mark.parametrize("block_size,width", [(32, 16), (128, 4)])

@@ -388,3 +388,30 @@ def maybe_copy_inplace(dst, *, src) -> None:
     assert type(src) == type(dst)
     if dst is not None:
         dst.copy_(src)
+
+
+def expand_index_page_table(
+    page_table: torch.Tensor,
+    *,
+    full_page_size: int,
+    compress_ratio: int,
+    index_page_size: int,
+) -> torch.Tensor:
+    """Block table of a low-ratio indexer-K pool, which pages at `index_page_size`
+    slots: [bs, n] -> [bs, n * blocks_per_page] int32. The kernel reads compressed
+    slot j at page_table[b, j // index_page_size] * index_page_size + j %
+    index_page_size, which after this expansion is the c1/c2 pool slot of the same
+    position."""
+    slots_per_page = full_page_size // compress_ratio
+    assert slots_per_page % index_page_size == 0, (
+        f"{full_page_size = } / {compress_ratio = } must be a multiple of "
+        f"{index_page_size = }"
+    )
+    blocks_per_page = slots_per_page // index_page_size
+    if blocks_per_page == 1:
+        return page_table
+    bs, n = page_table.shape
+    base = page_table.to(torch.int64) * blocks_per_page
+    offsets = torch.arange(blocks_per_page, device=page_table.device, dtype=torch.int64)
+    expanded = base.unsqueeze(-1) + offsets  # [bs, n, blocks_per_page]
+    return expanded.reshape(bs, n * blocks_per_page).to(torch.int32)

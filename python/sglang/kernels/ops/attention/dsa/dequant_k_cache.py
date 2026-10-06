@@ -557,10 +557,6 @@ def _gather_dequant_requant_fp8_paged_kernel(
         tl.store(dst_ptr, data, mask=mask)
 
 
-if __name__ == "__main__":
-    raise Exception("UT is in quant_k_cache.py")
-
-
 @triton.jit
 def _concat_cast_kv_fp8_pad_kernel(
     out_ptr,

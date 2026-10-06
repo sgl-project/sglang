@@ -288,6 +288,9 @@ def prepare_warmup_image_path(server_args: ServerArgs) -> str:
 
 
 class SchedulerWarmupMixin:
+    # A failed request-based warmup leaves the next request cold.
+    _req_based_warmup_failed: bool = False
+
     @staticmethod
     def _format_warmup_req(req_or_group: Any) -> str:
         return format_warmup_req(req_or_group)
@@ -391,6 +394,8 @@ class SchedulerWarmupMixin:
         else:
             warmup_desc = self._format_warmup_req(req_or_group)
             logger.warning("%s processing failed: %s", warmup_desc, output_batch.error)
+            if not server_based_warmup:
+                self._req_based_warmup_failed = True
 
     def process_received_reqs_with_req_based_warmup(
         self, recv_reqs: list[tuple[bytes, Any]]

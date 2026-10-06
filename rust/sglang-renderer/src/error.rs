@@ -1,6 +1,7 @@
 //! Transport-neutral renderer failures.
 
 use serde::{Deserialize, Serialize};
+use sglang_processor::ProcessorError;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,16 @@ impl From<&str> for RendererError {
     }
 }
 
+impl From<ProcessorError> for RendererError {
+    fn from(error: ProcessorError) -> Self {
+        match error {
+            ProcessorError::InvalidRequest(message) => Self::Request(message),
+            ProcessorError::Tokenize(message) => Self::Tokenize(message),
+            ProcessorError::Internal(message) => Self::Internal(message),
+        }
+    }
+}
+
 impl RendererError {
     pub fn kind(&self) -> RendererErrorKind {
         match self {
@@ -69,6 +80,19 @@ impl From<RendererError> for ResponseError {
         ResponseError {
             kind,
             message: error.to_string(),
+        }
+    }
+}
+
+impl From<ProcessorError> for ResponseError {
+    fn from(error: ProcessorError) -> Self {
+        match error {
+            // Output-processing failures carry their message without a renderer prefix.
+            ProcessorError::Internal(message) => ResponseError {
+                kind: ResponseErrorKind::Internal,
+                message,
+            },
+            error => RendererError::from(error).into(),
         }
     }
 }

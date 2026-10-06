@@ -22,8 +22,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
     ComfyNvfp4Config,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
     KitchenW4A4Config,
@@ -395,7 +395,7 @@ def resolve_comfy_checkpoint_quantization(
         return None
     formats = sorted({str(marker.get("format")) for marker in layer_markers.values()})
     if formats == ["int8_tensorwise"]:
-        return KitchenInt8Config(layer_markers=layer_markers)
+        return ConvRotInt8Config(layer_markers=layer_markers)
     if formats == ["asym_w4a8_int8"]:
         return KitchenW4A8Config(layer_markers)
     if formats == ["asym_w4a8_int8", "int8_tensorwise"]:

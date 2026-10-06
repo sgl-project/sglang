@@ -212,7 +212,7 @@ sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
 
 #### 4.2.2 GPU Optimization
 
-- `--dit-cpu-offload`: Use CPU offload for DiT inference. Enable if run out of memory with FSDP.
+- `--dit-cpu-offload`: Keep DiT weights on the CPU and move them onto the GPU whole around each use. This takes the DiT out of FSDP, which shards only resident components.
 - `--text-encoder-cpu-offload`: Use CPU offload for text encoder inference. Enable if run out of memory with FSDP.
 - `--image-encoder-cpu-offload`: Use CPU offload for image encoder inference. Enable if run out of memory with FSDP.
 - `--vae-cpu-offload`: Use CPU offload for VAE. Enable if run out of memory.

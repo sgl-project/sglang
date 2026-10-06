@@ -7,6 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import (
     LoadSnapshot,
     ShmLoadSnapshotReader,
@@ -263,7 +264,7 @@ class TestFactoryFunctions(CustomTestCase):
         self.addCleanup(override.restore)
 
     def test_shm_mode(self):
-        self._publish(enable_dp_attention=False, nnodes=1, dp_size=1)
+        self._publish(nnodes=1, dp_size=1)
         port_args = SimpleNamespace(instance_id="test_shm_factory")
         writer = create_load_snapshot_writer(port_args, dp_size=1, dp_rank=0)
         self.assertIsInstance(writer, ShmLoadSnapshotWriter)
@@ -278,7 +279,7 @@ class TestFactoryFunctions(CustomTestCase):
             os.unlink(path)
 
     def test_zmq_mode_via_env(self):
-        self._publish(enable_dp_attention=False, nnodes=1, dp_size=1)
+        self._publish(nnodes=1, dp_size=1)
         port_args = SimpleNamespace(instance_id="test_zmq_factory")
         os.environ["SGLANG_LOAD_SNAPSHOT_USE_ZMQ"] = "1"
         try:
@@ -292,7 +293,7 @@ class TestFactoryFunctions(CustomTestCase):
             del os.environ["SGLANG_LOAD_SNAPSHOT_USE_ZMQ"]
 
     def test_should_use_zmq_multinode_dp_attention(self):
-        self._publish(enable_dp_attention=True, nnodes=2, dp_size=2)
+        self._publish(attn_dp_size=2, nnodes=2)
         self.assertTrue(should_use_zmq())
 
 
@@ -304,10 +305,9 @@ class TestZmqReaderOwner(CustomTestCase):
     def _owners(self, **overrides):
         """Publish a config and return the callers that claim the socket."""
         fields = dict(
-            enable_dp_attention=True,
             nnodes=2,
             node_rank=0,
-            dp_size=1,
+            attn_dp_size=1,
             load_balance_method="round_robin",
             tokenizer_worker_num=1,
         )
@@ -320,38 +320,43 @@ class TestZmqReaderOwner(CustomTestCase):
             override.restore()
 
     def test_zmq_disabled_no_owner(self):
-        self.assertEqual(self._owners(enable_dp_attention=False, nnodes=1), set())
+        self.assertEqual(self._owners(nnodes=1), set())
 
     def test_non_zero_node_rank_no_owner(self):
         self.assertEqual(
-            self._owners(node_rank=1, dp_size=4, tokenizer_worker_num=8), set()
+            self._owners(node_rank=1, attn_dp_size=4, tokenizer_worker_num=8), set()
         )
 
     def test_tokenizer_manager_owns_when_dp1(self):
-        self.assertEqual(self._owners(dp_size=1), {"TokenizerManager"})
+        # A single DP rank runs zmq mode only when it is forced.
+        with envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.override(True):
+            self.assertEqual(self._owners(attn_dp_size=1), {"TokenizerManager"})
 
     def test_multi_tokenizer_router_owns_in_multi_tokenizer_dp1(self):
-        self.assertEqual(
-            self._owners(dp_size=1, tokenizer_worker_num=8), {"MultiTokenizerRouter"}
-        )
+        with envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.override(True):
+            self.assertEqual(
+                self._owners(attn_dp_size=1, tokenizer_worker_num=8),
+                {"MultiTokenizerRouter"},
+            )
 
     def test_multi_tokenizer_router_owns_in_multi_tokenizer_round_robin(self):
         self.assertEqual(
-            self._owners(dp_size=4, tokenizer_worker_num=8), {"MultiTokenizerRouter"}
+            self._owners(attn_dp_size=4, tokenizer_worker_num=8),
+            {"MultiTokenizerRouter"},
         )
 
     def test_data_parallel_controller_owns_load_aware(self):
         for method in ("total_tokens", "total_requests"):
             self.assertEqual(
                 self._owners(
-                    dp_size=4, tokenizer_worker_num=8, load_balance_method=method
+                    attn_dp_size=4, tokenizer_worker_num=8, load_balance_method=method
                 ),
                 {"DataParallelController"},
             )
 
     def test_tokenizer_manager_owns_dp4_round_robin(self):
         self.assertEqual(
-            self._owners(dp_size=4, tokenizer_worker_num=1), {"TokenizerManager"}
+            self._owners(attn_dp_size=4, tokenizer_worker_num=1), {"TokenizerManager"}
         )
 
     def test_the_controller_answers_within_its_audited_namespaces(self):
@@ -365,10 +370,9 @@ class TestZmqReaderOwner(CustomTestCase):
         import sglang.srt.runtime_context as rc
 
         fields = dict(
-            enable_dp_attention=True,
             nnodes=2,
             node_rank=0,
-            dp_size=4,
+            attn_dp_size=4,
             load_balance_method="total_tokens",
             tokenizer_worker_num=8,
         )
@@ -382,17 +386,19 @@ class TestZmqReaderOwner(CustomTestCase):
             self.assertTrue(zmq_reader_owner("DataParallelController"))
 
     def test_at_most_one_owner_across_configs(self):
-        for dp_size in (1, 4):
-            for tw in (1, 8):
-                for method in ("round_robin", "total_tokens", "total_requests"):
-                    for node_rank in (0, 1):
-                        owners = self._owners(
-                            dp_size=dp_size,
-                            tokenizer_worker_num=tw,
-                            load_balance_method=method,
-                            node_rank=node_rank,
-                        )
-                        self.assertLessEqual(len(owners), 1, owners)
+        # Forced zmq mode puts a single DP rank in the sweep too.
+        with envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.override(True):
+            for attn_dp_size in (1, 4):
+                for tw in (1, 8):
+                    for method in ("round_robin", "total_tokens", "total_requests"):
+                        for node_rank in (0, 1):
+                            owners = self._owners(
+                                attn_dp_size=attn_dp_size,
+                                tokenizer_worker_num=tw,
+                                load_balance_method=method,
+                                node_rank=node_rank,
+                            )
+                            self.assertLessEqual(len(owners), 1, owners)
 
 
 class TestZmqAddr(CustomTestCase):

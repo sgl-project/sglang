@@ -24,7 +24,6 @@ export const DeepSeekOCRDeployment = () => {
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', subtitle: 'Tensor Parallel', default: true, required: true },
-        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs only support Tensor Parallel (TP)' },
         { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs only support Tensor Parallel (TP)' }
       ]
     }
@@ -115,11 +114,6 @@ export const DeepSeekOCRDeployment = () => {
     // TP strategy
     if (strategyArray.includes('tp')) {
       cmd += ` \\\n  --tp 1`;
-    }
-
-    // DP strategy
-    if (strategyArray.includes('dp')) {
-      cmd += ` \\\n  --dp 1 \\\n  --enable-dp-attention`;
     }
 
     // EP strategy

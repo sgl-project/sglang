@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """PTX/tcgen05 KDA chunked-prefill backend (``--linear-attn-prefill-backend ptx_kda``).
 
-Wraps the vendored hand-CUDA ``kda_ptx_prefill`` kernel (GB300 / sm_103a) through
+Wraps the vendored hand-CUDA ``kda_ptx_prefill`` kernel (sm_100a / sm_103a) through
 its FLA-compatible ``chunk_kda_fwd`` interface. The kernel selects a fused
 long-sequence route or a two-launch high-head/many-sequence route at the KDA
 serving shape: K = V = 128, chunk 64.
@@ -58,9 +58,11 @@ class PtxKDAKernel(LinearAttnKernelBase):
     supports_track_state_snapshot: bool = True
 
     def __init__(self):
-        # tcgen05 + TMEM with sm_103a-only encodings: GB300 (SM103) only.
-        self.supports_prefill = torch.cuda.is_available() and (
-            torch.cuda.get_device_capability() == (10, 3)
+        from sglang.kernels.ops.attention.linear.kda_ptx_prefill import SM_ARCHS
+
+        # tcgen05 + TMEM: B200 / GB200 (SM100) and B300 / GB300 (SM103).
+        self.supports_prefill = (
+            torch.cuda.is_available() and torch.cuda.get_device_capability() in SM_ARCHS
         )
         self._fwd = None
         self._triton = TritonKDAKernel()
@@ -68,6 +70,7 @@ class PtxKDAKernel(LinearAttnKernelBase):
         # source tensor: this kernel instance is shared by every KDA layer.
         self._param_flat = {}
         self._unsupported_logged = False
+        self._no_lower_bound_logged = False
         # (bucket, H, K, V, device) -> staging dict for ragged token counts.
         self._staging = {}
 
@@ -81,7 +84,7 @@ class PtxKDAKernel(LinearAttnKernelBase):
             logger.info("Building the PTX KDA prefill extension (first use, ~1-2 min)")
             load_ext()
             self._fwd = chunk_kda_fwd
-            logger.info("Using PTX KDA chunked prefill (GB300 / sm_103a)")
+            logger.info("Using PTX KDA chunked prefill")
 
     def decode(self, *args, **kwargs):
         raise NotImplementedError("PtxKDAKernel is prefill-only")
@@ -225,6 +228,9 @@ class PtxKDAKernel(LinearAttnKernelBase):
             )
         eligible = (
             not kwargs.get("is_spec_decode")
+            # Only the safe gate is supported: without a lower bound the
+            # per-chunk decay overflows fp32 exp and the kernel returns NaN.
+            and lower_bound is not None
             # The native kernel cannot write the fp32 track snapshot buffer;
             # a batch carrying one must take the Triton fallback, which
             # forwards the snapshot arguments (see _triton_extend). Leaving
@@ -235,6 +241,12 @@ class PtxKDAKernel(LinearAttnKernelBase):
             and supported_shape
         )
         if not eligible:
+            if lower_bound is None and not self._no_lower_bound_logged:
+                self._no_lower_bound_logged = True
+                logger.warning(
+                    "PTX KDA prefill needs a gate lower bound (safe gate), and "
+                    "this model has none. Falling back to Triton."
+                )
             if shape_known and not supported_shape and not self._unsupported_logged:
                 self._unsupported_logged = True
                 logger.warning(

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.jit.utils import cache_once, get_jit_cuda_arch, load_jit
 from sglang.kernels.kda_kernels import _cuda_source
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -14,13 +14,23 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_ltx2_qknorm_split_rope_module(round_intermediates: bool = False) -> Module:
+    arch = get_jit_cuda_arch()
+    sm90 = (arch.major, arch.minor) == (9, 0)
+    namespace = "ltx2_qknorm_split_rope_kda" if sm90 else "ltx2_qknorm_split_rope"
     return load_jit(
         "diffusion_ltx2_qknorm_split_rope",
-        cuda_files=[_cuda_source("diffusion/ltx2_qknorm_split_rope.cuh")],
+        cuda_files=[
+            _cuda_source(
+                "diffusion/ltx2_qknorm_split_rope_sm90.cuh"
+                if sm90
+                else "diffusion/ltx2_qknorm_split_rope.cuh"
+            )
+        ],
+        extra_cuda_cflags=["-DKDA_SPLIT_THRESHOLD=1000000000"] if sm90 else [],
         cuda_wrappers=[
             (
                 "ltx2_qknorm_split_rope_pair",
-                "ltx2_qknorm_split_rope::LTX2QKNormSplitRopeKernel::run"
+                f"{namespace}::LTX2QKNormSplitRopeKernel::run"
                 f"<{str(round_intermediates).lower()}>",
             )
         ],

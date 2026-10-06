@@ -345,6 +345,23 @@ def _build_deepseek_v4_device_pool_group(
         c128_buffers,
         mappings.c128,
     )
+
+    # fp8 two-pool unified_kv: one row index addresses both kv_buffer (fp8 nope) and
+    # kv_buffer_rope (bf16 rope), but unified_region_buffers() above returns the nope
+    # pool only -- shipping that alone restores 512 of every 640 bytes and leaves stale
+    # rope, which is wrong output rather than a crash. Mirrors _dsv4_rope_sibling() on
+    # the HiCache side; returns None on non-fp8 layouts, so bf16 is untouched.
+    for ratio, rope_name, rope_pool, rope_mapping in (
+        (4, PoolName.DEEPSEEK_V4_C4_ROPE, kvcache.c4_kv_pool, mappings.c4),
+        (128, PoolName.DEEPSEEK_V4_C128_ROPE, kvcache.c128_kv_pool, mappings.c128),
+    ):
+        rope_region = (
+            kvcache.unified_rope_region_buffers(ratio) if is_unified_kv else None
+        )
+        if rope_region is None:
+            continue
+        rope_buffers, _ = rope_region
+        add(rope_name, PoolName.KV, rope_pool, rope_buffers, rope_mapping)
     if not is_unified_kv:
         add(
             PoolName.DEEPSEEK_V4_C4_STATE,

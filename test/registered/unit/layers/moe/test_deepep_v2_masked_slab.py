@@ -156,6 +156,78 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
                 if no_combine:
                     self.assertTrue(torch.equal(output.topk_weights, weights))
 
+    def test_runner_expanded_nonmasked_route_weighting(self):
+        # Non-masked expanded (do_expand=True prefill) post_permute. Guards the
+        # no_combine / deepep_v2_weight_prefused interaction: no_combine hands
+        # back raw rows + EXPANDED weights; a prefused fold must not re-weight.
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+            DeepGemmRunnerOutput,
+            post_permute_deep_gemm_to_deepep_v2,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.base import RoutewiseLayout
+
+        rows = torch.tensor([[2.0], [4.0], [8.0]], device=DEVICE)
+        weights = torch.tensor([0.25, 0.5, 0.75], device=DEVICE)
+        # (no_combine, prefused) -> (expected rows, expected weights, layout)
+        cases = [
+            (True, False, rows, weights, RoutewiseLayout.EXPANDED),
+            (False, True, rows, None, None),
+            (False, False, rows * weights.unsqueeze(-1), None, None),
+        ]
+        for no_combine, prefused, want_rows, want_w, want_layout in cases:
+            with self.subTest(no_combine=no_combine, prefused=prefused):
+                state = {
+                    "deepep_v2_expanded": True,
+                    "topk_weights": weights,
+                    "deepep_v2_weight_prefused": prefused,
+                }
+                output = post_permute_deep_gemm_to_deepep_v2(
+                    DeepGemmRunnerOutput(rows.clone()),
+                    None,
+                    MoeRunnerConfig(no_combine=no_combine),
+                    state,
+                )
+                self.assertTrue(torch.equal(output.hidden_states, want_rows))
+                self.assertEqual(output.routewise_layout, want_layout)
+                if want_w is None:
+                    self.assertIsNone(output.topk_weights)
+                else:
+                    self.assertTrue(torch.equal(output.topk_weights, want_w))
+
+    def test_runner_expanded_weighting_rounds_bf16_rows_once(self):
+        # Production rows are bf16 and DeepEP's expanded weights are fp32. The
+        # weighting must round once; casting the weights to bf16 first rounds
+        # twice and costs accuracy.
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+            DeepGemmRunnerOutput,
+            post_permute_deep_gemm_to_deepep_v2,
+        )
+
+        generator = torch.Generator(device=DEVICE).manual_seed(0)
+        rows = torch.randn(
+            (64, 128), device=DEVICE, dtype=torch.bfloat16, generator=generator
+        )
+        weights = torch.rand(64, device=DEVICE, generator=generator)
+        want = (rows.float() * weights.unsqueeze(-1)).to(torch.bfloat16)
+        weights_cast_first = rows * weights.to(torch.bfloat16).unsqueeze(-1)
+        # Otherwise the check below could not tell the two roundings apart.
+        self.assertFalse(torch.equal(want, weights_cast_first))
+
+        output = post_permute_deep_gemm_to_deepep_v2(
+            DeepGemmRunnerOutput(rows.clone()),
+            None,
+            MoeRunnerConfig(no_combine=False),
+            {
+                "deepep_v2_expanded": True,
+                "topk_weights": weights,
+                "deepep_v2_weight_prefused": False,
+            },
+        )
+        self.assertEqual(output.hidden_states.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(output.hidden_states, want))
+
     def test_runner_restores_token_topk_routes_and_masks_nonlocal_slots(self):
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
         from sglang.srt.layers.moe.moe_runner.deep_gemm import (

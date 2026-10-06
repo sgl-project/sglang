@@ -67,7 +67,7 @@ export const KimiK3MambaRatioCalculator = () => {
     const hasFlag = (name) => flags.some((f) => f.split(/[\s=]/)[0] === name);
 
     const tp = Number(flagArg("--tp-size")) || 8;
-    const dp = hasFlag("--enable-dp-attention") ? Number(flagArg("--dp-size")) || 1 : 1;
+    const dp = Number(flagArg("--attn-dp-size")) || 1;
     // KDA state and the replicated MLA KV both live per attention-TP group.
     // PP needs no term: it splits the layers of both pools equally.
     const attnTp = Math.max(1, Math.round(tp / dp));
@@ -231,9 +231,9 @@ export const KimiK3MambaRatioCalculator = () => {
       : `DSPARK (D = ${block + 1})`;
   const derivedChips = [
     // With DP attention on, show the whole topology so a large-scale preset is
-    // visibly understood: total GPUs = DP replicas x attention-TP group width.
+    // visibly understood: total GPUs = attention DP size x attention-TP group width.
     dp > 1
-      ? `${tp} GPUs = DP ${dp} × Attention TP ${attnTp}`
+      ? `${tp} GPUs = Attention DP ${dp} × Attention TP ${attnTp}`
       : `Attention TP ${attnTp}`,
     `DCP ${dcp}`,
     `KV ${kvDtype === "fp8_e4m3" ? "FP8" : "BF16"}`,

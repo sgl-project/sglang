@@ -283,7 +283,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 # Refresh the static DP token buffers bound by the captured
                 # graph (stale values misalign dp-gather segments across
                 # ranks); mirror the capture-side uniform
-                # [padded_num_tokens] * dp_size.
+                # [padded_num_tokens] * num_dp_ranks.
                 if self.require_mlp_tp_gather:
                     _padded_num_tokens = bs * self.captured_req_width
                     self.buffers.global_num_tokens_gpu.fill_(_padded_num_tokens)

@@ -11,15 +11,17 @@ from sglang.test.test_utils import CustomTestCase
 
 BUILD_AND_RUN_TIMEOUT_S = 900
 RUST_WORKSPACE = Path(__file__).resolve().parents[3] / "rust"
-register_cpu_ci(est_time=153, suite="base-a-test-cpu")
+GRPC_TYPES_PACKAGE = "sglang-grpc-types"
+register_cpu_ci(est_time=170, suite="base-a-test-cpu")
 
 
 # Exported by _pr-test-stage-cpu.yml as the negation of the check-changes
 # rust_workspace paths filter; it defaults to false, so only a CI run that
-# positively detected no rust/ changes skips the cargo build.
+# positively detected no Rust workspace input changes skips the cargo build.
 @unittest.skipIf(
     envs.SGLANG_SKIP_RUST_TESTS.get(),
-    "SGLANG_SKIP_RUST_TESTS is set (no rust/ workspace changes per CI check-changes)",
+    "SGLANG_SKIP_RUST_TESTS is set "
+    "(no Rust workspace input changes per CI check-changes)",
 )
 class TestCargoWorkspace(CustomTestCase):
     def _run_cargo(self, args: list[str], *, cwd: Path, env: dict | None = None):
@@ -55,6 +57,18 @@ class TestCargoWorkspace(CustomTestCase):
         )
 
         self._run_cargo(["test", "--workspace"], cwd=RUST_WORKSPACE)
+        # Verify that the public crate builds with only its packaged inputs.
+        self._run_cargo(
+            [
+                "package",
+                "-p",
+                GRPC_TYPES_PACKAGE,
+                "--locked",
+                "--allow-dirty",
+                "--offline",
+            ],
+            cwd=RUST_WORKSPACE,
+        )
 
 
 if __name__ == "__main__":

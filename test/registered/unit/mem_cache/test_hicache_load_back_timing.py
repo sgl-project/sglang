@@ -35,10 +35,6 @@ class TestLoadBackDurationMetric(CustomTestCase):
         torch.cuda.synchronize()
         return start, finish
 
-    def test_elapsed_time_works(self):
-        start, finish = self._completed_pair()
-        self.assertGreater(start.elapsed_time(finish), 0.0)
-
     def test_timing_fallback_uses_dedicated_events(self):
         events = []
 

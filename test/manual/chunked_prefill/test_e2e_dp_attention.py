@@ -13,8 +13,7 @@ class TestChunkedFeatureDPAttention(ChunkedTestBase):
         "--trust-remote-code",
         "--tp",
         "2",
-        "--enable-dp-attention",
-        "--dp",
+        "--attn-dp-size",
         "2",
     ]
 

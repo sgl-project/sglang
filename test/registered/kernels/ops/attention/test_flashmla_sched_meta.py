@@ -163,5 +163,27 @@ def test_extra_cache_schedule(b: int, topk: int, extra_topk: int):
     assert torch.equal(lse.view(torch.int32), ref_lse.view(torch.int32))
 
 
+def test_precompute_skips_oversized_schedule(monkeypatch):
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.attention import deepseek_v4_backend as backend
+
+    monkeypatch.setattr(backend, "_fast_flashmla_sched_shape", lambda q: True)
+    monkeypatch.setattr(backend, "_num_sms", lambda _: 148)
+    max_batch = (48 * 1024 // 4 - 1 - 148 * 8) // 5
+    for b in (max_batch + 1, 5000, 16384):
+        meta = SimpleNamespace(tile_scheduler_metadata=None, num_splits=None)
+        backend._maybe_precompute_flashmla_sched_meta(
+            meta,
+            q=SimpleNamespace(shape=(b, 1, 64, 512), device=SimpleNamespace(index=0)),
+            indices=None,
+            topk_length=None,
+            extra_indices=None,
+            extra_topk_length=None,
+        )
+        assert meta.tile_scheduler_metadata is None
+        assert meta.num_splits is None
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

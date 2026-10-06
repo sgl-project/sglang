@@ -18,6 +18,12 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     runs-on: intel-bmg
     environment: 'prod'
+    strategy:
+      fail-fast: false
+      matrix:
+        # wheel: prebuilt sglang-kernel-xpu pinned in pyproject_xpu.toml (feeds CI via :latest).
+        # main: sgl-kernel-xpu built from source at its main branch.
+        kernel: [wheel, main]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -31,6 +37,7 @@ jobs:
         id: image_meta
         env:
           SG_LANG_BRANCH: ${{ inputs.branch || 'main' }}
+          KERNEL_VARIANT: ${{ matrix.kernel }}
         run: |
           cd sglang-nightly-build
           date_tag=$(date +%Y%m%d)
@@ -46,11 +53,29 @@ jobs:
             branch_slug=$(echo "${SG_LANG_BRANCH}" | sed 's#[^a-zA-Z0-9._-]#-#g')
             image_tag="nightly-dev-xpu-bmg-${branch_slug}-${date_tag}-${commit_hash}"
           fi
+          if [ "${KERNEL_VARIANT}" = "wheel" ]; then
+            kernel_source=wheel
+            kernel_ref=main
+            latest_tag=latest
+          else
+            # Pin the kernel commit so the tag names exactly what was built.
+            kernel_ref=$(git ls-remote https://github.com/sgl-project/sgl-kernel-xpu.git refs/heads/main | cut -f1)
+            if [ -z "${kernel_ref}" ]; then
+              echo "::error::Could not resolve sgl-kernel-xpu main"
+              exit 1
+            fi
+            kernel_source=source
+            latest_tag=latest-kernel-main
+            image_tag="${image_tag}-kernel-main-${kernel_ref:0:7}"
+          fi
           echo "DATE=${date_tag}" >> $GITHUB_ENV
           echo "commit_hash=${commit_hash}" >> $GITHUB_OUTPUT
           echo "SG_LANG_BRANCH=${SG_LANG_BRANCH}" >> $GITHUB_ENV
           echo "IMAGE_TAG=${image_tag}" >> $GITHUB_ENV
-          echo "Building ref ${SG_LANG_BRANCH} at ${commit_hash}"
+          echo "LATEST_TAG=${latest_tag}" >> $GITHUB_ENV
+          echo "KERNEL_SOURCE=${kernel_source}" >> $GITHUB_ENV
+          echo "KERNEL_REF=${kernel_ref}" >> $GITHUB_ENV
+          echo "Building ref ${SG_LANG_BRANCH} at ${commit_hash} (kernel: ${KERNEL_VARIANT})"
           echo "Image tag: ${image_tag}"
 
       - name: Login to Docker Hub (Intel)
@@ -61,16 +86,19 @@ jobs:
 
       - name: Build intel/sglang-dev
         run: |
-          echo "Building intel/sglang-dev:${IMAGE_TAG} from ${SG_LANG_BRANCH}"
-          # Only main advances the rolling `latest` tag.
+          echo "Building intel/sglang-dev:${IMAGE_TAG} from ${SG_LANG_BRANCH} (kernel: ${KERNEL_SOURCE} ${KERNEL_REF})"
+          # Only main advances the rolling tag (`latest` for wheel, `latest-kernel-main` for source).
           latest_tag=()
           if [ "${SG_LANG_BRANCH}" = "main" ]; then
-            latest_tag=(-t "intel/sglang-dev:latest")
+            latest_tag=(-t "intel/sglang-dev:${LATEST_TAG}")
           fi
           docker build sglang-nightly-build \
             -f sglang-nightly-build/docker/xpu.Dockerfile \
             --build-arg SG_LANG_REPO=https://github.com/sgl-project/sglang.git \
             --build-arg SG_LANG_BRANCH="${SG_LANG_BRANCH}" \
+            --build-arg SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git \
+            --build-arg SG_LANG_KERNEL_BRANCH="${KERNEL_REF}" \
+            --build-arg SG_LANG_KERNEL_SOURCE="${KERNEL_SOURCE}" \
             --no-cache --progress=plain \
             -t "intel/sglang-dev:${IMAGE_TAG}" \
             "${latest_tag[@]}"
@@ -87,5 +115,5 @@ jobs:
           }
           push_with_retry "intel/sglang-dev:${IMAGE_TAG}"
           if [ "${SG_LANG_BRANCH}" = "main" ]; then
-            push_with_retry "intel/sglang-dev:latest"
+            push_with_retry "intel/sglang-dev:${LATEST_TAG}"
           fi

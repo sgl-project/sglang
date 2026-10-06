@@ -25,7 +25,8 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         free_pages=free_pages,
         get_all_free_pages=lambda: free_pages,
     )
-    tc = SimpleNamespace(slots={})
+    records = {}
+    tc = SimpleNamespace(session_records=lambda: records)
     _ps, _rtp, _alloc, _tc = page_size, rtp, alloc, tc
 
     class _FakeChecker:
@@ -34,6 +35,8 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         token_to_kv_pool_allocator = _alloc
         tree_cache = _tc
         get_last_batch = lambda self: None
+        get_running_batch = lambda self: None
+        get_chunked_req = lambda self: None
         count_memory_leak_warnings = 0
 
         from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -41,6 +44,7 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         )
 
         _check_kv_page_invariants = _RIC._check_kv_page_invariants
+        _requests_owning_rows = _RIC._requests_owning_rows
 
     return _FakeChecker(), rtt, tc, alloc
 
@@ -80,7 +84,7 @@ class TestKVPageInvariants(CustomTestCase):
     def test_slot_committed_gt_allocated_raises(self):
         chk, rtt, tc, alloc = _make_checker()
         chk.get_last_batch = lambda: None
-        tc.slots = {"s1": _FakeOwner(0, 145, 144)}
+        tc.session_records()["s1"] = _FakeOwner(0, 145, 144).kv
         with self.assertRaises(AssertionError):
             chk._check_kv_page_invariants()
 
@@ -95,6 +99,22 @@ class TestKVPageInvariants(CustomTestCase):
         )
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
+
+    def test_requests_outside_last_batch_are_checked(self):
+        # A request still owns its row from running_batch or parked between chunks.
+        for where in ("running", "chunked"):
+            with self.subTest(where=where):
+                chk, rtt, tc, alloc = _make_checker(free_pages=torch.tensor([5, 6, 7]))
+                rtt[0, :3] = torch.tensor(
+                    [5 * _PAGE_SIZE, 5 * _PAGE_SIZE + 1, 5 * _PAGE_SIZE + 2]
+                )
+                owner = _FakeOwner(0, 3, 3, rid="a")
+                if where == "running":
+                    chk.get_running_batch = lambda: SimpleNamespace(reqs=[owner])
+                else:
+                    chk.get_chunked_req = lambda: owner
+                with self.assertRaises(ValueError):
+                    chk._check_kv_page_invariants()
 
     def test_classed_allocator_without_flat_free_list_is_checked(self):
         chk, rtt, _tc, alloc = _make_checker(page_size=4, row_width=8)

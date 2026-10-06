@@ -23,6 +23,8 @@ HW_MAPPING = {
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
     "mlx": HWBackend.MLX,
+    "mps": HWBackend.MPS,
+    "ppu": HWBackend.PPU,
 }
 
 # Per-commit test suites (run on every PR).
@@ -105,7 +107,7 @@ PER_COMMIT_SUITES = {
         "extra-b-test-8-gpu-b300",
     ],
     HWBackend.NPU: [
-        "base-a-test-1-npu-a2",
+        "base-a-test-npu",
         "base-b-test-1-npu-a3",
         "base-b-test-2-npu-a3",
         "base-b-test-4-npu-a3",
@@ -124,6 +126,19 @@ PER_COMMIT_SUITES = {
         "stage-a-unit-test-mlx",
         "stage-b-e2e-mlx",
     ],
+    HWBackend.MPS: [
+        "stage-a-unit-test-mps",
+        # stage-b needs a self-hosted Apple Silicon runner; dispatched manually.
+        "stage-b-e2e-mps",
+    ],
+    # PPU has no suite in any of the three dicts yet: pr-test-ppu.yml only runs
+    # the runner preflight until the PPU SRT platform and AOT kernels land.
+    # Declaring a name here before a workflow dispatches it would let a test
+    # register, validate, and count as covered while never running, so each PPU
+    # suite name arrives with the job that runs it. Until then PPU is in
+    # _SUITE_CHECKED_BACKENDS with no valid suite, so validate_all_suites()
+    # rejects any register_ppu_ci() outright.
+    HWBackend.PPU: [],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -151,11 +166,15 @@ NIGHTLY_SUITES = {
         "nightly-amd-accuracy-8-gpu-mi35x-kimi-k3",
         "nightly-amd-8-gpu-mi35x-qwen38-mxfp4",
         "nightly-amd-8-gpu-mi35x-glm52-fp8",
+        "nightly-amd-8-gpu-mi35x-glm53-flash",
+        "nightly-amd-accuracy-8-gpu-glm53",
+        "nightly-amd-8-gpu-mi35x-glm53",
         "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
         "nightly-amd-accuracy-8-gpu-deepseek-v4-flash",
         "nightly-amd-8-gpu-mi35x-deepseek-v4-flash",
+        "nightly-amd-4-gpu-mi35x-deepseek-v41-flash",
         # MI35x 8-GPU suite (different model configs)
         "nightly-amd-8-gpu-mi35x",
     ],
@@ -228,6 +247,8 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.MUSA,
     HWBackend.XPU,
     HWBackend.MLX,
+    HWBackend.MPS,
+    HWBackend.PPU,
 }
 
 

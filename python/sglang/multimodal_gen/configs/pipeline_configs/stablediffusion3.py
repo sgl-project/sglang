@@ -200,3 +200,33 @@ class StableDiffusion3PipelineConfig(SpatialImagePipelineConfig):
             batch.height // spatial_ratio,
             batch.width // spatial_ratio,
         )
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
+        StableDiffusion3SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=StableDiffusion3SamplingParams,
+        pipeline_config_cls=StableDiffusion3PipelineConfig,
+        hf_model_paths=[
+            "stabilityai/stable-diffusion-3-medium",
+            "stabilityai/stable-diffusion-3-medium-diffusers",
+            "stabilityai/stable-diffusion-3.5-medium",
+            "stabilityai/stable-diffusion-3.5-medium-diffusers",
+            "stabilityai/stable-diffusion-3.5-large",
+            "stabilityai/stable-diffusion-3.5-large-diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                "stable-diffusion-3-medium" in hf_id.lower()
+                or "stable-diffusion-3.5-medium" in hf_id.lower()
+                or "stable-diffusion-3.5-large" in hf_id.lower()
+                or "sd3-medium" in hf_id.lower()
+                or "sd3.5-medium" in hf_id.lower()
+                or "sd3.5-large" in hf_id.lower()
+            )
+        ],
+    )
