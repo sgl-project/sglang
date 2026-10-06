@@ -300,7 +300,7 @@ class MSCCLPPMode(Enum):
 
 class MSCCLPPEPLayout(str, Enum):
     """MSCCL++ EP dispatch layout."""
-    
+
     RANK_MAJOR = "rank_major"
     EXPERT_MAJOR = "expert_major"
     TOKEN_MAJOR = "token_major"

@@ -33,6 +33,8 @@ from contextlib import ExitStack, contextmanager
 import msgspec
 import torch
 import torch.distributed as dist
+from torch.profiler import ProfilerActivity, profile
+
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -53,7 +55,6 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.test.test_utils import publish_build_topology
-from torch.profiler import ProfilerActivity, profile
 
 DTYPE = torch.bfloat16
 MSCCLPP_LL_HIDDEN_SIZES = (4096, 4352, 5120, 6656, 7168, 8192, 8704, 9216)
