@@ -207,10 +207,8 @@ class SchedulePolicy:
     ) -> None:
         policy = self._determine_active_policy(waiting_queue)
 
-        # Populate req.num_matched_prefix_tokens at schedule time. Cache-aware policies
-        # set it in _compute_prefix_matches; do the same full match for
-        # cache-agnostic policies when the radix supports it, so the load
-        # snapshot has it. Skip on decode (never prefills).
+        # Cache-agnostic policies sort without matching; match anyway so the load
+        # snapshot sees num_matched_prefix_tokens. Decode never prefills.
         if (
             not isinstance(policy, CacheAwarePolicy)
             and self.tree_cache.supports_fast_match_prefix()
@@ -315,10 +313,6 @@ class SchedulePolicy:
     def _compute_prefix_matches(
         self, waiting_queue: List[Req], policy: CacheAwarePolicy
     ) -> Set[int]:
-        """
-        Computes and caches the matching prefixes for requests in the waiting queue,
-            and handles in-batch prefix caching logic.
-        """
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
 

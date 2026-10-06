@@ -782,10 +782,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.pending_reqs.append(decode_req)
 
     def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
-        """
-        Match a request against the decode-side radix cache, lock the matched
-        node to prevent eviction, and return the matched prefix information.
-        """
         max_prefix_len = None
         if self._uses_swa_tail_prealloc():
             fill_len = self._pre_alloc_fill_len(req)
