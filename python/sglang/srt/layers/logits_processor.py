@@ -59,6 +59,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
+    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
@@ -490,7 +491,13 @@ class LogitsProcessor(nn.Module):
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=False, floor=128
             ),
-            enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
+            # One gatherer owns one signal pad and symmetric workspace. The
+            # final prefill head can overlap decode; use lane-local all-gather.
+            enabled=(
+                self.do_tensor_parallel_all_gather
+                and not self.use_attn_tp_group
+                and not get_disagg().enable_pdmux
+            ),
             skip_entry_sync=True,
         )
 
