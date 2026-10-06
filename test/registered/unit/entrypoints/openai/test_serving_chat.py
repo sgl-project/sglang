@@ -5224,6 +5224,49 @@ class InklingTokenOutputTest(CustomTestCase):
                     with self.subTest(case=name, no_stop_trim=no_stop_trim, mode=mode):
                         self.assertEqual(result, expected)
 
+    def test_unframed_prefix_keeps_the_following_marker_kind(self):
+        """Bug regression: stray text before a header-less thinking or tool-call
+        marker erased the marker, so reasoning became content and the call text."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        encode = tokenizer.encode_ordinary
+        special = tokenizer.encode_special
+        eos = special("content_model_end_sampling")
+        thinking = [
+            *encode("\n\n"),
+            special("content_thinking"),
+            *encode("plan"),
+            special("end_message"),
+            special("message_model"),
+            special("content_text"),
+            *encode("answer"),
+            special("end_message"),
+            eos,
+        ]
+        results = self._reasoning_and_content(
+            self.request, thinking, {"type": "stop", "matched": eos}
+        )
+        for mode, result in results.items():
+            with self.subTest(case="thinking", mode=mode):
+                self.assertEqual(result, ("plan", "\n\nanswer"))
+
+        call = [
+            *encode(" "),
+            special("content_invoke_tool_json"),
+            *encode('{"name":"weather","args":{"city":"SF"}}'),
+            special("end_message"),
+            eos,
+        ]
+        _, _, tool_calls, finish_reason = self.serving._parse_inkling_response(
+            self.request, call, {"type": "stop", "matched": eos}
+        )
+        self.assertEqual(finish_reason["type"], "tool_calls")
+        self.assertEqual(
+            [(c.function.name, json.loads(c.function.arguments)) for c in tool_calls],
+            [("weather", {"city": "SF"})],
+        )
+
     def test_constrained_output_without_header_is_content(self):
         """Bug regression: response_format grammars sample bare JSON where a
         message header belongs (after the reasoning terminator, or from the
@@ -5241,8 +5284,8 @@ class InklingTokenOutputTest(CustomTestCase):
             special("end_message"),
         ]
         eos = special("content_model_end_sampling")
-        # Grammars can sample a content-kind token inside the payload; it has
-        # no header, so it must not reopen a block that renders the EOS as text.
+        # Grammars can sample a content-kind token inside the payload; the EOS
+        # then lands in a reopened text block and must still not render.
         with_kind_token = [
             *encode('{"a": "'),
             special("content_text"),
