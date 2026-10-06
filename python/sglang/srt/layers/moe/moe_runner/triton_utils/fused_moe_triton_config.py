@@ -158,7 +158,13 @@ def get_moe_configs(
                 "up-projection config without TMA. Performance might be sub-optimal.",
                 config_file_path,
             )
-            return up_configs
+            # USE_TMA is projection-specific: an up-only config must not
+            # enable the sorted intermediate layout used by down TMA.
+            # Keep the cached up configs intact for the first GEMM.
+            return {
+                M: {key: value for key, value in config.items() if key != "USE_TMA"}
+                for M, config in up_configs.items()
+            }
         logger.warning(
             (
                 "Using default MoE kernel config. Performance might be sub-optimal! "
