@@ -4,6 +4,7 @@ import math
 import socket
 import unittest
 from contextlib import nullcontext
+from functools import wraps
 from unittest.mock import patch
 
 import torch
@@ -348,6 +349,7 @@ class TestQuantizedReloadScaleLayout(CustomTestCase):
                             n: p.data_ptr() for n, p in model.named_parameters()
                         }
 
+                        @wraps(native.load_weights)
                         def eager(weights):
                             weights = materialize(weights)
                             if isinstance(weights, dict):

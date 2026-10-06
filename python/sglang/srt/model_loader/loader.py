@@ -1434,7 +1434,10 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         destinations = load_destinations()
         try:
-            if getattr(first_time_load_weights, "_streams_weight_loading", False):
+            native = getattr(
+                first_time_load_weights, "__func__", first_time_load_weights
+            )
+            if getattr(native, "_streams_weight_loading", None) is native:
                 first_time_load_weights(itertools.chain.from_iterable(destinations))
             else:
                 # Generic loaders may eagerly materialize or reorder weights.
