@@ -26,11 +26,17 @@ enum Open {
     Function {
         id: String,
         index: usize,
-        tool_index: u64,
         call_id: String,
         name: String,
         args: String,
     },
+}
+
+/// Reasoning or message text held while a function call is open.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Held {
+    Reasoning,
+    Text,
 }
 
 pub struct ResponsesStream {
@@ -42,6 +48,8 @@ pub struct ResponsesStream {
     started: bool,
     terminal: bool,
     open: Option<Open>,
+    /// Emitted after the open call so it cannot split it.
+    held: Vec<(Held, String)>,
     output: Vec<Value>,
     finish_reason: Option<String>,
     usage: Option<Value>,
@@ -58,6 +66,7 @@ impl ResponsesStream {
             started: false,
             terminal: false,
             open: None,
+            held: Vec::new(),
             output: Vec::new(),
             finish_reason: None,
             usage: None,
@@ -76,6 +85,7 @@ impl ResponsesStream {
             let message = err
                 .get("message")
                 .and_then(Value::as_str)
+                .or_else(|| err.as_str())
                 .unwrap_or("upstream error");
             self.emit_failed(message, out);
             return;
@@ -121,7 +131,33 @@ impl ResponsesStream {
         self.emit("response.in_progress", json!({ "response": resp }), out);
     }
 
+    /// `true` when `delta` was held because a function call is open.
+    fn hold(&mut self, kind: Held, delta: &str) -> bool {
+        if !matches!(self.open, Some(Open::Function { .. })) {
+            return false;
+        }
+        match self.held.last_mut() {
+            Some((k, text)) if *k == kind => text.push_str(delta),
+            _ => self.held.push((kind, delta.to_owned())),
+        }
+        true
+    }
+
+    /// Emits held text after a call; whitespace alone is dropped.
+    fn flush_held(&mut self, out: &mut Vec<u8>) {
+        for (kind, text) in std::mem::take(&mut self.held) {
+            match kind {
+                _ if text.trim().is_empty() => {}
+                Held::Reasoning => self.reasoning_delta(&text, out),
+                Held::Text => self.text_delta(&text, out),
+            }
+        }
+    }
+
     fn reasoning_delta(&mut self, delta: &str, out: &mut Vec<u8>) {
+        if self.hold(Held::Reasoning, delta) {
+            return;
+        }
         if !matches!(self.open, Some(Open::Reasoning { .. })) {
             self.close_open(Finish::Completed, out);
             let id = new_id("rs");
@@ -155,6 +191,9 @@ impl ResponsesStream {
     }
 
     fn text_delta(&mut self, delta: &str, out: &mut Vec<u8>) {
+        if self.hold(Held::Text, delta) {
+            return;
+        }
         if !matches!(self.open, Some(Open::Message { .. })) {
             self.close_open(Finish::Completed, out);
             let id = new_id("msg");
@@ -187,11 +226,16 @@ impl ResponsesStream {
         self.emit("response.output_text.delta", data, out);
     }
 
+    /// SGLang names a call only on its first chunk, so a name starts a new
+    /// item: the index alone can repeat across calls.
     fn tool_delta(&mut self, call: &Value, out: &mut Vec<u8>) {
-        let tool_index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
-        let same =
-            matches!(&self.open, Some(Open::Function { tool_index: t, .. }) if *t == tool_index);
-        if !same {
+        let named = call
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            .is_some_and(|n| !n.is_empty());
+        if named || !matches!(self.open, Some(Open::Function { .. })) {
+            self.close_open(Finish::Completed, out);
+            self.flush_held(out);
             self.close_open(Finish::Completed, out);
             let id = new_id("fc");
             let index = self.output.len();
@@ -214,7 +258,6 @@ impl ResponsesStream {
             self.open = Some(Open::Function {
                 id,
                 index,
-                tool_index,
                 call_id,
                 name,
                 args: String::new(),
@@ -385,6 +428,10 @@ impl SseTransducer for ResponsesStream {
             return out;
         }
         let finish = Finish::from_chat(self.finish_reason.as_deref());
+        if !self.held.is_empty() {
+            self.close_open(Finish::Completed, &mut out);
+            self.flush_held(&mut out);
+        }
         self.close_open(finish, &mut out);
         let mut resp = self.response(finish.status());
         finish.annotate(&mut resp);
@@ -631,5 +678,75 @@ mod tests {
         assert_eq!(event, "response.failed");
         assert_eq!(data["response"]["status"], "failed");
         assert_eq!(data["response"]["output"][0]["status"], "incomplete");
+    }
+
+    fn call(name: Option<&str>, args: &str) -> Value {
+        let mut f = json!({"arguments": args});
+        if let Some(n) = name {
+            f["name"] = json!(n);
+        }
+        json!({"tool_calls": [{"index": 0, "function": f}]})
+    }
+
+    /// `(type, name or text, arguments)` of each finished output item.
+    fn items(evs: &[(String, Value)]) -> Vec<(String, String, String)> {
+        let done = &evs.last().unwrap().1["response"]["output"];
+        done.as_array()
+            .unwrap()
+            .iter()
+            .map(|i| {
+                let t = i["type"].as_str().unwrap().to_owned();
+                let label = i["name"]
+                    .as_str()
+                    .or_else(|| i.pointer("/content/0/text").and_then(Value::as_str))
+                    .unwrap_or("")
+                    .to_owned();
+                (t, label, i["arguments"].as_str().unwrap_or("").to_owned())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_repeated_index_with_a_new_name_is_a_new_call() {
+        let evs = run(&[
+            chunk(call(Some("weather"), r#"{"city":"Paris"}"#), None),
+            chunk(
+                call(Some("weather"), r#"{"city":"Rome"}"#),
+                Some("tool_calls"),
+            ),
+        ]);
+        assert_framing(&evs);
+        let fc = |a: &str| ("function_call".into(), "weather".into(), a.into());
+        assert_eq!(
+            items(&evs),
+            [fc(r#"{"city":"Paris"}"#), fc(r#"{"city":"Rome"}"#)]
+        );
+    }
+
+    #[test]
+    fn text_inside_a_call_does_not_split_it() {
+        let evs = run(&[
+            chunk(call(Some("f"), r#"{"x":"#), None),
+            chunk(json!({"content": "\n"}), None),
+            chunk(call(None, "1}"), None),
+            chunk(json!({"content": "done"}), Some("tool_calls")),
+        ]);
+        assert_framing(&evs);
+        assert_eq!(
+            items(&evs),
+            [
+                ("function_call".into(), "f".into(), r#"{"x":1}"#.into()),
+                ("message".into(), "\ndone".into(), String::new())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_string_error_keeps_its_message() {
+        let mut s = ResponsesStream::new(echo());
+        let raw = s.feed(b"data: {\"error\": \"queue full\"}\n\n");
+        let (event, data) = events(&raw).pop().unwrap();
+        assert_eq!(event, "response.failed");
+        assert_eq!(data["response"]["error"]["message"], "queue full");
     }
 }
