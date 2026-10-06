@@ -15,13 +15,36 @@ pub struct Config {
     pub router_inflight_load: InflightLoadConfig,
 }
 
-/// Outbound request timeout settings.
+/// Outbound request timeout and retry settings.
 #[derive(Debug, Clone, Copy)]
 pub struct ProxyConfig {
     /// Timeout for upstream response headers and body. Counts as a circuit-breaker failure.
     pub request_timeout_secs: u64,
     /// Maximum silence between streamed upstream chunks before the stream fails.
     pub stream_idle_timeout_secs: u64,
+    /// Dispatch attempts per request, including the first; 1 disables retries.
+    pub max_attempts: NonZeroU32,
+    /// Backoff before the first retry, doubling per retry up to `max_backoff_ms`.
+    pub initial_backoff_ms: u64,
+    /// Upper bound on any one backoff.
+    pub max_backoff_ms: u64,
+}
+
+impl ProxyConfig {
+    /// Delay before retry `retry` (1-based): a random wait in `[d/2, d]`, where
+    /// `d = min(initial_backoff_ms * 2^(retry-1), max_backoff_ms)`. The jitter
+    /// keeps clients that failed together from retrying in lockstep.
+    pub fn backoff(&self, retry: u32) -> std::time::Duration {
+        use rand::Rng;
+        let factor = 1u64
+            .checked_shl(retry.saturating_sub(1))
+            .unwrap_or(u64::MAX);
+        let ms = self
+            .initial_backoff_ms
+            .saturating_mul(factor)
+            .min(self.max_backoff_ms);
+        std::time::Duration::from_millis(rand::thread_rng().gen_range(ms / 2..=ms))
+    }
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
@@ -33,6 +56,9 @@ impl Default for ProxyConfig {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
             stream_idle_timeout_secs: 180,
+            max_attempts: NonZeroU32::MIN,
+            initial_backoff_ms: 50,
+            max_backoff_ms: 2000,
         }
     }
 }
@@ -511,7 +537,8 @@ pub const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = 32;
 pub const DEFAULT_MIN_LOAD_CHOICES: usize = 2;
 
 /// Affinity preference; legacy routing uses Strict/Soft, reorg uses Prefer/Balanced.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AffinityMode {
     /// Reorg: retain admissible affinity, otherwise fall back and rebind.
     Prefer,
@@ -524,6 +551,28 @@ pub enum AffinityMode {
     #[default]
     #[value(name = "soft")]
     Soft,
+}
+
+/// Engine load that reorg balanced affinity compares against the alternative.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BalancedBy {
+    /// Engine-reported waiting uncached tokens plus this request's uncached
+    /// tokens on that engine; needs native load reports.
+    #[default]
+    PrefillTokens,
+    /// Engine-reported running requests.
+    RunningRequests,
+}
+
+impl BalancedBy {
+    /// Minimum difference when `--affinity-load-gap` is unset, in this metric's unit.
+    pub fn default_gap(self) -> u64 {
+        match self {
+            Self::PrefillTokens => 1_024,
+            Self::RunningRequests => 4,
+        }
+    }
 }
 
 /// Controls the session-affinity lookup and fallback behavior.
@@ -549,8 +598,10 @@ pub struct AffinityConfig {
     pub session_eviction_interval_secs: u64,
     pub stable_pair: bool,
     pub mode: AffinityMode,
+    pub balanced_by: BalancedBy,
     pub load_factor: f64,
-    pub load_gap: u64,
+    /// `None` uses [`BalancedBy::default_gap`]; read through [`Self::load_gap`].
+    pub load_gap: Option<u64>,
     pub session_affinity_mode: SessionAffinityMode,
     pub pressure_guard: bool,
     pub pressure_abs_threshold_tokens: u64,
@@ -590,8 +641,9 @@ impl Default for AffinityConfig {
             session_eviction_interval_secs: default_sticky_eviction_interval_secs(),
             stable_pair: false,
             mode: AffinityMode::Soft,
+            balanced_by: BalancedBy::PrefillTokens,
             load_factor: 2.0,
-            load_gap: 1_024,
+            load_gap: None,
             session_affinity_mode: SessionAffinityMode::Bucket,
             pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,
@@ -608,6 +660,13 @@ impl Default for AffinityConfig {
             saturation_queue_floor: None,
             min_load_choices: DEFAULT_MIN_LOAD_CHOICES,
         }
+    }
+}
+
+impl AffinityConfig {
+    /// Balanced-mode minimum difference, in the `balanced_by` metric's unit.
+    pub fn load_gap(&self) -> u64 {
+        self.load_gap.unwrap_or(self.balanced_by.default_gap())
     }
 }
 
@@ -1121,5 +1180,47 @@ mod k8s_discovery_config_tests {
         )
         .expect("distinct selectors must validate");
         assert!(matches!(m, K8sDiscoveryMode::PdDisaggregation { .. }));
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn proxy(initial_backoff_ms: u64, max_backoff_ms: u64) -> ProxyConfig {
+        ProxyConfig {
+            initial_backoff_ms,
+            max_backoff_ms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn backoff_doubles_with_jitter_up_to_the_cap() {
+        let config = proxy(100, 1000);
+        for (retry, ceiling) in [
+            (1, 100),
+            (2, 200),
+            (3, 400),
+            (4, 800),
+            (5, 1000),
+            (u32::MAX, 1000),
+        ] {
+            for _ in 0..100 {
+                let delay = config.backoff(retry);
+                assert!(
+                    delay >= Duration::from_millis(ceiling / 2)
+                        && delay <= Duration::from_millis(ceiling),
+                    "retry {retry}: {delay:?} outside [{}, {ceiling}] ms",
+                    ceiling / 2
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_initial_backoff_retries_immediately() {
+        assert_eq!(proxy(0, 1000).backoff(3), Duration::ZERO);
     }
 }
