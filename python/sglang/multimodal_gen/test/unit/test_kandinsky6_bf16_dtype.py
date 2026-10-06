@@ -352,18 +352,19 @@ def test_bf16_joint_forward_and_cache_dit_lifetime(separate_cfg):
         outputs = []
         for step in range(3):
             for branch in range(2 if separate_cfg else 1):
-                outputs.append(
-                    dit(
-                        **(
-                            inputs
-                            | {
-                                "pooled_projections": inputs["pooled_projections"]
-                                + branch
-                            }
-                        ),
-                        timestep=torch.tensor([500.0 - step * 100], device="cuda"),
+                with set_forward_context(current_timestep=step, attn_metadata=None):
+                    outputs.append(
+                        dit(
+                            **(
+                                inputs
+                                | {
+                                    "pooled_projections": inputs["pooled_projections"]
+                                    + branch
+                                }
+                            ),
+                            timestep=torch.tensor([500.0 - step * 100], device="cuda"),
+                        )
                     )
-                )
         return outputs
 
     def assert_exact(actual, expected):

@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     load_model_from_full_model_state_dict,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.kandinsky6_sr import (
     Kandinsky6SRTransformer3DModel,
 )
@@ -115,7 +116,8 @@ def test_complete_checkpoint_loads_and_meta_buffers_are_rebuilt():
     model.to(device)
     x = torch.randn(1, 2, 4, 4, 4, device=device)
     rope_pos = [torch.arange(2, device=device) for _ in range(3)]
-    out = model(x, torch.tensor([500.0], device=device), rope_pos)
+    with set_forward_context(current_timestep=0, attn_metadata=None):
+        out = model(x, torch.tensor([500.0], device=device), rope_pos)
     assert out.shape == (1, 2, 4, 4, 12) and torch.isfinite(out).all()
 
 
