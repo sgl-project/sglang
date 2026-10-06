@@ -511,7 +511,8 @@ pub const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = 32;
 pub const DEFAULT_MIN_LOAD_CHOICES: usize = 2;
 
 /// Affinity preference; legacy routing uses Strict/Soft, reorg uses Prefer/Balanced.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AffinityMode {
     /// Reorg: retain admissible affinity, otherwise fall back and rebind.
     Prefer,
@@ -524,6 +525,28 @@ pub enum AffinityMode {
     #[default]
     #[value(name = "soft")]
     Soft,
+}
+
+/// Engine load that reorg balanced affinity compares against the alternative.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BalancedBy {
+    /// Engine-reported waiting uncached tokens plus this request's uncached
+    /// tokens on that engine; needs native load reports.
+    #[default]
+    PrefillTokens,
+    /// Engine-reported running requests.
+    RunningRequests,
+}
+
+impl BalancedBy {
+    /// Minimum difference when `--affinity-load-gap` is unset, in this metric's unit.
+    pub fn default_gap(self) -> u64 {
+        match self {
+            Self::PrefillTokens => 1_024,
+            Self::RunningRequests => 4,
+        }
+    }
 }
 
 /// Controls the session-affinity lookup and fallback behavior.
@@ -549,8 +572,10 @@ pub struct AffinityConfig {
     pub session_eviction_interval_secs: u64,
     pub stable_pair: bool,
     pub mode: AffinityMode,
+    pub balanced_by: BalancedBy,
     pub load_factor: f64,
-    pub load_gap: u64,
+    /// `None` uses [`BalancedBy::default_gap`]; read through [`Self::load_gap`].
+    pub load_gap: Option<u64>,
     pub session_affinity_mode: SessionAffinityMode,
     pub pressure_guard: bool,
     pub pressure_abs_threshold_tokens: u64,
@@ -590,8 +615,9 @@ impl Default for AffinityConfig {
             session_eviction_interval_secs: default_sticky_eviction_interval_secs(),
             stable_pair: false,
             mode: AffinityMode::Soft,
+            balanced_by: BalancedBy::PrefillTokens,
             load_factor: 2.0,
-            load_gap: 1_024,
+            load_gap: None,
             session_affinity_mode: SessionAffinityMode::Bucket,
             pressure_guard: true,
             pressure_abs_threshold_tokens: 1_024,
@@ -608,6 +634,13 @@ impl Default for AffinityConfig {
             saturation_queue_floor: None,
             min_load_choices: DEFAULT_MIN_LOAD_CHOICES,
         }
+    }
+}
+
+impl AffinityConfig {
+    /// Balanced-mode minimum difference, in the `balanced_by` metric's unit.
+    pub fn load_gap(&self) -> u64 {
+        self.load_gap.unwrap_or(self.balanced_by.default_gap())
     }
 }
 
