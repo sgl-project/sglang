@@ -473,9 +473,7 @@ if get_platform().is_blackwell and is_flashinfer_available():
         maybe_cache_mxfp8_dispatch,
     )
 
-    _flashinfer_mm_mxfp8_impl = _raw_flashinfer_mm_mxfp8
-    if get_bool_env_var("SGLANG_OPT_MXFP8_DISPATCH_CACHE", "true"):
-        _flashinfer_mm_mxfp8_impl = maybe_cache_mxfp8_dispatch(_raw_flashinfer_mm_mxfp8)
+    _flashinfer_mm_mxfp8_impl = maybe_cache_mxfp8_dispatch(_raw_flashinfer_mm_mxfp8)
 
     @lru_cache(maxsize=1)
     def _get_flashinfer_groupwise_backend() -> str:
