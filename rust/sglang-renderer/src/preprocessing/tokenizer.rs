@@ -71,7 +71,9 @@ impl PooledTokenizer {
                                     skip_special_tokens,
                                     reply,
                                 } => {
-                                    let result = tokenizer.decode(&token_ids, skip_special_tokens);
+                                    let result = tokenizer
+                                        .decode(&token_ids, skip_special_tokens)
+                                        .map_err(Error::from);
                                     let _ = reply.send(result);
                                 }
                                 PoolJob::Stop => break,

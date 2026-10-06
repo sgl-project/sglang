@@ -43,7 +43,7 @@ mod suite {
             Ok(text.split_whitespace().map(|_| 7).collect())
         }
 
-        fn decode(&self, token_ids: &[u32], _skip: bool) -> Result<String, RendererError> {
+        fn decode(&self, token_ids: &[u32], _skip: bool) -> Result<String, ProcessorError> {
             Ok(token_ids
                 .iter()
                 .map(|_| "word")

@@ -77,7 +77,7 @@ mod tests {
             &self,
             token_ids: &[u32],
             skip_special_tokens: bool,
-        ) -> Result<String, RendererError> {
+        ) -> Result<String, ProcessorError> {
             Ok(token_ids
                 .iter()
                 .filter(|&&id| !(skip_special_tokens && matches!(id, 1 | 2)))
