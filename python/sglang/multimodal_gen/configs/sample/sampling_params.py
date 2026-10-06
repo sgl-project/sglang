@@ -59,6 +59,20 @@ def generate_request_id() -> str:
 # is cumulative and may also enable model-owned approximate optimizations.
 QUALITY_LEVELS: tuple[str, ...] = ("lossless", "extra-high", "high")
 KERNEL_FUSION_QUALITY_LEVELS = frozenset({"extra-high", "high"})
+# libx264 presets, fastest first: each spends more encode time for a smaller
+# file at the same CRF.
+X264_PRESETS: tuple[str, ...] = (
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+    "placebo",
+)
 
 
 @dataclass(frozen=True)
@@ -232,6 +246,8 @@ class SamplingParams:
     )
     output_quality: str | None = "default"
     output_compression: int | None = None
+    # MP4 encode speed; None keeps the server's default preset
+    x264_preset: str | None = None
     # Model-owned, request-scoped quality level.
     #
     # - "lossless" (default): the exact reference path. Output is expected to
@@ -278,6 +294,9 @@ class SamplingParams:
     # The base __post_init__ will apply them when height/width are not provided.
     _default_height: ClassVar[int | None] = None
     _default_width: ClassVar[int | None] = None
+    # Fewest denoising steps the model's schedule accepts. Warmup requests are
+    # clamped to it, so a generic 1-step warmup stays a valid request.
+    min_num_inference_steps: ClassVar[int] = 1
 
     height: int | None = None
     width: int | None = None
@@ -612,6 +631,12 @@ class SamplingParams:
         ):
             raise ValueError(
                 f"seed must be a non-negative int or list of ints, got {self.seed!r}"
+            )
+
+        if self.x264_preset is not None and self.x264_preset not in X264_PRESETS:
+            raise ValueError(
+                f"x264_preset must be one of {', '.join(X264_PRESETS)}, "
+                f"got {self.x264_preset!r}"
             )
 
         # Used by seconds() and video writer; fps <= 0 is always invalid.
@@ -1214,6 +1239,16 @@ class SamplingParams:
             "--output-compression",
             type=int,
             help="Output compression level (0-100, higher means better quality but larger file size)",
+        )
+        add_argument(
+            "--x264-preset",
+            type=str,
+            choices=list(X264_PRESETS),
+            help=(
+                "libx264 preset for MP4 output. Faster presets encode sooner "
+                "and produce larger files at the same quality setting; "
+                "unset keeps the default (fast)."
+            ),
         )
         add_argument(
             "--quality",
