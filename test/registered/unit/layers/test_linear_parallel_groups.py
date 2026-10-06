@@ -743,6 +743,35 @@ class TestLinearParallelGroups(CustomTestCase):
             actual = wrapped.slice_lora_a_weights(full)
         torch.testing.assert_close(actual, full[:, 6:], rtol=0, atol=0)
 
+    def test_two_stream_lora_row_gates_on_the_retained_input_partition(self):
+        from sglang.srt.lora.trtllm_lora_temp import attention
+
+        for group, expected in (("attn_tp", self.x[:, 4:]), ("replicated", self.x)):
+            with self.subTest(group=group):
+                layer = RowParallelLinear(
+                    8,
+                    8,
+                    input_is_parallel=False,
+                    reduce_results=False,
+                    parallel_group=group,
+                )
+                wrapper = SimpleNamespace(base_layer=layer, lora_active=True)
+                fallback = Mock(return_value=(expected, None))
+                with (
+                    parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0),
+                    patch.object(
+                        attention, "is_two_stream_active", return_value=False
+                    ) as gate,
+                    patch.object(
+                        attention, "get_original_row_forward", return_value=fallback
+                    ),
+                ):
+                    output, _ = attention.row_parallel_lora_forward(wrapper, self.x)
+                gate.assert_called_once()
+                torch.testing.assert_close(gate.call_args.args[0], expected)
+                self.assertIs(output, expected)
+                fallback.assert_called_once_with(wrapper, self.x, False, None)
+
     def test_quant_initialization_keeps_the_entry_scope_partition(self):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
