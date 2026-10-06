@@ -65,14 +65,13 @@ def cake_route_enabled(name: str) -> bool:
 
 
 # Process-wide environment a selected route needs before torch.distributed or
-# any symmetric-memory allocation runs in the engine's worker processes.
-# ``sp_all_gather_matmul``: FlashInfer's Cake all-gather matmul allocates its
-# symmetric scratch through torch's NVSHMEM symmetric-memory backend, and torch
-# fixes the backend process-wide at the first symmetric allocation (the engine's
-# custom all-reduce), so the backend must be chosen before the workers start.
-ROUTE_PROCESS_ENV: dict[str, dict[str, str]] = {
-    "sp_all_gather_matmul": {"TORCH_SYMMMEM": "NVSHMEM"},
-}
+# any symmetric-memory allocation runs in the engine's worker processes (torch
+# fixes its symmetric-memory backend process-wide at the first allocation, the
+# engine's custom all-reduce). No route needs one at present:
+# ``sp_all_gather_matmul`` runs on torch's default CUDA symmetric-memory
+# backend since FlashInfer's CAKE-1053 change (the route checks the installed
+# FlashInfer at its first call and selects NVSHMEM only for older builds).
+ROUTE_PROCESS_ENV: dict[str, dict[str, str]] = {}
 
 
 def apply_route_process_env(environ=None) -> dict[str, str]:

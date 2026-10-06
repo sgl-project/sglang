@@ -40,7 +40,7 @@ import importlib
 import logging
 import re
 from collections import Counter
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 import torch
 
@@ -207,14 +207,16 @@ def sp_fused_matmul_eligible(linear) -> bool:
     """Whether the torch symm_mem fused matmul+collective fast-path applies: the
     ops are available and ``linear`` is unquantized, bias-free, bf16/fp16 (the
     case the fused ops support). Depends only on static layer properties, so the
-    decision is identical across TP ranks. Once the Cake route has selected the
-    NVSHMEM symmetric-memory backend (``_cake_sp_symmetric_backend_ready``) the
-    torch fused ops are off: their allocator rejects a process group under that
-    backend, so the non-admitted participants take the plain collective + GEMM.
+    decision is identical across TP ranks. Only when the Cake route had to select
+    the NVSHMEM symmetric-memory backend for an older FlashInfer
+    (``_cake_sp_symmetric_backend_ready``) are the torch fused ops off: their
+    allocator rejects a process group under that backend, so the non-admitted
+    participants take the plain collective + GEMM. On the default CUDA backend
+    (FlashInfer with CAKE-1053) they stay on.
     """
     if not _HAS_TORCH_SYMM_MEM_FUSED or linear.bias is not None:
         return False
-    if _cake_sp_symm_backend:
+    if _cake_sp_symm_backend == "NVSHMEM":
         return False
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
@@ -238,8 +240,11 @@ def sp_fused_matmul_eligible(linear) -> bool:
 # inside the kernel, so the launcher is prepared once per participant for the
 # engine's prefill chunk cap spread over the TP ranks and re-prepared only when
 # a larger shard arrives (every rank sees the same shard rows) or the parameter
-# storage changes (weight reload). SP is prefill-only, so nothing here runs
-# inside CUDA-graph capture; the guard below keeps that invariant explicit.
+# storage changes (weight reload). Prefill CUDA graphs capture this site too:
+# a captured call runs the launcher prepared eagerly for the participant (the
+# engine warms every captured shape eagerly first) and falls back to the stock
+# path when none of sufficient capacity exists, because preparation is a
+# collective that cannot run inside capture.
 
 CAKE_ROUTE_SP_ALL_GATHER_MATMUL = "sp_all_gather_matmul"
 _CAKE_LOG_PREFIX = "[cake-route]"
@@ -250,10 +255,12 @@ _cake_sp_rejected: set[tuple] = set()
 _cake_sp_launchers: dict[
     int, tuple[tuple, int, Callable[[torch.Tensor], torch.Tensor]]
 ] = {}
-# torch symmetric-memory backend selection for the route: None = not attempted,
-# True = NVSHMEM selected (FlashInfer's Cake backend requires it), False = unavailable.
-_cake_sp_symm_backend: Optional[bool] = None
-# (event, N) -> calls; events: taken-prepared, taken, fallback, prepare. Read by
+# torch symmetric-memory backend check for the route: None = not attempted, the
+# backend's name ("CUDA" / "NVSHMEM") = FlashInfer's Cake backend serves it,
+# False = unsupported or unavailable (the route falls back for the process).
+_cake_sp_symm_backend: Optional[Union[str, bool]] = None
+# (event, N) -> calls; events: taken-prepared, taken-captured, taken, fallback,
+# prepare. Read by
 # ``cake_sp_call_counts`` (tests, offline tools); with ``SGLANG_CAKE_DEBUG`` every
 # call is also logged, so admission can be counted from the engine log.
 _cake_sp_calls: Counter = Counter()
@@ -304,13 +311,17 @@ def _count_cake_sp_call(
 
 
 def _cake_sp_symmetric_backend_ready(device: torch.device) -> bool:
-    """Select torch's NVSHMEM symmetric-memory backend once per process.
+    """Check once per process that torch's symmetric-memory backend serves the route.
 
     FlashInfer's Cake all-gather matmul allocates its scratch and flags through
-    ``torch.distributed._symmetric_memory`` and refuses any other backend. The
-    selection happens on the first eligible call (eager prefill, before any
-    symmetric allocation of this process); when it fails the route falls back
-    for the rest of the process with one logged reason.
+    ``torch.distributed._symmetric_memory`` under the backend the process already
+    selected (the default CUDA backend or NVSHMEM; CAKE-1053) and never changes
+    it, so the engine's own symmetric-memory users (custom all-reduce v2, the
+    torch fused SP ops) keep running. A FlashInfer build from before that change
+    accepts NVSHMEM only: for it the route still selects NVSHMEM here (on the
+    first eligible call, before any symmetric allocation of this process) and
+    the fused SP ops go off. When the check fails the route falls back for the
+    rest of the process with one logged reason.
     """
     global _cake_sp_symm_backend
     if _cake_sp_symm_backend is None:
@@ -318,28 +329,32 @@ def _cake_sp_symmetric_backend_ready(device: torch.device) -> bool:
             # resolved through sys.modules (not the package attribute) so the
             # unit tests can substitute the module
             symm_mem = importlib.import_module("torch.distributed._symmetric_memory")
-
-            if str(symm_mem.get_backend(device) or "").upper() != "NVSHMEM":
-                symm_mem.set_backend("NVSHMEM")
-            _cake_sp_symm_backend = (
-                str(symm_mem.get_backend(device) or "").upper() == "NVSHMEM"
+            from sglang.kernels.cake_kernels.communication import (
+                symmetric_memory_backend_support,
             )
-            if not _cake_sp_symm_backend:
+
+            supported = symmetric_memory_backend_support(device)
+            if supported is None:  # FlashInfer before CAKE-1053: NVSHMEM only
+                if str(symm_mem.get_backend(device) or "").upper() != "NVSHMEM":
+                    symm_mem.set_backend("NVSHMEM")
+                supported = str(symm_mem.get_backend(device) or "").upper() == "NVSHMEM"
+            name = str(symm_mem.get_backend(device) or "").upper()
+            _cake_sp_symm_backend = name if supported else False
+            if not supported:
                 _log_cake_sp_once(
                     "fallback",
-                    "NVSHMEM symmetric-memory backend not selected: "
-                    f"get_backend returned {symm_mem.get_backend(device)!r}",
+                    f"torch symmetric-memory backend {name!r} is not served by "
+                    "FlashInfer's Cake all-gather matmul (or FlashInfer is unavailable)",
                 )
         except Exception as exc:  # backend missing in this torch / no NVSHMEM /
             # already fixed by an earlier symmetric allocation of this process
             _cake_sp_symm_backend = False
             _log_cake_sp_once(
                 "fallback",
-                f"NVSHMEM symmetric-memory backend unavailable ({exc!r}); the "
-                "engine launcher exports TORCH_SYMMMEM=NVSHMEM for this route, "
-                "set it explicitly when launching the workers another way",
+                f"symmetric-memory backend check failed ({exc!r}); the route needs "
+                "torch's default CUDA backend (FlashInfer with CAKE-1053) or NVSHMEM",
             )
-    return _cake_sp_symm_backend
+    return bool(_cake_sp_symm_backend)
 
 
 def cake_sp_call_counts() -> dict[tuple[str, int], int]:
@@ -460,6 +475,33 @@ def _cake_sp_launcher(
     return launcher
 
 
+def _cake_sp_captured_call(
+    linear, input_parallel: torch.Tensor, world_size: int, detail: str
+) -> Optional[torch.Tensor]:
+    """Inside CUDA-graph capture only an eagerly prepared launcher may run.
+
+    Preparation is a collective (symmetric allocation + rendezvous), so a
+    participant without a launcher of sufficient capacity for this shard takes
+    the stock path in the captured graph; the launcher itself is capturable.
+    """
+    rows, n_out = int(input_parallel.shape[0]), int(linear.weight.shape[0])
+    entry = _cake_sp_launchers.get(id(linear)) if _cake_sp_symm_backend else None
+    if entry is None or entry[0] != _cake_sp_weight_key(linear) or rows > entry[1]:
+        _log_cake_sp_once(
+            "fallback",
+            "inside CUDA-graph capture without an eagerly prepared launcher of "
+            f"sufficient capacity: {detail}",
+        )
+        _count_cake_sp_call("fallback", rows, n_out, world_size, reason="capture")
+        return None
+    output = entry[2](input_parallel)
+    _log_cake_sp_once(
+        "taken-captured", f"prepared launcher inside CUDA-graph capture: {detail}"
+    )
+    _count_cake_sp_call("taken-captured", rows, n_out, world_size)
+    return output
+
+
 def cake_column_parallel_g_matmul(
     linear, input_parallel: torch.Tensor
 ) -> Optional[torch.Tensor]:
@@ -476,17 +518,7 @@ def cake_column_parallel_g_matmul(
         f"weight={tuple(linear.weight.shape)} world_size={world_size}"
     )
     if torch.cuda.is_current_stream_capturing():
-        _log_cake_sp_once(
-            "fallback", f"inside CUDA-graph capture (no eager preparation): {detail}"
-        )
-        _count_cake_sp_call(
-            "fallback",
-            int(input_parallel.shape[0]),
-            int(linear.weight.shape[0]),
-            world_size,
-            reason="capture",
-        )
-        return None
+        return _cake_sp_captured_call(linear, input_parallel, world_size, detail)
     if not _cake_sp_symmetric_backend_ready(input_parallel.device):
         _count_cake_sp_call(
             "fallback",

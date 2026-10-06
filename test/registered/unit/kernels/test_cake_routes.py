@@ -58,6 +58,20 @@ if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
 
 
+_FAKE_ROUTE_ENV = {"sp_all_gather_matmul": {"TORCH_SYMMMEM": "NVSHMEM"}}
+
+
+def test_sp_route_needs_no_process_environment():
+    # FlashInfer's Cake all-gather matmul runs on torch's default symmetric-memory
+    # backend (CAKE-1053); the route must not force NVSHMEM on the process.
+    assert "sp_all_gather_matmul" not in _routes.ROUTE_PROCESS_ENV
+    with mock.patch.dict(os.environ, {_routes.ENV_VAR: "sp_all_gather_matmul"}):
+        env: dict = {}
+        assert _routes.apply_route_process_env(env) == {}
+        assert env == {}
+
+
+@mock.patch.dict(_routes.ROUTE_PROCESS_ENV, _FAKE_ROUTE_ENV)
 def test_route_process_env_exported_only_for_selected_routes():
     with mock.patch.dict(os.environ, {_routes.ENV_VAR: "gdn_prefill"}):
         env: dict = {}
@@ -76,6 +90,7 @@ def test_route_process_env_exported_only_for_selected_routes():
         assert _routes.apply_route_process_env(env) == {}
 
 
+@mock.patch.dict(_routes.ROUTE_PROCESS_ENV, _FAKE_ROUTE_ENV)
 def test_route_process_env_defaults_to_os_environ():
     with mock.patch.dict(os.environ, {_routes.ENV_VAR: "sp_all_gather_matmul"}):
         os.environ.pop("TORCH_SYMMMEM", None)

@@ -10,9 +10,10 @@ Four kernel families, all built for sm_100a / sm_103a and all multi-rank:
   weight, ``N % 256 == 0``, either contiguous or the ``weight.t()`` view of
   the engine's contiguous ``[N, 8192]`` parameter (each layout has its own
   kernel; no transposed copy). Needs an initialised NCCL process group with
-  ``world_size in {2, 4, 8}`` and the NVSHMEM
-  ``torch.distributed._symmetric_memory`` backend for FlashInfer's internal
-  symmetric scratch/flags (cached per device, group and dtype; the scratch
+  ``world_size in {2, 4, 8}``; FlashInfer's internal symmetric scratch/flags
+  come from ``torch.distributed._symmetric_memory`` under the backend the
+  process already selected (the default CUDA backend or NVSHMEM, see
+  ``symmetric_memory_backend_support``) (cached per device, group and dtype; the scratch
   grows to the largest ``M`` seen, and that growth and the first use
   synchronise; a failed collective poisons the state). The host side is
   nvcc-built from FlashInfer's ``csrc/cake_all_gather_matmul`` at first use.
@@ -48,7 +49,7 @@ Four kernel families, all built for sm_100a / sm_103a and all multi-rank:
   layout. Same dtype / hidden size / world-size / workspace contract as the
   union; ``norm_out``, ``residual_out`` and ``expert_scale_factor`` required.
 
-Process groups, NVSHMEM / CUDA-IPC workspaces and launch ordering across ranks
+Process groups, symmetric-memory / CUDA-IPC workspaces and launch ordering across ranks
 are owned by the runtime (``sglang.srt.layers.communication``); this module
 only forwards FlashInfer's prepare / factory / launch functions. The
 ``supports_*`` checks cover what one process can verify: device architecture,
@@ -64,6 +65,7 @@ moe_finalize_backend="cake")`` on a non-TRT-LLM workspace, and the private
 
 from __future__ import annotations
 
+import importlib
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from sglang.kernels.cake_kernels._support import (
@@ -80,6 +82,7 @@ ARCHS = BLACKWELL_DATACENTER
 
 # All-gather matmul (A38 / A39 / E2-24 / E2-25).
 FI_AG_MODULE = "flashinfer.comm.all_gather_matmul.cake_all_gather_matmul"
+FI_AG_BACKEND_MODULE = "flashinfer.comm.all_gather_matmul.cake_all_gather_matmul"
 FI_AG_DISPATCH_MODULE = "flashinfer.comm.all_gather_matmul.all_gather_matmul"
 AG_K = 8192
 # Output tile width: the kernel admits any N that is a multiple of it.
@@ -177,6 +180,25 @@ def supports_prepare_all_gather_matmul(
     )
 
 
+def symmetric_memory_backend_support(device: torch.device) -> Optional[bool]:
+    """Whether torch's process-selected symmetric-memory backend for ``device``
+    can serve FlashInfer's Cake all-gather matmul (the default CUDA backend or
+    NVSHMEM since CAKE-1053; FlashInfer never changes the backend). ``None``
+    when the installed FlashInfer predates that check and accepts NVSHMEM only.
+    ``False`` when FlashInfer is unavailable. Never raises."""
+    try:
+        module = importlib.import_module(FI_AG_BACKEND_MODULE)
+    except Exception:
+        return False
+    supports = getattr(module, "supports_symmetric_memory_backend", None)
+    if supports is None:
+        return None
+    try:
+        return bool(supports(device))
+    except Exception:
+        return False
+
+
 def all_gather_matmul(
     inp: torch.Tensor,
     w: torch.Tensor,
@@ -187,8 +209,9 @@ def all_gather_matmul(
     """Forward to FlashInfer; returns ``out [M * world_size, N]``.
 
     ``inp`` is local-only (it need not be a symmetric-memory tensor); the
-    backend's own scratch and flags use NVSHMEM symmetric memory. ``w`` is
-    passed as given (the engine's ``weight.t()`` view is a supported layout).
+    backend's own scratch and flags use torch symmetric memory under the
+    process-selected backend. ``w`` is passed as given (the engine's
+    ``weight.t()`` view is a supported layout).
     """
     from flashinfer.comm.all_gather_matmul.all_gather_matmul import all_gather_matmul
 

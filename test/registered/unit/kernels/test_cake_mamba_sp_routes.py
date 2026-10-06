@@ -795,7 +795,7 @@ def sp_env():
             sp_mod, "get_parallel", lambda: SimpleNamespace(tp_group=tp_group)
         ),
         mock.patch.object(sp_mod, "_HAS_TORCH_SYMM_MEM_FUSED", False),
-        mock.patch.object(sp_mod, "_cake_sp_symm_backend", True),
+        mock.patch.object(sp_mod, "_cake_sp_symm_backend", "CUDA"),
         mock.patch.object(
             sp_mod,
             "sp_exit_gather",
@@ -954,50 +954,93 @@ def test_sp_route_value_error_refusal_falls_back_and_is_cached(sp_env):
     assert ("prepare", N) not in sp_mod.cake_sp_call_counts()
 
 
-def test_sp_route_selects_nvshmem_backend_once_and_falls_back_without_it(
-    sp_env, caplog
-):
+_FI_BACKEND_MODULE = "flashinfer.comm.all_gather_matmul.cake_all_gather_matmul"
+
+
+def _fake_symm(backend):
+    fake = types.SimpleNamespace(backend=backend, set_calls=[])
+    fake.get_backend = lambda device: fake.backend
+    fake.set_backend = lambda name: (
+        fake.set_calls.append(name),
+        setattr(fake, "backend", name),
+    )
+    return fake
+
+
+def _backend_check_env(fake_symm, fake_fi):
+    modules = {"torch.distributed._symmetric_memory": fake_symm}
+    if fake_fi is not None:
+        modules[_FI_BACKEND_MODULE] = fake_fi
+    return (
+        mock.patch.object(sp_mod, "_cake_sp_symm_backend", None),
+        mock.patch.dict(sys.modules, modules),
+    )
+
+
+def test_sp_route_runs_on_the_default_backend_flashinfer_supports(sp_env, caplog):
+    """FlashInfer with CAKE-1053 serves torch's default CUDA symmetric-memory
+    backend: the route neither selects NVSHMEM nor turns the fused SP ops off."""
     caplog.set_level(logging.INFO, logger=sp_mod.logger.name)
     kernels, launchers = _sp_kernels()
     linear = _linear(sp_env)
     inp = torch.randn(ROWS, K).bfloat16()
-    fake_symm = types.SimpleNamespace(
-        backend=None,
-        get_backend=lambda device: fake_symm.backend,
-        set_backend=lambda name: setattr(fake_symm, "backend", name),
+    fake_symm = _fake_symm("CUDA")
+    fake_fi = types.SimpleNamespace(
+        supports_symmetric_memory_backend=lambda device: fake_symm.backend == "CUDA"
     )
     with (
         _routes(sp_mod, "sp_all_gather_matmul"),
         _patch_sp_kernels(kernels),
-        mock.patch.object(sp_mod, "_cake_sp_symm_backend", None),
-        mock.patch.dict(
-            sys.modules, {"torch.distributed._symmetric_memory": fake_symm}
-        ),
+        *_backend_check_env(fake_symm, fake_fi),
     ):
         out = sp_mod.column_parallel_g_matmul(linear, inp, None)
         sp_mod.column_parallel_g_matmul(linear, inp, None)
-        assert fake_symm.backend == "NVSHMEM"
-        assert sp_mod._cake_sp_symm_backend is True
-        # the torch fused symm_mem ops are off once the process runs NVSHMEM
+        assert fake_symm.set_calls == []
+        assert sp_mod._cake_sp_symm_backend == "CUDA"
+        with mock.patch.object(sp_mod, "_HAS_TORCH_SYMM_MEM_FUSED", True):
+            assert sp_mod.sp_fused_matmul_eligible(linear)
+    assert len(launchers) == 1 and launchers[0].call_count == 2
+    assert torch.all(out == 2.0)
+    assert "fallback to stock" not in caplog.text
+
+
+def test_sp_route_selects_nvshmem_for_a_flashinfer_without_the_backend_check(
+    sp_env, caplog
+):
+    """An older FlashInfer (no ``supports_symmetric_memory_backend``) accepts
+    NVSHMEM only: the route selects it once and the fused SP ops go off."""
+    caplog.set_level(logging.INFO, logger=sp_mod.logger.name)
+    kernels, launchers = _sp_kernels()
+    linear = _linear(sp_env)
+    inp = torch.randn(ROWS, K).bfloat16()
+    fake_symm = _fake_symm(None)
+    with (
+        _routes(sp_mod, "sp_all_gather_matmul"),
+        _patch_sp_kernels(kernels),
+        *_backend_check_env(fake_symm, types.SimpleNamespace()),
+    ):
+        out = sp_mod.column_parallel_g_matmul(linear, inp, None)
+        sp_mod.column_parallel_g_matmul(linear, inp, None)
+        assert fake_symm.set_calls == ["NVSHMEM"]
+        assert sp_mod._cake_sp_symm_backend == "NVSHMEM"
         with mock.patch.object(sp_mod, "_HAS_TORCH_SYMM_MEM_FUSED", True):
             assert not sp_mod.sp_fused_matmul_eligible(linear)
     assert len(launchers) == 1 and launchers[0].call_count == 2
     assert torch.all(out == 2.0)
 
-    def _no_backend(name):
-        raise RuntimeError("NVSHMEM not available")
 
-    fake_symm.backend = None
-    fake_symm.set_backend = _no_backend
-    sp_mod.reset_cake_sp_state_for_tests()
+def test_sp_route_falls_back_when_the_backend_is_not_served(sp_env, caplog):
+    caplog.set_level(logging.INFO, logger=sp_mod.logger.name)
     kernels, launchers = _sp_kernels()
+    linear = _linear(sp_env)
+    inp = torch.randn(ROWS, K).bfloat16()
+    # FlashInfer reports the process backend as unsupported
+    fake_symm = _fake_symm("NCCL")
+    fake_fi = types.SimpleNamespace(supports_symmetric_memory_backend=lambda d: False)
     with (
         _routes(sp_mod, "sp_all_gather_matmul"),
         _patch_sp_kernels(kernels),
-        mock.patch.object(sp_mod, "_cake_sp_symm_backend", None),
-        mock.patch.dict(
-            sys.modules, {"torch.distributed._symmetric_memory": fake_symm}
-        ),
+        *_backend_check_env(fake_symm, fake_fi),
     ):
         out = sp_mod.column_parallel_g_matmul(linear, inp, None)
         sp_mod.column_parallel_g_matmul(linear, inp, None)
@@ -1005,8 +1048,60 @@ def test_sp_route_selects_nvshmem_backend_once_and_falls_back_without_it(
     assert not launchers
     assert torch.all(out == 1.0)
     assert sp_mod.cake_sp_call_counts()[("fallback", N)] == 2
-    assert "NVSHMEM symmetric-memory backend unavailable" in caplog.text
+    assert "is not served by FlashInfer" in caplog.text
     assert caplog.text.count("fallback to stock") == 1
+
+    # an older FlashInfer whose NVSHMEM selection fails (backend already fixed)
+    def _no_backend(name):
+        raise RuntimeError("Backend can not be changed after use")
+
+    fake_symm = _fake_symm("CUDA")
+    fake_symm.set_backend = _no_backend
+    sp_mod.reset_cake_sp_state_for_tests()
+    kernels, launchers = _sp_kernels()
+    with (
+        _routes(sp_mod, "sp_all_gather_matmul"),
+        _patch_sp_kernels(kernels),
+        *_backend_check_env(fake_symm, types.SimpleNamespace()),
+    ):
+        out = sp_mod.column_parallel_g_matmul(linear, inp, None)
+        assert sp_mod._cake_sp_symm_backend is False
+    assert not launchers
+    assert torch.all(out == 1.0)
+    assert "symmetric-memory backend check failed" in caplog.text
+
+
+def test_sp_route_captured_call_uses_the_eagerly_prepared_launcher(sp_env, caplog):
+    """Prefill CUDA graphs: a shard captured after its eager warm-up runs the
+    prepared launcher (no prepare inside capture); a larger shard, or a
+    participant without a launcher, takes the stock path in the graph."""
+    caplog.set_level(logging.INFO, logger=sp_mod.logger.name)
+    kernels, launchers = _sp_kernels()
+    supports_ag, supports_prepare, ag, prepare = kernels
+    linear = _linear(sp_env)
+    other = _linear(sp_env)
+    inp = torch.randn(ROWS, K).bfloat16()
+    with _routes(sp_mod, "sp_all_gather_matmul"), _patch_sp_kernels(kernels):
+        sp_mod.column_parallel_g_matmul(linear, inp, None)  # eager warm-up
+        with _capturing():
+            out = sp_mod.column_parallel_g_matmul(linear, inp.clone(), None)
+            big = sp_mod.column_parallel_g_matmul(
+                linear, torch.randn(2 * ROWS, K).bfloat16(), None
+            )
+            cold = sp_mod.column_parallel_g_matmul(other, inp, None)
+    prepare.assert_called_once()
+    ag.assert_not_called()
+    assert len(launchers) == 1 and launchers[0].call_count == 2
+    assert torch.all(out == 2.0)
+    assert torch.all(big == 1.0) and torch.all(cold == 1.0)
+    assert linear.quant_method.apply.call_count == 1
+    assert other.quant_method.apply.call_count == 1
+    counts = sp_mod.cake_sp_call_counts()
+    assert counts[("taken-prepared", N)] == 1
+    assert counts[("taken-captured", N)] == 1
+    assert counts[("fallback", N)] == 2
+    assert "prepared launcher inside CUDA-graph capture" in caplog.text
+    assert "without an eagerly prepared launcher" in caplog.text
 
 
 def test_sp_route_on_functional_kernel_when_prepared_not_admitted(sp_env):
