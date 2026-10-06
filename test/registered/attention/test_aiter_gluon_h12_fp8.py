@@ -394,7 +394,7 @@ class TestMlaDcpAsmDecode(CustomTestCase):
 
     @mock.patch("sglang.srt.layers.attention.aiter_backend.get_parallel")
     @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_gluon_decode")
-    @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_decode_fwd")
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_decode_fwd", create=True)
     @mock.patch("sglang.srt.layers.attention.aiter_backend.scaled_fp8_quant")
     def test_verify_prefix_uses_asm_qlen1(
         self, mock_quant, mock_mla, mock_gluon, mock_parallel
