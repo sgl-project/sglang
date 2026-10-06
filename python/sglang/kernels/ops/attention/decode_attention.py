@@ -332,7 +332,9 @@ def _fwd_kernel_stage1(
                 mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
                 other=0.0,
             )
-            qk = tl.sum(q[None, :] * k, 1)
+            # Reduce in fp32; a bf16 tl.sum rounds each partial sum in compiler order.
+            # Cast the product, not q and k, to avoid a fp32 [BLOCK_N, D] tile.
+            qk = tl.sum((q[None, :] * k).to(tl.float32), 1)
             qk *= sm_scale_withk
 
             if logit_cap > 0:
@@ -1203,6 +1205,7 @@ def decode_attention_fwd(
         and _should_use_lean_decode(
             enable_lean, logit_cap, sinks, xai_temperature_len, score_mod
         )
+        and lean_locks is not None
     ):
         total_programs, XCD_REMAP, NUM_XCDS = _lean_decode_launch_params(
             v_buffer.shape[-2], kv_group_num
@@ -1483,7 +1486,6 @@ def _lean_attention_decode_kernel(
     # Use a regular while loop instead of tl.static_range with a dynamic bound to avoid
     # Triton compiler crashes in the Coalesce pass (max_output_tile_cnt is runtime-computed).
     while iter < cta_end_tile_gid:
-
         tile_row_idx = iter // tiles_per_khead
         tile_idx = tile_row_idx * batch_size
         tile_iter = tile_row_idx * tiles_per_khead

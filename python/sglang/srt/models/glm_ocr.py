@@ -26,11 +26,9 @@ import torch.nn as nn
 from einops import rearrange
 from transformers.models.glm_ocr.configuration_glm_ocr import (
     GlmOcrConfig,
-    GlmOcrTextConfig,
     GlmOcrVisionConfig,
 )
 
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import (
     VisionAttention,
@@ -54,7 +52,7 @@ from sglang.srt.models.glm4v import (
     Glm4vVisionModel,
     Glm4vVisionPatchEmbed,
 )
-from sglang.srt.runtime_context import get_mm
+from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -158,7 +156,6 @@ class GlmOcrVisionModel(Glm4vVisionModel):
     def __init__(
         self,
         vision_config: GlmOcrVisionConfig,
-        text_config: GlmOcrTextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
@@ -209,9 +206,16 @@ class GlmOcrVisionModel(Glm4vVisionModel):
                 for layer_idx in range(depth)
             ]
         )
+        projection_intermediate_size = getattr(
+            vision_config, "projection_intermediate_size", None
+        )
         self.merger = GlmOcrVisionPatchMerger(
             d_model=vision_config.out_hidden_size,
-            context_dim=text_config.intermediate_size,
+            context_dim=(
+                projection_intermediate_size
+                if projection_intermediate_size is not None
+                else vision_config.intermediate_size
+            ),
             quant_config=quant_config,
             bias=False,
             prefix=add_prefix("merger", prefix),
@@ -280,12 +284,11 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
     ) -> None:
         super().__init__(config, quant_config, prefix)
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
         self.visual = GlmOcrVisionModel(
             vision_config=config.vision_config,
-            text_config=config.text_config,
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
             use_data_parallel=self.use_data_parallel,

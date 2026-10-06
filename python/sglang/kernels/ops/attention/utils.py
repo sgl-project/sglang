@@ -48,6 +48,9 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.kernels.ops.kvcache.kv_indices import (
     get_num_page_per_block_flashmla as get_num_page_per_block_flashmla,
 )
+from sglang.kernels.ops.kvcache.kv_indices import (
+    kv_indices_num_token_blocks as kv_indices_num_token_blocks,
+)
 from sglang.kernels.ops.kvcache.rope_cache import (
     fused_qk_rope_reshape_and_cache as fused_qk_rope_reshape_and_cache,
 )
@@ -67,30 +70,21 @@ if _is_cuda:
 #
 # See: https://github.com/flashinfer-ai/flashinfer/issues/2232
 def canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
-    """
-    Adjust degenerate strides for a tensor, make it canonical.
+    """Give each size-1 dim whose stride collides with the next dim's a
+    canonical stride; every other stride is kept, so a non-contiguous KV view
+    keeps its addressing.
+
+    Example: shape ``[num_pages, 1, 64, 128]`` with stride
+    ``[8192, 128, 128, 1]`` becomes stride ``[8192, 8192, 128, 1]``.
     """
     sizes = tensor.size()
-    strides = tensor.stride()
-    ndim = tensor.dim()
-
-    need_fix = any(
-        sizes[i] == 1 and strides[i] == strides[i + 1] for i in range(ndim - 1)
-    )
-
-    if not need_fix:
+    strides = list(tensor.stride())
+    new_strides = list(strides)
+    for i in range(tensor.dim() - 2, -1, -1):
+        if sizes[i] == 1 and strides[i] == strides[i + 1]:
+            new_strides[i] = new_strides[i + 1] * sizes[i + 1]
+    if new_strides == strides:
         return tensor
-
-    # canonicalize the stride
-    # Example:
-    # - shape: [num_pages, 1, 64, 128]
-    # - stride: [8192, 128, 128, 1] (wrong!)
-    # Gives new stride: [8192, 8192, 128 ,1] (correct!)
-    new_strides = [0] * ndim
-    new_strides[-1] = 1
-    for i in range(ndim - 2, -1, -1):
-        new_strides[i] = new_strides[i + 1] * sizes[i + 1]
-
     return tensor.as_strided(sizes, new_strides)
 
 
@@ -178,6 +172,27 @@ def mla_quantize_and_rope_for_fp8(
     )
 
     return q_out, k_nope_out, k_rope_out
+
+
+def mla_quantize_for_fp8_no_rope(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    attn_dtype = torch.float8_e4m3fn
+    q_len, num_heads = q_rope.shape[:2]
+    q_out = q_rope.new_empty(
+        q_len,
+        num_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        dtype=attn_dtype,
+    )
+    q_out[..., :kv_lora_rank] = q_nope.to(attn_dtype)
+    q_out[..., kv_lora_rank:] = q_rope.to(attn_dtype)
+    return q_out, k_nope.to(attn_dtype), k_rope.to(attn_dtype)
 
 
 def mla_quantize_without_rope_for_fp8(

@@ -74,7 +74,6 @@ def _get_cla_factor(config: PretrainedConfig) -> int:
 
 
 class HunYuanMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -103,8 +102,7 @@ class HunYuanMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -116,7 +114,6 @@ class HunYuanMLP(nn.Module):
 
 
 class HunYuanSparseMoeBlock(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -244,7 +241,6 @@ def check_head_dim(config):
 
 
 class HunYuanAttention(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -385,7 +381,6 @@ class HunYuanAttention(nn.Module):
 
 
 class HunYuanDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -483,7 +478,6 @@ class HunYuanDecoderLayer(nn.Module):
 
 
 class HunYuanModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -797,7 +791,7 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
                 layer_self_attn.attn._kv_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
 

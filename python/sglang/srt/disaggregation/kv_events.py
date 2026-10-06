@@ -27,16 +27,14 @@ from abc import ABC, abstractmethod
 from collections import deque
 from itertools import count
 from queue import Queue
-from typing import TYPE_CHECKING, Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import msgspec
 import zmq
 from pydantic import BaseModel
 
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import NetworkAddress
-
-if TYPE_CHECKING:
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 
 logger = logging.getLogger(__name__)
 
@@ -63,17 +61,18 @@ def select_kv_publisher_dp_rank(
     return dp_rank or 0
 
 
-def is_kv_publisher_rank(kv_events_config: Optional[str], ps: "ParallelState") -> bool:
+def is_kv_publisher_rank(kv_events_config: Optional[str]) -> bool:
     """Whether this scheduler owns a KV-event publisher slot: one per
     independent KV cache (pp/attn-TP/attn-CP rank 0). Shared by
     `SchedulerKvEventsPublisher` and `SchedulerLoadPublisher`, which must
     gate identically or their /server_info-derived ports disagree.
     """
+    parallel = get_parallel()
     return bool(
         kv_events_config
-        and ps.pp_rank == 0
-        and ps.attn_tp_rank == 0
-        and ps.attn_cp_rank == 0
+        and parallel.pp_rank == 0
+        and parallel.attn_tp_rank == 0
+        and parallel.attn_cp_rank == 0
     )
 
 
@@ -241,11 +240,20 @@ class EventBatch(
 
 class KVCacheEvent(
     msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
     gc=False,  # type: ignore[call-arg]
     tag=True,
 ):
-    """Base class for all KV cache-related events"""
+    """Base class for all KV cache-related events.
+
+    Events are tagged msgpack maps: ``type`` carries the class name and every
+    other key is a field name. Optional fields left at ``None`` are omitted, so
+    adding an optional field never changes the shape an older consumer sees.
+    This is the same encoding vLLM uses for its ``KVCacheEvent``, so a consumer
+    such as Dynamo decodes both engines with one code path.
+
+    ``EventBatch`` stays a positional array ``[ts, events, attn_dp_rank]``.
+    """
 
 
 class StorageMedium(str, enum.Enum):
@@ -257,27 +265,13 @@ class StorageMedium(str, enum.Enum):
     EXTERNAL = "EXTERNAL"  # L4: shared / remote pool (e.g. Mooncake)
 
 
-class BlockStoredMetadata(msgspec.Struct, omit_defaults=True, gc=False):
-    """Typed request metadata attached to a stored KV block."""
+class OffloadedState(msgspec.Struct):
+    """Decode-side offload progress for one request, keyed by Req in the manager."""
 
-    cache_salt: str
-
-
-class OffloadedState:
-    """
-    OffloadedState represents the state of a KV cache block offloaded to the hicache.
-
-    - prefill_len (int): The length of the prefill part of the KV cache block.
-    - inc_len (int): The length of the incremental part of the KV cache block.
-    - last_hash (Optional[str]): The hash of the last token in the KV cache block.
-    """
-
-    def __init__(
-        self, prefill_len: int, inc_len: int = 0, last_hash: Optional[str] = None
-    ):
-        self.prefill_len = prefill_len
-        self.inc_len = inc_len
-        self.last_hash = last_hash
+    # Decode-incremental length already submitted for D2H offload.
+    inc_len: int = 0
+    # Tail of the page hash chain, extended as each offloaded chunk is backed up.
+    last_hash: Optional[str] = None
 
 
 class BlockStored(KVCacheEvent):
@@ -287,16 +281,13 @@ class BlockStored(KVCacheEvent):
     block_size: int
     lora_id: Optional[int]
     medium: Optional[str] = None
-
-
-class BlockStoredWithMetadata(BlockStored, tag="BlockStored", kw_only=True):
-    """BlockStored wire extension used only when typed metadata is present.
-
-    A separate struct keeps unsalted events at their legacy array length; an
-    optional field on BlockStored would still serialize a trailing null.
-    """
-
-    metadata: BlockStoredMetadata
+    # Salt of the request that stored these blocks. Block hashes are already
+    # namespaced by it; consumers index the emitted hashes rather than
+    # recompute them.
+    cache_salt: Optional[str] = None
+    # Session that triggered this store. Attribution only: the blocks may be
+    # shared with other sessions, and the hash does not depend on it.
+    session_id: Optional[str] = None
 
 
 class BlockRemoved(KVCacheEvent):
@@ -309,10 +300,6 @@ class AllBlocksCleared(KVCacheEvent):
 
 
 class KVEventBatch(EventBatch):
-    # BlockStoredWithMetadata deliberately stays out of this tagged union.
-    # Existing typed consumers decode its shared "BlockStored" tag as the base
-    # type and ignore the trailing metadata; adding both types would give
-    # msgspec duplicate tags and make the union invalid.
     events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
 
 

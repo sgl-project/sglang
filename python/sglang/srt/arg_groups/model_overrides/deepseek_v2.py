@@ -1,13 +1,11 @@
-"""Config-time override declarations for deepseek_v2.
-
-Architectures: DeepseekV32ForCausalLM, DeepseekV3ForCausalLM, Dots3NoteForCausalLM, GlmMoeDsaForCausalLM, KimiK25ForConditionalGeneration, LongcatFlashForCausalLM, LongcatFlashForCausalLMNextN, MistralLarge3ForCausalLM, PixtralForConditionalGeneration.
-"""
+"""Config-time override declarations for deepseek_v2."""
 
 import logging
 from typing import Any, Dict
 
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
+    context_parallel_attn_dp_size,
     is_attention_backend_not_set,
     resolving_view,
     use_mla_backend,
@@ -24,20 +22,60 @@ logger = logging.getLogger(__name__)
     "MistralLarge3ForCausalLM",
     "PixtralForConditionalGeneration",
     "GlmMoeDsaForCausalLM",
+    "Glm5NextForConditionalGeneration",
+    "HYV4ForCausalLM",
+    "HYV4ForCausalLMNextN",
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
     "Dots3NoteForCausalLM",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
-    """Order-safe declarations of the DeepSeek/DSA branch. The CP parallel
-    writes (enable_dp_attention/ep_size/moe_a2a_backend have post-monolith
-    writers), the kv-cache/split-backend defaults, the quant/moe block (read
-    before it by _set_default_dsa_kv_cache_dtype) and the env writes stay in
-    the branch."""
+    """Declare DeepSeek/DSA defaults; ordered CP, KV-cache, and MoE passes run in model_hook."""
     cfg = resolving_view(server_args)
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import (
+        get_dsa_index_kpool,
+        is_deepseek_dsa,
+        unwrap_modelopt_quantization_config,
+    )
+
+    model_arch = (getattr(hf_config, "architectures", None) or [None])[0]
+    if model_arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
+        if cfg.enable_prefill_cp:
+            raise ValueError(
+                "--enable-prefill-cp is not supported for HYV4 because its "
+                "attention path does not implement DSA context-parallel metadata "
+                f"and sharding. Got architecture={model_arch!r} and "
+                f"enable_prefill_cp={cfg.enable_prefill_cp!r}."
+            )
+        dcp_size = getattr(cfg, "dcp_size", 1)
+        if dcp_size > 1:
+            raise ValueError(
+                "--dcp-size > 1 is not supported for HYV4 because decode context "
+                "parallelism gathers query heads across DCP ranks but does not "
+                "provide single-owner semantics for learnable attention sinks. "
+                f"Got architecture={model_arch!r} and dcp_size={dcp_size!r}."
+            )
 
     overrides: Dict[str, Any] = {}
+
+    if model_arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
+        quant_cfg = getattr(hf_config, "quantization_config", None) or {}
+        quant_algo = unwrap_modelopt_quantization_config(quant_cfg).get(
+            "quant_algo", ""
+        )
+        if str(quant_algo).upper() == "MXFP8":
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            # auto would otherwise select an unqualified FP8/MoE path for HYV4 MXFP8.
+            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+                if cfg.moe_runner_backend == "auto":
+                    overrides["moe_runner_backend"] = "deep_gemm"
+                if cfg.fp8_gemm_runner_backend == "auto":
+                    overrides["fp8_gemm_runner_backend"] = "deep_gemm"
+                if overrides:
+                    logger.info(
+                        "HYV4 MXFP8: defaulting MoE/FP8 GEMM backends to deep_gemm."
+                    )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
         # Set attention backend for DeepSeek
@@ -49,31 +87,35 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 logger.warning(
                     "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
                 )
-                overrides["enable_dp_attention"] = True
-                overrides["moe_dense_tp_size"] = 1
+                attn_dp_size = context_parallel_attn_dp_size(
+                    cfg, "DSA context parallelism"
+                )
+                overrides["attn_dp_size"] = attn_dp_size
+                overrides["dp_size"] = 1
                 if cfg.cp_strategy == "zigzag":
+                    overrides["moe_dense_tp_size"] = 1
                     overrides["moe_a2a_backend"] = "deepep"
                     overrides["ep_size"] = cfg.tp_size
                     logger.warning(
                         "zigzag DSA CP requires moe_dense_tp_size=1, "
                         "moe_a2a_backend=deepep, ep_size=tp_size, batch_size=1."
                     )
-                else:
-                    assert (
-                        cfg.dp_size == 1
-                    ), "interleave DSA CP does not support DP attention."
-                assert (
-                    cfg.tp_size <= 8
-                ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
-                # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
-                # DSACPLayerCommunicator does not all-reduce attention-TP
-                # partial o_proj outputs before replicated dense FFNs.
-                attn_cp_size = cfg.tp_size // cfg.dp_size
+                assert cfg.tp_size <= 8, (
+                    "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                )
+                # Interleave can shard attention heads within each CP rank.
+                # Keep an explicit CP width; default to attention TP1 as before.
+                # Zigzag still requires attention TP1.
+                attn_cp_size = (
+                    cfg.attn_cp_size
+                    if cfg.cp_strategy == "interleave" and cfg.attn_cp_size > 1
+                    else cfg.tp_size // attn_dp_size
+                )
                 overrides["attn_cp_size"] = attn_cp_size
                 logger.warning(
                     "Enabled DSA context parallel: "
-                    f"strategy={cfg.cp_strategy}, dp_size={cfg.dp_size}, "
-                    f"moe_dense_tp_size={overrides['moe_dense_tp_size']}, "
+                    f"strategy={cfg.cp_strategy}, attn_dp_size={attn_dp_size}, "
+                    f"moe_dense_tp_size={overrides.get('moe_dense_tp_size', cfg.moe_dense_tp_size)}, "
                     f"ep_size={overrides.get('ep_size', cfg.ep_size)}, tp_size={cfg.tp_size}, "
                     f"attn_cp_size={attn_cp_size}, "
                     f"kv_cache_dtype={cfg.kv_cache_dtype}, "
@@ -98,8 +140,19 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     "needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1)."
                 )
             else:
-                overrides["page_size"] = 64
-                logger.warning("Setting page size to 64 for DeepSeek DSA.")
+                index_kpool = get_dsa_index_kpool(hf_config)
+                if index_kpool > 1 and getattr(cfg, "dcp_size", 1) > 1:
+                    raise ValueError(
+                        "--dcp-size > 1 is not supported for DSA with "
+                        f"index_kpool={index_kpool}: a pooled index key spans "
+                        "positions owned by different DCP ranks."
+                    )
+                page_size = 64 * index_kpool
+                overrides["page_size"] = page_size
+                logger.warning(f"Setting page size to {page_size} for DeepSeek DSA.")
+        elif get_platform().is_xpu:
+            overrides["page_size"] = 128
+            logger.warning("Setting page size to 128 for DeepSeek DSA on XPU.")
     else:
         # DeepSeek V3/R1/V3.1
         if get_platform().is_sm100:
@@ -119,7 +172,9 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 "MLA prefill context parallel is still experimental. "
                 "Verified on Hopper with the fa3 backend."
             )
-            overrides["enable_dp_attention"] = True
+            attn_dp_size = context_parallel_attn_dp_size(cfg, "MLA context parallelism")
+            overrides["attn_dp_size"] = attn_dp_size
+            overrides["dp_size"] = 1
             # TODO(kpham-sgl) Supports moe_dense_tp_size != 1.
             overrides["moe_dense_tp_size"] = 1
             overrides["moe_a2a_backend"] = "deepep"
@@ -128,13 +183,13 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 "For MLA CP, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
             )
             # FIXME(kpham-sgl): Keep attn_tp_size == 1 under MLA CP.
-            # DSACPLayerCommunicator does not all-reduce attention-TP
-            # partial o_proj outputs before replicated dense FFNs.
-            attn_cp_size = cfg.tp_size // cfg.dp_size
+            # The DSA / MLA CP gather and reduce-scatter
+            # (the dsa_cp_* helpers in adapters/context_parallel.py) assume it.
+            attn_cp_size = cfg.tp_size // attn_dp_size
             overrides["attn_cp_size"] = attn_cp_size
             logger.warning(
                 f"Enable Context Parallel opt for MLA, "
-                f"Setting dp_size == {cfg.dp_size} and "
+                f"Setting attn_dp_size == {attn_dp_size} and "
                 f"attn_cp_size == {attn_cp_size}, "
                 f"moe_dense_tp_size == {overrides['moe_dense_tp_size']}, "
                 f"ep_size == {overrides['ep_size']}, "

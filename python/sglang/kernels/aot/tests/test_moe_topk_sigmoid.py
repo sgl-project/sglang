@@ -44,13 +44,13 @@ def test_topk_sigmoid(num_tokens, num_experts, topk):
     topk_weights_ref, topk_indices_ref = torch.topk(sigmoid_output, topk, dim=-1)
 
     # Verify the top-k weights and indices match the torch native ones
-    assert torch.allclose(
-        topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3
-    ), f"Weights mismatch: torch={topk_weights_ref} vs SGLang={topk_weights}"
+    assert torch.allclose(topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3), (
+        f"Weights mismatch: torch={topk_weights_ref} vs SGLang={topk_weights}"
+    )
 
-    assert torch.allclose(
-        topk_indices_ref.int(), topk_indices, atol=0, rtol=0
-    ), f"Indices mismatch: torch={topk_indices_ref}, SGLang={topk_indices}"
+    assert torch.allclose(topk_indices_ref.int(), topk_indices, atol=0, rtol=0), (
+        f"Indices mismatch: torch={topk_indices_ref}, SGLang={topk_indices}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -87,13 +87,13 @@ def test_topk_sigmoid_dtype_regression(num_tokens, num_experts, topk, dtype):
         gating_output.float(),
     )
 
-    assert torch.allclose(
-        topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3
-    ), f"Weights mismatch: SGLang old interface={topk_weights_ref} vs SGLang new interface={topk_weights}"
+    assert torch.allclose(topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3), (
+        f"Weights mismatch: SGLang old interface={topk_weights_ref} vs SGLang new interface={topk_weights}"
+    )
 
-    assert torch.allclose(
-        topk_indices_ref.int(), topk_indices, atol=0, rtol=0
-    ), f"Indices mismatch: SGLang old interface={topk_indices_ref}, SGLang new interface={topk_indices}"
+    assert torch.allclose(topk_indices_ref.int(), topk_indices, atol=0, rtol=0), (
+        f"Indices mismatch: SGLang old interface={topk_indices_ref}, SGLang new interface={topk_indices}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -136,13 +136,13 @@ def test_topk_sigmoid_renormalize(num_tokens, num_experts, topk):
     )
     topk_weights_ref = topk_weights_ref / topk_weights_ref.sum(dim=-1, keepdim=True)
 
-    assert torch.allclose(
-        topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3
-    ), f"Weights mismatch: SGLang w/o fused renormalize={topk_weights_ref} vs SGLang w/ fused renormalize={topk_weights}"
+    assert torch.allclose(topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3), (
+        f"Weights mismatch: SGLang w/o fused renormalize={topk_weights_ref} vs SGLang w/ fused renormalize={topk_weights}"
+    )
 
-    assert torch.allclose(
-        topk_indices_ref.int(), topk_indices, atol=0, rtol=0
-    ), f"Indices mismatch: SGLang w/o fused renormalize={topk_indices_ref}, SGLang w/ fused renormalize={topk_indices}"
+    assert torch.allclose(topk_indices_ref.int(), topk_indices, atol=0, rtol=0), (
+        f"Indices mismatch: SGLang w/o fused renormalize={topk_indices_ref}, SGLang w/ fused renormalize={topk_indices}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -180,13 +180,13 @@ def test_topk_sigmoid_renormalize_correction_bias(num_tokens, num_experts, topk)
     topk_weights_ref = topk_weights_ref / topk_weights_ref.sum(dim=-1, keepdim=True)
 
     # Verify the top-k weights and indices match the torch native ones
-    assert torch.allclose(
-        topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3
-    ), f"Weights mismatch: torch={topk_weights_ref} vs SGLang={topk_weights}"
+    assert torch.allclose(topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3), (
+        f"Weights mismatch: torch={topk_weights_ref} vs SGLang={topk_weights}"
+    )
 
-    assert torch.allclose(
-        topk_indices_ref.int(), topk_indices, atol=0, rtol=0
-    ), f"Indices mismatch: torch={topk_indices_ref}, SGLang={topk_indices}"
+    assert torch.allclose(topk_indices_ref.int(), topk_indices, atol=0, rtol=0), (
+        f"Indices mismatch: torch={topk_indices_ref}, SGLang={topk_indices}"
+    )
 
 
 if __name__ == "__main__":

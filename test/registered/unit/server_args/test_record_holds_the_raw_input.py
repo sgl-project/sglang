@@ -8,18 +8,20 @@ value the caller still holds and the snapshot cannot see it.
 """
 
 import copy
-import dataclasses
 import json
 import os
 import shutil
 import tempfile
 import unittest
 
+import msgspec
+import msgspec.structs
+
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 _MINI_CONFIG = {
@@ -108,7 +110,7 @@ class TestRecordHoldsTheRawInput(CustomTestCase):
 
                 moved = {
                     field.name: (raw[field.name], getattr(server_args, field.name))
-                    for field in dataclasses.fields(server_args)
+                    for field in msgspec.structs.fields(server_args)
                     if _moved(getattr(server_args, field.name), raw[field.name])
                 }
                 self.assertEqual(

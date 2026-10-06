@@ -13,14 +13,10 @@ pub fn env_bool(name: &str, default: bool) -> bool {
     })
 }
 
-/// Deliberately restricted unsigned parser — NOT Python `int()` semantics.
-/// Accepts only what `u64::from_str` does: ASCII digits with an optional
-/// leading `+`, up to `u64::MAX`. Inputs Python's `EnvInt` would accept —
-/// surrounding whitespace (`" 45 "`), digit-group underscores (`"4_5"`),
-/// negatives, values above `u64::MAX`, non-ASCII digits — warn and fall back
-/// to the default, like any other invalid value. Callers are counts/sizes, so
-/// strictness over parity is intentional here.
-pub fn env_u64(name: &str, default: u64) -> u64 {
+/// Signed integer parser. Accepts the `i64::from_str` grammar, including
+/// negative values, while invalid or out-of-range values warn and use the
+/// default.
+pub fn env_i64(name: &str, default: i64) -> i64 {
     read(name, default, |raw| raw.parse().ok())
 }
 
@@ -71,30 +67,32 @@ mod tests {
         assert!(!env_bool("SGLANG_TEST_ENV_BOOL_UNSET", false));
     }
 
-    /// `env_u64`: strict `u64::from_str` grammar; everything else — including
-    /// int()-valid inputs the doc calls out as deliberately rejected — → default.
+    /// `env_i64`: strict `i64::from_str` grammar, including negative values;
+    /// everything else falls back to the default.
     #[test]
-    fn env_u64_parses_or_defaults() {
+    fn env_i64_parses_or_defaults() {
         for (i, (raw, want)) in [
             ("45", 45),
-            ("+45", 45), // u64::from_str allows a leading `+`
+            ("+45", 45),
+            ("-1", -1),
+            ("-9223372036854775808", i64::MIN),
+            ("9223372036854775807", i64::MAX),
             // Invalid → default.
             ("20s", 20),
             ("", 20),
-            // int()-valid but deliberately rejected → default.
             (" 45 ", 20),
             ("4_5", 20),
-            ("-1", 20),
-            ("18446744073709551616", 20), // u64::MAX + 1
-            ("١٢", 20),                   // non-ASCII digits
+            ("9223372036854775808", 20),
+            ("-9223372036854775809", 20),
+            ("١٢", 20), // non-ASCII digits
         ]
         .into_iter()
         .enumerate()
         {
-            let name = format!("SGLANG_TEST_ENV_U64_{i}");
+            let name = format!("SGLANG_TEST_ENV_I64_{i}");
             unsafe { std::env::set_var(&name, raw) };
-            assert_eq!(env_u64(&name, 20), want, "value {raw:?}");
+            assert_eq!(env_i64(&name, 20), want, "value {raw:?}");
         }
-        assert_eq!(env_u64("SGLANG_TEST_ENV_U64_UNSET", 20), 20);
+        assert_eq!(env_i64("SGLANG_TEST_ENV_I64_UNSET", 20), 20);
     }
 }

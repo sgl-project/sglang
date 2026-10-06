@@ -46,6 +46,13 @@ class QuantizeMethodBase(ABC):
         """
         return
 
+    def restore_weights_before_loading(self, layer: nn.Module) -> None:
+        """Undo an in-place repack so checkpoint-format weights can be loaded again.
+
+        Needed only when `process_weights_after_loading` changes parameter shapes.
+        """
+        return
+
 
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
@@ -234,7 +241,7 @@ class QuantizationConfig(ABC):
             if key in config:
                 return config[key]
         raise ValueError(
-            f"Cannot find any of {keys} in the model's " "quantization config."
+            f"Cannot find any of {keys} in the model's quantization config."
         )
 
     @staticmethod
@@ -260,6 +267,20 @@ class QuantizationConfig(ABC):
         """
         raise NotImplementedError()
 
+    def is_linear_unquantized(self, prefix: str) -> bool:
+        """Whether a linear layer at ``prefix`` keeps its checkpoint precision.
+
+        A query for deciding module layouts before layers are built, so an
+        override must not register ``prefix`` as a quantized layer.
+        """
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        return isinstance(
+            self.get_quant_method(LinearBase(1, 1), prefix=prefix),
+            UnquantizedLinearMethod,
+        )
+
     @abstractmethod
     def get_scaled_act_names(self) -> List[str]:
         """Returns the activation function names that should be post-scaled.
@@ -268,9 +289,7 @@ class QuantizationConfig(ABC):
         """
         raise NotImplementedError()
 
-    def apply_weight_name_mapper(
-        self, hf_to_sglang_mapper: WeightsMapper
-    ):  # noqa: B027
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):  # noqa: B027
         """
         Interface for models to update module names referenced in
         quantization configs in order to reflect the sglang model structure

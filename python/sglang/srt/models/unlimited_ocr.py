@@ -1,6 +1,7 @@
 """Standalone UNLIMITED-OCR model (SAM + CLIP vision encoders, Deepseek backbone)."""
 
 import logging
+from array import array
 from typing import Iterable, List, Optional, Set, Tuple, TypeAlias, Union
 
 import torch
@@ -181,7 +182,7 @@ class UnlimitedOCRForCausalLM(nn.Module):
         if pixel_values is not None:
             if not isinstance(pixel_values, (torch.Tensor, list)):
                 raise ValueError(
-                    "Incorrect type of pixel values. " f"Got type: {type(pixel_values)}"
+                    f"Incorrect type of pixel values. Got type: {type(pixel_values)}"
                 )
             if not isinstance(images_spatial_crop, (torch.Tensor, list)):
                 raise ValueError(
@@ -190,7 +191,7 @@ class UnlimitedOCRForCausalLM(nn.Module):
                 )
             if not isinstance(images_crop, (torch.Tensor, list)):
                 raise ValueError(
-                    "Incorrect type of image crop. " f"Got type: {type(images_crop)}"
+                    f"Incorrect type of image crop. Got type: {type(images_crop)}"
                 )
             return [pixel_values, images_crop, images_spatial_crop]
 
@@ -311,7 +312,7 @@ class UnlimitedOCRForCausalLM(nn.Module):
             )
         return inputs_embeds
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """Pad input token IDs with multimodal placeholder tokens."""
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)

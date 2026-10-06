@@ -20,6 +20,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils.common import is_building_neighbour_layer
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -215,7 +216,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
-        if self.tp_rank == 0:
+        if self.tp_rank == 0 and not is_building_neighbour_layer():
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
@@ -286,9 +287,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
             dispatch_output: Dispatched tokens and routing information
         """
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
 
         if self.tp_rank != 0 or self.wrapper is None:
             return

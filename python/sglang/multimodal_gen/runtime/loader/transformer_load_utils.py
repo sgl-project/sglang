@@ -14,14 +14,13 @@ from functools import partial
 from typing import Callable, Optional
 
 import torch
-from diffusers.utils import SAFE_WEIGHTS_INDEX_NAME
 from safetensors import safe_open
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
     KitchenW4A4Config,
@@ -36,13 +35,12 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     names_gguf_checkpoint,
     read_gguf_tensor_meta,
+    remap_gguf_tensor_meta,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
-from sglang.multimodal_gen.runtime.loader.weight_utils import (
-    filter_duplicate_safetensors_files,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
+    SNAPSHOT_OFFLOAD,
     ComponentResidencyError,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -72,9 +70,6 @@ logger = init_logger(__name__)
 
 PostLoadHook = Callable[[nn.Module], None]
 
-_PRECISION_VARIANT_SUFFIX_RE = re.compile(
-    r"^(?P<stem>.+?)(?P<precision>\.(?:fp16|bf16|fp32))(?P<shard>-\d+-of-\d+)?(?P<ext>\.safetensors)$"
-)
 _MIXED_SAFETENSORS_RE = re.compile(r".*-mixed(?:-\d+-of-\d+)?\.safetensors$")
 
 
@@ -181,9 +176,13 @@ class TransformerQuantLoadSpec:
         return _get_quant_config_name(self.quant_config) == "comfy_fp8"
 
     @property
-    def is_serialized_kitchen_int8(self) -> bool:
+    def is_convrot_int8(self) -> bool:
+        return isinstance(self.quant_config, ConvRotInt8Config)
+
+    @property
+    def is_serialized_convrot_int8(self) -> bool:
         return (
-            isinstance(self.quant_config, KitchenInt8Config)
+            isinstance(self.quant_config, ConvRotInt8Config)
             and self.quant_config.is_checkpoint_int8_serialized
         )
 
@@ -199,7 +198,7 @@ class TransformerQuantLoadSpec:
     def uses_comfy_layer_markers(self) -> bool:
         return (
             self.is_comfy_fp8
-            or self.is_serialized_kitchen_int8
+            or self.is_serialized_convrot_int8
             or self.is_serialized_kitchen_w4a4
             or self.is_serialized_kitchen_w4a8
             or (
@@ -239,7 +238,7 @@ def _uses_component_offload(
 ) -> bool:
     if component_name is None:
         return legacy_enabled
-    return server_args.residency_mode(component_name) == COMPONENT_OFFLOAD
+    return server_args.should_cpu_offload_component(component_name)
 
 
 def _reject_explicit_component_selector(
@@ -250,12 +249,12 @@ def _reject_explicit_component_selector(
 ) -> None:
     if component_name is None:
         return
-    selected_by_component_residency = (
-        server_args.canonical_residency_mode(component_name) == COMPONENT_OFFLOAD
-    )
+    selected_by_component_residency = server_args.canonical_residency_mode(
+        component_name
+    ) in (COMPONENT_OFFLOAD, SNAPSHOT_OFFLOAD)
     if selected_by_component_residency:
         raise ComponentResidencyError(
-            f"{feature_name} does not support component-offload for "
+            f"{feature_name} does not support {server_args.canonical_residency_mode(component_name)} for "
             f"{component_name!r}; select resident or layerwise-offload"
         )
 
@@ -645,17 +644,7 @@ def resolve_transformer_checkpoint_files(
 
     safetensors_list = _list_safetensors_files(component_model_path)
     if safetensors_list:
-        # Preserve legacy cleanup for the base component. Explicit overrides
-        # are resolved above, where an index is already the final authority.
-        safetensors_list = filter_duplicate_safetensors_files(
-            safetensors_list,
-            os.path.dirname(safetensors_list[0]),
-            SAFE_WEIGHTS_INDEX_NAME,
-        )
         safetensors_list = _prefer_mixed_safetensors_files(safetensors_list)
-        safetensors_list = _filter_duplicate_precision_variant_safetensors(
-            safetensors_list
-        )
 
     if not safetensors_list:
         raise ValueError(f"no safetensors files found in {component_model_path}")
@@ -696,48 +685,6 @@ def _prefer_mixed_safetensors_files(safetensors_list: list[str]) -> list[str]:
     return mixed_files
 
 
-def _filter_duplicate_precision_variant_safetensors(
-    safetensors_list: list[str],
-) -> list[str]:
-    """Drop precision-specific duplicates when a canonical file is present.
-
-    Diffusers checkpoints sometimes ship both `foo.safetensors` and
-    `foo.fp16.safetensors` (and their sharded variants) in the same directory.
-    Loading both is unsafe because duplicate parameter names race and whichever
-    tensor arrives last wins, leading to non-deterministic behavior
-
-    If a canonical unsuffixed (non bf16|fp32) file exists, prefer it and drop the precision
-    variant from the same family. Precision-only families are left untouched.
-    """
-    canonical_paths = set(safetensors_list)
-    filtered: list[str] = []
-    removed: list[str] = []
-
-    for path in safetensors_list:
-        match = _PRECISION_VARIANT_SUFFIX_RE.match(path)
-        if match is None:
-            filtered.append(path)
-            continue
-
-        canonical_path = (
-            f"{match.group('stem')}{match.group('shard') or ''}{match.group('ext')}"
-        )
-        if canonical_path in canonical_paths:
-            removed.append(path)
-            continue
-
-        filtered.append(path)
-
-    if removed:
-        logger.info(
-            "Filtered %d duplicate transformer precision variant file(s): %s",
-            len(removed),
-            removed,
-        )
-
-    return filtered
-
-
 def resolve_transformer_quant_load_spec(
     *,
     hf_config: dict,
@@ -770,8 +717,7 @@ def resolve_transformer_quant_load_spec(
             )
         if server_args.nunchaku_config is not None:
             raise ValueError(
-                "Per-layer checkpoint quantization and Nunchaku are mutually "
-                "exclusive"
+                "Per-layer checkpoint quantization and Nunchaku are mutually exclusive"
             )
         quant_config = checkpoint_quant_config
     elif getattr(model_cls, "handles_checkpoint_quantization", False):
@@ -846,10 +792,13 @@ def _resolve_gguf_quant_load_spec(
 
     _validate_gguf_runtime_support(server_args, component_name)
 
-    quant_config = GGUFConfig(
-        gguf_file=gguf_file,
-        tensor_meta=read_gguf_tensor_meta(gguf_file),
-    )
+    tensor_meta = read_gguf_tensor_meta(gguf_file)
+    dequantize_prefixes = vars(model_cls).get("gguf_dequantize_prefixes", ())
+    if dequantize_prefixes:
+        tensor_meta = remap_gguf_tensor_meta(
+            tensor_meta, lambda name: name, dequantize_prefixes=dequantize_prefixes
+        )
+    quant_config = GGUFConfig(gguf_file=gguf_file, tensor_meta=tensor_meta)
     packed = getattr(model_cls, "packed_modules_mapping", None)
     if packed:
         quant_config.packed_modules_mapping = packed
@@ -875,10 +824,8 @@ def _needs_device_weight_postprocess(
     quant_name = _get_quant_config_name(quant_config)
     if quant_name in ("modelopt_fp8", "comfy_fp8", "auto-round", "mxfp8"):
         return True
-    if quant_name == "kitchen_int8":
-        assert isinstance(quant_config, KitchenInt8Config)
-        return not quant_config.is_checkpoint_int8_serialized
-
+    # convrot_int8 is deliberately absent: both backends quantize each layer
+    # through their own CUDA round trip, so an offloaded DiT stays on the host.
     serialized_flag_by_quant_name = {
         "fp8": "is_checkpoint_fp8_serialized",
         "mxfp4": "is_checkpoint_mxfp4_serialized",
@@ -1062,6 +1009,9 @@ def _resolve_quant_config(
     if arch_config is None:
         arch_config = server_args.pipeline_config.dit_config.arch_config
     param_names_mapping_dict = arch_config.param_names_mapping
+    quant_param_names_mapping_dict = getattr(
+        arch_config, "quant_param_names_mapping", param_names_mapping_dict
+    )
     reverse_param_names_mapping_dict = arch_config.reverse_param_names_mapping
     quant_ignore_remap_dict = arch_config.quant_ignore_remap
 
@@ -1103,13 +1053,13 @@ def _resolve_quant_config(
                 "such as owner/repo:Q4_K_M)."
             )
 
-        # Online-quant convention: for `fp8`, `mxfp4` and `kitchen_int8`, a
+        # Online-quant convention: for `fp8`, `mxfp4` and `convrot_int8`, a
         # no-arg QuantizationConfig() selects the post-load path -- weights
         # load in source dtype and are quantized in
         # process_weights_after_loading.
         quant_cls = get_quantization_config(server_args.quantization)
         quant_kwargs = {}
-        if server_args.quantization in {"fp8", "mxfp4", "kitchen_int8"}:
+        if server_args.quantization in {"fp8", "mxfp4", "convrot_int8"}:
             quant_kwargs["ignored_layers"] = getattr(
                 server_args, "quantization_ignored_layers", None
             )
@@ -1133,7 +1083,7 @@ def _resolve_quant_config(
             fallback_group_size = getattr(quant_config, "group_size", None)
         inferred_nvfp4_config = build_nvfp4_config_from_safetensors_list(
             safetensors_list,
-            param_names_mapping_dict,
+            quant_param_names_mapping_dict,
             reverse_param_names_mapping_dict,
             fallback_group_size,
         )
