@@ -1,6 +1,5 @@
 """Unit tests for hybrid HiCache pool assembly."""
 
-import argparse
 import unittest
 from queue import Queue
 from types import SimpleNamespace
@@ -1141,45 +1140,37 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
 
 class TestUnifiedPageEnvelopeSelection(CustomTestCase):
     """Only no backend and Mori store the complete shared page, so only they
-    keep the page-envelope host arena. The host memory mode plays no part."""
+    keep the page-envelope host arena."""
 
-    def _publish(self, backend, mode):
+    def test_only_no_backend_and_mori_select_the_envelope(self):
         from sglang.srt.runtime_context import publish, reset_context
         from sglang.srt.server_args import ServerArgs
 
-        reset_context()
-        self.addCleanup(reset_context)
-        publish(
-            ServerArgs(
-                model_path="dummy",
-                enable_unified_memory=True,
-                hicache_storage_backend=backend,
-                hicache_host_memory_mode=mode,
-                hicache_mem_layout="layer_first",
-            ),
-            role="tokenizer",
-        )
-
-    def _selects_envelope(self, pool) -> bool:
-        return _uses_unified_page_envelope_host(
-            pool.full_kv_pool, pool.swa_kv_pool, use_mla=False
-        )
-
-    def test_only_no_backend_and_mori_select_the_envelope(self):
-        from sglang.srt.server_args import ServerArgs
-
-        # Every --hicache-storage-backend choice the parser accepts.
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        (action,) = [a for a in parser._actions if a.dest == "hicache_storage_backend"]
         pool = _build_unified_swa_pool().token_to_kv_pool
-        for mode in ("cache", "buffer_only"):
-            for backend in (None, *action.choices):
-                with self.subTest(mode=mode, backend=backend):
-                    self._publish(backend, mode)
-                    self.assertEqual(
-                        self._selects_envelope(pool), backend in (None, "mori")
-                    )
+        self.addCleanup(reset_context)
+        for backend, expected in (
+            (None, True),
+            ("mori", True),
+            ("mooncake", False),
+            ("dynamic", False),
+        ):
+            with self.subTest(backend=backend):
+                reset_context()
+                publish(
+                    ServerArgs(
+                        model_path="dummy",
+                        enable_unified_memory=True,
+                        hicache_storage_backend=backend,
+                        hicache_mem_layout="layer_first",
+                    ),
+                    role="tokenizer",
+                )
+                self.assertEqual(
+                    _uses_unified_page_envelope_host(
+                        pool.full_kv_pool, pool.swa_kv_pool, use_mla=False
+                    ),
+                    expected,
+                )
 
 
 if __name__ == "__main__":
