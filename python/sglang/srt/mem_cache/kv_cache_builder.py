@@ -61,6 +61,7 @@ from sglang.srt.utils import ceil_align, is_hip
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.tp_worker import BaseTpWorker
+    from sglang.srt.mem_cache.events import LoRANameTable
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -269,6 +270,7 @@ def build_kv_cache(
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
     dynamo_kv_event_format: bool = False,
+    kv_event_lora_names: Optional[LoRANameTable] = None,
 ) -> KVCacheBuildResult:
     parallel = get_parallel()
     sliding_window_size: Optional[int] = None
@@ -361,6 +363,7 @@ def build_kv_cache(
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         dynamo_kv_event_format=dynamo_kv_event_format,
+        kv_event_lora_names=kv_event_lora_names,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,

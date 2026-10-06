@@ -463,6 +463,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             enabled=params.enable_kv_cache_events,
             page_size=self.page_size,
             dynamo_format=params.dynamo_kv_event_format,
+            lora_names=params.kv_event_lora_names,
         )
 
         self.reset()

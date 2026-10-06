@@ -2106,6 +2106,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                     medium,
                     cache_salt,
                     session_id,
+                    extra_key,
                 } => {
                     let item: Py<PyAny> = (
                         "block_stored",
@@ -2116,6 +2117,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                         medium.as_str(),
                         cache_salt.map(|salt| salt.to_string()),
                         session_id.map(|session_id| session_id.to_string()),
+                        extra_key.map(|extra_key| extra_key.to_string()),
                     )
                         .into_py(py);
                     list.append(item)?;

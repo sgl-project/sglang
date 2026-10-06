@@ -527,7 +527,7 @@ pub struct CacheInitParams {
     pub has_swa_host_pool: bool,
     /// Whether tree mutations emit BlockStored/BlockRemoved events.
     pub enable_kv_cache_events: bool,
-    /// If true, events use the dynamo format with namespaced block hashes.
+    /// If true, events use the dynamo format: namespaced block hashes and extra_key.
     pub dynamo_kv_event_format: bool,
     /// Chunk alignment for the mamba branching seqlen; None when Mamba is disabled.
     pub mamba_cache_chunk_size: Option<usize>,
@@ -621,7 +621,7 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) has_swa_host_pool: bool,
     /// Whether tree mutations emit BlockStored/BlockRemoved events.
     pub(crate) enable_kv_cache_events: bool,
-    /// If true, events use the dynamo format with namespaced block hashes.
+    /// If true, events use the dynamo format: namespaced block hashes and extra_key.
     pub(crate) dynamo_kv_event_format: bool,
     /// Queued placement events, drained by take_events.
     pub(crate) kv_event_queue: Vec<KvCacheEvent<K::Atom>>,
@@ -3181,6 +3181,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     medium,
                     cache_salt,
                     session_id,
+                    ..
                 },
             ) if *tail_medium == medium
                 && *tail_block_size == block_size
@@ -3266,6 +3267,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.arena.node_mut(node_id).hash_value = Some(hash_values);
         }
         let cache_salt = self.arena.node(node_id).namespace.cache_salt_arc();
+        // Python reads the LoRA adapter name from extra_key in the dynamo format.
+        let extra_key = self
+            .dynamo_kv_event_format
+            .then(|| self.arena.node(node_id).namespace.extra_key_arc())
+            .flatten();
         let session_id: Option<Arc<str>> = session_id.map(Arc::from);
         let namespaced = self.arena.node(node_id).namespace != KeyNamespace::default();
         if namespaced {
@@ -3302,6 +3308,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     medium,
                     cache_salt: cache_salt.clone(),
                     session_id: session_id.clone(),
+                    extra_key: extra_key.clone(),
                 });
                 parent_block_hash = Some(block_hash);
             };
@@ -5721,6 +5728,9 @@ pub enum KvCacheEvent<A> {
         medium: StorageMedium,
         cache_salt: Option<Arc<str>>,
         session_id: Option<Arc<str>>,
+        /// Set only in the dynamo format, and not published. Python uses it to
+        /// find the LoRA adapter name.
+        extra_key: Option<Arc<str>>,
     },
     BlockRemoved {
         block_hashes: Vec<i64>,

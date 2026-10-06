@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.events import LoRANameTable
 from sglang.srt.mem_cache.evict_policy import TLRUStrategy
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -1654,13 +1655,17 @@ def test_salted_events_match_python_hash_and_metadata_contract():
     ]
 
 
-def test_dynamo_format_events_match_python_hashes():
-    """In the dynamo format, the Rust tree publishes the Python namespaced hashes."""
+def test_dynamo_format_events_match_python_hashes_and_name_the_adapter():
+    """In the dynamo format, the Rust tree publishes the Python namespaced hashes
+    and the adapter name."""
     lora_id = "a" * 32
+    lora_names = LoRANameTable()
+    lora_names.register(lora_id=lora_id, lora_name="adapter-a")
     core = _tree_core(
         enable_kv_cache_events=True,
         page_size=2,
         dynamo_kv_event_format=True,
+        kv_event_lora_names=lora_names,
     )
     key = RadixKey(array("q", [1, 2, 7, 8]), extra_key="user-" + lora_id)
     _pump_insert(
@@ -1682,6 +1687,7 @@ def test_dynamo_format_events_match_python_hashes():
             block_size=2,
             lora_id=None,
             medium=StorageMedium.GPU,
+            lora_name="adapter-a",
         )
     ]
 

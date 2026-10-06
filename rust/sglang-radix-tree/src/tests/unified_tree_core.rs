@@ -3090,6 +3090,7 @@ fn insert_coalesces_parent_linked_block_stores() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
     // Events hash lazily even though the storage tier is off.
@@ -3127,6 +3128,7 @@ fn insert_attributes_stored_blocks_to_session_without_changing_hashes() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: Some(Arc::from("session-a")),
+            extra_key: None,
         }]
     );
 }
@@ -3202,6 +3204,7 @@ fn extra_key_nodes_publish_token_only_event_hashes() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 
@@ -3295,6 +3298,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: None,
         session_id: None,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 1);
     // A different block size must not join the parent-linked store tail.
@@ -3306,6 +3310,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: None,
         session_id: None,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 2);
     // Matching size and parent are still separated across media.
@@ -3317,6 +3322,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Cpu,
         cache_salt: None,
         session_id: None,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 3);
     // Matching size and medium are still separated without the parent link.
@@ -3328,6 +3334,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Cpu,
         cache_salt: None,
         session_id: None,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 4);
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
@@ -3371,6 +3378,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: Some(Arc::from("tenant-a")),
         session_id: None,
+        extra_key: None,
     });
     tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
         block_hashes: vec![2],
@@ -3380,6 +3388,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: Some(Arc::from("tenant-b")),
         session_id: None,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 2);
 }
@@ -3568,6 +3577,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 }
@@ -3592,6 +3602,7 @@ fn finish_write_through_emits_cpu_stored_events() {
             medium: StorageMedium::Cpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 }
@@ -3648,6 +3659,7 @@ fn load_back_commit_emits_gpu_stored_events() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 }
@@ -3668,6 +3680,7 @@ fn unevict_on_insert_emits_a_gpu_stored_event() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 }
@@ -3757,6 +3770,7 @@ fn split_insert_stores_only_the_new_block_chained_to_the_split_parent() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
     // The split divided the page hashes between the two fragments.
@@ -3839,6 +3853,7 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
             medium: StorageMedium::Cpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
     // The matching ack cleared the pending mark on both fragments.
@@ -4170,6 +4185,7 @@ fn insert_host_publishes_a_host_store_event() {
             medium: StorageMedium::Cpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 }

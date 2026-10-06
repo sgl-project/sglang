@@ -7,6 +7,7 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.events import LoRANameTable
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.mem_cache.unified_cache.components import ComponentType
     from sglang.srt.mem_cache.unified_cache.components.base import (
@@ -34,6 +35,8 @@ class CacheInitParams:
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False
     dynamo_kv_event_format: bool = False
+    # The scheduler holds the same table and adds each adapter when it loads.
+    kv_event_lora_names: Optional[LoRANameTable] = None
     enable_session_radix_cache: bool = False
 
     enable_mamba_extra_buffer: bool = False

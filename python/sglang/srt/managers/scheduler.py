@@ -296,6 +296,7 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.events import LoRANameTable
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -563,6 +564,7 @@ class Scheduler(
             time.sleep(t)
 
         # Init cache and memory pool
+        self.init_kv_event_lora_names()
         result = kv_cache_builder.build_kv_cache(
             server_args=self.server_args,
             model_config=self.model_config,
@@ -576,6 +578,7 @@ class Scheduler(
                 and get_parallel().attn_tp_rank == 0
                 and get_parallel().attn_cp_rank == 0
             ),
+            kv_event_lora_names=self.kv_event_lora_names,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
             hicache_draft_plan=(
                 self.draft_worker.hicache_draft_plan
@@ -2388,6 +2391,10 @@ class Scheduler(
         if self.pp_group is not None:
             groups += [self.pp_group]
         rank_consensus_checker.configure(groups)
+
+    def init_kv_event_lora_names(self) -> None:
+        """Init the table that maps lora_id to adapter name for KV events."""
+        self.kv_event_lora_names = LoRANameTable.from_lora_refs(get_lora().lora_paths)
 
     def init_kv_events_publisher(self) -> None:
         self.kv_events_publisher = SchedulerKvEventsPublisher(
@@ -5651,6 +5658,10 @@ class Scheduler(
         """In-place loading a new lora adapter from disk or huggingface."""
 
         result = self.tp_worker.load_lora_adapter(recv_req)
+        if result.success:
+            self.kv_event_lora_names.register(
+                lora_id=recv_req.lora_id, lora_name=recv_req.lora_name
+            )
         return result
 
     def load_lora_adapter_from_tensors(
@@ -5659,6 +5670,10 @@ class Scheduler(
         """In-place loading a new lora adapter from serialized tensors."""
 
         result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
+        if result.success:
+            self.kv_event_lora_names.register(
+                lora_id=recv_req.lora_id, lora_name=recv_req.lora_name
+            )
         return result
 
     def unload_lora_adapter(

@@ -44,7 +44,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.events import KVCacheEventRecorder, LoRANameTable
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.utils import get_device
 from sglang.test.test_utils import CustomTestCase
@@ -131,6 +131,17 @@ class TestKVCacheEventQueue(unittest.TestCase):
         queue.enqueue(self._store(1, None, session_id="session-a"))
         queue.enqueue(self._store(2, 1, session_id="session-b"))
         self.assertEqual(len(queue.take()), 2)
+
+
+class TestLoRANameTable(unittest.TestCase):
+    def test_resolves_the_lora_id_suffix_of_extra_key(self):
+        lora_id = "0123456789abcdef0123456789abcdef"
+        table = LoRANameTable()
+        table.register(lora_id=lora_id, lora_name="adapter-a")
+
+        # Req adds lora_id to the end of the extra_key from the caller.
+        self.assertEqual(table.resolve("tenant-" + lora_id), "adapter-a")
+        self.assertIsNone(table.resolve("tenant-" + "f" * 32))
 
 
 class TestRadixKey(unittest.TestCase):
@@ -754,6 +765,8 @@ class TestRadixCache(CustomTestCase):
         """Adapter blocks and base blocks with the same tokens share block hashes in
         the default format. The dynamo format gives them different hashes."""
         lora_id = "0123456789abcdef0123456789abcdef"
+        lora_names = LoRANameTable()
+        lora_names.register(lora_id=lora_id, lora_name="adapter-a")
         tokens = [1, 2, 3, 4]
         mock_allocator = unittest.mock.Mock()
         mock_allocator.device = torch.device("cpu")
@@ -762,6 +775,7 @@ class TestRadixCache(CustomTestCase):
             page_size=2,
             enable_kv_cache_events=True,
             dynamo_kv_event_format=True,
+            kv_event_lora_names=lora_names,
         )
         for extra_key in (None, lora_id):
             cache.insert(
@@ -773,6 +787,7 @@ class TestRadixCache(CustomTestCase):
 
         base, lora = [e for e in cache.take_events() if isinstance(e, BlockStored)]
         self.assertNotEqual(lora.block_hashes, base.block_hashes)
+        self.assertEqual(lora.lora_name, "adapter-a")
 
         cache.evict(EvictParams(num_tokens=2 * len(tokens)))
         removed = [
