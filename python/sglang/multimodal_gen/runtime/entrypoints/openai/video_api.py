@@ -27,6 +27,9 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.prompt_enhancement import (
+    maybe_enhance_prompt,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
     VideoListResponse,
@@ -267,6 +270,8 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
 
     kwargs = {
         "prompt": request.prompt,
+        "task_type": request.task_type,
+        "request_data_type": DataType.VIDEO,
         "num_outputs_per_prompt": max(1, min(int(num_outputs), 10)),
         "size": request.size,
         "width": request.width,
@@ -304,6 +309,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "output_path": request.output_path,
         "quality": _extra_value(request, "quality"),
         "output_compression": request.output_compression,
+        "x264_preset": request.x264_preset,
         "output_quality": request.output_quality,
         "perf_dump_path": request.perf_dump_path,
         "profile": request.profile,
@@ -465,12 +471,14 @@ async def create_video(
     request: Request,
     # multipart/form-data fields (optional; used only when content-type is multipart)
     prompt: Optional[str] = Form(None),
+    enhance_prompt: Optional[bool] = Form(None),
     input_reference: Optional[UploadFile] = File(None),
     reference_url: Optional[str] = Form(None),
     video_reference: Optional[UploadFile] = File(None),
     video_url: Optional[str] = Form(None),
     video_path: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
+    task_type: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     num_outputs_per_prompt: Optional[int] = Form(None),
     seconds: Optional[int] = Form(None),
@@ -496,6 +504,7 @@ async def create_video(
     upscaling_scale: Optional[int] = Form(None),
     output_quality: Optional[str] = Form(None),
     output_compression: Optional[int] = Form(None),
+    x264_preset: Optional[str] = Form(None),
     output_path: Optional[str] = Form(None),
     perf_dump_path: Optional[str] = Form(None),
     extra_params: Optional[str] = Form(None),
@@ -505,7 +514,6 @@ async def create_video(
     request_id = generate_request_id()
 
     server_args = get_global_server_args()
-    task_type = server_args.pipeline_config.task_type
     is_multipart = "multipart/form-data" in content_type
     raw_form: Any = None
     extra_from_form: Dict[str, Any] = {}
@@ -563,12 +571,6 @@ async def create_video(
             video_input_path = reference_url
             image_sources = merge_image_input_list(input_reference)
 
-        # Validate image input based on model task type
-        if task_type.requires_image_input() and not image_sources:
-            raise HTTPException(
-                status_code=400,
-                detail="input_reference or reference_url is required for image-to-video generation",
-            )
         input_path = None
         if image_sources:
             try:
@@ -607,10 +609,12 @@ async def create_video(
 
         req = VideoGenerationsRequest(
             prompt=prompt,
+            enhance_prompt=form_value("enhance_prompt", enhance_prompt) or False,
             input_reference=input_path,
             video_path=form_value("video_path", video_input_path),
             video_url=form_value("video_url", video_url),
             model=form_value("model", model),
+            task_type=form_text_value("task_type", task_type),
             n=form_value("n", n),
             num_outputs_per_prompt=form_value(
                 "num_outputs_per_prompt", num_outputs_per_prompt
@@ -647,6 +651,7 @@ async def create_video(
             ),
             upscaling_scale=form_value("upscaling_scale", upscaling_scale),
             output_compression=form_value("output_compression", output_compression),
+            x264_preset=form_value("x264_preset", x264_preset),
             output_quality=form_value("output_quality", output_quality),
             output_path=form_value("output_path", output_path),
             perf_dump_path=form_value("perf_dump_path", perf_dump_path),
@@ -683,18 +688,6 @@ async def create_video(
             if _is_probably_video_source(payload.get("input_reference")):
                 payload.setdefault("video_path", payload.get("input_reference"))
 
-            has_image_input = (
-                payload.get("reference_url")
-                and not _is_probably_video_source(payload.get("reference_url"))
-            ) or (
-                payload.get("input_reference")
-                and not _is_probably_video_source(payload.get("input_reference"))
-            )
-            if task_type.requires_image_input() and not has_image_input:
-                raise HTTPException(
-                    status_code=400,
-                    detail="input_reference or reference_url is required for image-to-video generation",
-                )
             # for non-multipart/form-data type
             if payload.get("reference_url") and not _is_probably_video_source(
                 payload.get("reference_url")
@@ -730,10 +723,20 @@ async def create_video(
     logger.debug(f"Server received from create_video endpoint: req={req}")
 
     try:
+        image_path = _resolve_image_path(req, _resolve_video_path(req))
+        req.prompt = await maybe_enhance_prompt(
+            request,
+            req.prompt,
+            enabled=req.enhance_prompt,
+            task="video",
+            image_paths=[image_path] if image_path else None,
+        )
         sampling_params = _build_video_sampling_params(request_id, req)
-    except (ValueError, TypeError) as e:
+    except (asyncio.CancelledError, HTTPException, ValueError, TypeError) as e:
         for td in temp_dirs:
             shutil.rmtree(td, ignore_errors=True)
+        if isinstance(e, (asyncio.CancelledError, HTTPException)):
+            raise
         raise HTTPException(status_code=400, detail=str(e))
 
     batch: Req | None = None
@@ -766,6 +769,8 @@ async def create_video(
             sampling_params,
             server_args.served_model_name,
         )
+        if req.enhance_prompt:
+            job["revised_prompt"] = req.prompt
         job.update(sampling_params.project_video_queued_job_fields(batch))
         await VIDEO_STORE.upsert(request_id, job)
     except Exception as e:

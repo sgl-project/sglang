@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
     VERBOSE: bool = False
+    SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
     SGLANG_DIFFUSION_HOST_SPILL_DIR: str = os.path.expanduser(
@@ -47,7 +48,9 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
+    SGLANG_DIFFUSION_CONVROT_INT8_BACKEND: str = "auto"
     SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
+    SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -253,6 +256,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE": _lazy_int(
         "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE", 4
     ),
+    # Drop the SP tail-pad attention mask and run dense (unmasked) attention on
+    # the padded layout, instead of the packed-varlen path. Applies only when
+    # sequence parallelism is active and the mask is derived purely from the
+    # shard pad span.
+    "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK"
+    ),
     # Select a built-in platform or an installed platform entry point.
     # Empty means automatic plugin activation followed by built-in detection.
     "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
@@ -328,11 +338,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
         "SGLANG_DIFFUSION_CFG_GATE_STEP", 1.0
     ),
+    # Kernel backend for convrot_int8 (online or serialized ConvRot INT8):
+    # "auto" prefers SGLang's JIT-compiled convrot_int8 ops where they build
+    # and run (CC 9.0, 10.0, 12.0, 12.1 with nvcc) and falls back to
+    # comfy_kitchen; "jit" or "comfy_kitchen" forces one backend.
+    "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND", "auto"
+    ),
     # Path to a Parallel Decoding Distillation head stack (one fused output head
     # per denoise step, produced by fuse_minimax_h3_pdd_heads.py). Set only when serving a
     # PDD-distilled checkpoint; an ordinary run leaves the projection alone.
     "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS": _lazy_str(
         "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS"
+    ),
+    # NATTEN backend of the FLUX 3 video VAE (blackwell-fna, hopper-fna,
+    # cutlass-fna or flex-fna); probed per GPU when unset.
+    "SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND"
     ),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"

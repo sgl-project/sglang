@@ -25,7 +25,7 @@ Everything SP lives here so the feature stays decoupled from model code and from
 
   - which models opt in (the Qwen3-dense allowlist) and config validation,
   - the per-forward ``sp_active`` flag (a ForwardFlags bool) read at depth by the
-    participant linears and the ``LayerCommunicator``,
+    participant linears and the layer-boundary batch selector,
   - the entry-scatter / exit-gather collectives, and
   - the fused matmul + collective fast-paths for the participant linears.
 
@@ -47,7 +47,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.common import ceil_align
 
 # Architectures whose decoder layers route attention/MLP through
-# ``LayerCommunicator`` with the standard participant linears, and for which SP
+# layer boundaries with the standard participant linears, and for which SP
 # has been validated. Other models reject --enable-layernorm-sp at construction.
 # The mechanism is generic; extend the allowlist as families are validated.
 SP_SUPPORTED_ARCHITECTURES = frozenset({"Qwen3ForCausalLM"})

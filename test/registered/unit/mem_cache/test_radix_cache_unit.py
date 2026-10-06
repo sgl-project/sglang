@@ -291,46 +291,6 @@ class TestTreeNode(unittest.TestCase):
         node.value = torch.tensor([1, 2, 3])
         self.assertFalse(node.evicted)
 
-    def test_get_last_hash_value(self):
-        """Test get_last_hash_value method."""
-        node = TreeNode()
-        self.assertIsNone(node.get_last_hash_value())
-
-        node.hash_value = ["hash1", "hash2", "hash3"]
-        self.assertEqual(node.get_last_hash_value(), "hash3")
-
-    def test_get_prefix_hash_values_not_shared_across_calls(self):
-        """Regression guard for cached mutable prefix hash lists."""
-        for node_cls in (TreeNode,):
-            with self.subTest(node_cls=node_cls.__module__):
-                root = node_cls()
-                n1 = node_cls()
-                n1.parent = root
-                n1.hash_value = ["h1"]
-                n2 = node_cls()
-                n2.parent = n1
-                n2.hash_value = ["h2"]
-                n3 = node_cls()
-                n3.parent = n2
-                n3.hash_value = ["h3"]
-
-                first = n3.get_prefix_hash_values(n2)
-                self.assertEqual(first, ["h1", "h2"])
-
-                # Downstream storage code extends prefix_keys in place while
-                # processing pages. A cached list must not be observable by a
-                # later call.
-                first += ["h3"]
-
-                second = n3.get_prefix_hash_values(n2)
-                self.assertEqual(second, ["h1", "h2"])
-                self.assertIsNot(second, first)
-
-                n4 = node_cls()
-                n4.parent = n3
-                n4.hash_value = ["h4"]
-                self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
-
 
 class TestRadixCache(CustomTestCase):
     """Test cases for RadixCache class."""
@@ -453,7 +413,7 @@ class TestRadixCache(CustomTestCase):
         )
         self.assertEqual(cache.total_size(), 5)
 
-    def test_cache_unfinished_req_deferred_free_owns_original_indices(self):
+    def test_checkpoint_deferred_free_owns_original_indices(self):
         class ReqToTokenPool:
             def __init__(self, row):
                 self.req_to_token = row.unsqueeze(0)
@@ -488,11 +448,13 @@ class TestRadixCache(CustomTestCase):
             priority=0,
             last_node=cache.root_node,
         )
-        req.get_fill_ids.return_value = token_ids
+        req.full_untruncated_fill_ids = token_ids
+        req.origin_input_ids = token_ids
+        req.output_ids = array("q")
 
         available_before_free = allocator.available_size()
         allocator.free_group_begin()
-        cache.cache_unfinished_req(req)
+        cache.checkpoint(req, up_to=len(token_ids))
         allocator.free_group_end()
 
         self.assertEqual(
@@ -508,6 +470,9 @@ class TestRadixCache(CustomTestCase):
         class ReqToTokenPool:
             def __init__(self, row):
                 self.req_to_token = row.unsqueeze(0)
+
+            def write(self, indices, values):
+                self.req_to_token[indices] = values
 
         allocator = TokenToKVPoolAllocator(
             size=16,
@@ -525,6 +490,7 @@ class TestRadixCache(CustomTestCase):
         req = unittest.mock.Mock(
             origin_input_ids=prompt_ids,
             output_ids=output_ids,
+            full_untruncated_fill_ids=prompt_ids + output_ids,
             kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0),
             extra_key=None,
             cache_salt=None,
@@ -532,11 +498,10 @@ class TestRadixCache(CustomTestCase):
             last_node=cache.root_node,
         )
 
-        cache.cache_finished_req(
-            req,
-            is_insert=True,
-            owned_kv_len=len(prompt_ids) + len(output_ids),
-        )
+        up_to = len(prompt_ids) + len(output_ids)
+        cache.checkpoint(req, up_to=up_to)
+        cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, up_to)])
+        cache.unpin(req)
 
         (prompt_node,) = cache.root_node.children.values()
         (output_node,) = prompt_node.children.values()

@@ -295,6 +295,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 )
             extra_config["dram_page_size"] = dram_page_size
 
+        # TODO: `tp_rank` is the rank in the cache TP group but `tp_size` is the
+        # full TP width, and no `dp_rank` is set, unlike
+        # `HiCacheController._generate_storage_config`. Aligning the
+        # storage-config producers changes persisted storage keys, so it waits
+        # for a storage-key format change.
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
             tp_size=get_parallel().tp_size,
@@ -456,10 +461,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         # No layer suffix: one object per page (or per page component) holds
         # every layer, and a layer is read back as a byte range inside it.
         return component_keys, multiplier
-
-    def _object_keys(self, transfer: PoolTransfer) -> list[str]:
-        keys, _ = self._object_keys_for_pages(list(transfer.keys or []), transfer)
-        return keys
 
     def _page_exists(self, page_keys: list[str], transfer: PoolTransfer) -> list[bool]:
         entry = self.pools[transfer.name]
