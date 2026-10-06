@@ -98,8 +98,9 @@ _masked_standard_layout_memory_budget_bytes: Optional[int] = None
 # Cake (FlashInfer) contiguous grouped FP8 GEMM route, opt-in via
 # ``SGLANG_CAKE_ROUTES=moe_fp8_grouped``.
 #
-# Both expert GEMMs run on FlashInfer prepared runners (block-scaled contract,
-# see ``sglang.kernels.cake_kernels.gemm_grouped_fp8``).  A runner binds the
+# Both expert GEMMs run on FlashInfer prepared runners (block-scaled contract
+# of FlashInfer PR #6048, SM100a / SM103a; see
+# ``sglang.kernels.cake_kernels.gemm_grouped_fp8``).  A runner binds the
 # expert weights and their packed UE8M0 int32 scales; every call rebinds the
 # per-token operands -- the dispatcher's E4M3 rows, its packed UE8M0 int32
 # activation scales (MN-major ``(1, M)`` strides included) and ``m_indices``
@@ -107,16 +108,23 @@ _masked_standard_layout_memory_budget_bytes: Optional[int] = None
 # natively -- through ``launch(a=..., a_scale=..., m_indices=..., out=...)``.
 # No staging copies, no scale conversion, no padding fill, no stream
 # synchronisation; the down GEMM writes the caller-owned output directly.
-# Runners are cached per (per-token operand geometry, weights, alignment) and
-# prepared eagerly outside CUDA-graph capture.
+# Runners are cached per (per-token operand geometry, weights, alignment),
+# prepared eagerly outside CUDA-graph capture and released from the per-token
+# tensors they were prepared on (``release_prepared_operands``), so a cached
+# plan pins no batch buffers.
 # Admission is all-or-nothing: both expert GEMMs run on Cake or the call falls
-# through to the unchanged DeepGEMM code below.
+# through to the unchanged DeepGEMM code below, always with a logged reason.
 #
 # The fused gate_up GEMM + SwiGLU + FP8-quant FlashInfer entry stays unused:
-# it only accepts FP32 scales and emits FP32 output scales, which would force
-# the slower FP32 family on the down GEMM, and converting the dispatcher's
-# UE8M0 scales is exactly what this route no longer does (CAKE-929).  Re-enable
-# it once that entry speaks the block-scaled contract.
+# on FlashInfer main (PR #6049 unmerged) its ``launch()`` takes no operands,
+# it only accepts FP32 scales and rejects ``-1`` rows, so using it would bring
+# back the staging copies and scale conversion this route removed.
+# Re-enable it once that entry speaks the per-call block-scaled contract.
+#
+# The masked (batch DeepGEMM) MoE path has no Cake backend here: FlashInfer's
+# ``prepare_batch_deepgemm_fp8_nt_groupwise`` (PR #6044) binds every operand
+# at prepare, owns a fixed ``(N, K)`` band that excludes this route's models
+# and accepts packed UE8M0 scales only for two DeepSeek geometries.
 # ---------------------------------------------------------------------------
 
 _CAKE_ROUTE = "moe_fp8_grouped"
@@ -127,6 +135,8 @@ _CAKE_SCALE_BLOCK = 128
 # DeepGEMM at DeepGEMM's own 32/64/96/224 alignments on every shape (CAKE-931).
 _CAKE_LAYOUT_ALIGNMENT = 128
 _CAKE_ALIGNMENT_MULTIPLE = 32
+# FlashInfer requires 16-byte aligned storage for every launch operand.
+_CAKE_STORAGE_ALIGNMENT = 16
 _cake_logged: Dict[str, bool] = {}
 
 
@@ -470,10 +480,11 @@ class _CakeContigFp8Route:
     A plan (one prepared runner per GEMM) is keyed by the per-token operand
     geometry (``M``, ``K``, scale dtype and strides), the expert weight storage
     and the layout alignment; it is prepared once, eagerly, outside CUDA-graph
-    capture and rebound to the caller's tensors on every call.  Runners hold
-    descriptor workspace only, so the cache costs nothing per batch size
-    beyond that; the per-call intermediates (gate_up BF16, down input E4M3 +
-    scales) are ordinary allocations like the DeepGEMM path's.
+    capture, released from the tensors it was prepared on and rebound to the
+    caller's tensors on every call.  Runners own no descriptor storage and no
+    per-token device memory, so the cache costs nothing per batch size; the
+    per-call intermediates (gate_up BF16, down input E4M3 + scales) are
+    ordinary allocations like the DeepGEMM path's.
     """
 
     def __init__(self) -> None:
@@ -488,6 +499,23 @@ class _CakeContigFp8Route:
             if req.layout_alignment is not None
             else _CAKE_LAYOUT_ALIGNMENT
         )
+
+    @staticmethod
+    def _per_call_reject_reason(req: _CakeContigRequest) -> Optional[str]:
+        """Storage alignment of this call's dispatcher tensors.
+
+        ``launch`` rebinds them and FlashInfer requires 16-byte aligned storage
+        for every operand (shapes, dtypes and strides are pinned by the plan
+        key).  Checked before any allocation so a rejected call costs nothing.
+        """
+        for name, tensor in (
+            ("hidden_states", req.hidden_states),
+            ("hidden_states_scale", req.hidden_states_scale),
+            ("m_indices", req.m_indices),
+        ):
+            if tensor.data_ptr() % _CAKE_STORAGE_ALIGNMENT:
+                return f"{name} storage is not {_CAKE_STORAGE_ALIGNMENT}-byte aligned"
+        return None
 
     @classmethod
     def _static_reject_reason(cls, req: _CakeContigRequest) -> Optional[str]:
@@ -651,24 +679,33 @@ class _CakeContigFp8Route:
                 f"down GEMM not admitted (M={m} N={k} K={h} G={groups} "
                 f"scales={family} alignment={alignment})"
             )
-        gateup_runner = api.prepare_plain(
-            req.hidden_states,
-            req.w13_weight,
-            req.hidden_states_scale,
-            req.w13_scale,
-            req.m_indices,
-            ops.gateup,
-            **kwargs,
-        )
-        down_runner = api.prepare_plain(
-            down_input,
-            req.w2_weight,
-            down_input_scale,
-            req.w2_scale,
-            req.m_indices,
-            ops.out,
-            **kwargs,
-        )
+        # FlashInfer re-validates at prepare and may still refuse what the
+        # adapter's mirror admitted (route without a registered program on
+        # this device, grid below one cluster, ...): fall back with its reason.
+        try:
+            gateup_runner = api.prepare_plain(
+                req.hidden_states,
+                req.w13_weight,
+                req.hidden_states_scale,
+                req.w13_scale,
+                req.m_indices,
+                ops.gateup,
+                **kwargs,
+            )
+            down_runner = api.prepare_plain(
+                down_input,
+                req.w2_weight,
+                down_input_scale,
+                req.w2_scale,
+                req.m_indices,
+                ops.out,
+                **kwargs,
+            )
+        except (ValueError, TypeError, NotImplementedError, RuntimeError) as exc:
+            return None, (
+                f"FlashInfer refused to prepare the runners (M={m} N={n} K={k} "
+                f"G={groups} scales={family} alignment={alignment}): {exc}"
+            )
         # The plan outlives this call's tensors: drop the runners' references to
         # the operands they were prepared on (every launch rebinds all of them),
         # otherwise one full-size activation set per layer stays pinned.
@@ -704,6 +741,13 @@ class _CakeContigFp8Route:
         if reason is not None:
             _cake_log_once(
                 "fallback", f"Cake {_CAKE_ROUTE}: DeepGEMM fallback, {reason}"
+            )
+            return None
+        reason = self._per_call_reject_reason(req)
+        if reason is not None:
+            _cake_log_once(
+                "per_call_fallback",
+                f"Cake {_CAKE_ROUTE}: DeepGEMM fallback for this call, {reason}",
             )
             return None
         alignment = self._alignment(req)

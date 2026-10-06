@@ -3,17 +3,18 @@
 The FlashInfer adapter, DeepGEMM and the SwiGLU/quant kernel are replaced by
 fakes; no GPU is needed.  Covered: route switch off -> DeepGEMM path (Cake API
 never touched); route on -> one prepared runner pair per (per-token geometry,
-weights, alignment), rebound to the caller's tensors on every call with the
-packed UE8M0 int32 scales and the ``-1`` padding rows passed through untouched
-and the output written in place; the down GEMM input produced by the
-DeepGEMM path's own activation stage (BF16 ``silu_and_mul`` then
-``sglang_per_token_group_quant_fp8`` by default, the fused FP32 kernel only
-with ``silu_mul_keep_fp32``) in its UE8M0 MN-major scale layout; the FP32
-scale family
-(``fill_padding``); mixed scale dtypes, non-32-multiple alignments and static
-shape mismatches -> DeepGEMM; first sight of a shape inside CUDA-graph capture
--> DeepGEMM fallback; the compact-layout alignment policy; the adapter's
-block-scaled contract probe and scale admission.
+weights, alignment), released from the tensors it was prepared on and rebound
+to the caller's tensors on every call with the packed UE8M0 int32 scales and
+the ``-1`` padding rows passed through untouched and the output written in
+place; the down GEMM input produced by the DeepGEMM path's own activation
+stage (BF16 ``silu_and_mul`` then ``sglang_per_token_group_quant_fp8`` by
+default, the fused FP32 kernel only with ``silu_mul_keep_fp32``) in its UE8M0
+MN-major scale layout; the FP32 scale family (``fill_padding``); mixed scale
+dtypes, non-32-multiple alignments, static shape mismatches, a FlashInfer
+refusal at prepare and misaligned per-call storage -> DeepGEMM with a logged
+reason; first sight of a shape inside CUDA-graph capture -> DeepGEMM fallback;
+the compact-layout alignment policy; the adapter's block-scaled contract probe
+and its mirror of the FlashInfer operand contract.
 """
 
 import os
@@ -65,17 +66,28 @@ class _FakeRunner:
         self.fill_padding, self.alignment = fill_padding, alignment
         self.launches = []
         self.released = False
+        # Layout of the prepared per-token operands; rebinding must keep it.
+        self.layout = {
+            key: (tuple(t.shape), t.dtype, tuple(t.stride()))
+            for key, t in bound.items()
+        }
 
     def release_prepared_operands(self):
+        """FlashInfer: drop the prepared per-token tensors; every later launch
+        must supply all four operands."""
         self.released = True
+        self.bound = None
 
     def launch(self, a=None, a_scale=None, m_indices=None, out=None):
         assert self.released, "plan runners must release their prepared operands"
         rebound = dict(a=a, a_scale=a_scale, m_indices=m_indices, out=out)
+        assert all(t is not None for t in rebound.values()), (
+            "released runner launched without all four operands"
+        )
         for key, tensor in rebound.items():
-            prepared = self.bound[key]
-            assert tensor.shape == prepared.shape and tensor.dtype == prepared.dtype
-            assert tensor.stride() == prepared.stride()
+            shape, dtype, stride = self.layout[key]
+            assert tuple(tensor.shape) == shape and tensor.dtype == dtype
+            assert tuple(tensor.stride()) == stride
         self.launches.append(rebound)
         self.log.append(self.name)
         out[m_indices >= 0] = CAKE_FILL  # ``-1`` rows are skipped natively
@@ -91,6 +103,8 @@ class _FakeApi:
         self.log = []
         self.prepared = []
         self.supports_calls = []
+        # Set to an exception to make ``prepare_plain`` refuse like FlashInfer.
+        self.prepare_error = None
 
     def device_available(self, device_index):
         return self.available
@@ -129,6 +143,8 @@ class _FakeApi:
         fill_padding=False,
         alignment=128,
     ):
+        if self.prepare_error is not None:
+            raise self.prepare_error
         runner = _FakeRunner(
             f"plain:{tuple(b.shape)}",
             self.log,
@@ -387,6 +403,9 @@ def test_route_on_rebinds_callers_tensors_per_call(api, fake_deepgemm, fake_silu
     assert len(api.prepared) == 2 and len(gateup.launches) == len(down.launches) == 2
     for runner in api.prepared:
         assert runner.alignment == 128 and runner.fill_padding is False
+        # Prepared on the first call's tensors, then released: a cached plan
+        # pins no batch buffers.
+        assert runner.released
     # Per-token operands are the dispatcher's own tensors: no staging copies,
     # no scale unpacking, ``-1`` padding passed through untouched.
     for launch, acts in zip(gateup.launches, (acts1, acts2)):
@@ -584,6 +603,80 @@ def test_down_gemm_not_admitted_is_all_or_nothing(api):
     assert api.prepared == []
 
 
+def test_flashinfer_refusal_at_prepare_falls_back_with_its_reason(api, caplog):
+    """FlashInfer re-validates at prepare (route without a program on this
+    device, grid below one cluster, ...); its message reaches the log and the
+    negative result is cached."""
+    api.prepare_error = ValueError("device cannot schedule one complete kernel cluster")
+    weights = _weights()
+    with caplog.at_level("INFO", logger=dg.logger.name):
+        assert dg._CAKE_CONTIG_FP8.try_run(_request(weights), _allocate_output) is None
+    assert api.prepared == []
+    assert any(
+        "refused to prepare" in rec.getMessage()
+        and "one complete kernel cluster" in rec.getMessage()
+        for rec in caplog.records
+    )
+    api.prepare_error = None
+    assert dg._CAKE_CONTIG_FP8.try_run(_request(weights), _allocate_output) is None
+    assert api.prepared == []
+
+
+def _offset_storage(tensor, *, byte_offset=8):
+    """Copy of a contiguous ``tensor`` living ``byte_offset`` bytes into a fresh
+    allocation (same shape / dtype / strides, storage not 16-byte aligned)."""
+    itemsize = tensor.element_size()
+    assert byte_offset % itemsize == 0
+    storage = torch.empty(tensor.numel() + 16 // itemsize, dtype=tensor.dtype)
+    offset = byte_offset // itemsize
+    view = storage[offset : offset + tensor.numel()].view(tensor.shape)
+    view.copy_(tensor)
+    assert view.data_ptr() % 16 == byte_offset % 16
+    return view
+
+
+def test_misaligned_per_call_storage_falls_back_without_allocating(
+    api, fake_silu_quant, caplog
+):
+    """``launch`` rebinds the dispatcher's tensors; FlashInfer needs 16-byte
+    aligned storage, so a misaligned call runs DeepGEMM (no plan is built or
+    poisoned) and the next aligned call takes the route."""
+    weights = _weights()
+    acts = _activations()
+    misaligned = SimpleNamespace(
+        hidden_states=_offset_storage(acts.hidden_states),
+        hidden_states_scale=acts.hidden_states_scale,
+        m_indices=acts.m_indices,
+    )
+    outputs = []
+
+    def allocate():
+        outputs.append(_allocate_output())
+        return outputs[-1]
+
+    with caplog.at_level("INFO", logger=dg.logger.name):
+        assert (
+            dg._CAKE_CONTIG_FP8.try_run(_request(weights, misaligned), allocate) is None
+        )
+    assert outputs == [] and api.prepared == [] and api.supports_calls == []
+    assert any(
+        "hidden_states storage is not 16-byte aligned" in rec.getMessage()
+        for rec in caplog.records
+    )
+    misaligned_indices = SimpleNamespace(
+        hidden_states=acts.hidden_states,
+        hidden_states_scale=acts.hidden_states_scale,
+        m_indices=_offset_storage(acts.m_indices),
+    )
+    assert (
+        dg._CAKE_CONTIG_FP8.try_run(_request(weights, misaligned_indices), allocate)
+        is None
+    )
+    assert outputs == [] and api.prepared == []
+    assert dg._CAKE_CONTIG_FP8.try_run(_request(weights, acts), allocate) is not None
+    assert len(outputs) == 1 and len(api.prepared) == 2
+
+
 @pytest.mark.parametrize(
     "overrides,reason",
     [
@@ -707,7 +800,7 @@ def test_alignment_policy_ignores_non_cuda_devices(policy_env):
 # -- adapter: block-scaled contract probe + scale admission --------------------
 
 
-def _fake_flashinfer(monkeypatch, *, new_contract):
+def _fake_flashinfer(monkeypatch, *, new_contract, release=True):
     def prepare_new(
         a,
         b,
@@ -746,7 +839,7 @@ def _fake_flashinfer(monkeypatch, *, new_contract):
             pass
 
     module.PreparedGroupGemmFp8NtGroupwiseContiguous = (
-        _PreparedNew if new_contract else _PreparedOld
+        _PreparedNew if new_contract and release else _PreparedOld
     )
     pkg_gemm = types.ModuleType("flashinfer.gemm")
     pkg = types.ModuleType("flashinfer")
@@ -770,6 +863,10 @@ def test_contract_probe_inspects_alignment_keyword(monkeypatch, _clear_contract_
     _fake_flashinfer(monkeypatch, new_contract=True)
     assert adapter.block_scaled_contract_available() is True
     _fake_flashinfer(monkeypatch, new_contract=False)
+    assert adapter.block_scaled_contract_available() is False
+    # The keywords alone are not enough: the runner must also release the
+    # prepared per-token operands (per-call binding contract).
+    _fake_flashinfer(monkeypatch, new_contract=True, release=False)
     assert adapter.block_scaled_contract_available() is False
     monkeypatch.delitem(sys.modules, "flashinfer.gemm.cake_grouped_fp8_gemm")
     monkeypatch.delitem(sys.modules, "flashinfer.gemm")
@@ -803,7 +900,7 @@ def test_alignment_ok():
     assert adapter.alignment_ok(None) and adapter.alignment_ok(32)
     assert adapter.alignment_ok(128) and adapter.alignment_ok(224)
     assert not adapter.alignment_ok(0) and not adapter.alignment_ok(48)
-    assert not adapter.alignment_ok(-32)
+    assert not adapter.alignment_ok(-32) and not adapter.alignment_ok(True)
 
 
 @pytest.mark.parametrize("contract", [True, False])
@@ -824,10 +921,105 @@ def test_scales_ok_per_family(monkeypatch, contract):
     assert not adapter._scales_ok(
         i32_a, i32_b_rows, **dict(common, allow_block_scaled=False)
     )
+    # FlashInfer reads ``4 * cols >= K / 128`` packed columns: extra columns are
+    # fine, too few are not.
+    assert (
+        adapter._scales_ok(
+            torch.ones((M, _scale_cols(K) + 1), dtype=torch.int32),
+            i32_b_rows,
+            **common,
+        )
+        is contract
+    )
     assert not adapter._scales_ok(
-        torch.ones((M, _scale_cols(K) + 1), dtype=torch.int32), i32_b_rows, **common
+        torch.ones((M, 0), dtype=torch.int32), i32_b_rows, **common
+    )
+    assert not adapter._scales_ok(
+        i32_a, torch.ones((G, N, 0), dtype=torch.int32), **common
+    )
+    # Packed scales must be contiguous or transpose-contiguous, 16-byte aligned.
+    strided = torch.ones((M, 2 * _scale_cols(K)), dtype=torch.int32)[:, ::2]
+    assert not adapter._scales_ok(strided, i32_b_rows, **common)
+    assert not adapter._scales_ok(
+        _offset_storage(i32_a.contiguous()), i32_b_rows, **common
+    )
+    assert not adapter._scales_ok(
+        i32_a, _offset_storage(i32_b_rows.contiguous()), **common
     )
     assert not adapter._scales_ok(fp32_a.t().contiguous().t(), fp32_b, **common)
+
+
+@pytest.fixture
+def plain_admission(monkeypatch):
+    """Treat CPU tensors as living on an admitted device with the new contract
+    installed, so ``supports_group_gemm_fp8_nt_groupwise_contiguous`` exercises
+    its operand mirror only."""
+    monkeypatch.setattr(adapter, "flashinfer_module_available", lambda *names: True)
+    monkeypatch.setattr(adapter, "cuda_tensor_on", lambda tensor, archs: True)
+    monkeypatch.setattr(adapter, "block_scaled_contract_available", lambda: True)
+    monkeypatch.setattr(adapter, "_programs_registered", lambda index, fused: True)
+
+
+def test_supports_plain_mirrors_flashinfer_operand_contract(plain_admission):
+    weights, acts = _weights(), _activations()
+    out = _allocate_output()
+    supports = adapter.supports_group_gemm_fp8_nt_groupwise_contiguous
+
+    def ok(**overrides):
+        args = dict(
+            a=acts.hidden_states,
+            b=weights.w13_weight,
+            a_scale=acts.hidden_states_scale,
+            b_scale=weights.w13_scale,
+            m_indices=acts.m_indices,
+            out=torch.empty((M, N), dtype=torch.bfloat16),
+            fill_padding=False,
+            alignment=128,
+        )
+        args.update(overrides)
+        return supports(
+            args["a"],
+            args["b"],
+            args["a_scale"],
+            args["b_scale"],
+            args["m_indices"],
+            args["out"],
+            fill_padding=args["fill_padding"],
+            alignment=args["alignment"],
+        )
+
+    assert ok()
+    assert ok(alignment=None) and ok(alignment=64)
+    assert not ok(alignment=48) and not ok(alignment=True)
+    # Block-scaled family: no fill_padding, 16-byte aligned output, N % 128.
+    assert not ok(fill_padding=True)
+    assert not ok(out=_offset_storage(torch.empty((M, N), dtype=torch.bfloat16)))
+    n_bad = N + 64
+    assert not ok(
+        b=torch.zeros((G, n_bad, K), dtype=torch.bfloat16).to(FP8),
+        b_scale=_packed_weight_scale(G, n_bad, K),
+        out=torch.empty((M, n_bad), dtype=torch.bfloat16),
+    )
+    # Every launch operand must be contiguous and 16-byte aligned.
+    assert not ok(a=_offset_storage(acts.hidden_states))
+    assert not ok(m_indices=_offset_storage(acts.m_indices))
+    assert not ok(m_indices=acts.m_indices.to(torch.int64))
+    assert not ok(out=out[:, :K])  # (M, K) instead of (M, N)
+    # FP32 family: fill_padding allowed, a 2-byte aligned output selects the
+    # scalar-store route.
+    fp32_w, fp32_a = _weights(fp32_scales=True), _activations(fp32_scales=True)
+    fp32 = dict(
+        a=fp32_a.hidden_states,
+        a_scale=fp32_a.hidden_states_scale,
+        b_scale=fp32_w.w13_scale,
+    )
+    assert ok(**fp32) and ok(**fp32, fill_padding=True)
+    assert ok(
+        **fp32,
+        out=_offset_storage(torch.empty((M, N), dtype=torch.bfloat16), byte_offset=2),
+    )
+    # Mixed scale families never qualify.
+    assert not ok(a_scale=fp32_a.hidden_states_scale)
 
 
 if __name__ == "__main__":
