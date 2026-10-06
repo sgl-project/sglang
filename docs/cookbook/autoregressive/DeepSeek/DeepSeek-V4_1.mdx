@@ -204,3 +204,102 @@ The Write policy knob controls the GPU → CPU write and defaults to `write_thro
 The card is not offered on MI350X: hierarchical cache has not been validated on ROCm for this model yet.
 
 Only the L2 tier is exposed here. For the storage (L3) tier and the canonical flag set, see the [HiCache best-practices recipe](../../../docs/advanced_features/hicache_best_practices) and the [HiCache documentation](../../../docs/advanced_features/hicache).
+
+### 3.6 B200 AgentX serving with DSpark
+
+The general-purpose deployment panel above uses SGLang's verified cells. For an AgentX-style workload with long, multi-turn tool traces, [InferenceX PR #3745](https://github.com/SemiAnalysisAI/InferenceX/pull/3745) exercised the following **four-B200-GPU** aggregate shapes from its [pinned recipe](https://github.com/SemiAnalysisAI/InferenceX/blob/322bc37b368c85828357afb57dce6739d94ef955/inferencex-e2e/benchmarks/single_node/srt-slurm-recipes/dsv41flash/sglang/b200-fp4-mtp/agentic.yaml) on `lmsysorg/sglang:nightly-dev-cu13-20261004-295a53c9@sha256:7cfd4dd8e0e902d2a3c0560565963c4e172091e1586aaed15ff5a0a131394d34`. The [successful sweep](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/37420473448) ran eight performance points and separate AgentX evals at concurrency 32 and 128. The performance harness used synthetic draft acceptance; the evals used normal verification. These settings are workload-specific and do not replace the deployment panel's general recommendations.
+
+Run either server command **inside that image**, with four B200 GPUs visible. Plan for sufficient CPU memory and huge pages for efficient host-resident Engram tables. The commands enable thinking by default to match the measured workload; applications can instead select reasoning per request.
+
+<Accordion title="TP4 / EP4 server (concurrency 1)">
+
+```bash Command
+SGLANG_DEFAULT_THINKING=1 \
+SGLANG_DSV41_REASONING_EFFORT=high \
+SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
+SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank \
+SGLANG_TIMEOUT_KEEP_ALIVE=900 \
+sglang serve \
+    --model-path deepseek-ai/DeepSeek-V4.1-Flash \
+    --served-model-name deepseek-ai/DeepSeek-V4.1-Flash \
+    --trust-remote-code \
+    --tp 4 --ep-size 4 \
+    --mem-fraction-static 0.76 \
+    --chunked-prefill-size 8192 \
+    --swa-prefix-tails 128 \
+    --max-running-requests 2 \
+    --schedule-policy lpm \
+    --prefill-decode-interval 16 \
+    --speculative-algorithm DSPARK \
+    --speculative-dspark-block-size 5 \
+    --cuda-graph-max-bs-decode 64 \
+    --reasoning-parser auto --tool-call-parser auto \
+    --watchdog-timeout 3600 \
+    --host 0.0.0.0 --port 30000
+```
+
+</Accordion>
+
+For the other TP4 points, replace the four tuning arguments in this command with the values below. Omit `--schedule-policy` where the table shows “default”; do not carry `lpm` over from the concurrency-1 example.
+
+| AgentX concurrency | `--swa-prefix-tails` | `--max-running-requests` | `--prefill-decode-interval` | `--schedule-policy` |
+| --- | ---: | ---: | ---: | --- |
+| 1 | 128 | 2 | 16 | `lpm` |
+| 4 | 128 | 8 | 192 | `lpm` |
+| 8 | 256 | 16 | 192 | `lpm` |
+| 16 | 512 | 32 | 96 | default |
+| 24 | 768 | 48 | 48 | default |
+| 32 | 1024 | 64 | 32 | default |
+
+At concurrency 48 and 128, the same four GPUs instead use TP4 / EP4 / DP4 with DP attention and a DP-aware SGLang router. This is **one aggregate server** with four DP attention ranks, not four independent TP4 replicas. Start the server first, then start the router; send application traffic to port 8000 and supply a stable `x-correlation-id` per conversation for cache-aware routing.
+
+<Accordion title="TP4 / EP4 / DP4 server (concurrency 48)">
+
+```bash Command
+SGLANG_DEFAULT_THINKING=1 \
+SGLANG_DSV41_REASONING_EFFORT=high \
+SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
+SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank \
+SGLANG_TIMEOUT_KEEP_ALIVE=900 \
+sglang serve \
+    --model-path deepseek-ai/DeepSeek-V4.1-Flash \
+    --served-model-name deepseek-ai/DeepSeek-V4.1-Flash \
+    --trust-remote-code \
+    --tp 4 --ep-size 4 --data-parallel-size 4 \
+    --enable-dp-attention \
+    --enable-dp-lm-head \
+    --enable-dp-attention-local-control-broadcast \
+    --load-balance-method total_requests \
+    --tokenizer-worker-num 8 \
+    --mem-fraction-static 0.76 \
+    --chunked-prefill-size 32768 \
+    --swa-prefix-tails 2048 \
+    --max-running-requests 256 \
+    --prefill-decode-interval 64 \
+    --speculative-algorithm DSPARK \
+    --speculative-dspark-block-size 5 \
+    --cuda-graph-max-bs-decode 64 \
+    --reasoning-parser auto --tool-call-parser auto \
+    --watchdog-timeout 3600 \
+    --host 0.0.0.0 --port 30000
+```
+
+</Accordion>
+
+For concurrency 128, change only `--prefill-decode-interval 64` to `--prefill-decode-interval 16`.
+
+<Accordion title="DP-aware router for the concurrency-48/128 server">
+
+```bash Command
+python3 -m sglang_router.launch_router \
+    --host 0.0.0.0 --port 8000 \
+    --policy cache_aware \
+    --request-id-headers x-correlation-id \
+    --dp-aware \
+    --connect-timeout-secs 900 \
+    --request-timeout-secs 14400 \
+    --disable-health-check --disable-retries \
+    --worker-urls http://127.0.0.1:30000
+```
+
+</Accordion>
