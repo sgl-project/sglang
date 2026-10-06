@@ -6,8 +6,8 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.kernels.ops.sampling import softmax as sampler_softmax
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -31,6 +31,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_xpu,
 )
 
 if is_cuda():
@@ -43,7 +44,7 @@ if is_cuda():
         top_p_renorm_prob,
     )
 
-if is_musa():
+if is_musa() or is_xpu():
     from sgl_kernel import (
         min_p_sampling_from_probs,
         top_k_renorm_prob,
@@ -73,7 +74,7 @@ logger = logging.getLogger(__name__)
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
-_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend", "intel_xpu"}
 
 
 def _trace_e2e_sampler(stage: str, **fields) -> None:
@@ -109,11 +110,13 @@ def _select_sampling_mask_rows(
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        self.tp_sync_group = get_tp_group().device_group
+        self.tp_sync_group = get_parallel().tp_group.device_group
         self.cp_sync_group = None
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
-            self.cp_sync_group = get_parallel().attn_cp_group.device_group
+            # Single-shard drafts may have no context-parallel group.
+            if get_parallel().attn_cp_size > 1:
+                self.cp_sync_group = get_parallel().attn_cp_group.device_group
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
@@ -175,6 +178,9 @@ class Sampler(nn.Module):
         _trace_e2e_sampler("preprocess_returned")
         sampling_mask_batch_indices = sampling_info.sampling_mask_batch_indices
         return_sampling_mask = sampling_mask_batch_indices is not None
+        sampling_support_logprobs_capture_indices = (
+            sampling_info.sampling_support_logprobs_capture_indices
+        )
         sampling_mask_capture = None
 
         if sampling_info.is_all_greedy:
@@ -258,7 +264,11 @@ class Sampler(nn.Module):
                     )
 
                 # In-place op to save memory
-                logits[:] = torch.softmax(logits, dim=-1)
+                logits[:] = (
+                    torch.softmax(logits, dim=-1)
+                    if self.enable_deterministic
+                    else sampler_softmax(logits)
+                )
                 probs = logits
 
                 batch_next_token_ids, sampling_mask_capture = self._sample_from_probs(
@@ -295,7 +305,9 @@ class Sampler(nn.Module):
             if sampling_info.is_all_greedy:
                 logits_output.sampling_mask_output = (
                     self._build_greedy_sampling_mask_output(
-                        sampling_mask_batch_indices, batch_next_token_ids
+                        sampling_mask_batch_indices,
+                        batch_next_token_ids,
+                        sampling_support_logprobs_capture_indices,
                     )
                 )
             else:
@@ -308,6 +320,7 @@ class Sampler(nn.Module):
                 logits_output.sampling_mask_output = self._build_sampling_mask_output(
                     batch_next_token_ids,
                     sampling_mask_capture,
+                    sampling_support_logprobs_capture_indices,
                 )
 
         _trace_e2e_sampler("forward_returned")
@@ -354,9 +367,9 @@ class Sampler(nn.Module):
                 )
         else:
             backend = get_exec().kernel.sampling_backend
-            if backend == "flashinfer":
+            if backend in ("flashinfer", "intel_xpu"):
                 assert sampling_info.sampling_seed is None, (
-                    "Sampling seed is not supported for flashinfer backend"
+                    f"Sampling seed is not supported for {backend} backend"
                 )
                 if sampling_info.need_min_p_sampling:
                     probs = top_k_renorm_prob(probs, sampling_info.top_ks)
@@ -460,6 +473,7 @@ class Sampler(nn.Module):
         self,
         batch_indices: torch.Tensor,
         batch_next_token_ids: torch.Tensor,
+        support_capture_indices: Optional[torch.Tensor],
     ) -> SamplingMaskOutput:
         token_ids = batch_next_token_ids.index_select(0, batch_indices).to(torch.int32)
         num_requests = batch_indices.numel()
@@ -470,6 +484,15 @@ class Sampler(nn.Module):
             ),
             selected_logprobs=torch.zeros(
                 num_requests, dtype=torch.float32, device=token_ids.device
+            ),
+            support_logprobs=(
+                torch.zeros(
+                    (support_capture_indices.numel(), 1),
+                    dtype=torch.float32,
+                    device=token_ids.device,
+                )
+                if support_capture_indices is not None
+                else None
             ),
             statuses=torch.full(
                 (num_requests,),
@@ -483,6 +506,7 @@ class Sampler(nn.Module):
         self,
         batch_next_token_ids: torch.Tensor,
         sampling_mask_capture: _SamplingMaskCapture,
+        support_capture_indices: Optional[torch.Tensor],
     ) -> SamplingMaskOutput:
         """Pack captured positive support into the fixed-cap device result."""
         batch_indices = sampling_mask_capture.batch_rows
@@ -548,18 +572,27 @@ class Sampler(nn.Module):
 
         packed_size = min(self.sampling_mask_max_tokens, weights.shape[-1])
         if token_ids is None:
-            _, packed_positions = torch.topk(
+            packed_weights, packed_positions = torch.topk(
                 weights, k=packed_size, dim=-1, largest=True, sorted=True
             )
             packed_token_ids = packed_positions.to(torch.int32)
         else:
             # The PyTorch producer already sorts weights and IDs together.
             packed_token_ids = token_ids[:, :packed_size].contiguous()
+            packed_weights = weights[:, :packed_size]
+
+        support_logprobs = None
+        if support_capture_indices is not None:
+            support_logprobs = torch.log(
+                packed_weights.index_select(0, support_capture_indices).float()
+                / support_mass.index_select(0, support_capture_indices).unsqueeze(-1)
+            )
 
         return SamplingMaskOutput(
             token_ids=packed_token_ids,
             lengths=realized_lengths.clamp(max=packed_size),
             selected_logprobs=selected_logprobs,
+            support_logprobs=support_logprobs,
             statuses=statuses,
         )
 
@@ -615,6 +648,7 @@ class Sampler(nn.Module):
                 sampling_info.need_min_p_sampling,
                 sampling_info.sampling_seed,
                 positions,
+                npu_top_k_top_p_eligible=sampling_info.npu_top_k_top_p_eligible,
             )
             return batch_next_token_ids.to(torch.int32)
 
@@ -782,15 +816,14 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     need_min_p_sampling: bool,
     sampling_seed: Optional[torch.Tensor],
     positions: torch.Tensor,
+    npu_top_k_top_p_eligible: bool = False,
 ):
     """A top-k, top-p and min-p sampling implementation for ascend npu with torch_npu interface.
 
     Takes temperature-scaled logits as input (softmax is applied internally).
     """
     # torch_npu.npu_top_k_top_p requires top_k value range in [1, 1024]
-    if hasattr(torch_npu, "npu_top_k_top_p") and torch.all(
-        (top_ks <= 1024) & (top_ks >= 1)
-    ):
+    if hasattr(torch_npu, "npu_top_k_top_p") and npu_top_k_top_p_eligible:
         logits_top_k_top_p = torch_npu.npu_top_k_top_p(logits, top_ps, top_ks)
         probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
 
@@ -949,25 +982,38 @@ def apply_custom_logit_processor(
         f"({num_tokens_in_batch})"
     )
 
-    for _, (
-        processor,
-        batch_mask,
-    ) in sampling_batch_info.custom_logit_processor.items():
-        # Get the batch indices that need to be processed
-        batch_indices = batch_mask.nonzero(as_tuple=True)[0]
+    batch_size = len(sampling_batch_info)
+    assert len(sampling_batch_info.custom_params) == batch_size, (
+        f"The number of custom params ({len(sampling_batch_info.custom_params)}) does "
+        f"not match the number of sampling_batch_info ({batch_size})"
+    )
 
-        assert batch_mask.shape[0] == len(sampling_batch_info), (
-            f"The number of batch mask ({batch_mask.shape[0]}) does not match the number of "
-            f"sampling_batch_info ({len(sampling_batch_info)})"
+    token_offsets = (
+        None
+        if num_tokens_in_batch == 1
+        else torch.arange(num_tokens_in_batch, device=sampling_batch_info.device)
+    )
+    for entry in sampling_batch_info.custom_logit_processor.values():
+        rows, indices = entry.rows, entry.indices
+        assert len(rows) == indices.numel(), (
+            f"The number of cached processor rows ({len(rows)}) does not match the "
+            f"number of cached device indices ({indices.numel()})"
         )
-        batch_mask = torch.repeat_interleave(batch_mask, num_tokens_in_batch)
+        assert not rows or rows[-1] < batch_size, (
+            f"Cached processor rows {rows} are stale for a batch of {batch_size}"
+        )
 
-        # Apply the processor to the logits
-        logits[batch_mask] = processor(
-            logits[batch_mask],
-            [sampling_batch_info.custom_params[i] for i in batch_indices],
-        )
+        if token_offsets is not None:
+            indices = (indices[:, None] * num_tokens_in_batch + token_offsets).flatten()
+        selected = logits.index_select(0, indices)
+        custom_params = [
+            sampling_batch_info.custom_params[i]
+            for i in rows
+            for _ in range(num_tokens_in_batch)
+        ]
+        result = entry.processor(selected, custom_params)
+        logits.index_copy_(0, indices, result.to(logits.dtype))
 
         logger.debug(
-            f"Custom logit processor {processor.__class__.__name__} is applied."
+            f"Custom logit processor {entry.processor.__class__.__name__} is applied."
         )

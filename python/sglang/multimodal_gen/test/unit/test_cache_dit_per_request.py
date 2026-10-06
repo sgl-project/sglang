@@ -6,6 +6,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
+from sglang.multimodal_gen.runtime.cache import cache_dit_integration
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     cache_dit_overrides_key,
     resolve_cache_dit_request_overrides,
@@ -16,6 +19,34 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.ideogram import (
+    Ideogram4ProgressiveDenoisingStage,
+)
+
+
+class TestIdeogramActiveCacheRefresh(unittest.TestCase):
+    def test_request_override_and_active_transformers_survive_transition(self):
+        for skip, has_unconditional in ((False, True), (True, True), (False, False)):
+            with self.subTest(skip=skip, has_unconditional=has_unconditional):
+                stage = object.__new__(Ideogram4ProgressiveDenoisingStage)
+                stage.transformer = torch.nn.Linear(2, 2)
+                stage.unconditional_transformer = (
+                    torch.nn.Linear(2, 2) if has_unconditional else None
+                )
+                stage._cache_dit_request_overrides = {"scm_preset": "none"}
+                ctx = SimpleNamespace(extra={"ideogram4_skip_unconditional": skip})
+                with patch.object(
+                    cache_dit_integration.cache_dit, "refresh_context"
+                ) as refresh:
+                    stage._refresh_cache_dit_context(
+                        4, stage._effective_scm_preset(), ctx
+                    )
+                targets = [call.args[0] for call in refresh.call_args_list]
+                expected = [stage.transformer]
+                if has_unconditional and not skip:
+                    expected.append(stage.unconditional_transformer)
+                self.assertEqual(targets, expected)
+                self.assertIsNone(stage._effective_scm_preset())
 
 
 class TestResolveCacheDitRequestOverrides(unittest.TestCase):
@@ -192,6 +223,39 @@ class TestPerRequestCacheDitTransitions(unittest.TestCase):
         self.assertEqual(config.max_warmup_steps, 2)
         self.assertEqual(config.steps_computation_policy, "static")
         self.assertEqual(config.num_inference_steps, 8)
+
+    def test_request_dmd_knobs_reach_cache_dit_config(self):
+        self.stage._maybe_enable_cache_dit(
+            8,
+            _batch(
+                enable_cache_dit=True,
+                cache_dit_params={
+                    "enable_dmd": True,
+                    "dmd_history": 8,
+                    "dmd_svd_precision": "high",
+                },
+            ),
+        )
+        (config,) = self.enable_calls
+        self.assertTrue(config.enable_dmd)
+        self.assertEqual(config.dmd_history, 8)
+        self.assertEqual(config.dmd_svd_precision, "high")
+        # untouched knobs keep their env defaults
+        self.assertEqual(config.dmd_rank, 0)
+
+    def test_secondary_inherits_request_primary_dmd(self):
+        self.stage._cache_dit_request_overrides = resolve_cache_dit_request_overrides(
+            {"enable_dmd": True, "secondary": {"dmd_rank": 4}}
+        )
+        primary = self.stage._build_cache_dit_config(
+            10, steps_computation_mask=None, scm_policy="dynamic"
+        )
+        secondary = self.stage._build_cache_dit_config(
+            10, steps_computation_mask=None, scm_policy="dynamic", secondary=True
+        )
+        self.assertTrue(primary.enable_dmd)
+        self.assertTrue(secondary.enable_dmd)  # inherited from primary
+        self.assertEqual(secondary.dmd_rank, 4)
 
     def test_invalid_request_params_raise(self):
         with self.assertRaisesRegex(ValueError, "Unknown cache_dit_params keys"):
