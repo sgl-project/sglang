@@ -403,13 +403,12 @@ impl<R: EngineRpc> Transport for Grpc<R> {
         worker: &Worker,
         _path: &'static str,
         leg: Leg,
-        _engine_rid: Option<&str>,
+        engine_rid: Option<&str>,
         load_guards: LoadGuards,
         metrics: &DispatchMetrics,
         expiration: CancellationToken,
         stream_abort: CancellationToken,
     ) -> Result<Self::Response, ApiError> {
-        // A dropped call aborts the engine request, so the rid needs no abort hook.
         let (guards, on_first_byte, on_stream_end): (Box<dyn Send + 'static>, _, _) =
             if metrics.streaming {
                 (
@@ -427,6 +426,7 @@ impl<R: EngineRpc> Transport for Grpc<R> {
                 &leg.headers,
                 leg.body,
                 &leg.additions,
+                engine_rid,
                 metrics.streaming,
                 Some(guards),
                 on_first_byte,
@@ -447,7 +447,8 @@ impl<R: EngineRpc> Transport for Grpc<R> {
         let (headers, body, additions) = (&leg.headers, leg.body, &leg.additions);
         let result = proxy
             .forward_grpc(
-                &worker, &*self.0, headers, body, additions, false, None, None, None, None, None,
+                &worker, &*self.0, headers, body, additions, None, false, None, None, None, None,
+                None,
             )
             .await;
         let status = match result {

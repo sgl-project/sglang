@@ -216,11 +216,15 @@ fn openai(body: Vec<u8>) -> proto::OpenAiRequest {
 
 /// A round-robin router over `(mode, url, engine gRPC port)` workers.
 fn router_ctx(workers: &[(WorkerMode, &str, Option<u16>)]) -> Arc<AppContext> {
-    router_ctx_with(workers, false)
+    router_ctx_with(workers, false, Proxy::new(Duration::from_secs(5)).unwrap())
 }
 
 /// [`router_ctx`] on the bucket-first (reorg) selection path when `reorg`.
-fn router_ctx_with(workers: &[(WorkerMode, &str, Option<u16>)], reorg: bool) -> Arc<AppContext> {
+fn router_ctx_with(
+    workers: &[(WorkerMode, &str, Option<u16>)],
+    reorg: bool,
+    proxy: Proxy,
+) -> Arc<AppContext> {
     let mut cfg = cache_aware_fixture::config();
     cfg.model.id = "tiny".into();
     cfg.model.policy = PolicyKind::RoundRobin;
@@ -248,7 +252,7 @@ fn router_ctx_with(workers: &[(WorkerMode, &str, Option<u16>)], reorg: bool) -> 
     let mut ctx = AppContext::new(
         cfg.clone(),
         Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap()),
-        Arc::new(Proxy::new(Duration::from_secs(5)).unwrap()),
+        Arc::new(proxy),
         Arc::new(registry),
         Arc::new(build_registry_with_defaults(&cfg).unwrap()),
     );
@@ -284,6 +288,26 @@ fn without_rid(mut body: Value) -> Value {
     assert!(body["rid"].is_string(), "the router mints an engine rid");
     body.as_object_mut().unwrap().remove("rid");
     body
+}
+
+/// One chunk, then nothing until the call is dropped; `dropped` hears about it.
+fn stalled_after_one_chunk(
+    dropped: tokio::sync::mpsc::UnboundedSender<()>,
+) -> Replies<proto::OpenAiStreamChunk> {
+    struct Dropped(tokio::sync::mpsc::UnboundedSender<()>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    let guard = Dropped(dropped);
+    stream::iter([Ok(chunk("{}", false, None))])
+        .chain(stream::pending())
+        .map(move |item| {
+            let _ = &guard;
+            item
+        })
+        .boxed()
 }
 
 #[tokio::test]
@@ -351,7 +375,12 @@ async fn pd_legs_share_one_bootstrap_room() {
             (WorkerMode::Prefill, "http://127.0.0.1:1", Some(prefill)),
             (WorkerMode::Decode, "http://127.0.0.1:2", Some(decode)),
         ];
-        let mut client = serve_grpc(router_ctx_with(&workers, reorg)).await;
+        let mut client = serve_grpc(router_ctx_with(
+            &workers,
+            reorg,
+            Proxy::new(Duration::from_secs(5)).unwrap(),
+        ))
+        .await;
 
         collect(client.chat_complete(openai(chat(true))).await)
             .await
@@ -476,24 +505,18 @@ async fn text_rpcs_reach_the_engine_as_router_tokens() {
 }
 
 #[tokio::test]
-async fn client_cancel_drops_the_engine_call() {
-    struct Dropped(tokio::sync::mpsc::UnboundedSender<()>);
-    impl Drop for Dropped {
-        fn drop(&mut self) {
-            let _ = self.0.send(());
-        }
-    }
+async fn client_cancel_aborts_the_engine_request() {
     let (dropped_tx, mut dropped) = tokio::sync::mpsc::unbounded_channel();
+    let (chats, aborts) = (Seen::new(), Seen::new());
+    let (record_chat, record_abort) = (chats.record(), aborts.record());
     let port = MockEngine::default()
-        .stream("ChatComplete", move |_: proto::OpenAiRequest| {
-            let guard = Dropped(dropped_tx.clone());
-            stream::iter([Ok(chunk("{}", false, None))])
-                .chain(stream::pending())
-                .map(move |item| {
-                    let _ = &guard;
-                    item
-                })
-                .boxed()
+        .stream("ChatComplete", move |request| {
+            record_chat(request);
+            stalled_after_one_chunk(dropped_tx.clone())
+        })
+        .unary("Abort", move |request: proto::AbortRequest| {
+            record_abort(request);
+            proto::AbortResponse::default()
         })
         .start()
         .await;
@@ -515,6 +538,80 @@ async fn client_cancel_drops_the_engine_call() {
     tokio::time::timeout(Duration::from_secs(5), dropped.recv())
         .await
         .expect("the engine call outlived the client");
+    // The engine's own abort on a dropped call targets another id, so the rid is aborted too.
+    let rid = body_of(&chats.last().await)["rid"].clone();
+    assert_eq!(aborts.last().await.rid, rid.as_str().unwrap());
+}
+
+#[tokio::test]
+async fn stream_outcomes_reach_the_breaker_by_status() {
+    let calls = Arc::new(Mutex::new(0));
+    let counted = Arc::clone(&calls);
+    let port = MockEngine::default()
+        .stream("ChatComplete", move |_: proto::OpenAiRequest| {
+            let mut calls = counted.lock().unwrap();
+            *calls += 1;
+            match *calls {
+                // Backpressure ends three streams; it must not open the breaker.
+                1..=3 => stream::iter([
+                    Ok(chunk("{}", false, None)),
+                    Err(Status::resource_exhausted("queue full")),
+                ])
+                .boxed(),
+                // A rejected request is one finished chunk with its status; faults count.
+                _ => stream::iter([Ok(chunk(r#"{"object":"error"}"#, true, Some(500)))]).boxed(),
+            }
+        })
+        .start()
+        .await;
+    let mut client = serve_grpc(router_ctx(&[(
+        WorkerMode::Plain,
+        "http://127.0.0.1:1",
+        Some(port),
+    )]))
+    .await;
+
+    for _ in 0..3 {
+        let result = collect(client.chat_complete(openai(chat(true))).await).await;
+        assert_eq!(result.unwrap_err().code(), Code::ResourceExhausted);
+    }
+    for _ in 0..3 {
+        let chunks = collect(client.chat_complete(openai(chat(true))).await)
+            .await
+            .unwrap();
+        assert_eq!(chunks[0].status_code, Some(500));
+    }
+    let status = client.chat_complete(openai(chat(true))).await.unwrap_err();
+    assert_eq!(
+        status.code(),
+        Code::Unavailable,
+        "three 500s open the breaker"
+    );
+    assert_eq!(*calls.lock().unwrap(), 6);
+}
+
+#[tokio::test]
+async fn router_stream_failures_keep_their_error_code() {
+    let (dropped_tx, _dropped) = tokio::sync::mpsc::unbounded_channel();
+    let port = MockEngine::default()
+        .stream("ChatComplete", move |_: proto::OpenAiRequest| {
+            stalled_after_one_chunk(dropped_tx.clone())
+        })
+        .start()
+        .await;
+    let proxy = Proxy::new(Duration::from_secs(5))
+        .unwrap()
+        .with_stream_idle_timeout(Duration::from_millis(100));
+    let workers = [(WorkerMode::Plain, "http://127.0.0.1:1", Some(port))];
+    let mut client = serve_grpc(router_ctx_with(&workers, false, proxy)).await;
+
+    let result = collect(client.chat_complete(openai(chat(true))).await).await;
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), Code::DeadlineExceeded);
+    assert_eq!(
+        status.metadata().get("x-router-error-code").unwrap(),
+        "upstream_timeout"
+    );
 }
 
 #[tokio::test]
