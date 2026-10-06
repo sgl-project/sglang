@@ -14,9 +14,11 @@ use serde_json::{json, Value};
 use sgl_router::config::PolicyKind;
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults;
+use sgl_router::policies_reorg::factory::build_resolver;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
-use sgl_router::server::app_context::AppContext;
+use sgl_router::server::app_context::{AppContext, ChatRouting};
+use sgl_router::state::kv_events::KvEventIndex;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
 use sglang_grpc_types::sglang::runtime::v1 as proto;
@@ -214,6 +216,11 @@ fn openai(body: Vec<u8>) -> proto::OpenAiRequest {
 
 /// A round-robin router over `(mode, url, engine gRPC port)` workers.
 fn router_ctx(workers: &[(WorkerMode, &str, Option<u16>)]) -> Arc<AppContext> {
+    router_ctx_with(workers, false)
+}
+
+/// [`router_ctx`] on the bucket-first (reorg) selection path when `reorg`.
+fn router_ctx_with(workers: &[(WorkerMode, &str, Option<u16>)], reorg: bool) -> Arc<AppContext> {
     let mut cfg = cache_aware_fixture::config();
     cfg.model.id = "tiny".into();
     cfg.model.policy = PolicyKind::RoundRobin;
@@ -235,13 +242,21 @@ fn router_ctx(workers: &[(WorkerMode, &str, Option<u16>)]) -> Arc<AppContext> {
         };
         registry.add_with_cb(spec, None, profile).unwrap();
     }
-    Arc::new(AppContext::new(
+    if reorg {
+        cfg.model.policy = PolicyKind::PowerOfTwo;
+    }
+    let mut ctx = AppContext::new(
         cfg.clone(),
         Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap()),
         Arc::new(Proxy::new(Duration::from_secs(5)).unwrap()),
         Arc::new(registry),
         Arc::new(build_registry_with_defaults(&cfg).unwrap()),
-    ))
+    );
+    if reorg {
+        let (resolver, _) = build_resolver(&cfg.model, &KvEventIndex::new(), None).unwrap();
+        ctx.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
+    }
+    Arc::new(ctx)
 }
 
 async fn serve_grpc(ctx: Arc<AppContext>) -> SglangServiceClient<Channel> {
@@ -330,47 +345,50 @@ async fn pd_legs_share_one_bootstrap_room() {
     let (decode_chats, decode_generates) = (Seen::new(), Seen::new());
     let prefill = engine(&prefill_chats, &prefill_generates).start().await;
     let decode = engine(&decode_chats, &decode_generates).start().await;
-    let mut client = serve_grpc(router_ctx(&[
-        (WorkerMode::Prefill, "http://127.0.0.1:1", Some(prefill)),
-        (WorkerMode::Decode, "http://127.0.0.1:2", Some(decode)),
-    ]))
-    .await;
+    // Legacy policies, then the reorg bucket path.
+    for reorg in [false, true] {
+        let workers = [
+            (WorkerMode::Prefill, "http://127.0.0.1:1", Some(prefill)),
+            (WorkerMode::Decode, "http://127.0.0.1:2", Some(decode)),
+        ];
+        let mut client = serve_grpc(router_ctx_with(&workers, reorg)).await;
 
-    collect(client.chat_complete(openai(chat(true))).await)
-        .await
-        .unwrap();
-    let (p, d) = (
-        body_of(&prefill_chats.last().await),
-        body_of(&decode_chats.last().await),
-    );
-    assert!(p["bootstrap_room"].is_u64());
-    assert_eq!(p["bootstrap_room"], d["bootstrap_room"]);
+        collect(client.chat_complete(openai(chat(true))).await)
+            .await
+            .unwrap();
+        let (p, d) = (
+            body_of(&prefill_chats.last().await),
+            body_of(&decode_chats.last().await),
+        );
+        assert!(p["bootstrap_room"].is_u64());
+        assert_eq!(p["bootstrap_room"], d["bootstrap_room"]);
 
-    let request = proto::GenerateRequest {
-        input_ids: vec![1, 2, 3],
-        stream: Some(true),
-        ..Default::default()
-    };
-    let replies = collect(client.generate(request).await).await.unwrap();
-    assert_eq!(
-        replies[0].output_ids,
-        [7],
-        "decode's reply reaches the client"
-    );
-    let (p, d) = (
-        prefill_generates.last().await,
-        decode_generates.last().await,
-    );
-    let room = p.disaggregated_params.as_ref().unwrap();
-    assert_eq!(
-        (room.bootstrap_host.as_str(), room.bootstrap_port),
-        ("127.0.0.1", 8998)
-    );
-    assert_eq!(p.disaggregated_params, d.disaggregated_params);
-    assert!(
-        p.rid.is_some() && p.rid == d.rid,
-        "both legs carry the router's rid"
-    );
+        let request = proto::GenerateRequest {
+            input_ids: vec![1, 2, 3],
+            stream: Some(true),
+            ..Default::default()
+        };
+        let replies = collect(client.generate(request).await).await.unwrap();
+        assert_eq!(
+            replies[0].output_ids,
+            [7],
+            "decode's reply reaches the client"
+        );
+        let (p, d) = (
+            prefill_generates.last().await,
+            decode_generates.last().await,
+        );
+        let room = p.disaggregated_params.as_ref().unwrap();
+        assert_eq!(
+            (room.bootstrap_host.as_str(), room.bootstrap_port),
+            ("127.0.0.1", 8998)
+        );
+        assert_eq!(p.disaggregated_params, d.disaggregated_params);
+        assert!(
+            p.rid.is_some() && p.rid == d.rid,
+            "both legs carry the router's rid"
+        );
+    }
 }
 
 #[tokio::test]
