@@ -930,8 +930,9 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         # Lifetime owned by UnifiedKVPool; do not delete the views.
         pass
 
-    # `rebind_write_loc` already collapsed the widened id and sent the rows this
-    # rank does not own to the padding sink.
+    # The plan's write translation (`translate_write_loc`) already collapsed
+    # the widened id and sent the rows this rank does not own to the padding
+    # sink.
     write_loc_is_dcp_resolved = True
 
     def get_kv_size_bytes(self):

@@ -360,7 +360,7 @@ class DraftBlockProposer:
         )
         # Hand-built batch bypasses ForwardBatch.init_new: rebind the write
         # loc to the draft's kernel-facing ids (no-op on plain pools).
-        self.draft_model_runner.kv_index_translator.rebind_write_loc(idle_batch)
+        self.draft_model_runner.kv_index_translator.bind_own_plan(idle_batch)
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
         with torch.inference_mode():
             self.draft_model_runner.forward(idle_batch)

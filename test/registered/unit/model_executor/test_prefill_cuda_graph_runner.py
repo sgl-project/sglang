@@ -372,7 +372,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_forward_mode=ForwardMode.EXTEND,
         )
-        translator.rebind_write_loc(forward_batch)
+        translator.bind_own_plan(forward_batch)
 
         static_batch = runner.load_batch(forward_batch)
 

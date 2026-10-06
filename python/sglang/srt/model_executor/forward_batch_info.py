@@ -1893,6 +1893,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        if self.out_cache_loc_swa is not None:
+            # The padded lanes write the sink in the sliding-window space too.
+            self.out_cache_loc_swa = self._pad_tensor_to_size(
+                self.out_cache_loc_swa, num_tokens
+            )
         if self.origin_out_cache_loc is not None:
             self.origin_out_cache_loc = self._pad_tensor_to_size(
                 self.origin_out_cache_loc, num_tokens

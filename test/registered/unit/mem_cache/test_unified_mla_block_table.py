@@ -21,16 +21,15 @@ page ids:
 
     kernel_page(virtual_page) = v2p[virtual_page]
 
-Since the read-path translator, ONE builder computes that formula for every
-family — `build_index_table` (the canonical) — and the backends only
-differ in how they consume it:
-  - trtllm_mla / cutedsl_mla / tokenspeed_mla / flashmla: rows filled straight
-    into their padded block tables (`KVIndexTranslator.fill_read_table`, prefix-only so
-    the backends' own -1 / stale tail sentinels survive);
-  - the flashinfer updaters: token ids reconstructed from the canonical by
+ONE builder computes that formula for every family -- the iteration plan's
+read table (`KVLocPlan.read_table`) -- and the backends only differ in how
+they consume it:
+  - trtllm_mla / cutedsl_mla / tokenspeed_mla / flashmla: the plan's rows
+    copied into their padded block tables (`KVIndexTranslator.copy_page_table`);
+  - the flashinfer updaters: token ids reconstructed from the table by
     `create_flashinfer_kv_indices_triton[ENTRY_PAGE_SIZE=ps]`;
-  - fa3's captured decode: `normal_decode_set_metadata` copies the canonical
-    rows' live prefixes (src_is_read_table=True).
+  - fa3's captured decode: the plan's rows copied into its captured page
+    table.
 
 Covered here:
   - the static `create_flashmla_kv_indices_triton` (no id-space knowledge left)

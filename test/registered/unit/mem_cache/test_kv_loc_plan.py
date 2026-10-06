@@ -29,6 +29,9 @@
   draft); a pass-through reader gathers `req_to_token`, and a draft with a
   `req_to_token` of its own plans its own reads over the shared write ids
   (`reads_from`);
+- one iteration's forwards -- a draft step, the verify, a draft extend, the
+  readers of a target and a fused draft -- translate the window once and
+  build each id space's table once;
 - `bind` gives a batch its ids, with the virtual mirror only when they were
   translated;
 - a runner's own write buffer (graph capture, warmup) is used as it is, its
@@ -64,6 +67,16 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 _PS = 2
+
+
+def _reference(req_to_token, rows, lens, v2p, width):
+    """Independent derivation of a read table: each row's pages over `lens`,
+    through `v2p`, the sink past them."""
+    out = torch.zeros((rows.numel(), width), dtype=torch.int32)
+    for b, row in enumerate(rows.tolist()):
+        for c in range(min(-(-int(lens[b]) // _PS), width)):
+            out[b, c] = max(int(v2p[int(req_to_token[row, c * _PS]) // _PS]), 0)
+    return out
 
 
 class _FakeKVCache:
@@ -214,13 +227,44 @@ class TestKVLocPlan(unittest.TestCase):
                 self.allocator.translate_loc_from_full_to_swa(self.window),
             )
         )
-        # The same ids the physical-side derivation produces.
-        self.assertTrue(
-            torch.equal(
-                plan.swa_write_ids(),
-                self.target.sliding_window_write_loc_for(plan.write_physical),
-            )
-        )
+
+    def test_one_iteration_translates_once(self):
+        writes, builds = [], []
+        real_write = self.allocator.translate_write_loc
+        real_build = kv_index_translator.build_kv_read_table
+
+        def counting_write(ids, *a, **kw):
+            writes.append(ids)
+            return real_write(ids, *a, **kw)
+
+        def counting_build(**kwargs):
+            builds.append(kwargs["v2p"])
+            return real_build(**kwargs)
+
+        with (
+            patch.object(self.allocator, "translate_write_loc", counting_write),
+            patch.object(kv_index_translator, "build_kv_read_table", counting_build),
+        ):
+            # The translator binds the allocator's translate when built.
+            self.target._translate_write_full = counting_write
+            plan = self._plan(read_extent=2)
+            draft, verify, extend = (SimpleNamespace() for _ in range(3))
+            plan.bind(draft, self.fused_draft, cols=slice(0, 1))
+            plan.bind(verify, self.target)
+            plan.bind(extend, self.fused_draft)
+            bs = int(self.rpi.numel())
+            for reader in (self.target, self.fused_draft):
+                # What a packed stream gathers from, and a captured table.
+                reader.read_source(plan, req_pool_indices=self.rpi, bs=bs + 1)
+                reader.read_table(plan)
+                reader.copy_page_table(
+                    plan, out=torch.zeros((bs + 2, 4), dtype=torch.int32)
+                )
+        self.assertEqual(len(writes), 1)
+        # The full and the sliding-window id space, one build each.
+        self.assertEqual(len(builds), 2)
+        self.assertTrue(torch.equal(verify.out_cache_loc, plan.write_physical))
+        self.assertIs(extend.out_cache_loc, verify.out_cache_loc)
 
     def test_a_verify_reads_the_window_it_writes(self):
         def own_plan(mode, spec_info):
@@ -271,14 +315,15 @@ class TestKVLocPlan(unittest.TestCase):
             self.assertTrue(
                 torch.equal(padded.sliding_window_ids[:2], table.sliding_window_ids)
             )
-        # The rows cover `seq_lens + read_extent`, as a table built for those
-        # lengths does.
-        reference = self.target.build_index_table(
-            req_pool_indices=self.rpi,
-            seq_lens=self.seq_lens + 1,
-            max_pages=table.ids.shape[1],
+        # The rows cover `seq_lens + read_extent`.
+        reference = _reference(
+            self.req_to_token,
+            self.rpi,
+            self.seq_lens + 1,
+            self.allocator.full_v2p_page_table,
+            table.ids.shape[1],
         )
-        self.assertTrue(torch.equal(table.ids, reference.ids))
+        self.assertTrue(torch.equal(table.ids, reference))
 
     def test_only_readers_of_its_rows_read_its_table(self):
         plan = self._plan()
@@ -321,12 +366,15 @@ class TestKVLocPlan(unittest.TestCase):
         self.assertIs(derived.write_physical, plan.write_physical)
         self.assertIs(derived.write_ids(compact), plan.write_physical)
         self.assertTrue(derived.is_read_by(compact))
-        reference = compact.build_index_table(
-            req_pool_indices=self.rpi,
-            seq_lens=lens + 1,
-            max_pages=derived.read_table().ids.shape[1],
+        compact_rows[self.rpi, :2] = compact_rows[self.rpi, 2:4]
+        reference = _reference(
+            compact_rows,
+            self.rpi,
+            lens + 1,
+            self.allocator.full_v2p_page_table,
+            derived.read_table().ids.shape[1],
         )
-        self.assertTrue(torch.equal(derived.read_table().ids, reference.ids))
+        self.assertTrue(torch.equal(derived.read_table().ids, reference))
 
     def test_a_pass_through_plan_does_no_work(self):
         plan = self._plan(source=self.private_draft)

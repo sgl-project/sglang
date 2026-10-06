@@ -670,7 +670,7 @@ def _make_forward_batch(
         positions=torch.tensor(positions, dtype=torch.int64, device=device),
     )
     # Production batches take their KV ids from a plan (`init_new`).
-    runner.kv_index_translator.rebind_write_loc(batch)
+    runner.kv_index_translator.bind_own_plan(batch)
     # extend_* fields are only populated for extend-shaped modes. DECODE leaves
     # them at their defaults; the flash_mla path reads metadata directly from
     # DSV4AttnMetadata so the extend fields are unused for the compress_ratio=0

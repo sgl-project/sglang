@@ -312,7 +312,7 @@ class UnoWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             return_hidden_states_before_norm=False,
         )
-        self.model_runner.kv_index_translator.rebind_write_loc(forward_batch)
+        self.model_runner.kv_index_translator.bind_own_plan(forward_batch)
         return forward_batch
 
     def _run_target_block(

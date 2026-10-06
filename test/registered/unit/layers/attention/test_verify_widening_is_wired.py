@@ -73,7 +73,6 @@ def _translator(req_to_token, page_size, n_pages):
     )
     t._swa_v2p_table = None
     t._rows = torch.arange(req_to_token.shape[0], dtype=torch.int64, device=_DEV)
-    t._index_table_memo = None
     return t
 
 

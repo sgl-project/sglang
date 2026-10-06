@@ -18,7 +18,7 @@
    SAME translate -- same pages, same v2p table, same physical ids (the draft
    parts sit inside the host entry). A dense draft pool routes no window
    layers, so it has no swa id space: the window index table falls back to
-   the one dense table and `sliding_window_write_loc_for()` answers None (a
+   the one dense table and its plan binds no sliding-window write ids (a
    separate-swa assumption here crashed the read side and left the write side
    with nothing to derive).
 3. PRIVATE-POOL draft (DSPARK/DFLASH shape: target's allocator, own
@@ -157,7 +157,7 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         v = allocator.alloc(2 * _PS)
         self.assertIsNotNone(v)
         fb = SimpleNamespace(out_cache_loc=v)
-        src.rebind_write_loc(fb)
+        src.bind_own_plan(fb)
         self.assertTrue(torch.equal(fb.out_cache_loc, allocator.translate_kv_loc(v)))
 
     def test_fused_draft_runner_translates_to_the_same_physical_ids(self):
@@ -166,40 +166,39 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         self.assertTrue(src.is_translating)
         self.assertIsNone(src._swa_v2p_table)  # single space: no swa id space
 
-        # rebind_write_loc translates to the HOST's physical ids: the draft
-        # parts live inside the same slots.
+        # Its own plan translates to the HOST's physical ids: the draft parts
+        # live inside the same slots.
         v = allocator.alloc(2 * _PS)
         self.assertIsNotNone(v)
         fb = SimpleNamespace(out_cache_loc=v)
-        src.rebind_write_loc(fb)
+        src.bind_own_plan(fb)
         self.assertIsNot(fb.out_cache_loc, v)
         fa = allocator.full_attn_allocator
         expected = torch.clamp_min(fa.virtual_to_physical[v // _PS] * _PS + v % _PS, 0)
         torch.testing.assert_close(fb.out_cache_loc, expected, rtol=0, atol=0)
         self.assertTrue(torch.equal(fb.out_cache_loc, allocator.translate_kv_loc(v)))
         # A dense draft pool routes no window layers: no swa write loc.
-        self.assertIsNone(src.sliding_window_write_loc_for(fb.out_cache_loc))
+        self.assertIsNone(fb.out_cache_loc_swa)
 
     def test_dense_fused_draft_has_no_window_write_loc(self):
-        """`sliding_window_write_loc_for()` on a dense fused-draft batch answers
-        None: the pool routes no window layers, so there is nothing to
-        derive. The hybrid-SWA TARGET on the same allocator keeps a genuinely
-        derived swa loc, so the None can never paper over a real swa id
-        space."""
+        """A dense fused-draft batch binds no sliding-window write ids: the
+        pool routes no window layers, so there is nothing to derive. The
+        hybrid-SWA TARGET on the same allocator keeps genuinely derived swa
+        ids, so the None can never paper over a real swa id space."""
         _, allocator, kvcache, draft_pool = _build()
         src = _source(allocator, draft_pool)
         v = allocator.alloc(_PS)
         self.assertIsNotNone(v)
         fb = SimpleNamespace(out_cache_loc=v)
-        src.rebind_write_loc(fb)
-        self.assertIsNone(src.sliding_window_write_loc_for(fb.out_cache_loc))
+        src.bind_own_plan(fb)
+        self.assertIsNone(fb.out_cache_loc_swa)
         # Target contrast: a real swa side derives a DIFFERENT loc.
         tgt = _source(allocator, kvcache)
         tv = allocator.alloc(_PS)
         self.assertIsNotNone(tv)
         tfb = SimpleNamespace(out_cache_loc=tv)
-        tgt.rebind_write_loc(tfb)
-        tswa = tgt.sliding_window_write_loc_for(tfb.out_cache_loc)
+        tgt.bind_own_plan(tfb)
+        tswa = tfb.out_cache_loc_swa
         self.assertIsNotNone(tswa)
         self.assertIsNot(tswa, tfb.out_cache_loc)
         self.assertTrue(torch.equal(tswa, allocator.translate_loc_from_full_to_swa(tv)))
@@ -211,7 +210,7 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         self.assertFalse(src.is_translating)
         v = torch.arange(2 * _PS, dtype=torch.int64)
         fb = SimpleNamespace(out_cache_loc=v)
-        src.rebind_write_loc(fb)
+        src.bind_own_plan(fb)
         self.assertIs(fb.out_cache_loc, v)  # untouched, not even a copy
 
     def test_foreign_allocator_draft_pool_is_not_enabled(self):
@@ -222,11 +221,7 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         src = _source(allocator, other_draft)
         self.assertFalse(src.is_translating)
 
-    def test_seq_len_delta_matches_widened_lens(self):
-        """``seq_len_delta=k`` must be byte-identical to building with
-        ``seq_lens + k`` -- the two spellings of the whole-sequence verify
-        widening. A kernel applying the delta to the page count but not the
-        loads (or vice versa) silently truncates the verify tail."""
+    def _one_row(self):
         _, allocator, kvcache, _ = _build()
         v = allocator.alloc(6 * _PS)
         self.assertIsNotNone(v)
@@ -239,62 +234,57 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
             page_size=_PS,
             device=_DEV,
         )
-        rpi = torch.tensor([0], dtype=torch.int64)
-        seq = torch.tensor([3], dtype=torch.int64)
+        return src, torch.tensor([0], dtype=torch.int64), torch.tensor([3])
+
+    def test_read_extent_matches_widened_lens(self):
+        """A plan reading ``k`` past its lengths must be byte-identical to one
+        built over ``seq_lens + k`` -- the two spellings of the whole-sequence
+        verify widening. A kernel applying the extent to the page count but
+        not the loads (or vice versa) silently truncates the verify tail."""
+        src, rpi, seq = self._one_row()
         delta = 2 * _PS + 1
-        max_pages = -(-(3 + delta) // _PS)
-        widened = src.build_index_table(
+        widened = src.plan(
             req_pool_indices=rpi,
             seq_lens=seq,
-            max_pages=max_pages,
-            seq_len_delta=delta,
-        )
-        by_lens = src.build_index_table(
-            req_pool_indices=rpi, seq_lens=seq + delta, max_pages=max_pages
-        )
+            seq_lens_cpu=seq.clone(),
+            write_virtual=None,
+            read_extent=delta,
+        ).read_table()
+        by_lens = src.plan(
+            req_pool_indices=rpi,
+            seq_lens=seq + delta,
+            seq_lens_cpu=seq + delta,
+            write_virtual=None,
+        ).read_table()
+        self.assertEqual(widened.ids.shape, by_lens.ids.shape)
         torch.testing.assert_close(widened.ids, by_lens.ids, rtol=0, atol=0)
-        # The delta genuinely widened: entries exist past the unwidened prefix.
+        # The extent genuinely widened: entries exist past the plain prefix.
         plain_pages = -(-3 // _PS)
         self.assertTrue(bool((widened.ids[0, plain_pages:] > 0).any()))
 
-    def test_widened_index_table_matches_widened_lens(self):
-        """`widened_index_table` (the verify entry point) must equal the
-        widened-lens build over the SAME batch: derive max_pages from the
-        widened max and forward the delta. Deriving max_pages from the
-        un-widened lens silently truncates the verify tail's pages."""
-        _, allocator, kvcache, _ = _build()
-        v = allocator.alloc(6 * _PS)
-        self.assertIsNotNone(v)
-        rt = torch.zeros((2, 16), dtype=torch.int32)
-        rt[0, : v.numel()] = v.to(torch.int32)
-        src = KVIndexTranslator(
-            req_to_token=rt,
-            token_to_kv_pool_allocator=allocator,
-            token_to_kv_pool=kvcache,
-            page_size=_PS,
-            device=_DEV,
-        )
-        rpi = torch.tensor([0], dtype=torch.int64)
-        seq = torch.tensor([3], dtype=torch.int64)
+    def test_a_verify_plans_its_draft_tail(self):
+        """A verify's own plan reads its `draft_token_num` past its lengths, as
+        the widened-lens build over the SAME batch does."""
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        src, rpi, seq = self._one_row()
         delta = 2 * _PS + 1
         fb = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=SimpleNamespace(draft_token_num=delta),
+            batch_size=1,
             req_pool_indices=rpi,
             seq_lens=seq,
-            seq_lens_cpu=seq.cpu(),
-            # `seq_lens_sum` is the liveness signal for seq_lens_cpu: it is a
-            # non-None but STALE slice on a gpu_only batch, so the build only
-            # trusts it when the sum is present. Without the field the stand-in
-            # batch falls back to the full req_to_token width.
-            seq_lens_sum=int(seq.sum()),
-            out_cache_loc=None,
-            spec_info=None,
+            seq_lens_cpu=seq.clone(),
+            out_cache_loc=torch.zeros(delta, dtype=torch.int64),
         )
-        widened = src.widened_index_table(fb, seq_len_delta=delta)
-        max_pages = -(-(3 + delta) // _PS)
-        by_lens = src.build_index_table(
-            req_pool_indices=rpi, seq_lens=seq + delta, max_pages=max_pages
-        )
-        self.assertEqual(widened.ids.shape, by_lens.ids.shape)
+        widened = src.own_plan(fb).read_table()
+        by_lens = src.plan(
+            req_pool_indices=rpi,
+            seq_lens=seq + delta,
+            seq_lens_cpu=seq + delta,
+            write_virtual=None,
+        ).read_table()
         torch.testing.assert_close(widened.ids, by_lens.ids, rtol=0, atol=0)
 
     def test_target_hidden_writers_write_physical_ids(self):
@@ -420,21 +410,21 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
             injected["cache_loc_2d"], physical.view(2, 2), rtol=0, atol=0
         )
 
-    def test_full_flat_v2p_per_disposition(self):
-        """The flat-translate accessor must hand a kernel exactly what
+    def test_full_v2p_table_per_disposition(self):
+        """The v2p accessor must hand a DCP table builder exactly what
         `translate_kv_loc` would use: the shared v2p table on the target and
         on the fused draft, and None on a pass-through runner (a translated
         pass-through would address a private buffer with the target's ids)."""
         _, allocator, kvcache, draft_pool = _build()
 
         target = _source(allocator, kvcache)
-        self.assertIs(target.full_flat_v2p(), allocator.full_v2p_page_table)
+        self.assertIs(target.full_v2p_table, allocator.full_v2p_page_table)
 
         draft = _source(allocator, draft_pool)
-        self.assertIs(draft.full_flat_v2p(), allocator.full_v2p_page_table)
+        self.assertIs(draft.full_v2p_table, allocator.full_v2p_page_table)
 
         passthrough = _source(allocator, _FakeKVCache(64))
-        self.assertIsNone(passthrough.full_flat_v2p())
+        self.assertIsNone(passthrough.full_v2p_table)
 
     def test_multi_step_containers_read_the_plans_table(self):
         """Every `generate_draft_decode_kv_indices` launch must gather from

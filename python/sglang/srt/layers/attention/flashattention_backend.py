@@ -1224,7 +1224,9 @@ class FlashAttentionBackend(AttentionBackend):
             # The plan's table covers this forward's reads, a verify's and a
             # draft decode's window included; the kernels bound each row by
             # `cache_seqlens`.
-            kv_view = self.kv_index_translator.read_table(forward_batch.kv_loc_plan)
+            kv_view = self.kv_index_translator.read_table(
+                forward_batch.kv_loc_plan, rows=forward_batch.batch_size
+            )
             metadata.page_table = kv_view.ids
             if self.use_sliding_window_kv_pool:
                 metadata.swa_page_table = kv_view.sliding_window_ids

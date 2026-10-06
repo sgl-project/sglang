@@ -11,29 +11,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""A hand-built ForwardBatch view must carry the write rail.
+"""A hand-built ForwardBatch view must carry the iteration's plan.
 
-BUG REGRESSION. The speculative draft-extend cuda-graph runners do not hand a
-real ForwardBatch to `init_forward_metadata_out_graph`; they build a
-`SimpleNamespace` view over their capture-stable buffers. On a translating
-pool that hook reaches `fill_capture_write_loc`, which reads
-`out_cache_loc_virtual` -- the pre-translate write loc -- and translates it
-into the backend's capture buffer.
+The speculative cuda-graph runners do not hand a real ForwardBatch to
+`init_forward_metadata_out_graph`; they build a `SimpleNamespace` view over
+their capture-stable buffers. The backends read the iteration's ids through
+the view's `kv_loc_plan`: its read table on a translating pool.
 
-A view that omits the field fails two ways, and the quiet one is worse. A
-`SimpleNamespace` raises AttributeError, which at least crashes the cell. But
-`fill_capture_write_loc` also accepts the field being None, and answers it by
-zeroing the buffer -- page-0 sink ids. So a view that "fixes" the crash by
-passing None sends every draft-extend KV write to the sink, and speculative
-decoding rejects the resulting drafts instead of failing: it surfaces as
-accept length decaying toward 1.0, not as an error.
+A view that omits the plan crashes on a unified pool, and passes on a static
+one, whose reads never touch the plan -- which is why the default builds
+never catch it. A view that names it None is the same omission in disguise.
 
-Three runners had the omission independently, so this guards the shape rather
-than the three sites: any `SimpleNamespace` view that reaches
-`init_forward_metadata_out_graph` must name `out_cache_loc_virtual`.
-
-The field is only read on a unified (translating) pool, which is why the
-default builds never caught it.
+Several runners build such views, so this guards the shape rather than the
+sites: any `SimpleNamespace` view that reaches
+`init_forward_metadata_out_graph` must name `kv_loc_plan`.
 
 CPU-only, no torch.
 
@@ -56,7 +47,7 @@ _SPEC_DIR = (
     / "speculative"
 )
 _HOOK = "init_forward_metadata_out_graph"
-_RAIL = "out_cache_loc_virtual"
+_RAIL = "kv_loc_plan"
 
 
 def _views_missing_the_rail(path: pathlib.Path):
@@ -122,7 +113,7 @@ class TestHandBuiltViewWriteRail(unittest.TestCase):
             offenders,
             [],
             f"hand-built ForwardBatch view reaches {_HOOK} without {_RAIL}; on a "
-            "unified pool the draft-extend writes land on the page-0 sink: "
+            "unified pool its reads have no table to gather from: "
             + "; ".join(offenders),
         )
 
@@ -142,12 +133,11 @@ class TestHandBuiltViewWriteRail(unittest.TestCase):
         )
 
     def test_detector_catches_a_view_that_passes_none(self):
-        """None is accepted by `fill_capture_write_loc` and becomes the page-0
-        sink, so naming the rail with None is the omission in disguise."""
+        """Naming the plan with None is the omission in disguise."""
         src = (
             "class R:\n"
             "    def replay(self, fb):\n"
-            "        v = SimpleNamespace(batch_size=8, out_cache_loc_virtual=None)\n"
+            "        v = SimpleNamespace(batch_size=8, kv_loc_plan=None)\n"
             "        self.backend.init_forward_metadata_out_graph(v)\n"
         )
         self.assertEqual(
@@ -162,7 +152,7 @@ class TestHandBuiltViewWriteRail(unittest.TestCase):
             "        v = SimpleNamespace(\n"
             "            batch_size=8,\n"
             "            out_cache_loc=self.buffers.out_cache_loc,\n"
-            "            out_cache_loc_virtual=fb.out_cache_loc_virtual,\n"
+            "            kv_loc_plan=fb.kv_loc_plan,\n"
             "        )\n"
             "        self.backend.init_forward_metadata_out_graph(v)\n"
         )

@@ -1,7 +1,8 @@
 """Nothing under layers/attention may translate KV ids for itself.
 
-Ownership is exactly two places: `KVIndexTranslator` for READS and the
-ForwardBatch rebind (`rebind_write_loc`) for WRITES. Virtual and physical ids
+Ownership is exactly one place: the iteration's `KVLocPlan`, built through
+`KVIndexTranslator`, translates the WRITE window and the READ table once, and
+backends read the result. Virtual and physical ids
 share a value range, so a backend that forgets a translate -- or does one
 twice -- reads the wrong rows and nothing crashes.
 

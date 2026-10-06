@@ -1120,8 +1120,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._post_process_after_profile(prof)
         self._profiler = None
 
-        # No pool-side pin to clear: the captured full-physical write loc rides the
-        # backend's `ForwardMetadata.out_cache_loc_full_physical` (-> KVWriteLoc.full_loc).
+        # No pool-side pin to clear: a captured forward writes through this
+        # runner's `out_cache_loc` slot, refilled with physical ids each replay.
 
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(
@@ -1273,9 +1273,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if (c := self.model_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
-            # Full-physical write loc lives in the attention metadata (the backend's
-            # `out_cache_loc_full_physical` -> KVWriteLoc.full_loc), so the runner
-            # wires no buffer here. (SWA write loc rides the `swa_out_cache_loc` rail.)
+            # The captured write loc is this runner's `out_cache_loc` slot; the
+            # SWA write loc rides the backend's `swa_out_cache_loc` buffer.
 
             with canary_ctx:
                 shape_key = self._make_graph_key(

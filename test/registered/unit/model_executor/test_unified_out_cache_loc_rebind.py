@@ -13,11 +13,12 @@
 # ==============================================================================
 """ForwardBatch construction wires the unified write-loc rebind.
 
-`init_new` must call `kv_index_translator.rebind_write_loc`: a construction
-path that skips it ships VIRTUAL write ids to the kernels, a silent
-wrong-slot store. Also runs the REAL `_pad_inputs_to_size` against a live
-translator, since pad lanes are zeros and zeros must derive to the slot-0
-sink. Sliding-window semantics are pinned in test_kv_index_translator.py.
+`init_new` must bind the batch to a plan (`translator.own_plan`,
+`kv_loc_plan.bind`): a construction path that skips it ships VIRTUAL write
+ids to the kernels, a silent wrong-slot store. Also runs the REAL
+`_pad_inputs_to_size` against a live translator, since pad lanes are zeros
+and must write the slot-0 sink in every id space. Sliding-window semantics
+are pinned in test_kv_index_translator.py.
 
     python -m pytest test/registered/unit/model_executor/test_unified_out_cache_loc_rebind.py -v
 """
@@ -73,13 +74,9 @@ def _armed_source(v2p, swa_map):
     # The WRITE loc has its own translate because under DCP it arrives widened;
     # at dcp_size == 1 it is the read translate, so arm it with the same fake.
     src._translate_write_full = src._translate_full
-    # Phase 2 derives from physical values through p2v + the swa v2p; arm the
-    # inverse of the fake v2p (ps=1, so the expected swa loc for virtual t is
-    # swa_map[t]).
-    p2v = torch.zeros(int(v2p.max()) + 1, dtype=torch.int64)
-    p2v[v2p] = torch.arange(v2p.numel(), dtype=torch.int64)
-    src._full_p2v_table = p2v
-    src._swa_v2p_table = swa_map
+    # The sliding-window ids derive from the virtual window (ps=1, so the swa
+    # id for virtual t is swa_map[t]).
+    src._swa_write_from_virtual = lambda t: swa_map[t.to(torch.int64)]
     return src
 
 
@@ -122,11 +119,10 @@ class TestPadComposesWithDerivation(CustomTestCase):
             kv_index_translator=src,
         )
 
-    def test_pad_lanes_derive_to_sink_and_slices_stay_pointwise(self):
-        """The REAL `_pad_inputs_to_size` composes with phase 2: pad lanes are
-        zeros, zeros derive to the slot-0 sink, and any slice of the padded
-        tensor (the TBO-child shape) derives pointwise -- no handover call
-        exists for the pad to make."""
+    def test_pad_lanes_write_the_sink_in_both_spaces(self):
+        """The REAL `_pad_inputs_to_size` pads the full and the sliding-window
+        write ids together: pad lanes write the slot-0 sink in both spaces,
+        and both stay the same length as the batch's tokens."""
         n, padded = 3, 6
         v2p = torch.arange(64, dtype=torch.int64) * 3
         swa_map = torch.arange(64, dtype=torch.int64) * 5
@@ -135,30 +131,30 @@ class TestPadComposesWithDerivation(CustomTestCase):
         fb = _make_fb(virt.clone())
         fb.positions = torch.arange(n, dtype=torch.int64)
         fb.lora_ids = [None] * fb.batch_size
-        src.rebind_write_loc(fb)
+        src.bind_own_plan(fb)
         self.assertTrue(torch.equal(fb.out_cache_loc, v2p[virt]))
+        self.assertTrue(torch.equal(fb.out_cache_loc_swa, swa_map[virt]))
 
         fb._pad_inputs_to_size(self._fake_runner_for_pad(src), padded, fb.batch_size)
 
-        self.assertEqual(fb.out_cache_loc.shape[0], padded)
         # Padded tail lanes go to slot 0 -- the reserved dummy-write sink.
-        self.assertTrue(bool((fb.out_cache_loc[n:] == 0).all()))
-        loc = src._swa_write_loc_unified(fb.out_cache_loc)
-        self.assertTrue(torch.equal(loc[:n], swa_map[virt]))
-        self.assertTrue(bool((loc[n:] == 0).all()))
-        self.assertEqual(loc.dtype, torch.int64)
-        # The TBO-child shape: a slice of the PADDED tensor derives pointwise.
-        sub = src._swa_write_loc_unified(fb.out_cache_loc[1:5])
-        self.assertTrue(torch.equal(sub, loc[1:5]))
+        for loc, want in (
+            (fb.out_cache_loc, v2p[virt]),
+            (fb.out_cache_loc_swa, swa_map[virt]),
+        ):
+            self.assertEqual(loc.shape[0], padded)
+            self.assertTrue(torch.equal(loc[:n], want))
+            self.assertTrue(bool((loc[n:] == 0).all()))
+            self.assertEqual(loc.dtype, torch.int64)
 
     def test_empty_loc_rebinds_to_empty(self):
         src = _armed_source(
             torch.arange(8, dtype=torch.int64), torch.arange(8, dtype=torch.int64)
         )
         fb = _make_fb(torch.empty(0, dtype=torch.int64))
-        src.rebind_write_loc(fb)
+        src.bind_own_plan(fb)
         self.assertEqual(fb.out_cache_loc.numel(), 0)
-        self.assertEqual(src._swa_write_loc_unified(fb.out_cache_loc).numel(), 0)
+        self.assertEqual(fb.out_cache_loc_swa.numel(), 0)
 
 
 class TestReadRailTranslatesAtProduction(CustomTestCase):

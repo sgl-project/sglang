@@ -26,16 +26,19 @@ class _BonusTokenVerifyInput(SpecInput):
 class _KVIndexTranslator:
     is_translating = False
 
-    def fill_packed_read_stream(
+    def pack_read_stream(
         self,
+        plan,
         *,
         req_pool_indices,
         seq_lens,
         indptr,
-        total_tokens,
         out,
+        kv_start_idx=None,
+        sliding_window=False,
     ):
         out.zero_()
+        return False
 
 
 class _RecordingTritonBackend(TritonAttnBackend):
@@ -92,6 +95,8 @@ def _make_forward_batch(batch_size, spec_info):
         spec_info=spec_info,
         forward_mode=ForwardMode.TARGET_VERIFY,
         out_cache_loc=torch.zeros(batch_size * 7, dtype=torch.int64),
+        # A static pool's reads never touch the plan.
+        kv_loc_plan=None,
     )
 
 
