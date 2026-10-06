@@ -52,25 +52,33 @@ __global__ void gelu_tanh_cat_kernel(
 template <typename T>
 void gelu_tanh_cat(tvm::ffi::TensorView attn, tvm::ffi::TensorView mlp, tvm::ffi::TensorView output) {
   using namespace host;
-  auto rows = SymbolicSize{"rows"};
-  auto attn_width = SymbolicSize{"attn_width"};
-  auto mlp_width = SymbolicSize{"mlp_width"};
+  CHECK_HOST(attn.ndim() >= 2) << "gelu_tanh_cat: expected at least two dimensions";
+  auto dtype = SymbolicDType{};
+  dtype.set_options<T>();
   auto device_ = SymbolicDevice{};
   device_.set_options<kDLCUDA>();
-  TensorMatcher({rows, attn_width}).with_dtype<T>().with_device(device_).verify(attn);
-  TensorMatcher({rows, mlp_width}).with_dtype<T>().with_device(device_).verify(mlp);
-  const int64_t a = attn_width.unwrap();
-  const int64_t m = mlp_width.unwrap();
-  TensorMatcher({rows, a + m}).with_dtype<T>().with_device(device_).verify(output);
+  for (const auto tensor : {attn, mlp, output}) {
+    dtype.verify(tensor.dtype());
+    device_.verify(tensor.device());
+    CHECK_HOST(tensor.ndim() == attn.ndim() && tensor.is_contiguous())
+        << "gelu_tanh_cat: expected contiguous tensors of equal rank";
+    for (int64_t dim = 0; dim < attn.ndim() - 1; ++dim) {
+      CHECK_HOST(tensor.size(dim) == attn.size(dim)) << "gelu_tanh_cat: leading dimensions must match";
+    }
+  }
+  const int64_t a = attn.size(-1);
+  const int64_t m = mlp.size(-1);
+  CHECK_HOST(output.size(-1) == a + m) << "gelu_tanh_cat: incorrect output width";
   constexpr int kVecN = 16 / sizeof(T);
   CHECK_HOST(a > 0 && m > 0 && a % kVecN == 0 && m % kVecN == 0)
       << "gelu_tanh_cat: both widths must be positive multiples of " << kVecN;
-  CHECK_HOST(rows.unwrap() > 0) << "gelu_tanh_cat: rows must be positive";
+  const int64_t rows = attn.numel() / a;
+  CHECK_HOST(rows > 0) << "gelu_tanh_cat: rows must be positive";
   CHECK_HOST(
       reinterpret_cast<uintptr_t>(attn.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(mlp.data_ptr()) % 16 == 0 &&
       reinterpret_cast<uintptr_t>(output.data_ptr()) % 16 == 0)
       << "gelu_tanh_cat: tensors must be 16-byte aligned";
-  const int64_t n = rows.unwrap() * ((a + m) / kVecN);
+  const int64_t n = rows * ((a + m) / kVecN);
   CHECK_HOST(n <= std::numeric_limits<int32_t>::max()) << "gelu_tanh_cat: tensor is too large";
   constexpr int kBlockSize = 256;
   const auto kernel = gelu_tanh_cat_kernel<T, kVecN>;
