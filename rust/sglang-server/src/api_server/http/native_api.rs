@@ -15,12 +15,11 @@ use super::frame::{
     OutputAccumulator, cumulative_frame_string, frame_value, stream_frame_string, tag_value,
 };
 use crate::api_server::core::{
-    CoreCall, CoreError, CoreEvent, CoreOutput, CoreRequest, HealthStatus, recv_indexed,
+    CoreCall, CoreError, CoreEvent, CoreOutput, HealthStatus, recv_indexed,
 };
-use crate::api_server::core_error_status;
 #[cfg(test)]
 use crate::message::ids::Rid;
-use crate::message::request::into_requests;
+use crate::message::request::{GenerateRequest, into_requests};
 use crate::message::wire::merge_preferred_sampling;
 use crate::utils::{
     environ,
@@ -37,7 +36,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use sglang_api_types::api::v1::GenerateRequest as WireGenerateRequest;
+use sglang_api_types::api::v1 as api;
 
 /// API-local timing for one request.
 ///
@@ -92,7 +91,7 @@ pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Res
 }
 
 fn native_core_error(error: CoreError, stream: bool) -> Response {
-    native_error(core_error_status(&error), &error.to_string(), stream)
+    native_error(error.http_status(), &error.to_string(), stream)
 }
 
 /// `/health` + `/health_generate`. Both env knobs are resolved ONCE here, at
@@ -185,7 +184,7 @@ async fn generate(
     }
     // The schema (sglang_api_types) is the contract: decode errors carry
     // serde's field-level text, as Python's 400s do.
-    let body: WireGenerateRequest = match serde_json::from_value(body) {
+    let body: api::GenerateRequest = match serde_json::from_value(body) {
         Ok(body) => body,
         Err(error) => return native_error(StatusCode::BAD_REQUEST, &error.to_string(), false),
     };
@@ -222,7 +221,7 @@ async fn generate(
 /// SSE frames or fold to one unary response.
 async fn generate_single(
     state: &AppState,
-    req: CoreRequest,
+    req: GenerateRequest,
     stream: bool,
     timing: RequestTiming,
 ) -> Response {
@@ -275,7 +274,7 @@ async fn drain_unary(
             }
             CoreEvent::Failed(error) => {
                 timing.finish();
-                let status = core_error_status(&error);
+                let status = error.http_status();
                 return (status, error_value(status.as_u16(), &error.to_string()));
             }
         }
@@ -296,7 +295,7 @@ async fn drain_unary(
 /// own `{ "error": … }` entry; the batch response is 200.
 async fn generate_batch(
     state: &AppState,
-    requests: Vec<CoreRequest>,
+    requests: Vec<GenerateRequest>,
     stream: bool,
     timing: RequestTiming,
 ) -> Response {
@@ -408,7 +407,7 @@ fn generation_event_stream(
             }
 
             if let Some(error) = failed {
-                let status = core_error_status(&error);
+                let status = error.http_status();
                 yield tag_value(error_value(status.as_u16(), &error.to_string()), idx(i));
             } else if let Some(out) = terminal {
                 // The final frame carries the full cumulative state, so any

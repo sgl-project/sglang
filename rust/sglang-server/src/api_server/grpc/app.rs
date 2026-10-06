@@ -8,7 +8,7 @@
 use sglang_api_types::api::v1::sglang_service_server::SglangServiceServer;
 use tokio_stream::wrappers::TcpListenerStream;
 
-use super::GrpcService;
+use super::service::GrpcService;
 
 /// Tonic's 4 MiB default is too small for large token or multimodal request
 /// bodies; keep the limit the Python-backed gRPC server established.

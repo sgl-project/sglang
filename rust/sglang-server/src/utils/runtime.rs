@@ -320,7 +320,8 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let shutdown_rx = shutdown_rx.clone();
         let grpc_server = grpc_listener.map(|listener| {
-            let service = api_server::grpc::GrpcService::new(core.clone(), &cfg.server_args);
+            let service =
+                api_server::grpc::service::GrpcService::new(core.clone(), &cfg.server_args);
             (listener, service)
         });
         let handle = std::thread::Builder::new()
@@ -350,7 +351,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     if let Some((listener, service)) = grpc_server {
                         tokio::join!(
                             http,
-                            api_server::grpc::server::serve(listener, service, shutdown_rx)
+                            api_server::grpc::app::serve(listener, service, shutdown_rx)
                         );
                     } else {
                         http.await;

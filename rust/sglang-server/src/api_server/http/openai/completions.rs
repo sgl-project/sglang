@@ -24,10 +24,10 @@ use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
     openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::api_server::core::{CoreCall, CoreError, CoreEvent, CoreOutput, CoreRequest};
-use crate::api_server::core_error_status;
+use crate::api_server::core::{CoreCall, CoreError, CoreEvent, CoreOutput};
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
+use crate::message::request::GenerateRequest;
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::{OneOrMany, TokenIds};
@@ -162,7 +162,7 @@ async fn completions(
                     Err(response) => return response,
                 };
             }
-            let native = CoreRequest {
+            let native = GenerateRequest {
                 rid: rid.clone(),
                 text: text.clone(),
                 input_ids: input_ids.clone(),
@@ -250,7 +250,7 @@ async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<Str
             false,
         )),
         Err(error) => {
-            let status = core_error_status(&error);
+            let status = error.http_status();
             Err(openai_error(
                 status,
                 format!("failed to decode prompt for echo: {error}"),
@@ -521,7 +521,7 @@ pub(super) fn completion_event_stream(
             let output = match event {
                 CoreEvent::Delta(output) | CoreEvent::Finished(output) => output,
                 CoreEvent::Failed(error) => {
-                    yield error_payload(core_error_status(&error), error.to_string()).to_string();
+                    yield error_payload(error.http_status(), error.to_string()).to_string();
                     continue;
                 }
             };

@@ -12,7 +12,7 @@ use axum::{
     response::Response,
 };
 
-use super::{common, native_api, openai};
+use super::{info, native_api, openai};
 use crate::api_server::core::CoreHandle;
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
 use crate::api_server::log;
@@ -74,7 +74,7 @@ pub async fn serve(
     });
     // Each endpoint module registers its own routes and merges here.
     let router = Router::new()
-        .merge(common::routes())
+        .merge(info::routes())
         .merge(native_api::routes())
         .merge(openai::routes());
 

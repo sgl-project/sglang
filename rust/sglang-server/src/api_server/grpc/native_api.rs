@@ -10,14 +10,12 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use sglang_api_types::api::v1 as api;
-use sglang_api_types::api::v1::generate_stream_item::Item;
 use tonic::{Code, Status};
 
-use super::ResponseStream;
+use super::service::ResponseStream;
 use crate::api_server::core::{
     CoreCall, CoreError, CoreErrorKind, CoreEvent, CoreOutput, recv_indexed,
 };
-use crate::api_server::core_error_status;
 use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
 
 pub(super) struct StreamOptions {
@@ -136,14 +134,16 @@ fn frame_item(
     e2e_latency: Option<f64>,
 ) -> api::GenerateStreamItem {
     api::GenerateStreamItem {
-        item: Some(Item::Frame(api::GenerateResponse {
-            text: output.text.clone(),
-            meta_info: Some(meta_info(output, public_id, e2e_latency)),
-            output_ids: (!output.token_ids.is_empty()).then(|| api::TokenIds {
-                ids: output.token_ids.clone(),
-            }),
-            index,
-        })),
+        item: Some(api::generate_stream_item::Item::Frame(
+            api::GenerateResponse {
+                text: output.text.clone(),
+                meta_info: Some(meta_info(output, public_id, e2e_latency)),
+                output_ids: (!output.token_ids.is_empty()).then(|| api::TokenIds {
+                    ids: output.token_ids.clone(),
+                }),
+                index,
+            },
+        )),
     }
 }
 
@@ -151,13 +151,15 @@ fn frame_item(
 /// HTTP status, as on the SSE error frame.
 fn error_item(error: &CoreError, index: Option<u32>) -> api::GenerateStreamItem {
     api::GenerateStreamItem {
-        item: Some(Item::Error(api::GenerateStreamError {
-            error: Some(api::ErrorBody {
-                message: error.to_string(),
-                code: u32::from(core_error_status(error).as_u16()),
-            }),
-            index,
-        })),
+        item: Some(api::generate_stream_item::Item::Error(
+            api::GenerateStreamError {
+                error: Some(api::ErrorBody {
+                    message: error.to_string(),
+                    code: u32::from(error.http_status().as_u16()),
+                }),
+                index,
+            },
+        )),
     }
 }
 

@@ -7,6 +7,7 @@ pub mod config;
 pub mod detok;
 pub mod finish_reason;
 pub mod ids;
+pub mod info;
 pub mod io_struct;
 pub mod multimodal;
 pub mod request;

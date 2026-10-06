@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use super::app::AppState;
 use super::native_api::native_error;
-use crate::api_server::core::{CoreError, ServerInfo};
-use crate::api_server::core_error_status;
+use crate::api_server::core::CoreError;
+use crate::message::info::ServerInfo;
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -55,7 +55,7 @@ async fn await_server_info(state: &AppState) -> Result<ServerInfo, Response> {
             )
                 .into_response())
         }
-        Err(error) => Err((core_error_status(&error), error.to_string()).into_response()),
+        Err(error) => Err((error.http_status(), error.to_string()).into_response()),
     }
 }
 

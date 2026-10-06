@@ -36,10 +36,10 @@ use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
     indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::api_server::core::{CoreCall, CoreEvent, CoreRequest};
-use crate::api_server::core_error_status;
+use crate::api_server::core::{CoreCall, CoreEvent};
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::ids::Rid;
+use crate::message::request::GenerateRequest;
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
@@ -204,7 +204,7 @@ async fn chat_completions(
                 .expect("chat prompt exists until the last choice")
                 .clone()
         };
-        let native = CoreRequest {
+        let native = GenerateRequest {
             rid: rid.clone(),
             text: Some(choice_prompt),
             // Rendered templates own their special tokens — the pool must not
@@ -589,7 +589,7 @@ pub(super) fn chat_event_stream(
                         id: None,
                         event: None,
                         comment: None,
-                        error: Some(error_payload(core_error_status(&error), error.to_string()).to_string()),
+                        error: Some(error_payload(error.http_status(), error.to_string()).to_string()),
                     };
                     continue;
                 }

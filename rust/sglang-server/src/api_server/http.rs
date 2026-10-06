@@ -1,6 +1,6 @@
-pub mod app;
-mod common;
+pub(crate) mod app;
 mod frame;
+mod info;
 mod native_api;
 mod native_generation;
 mod openai;

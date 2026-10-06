@@ -22,9 +22,9 @@ pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
 
 use super::app::AppState;
 use super::frame::OutputAccumulator;
-use crate::api_server::core::{CoreCall, CoreError, CoreEvent, CoreOutput, CoreRequest};
-use crate::api_server::core_error_status;
+use crate::api_server::core::{CoreCall, CoreError, CoreEvent, CoreOutput};
 use crate::message::config::ServerArgs;
+use crate::message::request::GenerateRequest;
 use crate::tokenizer_manager::tokenizer;
 use crate::utils::response::error_response;
 
@@ -126,7 +126,7 @@ async fn collect_output(mut call: CoreCall) -> Result<CoreOutput, (StatusCode, S
                 break accumulator.into_output();
             }
             Some(CoreEvent::Failed(error)) => {
-                let status = core_error_status(&error);
+                let status = error.http_status();
                 return Err((status, error.to_string()));
             }
             None => {
@@ -142,7 +142,7 @@ async fn collect_output(mut call: CoreCall) -> Result<CoreOutput, (StatusCode, S
 
 async fn submit_generation(
     state: &AppState,
-    request: CoreRequest,
+    request: GenerateRequest,
     stream: bool,
 ) -> Result<CoreCall, Response> {
     match state.core.generate(request).await {
