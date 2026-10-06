@@ -191,6 +191,15 @@ class EngramLayout(msgspec.Struct, frozen=True):
             head_dim=config.engram_head_dim,
         )
 
+    def column_bounds(self, hash_index: int) -> tuple[int, ...]:
+        """Prefix sums of one layer's column segments, in the hash's (n-gram
+        size, head) column order: hash column c owns rows [bounds[c], bounds[c + 1])."""
+        bounds = [0]
+        for per_ngram in self.primes[hash_index]:
+            for prime in per_ngram:
+                bounds.append(bounds[-1] + prime)
+        return tuple(bounds)
+
 
 def compute_engram_hash_ids(
     tokens: torch.Tensor,
@@ -712,22 +721,55 @@ class _HostTable:
             logger.info(msg)
 
 
+def shard_range(
+    num_embeddings: int,
+    column_bounds: tuple[int, ...],
+    tp_rank: int,
+    tp_size: int,
+) -> tuple[int, int]:
+    """This rank's [start, end) rows: on the layer's hash-column boundaries when
+    the column count divides evenly, so a rank owns whole per-head subtables,
+    else the equal-row split. Exactly one rank owns each row either way, so the
+    zero-fill + all-reduce lookup is bitwise independent of the choice."""
+    assert column_bounds[-1] == num_embeddings, (
+        "the config's table size disagrees with its primes"
+    )
+    if (len(column_bounds) - 1) % tp_size == 0:
+        cols_per_rank = (len(column_bounds) - 1) // tp_size
+        return (
+            column_bounds[tp_rank * cols_per_rank],
+            column_bounds[(tp_rank + 1) * cols_per_rank],
+        )
+    return (
+        num_embeddings * tp_rank // tp_size,
+        num_embeddings * (tp_rank + 1) // tp_size,
+    )
+
+
 class EngramEmbedding(nn.Module):
     """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
-    Rows are sharded over the TP group in device memory; with
+    Rows are sharded over the TP group in device memory, aligned to the hash
+    columns where they divide evenly (`shard_range`); with
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE they live in host memory instead, as
     one shared copy or one shard per rank (see _HostTable). Loading is sharded
     in every layout: a rank writes only its own row range.
     """
 
-    def __init__(self, num_embeddings: int, dim: int, layer_id: int):
+    def __init__(
+        self,
+        num_embeddings: int,
+        dim: int,
+        layer_id: int,
+        column_bounds: tuple[int, ...],
+    ):
         super().__init__()
         self.dim = dim
         self.tp_size = get_parallel().tp_size
         tp_rank = get_parallel().tp_rank
-        self.row_start = num_embeddings * tp_rank // self.tp_size
-        row_end = num_embeddings * (tp_rank + 1) // self.tp_size
+        self.row_start, row_end = shard_range(
+            num_embeddings, column_bounds, tp_rank, self.tp_size
+        )
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
         if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
@@ -957,7 +999,10 @@ class Engram(nn.Module):
         self.clamp_value = 1e-6
         dim, hc_mult = config.hidden_size, config.hc_mult
         self.embed = EngramEmbedding(
-            layout.num_embeddings[self.layer_hash_index], layout.head_dim, layer_id
+            layout.num_embeddings[self.layer_hash_index],
+            layout.head_dim,
+            layer_id,
+            column_bounds=layout.column_bounds(self.layer_hash_index),
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
