@@ -87,6 +87,35 @@ runs:
           let apiCalls = 0;
           let cachedCalls = 0;
 
+          // The GitHub jobs API intermittently returns 5xx/429 or drops the
+          // connection, which used to crash the whole gate job on a single
+          // failed poll. Retry those transient failures with backoff.
+          const retryBackoffSeconds = [5, 10];
+
+          function isTransientError(err) {
+            if (err.status === 429 || (err.status && err.status >= 500)) {
+              return true;
+            }
+            // Network-level failures (e.g. ECONNRESET) surface without a status.
+            return err.status === undefined;
+          }
+
+          async function requestWithRetry(url, params) {
+            for (let attempt = 1; ; attempt++) {
+              try {
+                return await github.request(url, params);
+              } catch (err) {
+                if (attempt >= 3 || !isTransientError(err)) {
+                  throw err;
+                }
+                const retryAfter = parseInt(err.response?.headers?.['retry-after']);
+                const delaySeconds = retryAfter > 0 ? retryAfter : retryBackoffSeconds[attempt - 1];
+                console.log(`[retry] ${url} failed (attempt ${attempt}/3, status ${err.status === undefined ? 'network' : err.status}): ${err.message}; retrying in ${delaySeconds}s`);
+                await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
+              }
+            }
+          }
+
           async function fetchJobs() {
             const url = `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs`;
             const params = {
@@ -101,7 +130,7 @@ runs:
             }
 
             try {
-              const response = await github.request(url, params);
+              const response = await requestWithRetry(url, params);
               apiCalls++;
               const rateRemaining = response.headers['x-ratelimit-remaining'] || '?';
               const rateLimit = response.headers['x-ratelimit-limit'] || '?';
@@ -115,7 +144,7 @@ runs:
               if (response.data.total_count > 100) {
                 lastEtag = '';
                 for (let page = 2; page <= Math.ceil(response.data.total_count / 100); page++) {
-                  const { data: pageData } = await github.request(url, {
+                  const { data: pageData } = await requestWithRetry(url, {
                     ...params,
                     page,
                     headers: {},
