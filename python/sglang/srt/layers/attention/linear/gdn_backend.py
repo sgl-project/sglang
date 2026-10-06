@@ -28,6 +28,7 @@ from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 _is_hip = is_hip()
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
@@ -352,8 +353,11 @@ class GDNKernelDispatcher:
                 flashinfer_kernel = FlashInferGDNKernel()
                 self.extend_kernel = flashinfer_kernel
         elif prefill_backend.is_flydsl():
-            if not is_gfx95_supported():
-                raise ValueError("The FlyDSL GDN prefill backend requires AMD gfx95")
+            if not _use_aiter or not is_gfx95_supported():
+                raise ValueError(
+                    "The FlyDSL GDN prefill backend requires AMD gfx95 and "
+                    "SGLANG_USE_AITER=1"
+                )
             from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import (
                 FlyDSLGDNKernel,
             )
