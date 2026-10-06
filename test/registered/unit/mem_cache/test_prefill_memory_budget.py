@@ -66,7 +66,7 @@ def _cache():
         sliding_window_size=8,
         full_evictable_size=lambda: 0,
         swa_evictable_size=lambda: 0,
-        is_chunk_cache=lambda: False,
+        supports_prefix_sharing=lambda: True,
     )
 
 
@@ -179,14 +179,14 @@ class TestSharedPrefillAdmission(unittest.TestCase):
         with get_parallel().override(attn_dcp_size=1):
             scheduler.init_req_max_new_tokens(req)
         self.assertEqual(req.sampling_params.max_new_tokens, 1)
-        req._refresh_fill_ids()
+        req.refresh_fill_ids()
 
         cache = SimpleNamespace(
             sliding_window_size=page_size,
             disable=True,
             full_evictable_size=lambda: 0,
             swa_evictable_size=lambda: 0,
-            is_chunk_cache=lambda: True,
+            supports_prefix_sharing=lambda: False,
             supports_mamba=lambda: False,
         )
         adder = PrefillAdder(

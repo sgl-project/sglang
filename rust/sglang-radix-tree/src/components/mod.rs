@@ -60,6 +60,40 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// The component this driver serves.
     fn component_type(&self) -> ComponentType;
 
+    /// Return the node's lock-segment UUID, minting and storing one when absent.
+    fn get_or_fill_uuid(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+        host: bool,
+    ) -> i64 {
+        let component_type = self.component_type();
+        let existing = match (component_type, host) {
+            (ComponentType::Full, true) => tree_core.arena.node(node_id).full_host_uuid,
+            (ComponentType::Swa, true) => tree_core.arena.node(node_id).swa_host_uuid,
+            (ComponentType::Swa, false) => tree_core.arena.node(node_id).swa_uuid,
+            (ComponentType::Full, false) => {
+                panic!("get_or_fill_uuid is unsupported for Full device locks")
+            }
+            (ComponentType::Mamba, _) => {
+                panic!("get_or_fill_uuid is unsupported for Mamba")
+            }
+        };
+        if let Some(uuid) = existing {
+            return uuid;
+        }
+
+        let uuid = tree_core.next_component_uuid_(component_type);
+        let node = tree_core.arena.node_mut(node_id);
+        match (component_type, host) {
+            (ComponentType::Full, true) => node.full_host_uuid = Some(uuid),
+            (ComponentType::Swa, true) => node.swa_host_uuid = Some(uuid),
+            (ComponentType::Swa, false) => node.swa_uuid = Some(uuid),
+            (ComponentType::Full, false) | (ComponentType::Mamba, _) => unreachable!(),
+        }
+        uuid
+    }
+
     /// Whether this component has device data that still needs a host backup.
     fn needs_incremental_backup(
         &self,
@@ -308,7 +342,7 @@ pub trait TreeComponent<K: ChildKeyType> {
     //           node itself (mamba state is per-leaf, not per-path).
     //
     //         When ``lock_host`` is True, the lock applies to host-side state:
-    //         - Full: single-node host lock.
+    //         - Full: a one-node UUID-bounded segment that expands across splits.
     //         - SWA: host window-lock with a dedicated host UUID boundary.
     //         - Mamba: single-node host lock with host LRU detach."""
     //         ...
@@ -338,7 +372,8 @@ pub trait TreeComponent<K: ChildKeyType> {
     //         - Mamba: single-node unlock — only decrements lock_ref on the
     //           node itself.
     //
-    //         When ``lock_host`` is True, the inverse host-side semantics apply."""
+    //         When ``lock_host`` is True, Full and SWA replay their host boundary
+    //         UUIDs while Mamba retains its single-node semantics."""
     //         ...
     fn release_component_lock(
         &self,
