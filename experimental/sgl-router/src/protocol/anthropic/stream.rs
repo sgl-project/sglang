@@ -9,11 +9,11 @@ use serde_json::{json, Value};
 use super::{error_type, new_id, stop_reason, usage_from_chat, EchoContext};
 use crate::protocol::sse::{data_payload, write_event, LineBuffer, SseTransducer};
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Thinking,
     Text,
-    Tool(u64),
+    Tool,
 }
 
 pub struct MessagesStream {
@@ -23,6 +23,9 @@ pub struct MessagesStream {
     started: bool,
     terminal: bool,
     open: Option<(Kind, usize)>,
+    /// Text or thinking that arrived while a tool call was open; emitted
+    /// after the call so it cannot split it.
+    held: Vec<(Kind, String)>,
     next_index: usize,
     usage: Option<Value>,
     finish_reason: Option<String>,
@@ -38,6 +41,7 @@ impl MessagesStream {
             started: false,
             terminal: false,
             open: None,
+            held: Vec::new(),
             next_index: 0,
             usage: None,
             finish_reason: None,
@@ -56,6 +60,7 @@ impl MessagesStream {
             let message = err
                 .get("message")
                 .and_then(Value::as_str)
+                .or_else(|| err.as_str())
                 .unwrap_or("upstream error");
             let status = err.get("code").and_then(Value::as_u64);
             let status = status.and_then(|c| u16::try_from(c).ok()).unwrap_or(500);
@@ -77,12 +82,10 @@ impl MessagesStream {
                     .filter(|s| !s.is_empty())
             };
             if let Some(r) = text("reasoning_content") {
-                self.open_block(Kind::Thinking, None, out);
-                self.delta(json!({"type": "thinking_delta", "thinking": r}), out);
+                self.text(Kind::Thinking, r, out);
             }
             if let Some(t) = text("content") {
-                self.open_block(Kind::Text, None, out);
-                self.delta(json!({"type": "text_delta", "text": t}), out);
+                self.text(Kind::Text, t, out);
             }
             for call in delta
                 .get("tool_calls")
@@ -90,18 +93,7 @@ impl MessagesStream {
                 .into_iter()
                 .flatten()
             {
-                let idx = call.get("index").and_then(Value::as_u64).unwrap_or(0);
-                self.open_block(Kind::Tool(idx), Some(call), out);
-                if let Some(args) = call
-                    .pointer("/function/arguments")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                {
-                    self.delta(
-                        json!({"type": "input_json_delta", "partial_json": args}),
-                        out,
-                    );
-                }
+                self.tool_call(call, out);
             }
         }
         if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
@@ -133,10 +125,58 @@ impl MessagesStream {
         write_event(out, "message_start", &data);
     }
 
-    fn open_block(&mut self, kind: Kind, call: Option<&Value>, out: &mut Vec<u8>) {
-        if self.open.as_ref().is_some_and(|(k, _)| *k == kind) {
+    fn text(&mut self, kind: Kind, s: &str, out: &mut Vec<u8>) {
+        if matches!(self.open, Some((Kind::Tool, _))) {
+            match self.held.last_mut() {
+                Some((k, held)) if *k == kind => held.push_str(s),
+                _ => self.held.push((kind, s.to_owned())),
+            }
             return;
         }
+        if !matches!(self.open, Some((k, _)) if k == kind) {
+            self.open_block(kind, None, out);
+        }
+        let delta = match kind {
+            Kind::Thinking => json!({"type": "thinking_delta", "thinking": s}),
+            _ => json!({"type": "text_delta", "text": s}),
+        };
+        self.delta(delta, out);
+    }
+
+    /// SGLang names a call only on its first chunk, so a name starts a new
+    /// block: the index alone can repeat across calls.
+    fn tool_call(&mut self, call: &Value, out: &mut Vec<u8>) {
+        let named = call
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            .is_some_and(|n| !n.is_empty());
+        if named || !matches!(self.open, Some((Kind::Tool, _))) {
+            self.close_block(out);
+            self.flush_held(out);
+            self.open_block(Kind::Tool, Some(call), out);
+        }
+        if let Some(args) = call
+            .pointer("/function/arguments")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            self.delta(
+                json!({"type": "input_json_delta", "partial_json": args}),
+                out,
+            );
+        }
+    }
+
+    /// Emits held text after a tool call; whitespace alone is dropped.
+    fn flush_held(&mut self, out: &mut Vec<u8>) {
+        for (kind, s) in std::mem::take(&mut self.held) {
+            if !s.trim().is_empty() {
+                self.text(kind, &s, out);
+            }
+        }
+    }
+
+    fn open_block(&mut self, kind: Kind, call: Option<&Value>, out: &mut Vec<u8>) {
         self.ensure_started(out);
         self.close_block(out);
         let index = self.next_index;
@@ -144,7 +184,7 @@ impl MessagesStream {
         let block = match kind {
             Kind::Thinking => json!({"type": "thinking", "thinking": "", "signature": ""}),
             Kind::Text => json!({"type": "text", "text": ""}),
-            Kind::Tool(_) => json!({
+            Kind::Tool => json!({
                 "type": "tool_use",
                 "id": call.and_then(|c| c.get("id")).and_then(Value::as_str)
                     .map(str::to_owned).unwrap_or_else(|| new_id("toolu")),
@@ -221,6 +261,8 @@ impl SseTransducer for MessagesStream {
             return out;
         }
         self.ensure_started(&mut out);
+        self.close_block(&mut out);
+        self.flush_held(&mut out);
         self.close_block(&mut out);
         let (reason, sequence) = stop_reason(
             self.finish_reason.as_deref(),
@@ -441,5 +483,84 @@ mod tests {
         assert_eq!(evs[0].0, "message_start");
         let md = &evs.iter().find(|(e, _)| e == "message_delta").unwrap().1;
         assert_eq!(md["usage"]["input_tokens"], 4);
+    }
+
+    /// The partial JSON each `tool_use` block received, in block order.
+    fn tool_inputs(evs: &[(String, Value)]) -> Vec<(String, String)> {
+        let mut blocks: Vec<(u64, String, String)> = Vec::new();
+        for (e, d) in evs {
+            if e == "content_block_start" && d["content_block"]["type"] == "tool_use" {
+                let name = d["content_block"]["name"].as_str().unwrap().to_owned();
+                blocks.push((d["index"].as_u64().unwrap(), name, String::new()));
+            }
+            if e == "content_block_delta" && d["delta"]["type"] == "input_json_delta" {
+                let i = d["index"].as_u64().unwrap();
+                let b = blocks.iter_mut().find(|b| b.0 == i).unwrap();
+                b.2.push_str(d["delta"]["partial_json"].as_str().unwrap());
+            }
+        }
+        blocks.into_iter().map(|(_, n, a)| (n, a)).collect()
+    }
+
+    fn call(name: Option<&str>, args: &str) -> Value {
+        let mut f = json!({"arguments": args});
+        if let Some(n) = name {
+            f["name"] = json!(n);
+        }
+        json!({"tool_calls": [{"index": 0, "function": f}]})
+    }
+
+    #[test]
+    fn a_repeated_index_with_a_new_name_is_a_new_call() {
+        let evs = run(&[
+            chunk(call(Some("weather"), r#"{"city":"Paris"}"#), None, true),
+            chunk(
+                call(Some("weather"), r#"{"city":"Rome"}"#),
+                Some("tool_calls"),
+                true,
+            ),
+        ]);
+        assert_eq!(
+            tool_inputs(&evs),
+            [
+                ("weather".into(), r#"{"city":"Paris"}"#.into()),
+                ("weather".into(), r#"{"city":"Rome"}"#.into())
+            ]
+        );
+    }
+
+    fn text_deltas(evs: &[(String, Value)]) -> Vec<&str> {
+        evs.iter()
+            .filter(|(e, d)| e == "content_block_delta" && d["delta"]["type"] == "text_delta")
+            .map(|(_, d)| d["delta"]["text"].as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn text_inside_a_call_does_not_split_it() {
+        let split = |after: &str| {
+            run(&[
+                chunk(call(Some("f"), r#"{"x":"#), None, true),
+                chunk(json!({"content": "\n"}), None, true),
+                chunk(call(None, "1}"), None, true),
+                chunk(json!({"content": after}), Some("tool_calls"), true),
+            ])
+        };
+        // Held whitespace alone is dropped.
+        let evs = split(" ");
+        assert_eq!(tool_inputs(&evs), [("f".into(), r#"{"x":1}"#.into())]);
+        assert!(text_deltas(&evs).is_empty());
+        // Real text is kept, after the call.
+        let evs = split("done");
+        assert_eq!(tool_inputs(&evs), [("f".into(), r#"{"x":1}"#.into())]);
+        assert_eq!(text_deltas(&evs), ["\ndone"]);
+    }
+
+    #[test]
+    fn a_string_error_keeps_its_message() {
+        let mut s = MessagesStream::new(echo());
+        let raw = s.feed(b"data: {\"error\": \"queue full\"}\n\n");
+        let (_, data) = events(&raw).pop().unwrap();
+        assert_eq!(data["error"]["message"], "queue full");
     }
 }

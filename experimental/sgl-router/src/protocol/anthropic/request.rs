@@ -69,19 +69,23 @@ pub fn to_chat(req: Value, count_only: bool) -> Result<Converted, String> {
     };
 
     let mut messages = Vec::new();
-    let mut system = system_text(req.get("system"))?;
+    if let Some(s) = system_text(req.get("system"))? {
+        messages.push(json!({"role": "system", "content": s}));
+    }
     let Some(Value::Array(turns)) = req.get("messages") else {
         return Err("messages: field required and must be an array".into());
     };
     if turns.is_empty() {
         return Err("messages: at least one message is required".into());
     }
-    for (i, turn) in turns.iter().enumerate() {
-        convert_turn(turn, i, &mut messages, &mut system)?;
+    for turn in merge_turns(turns)? {
+        match turn.role {
+            "user" => convert_user(&turn.blocks, turn.at, &mut messages)?,
+            _ => convert_assistant(&turn.blocks, turn.at, &mut messages)?,
+        }
     }
-    if let Some(s) = system {
-        messages.insert(0, json!({"role": "system", "content": s}));
-    }
+    // A final assistant turn is a prefill the reply continues.
+    let prefill = messages.last().is_some_and(|m| m["role"] == "assistant");
 
     let mut chat = Map::new();
     for (k, v) in &req {
@@ -91,6 +95,9 @@ pub fn to_chat(req: Value, count_only: bool) -> Result<Converted, String> {
     }
     chat.insert("model".into(), Value::String(model.clone()));
     chat.insert("messages".into(), Value::Array(messages));
+    if prefill && !req.contains_key("continue_final_message") {
+        chat.insert("continue_final_message".into(), Value::Bool(true));
+    }
     chat.insert("stream".into(), Value::Bool(stream));
     if stream {
         // Usage on every chunk so `message_start` has `input_tokens`.
@@ -219,58 +226,54 @@ fn system_text(system: Option<&Value>) -> Result<Option<String>, String> {
     }
 }
 
-fn convert_turn(
-    turn: &Value,
-    i: usize,
-    messages: &mut Vec<Value>,
-    system: &mut Option<String>,
-) -> Result<(), String> {
-    let role = turn
-        .get("role")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("messages.{i}.role: field required"))?;
-    let content = turn
-        .get("content")
-        .filter(|v| !v.is_null())
-        .ok_or_else(|| format!("messages.{i}.content: field required"))?;
-    match role {
-        "user" => convert_user(content, i, messages),
-        "assistant" => convert_assistant(content, i, messages),
-        // Fold into the top-level system prompt.
-        "system" => {
-            let text = match content {
-                Value::String(s) => s.clone(),
-                other => system_text(Some(other))?.unwrap_or_default(),
-            };
-            match system {
-                Some(s) => {
-                    s.push('\n');
-                    s.push_str(&text);
-                }
-                None => *system = Some(text),
+/// One turn after consecutive same-role turns are merged, as the Messages
+/// API does; `at` is the first source index, for error paths.
+struct Turn<'a> {
+    role: &'a str,
+    at: usize,
+    blocks: Vec<Value>,
+}
+
+fn merge_turns(turns: &[Value]) -> Result<Vec<Turn<'_>>, String> {
+    let mut out: Vec<Turn> = Vec::new();
+    for (i, turn) in turns.iter().enumerate() {
+        let role = match turn.get("role").and_then(Value::as_str) {
+            Some(r @ ("user" | "assistant")) => r,
+            Some(other) => {
+                return Err(format!(
+                    "messages.{i}.role: expected user or assistant, got `{other}`"
+                ))
             }
-            Ok(())
+            None => return Err(format!("messages.{i}.role: field required")),
+        };
+        let blocks = match turn.get("content") {
+            Some(Value::String(s)) => vec![json!({"type": "text", "text": s})],
+            Some(Value::Array(b)) if !b.is_empty() => b.clone(),
+            Some(Value::Array(_)) => {
+                return Err(format!("messages.{i}.content: must not be empty"))
+            }
+            None | Some(Value::Null) => {
+                return Err(format!("messages.{i}.content: field required"))
+            }
+            Some(_) => {
+                return Err(format!(
+                    "messages.{i}.content: must be a string or an array of content blocks"
+                ))
+            }
+        };
+        match out.last_mut() {
+            Some(last) if last.role == role => last.blocks.extend(blocks),
+            _ => out.push(Turn {
+                role,
+                at: i,
+                blocks,
+            }),
         }
-        other => Err(format!(
-            "messages.{i}.role: expected user or assistant, got `{other}`"
-        )),
     }
+    Ok(out)
 }
 
-fn blocks(content: &Value, i: usize) -> Result<&[Value], String> {
-    match content {
-        Value::Array(b) => Ok(b),
-        _ => Err(format!(
-            "messages.{i}.content: must be a string or an array of content blocks"
-        )),
-    }
-}
-
-fn convert_user(content: &Value, i: usize, messages: &mut Vec<Value>) -> Result<(), String> {
-    if let Value::String(s) = content {
-        messages.push(json!({"role": "user", "content": s}));
-        return Ok(());
-    }
+fn convert_user(blocks: &[Value], i: usize, messages: &mut Vec<Value>) -> Result<(), String> {
     let mut parts: Vec<Value> = Vec::new();
     // Keeps order: user(pre) → tool → user(post).
     let flush = |parts: &mut Vec<Value>, messages: &mut Vec<Value>| {
@@ -278,14 +281,13 @@ fn convert_user(content: &Value, i: usize, messages: &mut Vec<Value>) -> Result<
             messages.push(json!({"role": "user", "content": collapse(std::mem::take(parts))}));
         }
     };
-    for (j, block) in blocks(content, i)?.iter().enumerate() {
+    for (j, block) in blocks.iter().enumerate() {
         let typ = block.get("type").and_then(Value::as_str).unwrap_or("");
         match typ {
             "tool_result" => {
                 flush(&mut parts, messages);
                 let id = block
                     .get("tool_use_id")
-                    .or_else(|| block.get("id"))
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
                         format!("messages.{i}.content.{j}.tool_use_id: field required")
@@ -306,12 +308,13 @@ fn convert_user(content: &Value, i: usize, messages: &mut Vec<Value>) -> Result<
                     }
                     Some(other) => Value::String(other.to_string()),
                 };
-                let tool_content = match block.get("is_error").and_then(Value::as_bool) {
-                    Some(true) => match tool_content {
-                        Value::String(s) => Value::String(format!("Error: {s}")),
-                        other => other,
-                    },
-                    _ => tool_content,
+                let tool_content = match (block.get("is_error"), tool_content) {
+                    (Some(Value::Bool(true)), Value::String(s)) => format!("Error: {s}").into(),
+                    (Some(Value::Bool(true)), Value::Array(mut parts)) => {
+                        parts.insert(0, json!({"type": "text", "text": "Error:"}));
+                        Value::Array(parts)
+                    }
+                    (_, c) => c,
                 };
                 messages.push(json!({"role": "tool", "tool_call_id": id, "content": tool_content}));
             }
@@ -326,17 +329,13 @@ fn convert_user(content: &Value, i: usize, messages: &mut Vec<Value>) -> Result<
     Ok(())
 }
 
-fn convert_assistant(content: &Value, i: usize, messages: &mut Vec<Value>) -> Result<(), String> {
-    if let Value::String(s) = content {
-        messages.push(json!({"role": "assistant", "content": s}));
-        return Ok(());
-    }
-    let mut text = String::new();
+fn convert_assistant(blocks: &[Value], i: usize, messages: &mut Vec<Value>) -> Result<(), String> {
+    let mut texts: Vec<&str> = Vec::new();
     let mut reasoning: Vec<&str> = Vec::new();
     let mut tool_calls = Vec::new();
-    for (j, block) in blocks(content, i)?.iter().enumerate() {
+    for (j, block) in blocks.iter().enumerate() {
         match block.get("type").and_then(Value::as_str).unwrap_or("") {
-            "text" => text.push_str(block.get("text").and_then(Value::as_str).unwrap_or("")),
+            "text" => texts.push(block.get("text").and_then(Value::as_str).unwrap_or("")),
             "thinking" => {
                 if let Some(t) = block.get("thinking").and_then(Value::as_str) {
                     if !t.is_empty() {
@@ -368,6 +367,8 @@ fn convert_assistant(content: &Value, i: usize, messages: &mut Vec<Value>) -> Re
             }
         }
     }
+    // Chat content is one string; tool calls follow it.
+    let text = texts.join("\n");
     let mut m = Map::new();
     m.insert("role".into(), "assistant".into());
     m.insert(
@@ -396,7 +397,6 @@ fn convert_block(block: &Value, at: &str) -> Result<Option<Value>, String> {
         }
         "image" => json!({"type": "image_url", "image_url": {"url": source_url(block, at)?}}),
         "search_result" => json!({"type": "text", "text": search_result_text(block)}),
-        "image_url" => block.clone(),
         "thinking" | "redacted_thinking" => return Ok(None),
         "" => return Err(format!("messages.{at}.type: field required")),
         other => {
@@ -768,5 +768,89 @@ mod tests {
             true
         )
         .is_ok());
+    }
+
+    fn req(messages: Value) -> Value {
+        json!({"model": "m", "max_tokens": 8, "messages": messages})
+    }
+
+    #[test]
+    fn consecutive_same_role_turns_merge_in_order() {
+        let c = chat(req(json!([
+            {"role": "user", "content": "a"},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "r1"},
+                {"type": "text", "text": "b"}]},
+            {"role": "assistant", "content": "x"},
+            {"role": "assistant", "content": [{"type": "text", "text": "y"}]},
+            {"role": "user", "content": "c"},
+        ])));
+        let roles: Vec<&str> = c["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "tool", "user", "assistant", "user"]);
+        assert_eq!(c["messages"][3]["content"], "x\ny");
+    }
+
+    #[test]
+    fn final_assistant_turn_is_a_prefill() {
+        let c = chat(req(json!([
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "{\"answer\":"},
+        ])));
+        assert_eq!(c["continue_final_message"], true);
+        assert!(chat(req(json!([{"role": "user", "content": "q"}])))
+            .get("continue_final_message")
+            .is_none());
+        let mut r =
+            req(json!([{"role": "user", "content": "q"}, {"role": "assistant", "content": "p"}]));
+        r["continue_final_message"] = json!(false);
+        assert_eq!(chat(r)["continue_final_message"], false);
+    }
+
+    #[test]
+    fn tool_result_error_with_blocks_keeps_the_flag() {
+        let c = chat(req(json!([{"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "t", "is_error": true,
+            "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}]}])));
+        assert_eq!(
+            c["messages"][0]["content"][0],
+            json!({"type": "text", "text": "Error:"})
+        );
+        assert_eq!(c["messages"][0]["content"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn rejects_inputs_outside_the_spec() {
+        for (messages, needle) in [
+            (
+                json!([{"role": "system", "content": "s"}]),
+                "expected user or assistant",
+            ),
+            (
+                json!([{"role": "user", "content": []}]),
+                "must not be empty",
+            ),
+            (
+                json!([{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "u"}}]}]),
+                "image_url",
+            ),
+            (
+                json!([{"role": "user", "content": [
+                    {"type": "tool_result", "id": "t", "content": "r"}]}]),
+                "tool_use_id",
+            ),
+        ] {
+            let err = to_chat(req(messages.clone()), false).unwrap_err();
+            assert!(err.contains(needle), "{messages}: {err}");
+        }
+        // Clients also send `stop_sequences` as a bare string.
+        let mut r = req(json!([{"role": "user", "content": "q"}]));
+        r["stop_sequences"] = json!("END");
+        assert_eq!(chat(r)["stop"], json!(["END"]));
     }
 }

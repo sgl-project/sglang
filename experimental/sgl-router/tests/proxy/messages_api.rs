@@ -38,7 +38,10 @@ fn config() -> Config {
 }
 
 fn build_ctx(url: String) -> Arc<AppContext> {
-    let cfg = config();
+    build_ctx_with(url, config())
+}
+
+fn build_ctx_with(url: String, cfg: Config) -> Arc<AppContext> {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
     let _ = registry.add(WorkerSpec {
@@ -232,15 +235,38 @@ async fn router_side_rejections_use_the_anthropic_envelope() {
 #[tokio::test]
 async fn count_tokens() {
     let mock = MockWorker::start(vec![]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let tokenizer = dir.path().join("tokenizer.json");
+    std::fs::copy("tests/fixtures/tiny_tokenizer.json", &tokenizer).unwrap();
+    std::fs::write(
+        dir.path().join("tokenizer_config.json"),
+        json!({"chat_template": "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}"})
+            .to_string(),
+    )
+    .unwrap();
+    let mut cfg = config();
+    cfg.model.tokenizer_path = Some(tokenizer.to_str().unwrap().into());
+    let req = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello world"}]});
+
     let (status, _, body) = post(
-        build_ctx(mock.url.clone()),
+        build_ctx_with(mock.url.clone(), cfg),
         "/v1/messages/count_tokens",
-        json!({"model": MODEL, "messages": [{"role": "user", "content": "hello world"}]}),
+        req.clone(),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert!(v["input_tokens"].as_u64().unwrap() > 0, "{v}");
+
+    // Without a chat template there is no exact count, and no raw-text guess.
+    let (status, _, body) = post(
+        build_ctx(mock.url.clone()),
+        "/v1/messages/count_tokens",
+        req,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_anthropic_error(&body, "api_error");
     assert!(
         captured(&mock).is_none(),
         "count_tokens is answered by the router"

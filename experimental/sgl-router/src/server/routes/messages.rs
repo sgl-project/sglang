@@ -14,7 +14,6 @@ use axum::middleware::Next;
 use axum::response::IntoResponse;
 use bytes::Bytes;
 
-use crate::discovery::ModelId;
 use crate::protocol::anthropic::{
     self, response::chat_to_message, stream::MessagesStream, EchoContext,
 };
@@ -44,7 +43,7 @@ pub(crate) async fn messages(
     adapt(resp, Some((converted.echo, converted.stream))).await
 }
 
-/// Exact with the model's chat encoder, approximate without.
+/// Counted with the model's chat encoder; image tokens are not included.
 pub(crate) async fn count_tokens(
     State(ctx): State<Arc<AppContext>>,
     body: Bytes,
@@ -57,12 +56,16 @@ pub(crate) async fn count_tokens(
     if let Err(e) = tokenizer_for(&ctx, &model) {
         return adapt(e.into_response(), None).await;
     }
-    match crate::policies::request_tokens_for(&ctx.tokenizers, &ModelId(model), &converted.chat) {
-        Some(t) => axum::Json(serde_json::json!({"input_tokens": t.ids.len()})).into_response(),
+    // No raw-text fallback: a count without template and tool overhead is wrong.
+    match ctx.tokenizers.encode_chat(&model, &converted.chat) {
+        Some(ids) => axum::Json(serde_json::json!({"input_tokens": ids.len()})).into_response(),
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             [(header::CONTENT_TYPE, "application/json")],
-            anthropic::error_body(500, "failed to render the request for token counting"),
+            anthropic::error_body(
+                500,
+                "could not render the request with the model's chat template",
+            ),
         )
             .into_response(),
     }
