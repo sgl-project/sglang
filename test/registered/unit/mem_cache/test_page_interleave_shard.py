@@ -1893,6 +1893,13 @@ class _IndexerCacheCheck:
                     assert got.is_contiguous()
                     _assert_bytes(got, value.to(expected_dtype), "decoded latent KV")
 
+    def read_index(self, layer_id, pages, seq_len):
+        """Gather one request's keys and scales by logical page IDs."""
+        lengths = torch.tensor([seq_len], dtype=torch.int32, device=self.device)
+        return self.pool.get_index_k_scale_buffer(
+            layer_id, lengths, pages[None], seq_len, seq_len
+        )
+
     def batch(self, requests, generation):
         """requests contains (logical pages, prefix token count, sequence length)."""
         seq_lens = [seq_len for _, _, seq_len in requests]
@@ -1936,7 +1943,7 @@ class _IndexerCacheCheck:
             self.assert_owned(layer_id)
             if _INDEXER_SKIP_TOPK[layer_id - _INDEXER_START_LAYER]:
                 with unittest.TestCase().assertRaisesRegex(AssertionError, "skip-topk"):
-                    self.pool.get_index_k_continuous(layer_id, 1, page_table[0])
+                    self.read_index(layer_id, page_table[0], 1)
                 continue
 
             # Repeated public reads must preserve the resident layer while
@@ -1950,18 +1957,9 @@ class _IndexerCacheCheck:
                     expected_k, expected_s = _unpack_index(
                         reference_buf, pages, seq_len
                     )
-                    _assert_bytes(
-                        self.pool.get_index_k_continuous(layer_id, seq_len, pages),
-                        expected_k,
-                        "continuous FP8 keys",
-                    )
-                    _assert_bytes(
-                        self.pool.get_index_k_scale_continuous(
-                            layer_id, seq_len, pages
-                        ),
-                        expected_s,
-                        "continuous FP32 scales",
-                    )
+                    got_k, got_s = self.read_index(layer_id, pages, seq_len)
+                    _assert_bytes(got_k, expected_k, "per-request FP8 keys")
+                    _assert_bytes(got_s, expected_s, "per-request FP32 scales")
                     scratch_pages = (
                         self.pool.translate_loc_to_scratch(
                             pages.long() * _INDEXER_PAGE_SIZE
@@ -2012,7 +2010,7 @@ class _IndexerCacheCheck:
                 with unittest.TestCase().assertRaisesRegex(
                     AssertionError, "begin_shard_extend"
                 ):
-                    self.pool.get_index_k_continuous(_INDEXER_START_LAYER, 1, pages[:1])
+                    self.read_index(_INDEXER_START_LAYER, pages[:1], 1)
 
             for layer_id in range(
                 _INDEXER_START_LAYER, _INDEXER_START_LAYER + len(_INDEXER_SKIP_TOPK)
@@ -2041,20 +2039,9 @@ class _IndexerCacheCheck:
                         expected_k, expected_s = _index_values(
                             pages[i : i + 1] * _INDEXER_PAGE_SIZE, layer_id, 8 + i
                         )
-                        _assert_bytes(
-                            self.pool.get_index_k_continuous(
-                                layer_id, 1, pages[i : i + 1]
-                            ),
-                            expected_k,
-                            "mutated location FP8 keys",
-                        )
-                        _assert_bytes(
-                            self.pool.get_index_k_scale_continuous(
-                                layer_id, 1, pages[i : i + 1]
-                            ),
-                            expected_s,
-                            "mutated location FP32 scales",
-                        )
+                        got_k, got_s = self.read_index(layer_id, pages[i : i + 1], 1)
+                        _assert_bytes(got_k, expected_k, "mutated location FP8 keys")
+                        _assert_bytes(got_s, expected_s, "mutated location FP32 scales")
             self.pool.end_shard_extend()
         torch.cuda.synchronize()
         torch.distributed.barrier()
@@ -2093,20 +2080,8 @@ class _IndexerCacheCheck:
             reference = self.reference.get_index_k_with_scale_buffer(layer_id)
             snapshots.append((raw[scratch_pages].clone(), reference[page_ids]))
             expected_k, expected_s = _unpack_index(reference, page_ids, locs.numel())
-            snapshots.append(
-                (
-                    self.pool.get_index_k_continuous(layer_id, locs.numel(), page_ids),
-                    expected_k,
-                )
-            )
-            snapshots.append(
-                (
-                    self.pool.get_index_k_scale_continuous(
-                        layer_id, locs.numel(), page_ids
-                    ),
-                    expected_s,
-                )
-            )
+            got_k, got_s = self.read_index(layer_id, page_ids, locs.numel())
+            snapshots.extend(((got_k, expected_k), (got_s, expected_s)))
         torch.cuda.synchronize()
         for actual, expected in snapshots:
             _assert_bytes(actual, expected, "asynchronous layer pipeline")

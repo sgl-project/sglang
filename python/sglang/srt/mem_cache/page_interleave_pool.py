@@ -764,18 +764,6 @@ class _PageInterleaveIndexKeyCache(IndexKeyCache):
         )
         return self.pool._page_pos[page_indices.long()]
 
-    def get_k_continuous(self, layer_id: int, seq_len: int, page_indices: torch.Tensor):
-        return super().get_k_continuous(
-            layer_id, seq_len, self._scratch_pages(layer_id, page_indices)
-        )
-
-    def get_k_scale_continuous(
-        self, layer_id: int, seq_len: int, page_indices: torch.Tensor
-    ):
-        return super().get_k_scale_continuous(
-            layer_id, seq_len, self._scratch_pages(layer_id, page_indices)
-        )
-
     def get_k_and_scale(
         self,
         layer_id: int,
@@ -845,8 +833,7 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
     Prefix gathers copy complete packed indexer pages; chunk stores stage
     every token and persist only the owning rank's tokens.
 
-    ``get_index_k_continuous``, ``get_index_k_scale_continuous``, and
-    ``get_index_k_scale_buffer`` accept logical page IDs during an active
+    ``get_index_k_scale_buffer`` accepts logical page IDs during an active
     sharded extend. Consumers of the raw ``get_index_k_with_scale_buffer``
     must translate their page IDs with the batch's scratch plan themselves,
     just as consumers of ``get_key_buffer`` do. Outside an extend, raw getters
