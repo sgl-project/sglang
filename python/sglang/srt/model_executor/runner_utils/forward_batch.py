@@ -40,8 +40,8 @@ def get_forward_batch() -> "ForwardBatch":
 @contextmanager
 def set_forward_batch(forward_batch: "ForwardBatch") -> Iterator[None]:
     """Publish the current batch and restore the previous one on scope exit."""
-    token = _current_batch.set(forward_batch)
+    reset_token = _current_batch.set(forward_batch)
     try:
         yield
     finally:
-        _current_batch.reset(token)
+        _current_batch.reset(reset_token)
