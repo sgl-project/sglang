@@ -205,15 +205,16 @@ The card is not offered on MI350X: hierarchical cache has not been validated on 
 
 Only the L2 tier is exposed here. For the storage (L3) tier and the canonical flag set, see the [HiCache best-practices recipe](../../../docs/advanced_features/hicache_best_practices) and the [HiCache documentation](../../../docs/advanced_features/hicache).
 
-### 3.6 Agentic Long-Context (SemiAnalysis InferenceX AgentX)
+### 3.6 Agentic Long-Context
 
 <Warning>
 These configurations are mirrored from [SemiAnalysis InferenceX](https://github.com/SemiAnalysisAI/InferenceX) AgentX submissions and have **not been verified by the SGLang team**. For launch commands the SGLang team has verified, use the [Deployment panel](#deployment) and the [Playground](#playground) above.
 </Warning>
 
-[AgentX](https://inferencex.semianalysis.com/) replays multi-turn agentic-coding traces, whose long and highly reusable prefixes reward KV-cache reuse and host-memory offload. Pick a hardware platform, checkpoint, deployment shape, concurrency and router to get every process of that deployment as a raw command: infrastructure (etcd, NATS, Mooncake), each worker role, and the front door. Each configuration links back to the SemiAnalysis sweep run that measured it.
+[AgentX](https://inferencex.semianalysis.com/) replays multi-turn agentic-coding traces, whose long and highly reusable prefixes reward KV-cache reuse and host-memory offload. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV offload and router to get every process of that deployment as a raw command: infrastructure (etcd, NATS, Mooncake), each worker role, and the front door. Each configuration links back to the SemiAnalysis sweep run that measured it.
 
 - **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks). The other router is derived by re-rendering the same recipe through [srt-slurm](https://github.com/NVIDIA/srt-slurm), and is marked as not run.
+- **KV offload.** Each configuration was measured with one KV tier: none (GPU KV only), HiCache (host DRAM), or a Mooncake store attached through the external linker. The other tiers are derived by swapping only the KV-cache settings and are marked as not run. HiCache settings come from a verified configuration of the same model; Mooncake settings come from the verified DeepSeek-V4 GB300 external-linker configuration. The Mooncake option needs an image whose SGLang build includes `--enable-unified-cache-external-linker`.
 - **What changed from the submission.** Benchmark-harness plumbing, SemiAnalysis cluster paths and caches, telemetry switches, and the synthetic speculative-decoding acceptance that InferenceX injects for comparable throughput are removed. IPs, ports and NIC names become placeholders. Engine flags and environment variables are otherwise mirrored as submitted.
 - **Container image.** Run the commands inside the image listed for each configuration. Several are SGLang nightly images, so flag names follow that image.
 

@@ -3,7 +3,7 @@
 // (SemiAnalysisAI/InferenceX main@8ba71d026e86 plus open PRs #3187, #3598, #3631, #3659), with SA-specific settings removed.
 export const agentx = {
  "model": "GLM-5.2",
- "generatedOn": "2026-10-05",
+ "generatedOn": "2026-10-06",
  "source": {
   "repo": "https://github.com/SemiAnalysisAI/InferenceX",
   "main": "8ba71d026e866e7792074a3fd3f896fe6d1ad099",
@@ -79,6 +79,67 @@ export const agentx = {
    "NATS_SERVER": "nats://$NATS_IP:4222"
   }
  ],
+ "kvMooncake": {
+  "donor": "dsv4-fp4-gb300-dynamo-sglang-agentic-disagg",
+  "donorHardware": "gb300",
+  "master": {
+   "dynamo": {
+    "kind": "mooncake-master",
+    "count_nodes": 1,
+    "ports": ["8700"],
+    "cmd": "mooncake_master",
+    "env": {
+     "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+     "NATS_SERVER": "nats://$NATS_IP:4222"
+    },
+    "args": [
+     ["--port", "8700"],
+     ["--enable_http_metadata_server", "true"],
+     ["--http_metadata_server_port", "8701"],
+     ["--default_kv_lease_ttl", "10000"],
+     ["--rpc_thread_num", "16"],
+     ["--eviction_high_watermark_ratio", "0.90"]
+    ]
+   },
+   "sglang": {
+    "kind": "mooncake-master",
+    "count_nodes": 1,
+    "ports": ["8700"],
+    "cmd": "mooncake_master",
+    "env": {},
+    "args": [
+     ["--port", "8700"],
+     ["--enable_http_metadata_server", "true"],
+     ["--http_metadata_server_port", "8701"],
+     ["--default_kv_lease_ttl", "10000"],
+     ["--rpc_thread_num", "16"],
+     ["--eviction_high_watermark_ratio", "0.90"]
+    ]
+   }
+  },
+  "args": [
+   ["--enable-unified-cache-external-linker"],
+   ["--hicache-storage-backend-extra-config", "{\"enable_group_semantics\":true}"],
+   ["--unified-cache-external-linker-backend", "mooncake"]
+  ],
+  "env": {
+   "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+   "MC_TCP_BIND_ADDRESS": "$NODE_IP",
+   "MOONCAKE_DEVICE": "$IB_DEVICES",
+   "MOONCAKE_GLOBAL_SEGMENT_SIZE": "140gb",
+   "MOONCAKE_LOCAL_HOSTNAME": "$NODE_IP",
+   "MOONCAKE_MASTER": "$MOONCAKE_MASTER_IP:8700",
+   "MOONCAKE_PROTOCOL": "rdma",
+   "MOONCAKE_STANDALONE_STORAGE": "0",
+   "MOONCAKE_TE_META_DATA_SERVER": "http://$MOONCAKE_MASTER_IP:8701/metadata"
+  },
+  "decode_env": {
+   "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+   "MOONCAKE_LOCAL_HOSTNAME": "$NODE_IP",
+   "MOONCAKE_MASTER": "$MOONCAKE_MASTER_IP:8700",
+   "MOONCAKE_TE_META_DATA_SERVER": "http://$MOONCAKE_MASTER_IP:8701/metadata"
+  }
+ },
  "files": {
   "nats.conf#7d9e9ee1": {
    "name": "nats.conf",
@@ -143,7 +204,7 @@ export const agentx = {
    "hw": "b300",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
    "label": "Agg TP8",
-   "detail": "HiCache DRAM · MTP 3-1-4",
+   "detail": "MTP 3-1-4",
    "gpus": 8,
    "configKey": "glm5.2-fp4-b300-sglang-agentic-mtp",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260901-07c8f729",
@@ -152,6 +213,23 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-size", "270"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-b300-sglang-agentic-mtp",
+     "donorHardware": "b300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -164,7 +242,8 @@ export const agentx = {
      "date": "2026-09-11",
      "sha": "674946f358232388205c9e398d0cc06b14ba2969",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375964",
-     "goldenAL": "2.99"
+     "goldenAL": "2.99",
+     "kv": "hicache"
     },
     {
      "concs": [4],
@@ -178,6 +257,7 @@ export const agentx = {
      "sha": "674946f358232388205c9e398d0cc06b14ba2969",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375774",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -211,6 +291,7 @@ export const agentx = {
      "sha": "674946f358232388205c9e398d0cc06b14ba2969",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375813",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -244,6 +325,7 @@ export const agentx = {
      "sha": "674946f358232388205c9e398d0cc06b14ba2969",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375382",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -277,6 +359,7 @@ export const agentx = {
      "sha": "674946f358232388205c9e398d0cc06b14ba2969",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375184",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -310,6 +393,7 @@ export const agentx = {
      "sha": "674946f358232388205c9e398d0cc06b14ba2969",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044376125",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -343,6 +427,7 @@ export const agentx = {
      "sha": "674946f358232388205c9e398d0cc06b14ba2969",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375368",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -376,6 +461,7 @@ export const agentx = {
      "sha": "674946f358232388205c9e398d0cc06b14ba2969",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044374971",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -409,6 +495,7 @@ export const agentx = {
      "sha": "674946f358232388205c9e398d0cc06b14ba2969",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375267",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -442,6 +529,7 @@ export const agentx = {
      "sha": "674946f358232388205c9e398d0cc06b14ba2969",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375118",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -475,6 +563,7 @@ export const agentx = {
      "sha": "674946f358232388205c9e398d0cc06b14ba2969",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375877",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -501,7 +590,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["hicache-size"],
      "blocks": [
       {
        "kind": "worker",
@@ -548,7 +636,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": ["hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -596,7 +683,7 @@ export const agentx = {
    "hw": "b300",
    "ckpt": "zai-org/GLM-5.2-FP8",
    "label": "Agg TP8",
-   "detail": "HiCache DRAM · MTP 3-1-4",
+   "detail": "MTP 3-1-4",
    "gpus": 8,
    "configKey": "glm5.2-fp8-b300-sglang-agentic-mtp",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260908-20ca564b",
@@ -605,6 +692,21 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-size", "270"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-b300-sglang-agentic-mtp",
+     "donorHardware": "b300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -617,7 +719,8 @@ export const agentx = {
      "date": "2026-09-16",
      "sha": "de588b628068061130059bf4ecd4c08877c74250",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340182",
-     "goldenAL": "2.99"
+     "goldenAL": "2.99",
+     "kv": "hicache"
     },
     {
      "concs": [4],
@@ -631,6 +734,7 @@ export const agentx = {
      "sha": "de588b628068061130059bf4ecd4c08877c74250",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340169",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -664,6 +768,7 @@ export const agentx = {
      "sha": "de588b628068061130059bf4ecd4c08877c74250",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340279",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -697,6 +802,7 @@ export const agentx = {
      "sha": "de588b628068061130059bf4ecd4c08877c74250",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340368",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -730,6 +836,7 @@ export const agentx = {
      "sha": "de588b628068061130059bf4ecd4c08877c74250",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340285",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -756,7 +863,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["hicache-size"],
      "blocks": [
       {
        "kind": "worker",
@@ -803,7 +909,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": ["hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -851,7 +956,7 @@ export const agentx = {
    "hw": "b200",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
    "label": "Agg TP8",
-   "detail": "HiCache DRAM · MTP 3-1-4 · glm5.2-fp4-b200-dynamo-sglang-agentic-agg",
+   "detail": "MTP 3-1-4 · glm5.2-fp4-b200-dynamo-sglang-agentic-agg",
    "gpus": 8,
    "configKey": "glm5.2-fp4-b200-dynamo-sglang-agentic-agg",
    "image": "lmsysorg/sglang:nightly-dev-20260910-00840301",
@@ -860,6 +965,20 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "110"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-b200-dynamo-sglang-agentic-agg",
+     "donorHardware": "b200"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -872,7 +991,8 @@ export const agentx = {
      "date": "2026-10-02",
      "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
      "override": "override_c1",
-     "goldenAL": "2.99"
+     "goldenAL": "2.99",
+     "kv": "hicache"
     },
     {
      "concs": [4],
@@ -886,6 +1006,7 @@ export const agentx = {
      "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
      "override": "override_c4",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "dynamo": [
        null,
@@ -922,6 +1043,7 @@ export const agentx = {
      "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
      "override": "override_c8",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "dynamo": [
        null,
@@ -951,7 +1073,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": ["nats.conf#7d9e9ee1", "nginx.conf#524cca35"],
-     "notes": ["hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -1057,7 +1178,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["hicache-size"],
      "blocks": [
       {
        "from": 2,
@@ -1093,7 +1213,7 @@ export const agentx = {
    "hw": "b200",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
    "label": "Agg TP8",
-   "detail": "HiCache DRAM · MTP 3-1-4 · glm5.2-fp4-b200-sglang-agentic-mtp",
+   "detail": "MTP 3-1-4 · glm5.2-fp4-b200-sglang-agentic-mtp",
    "gpus": 8,
    "configKey": "glm5.2-fp4-b200-sglang-agentic-mtp",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260901-07c8f729",
@@ -1102,6 +1222,22 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "110"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-b200-dynamo-sglang-agentic-agg",
+     "donorHardware": "b200"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -1114,7 +1250,8 @@ export const agentx = {
      "date": "2026-09-02",
      "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089398",
-     "goldenAL": "2.99"
+     "goldenAL": "2.99",
+     "kv": "hicache"
     },
     {
      "concs": [4],
@@ -1128,6 +1265,7 @@ export const agentx = {
      "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089293",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -1161,6 +1299,7 @@ export const agentx = {
      "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089238",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -1194,6 +1333,7 @@ export const agentx = {
      "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089321",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -1231,6 +1371,7 @@ export const agentx = {
      "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089397",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -1261,7 +1402,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "worker",
@@ -1308,7 +1448,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -1356,7 +1495,7 @@ export const agentx = {
    "hw": "b200",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
    "label": "Disagg 1P4D · prefill DEP8 · decode TP4",
-   "detail": "HiCache DRAM · MTP 2-1-3",
+   "detail": "MTP 2-1-3",
    "gpus": 40,
    "configKey": "glm5.2-fp4-b200-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-20260910-00840301",
@@ -1365,6 +1504,20 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "110"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-b200-dynamo-sglang-agentic-disagg",
+     "donorHardware": "b200"
+    }
+   },
    "points": [
     {
      "concs": [48],
@@ -1377,14 +1530,14 @@ export const agentx = {
      "date": "2026-10-02",
      "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
      "override": "override_1p4d_tp4_c48",
-     "goldenAL": "2.5"
+     "goldenAL": "2.5",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": [],
      "files": ["nats.conf#7d9e9ee1", "nginx.conf#c1dc3753"],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -1566,7 +1719,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "from": 2,
@@ -1624,7 +1776,7 @@ export const agentx = {
    "hw": "b200",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
    "label": "Disagg 1P1D · prefill DEP8 · decode DEP8",
-   "detail": "HiCache DRAM · MTP 2-1-3",
+   "detail": "MTP 2-1-3",
    "gpus": 16,
    "configKey": "glm5.2-fp4-b200-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-20260910-00840301",
@@ -1633,6 +1785,20 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "110"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-b200-dynamo-sglang-agentic-disagg",
+     "donorHardware": "b200"
+    }
+   },
    "points": [
     {
      "concs": [64],
@@ -1645,14 +1811,14 @@ export const agentx = {
      "date": "2026-10-02",
      "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
      "override": "override_1p1d_c64",
-     "goldenAL": "2.5"
+     "goldenAL": "2.5",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": [],
      "files": ["deepep_config.json#42ebb085", "nats.conf#7d9e9ee1", "nginx.conf#1fa49161"],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -1741,7 +1907,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": ["deepep_config.json#42ebb085"],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "from": 2,
@@ -1796,7 +1961,7 @@ export const agentx = {
    "hw": "b200",
    "ckpt": "zai-org/GLM-5.2-FP8",
    "label": "Agg TP8",
-   "detail": "HiCache DRAM · MTP 3-1-4",
+   "detail": "MTP 3-1-4",
    "gpus": 8,
    "configKey": "glm5.2-fp8-b200-sglang-agentic-mtp",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260908-20ca564b",
@@ -1805,6 +1970,20 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "110"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-b200-dynamo-sglang-agentic-agg",
+     "donorHardware": "b200"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -1817,7 +1996,8 @@ export const agentx = {
      "date": "2026-09-17",
      "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588543",
-     "goldenAL": "2.99"
+     "goldenAL": "2.99",
+     "kv": "hicache"
     },
     {
      "concs": [4],
@@ -1831,6 +2011,7 @@ export const agentx = {
      "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588624",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -1864,6 +2045,7 @@ export const agentx = {
      "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588912",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -1897,6 +2079,7 @@ export const agentx = {
      "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588733",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -1934,6 +2117,7 @@ export const agentx = {
      "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588655",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -1964,7 +2148,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "worker",
@@ -2011,7 +2194,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -2059,7 +2241,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
    "label": "Agg TP8 (2 nodes)",
-   "detail": "HiCache DRAM · MTP 5-1-6",
+   "detail": "MTP 5-1-6",
    "gpus": 8,
    "configKey": "glm5.2-fp4-gb300-dynamo-sglang-agentic-agg",
    "image": "lmsysorg/sglang:nightly-dev-20260914-4358a161",
@@ -2068,6 +2250,20 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "135"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-gb300-dynamo-sglang-agentic-agg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -2079,7 +2275,8 @@ export const agentx = {
      "pr": "3659",
      "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
      "goldenAL": "3.61",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060",
+     "kv": "hicache"
     },
     {
      "concs": [2],
@@ -2092,6 +2289,7 @@ export const agentx = {
      "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
      "goldenAL": "3.61",
      "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060",
+     "kv": "hicache",
      "patch": {
       "dynamo": [
        null,
@@ -2127,6 +2325,7 @@ export const agentx = {
      "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
      "goldenAL": "3.61",
      "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060",
+     "kv": "hicache",
      "patch": {
       "dynamo": [
        null,
@@ -2156,7 +2355,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": ["nats.conf#7d9e9ee1", "nginx.conf#54fdce8a"],
-     "notes": ["hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -2259,7 +2457,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["hicache-size"],
      "blocks": [
       {
        "from": 2,
@@ -2295,7 +2492,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
    "label": "Disagg 1P4D · prefill DEP4 · decode TP4",
-   "detail": "HiCache DRAM · MTP 2-1-3",
+   "detail": "MTP 2-1-3",
    "gpus": 20,
    "configKey": "glm5.2-fp4-gb300-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-20260914-4358a161",
@@ -2304,6 +2501,20 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "135"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [45],
@@ -2315,14 +2526,14 @@ export const agentx = {
      "pr": "3659",
      "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
      "goldenAL": "2.5",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": [],
      "files": ["nats.conf#7d9e9ee1", "nginx.conf#5be3ba02"],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -2490,7 +2701,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "from": 2,
@@ -2548,7 +2758,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
    "label": "Disagg 1P6D · prefill DEP4 · decode TP4",
-   "detail": "HiCache DRAM · MTP 2-1-3",
+   "detail": "MTP 2-1-3",
    "gpus": 28,
    "configKey": "glm5.2-fp4-gb300-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-20260914-4358a161",
@@ -2557,6 +2767,20 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "135"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [45],
@@ -2568,14 +2792,14 @@ export const agentx = {
      "pr": "3659",
      "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
      "goldenAL": "2.5",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": [],
      "files": ["nats.conf#7d9e9ee1", "nginx.conf#e6b85fe6"],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -2631,7 +2855,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "from": 2,
@@ -2691,7 +2914,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
    "label": "Disagg 1P2D · prefill DEP4 · decode TP4",
-   "detail": "HiCache DRAM · MTP 2-1-3",
+   "detail": "MTP 2-1-3",
    "gpus": 12,
    "configKey": "glm5.2-fp4-gb300-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-20260914-4358a161",
@@ -2700,6 +2923,20 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "135"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [48],
@@ -2711,14 +2948,14 @@ export const agentx = {
      "pr": "3659",
      "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
      "goldenAL": "2.5",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": [],
      "files": ["nats.conf#7d9e9ee1", "nginx.conf#c1dc3753"],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -2774,7 +3011,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "from": 2,
@@ -2830,7 +3066,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
    "label": "Disagg 2P1D · prefill DEP8 (2 nodes) · decode DEP16 (4 nodes)",
-   "detail": "HiCache DRAM · MTP 2-1-3",
+   "detail": "MTP 2-1-3",
    "gpus": 32,
    "configKey": "glm5.2-fp4-gb300-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-20260914-4358a161",
@@ -2839,6 +3075,20 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "135"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [192],
@@ -2850,14 +3100,14 @@ export const agentx = {
      "pr": "3659",
      "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
      "goldenAL": "2.5",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": [],
      "files": ["deepep_config.json#42ebb085", "nats.conf#7d9e9ee1", "nginx.conf#b7269bf0"],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -2959,7 +3209,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": ["deepep_config.json#42ebb085"],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "from": 2,
@@ -3015,7 +3264,7 @@ export const agentx = {
    "hw": "gb200",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
    "label": "Agg TP8 (2 nodes)",
-   "detail": "HiCache DRAM · MTP 3-1-4",
+   "detail": "MTP 3-1-4",
    "gpus": 8,
    "configKey": "glm5.2-fp4-gb200-dynamo-sglang-agentic-agg",
    "image": "lmsysorg/sglang:v0.5.17-cu130",
@@ -3030,6 +3279,22 @@ export const agentx = {
     }
    ],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "135"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-gb200-dynamo-sglang-agentic-mtp-agg",
+     "donorHardware": "gb200"
+    }
+   },
    "points": [
     {
      "concs": [1, 2, 4, 8, 12, 16],
@@ -3041,14 +3306,14 @@ export const agentx = {
      "pr": "2620",
      "date": "2026-08-16",
      "sha": "5921b0f0451ea6352875935cd3f7e7aae1a20e40",
-     "goldenAL": "2.99"
+     "goldenAL": "2.99",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["# Dynamo built from source at https://github.com/ai-dynamo/dynamo/commit/71eb001e17fa73c742f0afe1a6ed96836cb135fd"],
      "files": ["nats.conf#7d9e9ee1", "nginx.conf#54fdce8a"],
-     "notes": ["hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -3166,7 +3431,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["hicache-size"],
      "blocks": [
       {
        "from": 2,
@@ -3202,7 +3466,7 @@ export const agentx = {
    "hw": "gb200",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
    "label": "Agg TP8 (2 nodes)",
-   "detail": "HiCache DRAM · MTP 4-1-5",
+   "detail": "MTP 4-1-5",
    "gpus": 8,
    "configKey": "glm5.2-fp4-gb200-dynamo-sglang-agentic-mtp-agg",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260805-211ee642",
@@ -3217,6 +3481,22 @@ export const agentx = {
     }
    ],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "135"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-gb200-dynamo-sglang-agentic-mtp-agg",
+     "donorHardware": "gb200"
+    }
+   },
    "points": [
     {
      "concs": [2],
@@ -3228,7 +3508,8 @@ export const agentx = {
      "pr": "2642",
      "date": "2026-08-19",
      "sha": "6130a8b5b671be6fc9695e8d159197f2cd275482",
-     "goldenAL": "3.33"
+     "goldenAL": "3.33",
+     "kv": "hicache"
     },
     {
      "concs": [4],
@@ -3240,7 +3521,8 @@ export const agentx = {
      "pr": "2642",
      "date": "2026-08-19",
      "sha": "6130a8b5b671be6fc9695e8d159197f2cd275482",
-     "goldenAL": "3.33"
+     "goldenAL": "3.33",
+     "kv": "hicache"
     },
     {
      "concs": [8],
@@ -3252,14 +3534,14 @@ export const agentx = {
      "pr": "2642",
      "date": "2026-08-19",
      "sha": "6130a8b5b671be6fc9695e8d159197f2cd275482",
-     "goldenAL": "3.33"
+     "goldenAL": "3.33",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["# Dynamo built from source at https://github.com/ai-dynamo/dynamo/commit/71eb001e17fa73c742f0afe1a6ed96836cb135fd"],
      "files": ["nats.conf#7d9e9ee1", "nginx.conf#1fa49161"],
-     "notes": ["hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -3326,7 +3608,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["hicache-size"],
      "blocks": [
       {
        "from": 2,
@@ -3362,7 +3643,7 @@ export const agentx = {
    "hw": "gb200",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
    "label": "Disagg 1P1D · prefill TP4 · decode TP4",
-   "detail": "HiCache DRAM · MTP 3-1-4",
+   "detail": "MTP 3-1-4",
    "gpus": 8,
    "configKey": "glm5.2-fp4-gb200-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:v0.5.17-cu130",
@@ -3377,6 +3658,23 @@ export const agentx = {
     }
    ],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-size", "135"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-gb200-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb200"
+    }
+   },
    "points": [
     {
      "concs": [10, 12],
@@ -3389,14 +3687,14 @@ export const agentx = {
      "date": "2026-08-16",
      "sha": "5921b0f0451ea6352875935cd3f7e7aae1a20e40",
      "override": "zip_override_mtp_agentx_frontier[0]",
-     "goldenAL": "2.99"
+     "goldenAL": "2.99",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["# Dynamo built from source at https://github.com/ai-dynamo/dynamo/commit/71eb001e17fa73c742f0afe1a6ed96836cb135fd"],
      "files": ["nats.conf#7d9e9ee1", "nginx.conf#1fa49161"],
-     "notes": ["hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -3593,7 +3891,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["hicache-size"],
      "blocks": [
       {
        "from": 2,
@@ -3650,7 +3947,7 @@ export const agentx = {
    "hw": "gb200",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
    "label": "Disagg 1P6D · prefill DEP8 (2 nodes) · decode TP4",
-   "detail": "HiCache DRAM · MTP 1-1-2",
+   "detail": "MTP 1-1-2",
    "gpus": 32,
    "configKey": "glm5.2-fp4-gb200-dynamo-sglang-agentic-mtp",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260805-211ee642",
@@ -3665,6 +3962,22 @@ export const agentx = {
     }
    ],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "135"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-gb200-dynamo-sglang-agentic-mtp",
+     "donorHardware": "gb200"
+    }
+   },
    "points": [
     {
      "concs": [45],
@@ -3676,14 +3989,14 @@ export const agentx = {
      "pr": "2642",
      "date": "2026-08-19",
      "sha": "6130a8b5b671be6fc9695e8d159197f2cd275482",
-     "goldenAL": "2.5"
+     "goldenAL": "2.5",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["# Dynamo built from source at https://github.com/ai-dynamo/dynamo/commit/71eb001e17fa73c742f0afe1a6ed96836cb135fd"],
      "files": ["nats.conf#7d9e9ee1", "nginx.conf#b7269bf0"],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -3790,7 +4103,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "from": 2,
@@ -3850,7 +4162,7 @@ export const agentx = {
    "hw": "gb200",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
    "label": "Disagg 1P4D · prefill DEP8 (2 nodes) · decode TP4",
-   "detail": "HiCache DRAM · MTP 1-1-2",
+   "detail": "MTP 1-1-2",
    "gpus": 24,
    "configKey": "glm5.2-fp4-gb200-dynamo-sglang-agentic-mtp",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260805-211ee642",
@@ -3865,6 +4177,22 @@ export const agentx = {
     }
    ],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "135"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-gb200-dynamo-sglang-agentic-mtp",
+     "donorHardware": "gb200"
+    }
+   },
    "points": [
     {
      "concs": [48],
@@ -3876,14 +4204,14 @@ export const agentx = {
      "pr": "2642",
      "date": "2026-08-19",
      "sha": "6130a8b5b671be6fc9695e8d159197f2cd275482",
-     "goldenAL": "2.5"
+     "goldenAL": "2.5",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["# Dynamo built from source at https://github.com/ai-dynamo/dynamo/commit/71eb001e17fa73c742f0afe1a6ed96836cb135fd"],
      "files": ["nats.conf#7d9e9ee1", "nginx.conf#de2c9a47"],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -3939,7 +4267,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "from": 2,
@@ -3997,7 +4324,7 @@ export const agentx = {
    "hw": "gb200",
    "ckpt": "nvidia/GLM-5.2-NVFP4",
    "label": "Disagg 2P1D · prefill DEP8 (2 nodes) · decode DEP16 (4 nodes)",
-   "detail": "HiCache DRAM · MTP 1-1-2",
+   "detail": "MTP 1-1-2",
    "gpus": 32,
    "configKey": "glm5.2-fp4-gb200-dynamo-sglang-agentic-mtp",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260805-211ee642",
@@ -4012,6 +4339,22 @@ export const agentx = {
     }
    ],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "135"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp4-gb200-dynamo-sglang-agentic-mtp",
+     "donorHardware": "gb200"
+    }
+   },
    "points": [
     {
      "concs": [128],
@@ -4023,14 +4366,14 @@ export const agentx = {
      "pr": "2642",
      "date": "2026-08-19",
      "sha": "6130a8b5b671be6fc9695e8d159197f2cd275482",
-     "goldenAL": "2.5"
+     "goldenAL": "2.5",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["# Dynamo built from source at https://github.com/ai-dynamo/dynamo/commit/71eb001e17fa73c742f0afe1a6ed96836cb135fd"],
      "files": ["deepep_config.json#42ebb085", "nats.conf#7d9e9ee1", "nginx.conf#b7269bf0"],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -4118,7 +4461,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": ["deepep_config.json#42ebb085"],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "from": 2,
@@ -4174,7 +4516,7 @@ export const agentx = {
    "hw": "h200",
    "ckpt": "zai-org/GLM-5.2-FP8",
    "label": "Agg TP8",
-   "detail": "HiCache DRAM · MTP 3-1-4",
+   "detail": "MTP 3-1-4",
    "gpus": 8,
    "configKey": "glm5.2-fp8-h200-dynamo-sglang-agentic-mtp-agg",
    "image": "lmsysorg/sglang:nightly-dev-20260914-4358a161",
@@ -4183,6 +4525,20 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-size", "135"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp8-h200-dynamo-sglang-agentic-mtp-agg",
+     "donorHardware": "h200"
+    }
+   },
    "points": [
     {
      "concs": [2],
@@ -4194,7 +4550,8 @@ export const agentx = {
      "pr": "3112",
      "date": "2026-09-18",
      "sha": "f8fbcc22342bc842c05181205f87080b9c6136c4",
-     "goldenAL": "2.99"
+     "goldenAL": "2.99",
+     "kv": "hicache"
     },
     {
      "concs": [4],
@@ -4207,6 +4564,7 @@ export const agentx = {
      "date": "2026-09-18",
      "sha": "f8fbcc22342bc842c05181205f87080b9c6136c4",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "dynamo": [
        null,
@@ -4242,6 +4600,7 @@ export const agentx = {
      "date": "2026-09-18",
      "sha": "f8fbcc22342bc842c05181205f87080b9c6136c4",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "dynamo": [
        null,
@@ -4277,6 +4636,7 @@ export const agentx = {
      "date": "2026-09-18",
      "sha": "f8fbcc22342bc842c05181205f87080b9c6136c4",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "dynamo": [
        null,
@@ -4312,6 +4672,7 @@ export const agentx = {
      "date": "2026-09-18",
      "sha": "f8fbcc22342bc842c05181205f87080b9c6136c4",
      "goldenAL": "2.99",
+     "kv": "hicache",
      "patch": {
       "dynamo": [
        null,
@@ -4341,7 +4702,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": ["nats.conf#7d9e9ee1", "nginx.conf#033bddfb"],
-     "notes": ["hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -4440,7 +4800,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["hicache-size"],
      "blocks": [
       {
        "from": 2,
@@ -4476,7 +4835,7 @@ export const agentx = {
    "hw": "h200",
    "ckpt": "zai-org/GLM-5.2-FP8",
    "label": "Disagg 1P1D · prefill TP8 · decode TP8·DPA8",
-   "detail": "HiCache DRAM · MTP 6-1-7",
+   "detail": "MTP 6-1-7",
    "gpus": 16,
    "configKey": "glm5.2-fp8-h200-dynamo-sglang-agentic-mtp-1p1d-hicache",
    "image": "lmsysorg/sglang:v0.5.16-cu130",
@@ -4485,6 +4844,23 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "kernel"],
+      ["--hicache-mem-layout", "layer_first"],
+      ["--hicache-size", "64"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp8-h200-dynamo-sglang-agentic-mtp-1p1d-hicache",
+     "donorHardware": "h200"
+    }
+   },
    "points": [
     {
      "concs": [8],
@@ -4496,7 +4872,8 @@ export const agentx = {
      "pr": "3021",
      "date": "2026-09-15",
      "sha": "e2404449f9255a3b40c02394c09e91ce5f0f5101",
-     "goldenAL": "3.78"
+     "goldenAL": "3.78",
+     "kv": "hicache"
     },
     {
      "concs": [12],
@@ -4508,7 +4885,8 @@ export const agentx = {
      "pr": "3021",
      "date": "2026-09-15",
      "sha": "e2404449f9255a3b40c02394c09e91ce5f0f5101",
-     "goldenAL": "3.78"
+     "goldenAL": "3.78",
+     "kv": "hicache"
     },
     {
      "concs": [16],
@@ -4520,14 +4898,14 @@ export const agentx = {
      "pr": "3021",
      "date": "2026-09-15",
      "sha": "e2404449f9255a3b40c02394c09e91ce5f0f5101",
-     "goldenAL": "3.78"
+     "goldenAL": "3.78",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.3.0.dev1\" \"ai-dynamo==1.3.0.dev1\""],
      "files": ["nats.conf#13771a85", "nginx.conf#0c30b190"],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "kind": "etcd",
@@ -4655,7 +5033,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention", "hicache-size"],
      "blocks": [
       {
        "from": 2,
@@ -4709,7 +5086,7 @@ export const agentx = {
    "hw": "h200",
    "ckpt": "zai-org/GLM-5.2-FP8",
    "label": "Disagg 2P2D · prefill TP8 · decode TP8·DPA8",
-   "detail": "GPU KV · MTP 3-1-4",
+   "detail": "MTP 3-1-4",
    "gpus": 32,
    "configKey": "glm5.2-fp8-h200-dynamo-sglang-agentic-mtp-2p2d",
    "image": "lmsysorg/sglang:v0.5.16-cu130",
@@ -4718,6 +5095,23 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "kernel"],
+      ["--hicache-mem-layout", "layer_first"],
+      ["--hicache-size", "64"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "glm5.2-fp8-h200-dynamo-sglang-agentic-mtp-1p1d-hicache",
+     "donorHardware": "h200"
+    }
+   },
    "points": [
     {
      "concs": [8],
@@ -4729,7 +5123,8 @@ export const agentx = {
      "pr": "2684",
      "date": "2026-08-25",
      "sha": "76ff8a6f83cfe190a98d28d4884507edf6cc8040",
-     "goldenAL": "2.99"
+     "goldenAL": "2.99",
+     "kv": "none"
     },
     {
      "concs": [12],
@@ -4741,7 +5136,8 @@ export const agentx = {
      "pr": "2684",
      "date": "2026-08-25",
      "sha": "76ff8a6f83cfe190a98d28d4884507edf6cc8040",
-     "goldenAL": "2.99"
+     "goldenAL": "2.99",
+     "kv": "none"
     },
     {
      "concs": [16],
@@ -4753,14 +5149,14 @@ export const agentx = {
      "pr": "2684",
      "date": "2026-08-25",
      "sha": "76ff8a6f83cfe190a98d28d4884507edf6cc8040",
-     "goldenAL": "2.99"
+     "goldenAL": "2.99",
+     "kv": "none"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.3.0.dev1\" \"ai-dynamo==1.3.0.dev1\""],
      "files": ["nats.conf#13771a85", "nginx.conf#ef3d612f"],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "kind": "etcd",
@@ -4831,7 +5227,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "from": 2,

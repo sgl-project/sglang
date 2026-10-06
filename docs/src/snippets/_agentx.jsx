@@ -2,8 +2,10 @@
 //
 // Reads a generated `agentx/<org>/<model>.jsx` (`agentx` export, produced by the
 // sa-infx-cookbook sync scripts). Pick hardware -> checkpoint -> deployment shape ->
-// concurrency -> router and get every process of that deployment as raw commands (etcd /
-// NATS / Mooncake, workers, frontend or router), with provenance back to the SA run.
+// concurrency -> KV offload -> router and get every process of that deployment as raw
+// commands (etcd / NATS / Mooncake, workers, frontend or router), one tab per process, with
+// provenance back to the SA run. Only the measured KV tier + submitted router is verified;
+// the other combinations are derived (see kvTransform).
 //
 // Data encoding (mirrors the Python encoder, which verifies every point decodes exactly):
 //   cell.routers[r].blocks   base blocks of the cell's first point. A block is either full
@@ -41,15 +43,15 @@ export const AgentX = ({ data }) => {
     if (d.block) return clone(d.block);
     const b = clone(block);
     const da = d.args || {};
-    let args = b.args.filter((a) => !(a[0] in da && da[a[0]] === null));
-    args = args.map((a) => (a[0] in da ? [a[0], ...da[a[0]]] : a));
+    let args = b.args.filter((a) => da[a[0]] !== null);
+    args = args.map((a) => (da[a[0]] !== undefined ? [a[0], ...da[a[0]]] : a));
     const names = new Set(args.map((a) => a[0]));
     for (const [k, v] of Object.entries(da)) if (v !== null && !names.has(k)) args.push([k, ...v]);
     if (b.kind === "worker") args.sort(cmpArgs);
     b.args = args;
     const de = d.env || {};
     const env = {};
-    for (const [k, v] of Object.entries(b.env || {})) if (!(k in de && de[k] === null)) env[k] = v;
+    for (const [k, v] of Object.entries(b.env || {})) if (de[k] !== null) env[k] = v;
     for (const [k, v] of Object.entries(de)) if (v !== null) env[k] = v;
     b.env = sortedObj(env);
     return b;
@@ -60,8 +62,8 @@ export const AgentX = ({ data }) => {
     return base.map((b, i) => applyDiff(b, p[i]));
   };
   const fromRef = (ref, e) => {
-    const r = clone(ref);
-    for (const k of e.drop || []) delete r[k];
+    const drop = e.drop || [];
+    const r = Object.fromEntries(Object.entries(clone(ref)).filter(([k]) => !drop.includes(k)));
     for (const [k, v] of Object.entries(e)) if (!["from", "diff", "drop", "ref"].includes(k)) r[k] = v;
     return applyDiff(r, e.diff);
   };
@@ -75,19 +77,57 @@ export const AgentX = ({ data }) => {
       if (e.from !== undefined) return fromRef(materialize(ci, cell.submitted)[e.from], e);
       return clone(e);
     });
-    for (const b of out) {
-      if (b.envRef !== undefined) {
-        b.env = sortedObj(data.envs[b.envRef]);
-        delete b.envRef;
+    const resolved = out.map((b) => (b.envRef === undefined ? b : {
+      ...Object.fromEntries(Object.entries(b).filter(([k]) => k !== "envRef")),
+      env: sortedObj(data.envs[b.envRef]),
+    }));
+    memo[key] = resolved;
+    return resolved;
+  };
+  // KV-offload tiers: "none" | "hicache" | "mooncake" (external linker). A derived tier strips
+  // the measured tier from the cache-owning workers and adds the target tier's settings
+  // (cell.kv.hicache / data.kvMooncake), mirroring the generator's kv.py.
+  const LINKER_FLAGS = ["--enable-unified-cache-external-linker", "--unified-cache-external-linker-backend", "--hicache-storage-backend-extra-config"];
+  const STORE_ONLY_ENV = ["MOONCAKE_MASTER", "MOONCAKE_TE_META_DATA_SERVER", "MOONCAKE_GLOBAL_SEGMENT_SIZE", "MOONCAKE_STANDALONE_STORAGE"];
+  const CACHE_ROLES = ["agg", "prefill"];
+  const isKvFlag = (n) => n === "--enable-hierarchical-cache" || n.startsWith("--hicache-") || LINKER_FLAGS.includes(n);
+  const kvTransform = (blocks, source, target, cellKv, router) => {
+    if (source === target) return blocks;
+    const mc = data.kvMooncake;
+    const out = [];
+    for (const b0 of blocks) {
+      if (source === "mooncake" && (b0.kind === "mooncake-master" || b0.kind === "mooncake-store")) continue;
+      const b = { ...b0, args: (b0.args || []).map((a) => [...a]), env: { ...(b0.env || {}) } };
+      if (b.kind === "worker") {
+        b.args = b.args.filter((a) => !isKvFlag(a[0]));
+        if (source === "mooncake") b.env = Object.fromEntries(Object.entries(b.env).filter(([k]) => !STORE_ONLY_ENV.includes(k)));
+        let add = [];
+        let env = {};
+        if (CACHE_ROLES.includes(b.role)) {
+          if (target === "hicache") add = cellKv.hicache.args;
+          else if (target === "mooncake") { add = mc.args; env = mc.env; }
+        } else if (target === "mooncake") env = mc.decode_env;
+        const names = new Set(b.args.map((a) => a[0]));
+        for (const a of add) if (!names.has(a[0])) b.args.push([...a]);
+        b.args.sort(cmpArgs);
+        for (const [k, v] of Object.entries(env)) if (b.env[k] === undefined) b.env[k] = v;
+        b.env = sortedObj(b.env);
       }
+      out.push(b);
     }
-    memo[key] = out;
+    if (target === "mooncake") {
+      const firstWorker = out.findIndex((b) => b.kind === "worker");
+      let at = 0;
+      out.slice(0, firstWorker).forEach((b, i) => { if (b.kind === "etcd" || b.kind === "nats") at = Math.max(at, i + 1); });
+      out.splice(at, 0, clone(mc.master[router]));
+    }
     return out;
   };
-  const blocksFor = (ci, pi, router) => {
+  const blocksFor = (ci, pi, router, kv) => {
+    const cell = data.cells[ci];
     const base = materialize(ci, router);
-    if (pi === 0) return base;
-    return applyPatch(base, ((data.cells[ci].points[pi] || {}).patch || {})[router]);
+    const measured = pi === 0 ? base : applyPatch(base, ((cell.points[pi] || {}).patch || {})[router]);
+    return kvTransform(measured, cell.points[pi].kv, kv || cell.points[pi].kv, cell.kv, router);
   };
 
   // ==== 2. Shell formatting ====
@@ -138,14 +178,14 @@ export const AgentX = ({ data }) => {
       return parts.join(" ") || `Run on the ${b.role} node.`;
     }
     if (b.kind === "etcd") return "Start once, before everything else, on $ETCD_IP.";
-    if (b.kind === "nats") return "Start once on $NATS_IP with the nats.conf shown below.";
+    if (b.kind === "nats") return "Start once on $NATS_IP with the config from the nats.conf tab.";
     if (b.kind === "mooncake-master") return "Start once on $MOONCAKE_MASTER_IP before the workers.";
     if (b.kind === "mooncake-store") {
       const ports = b.ports || [];
       return `Start on each of the ${b.count_nodes || 1} decode node(s)${ports.length > 1 ? `, one instance per port (${ports.join(", ")}; change --port)` : ""}.`;
     }
     if (b.kind === "dynamo-frontend") return b.count > 1 ? `SA ran ${b.count} frontends on separate nodes behind the nginx block (port 8180 each, nginx on 8000). One frontend on port 8000 also works.` : "Start once; clients connect to port 8000.";
-    if (b.kind === "nginx") return "Optional scale-out: hashes each session onto one frontend and listens on port 8000. Uses the nginx.conf below.";
+    if (b.kind === "nginx") return "Optional scale-out: hashes each session onto one frontend and listens on port 8000. Uses the config from the nginx.conf tab.";
     if (b.kind === "sglang-router") return "Start once after the workers; clients connect to port 8000.";
     return "";
   };
@@ -154,7 +194,20 @@ export const AgentX = ({ data }) => {
     "hicache-size": <><code style={S.code}>--hicache-size</code> is host DRAM per rank in GB, sized to SemiAnalysis's nodes. Scale it to your host memory.</>,
     efa: <><code style={S.code}>MOONCAKE_PROTOCOL=efa</code> reflects SemiAnalysis's AWS-EFA B300 cluster. Use <code style={S.code}>rdma</code> on InfiniBand.</>,
     "ib-devices": <>Set <code style={S.code}>IB_DEVICES</code> to your node's RDMA NICs (comma-separated, e.g. <code style={S.code}>mlx5_0,mlx5_1</code>).</>,
+    "mooncake-segment": <><code style={S.code}>MOONCAKE_GLOBAL_SEGMENT_SIZE</code> is the host DRAM each worker process contributes to the Mooncake store. Size it to your host memory.</>,
   });
+  const notesFor = (blocks) => {
+    const names = new Set(blocks.flatMap((b) => (b.args || []).map((a) => a[0])));
+    const env = Object.assign({}, ...blocks.map((b) => b.env || {}));
+    const text = JSON.stringify(blocks);
+    return [
+      names.has("--enable-dp-attention") && "rename-dp-attention",
+      names.has("--hicache-size") && "hicache-size",
+      env.MOONCAKE_PROTOCOL === "efa" && "efa",
+      env.MOONCAKE_GLOBAL_SEGMENT_SIZE !== undefined && "mooncake-segment",
+      text.includes("$IB_DEVICES") && "ib-devices",
+    ].filter(Boolean);
+  };
   const PLACEHOLDERS = {
     NODE_RANK: "rank of this node within its worker (0 on the worker's first node)",
     NODE_IP: "IP of the node the command runs on",
@@ -196,25 +249,25 @@ export const AgentX = ({ data }) => {
   const [cellIdx, setCellIdx] = useState(cellsFor(hwList[0], ckptsFor(hwList[0])[0])[0][1]);
   const [pointIdx, setPointIdx] = useState(0);
   const [router, setRouter] = useState(data.cells[cellIdx].submitted);
+  const [kvChoice, setKvChoice] = useState(null); // null = the tier the point was measured with
+  const [tab, setTab] = useState(null);
   const [copied, setCopied] = useState(null);
-  const [openFile, setOpenFile] = useState(null);
 
+  const resetCell = (ci) => { setCellIdx(ci); setPointIdx(0); setRouter(data.cells[ci].submitted); setKvChoice(null); };
   const pickHw = (h) => {
     const k = ckptsFor(h)[0];
-    const ci = cellsFor(h, k)[0][1];
-    setHw(h); setCkpt(k); setCellIdx(ci); setPointIdx(0); setRouter(data.cells[ci].submitted);
+    setHw(h); setCkpt(k); resetCell(cellsFor(h, k)[0][1]);
   };
-  const pickCkpt = (k) => {
-    const ci = cellsFor(hw, k)[0][1];
-    setCkpt(k); setCellIdx(ci); setPointIdx(0); setRouter(data.cells[ci].submitted);
-  };
-  const pickCell = (ci) => { setCellIdx(ci); setPointIdx(0); setRouter(data.cells[ci].submitted); };
+  const pickCkpt = (k) => { setCkpt(k); resetCell(cellsFor(hw, k)[0][1]); };
+  const pickCell = (ci) => resetCell(ci);
 
   const cell = data.cells[cellIdx];
-  const point = cell.points[Math.min(pointIdx, cell.points.length - 1)];
+  const pi = Math.min(pointIdx, cell.points.length - 1);
+  const point = cell.points[pi];
+  const kv = kvChoice && cell.kv.available.includes(kvChoice) ? kvChoice : point.kv;
   const routerData = cell.routers[router];
-  const blocks = blocksFor(cellIdx, Math.min(pointIdx, cell.points.length - 1), router);
-  const status = router === cell.submitted ? point.status : "derived";
+  const blocks = blocksFor(cellIdx, pi, router, kv);
+  const status = router === cell.submitted && kv === point.kv ? point.status : "derived";
   const workerCount = blocks.filter((b) => b.kind === "worker").reduce((n, b) => n + (b.workers || 1), 0);
   const allText = blocks.map((b) => `# ${b.kind === "worker" ? ROLE_TITLE[b.role] : KIND_TITLE[b.kind] || b.kind}\n${formatBlock(b)}`).join("\n\n");
   const usedPlaceholders = [...new Set((allText + JSON.stringify(routerData.files.map((f) => data.files[f]))).match(/\$[A-Z][A-Z0-9_]*/g) || [])]
@@ -222,6 +275,21 @@ export const AgentX = ({ data }) => {
     .filter((p) => placeholderText(p));
   const exportText = usedPlaceholders.map((p) => `export ${p}=<${placeholderText(p)}>`).join("\n");
   const copyAllText = (exportText ? `# Set per node before running the commands below\n${exportText}\n\n` : "") + allText;
+
+  const shortTitle = (b) => {
+    const base = b.kind === "worker" ? { agg: "Worker", prefill: "Prefill", decode: "Decode" }[b.role]
+      : { etcd: "etcd", nats: "NATS", "mooncake-master": "Mooncake master", "mooncake-store": "Mooncake store", "dynamo-frontend": "Frontend", "sglang-router": "Router", nginx: "nginx (optional)" }[b.kind] || b.kind;
+    const n = b.kind === "worker" ? b.workers : b.count;
+    return n > 1 ? `${base} ×${n}` : base;
+  };
+  const tabs = [
+    ...blocks.map((b, i) => ({ id: `block:${b.kind}:${b.role || ""}`, label: shortTitle(b), block: b, index: i })),
+    ...routerData.files.map((fid) => ({ id: `file:${data.files[fid].name}`, label: data.files[fid].name, file: data.files[fid] })),
+    ...(usedPlaceholders.length ? [{ id: "exports", label: "Placeholders" }] : []),
+  ];
+  const defaultTab = (tabs.find((t) => t.block && t.block.kind === "worker") || tabs[0]).id;
+  const activeTab = tabs.some((t) => t.id === tab) ? tab : defaultTab;
+  const KV_LABEL = { none: "No KV offload", hicache: "HiCache (host DRAM)", mooncake: "Mooncake store (external linker)" };
 
   const copy = (text, id) => {
     navigator.clipboard.writeText(text);
@@ -256,6 +324,12 @@ export const AgentX = ({ data }) => {
     list: { margin: "4px 0", paddingLeft: "18px", listStyleType: "disc", fontSize: "12px", lineHeight: 1.55, color: isDark ? "#d1d5db" : "#374151" },
     code: { fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace", fontSize: "11px", padding: "0 4px", borderRadius: "3px", background: isDark ? "#374151" : "#f3f4f6", color: isDark ? "#e5e7eb" : "#1f2937" },
     a: { color: accent, textDecoration: "underline" },
+    tabBar: { display: "flex", flexWrap: "wrap", gap: "4px", alignItems: "center", borderBottom: `1px solid ${border}`, paddingBottom: "4px" },
+    tab: (on) => ({
+      padding: "4px 10px", fontSize: "12px", fontWeight: on ? 600 : 500, cursor: "pointer", borderRadius: "4px 4px 0 0",
+      border: `1px solid ${on ? accent : border}`, borderBottom: on ? `2px solid ${accent}` : `1px solid ${border}`,
+      background: on ? (isDark ? "#1f2937" : "#fff") : (isDark ? "#111827" : "#f9fafb"), color: isDark ? "#e5e7eb" : "inherit",
+    }),
   };
 
   const statusText = {
@@ -312,6 +386,22 @@ export const AgentX = ({ data }) => {
         </div>
       </div>
       <div style={S.card}>
+        <span style={S.title} className="sg-agentx-row sg-agentx-row-kv">KV offload</span>
+        <div style={S.chips}>
+          {["none", "hicache", "mooncake"].map((t) => {
+            const ok = cell.kv.available.includes(t);
+            return (
+              <button key={t} value={t} disabled={!ok} title={ok ? "" : cell.kv.unavailable[t]}
+                style={{ ...S.chip(kv === t), ...(ok ? {} : { opacity: 0.4, cursor: "not-allowed" }) }}
+                onClick={() => ok && setKvChoice(t)}>
+                {KV_LABEL[t]}{t === point.kv ? " ✓" : ""}
+                <span style={S.sub}>{t === point.kv ? "as measured" : ok ? "derived" : "not available for this image"}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div style={S.card}>
         <span style={S.title} className="sg-agentx-row sg-agentx-row-router">Router</span>
         <div style={S.chips}>
           {Object.keys(cell.routers).sort().map((r) => (
@@ -343,9 +433,19 @@ export const AgentX = ({ data }) => {
           <div style={S.meta}>The tag has been removed from Docker Hub; pull the image by its digest (the <code style={S.code}>@sha256:...</code> part).</div>
         )}
         {status === "derived" && (
-          <div style={S.meta}>
-            Translated from the verified {routerLabel[cell.submitted]} launch by re-rendering the same recipe with srt-slurm's {router === "dynamo" ? "Dynamo" : "SGLang router"} frontend. Engine flags are unchanged; only the launcher, routing and router-specific flags differ.
-          </div>
+          <ul style={S.list}>
+            <li>Derived from the verified launch ({routerLabel[cell.submitted]}, {KV_LABEL[point.kv].toLowerCase()}); SemiAnalysis did not run this combination.</li>
+            {router !== cell.submitted && (
+              <li>Router: re-rendered with srt-slurm's {router === "dynamo" ? "Dynamo" : "SGLang router"} frontend. Engine flags are unchanged; only the launcher, routing and router-specific flags differ.</li>
+            )}
+            {kv !== point.kv && kv === "none" && <li>KV offload: removed; only the GPU KV cache is used.</li>}
+            {kv !== point.kv && kv === "hicache" && (
+              <li>KV offload: HiCache settings from the verified <code style={S.code}>{cell.kv.hicache.donor}</code> launch ({cell.kv.hicache.donorHardware.toUpperCase()}), applied to the workers that hold the prefix cache ({blocks.some((b) => b.role === "prefill") ? "prefill" : "aggregated"}).</li>
+            )}
+            {kv !== point.kv && kv === "mooncake" && (
+              <li>KV offload: Mooncake external-linker flags, store-client environment and <code style={S.code}>mooncake_master</code> from the verified <code style={S.code}>{data.kvMooncake.donor}</code> launch ({data.kvMooncake.donorHardware.toUpperCase()}). Its optional standalone Mooncake stores are not included.</li>
+            )}
+          </ul>
         )}
         <ul style={S.list}>
           {cell.disclosures.includes("synthetic-acceptance") && point.goldenAL && (
@@ -354,7 +454,7 @@ export const AgentX = ({ data }) => {
           {cell.disclosures.includes("chat-template") && (
             <li>The SA run passed InferenceX's thinking-only chat template (<code style={S.code}>deepseek_v4_thinking.jinja</code>, which drops tool definitions). These commands keep SGLang's built-in DeepSeek-V4 encoding, which supports tool calling.</li>
           )}
-          {routerData.notes.map((n) => noteText(S)[n] && <li key={n}>{noteText(S)[n]}</li>)}
+          {notesFor(blocks).map((n) => noteText(S)[n] && <li key={n}>{noteText(S)[n]}</li>)}
           {routerData.install.map((cmd) => (
             <li key={cmd}>{cmd.startsWith("#") ? <>Dynamo: {cmd.replace(/^# /, "")}</> : <>Dynamo install used by SA: <code style={S.code}>{cmd}</code></>}</li>
           ))}
@@ -365,45 +465,37 @@ export const AgentX = ({ data }) => {
         </ul>
       </div>
 
-      {usedPlaceholders.length > 0 && (
-        <div style={S.blockWrap}>
-          <div style={S.blockHead}>
-            <strong>Placeholders — set on each node first</strong>
-            <button style={S.button} onClick={() => copy(exportText, "exports")}>{copied === "exports" ? "Copied" : "⧉ Copy"}</button>
-          </div>
-          <pre style={S.pre} className="sg-agentx-exports">{exportText}</pre>
-        </div>
-      )}
-      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+      <div style={S.tabBar} className="sg-agentx-tabs">
+        {tabs.map((t) => (
+          <button key={t.id} value={t.id} style={S.tab(activeTab === t.id)} onClick={() => setTab(t.id)}>{t.label}</button>
+        ))}
+        <span style={{ flex: 1 }} />
         <button style={S.button} onClick={() => copy(copyAllText, "all")}>{copied === "all" ? "Copied" : "⧉ Copy all"}</button>
       </div>
-      {blocks.map((b, i) => {
-        const text = formatBlock(b);
-        const title = b.kind === "worker" ? ROLE_TITLE[b.role] : KIND_TITLE[b.kind] || b.kind;
-        return (
-          <div key={`${cellIdx}-${pointIdx}-${router}-${i}`} style={S.blockWrap}>
-            <div style={S.blockHead}>
-              <strong>{title}{b.count > 1 ? ` ×${b.count}` : ""}</strong>
-              <button style={S.button} onClick={() => copy(text, i)}>{copied === i ? "Copied" : "⧉ Copy"}</button>
+      {tabs.map((t) => {
+        const visible = activeTab === t.id;
+        if (t.block) {
+          const text = formatBlock(t.block);
+          const title = t.block.kind === "worker" ? ROLE_TITLE[t.block.role] : KIND_TITLE[t.block.kind] || t.block.kind;
+          return (
+            <div key={`${cellIdx}-${pi}-${router}-${kv}-${t.id}`} style={{ ...S.blockWrap, display: visible ? "block" : "none" }}>
+              <div style={S.blockHead}>
+                <strong>{title}{t.block.count > 1 ? ` ×${t.block.count}` : ""}</strong>
+                <button style={S.button} onClick={() => copy(text, t.id)}>{copied === t.id ? "Copied" : "⧉ Copy"}</button>
+              </div>
+              <div style={S.where}>{where(t.block, router, workerCount)}</div>
+              <pre style={S.pre} className="sg-agentx-block">{text}</pre>
             </div>
-            <div style={S.where}>{where(b, router, workerCount)}</div>
-            <pre style={S.pre} className="sg-agentx-block">{text}</pre>
-          </div>
-        );
-      })}
-      {routerData.files.map((fid) => {
-        const f = data.files[fid];
-        const open = openFile === fid;
+          );
+        }
+        const text = t.file ? t.file.content : exportText;
         return (
-          <div key={fid} style={S.blockWrap}>
+          <div key={t.id} style={{ ...S.blockWrap, display: visible ? "block" : "none" }}>
             <div style={S.blockHead}>
-              <strong>{f.name}</strong>
-              <span style={{ display: "flex", gap: "6px" }}>
-                <button style={S.button} onClick={() => setOpenFile(open ? null : fid)}>{open ? "Hide" : "Show"}</button>
-                <button style={S.button} onClick={() => copy(f.content, fid)}>{copied === fid ? "Copied" : "⧉ Copy"}</button>
-              </span>
+              <strong>{t.file ? t.file.name : "Placeholders — set on each node first"}</strong>
+              <button style={S.button} onClick={() => copy(text, t.id)}>{copied === t.id ? "Copied" : "⧉ Copy"}</button>
             </div>
-            {open && <pre style={S.pre}>{f.content}</pre>}
+            <pre style={S.pre} className={t.file ? "sg-agentx-file" : "sg-agentx-exports"}>{text}</pre>
           </div>
         );
       })}

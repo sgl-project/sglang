@@ -3,7 +3,7 @@
 // (SemiAnalysisAI/InferenceX main@8ba71d026e86 plus open PRs #3187, #3598, #3631, #3659), with SA-specific settings removed.
 export const agentx = {
  "model": "DeepSeek-V4.1",
- "generatedOn": "2026-10-05",
+ "generatedOn": "2026-10-06",
  "source": {
   "repo": "https://github.com/SemiAnalysisAI/InferenceX",
   "main": "8ba71d026e866e7792074a3fd3f896fe6d1ad099",
@@ -85,6 +85,67 @@ export const agentx = {
    "NATS_SERVER": "nats://$NATS_IP:4222"
   }
  ],
+ "kvMooncake": {
+  "donor": "dsv4-fp4-gb300-dynamo-sglang-agentic-disagg",
+  "donorHardware": "gb300",
+  "master": {
+   "dynamo": {
+    "kind": "mooncake-master",
+    "count_nodes": 1,
+    "ports": ["8700"],
+    "cmd": "mooncake_master",
+    "env": {
+     "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+     "NATS_SERVER": "nats://$NATS_IP:4222"
+    },
+    "args": [
+     ["--port", "8700"],
+     ["--enable_http_metadata_server", "true"],
+     ["--http_metadata_server_port", "8701"],
+     ["--default_kv_lease_ttl", "10000"],
+     ["--rpc_thread_num", "16"],
+     ["--eviction_high_watermark_ratio", "0.90"]
+    ]
+   },
+   "sglang": {
+    "kind": "mooncake-master",
+    "count_nodes": 1,
+    "ports": ["8700"],
+    "cmd": "mooncake_master",
+    "env": {},
+    "args": [
+     ["--port", "8700"],
+     ["--enable_http_metadata_server", "true"],
+     ["--http_metadata_server_port", "8701"],
+     ["--default_kv_lease_ttl", "10000"],
+     ["--rpc_thread_num", "16"],
+     ["--eviction_high_watermark_ratio", "0.90"]
+    ]
+   }
+  },
+  "args": [
+   ["--enable-unified-cache-external-linker"],
+   ["--hicache-storage-backend-extra-config", "{\"enable_group_semantics\":true}"],
+   ["--unified-cache-external-linker-backend", "mooncake"]
+  ],
+  "env": {
+   "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+   "MC_TCP_BIND_ADDRESS": "$NODE_IP",
+   "MOONCAKE_DEVICE": "$IB_DEVICES",
+   "MOONCAKE_GLOBAL_SEGMENT_SIZE": "140gb",
+   "MOONCAKE_LOCAL_HOSTNAME": "$NODE_IP",
+   "MOONCAKE_MASTER": "$MOONCAKE_MASTER_IP:8700",
+   "MOONCAKE_PROTOCOL": "rdma",
+   "MOONCAKE_STANDALONE_STORAGE": "0",
+   "MOONCAKE_TE_META_DATA_SERVER": "http://$MOONCAKE_MASTER_IP:8701/metadata"
+  },
+  "decode_env": {
+   "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+   "MOONCAKE_LOCAL_HOSTNAME": "$NODE_IP",
+   "MOONCAKE_MASTER": "$MOONCAKE_MASTER_IP:8700",
+   "MOONCAKE_TE_META_DATA_SERVER": "http://$MOONCAKE_MASTER_IP:8701/metadata"
+  }
+ },
  "files": {},
  "cells": [
   {
@@ -92,7 +153,7 @@ export const agentx = {
    "hw": "b300",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Agg TP2·EP2",
-   "detail": "GPU KV · DSpark 5",
+   "detail": "DSpark 5",
    "gpus": 8,
    "configKey": "dsv41flash-fp4-b300-sglang-agentic-dspark",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260922-582389ce@sha256:35ea4d321b0735051dcce2599fc495853ad1ef30f6a1908f0a75e74204362d14",
@@ -101,6 +162,20 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -113,7 +188,8 @@ export const agentx = {
      "date": "2026-09-22",
      "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667235",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [2],
@@ -127,6 +203,7 @@ export const agentx = {
      "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667317",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -158,6 +235,7 @@ export const agentx = {
      "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667390",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -191,6 +269,7 @@ export const agentx = {
      "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799668150",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -224,6 +303,7 @@ export const agentx = {
      "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667458",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -259,6 +339,7 @@ export const agentx = {
      "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667227",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -296,6 +377,7 @@ export const agentx = {
      "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799666217",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -333,6 +415,7 @@ export const agentx = {
      "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667031",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -363,7 +446,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "worker",
@@ -399,7 +481,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -447,7 +528,7 @@ export const agentx = {
    "hw": "b300",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Agg TP4·EP4",
-   "detail": "GPU KV · DSpark 5",
+   "detail": "DSpark 5",
    "gpus": 8,
    "configKey": "dsv41flash-fp4-b300-sglang-agentic-dspark",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260922-582389ce@sha256:35ea4d321b0735051dcce2599fc495853ad1ef30f6a1908f0a75e74204362d14",
@@ -456,6 +537,20 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -468,7 +563,8 @@ export const agentx = {
      "date": "2026-09-22",
      "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799666410",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [2],
@@ -482,6 +578,7 @@ export const agentx = {
      "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667236",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -513,6 +610,7 @@ export const agentx = {
      "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667229",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -546,6 +644,7 @@ export const agentx = {
      "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667206",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -579,6 +678,7 @@ export const agentx = {
      "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667446",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -612,6 +712,7 @@ export const agentx = {
      "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667454",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -645,6 +746,7 @@ export const agentx = {
      "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667008",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -678,6 +780,7 @@ export const agentx = {
      "sha": "d4c38818ce6eb20093b7f6cc7ba860522ef41632",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35743388889/job/106799667096",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -704,7 +807,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "diff": {
@@ -720,7 +822,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -768,7 +869,7 @@ export const agentx = {
    "hw": "b200",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Agg TP2·EP2",
-   "detail": "GPU KV · DSpark 5",
+   "detail": "DSpark 5",
    "gpus": 8,
    "configKey": "dsv41flash-fp4-b200-sglang-agentic-dspark",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260922-582389ce@sha256:0e1b14e302619a42ef5581b87db6804651d4f946301cf543d74a3a1eb1c33b40",
@@ -777,6 +878,20 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -789,7 +904,8 @@ export const agentx = {
      "date": "2026-09-22",
      "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784145156",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [2],
@@ -803,6 +919,7 @@ export const agentx = {
      "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784143620",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -836,6 +953,7 @@ export const agentx = {
      "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144968",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -869,6 +987,7 @@ export const agentx = {
      "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784145125",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -895,7 +1014,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "worker",
@@ -930,7 +1048,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -978,7 +1095,7 @@ export const agentx = {
    "hw": "b200",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Agg TP4·EP4",
-   "detail": "GPU KV · DSpark 5",
+   "detail": "DSpark 5",
    "gpus": 8,
    "configKey": "dsv41flash-fp4-b200-sglang-agentic-dspark",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260922-582389ce@sha256:0e1b14e302619a42ef5581b87db6804651d4f946301cf543d74a3a1eb1c33b40",
@@ -987,6 +1104,20 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -999,7 +1130,8 @@ export const agentx = {
      "date": "2026-09-22",
      "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144472",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [2],
@@ -1013,6 +1145,7 @@ export const agentx = {
      "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144541",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1044,6 +1177,7 @@ export const agentx = {
      "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784145073",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1077,6 +1211,7 @@ export const agentx = {
      "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144761",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1110,6 +1245,7 @@ export const agentx = {
      "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784145886",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1143,6 +1279,7 @@ export const agentx = {
      "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784145200",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1176,6 +1313,7 @@ export const agentx = {
      "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144883",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1209,6 +1347,7 @@ export const agentx = {
      "sha": "f6e7873ff09337d7ad768ced6e2d0ea2e4236d26",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35683233478/job/106784144947",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1235,7 +1374,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "diff": {
@@ -1256,7 +1394,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -1304,7 +1441,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Agg TP2·EP2",
-   "detail": "GPU KV · DSpark 5 · dsv41flash-fp4-gb300-dynamo-sglang-agentic-agg",
+   "detail": "DSpark 5 · dsv41flash-fp4-gb300-dynamo-sglang-agentic-agg",
    "gpus": 4,
    "configKey": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-agg",
    "image": "lmsysorg/sglang:nightly-dev-20260928-81f27fb3@sha256:d9e4917808cfaa4b3be033a0c85a3a73d71eb93c17accbfa2ac3e96f551f3a33",
@@ -1313,6 +1450,20 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -1325,14 +1476,14 @@ export const agentx = {
      "sha": "0f45d5f4c3d57f9804f7655d7b3b294acdd53441",
      "override": "override_tp2_c1",
      "goldenAL": "3.51",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598#issuecomment-6006341782"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598#issuecomment-6006341782",
+     "kv": "none"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260914\" \"ai-dynamo==1.5.0.dev20260914\""],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -1412,7 +1563,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "from": 2,
@@ -1448,7 +1598,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Agg TP2·EP2",
-   "detail": "GPU KV · DSpark 5 · dsv41flash-fp4-gb300-sglang-agentic-dspark",
+   "detail": "DSpark 5 · dsv41flash-fp4-gb300-sglang-agentic-dspark",
    "gpus": 4,
    "configKey": "dsv41flash-fp4-gb300-sglang-agentic-dspark",
    "image": "lmsysorg/sglang:dev-cu13-nightly-0924@sha256:d2c9929f8cc9889326203f6cbc46da48b69de42891b167592c9c76cc803d246e",
@@ -1457,6 +1607,20 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -1469,7 +1633,8 @@ export const agentx = {
      "date": "2026-09-29",
      "sha": "68898926209230628f500819194999b8dd89f17d",
      "override": "override_tp2_c1",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [2],
@@ -1483,6 +1648,7 @@ export const agentx = {
      "sha": "68898926209230628f500819194999b8dd89f17d",
      "override": "override_tp2_c2",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1516,6 +1682,7 @@ export const agentx = {
      "sha": "68898926209230628f500819194999b8dd89f17d",
      "override": "override_tp2_c4",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1549,6 +1716,7 @@ export const agentx = {
      "sha": "68898926209230628f500819194999b8dd89f17d",
      "override": "override_tp2_c8",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1582,6 +1750,7 @@ export const agentx = {
      "sha": "68898926209230628f500819194999b8dd89f17d",
      "override": "override_tp2_c16",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1615,6 +1784,7 @@ export const agentx = {
      "sha": "68898926209230628f500819194999b8dd89f17d",
      "override": "override_tp2_c32",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1648,6 +1818,7 @@ export const agentx = {
      "sha": "68898926209230628f500819194999b8dd89f17d",
      "override": "override_tp2_c64",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1683,6 +1854,7 @@ export const agentx = {
      "sha": "68898926209230628f500819194999b8dd89f17d",
      "override": "override_tp2_c128",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1711,7 +1883,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "diff": {
@@ -1730,7 +1901,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -1778,7 +1948,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Agg TP4",
-   "detail": "GPU KV · DSpark 5 · dsv41flash-fp4-gb300-dynamo-sglang-agentic-agg",
+   "detail": "DSpark 5 · dsv41flash-fp4-gb300-dynamo-sglang-agentic-agg",
    "gpus": 4,
    "configKey": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-agg",
    "image": "lmsysorg/sglang:nightly-dev-20260928-81f27fb3@sha256:d9e4917808cfaa4b3be033a0c85a3a73d71eb93c17accbfa2ac3e96f551f3a33",
@@ -1787,6 +1957,20 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -1799,14 +1983,14 @@ export const agentx = {
      "sha": "0f45d5f4c3d57f9804f7655d7b3b294acdd53441",
      "override": "override_tp4_c1",
      "goldenAL": "3.51",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598#issuecomment-6006341782"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598#issuecomment-6006341782",
+     "kv": "none"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260914\" \"ai-dynamo==1.5.0.dev20260914\""],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -1857,7 +2041,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "from": 2,
@@ -1893,7 +2076,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Agg TP4",
-   "detail": "GPU KV · DSpark 5 · dsv41flash-fp4-gb300-sglang-agentic-dspark",
+   "detail": "DSpark 5 · dsv41flash-fp4-gb300-sglang-agentic-dspark",
    "gpus": 4,
    "configKey": "dsv41flash-fp4-gb300-sglang-agentic-dspark",
    "image": "lmsysorg/sglang:dev-cu13-nightly-0924@sha256:d2c9929f8cc9889326203f6cbc46da48b69de42891b167592c9c76cc803d246e",
@@ -1902,6 +2085,20 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -1914,7 +2111,8 @@ export const agentx = {
      "date": "2026-09-29",
      "sha": "68898926209230628f500819194999b8dd89f17d",
      "override": "override_tp4_c1",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [2],
@@ -1928,6 +2126,7 @@ export const agentx = {
      "sha": "68898926209230628f500819194999b8dd89f17d",
      "override": "override_tp4_c2",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1954,7 +2153,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "diff": {
@@ -1973,7 +2171,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -2021,7 +2218,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Agg TP4·EP4",
-   "detail": "GPU KV · DSpark 5",
+   "detail": "DSpark 5",
    "gpus": 4,
    "configKey": "dsv41flash-fp4-gb300-sglang-agentic-dspark",
    "image": "lmsysorg/sglang:dev-cu13-nightly-0924@sha256:d2c9929f8cc9889326203f6cbc46da48b69de42891b167592c9c76cc803d246e",
@@ -2030,6 +2227,20 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [4],
@@ -2042,7 +2253,8 @@ export const agentx = {
      "date": "2026-09-29",
      "sha": "68898926209230628f500819194999b8dd89f17d",
      "override": "override_tp4_c4",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [8],
@@ -2055,7 +2267,8 @@ export const agentx = {
      "date": "2026-09-29",
      "sha": "68898926209230628f500819194999b8dd89f17d",
      "override": "override_tp4_c8",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [16],
@@ -2068,7 +2281,8 @@ export const agentx = {
      "date": "2026-09-29",
      "sha": "68898926209230628f500819194999b8dd89f17d",
      "override": "override_tp4_c16",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [32],
@@ -2081,7 +2295,8 @@ export const agentx = {
      "date": "2026-09-29",
      "sha": "68898926209230628f500819194999b8dd89f17d",
      "override": "override_tp4_c32",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [64],
@@ -2094,7 +2309,8 @@ export const agentx = {
      "date": "2026-09-29",
      "sha": "68898926209230628f500819194999b8dd89f17d",
      "override": "override_tp4_c64",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [128],
@@ -2107,14 +2323,14 @@ export const agentx = {
      "date": "2026-09-29",
      "sha": "68898926209230628f500819194999b8dd89f17d",
      "override": "override_tp4_c128",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     }
    ],
    "routers": {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "diff": {
@@ -2138,7 +2354,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -2186,7 +2401,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Disagg 1P2D · prefill TP2·EP2 · decode TP2·EP2",
-   "detail": "GPU KV · DSpark 5",
+   "detail": "DSpark 5",
    "gpus": 12,
    "configKey": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-20260928-81f27fb3@sha256:d9e4917808cfaa4b3be033a0c85a3a73d71eb93c17accbfa2ac3e96f551f3a33",
@@ -2195,6 +2410,20 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [16],
@@ -2207,7 +2436,8 @@ export const agentx = {
      "sha": "0f45d5f4c3d57f9804f7655d7b3b294acdd53441",
      "override": "override_1p2d_spread_c16",
      "goldenAL": "3.51",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598#issuecomment-6006341782"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598#issuecomment-6006341782",
+     "kv": "none"
     },
     {
      "concs": [48],
@@ -2220,7 +2450,8 @@ export const agentx = {
      "sha": "0f45d5f4c3d57f9804f7655d7b3b294acdd53441",
      "override": "override_1p2d_c48",
      "goldenAL": "3.51",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598#issuecomment-6006341782"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598#issuecomment-6006341782",
+     "kv": "none"
     },
     {
      "concs": [64],
@@ -2233,14 +2464,14 @@ export const agentx = {
      "sha": "0f45d5f4c3d57f9804f7655d7b3b294acdd53441",
      "override": "override_1p2d_c64",
      "goldenAL": "3.51",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598#issuecomment-6006341782"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598#issuecomment-6006341782",
+     "kv": "none"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260914\" \"ai-dynamo==1.5.0.dev20260914\""],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -2379,7 +2610,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "from": 2,
@@ -2436,7 +2666,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Disagg 1P1D · prefill TP2·EP2 · decode TP2·EP2",
-   "detail": "GPU KV · DSpark 5",
+   "detail": "DSpark 5",
    "gpus": 8,
    "configKey": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-20260928-81f27fb3@sha256:d9e4917808cfaa4b3be033a0c85a3a73d71eb93c17accbfa2ac3e96f551f3a33",
@@ -2445,6 +2675,20 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [96],
@@ -2457,14 +2701,66 @@ export const agentx = {
      "sha": "0f45d5f4c3d57f9804f7655d7b3b294acdd53441",
      "override": "override_1p1d_c96",
      "goldenAL": "3.51",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598#issuecomment-6006341782"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598#issuecomment-6006341782",
+     "kv": "none"
+    },
+    {
+     "concs": [160],
+     "item": 4,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/0f45d5f4c3d57f9804f7655d7b3b294acdd53441/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
+     "status": "verified-pr",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/37260940238",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598",
+     "pr": "3598",
+     "sha": "0f45d5f4c3d57f9804f7655d7b3b294acdd53441",
+     "override": "override_1p1d_hicache_c160",
+     "goldenAL": "3.51",
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598#issuecomment-6006341782",
+     "kv": "hicache",
+     "patch": {
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--enable-hierarchical-cache": [],
+         "--hicache-io-backend": ["direct"],
+         "--hicache-ratio": ["1"],
+         "--hicache-write-policy": ["write_back"]
+        }
+       },
+       {
+        "args": {
+         "--cuda-graph-max-bs-decode": ["192"],
+         "--max-running-requests": ["192"]
+        }
+       },
+       null
+      ],
+      "sglang": [
+       {
+        "args": {
+         "--enable-hierarchical-cache": [],
+         "--hicache-io-backend": ["direct"],
+         "--hicache-ratio": ["1"],
+         "--hicache-write-policy": ["write_back"]
+        }
+       },
+       {
+        "args": {
+         "--cuda-graph-max-bs-decode": ["192"],
+         "--max-running-requests": ["192"]
+        }
+       },
+       null
+      ]
+     }
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260914\" \"ai-dynamo==1.5.0.dev20260914\""],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -2517,150 +2813,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
-     "blocks": [
-      {
-       "from": 2,
-       "cmd": "python3 -m sglang.launch_server",
-       "diff": {
-        "args": {
-         "--skip-server-warmup": [],
-         "--request-plane": null,
-         "--kv-events-config": null
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": null,
-         "ETCD_ENDPOINTS": null,
-         "NATS_SERVER": null
-        }
-       }
-      },
-      {
-       "from": 3,
-       "cmd": "python3 -m sglang.launch_server",
-       "diff": {
-        "args": {
-         "--skip-server-warmup": [],
-         "--request-plane": null,
-         "--kv-events-config": null
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": null,
-         "ETCD_ENDPOINTS": null,
-         "NATS_SERVER": null
-        }
-       }
-      },
-      {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
-       "env": {},
-       "args": [
-        ["--decode", "http://$DECODE_0_HEAD_IP:30000"],
-        ["--prefill", "http://$PREFILL_0_HEAD_IP:30000", "8998"],
-        ["--pd-disaggregation"],
-        ["--host", "0.0.0.0"],
-        ["--port", "8000"],
-        ["--policy", "cache_aware"]
-       ]
-      }
-     ]
-    }
-   }
-  },
-  {
-   "id": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg#4",
-   "hw": "gb300",
-   "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
-   "label": "Disagg 1P1D · prefill TP2·EP2 · decode TP2·EP2",
-   "detail": "HiCache DRAM · DSpark 5",
-   "gpus": 8,
-   "configKey": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
-   "image": "lmsysorg/sglang:nightly-dev-20260928-81f27fb3@sha256:d9e4917808cfaa4b3be033a0c85a3a73d71eb93c17accbfa2ac3e96f551f3a33",
-   "imageStatus": "ok",
-   "imageCommit": "81f27fb3",
-   "submitted": "dynamo",
-   "setup": [],
-   "disclosures": ["synthetic-acceptance"],
-   "points": [
-    {
-     "concs": [160],
-     "item": 4,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/0f45d5f4c3d57f9804f7655d7b3b294acdd53441/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
-     "status": "verified-pr",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/37260940238",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598",
-     "pr": "3598",
-     "sha": "0f45d5f4c3d57f9804f7655d7b3b294acdd53441",
-     "override": "override_1p1d_hicache_c160",
-     "goldenAL": "3.51",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598#issuecomment-6006341782"
-    }
-   ],
-   "routers": {
-    "dynamo": {
-     "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260914\" \"ai-dynamo==1.5.0.dev20260914\""],
-     "files": [],
-     "notes": [],
-     "blocks": [
-      {
-       "kind": "etcd",
-       "count_nodes": 1,
-       "cmd": "etcd",
-       "env": {},
-       "args": [
-        ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
-       ]
-      },
-      {
-       "kind": "nats",
-       "count_nodes": 1,
-       "cmd": "nats-server -c nats.conf",
-       "env": {},
-       "args": []
-      },
-      {
-       "diff": {
-        "args": {
-         "--enable-hierarchical-cache": [],
-         "--hicache-io-backend": ["direct"],
-         "--hicache-ratio": ["1"],
-         "--hicache-write-policy": ["write_back"]
-        }
-       },
-       "ref": [9, "dynamo", 2]
-      },
-      {
-       "diff": {
-        "args": {
-         "--cuda-graph-max-bs-decode": ["192"],
-         "--max-running-requests": ["192"]
-        }
-       },
-       "ref": [10, "dynamo", 3]
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 1,
-       "cmd": "python3 -m dynamo.frontend",
-       "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"],
-        ["--router-session-affinity-ttl-secs", "3600"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"]
-       ],
-       "envRef": 2
-      }
-     ]
-    },
-    "sglang": {
-     "install": [],
-     "files": [],
-     "notes": [],
      "blocks": [
       {
        "from": 2,
@@ -2716,7 +2868,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Disagg 2P1D · prefill TP2·EP2 · decode TP2·EP2",
-   "detail": "HiCache DRAM · DSpark 5",
+   "detail": "DSpark 5",
    "gpus": 12,
    "configKey": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-20260928-81f27fb3@sha256:d9e4917808cfaa4b3be033a0c85a3a73d71eb93c17accbfa2ac3e96f551f3a33",
@@ -2725,6 +2877,20 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [256],
@@ -2737,14 +2903,14 @@ export const agentx = {
      "sha": "0f45d5f4c3d57f9804f7655d7b3b294acdd53441",
      "override": "override_2p1d_hicache_c256",
      "goldenAL": "3.51",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598#issuecomment-6006341782"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3598#issuecomment-6006341782",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260914\" \"ai-dynamo==1.5.0.dev20260914\""],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -2772,10 +2938,14 @@ export const agentx = {
        ],
        "diff": {
         "args": {
+         "--enable-hierarchical-cache": [],
+         "--hicache-io-backend": ["direct"],
+         "--hicache-ratio": ["1"],
+         "--hicache-write-policy": ["write_back"],
          "--max-running-requests": ["128"]
         }
        },
-       "ref": [11, "dynamo", 2]
+       "ref": [9, "dynamo", 2]
       },
       {
        "diff": {
@@ -2805,7 +2975,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "from": 2,
@@ -2862,7 +3031,7 @@ export const agentx = {
    "hw": "gb200",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Agg TP2",
-   "detail": "GPU KV · DSpark 5",
+   "detail": "DSpark 5",
    "gpus": 4,
    "configKey": "dsv41flash-fp4-gb200-sglang-agentic-dspark",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260923-06008c17@sha256:5921361fcf358cdde4df1968c941c14157f418613b099ad7f3e5aeed6427ae15",
@@ -2871,6 +3040,20 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -2883,7 +3066,8 @@ export const agentx = {
      "date": "2026-09-24",
      "sha": "85d8aee8a879b5aa27f827e472673a055fd370f0",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35876607563/job/107235293211",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [2],
@@ -2897,6 +3081,7 @@ export const agentx = {
      "sha": "85d8aee8a879b5aa27f827e472673a055fd370f0",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35876607563/job/107235292993",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -2930,6 +3115,7 @@ export const agentx = {
      "sha": "85d8aee8a879b5aa27f827e472673a055fd370f0",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35876607563/job/107235293039",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -2963,6 +3149,7 @@ export const agentx = {
      "sha": "85d8aee8a879b5aa27f827e472673a055fd370f0",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35876607563/job/107235292894",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -2996,6 +3183,7 @@ export const agentx = {
      "sha": "85d8aee8a879b5aa27f827e472673a055fd370f0",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35876607563/job/107235293276",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3029,6 +3217,7 @@ export const agentx = {
      "sha": "85d8aee8a879b5aa27f827e472673a055fd370f0",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35876607563/job/107235292594",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3062,6 +3251,7 @@ export const agentx = {
      "sha": "85d8aee8a879b5aa27f827e472673a055fd370f0",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35876607563/job/107235292677",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3095,6 +3285,7 @@ export const agentx = {
      "sha": "85d8aee8a879b5aa27f827e472673a055fd370f0",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35876607563/job/107235293191",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3121,7 +3312,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "worker",
@@ -3156,7 +3346,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -3204,7 +3393,7 @@ export const agentx = {
    "hw": "gb200",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Agg TP4",
-   "detail": "GPU KV · DSpark 5",
+   "detail": "DSpark 5",
    "gpus": 4,
    "configKey": "dsv41flash-fp4-gb200-sglang-agentic-dspark",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260923-06008c17@sha256:5921361fcf358cdde4df1968c941c14157f418613b099ad7f3e5aeed6427ae15",
@@ -3213,6 +3402,20 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -3225,7 +3428,8 @@ export const agentx = {
      "date": "2026-09-24",
      "sha": "85d8aee8a879b5aa27f827e472673a055fd370f0",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35876607563/job/107235293671",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [2],
@@ -3239,6 +3443,7 @@ export const agentx = {
      "sha": "85d8aee8a879b5aa27f827e472673a055fd370f0",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35876607563/job/107235292970",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3272,6 +3477,7 @@ export const agentx = {
      "sha": "85d8aee8a879b5aa27f827e472673a055fd370f0",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35876607563/job/107235293097",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3305,6 +3511,7 @@ export const agentx = {
      "sha": "85d8aee8a879b5aa27f827e472673a055fd370f0",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35876607563/job/107235293290",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3338,6 +3545,7 @@ export const agentx = {
      "sha": "85d8aee8a879b5aa27f827e472673a055fd370f0",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35876607563/job/107235293589",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3373,6 +3581,7 @@ export const agentx = {
      "sha": "85d8aee8a879b5aa27f827e472673a055fd370f0",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35876607563/job/107235293125",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3406,6 +3615,7 @@ export const agentx = {
      "sha": "85d8aee8a879b5aa27f827e472673a055fd370f0",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35876607563/job/107235292797",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3439,6 +3649,7 @@ export const agentx = {
      "sha": "85d8aee8a879b5aa27f827e472673a055fd370f0",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35876607563/job/107235293468",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3465,7 +3676,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "diff": {
@@ -3481,14 +3691,13 @@ export const agentx = {
          "PYTORCH_CUDA_ALLOC_CONF": null
         }
        },
-       "ref": [13, "sglang", 0]
+       "ref": [12, "sglang", 0]
       }
      ]
     },
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -3536,7 +3745,7 @@ export const agentx = {
    "hw": "h200",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Agg TP4",
-   "detail": "GPU KV · DSpark 5",
+   "detail": "DSpark 5",
    "gpus": 8,
    "configKey": "dsv41flash-fp4-h200-sglang-agentic-dspark",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260923-06008c17",
@@ -3545,6 +3754,20 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -3557,7 +3780,8 @@ export const agentx = {
      "date": "2026-09-24",
      "sha": "8f0557a3602d48cad916b9e37c11acf7452c283f",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35893977246/job/107293899458",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [2],
@@ -3571,6 +3795,7 @@ export const agentx = {
      "sha": "8f0557a3602d48cad916b9e37c11acf7452c283f",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35893977246/job/107293900133",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3602,6 +3827,7 @@ export const agentx = {
      "sha": "8f0557a3602d48cad916b9e37c11acf7452c283f",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35893977246/job/107293899676",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3633,6 +3859,7 @@ export const agentx = {
      "sha": "8f0557a3602d48cad916b9e37c11acf7452c283f",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35893977246/job/107293899409",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3664,6 +3891,7 @@ export const agentx = {
      "sha": "8f0557a3602d48cad916b9e37c11acf7452c283f",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35893977246/job/107293900085",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3695,6 +3923,7 @@ export const agentx = {
      "sha": "8f0557a3602d48cad916b9e37c11acf7452c283f",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35893977246/job/107293899493",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3726,6 +3955,7 @@ export const agentx = {
      "sha": "8f0557a3602d48cad916b9e37c11acf7452c283f",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35893977246/job/107293900130",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3757,6 +3987,7 @@ export const agentx = {
      "sha": "8f0557a3602d48cad916b9e37c11acf7452c283f",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35893977246/job/107293900276",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3781,7 +4012,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "worker",
@@ -3819,7 +4049,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -3867,7 +4096,7 @@ export const agentx = {
    "hw": "h200",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Agg TP8",
-   "detail": "GPU KV · DSpark 5",
+   "detail": "DSpark 5",
    "gpus": 8,
    "configKey": "dsv41flash-fp4-h200-sglang-agentic-dspark",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260923-06008c17",
@@ -3876,6 +4105,20 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -3888,7 +4131,8 @@ export const agentx = {
      "date": "2026-09-24",
      "sha": "8f0557a3602d48cad916b9e37c11acf7452c283f",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35893977246/job/107293900132",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [2],
@@ -3902,6 +4146,7 @@ export const agentx = {
      "sha": "8f0557a3602d48cad916b9e37c11acf7452c283f",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35893977246/job/107293900277",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3933,6 +4178,7 @@ export const agentx = {
      "sha": "8f0557a3602d48cad916b9e37c11acf7452c283f",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35893977246/job/107293900225",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3964,6 +4210,7 @@ export const agentx = {
      "sha": "8f0557a3602d48cad916b9e37c11acf7452c283f",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35893977246/job/107293899538",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -3995,6 +4242,7 @@ export const agentx = {
      "sha": "8f0557a3602d48cad916b9e37c11acf7452c283f",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35893977246/job/107293899316",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -4026,6 +4274,7 @@ export const agentx = {
      "sha": "8f0557a3602d48cad916b9e37c11acf7452c283f",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35893977246/job/107293899340",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -4057,6 +4306,7 @@ export const agentx = {
      "sha": "8f0557a3602d48cad916b9e37c11acf7452c283f",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35893977246/job/107293899314",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -4088,6 +4338,7 @@ export const agentx = {
      "sha": "8f0557a3602d48cad916b9e37c11acf7452c283f",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35893977246/job/107293900360",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -4112,7 +4363,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "diff": {
@@ -4120,14 +4370,13 @@ export const agentx = {
          "--tp": ["8"]
         }
        },
-       "ref": [15, "sglang", 0]
+       "ref": [14, "sglang", 0]
       }
      ]
     },
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -4175,7 +4424,7 @@ export const agentx = {
    "hw": "h100",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Agg TP8·EP8",
-   "detail": "GPU KV · DSpark 5",
+   "detail": "DSpark 5",
    "gpus": 8,
    "configKey": "dsv41flash-fp4-h100-sglang-agentic-dspark",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260922-582389ce@sha256:0e1b14e302619a42ef5581b87db6804651d4f946301cf543d74a3a1eb1c33b40",
@@ -4184,6 +4433,20 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -4196,7 +4459,8 @@ export const agentx = {
      "date": "2026-09-24",
      "sha": "510568c51a127f46c6fcc54d66e925395a512ed1",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35690159495/job/106785881964",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [2],
@@ -4210,6 +4474,7 @@ export const agentx = {
      "sha": "510568c51a127f46c6fcc54d66e925395a512ed1",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35690159495/job/106785882058",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -4243,6 +4508,7 @@ export const agentx = {
      "sha": "510568c51a127f46c6fcc54d66e925395a512ed1",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35690159495/job/106785882276",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -4276,6 +4542,7 @@ export const agentx = {
      "sha": "510568c51a127f46c6fcc54d66e925395a512ed1",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35690159495/job/106785881475",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -4309,6 +4576,7 @@ export const agentx = {
      "sha": "510568c51a127f46c6fcc54d66e925395a512ed1",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35690159495/job/106785881396",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -4342,6 +4610,7 @@ export const agentx = {
      "sha": "510568c51a127f46c6fcc54d66e925395a512ed1",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35690159495/job/106785881521",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -4368,7 +4637,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "worker",
@@ -4404,7 +4672,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -4452,7 +4719,7 @@ export const agentx = {
    "hw": "h100",
    "ckpt": "deepseek-ai/DeepSeek-V4.1-Flash",
    "label": "Agg DEP8",
-   "detail": "GPU KV · DSpark 5",
+   "detail": "DSpark 5",
    "gpus": 8,
    "configKey": "dsv41flash-fp4-h100-sglang-agentic-dspark-dpa",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260922-582389ce@sha256:0e1b14e302619a42ef5581b87db6804651d4f946301cf543d74a3a1eb1c33b40",
@@ -4461,6 +4728,20 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "1"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv41flash-fp4-gb300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb300"
+    }
+   },
    "points": [
     {
      "concs": [4],
@@ -4473,7 +4754,8 @@ export const agentx = {
      "date": "2026-09-24",
      "sha": "510568c51a127f46c6fcc54d66e925395a512ed1",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35690159495/job/106785886368",
-     "goldenAL": "3.51"
+     "goldenAL": "3.51",
+     "kv": "none"
     },
     {
      "concs": [8],
@@ -4487,6 +4769,7 @@ export const agentx = {
      "sha": "510568c51a127f46c6fcc54d66e925395a512ed1",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35690159495/job/106785882300",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -4519,6 +4802,7 @@ export const agentx = {
      "sha": "510568c51a127f46c6fcc54d66e925395a512ed1",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35690159495/job/106785881433",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -4551,6 +4835,7 @@ export const agentx = {
      "sha": "510568c51a127f46c6fcc54d66e925395a512ed1",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35690159495/job/106785882144",
      "goldenAL": "3.51",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -4576,7 +4861,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "diff": {
@@ -4588,7 +4872,7 @@ export const agentx = {
          "--swa-prefix-tails": ["64"]
         }
        },
-       "ref": [17, "sglang", 0]
+       "ref": [16, "sglang", 0]
       },
       {
        "kind": "sglang-router",
@@ -4612,7 +4896,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "kind": "etcd",

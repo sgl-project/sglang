@@ -3,7 +3,7 @@
 // (SemiAnalysisAI/InferenceX main@8ba71d026e86 plus open PRs #3187, #3598, #3631, #3659), with SA-specific settings removed.
 export const agentx = {
  "model": "DeepSeek-V4",
- "generatedOn": "2026-10-05",
+ "generatedOn": "2026-10-06",
  "source": {
   "repo": "https://github.com/SemiAnalysisAI/InferenceX",
   "main": "8ba71d026e866e7792074a3fd3f896fe6d1ad099",
@@ -128,6 +128,67 @@ export const agentx = {
    "MOONCAKE_TE_META_DATA_SERVER": "http://$MOONCAKE_MASTER_IP:8701/metadata"
   }
  ],
+ "kvMooncake": {
+  "donor": "dsv4-fp4-gb300-dynamo-sglang-agentic-disagg",
+  "donorHardware": "gb300",
+  "master": {
+   "dynamo": {
+    "kind": "mooncake-master",
+    "count_nodes": 1,
+    "ports": ["8700"],
+    "cmd": "mooncake_master",
+    "env": {
+     "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+     "NATS_SERVER": "nats://$NATS_IP:4222"
+    },
+    "args": [
+     ["--port", "8700"],
+     ["--enable_http_metadata_server", "true"],
+     ["--http_metadata_server_port", "8701"],
+     ["--default_kv_lease_ttl", "10000"],
+     ["--rpc_thread_num", "16"],
+     ["--eviction_high_watermark_ratio", "0.90"]
+    ]
+   },
+   "sglang": {
+    "kind": "mooncake-master",
+    "count_nodes": 1,
+    "ports": ["8700"],
+    "cmd": "mooncake_master",
+    "env": {},
+    "args": [
+     ["--port", "8700"],
+     ["--enable_http_metadata_server", "true"],
+     ["--http_metadata_server_port", "8701"],
+     ["--default_kv_lease_ttl", "10000"],
+     ["--rpc_thread_num", "16"],
+     ["--eviction_high_watermark_ratio", "0.90"]
+    ]
+   }
+  },
+  "args": [
+   ["--enable-unified-cache-external-linker"],
+   ["--hicache-storage-backend-extra-config", "{\"enable_group_semantics\":true}"],
+   ["--unified-cache-external-linker-backend", "mooncake"]
+  ],
+  "env": {
+   "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+   "MC_TCP_BIND_ADDRESS": "$NODE_IP",
+   "MOONCAKE_DEVICE": "$IB_DEVICES",
+   "MOONCAKE_GLOBAL_SEGMENT_SIZE": "140gb",
+   "MOONCAKE_LOCAL_HOSTNAME": "$NODE_IP",
+   "MOONCAKE_MASTER": "$MOONCAKE_MASTER_IP:8700",
+   "MOONCAKE_PROTOCOL": "rdma",
+   "MOONCAKE_STANDALONE_STORAGE": "0",
+   "MOONCAKE_TE_META_DATA_SERVER": "http://$MOONCAKE_MASTER_IP:8701/metadata"
+  },
+  "decode_env": {
+   "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+   "MOONCAKE_LOCAL_HOSTNAME": "$NODE_IP",
+   "MOONCAKE_MASTER": "$MOONCAKE_MASTER_IP:8700",
+   "MOONCAKE_TE_META_DATA_SERVER": "http://$MOONCAKE_MASTER_IP:8701/metadata"
+  }
+ },
  "files": {
   "nats.conf#13771a85": {
    "name": "nats.conf",
@@ -160,7 +221,7 @@ export const agentx = {
    "hw": "b300",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro",
    "label": "Agg TP4",
-   "detail": "GPU KV · MTP 3-1-4",
+   "detail": "MTP 3-1-4",
    "gpus": 8,
    "configKey": "dsv4-fp4-b300-sglang-agentic-hicache-eagle",
    "image": "lmsysorg/sglang:dev-cu13-nightly-09242@sha256:c47bbe7448050608b4e08669c742df4835a45a95bf6b19f2c4e51a7f6609e9d5",
@@ -169,6 +230,21 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["chat-template", "synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "2.75"],
+      ["--hicache-write-policy", "write_through"]
+     ],
+     "donor": "dsv4-fp4-b300-dynamo-sglang-agentic-agg",
+     "donorHardware": "b300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -181,7 +257,8 @@ export const agentx = {
      "date": "2026-09-29",
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_tp4_c1",
-     "goldenAL": "2.49"
+     "goldenAL": "2.49",
+     "kv": "none"
     },
     {
      "concs": [2],
@@ -195,6 +272,7 @@ export const agentx = {
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_tp4_c2",
      "goldenAL": "2.49",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -228,6 +306,7 @@ export const agentx = {
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_tp4_c4",
      "goldenAL": "2.49",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -261,6 +340,7 @@ export const agentx = {
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_tp4_c8",
      "goldenAL": "2.49",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -294,6 +374,7 @@ export const agentx = {
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_tp4_c16",
      "goldenAL": "2.49",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -327,6 +408,7 @@ export const agentx = {
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_tp4_c32",
      "goldenAL": "2.49",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -353,7 +435,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "worker",
@@ -406,7 +487,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -454,7 +534,7 @@ export const agentx = {
    "hw": "b300",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro",
    "label": "Agg TP8",
-   "detail": "GPU KV · MTP 3-1-4",
+   "detail": "MTP 3-1-4",
    "gpus": 8,
    "configKey": "dsv4-fp4-b300-sglang-agentic-hicache-eagle",
    "image": "lmsysorg/sglang:dev-cu13-nightly-09242@sha256:c47bbe7448050608b4e08669c742df4835a45a95bf6b19f2c4e51a7f6609e9d5",
@@ -463,6 +543,21 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["chat-template", "synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "2.75"],
+      ["--hicache-write-policy", "write_through"]
+     ],
+     "donor": "dsv4-fp4-b300-dynamo-sglang-agentic-agg",
+     "donorHardware": "b300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -475,7 +570,8 @@ export const agentx = {
      "date": "2026-09-29",
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_tp8_c1",
-     "goldenAL": "2.49"
+     "goldenAL": "2.49",
+     "kv": "none"
     },
     {
      "concs": [2],
@@ -489,6 +585,7 @@ export const agentx = {
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_tp8_c2",
      "goldenAL": "2.49",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -522,6 +619,7 @@ export const agentx = {
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_tp8_c4",
      "goldenAL": "2.49",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -555,6 +653,7 @@ export const agentx = {
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_tp8_c8",
      "goldenAL": "2.49",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -588,6 +687,7 @@ export const agentx = {
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_tp8_c16",
      "goldenAL": "2.49",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -621,6 +721,7 @@ export const agentx = {
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_tp8_c32",
      "goldenAL": "2.49",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -647,7 +748,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "diff": {
@@ -662,7 +762,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -710,7 +809,7 @@ export const agentx = {
    "hw": "b300",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro",
    "label": "Agg DEP8",
-   "detail": "HiCache DRAM · MTP 3-1-4",
+   "detail": "MTP 3-1-4",
    "gpus": 8,
    "configKey": "dsv4-fp4-b300-sglang-agentic-hicache-eagle",
    "image": "lmsysorg/sglang:dev-cu13-nightly-09242@sha256:c47bbe7448050608b4e08669c742df4835a45a95bf6b19f2c4e51a7f6609e9d5",
@@ -719,6 +818,21 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["chat-template", "synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "3"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv4-fp4-b300-sglang-agentic-hicache-mtp",
+     "donorHardware": "b300"
+    }
+   },
    "points": [
     {
      "concs": [64],
@@ -731,7 +845,8 @@ export const agentx = {
      "date": "2026-09-29",
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_dep8_c64",
-     "goldenAL": "2.49"
+     "goldenAL": "2.49",
+     "kv": "hicache"
     },
     {
      "concs": [128],
@@ -745,6 +860,7 @@ export const agentx = {
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_dep8_c128",
      "goldenAL": "2.49",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -777,6 +893,7 @@ export const agentx = {
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_dep8_c256",
      "goldenAL": "2.49",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -809,6 +926,7 @@ export const agentx = {
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_dep8_c384",
      "goldenAL": "2.49",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -841,6 +959,7 @@ export const agentx = {
      "sha": "f9bdb7683235c65624ba1100a1f866490e52c8d1",
      "override": "override_dep8_c512",
      "goldenAL": "2.49",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -866,7 +985,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "diff": {
@@ -931,7 +1049,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "kind": "etcd",
@@ -975,11 +1092,11 @@ export const agentx = {
    }
   },
   {
-   "id": "dsv4-fp4-b300-dynamo-sglang-agentic-agg#0",
+   "id": "dsv4-fp4-b300-dynamo-sglang-agentic-agg#0@c1",
    "hw": "b300",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Agg TP8",
-   "detail": "GPU KV · DSpark 6 · dsv4-fp4-b300-dynamo-sglang-agentic-agg",
+   "detail": "DSpark 6 · dsv4-fp4-b300-dynamo-sglang-agentic-agg",
    "gpus": 8,
    "configKey": "dsv4-fp4-b300-dynamo-sglang-agentic-agg",
    "image": "lmsysorg/sglang:nightly-dev-20260916-c9a8fba9",
@@ -988,6 +1105,21 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "2.75"],
+      ["--hicache-write-policy", "write_through"]
+     ],
+     "donor": "dsv4-fp4-b300-dynamo-sglang-agentic-agg",
+     "donorHardware": "b300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -999,14 +1131,14 @@ export const agentx = {
      "pr": "3631",
      "sha": "3b798abfd43bc4260ab11e43d66c88a99e33461a",
      "goldenAL": "3.77",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3631#issuecomment-6010320587"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3631#issuecomment-6010320587",
+     "kv": "none"
     }
    ],
    "routers": {
     "dynamo": {
      "install": [],
      "files": ["nats.conf#13771a85"],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -1100,7 +1232,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "from": 2,
@@ -1136,7 +1267,7 @@ export const agentx = {
    "hw": "b300",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Agg TP8",
-   "detail": "GPU KV · DSpark 6 · dsv4-fp4-b300-sglang-agentic-hicache-mtp",
+   "detail": "DSpark 6 · dsv4-fp4-b300-sglang-agentic-hicache-mtp",
    "gpus": 8,
    "configKey": "dsv4-fp4-b300-sglang-agentic-hicache-mtp",
    "image": "lmsysorg/sglang:nightly-dev-20260901-07c8f729",
@@ -1145,6 +1276,23 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["chat-template", "synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "2.75"],
+      ["--hicache-write-policy", "write_through"]
+     ],
+     "donor": "dsv4-fp4-b300-dynamo-sglang-agentic-agg",
+     "donorHardware": "b300"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -1157,7 +1305,8 @@ export const agentx = {
      "date": "2026-09-15",
      "sha": "3f52b08875691ed8eeb9d1834a6647a0d212c1ed",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34595563156/job/103251129685",
-     "goldenAL": "3.77"
+     "goldenAL": "3.77",
+     "kv": "none"
     },
     {
      "concs": [4],
@@ -1171,6 +1320,7 @@ export const agentx = {
      "sha": "3f52b08875691ed8eeb9d1834a6647a0d212c1ed",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34595563156/job/103251129832",
      "goldenAL": "3.77",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1204,6 +1354,7 @@ export const agentx = {
      "sha": "3f52b08875691ed8eeb9d1834a6647a0d212c1ed",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34595563156/job/103251129768",
      "goldenAL": "3.77",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1237,6 +1388,7 @@ export const agentx = {
      "sha": "3f52b08875691ed8eeb9d1834a6647a0d212c1ed",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34595563156/job/103251129881",
      "goldenAL": "3.77",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1270,6 +1422,7 @@ export const agentx = {
      "sha": "3f52b08875691ed8eeb9d1834a6647a0d212c1ed",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34595563156/job/103251129678",
      "goldenAL": "3.77",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -1296,7 +1449,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "diff": {
@@ -1340,7 +1492,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -1384,11 +1535,11 @@ export const agentx = {
    }
   },
   {
-   "id": "dsv4-fp4-b300-dynamo-sglang-agentic-agg#1",
+   "id": "dsv4-fp4-b300-dynamo-sglang-agentic-agg#0@c4",
    "hw": "b300",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Agg TP4",
-   "detail": "GPU KV · DSpark 6",
+   "detail": "DSpark 6",
    "gpus": 8,
    "configKey": "dsv4-fp4-b300-dynamo-sglang-agentic-agg",
    "image": "lmsysorg/sglang:nightly-dev-20260916-c9a8fba9",
@@ -1397,6 +1548,21 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "2.75"],
+      ["--hicache-write-policy", "write_through"]
+     ],
+     "donor": "dsv4-fp4-b300-dynamo-sglang-agentic-agg",
+     "donorHardware": "b300"
+    }
+   },
    "points": [
     {
      "concs": [4],
@@ -1408,14 +1574,59 @@ export const agentx = {
      "pr": "3631",
      "sha": "3b798abfd43bc4260ab11e43d66c88a99e33461a",
      "goldenAL": "3.77",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3631#issuecomment-6010320587"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3631#issuecomment-6010320587",
+     "kv": "none"
+    },
+    {
+     "concs": [8],
+     "item": 0,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/3b798abfd43bc4260ab11e43d66c88a99e33461a/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv4/sglang/b300-fp4/agentx/agg-tp4-c8-mtp-kvoffload.yaml",
+     "status": "verified-pr",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36974436489",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3631",
+     "pr": "3631",
+     "sha": "3b798abfd43bc4260ab11e43d66c88a99e33461a",
+     "goldenAL": "3.77",
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3631#issuecomment-6010320587",
+     "kv": "hicache",
+     "patch": {
+      "dynamo": [
+       null,
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs-decode": ["16"],
+         "--enable-hierarchical-cache": [],
+         "--hicache-io-backend": ["direct"],
+         "--hicache-mem-layout": ["page_first_direct"],
+         "--hicache-ratio": ["2.75"],
+         "--hicache-write-policy": ["write_through"],
+         "--max-running-requests": ["16"]
+        }
+       },
+       null
+      ],
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs-decode": ["16"],
+         "--enable-hierarchical-cache": [],
+         "--hicache-io-backend": ["direct"],
+         "--hicache-mem-layout": ["page_first_direct"],
+         "--hicache-ratio": ["2.75"],
+         "--hicache-write-policy": ["write_through"],
+         "--max-running-requests": ["16"]
+        }
+       },
+       null
+      ]
+     }
     }
    ],
    "routers": {
     "dynamo": {
      "install": [],
      "files": ["nats.conf#13771a85"],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -1464,123 +1675,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
-     "blocks": [
-      {
-       "from": 2,
-       "cmd": "python3 -m sglang.launch_server",
-       "diff": {
-        "args": {
-         "--request-plane": null
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": null,
-         "ETCD_ENDPOINTS": null,
-         "NATS_SERVER": null
-        }
-       }
-      },
-      {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
-       "env": {},
-       "args": [
-        ["--host", "0.0.0.0"],
-        ["--port", "8000"],
-        ["--policy", "cache_aware"],
-        ["--worker-urls", "http://127.0.0.1:30000"]
-       ]
-      }
-     ]
-    }
-   }
-  },
-  {
-   "id": "dsv4-fp4-b300-dynamo-sglang-agentic-agg#0",
-   "hw": "b300",
-   "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
-   "label": "Agg TP4",
-   "detail": "HiCache DRAM · DSpark 6",
-   "gpus": 8,
-   "configKey": "dsv4-fp4-b300-dynamo-sglang-agentic-agg",
-   "image": "lmsysorg/sglang:nightly-dev-20260916-c9a8fba9",
-   "imageStatus": "pruned",
-   "imageCommit": "c9a8fba9",
-   "submitted": "dynamo",
-   "setup": [],
-   "disclosures": ["synthetic-acceptance"],
-   "points": [
-    {
-     "concs": [8],
-     "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/3b798abfd43bc4260ab11e43d66c88a99e33461a/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv4/sglang/b300-fp4/agentx/agg-tp4-c8-mtp-kvoffload.yaml",
-     "status": "verified-pr",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36974436489",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3631",
-     "pr": "3631",
-     "sha": "3b798abfd43bc4260ab11e43d66c88a99e33461a",
-     "goldenAL": "3.77",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3631#issuecomment-6010320587"
-    }
-   ],
-   "routers": {
-    "dynamo": {
-     "install": [],
-     "files": ["nats.conf#13771a85"],
-     "notes": [],
-     "blocks": [
-      {
-       "kind": "etcd",
-       "count_nodes": 1,
-       "cmd": "etcd",
-       "env": {},
-       "args": [
-        ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
-       ]
-      },
-      {
-       "kind": "nats",
-       "count_nodes": 1,
-       "cmd": "nats-server -c nats.conf",
-       "env": {},
-       "args": []
-      },
-      {
-       "diff": {
-        "args": {
-         "--cuda-graph-max-bs-decode": ["16"],
-         "--enable-hierarchical-cache": [],
-         "--hicache-io-backend": ["direct"],
-         "--hicache-mem-layout": ["page_first_direct"],
-         "--hicache-ratio": ["2.75"],
-         "--hicache-write-policy": ["write_through"],
-         "--max-running-requests": ["16"]
-        }
-       },
-       "ref": [5, "dynamo", 2]
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 1,
-       "cmd": "python3 -m dynamo.frontend",
-       "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"],
-        ["--router-session-affinity-ttl-secs", "3600"],
-        ["--active-decode-blocks-threshold", "None"],
-        ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"]
-       ],
-       "envRef": 0
-      }
-     ]
-    },
-    "sglang": {
-     "install": [],
-     "files": [],
-     "notes": [],
      "blocks": [
       {
        "from": 2,
@@ -1616,7 +1710,7 @@ export const agentx = {
    "hw": "b300",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Agg DEP8",
-   "detail": "HiCache DRAM · DSpark 6 · dsv4-fp4-b300-sglang-agentic-hicache-mtp",
+   "detail": "DSpark 6 · dsv4-fp4-b300-sglang-agentic-hicache-mtp",
    "gpus": 8,
    "configKey": "dsv4-fp4-b300-sglang-agentic-hicache-mtp",
    "image": "lmsysorg/sglang:nightly-dev-20260901-07c8f729",
@@ -1625,6 +1719,23 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["chat-template", "synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "3"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv4-fp4-b300-sglang-agentic-hicache-mtp",
+     "donorHardware": "b300"
+    }
+   },
    "points": [
     {
      "concs": [32],
@@ -1637,7 +1748,8 @@ export const agentx = {
      "date": "2026-09-15",
      "sha": "3f52b08875691ed8eeb9d1834a6647a0d212c1ed",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34595563156/job/103251129927",
-     "goldenAL": "3.77"
+     "goldenAL": "3.77",
+     "kv": "hicache"
     },
     {
      "concs": [64],
@@ -1651,6 +1763,7 @@ export const agentx = {
      "sha": "3f52b08875691ed8eeb9d1834a6647a0d212c1ed",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34595563156/job/103251129864",
      "goldenAL": "3.77",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -1683,6 +1796,7 @@ export const agentx = {
      "sha": "3f52b08875691ed8eeb9d1834a6647a0d212c1ed",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34595563156/job/103251129925",
      "goldenAL": "3.77",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -1715,6 +1829,7 @@ export const agentx = {
      "sha": "3f52b08875691ed8eeb9d1834a6647a0d212c1ed",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34595563156/job/103251129840",
      "goldenAL": "3.77",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -1747,6 +1862,7 @@ export const agentx = {
      "sha": "3f52b08875691ed8eeb9d1834a6647a0d212c1ed",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34595563156/job/103251129938",
      "goldenAL": "3.77",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -1781,6 +1897,7 @@ export const agentx = {
      "sha": "3f52b08875691ed8eeb9d1834a6647a0d212c1ed",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34595563156/job/103251129788",
      "goldenAL": "3.77",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -1815,6 +1932,7 @@ export const agentx = {
      "sha": "3f52b08875691ed8eeb9d1834a6647a0d212c1ed",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34595563156/job/103251129766",
      "goldenAL": "3.77",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -1842,7 +1960,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "diff": {
@@ -1906,7 +2023,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "kind": "etcd",
@@ -1955,7 +2071,7 @@ export const agentx = {
    "hw": "b300",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Disagg 1P1D · prefill DEP8 · decode DEP8",
-   "detail": "HiCache DRAM · DSpark 6",
+   "detail": "DSpark 6",
    "gpus": 16,
    "configKey": "dsv4-fp4-b300-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-20260916-c9a8fba9",
@@ -1970,6 +2086,20 @@ export const agentx = {
     }
    ],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "3"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv4-fp4-b300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "b300"
+    }
+   },
    "points": [
     {
      "concs": [64],
@@ -1981,7 +2111,8 @@ export const agentx = {
      "pr": "3631",
      "sha": "3b798abfd43bc4260ab11e43d66c88a99e33461a",
      "goldenAL": "3.77",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3631#issuecomment-6010320587"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3631#issuecomment-6010320587",
+     "kv": "hicache"
     },
     {
      "concs": [240],
@@ -1994,6 +2125,7 @@ export const agentx = {
      "sha": "3b798abfd43bc4260ab11e43d66c88a99e33461a",
      "goldenAL": "3.77",
      "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3631#issuecomment-6010320587",
+     "kv": "hicache",
      "patch": {
       "dynamo": [
        null,
@@ -2023,7 +2155,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": ["nats.conf#13771a85", "nginx.conf#033bddfb"],
-     "notes": ["rename-dp-attention", "efa"],
      "blocks": [
       {
        "kind": "etcd",
@@ -2209,7 +2340,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention", "efa"],
      "blocks": [
       {
        "from": 2,
@@ -2265,7 +2395,7 @@ export const agentx = {
    "hw": "b300",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Disagg 1P2D · prefill DEP8 · decode DEP8",
-   "detail": "HiCache DRAM · DSpark 6",
+   "detail": "DSpark 6",
    "gpus": 24,
    "configKey": "dsv4-fp4-b300-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-20260916-c9a8fba9",
@@ -2280,6 +2410,20 @@ export const agentx = {
     }
    ],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-ratio", "3"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv4-fp4-b300-dynamo-sglang-agentic-disagg",
+     "donorHardware": "b300"
+    }
+   },
    "points": [
     {
      "concs": [64],
@@ -2291,14 +2435,14 @@ export const agentx = {
      "pr": "3631",
      "sha": "3b798abfd43bc4260ab11e43d66c88a99e33461a",
      "goldenAL": "3.77",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3631#issuecomment-6010320587"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3631#issuecomment-6010320587",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": [],
      "files": ["nats.conf#13771a85", "nginx.conf#1fa49161"],
-     "notes": ["rename-dp-attention", "efa"],
      "blocks": [
       {
        "kind": "etcd",
@@ -2319,11 +2463,11 @@ export const agentx = {
        "args": []
       },
       {
-       "ref": [8, "dynamo", 2]
+       "ref": [7, "dynamo", 2]
       },
       {
        "workers": 2,
-       "ref": [8, "dynamo", 3]
+       "ref": [7, "dynamo", 3]
       },
       {
        "kind": "nginx",
@@ -2350,7 +2494,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention", "efa"],
      "blocks": [
       {
        "from": 2,
@@ -2407,7 +2550,7 @@ export const agentx = {
    "hw": "b300",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Agg DEP8",
-   "detail": "HiCache DRAM · DSpark 6 · dsv4-fp4-b300-dynamo-sglang-agentic-agg",
+   "detail": "DSpark 6 · dsv4-fp4-b300-dynamo-sglang-agentic-agg",
    "gpus": 8,
    "configKey": "dsv4-fp4-b300-dynamo-sglang-agentic-agg",
    "image": "lmsysorg/sglang:nightly-dev-20260916-c9a8fba9",
@@ -2416,6 +2559,21 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "3"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv4-fp4-b300-sglang-agentic-hicache-mtp",
+     "donorHardware": "b300"
+    }
+   },
    "points": [
     {
      "concs": [384],
@@ -2427,14 +2585,14 @@ export const agentx = {
      "pr": "3631",
      "sha": "3b798abfd43bc4260ab11e43d66c88a99e33461a",
      "goldenAL": "3.77",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3631#issuecomment-6010320587"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3631#issuecomment-6010320587",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": [],
      "files": ["nats.conf#13771a85"],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "kind": "etcd",
@@ -2488,7 +2646,7 @@ export const agentx = {
          "SGLANG_TIMEOUT_KEEP_ALIVE": null
         }
        },
-       "ref": [7, "dynamo", 1]
+       "ref": [6, "dynamo", 1]
       },
       {
        "kind": "dynamo-frontend",
@@ -2515,7 +2673,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "from": 2,
@@ -2552,7 +2709,7 @@ export const agentx = {
    "hw": "b200",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Agg TP8",
-   "detail": "HiCache DRAM · DSpark 6 · dsv4-fp4-b200-dynamo-sglang-agentic-agg",
+   "detail": "DSpark 6 · dsv4-fp4-b200-dynamo-sglang-agentic-agg",
    "gpus": 8,
    "configKey": "dsv4-fp4-b200-dynamo-sglang-agentic-agg",
    "image": "lmsysorg/sglang:nightly-dev-20260916-c9a8fba9",
@@ -2561,6 +2718,21 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "2.75"],
+      ["--hicache-write-policy", "write_through"]
+     ],
+     "donor": "dsv4-fp4-b200-dynamo-sglang-agentic-agg",
+     "donorHardware": "b200"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -2572,7 +2744,8 @@ export const agentx = {
      "pr": "3257",
      "date": "2026-09-22",
      "sha": "1d0716bb364d49a450386c867d632f7409ff7ced",
-     "goldenAL": "3.77"
+     "goldenAL": "3.77",
+     "kv": "hicache"
     },
     {
      "concs": [4],
@@ -2585,6 +2758,7 @@ export const agentx = {
      "date": "2026-09-22",
      "sha": "1d0716bb364d49a450386c867d632f7409ff7ced",
      "goldenAL": "3.77",
+     "kv": "hicache",
      "patch": {
       "dynamo": [
        null,
@@ -2619,6 +2793,7 @@ export const agentx = {
      "date": "2026-09-22",
      "sha": "1d0716bb364d49a450386c867d632f7409ff7ced",
      "goldenAL": "3.77",
+     "kv": "hicache",
      "patch": {
       "dynamo": [
        null,
@@ -2647,7 +2822,6 @@ export const agentx = {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260914\" \"ai-dynamo==1.5.0.dev20260914\""],
      "files": ["nats.conf#13771a85"],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -2729,7 +2903,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "from": 2,
@@ -2765,7 +2938,7 @@ export const agentx = {
    "hw": "b200",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Agg TP8",
-   "detail": "GPU KV · DSpark 6",
+   "detail": "DSpark 6 · dsv4-fp4-b200-sglang-agentic-hicache-mtp",
    "gpus": 8,
    "configKey": "dsv4-fp4-b200-sglang-agentic-hicache-mtp",
    "image": "lmsysorg/sglang:v0.5.19-cu130",
@@ -2774,6 +2947,23 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["chat-template", "synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "2.75"],
+      ["--hicache-write-policy", "write_through"]
+     ],
+     "donor": "dsv4-fp4-b200-dynamo-sglang-agentic-agg",
+     "donorHardware": "b200"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -2786,7 +2976,8 @@ export const agentx = {
      "date": "2026-09-16",
      "sha": "da239a6585566fec56766c7185ecd22e147616af",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/job/103278189777",
-     "goldenAL": "3.77"
+     "goldenAL": "3.77",
+     "kv": "none"
     },
     {
      "concs": [2],
@@ -2800,6 +2991,7 @@ export const agentx = {
      "sha": "da239a6585566fec56766c7185ecd22e147616af",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/job/103278189747",
      "goldenAL": "3.77",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -2833,6 +3025,7 @@ export const agentx = {
      "sha": "da239a6585566fec56766c7185ecd22e147616af",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/job/103278190069",
      "goldenAL": "3.77",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -2866,6 +3059,7 @@ export const agentx = {
      "sha": "da239a6585566fec56766c7185ecd22e147616af",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/job/103278189788",
      "goldenAL": "3.77",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -2899,6 +3093,7 @@ export const agentx = {
      "sha": "da239a6585566fec56766c7185ecd22e147616af",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/job/103278190011",
      "goldenAL": "3.77",
+     "kv": "none",
      "patch": {
       "sglang": [
        {
@@ -2919,13 +3114,144 @@ export const agentx = {
        null
       ]
      }
+    },
+    {
+     "concs": [8],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/da239a6585566fec56766c7185ecd22e147616af/benchmarks/single_node/agentic/dsv4_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3012",
+     "pr": "3012",
+     "date": "2026-09-16",
+     "sha": "da239a6585566fec56766c7185ecd22e147616af",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/job/103278189986",
+     "goldenAL": "3.77",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["16"],
+         "--enable-hierarchical-cache": [],
+         "--hicache-io-backend": ["direct"],
+         "--hicache-mem-layout": ["page_first_direct"],
+         "--hicache-ratio": ["2.75"],
+         "--hicache-write-policy": ["write_through"],
+         "--max-running-requests": ["16"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["16"],
+         "--enable-hierarchical-cache": [],
+         "--hicache-io-backend": ["direct"],
+         "--hicache-mem-layout": ["page_first_direct"],
+         "--hicache-ratio": ["2.75"],
+         "--hicache-write-policy": ["write_through"],
+         "--max-running-requests": ["16"]
+        }
+       },
+       null
+      ]
+     }
+    },
+    {
+     "concs": [10],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/da239a6585566fec56766c7185ecd22e147616af/benchmarks/single_node/agentic/dsv4_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3012",
+     "pr": "3012",
+     "date": "2026-09-16",
+     "sha": "da239a6585566fec56766c7185ecd22e147616af",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/job/103278189804",
+     "goldenAL": "3.77",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["20"],
+         "--enable-hierarchical-cache": [],
+         "--hicache-io-backend": ["direct"],
+         "--hicache-mem-layout": ["page_first_direct"],
+         "--hicache-ratio": ["2.75"],
+         "--hicache-write-policy": ["write_through"],
+         "--max-running-requests": ["20"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["20"],
+         "--enable-hierarchical-cache": [],
+         "--hicache-io-backend": ["direct"],
+         "--hicache-mem-layout": ["page_first_direct"],
+         "--hicache-ratio": ["2.75"],
+         "--hicache-write-policy": ["write_through"],
+         "--max-running-requests": ["20"]
+        }
+       },
+       null
+      ]
+     }
+    },
+    {
+     "concs": [16],
+     "item": 1,
+     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/da239a6585566fec56766c7185ecd22e147616af/benchmarks/single_node/agentic/dsv4_fp4_b200_sglang_mtp.sh",
+     "status": "verified",
+     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/attempts/1",
+     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3012",
+     "pr": "3012",
+     "date": "2026-09-16",
+     "sha": "da239a6585566fec56766c7185ecd22e147616af",
+     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/job/103278189895",
+     "goldenAL": "3.77",
+     "kv": "hicache",
+     "patch": {
+      "sglang": [
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["32"],
+         "--enable-hierarchical-cache": [],
+         "--hicache-io-backend": ["direct"],
+         "--hicache-mem-layout": ["page_first_direct"],
+         "--hicache-ratio": ["2.75"],
+         "--hicache-write-policy": ["write_through"],
+         "--max-running-requests": ["32"]
+        }
+       }
+      ],
+      "dynamo": [
+       null,
+       {
+        "args": {
+         "--cuda-graph-max-bs": ["32"],
+         "--enable-hierarchical-cache": [],
+         "--hicache-io-backend": ["direct"],
+         "--hicache-mem-layout": ["page_first_direct"],
+         "--hicache-ratio": ["2.75"],
+         "--hicache-write-policy": ["write_through"],
+         "--max-running-requests": ["32"]
+        }
+       },
+       null
+      ]
+     }
     }
    ],
    "routers": {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "worker",
@@ -2977,170 +3303,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": [],
-     "blocks": [
-      {
-       "kind": "etcd",
-       "count_nodes": 1,
-       "cmd": "etcd",
-       "env": {},
-       "args": [
-        ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
-       ]
-      },
-      {
-       "from": 0,
-       "cmd": "python3 -m dynamo.sglang",
-       "diff": {
-        "args": {
-         "--request-plane": ["tcp"]
-        },
-        "env": {
-         "DYN_REQUEST_PLANE": "tcp",
-         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-        }
-       }
-      },
-      {
-       "kind": "dynamo-frontend",
-       "count": 1,
-       "cmd": "python3 -m dynamo.frontend",
-       "env": {
-        "DYN_REQUEST_PLANE": "tcp",
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-       },
-       "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"]
-       ]
-      }
-     ]
-    }
-   }
-  },
-  {
-   "id": "dsv4-fp4-b200-sglang-agentic-hicache-mtp#1",
-   "hw": "b200",
-   "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
-   "label": "Agg TP8",
-   "detail": "HiCache DRAM · DSpark 6 · dsv4-fp4-b200-sglang-agentic-hicache-mtp",
-   "gpus": 8,
-   "configKey": "dsv4-fp4-b200-sglang-agentic-hicache-mtp",
-   "image": "lmsysorg/sglang:v0.5.19-cu130",
-   "imageStatus": "ok",
-   "imageCommit": null,
-   "submitted": "sglang",
-   "setup": [],
-   "disclosures": ["chat-template", "synthetic-acceptance"],
-   "points": [
-    {
-     "concs": [8],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/da239a6585566fec56766c7185ecd22e147616af/benchmarks/single_node/agentic/dsv4_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3012",
-     "pr": "3012",
-     "date": "2026-09-16",
-     "sha": "da239a6585566fec56766c7185ecd22e147616af",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/job/103278189986",
-     "goldenAL": "3.77"
-    },
-    {
-     "concs": [10],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/da239a6585566fec56766c7185ecd22e147616af/benchmarks/single_node/agentic/dsv4_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3012",
-     "pr": "3012",
-     "date": "2026-09-16",
-     "sha": "da239a6585566fec56766c7185ecd22e147616af",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/job/103278189804",
-     "goldenAL": "3.77",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["20"],
-         "--max-running-requests": ["20"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["20"],
-         "--max-running-requests": ["20"]
-        }
-       },
-       null
-      ]
-     }
-    },
-    {
-     "concs": [16],
-     "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/da239a6585566fec56766c7185ecd22e147616af/benchmarks/single_node/agentic/dsv4_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3012",
-     "pr": "3012",
-     "date": "2026-09-16",
-     "sha": "da239a6585566fec56766c7185ecd22e147616af",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/job/103278189895",
-     "goldenAL": "3.77",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["32"],
-         "--max-running-requests": ["32"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       {
-        "args": {
-         "--cuda-graph-max-bs": ["32"],
-         "--max-running-requests": ["32"]
-        }
-       },
-       null
-      ]
-     }
-    }
-   ],
-   "routers": {
-    "sglang": {
-     "install": [],
-     "files": [],
-     "notes": [],
-     "blocks": [
-      {
-       "diff": {
-        "args": {
-         "--cuda-graph-max-bs": ["16"],
-         "--enable-hierarchical-cache": [],
-         "--hicache-io-backend": ["direct"],
-         "--hicache-mem-layout": ["page_first_direct"],
-         "--hicache-ratio": ["2.75"],
-         "--hicache-write-policy": ["write_through"],
-         "--max-running-requests": ["16"]
-        }
-       },
-       "ref": [12, "sglang", 0]
-      }
-     ]
-    },
-    "dynamo": {
-     "install": [],
-     "files": [],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -3188,7 +3350,7 @@ export const agentx = {
    "hw": "b200",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Agg DEP8",
-   "detail": "HiCache DRAM · DSpark 6",
+   "detail": "DSpark 6",
    "gpus": 8,
    "configKey": "dsv4-fp4-b200-sglang-agentic-hicache-mtp",
    "image": "lmsysorg/sglang:v0.5.19-cu130",
@@ -3197,6 +3359,23 @@ export const agentx = {
    "submitted": "sglang",
    "setup": [],
    "disclosures": ["chat-template", "synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "8"],
+      ["--hicache-write-policy", "write_through"]
+     ],
+     "donor": "dsv4-fp4-b200-sglang-agentic-hicache-mtp",
+     "donorHardware": "b200"
+    }
+   },
    "points": [
     {
      "concs": [64],
@@ -3209,7 +3388,8 @@ export const agentx = {
      "date": "2026-09-16",
      "sha": "da239a6585566fec56766c7185ecd22e147616af",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/job/103278190531",
-     "goldenAL": "3.77"
+     "goldenAL": "3.77",
+     "kv": "hicache"
     },
     {
      "concs": [96],
@@ -3223,6 +3403,7 @@ export const agentx = {
      "sha": "da239a6585566fec56766c7185ecd22e147616af",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/job/103278190009",
      "goldenAL": "3.77",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -3255,6 +3436,7 @@ export const agentx = {
      "sha": "da239a6585566fec56766c7185ecd22e147616af",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/job/103278190275",
      "goldenAL": "3.77",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -3287,6 +3469,7 @@ export const agentx = {
      "sha": "da239a6585566fec56766c7185ecd22e147616af",
      "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34603861241/job/103278189988",
      "goldenAL": "3.77",
+     "kv": "hicache",
      "patch": {
       "sglang": [
        {
@@ -3345,7 +3528,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "diff": {
@@ -3358,9 +3540,13 @@ export const agentx = {
          "--enable-dp-attention": [],
          "--enable-dp-attention-local-control-broadcast": [],
          "--enable-dp-lm-head": [],
+         "--enable-hierarchical-cache": [],
          "--enable-w4a4-mxfp4-megamoe": [],
          "--ep-size": ["8"],
+         "--hicache-io-backend": ["direct"],
+         "--hicache-mem-layout": ["page_first_direct"],
          "--hicache-ratio": ["8"],
+         "--hicache-write-policy": ["write_through"],
          "--incremental-streaming-output": [],
          "--load-balance-method": ["total_requests"],
          "--load-snapshot-publish-interval": ["1"],
@@ -3377,7 +3563,7 @@ export const agentx = {
          "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "8320"
         }
        },
-       "ref": [13, "sglang", 0]
+       "ref": [11, "sglang", 0]
       },
       {
        "kind": "sglang-router",
@@ -3401,7 +3587,6 @@ export const agentx = {
     "dynamo": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "kind": "etcd",
@@ -3450,7 +3635,7 @@ export const agentx = {
    "hw": "b200",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Disagg 1P1D · prefill DEP8 · decode DEP8",
-   "detail": "HiCache DRAM · DSpark 6",
+   "detail": "DSpark 6",
    "gpus": 16,
    "configKey": "dsv4-fp4-b200-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-20260916-c9a8fba9",
@@ -3459,6 +3644,21 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "8"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv4-fp4-b200-dynamo-sglang-agentic-disagg",
+     "donorHardware": "b200"
+    }
+   },
    "points": [
     {
      "concs": [64],
@@ -3470,7 +3670,8 @@ export const agentx = {
      "pr": "3257",
      "date": "2026-09-22",
      "sha": "1d0716bb364d49a450386c867d632f7409ff7ced",
-     "goldenAL": "3.77"
+     "goldenAL": "3.77",
+     "kv": "hicache"
     },
     {
      "concs": [128],
@@ -3483,6 +3684,7 @@ export const agentx = {
      "date": "2026-09-22",
      "sha": "1d0716bb364d49a450386c867d632f7409ff7ced",
      "goldenAL": "3.77",
+     "kv": "hicache",
      "patch": {
       "dynamo": [
        null,
@@ -3512,7 +3714,6 @@ export const agentx = {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260914\" \"ai-dynamo==1.5.0.dev20260914\""],
      "files": ["nats.conf#13771a85", "nginx.conf#033bddfb"],
-     "notes": ["rename-dp-attention", "ib-devices"],
      "blocks": [
       {
        "kind": "etcd",
@@ -3704,7 +3905,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention", "ib-devices"],
      "blocks": [
       {
        "from": 2,
@@ -3760,7 +3960,7 @@ export const agentx = {
    "hw": "b200",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Disagg 2P1D · prefill DEP8 · decode DEP8",
-   "detail": "HiCache DRAM · DSpark 6",
+   "detail": "DSpark 6",
    "gpus": 24,
    "configKey": "dsv4-fp4-b200-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-20260916-c9a8fba9",
@@ -3769,6 +3969,21 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "8"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv4-fp4-b200-dynamo-sglang-agentic-disagg",
+     "donorHardware": "b200"
+    }
+   },
    "points": [
     {
      "concs": [256],
@@ -3780,14 +3995,14 @@ export const agentx = {
      "pr": "3257",
      "date": "2026-09-22",
      "sha": "1d0716bb364d49a450386c867d632f7409ff7ced",
-     "goldenAL": "3.77"
+     "goldenAL": "3.77",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260914\" \"ai-dynamo==1.5.0.dev20260914\""],
      "files": ["nats.conf#13771a85", "nginx.conf#1fa49161"],
-     "notes": ["rename-dp-attention", "ib-devices"],
      "blocks": [
       {
        "kind": "etcd",
@@ -3814,7 +4029,7 @@ export const agentx = {
          "--swa-full-tokens-ratio": ["0.02"]
         }
        },
-       "ref": [15, "dynamo", 2]
+       "ref": [13, "dynamo", 2]
       },
       {
        "diff": {
@@ -3827,7 +4042,7 @@ export const agentx = {
          "SGLANG_DSV4_MHC_PREWARM": "1"
         }
        },
-       "ref": [15, "dynamo", 3]
+       "ref": [13, "dynamo", 3]
       },
       {
        "kind": "nginx",
@@ -3858,7 +4073,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention", "ib-devices"],
      "blocks": [
       {
        "from": 2,
@@ -3915,7 +4129,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Agg TP8 (2 nodes)",
-   "detail": "GPU KV · DSpark 6",
+   "detail": "DSpark 6",
    "gpus": 8,
    "configKey": "dsv4-fp4-gb300-dynamo-sglang-agentic-agg",
    "image": "lmsysorg/sglang:v0.5.19-cu130@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9",
@@ -3924,6 +4138,23 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache"],
+    "unavailable": {
+     "mooncake": "this image's SGLang build predates --enable-unified-cache-external-linker"
+    },
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "2.75"],
+      ["--hicache-write-policy", "write_through"]
+     ],
+     "donor": "dsv4-fp4-b200-dynamo-sglang-agentic-agg",
+     "donorHardware": "b200"
+    }
+   },
    "points": [
     {
      "concs": [1, 4],
@@ -3936,14 +4167,14 @@ export const agentx = {
      "sha": "34d06e54c7614bb33d2a271b010ffde3ce3fa563",
      "override": "override_tp8",
      "goldenAL": "3.77",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3187#issuecomment-5996444239"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3187#issuecomment-5996444239",
+     "kv": "none"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260910\" \"ai-dynamo==1.5.0.dev20260910\""],
      "files": ["nats.conf#13771a85"],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -4023,7 +4254,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "from": 2,
@@ -4059,7 +4289,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Disagg 1P1D · prefill DEP8 (2 nodes) · decode DEP16 (4 nodes)",
-   "detail": "Mooncake store · DSpark 6",
+   "detail": "DSpark 6",
    "gpus": 24,
    "configKey": "dsv4-fp4-gb300-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260916-c9a8fba9",
@@ -4068,6 +4298,21 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "2"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv4-fp4-gb200-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb200"
+    }
+   },
    "points": [
     {
      "concs": [120, 480],
@@ -4080,14 +4325,14 @@ export const agentx = {
      "sha": "34d06e54c7614bb33d2a271b010ffde3ce3fa563",
      "override": "override_1p1d_c480",
      "goldenAL": "3.77",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3187#issuecomment-5996444239"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3187#issuecomment-5996444239",
+     "kv": "mooncake"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260914\" \"ai-dynamo==1.5.0.dev20260914\""],
      "files": ["nats.conf#13771a85", "nginx.conf#d0813d43"],
-     "notes": ["rename-dp-attention", "ib-devices"],
      "blocks": [
       {
        "kind": "etcd",
@@ -4329,7 +4574,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention", "ib-devices"],
      "blocks": [
       {
        "kind": "mooncake-master",
@@ -4411,7 +4655,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Disagg 2P1D · prefill DEP8 (2 nodes) · decode DEP16 (4 nodes)",
-   "detail": "Mooncake store · DSpark 6",
+   "detail": "DSpark 6",
    "gpus": 32,
    "configKey": "dsv4-fp4-gb300-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260916-c9a8fba9",
@@ -4420,6 +4664,21 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "2"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv4-fp4-gb200-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb200"
+    }
+   },
    "points": [
     {
      "concs": [960],
@@ -4432,14 +4691,14 @@ export const agentx = {
      "sha": "34d06e54c7614bb33d2a271b010ffde3ce3fa563",
      "override": "override_2p1d_c960",
      "goldenAL": "3.77",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3187#issuecomment-5996444239"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3187#issuecomment-5996444239",
+     "kv": "mooncake"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260914\" \"ai-dynamo==1.5.0.dev20260914\""],
      "files": ["nats.conf#13771a85", "nginx.conf#d0813d43"],
-     "notes": ["rename-dp-attention", "ib-devices"],
      "blocks": [
       {
        "kind": "etcd",
@@ -4495,7 +4754,7 @@ export const agentx = {
          "OMP_NUM_THREADS": "1"
         }
        },
-       "ref": [18, "dynamo", 4]
+       "ref": [16, "dynamo", 4]
       },
       {
        "diff": {
@@ -4504,7 +4763,7 @@ export const agentx = {
          "SGLANG_DSV4_MHC_PREWARM": "1"
         }
        },
-       "ref": [18, "dynamo", 5]
+       "ref": [16, "dynamo", 5]
       },
       {
        "kind": "nginx",
@@ -4535,7 +4794,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention", "ib-devices"],
      "blocks": [
       {
        "kind": "mooncake-master",
@@ -4618,7 +4876,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Disagg 3P1D · prefill DEP8 (2 nodes) · decode DEP16 (4 nodes)",
-   "detail": "Mooncake store · DSpark 6",
+   "detail": "DSpark 6",
    "gpus": 40,
    "configKey": "dsv4-fp4-gb300-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260916-c9a8fba9",
@@ -4627,6 +4885,21 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "2"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv4-fp4-gb200-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb200"
+    }
+   },
    "points": [
     {
      "concs": [1440],
@@ -4639,14 +4912,14 @@ export const agentx = {
      "sha": "34d06e54c7614bb33d2a271b010ffde3ce3fa563",
      "override": "override_3p1d_c1440",
      "goldenAL": "3.77",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3187#issuecomment-5996444239"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3187#issuecomment-5996444239",
+     "kv": "mooncake"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260914\" \"ai-dynamo==1.5.0.dev20260914\""],
      "files": ["nats.conf#13771a85", "nginx.conf#d0813d43"],
-     "notes": ["rename-dp-attention", "ib-devices"],
      "blocks": [
       {
        "kind": "etcd",
@@ -4703,7 +4976,7 @@ export const agentx = {
          "--max-running-requests": ["512"]
         }
        },
-       "ref": [18, "dynamo", 4]
+       "ref": [16, "dynamo", 4]
       },
       {
        "diff": {
@@ -4711,7 +4984,7 @@ export const agentx = {
          "--cuda-graph-max-bs-decode": ["512"]
         }
        },
-       "ref": [18, "dynamo", 5]
+       "ref": [16, "dynamo", 5]
       },
       {
        "kind": "nginx",
@@ -4742,7 +5015,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention", "ib-devices"],
      "blocks": [
       {
        "kind": "mooncake-master",
@@ -4826,7 +5098,7 @@ export const agentx = {
    "hw": "gb300",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Disagg 4P1D · prefill DEP8 (2 nodes) · decode DEP16 (4 nodes)",
-   "detail": "Mooncake store · DSpark 6",
+   "detail": "DSpark 6",
    "gpus": 48,
    "configKey": "dsv4-fp4-gb300-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-cu13-20260916-c9a8fba9",
@@ -4835,6 +5107,21 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "2"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv4-fp4-gb200-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb200"
+    }
+   },
    "points": [
     {
      "concs": [2400],
@@ -4847,14 +5134,14 @@ export const agentx = {
      "sha": "34d06e54c7614bb33d2a271b010ffde3ce3fa563",
      "override": "override_4p1d_c2400",
      "goldenAL": "3.77",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3187#issuecomment-5996444239"
+     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3187#issuecomment-5996444239",
+     "kv": "mooncake"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260914\" \"ai-dynamo==1.5.0.dev20260914\""],
      "files": ["nats.conf#13771a85", "nginx.conf#c1e648ce"],
-     "notes": ["rename-dp-attention", "ib-devices"],
      "blocks": [
       {
        "kind": "etcd",
@@ -4914,7 +5201,7 @@ export const agentx = {
          "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "3600"
         }
        },
-       "ref": [18, "dynamo", 4]
+       "ref": [16, "dynamo", 4]
       },
       {
        "diff": {
@@ -4925,7 +5212,7 @@ export const agentx = {
          "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "3600"
         }
        },
-       "ref": [18, "dynamo", 5]
+       "ref": [16, "dynamo", 5]
       },
       {
        "kind": "nginx",
@@ -4952,7 +5239,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention", "ib-devices"],
      "blocks": [
       {
        "kind": "mooncake-master",
@@ -5037,7 +5323,7 @@ export const agentx = {
    "hw": "gb200",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Agg TP8 (2 nodes)",
-   "detail": "HiCache DRAM · DSpark 6",
+   "detail": "DSpark 6",
    "gpus": 8,
    "configKey": "dsv4-fp4-gb200-dynamo-sglang-agentic-agg",
    "image": "lmsysorg/sglang:nightly-dev-20260916-c9a8fba9",
@@ -5052,6 +5338,21 @@ export const agentx = {
     }
    ],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "2.75"],
+      ["--hicache-write-policy", "write_through"]
+     ],
+     "donor": "dsv4-fp4-gb200-dynamo-sglang-agentic-agg",
+     "donorHardware": "gb200"
+    }
+   },
    "points": [
     {
      "concs": [1],
@@ -5063,7 +5364,8 @@ export const agentx = {
      "pr": "3629",
      "date": "2026-10-02",
      "sha": "2a58623b5a441f1b5c190ba9666a70881301d1d3",
-     "goldenAL": "3.77"
+     "goldenAL": "3.77",
+     "kv": "hicache"
     },
     {
      "concs": [4],
@@ -5076,6 +5378,7 @@ export const agentx = {
      "date": "2026-10-02",
      "sha": "2a58623b5a441f1b5c190ba9666a70881301d1d3",
      "goldenAL": "3.77",
+     "kv": "hicache",
      "patch": {
       "dynamo": [
        null,
@@ -5104,7 +5407,6 @@ export const agentx = {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260910\" \"ai-dynamo==1.5.0.dev20260910\""],
      "files": ["nats.conf#13771a85"],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -5189,7 +5491,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "from": 2,
@@ -5225,7 +5526,7 @@ export const agentx = {
    "hw": "gb200",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Disagg 1P1D · prefill DEP8 (2 nodes) · decode DEP16 (4 nodes)",
-   "detail": "HiCache DRAM · DSpark 6",
+   "detail": "DSpark 6",
    "gpus": 24,
    "configKey": "dsv4-fp4-gb200-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-20260916-c9a8fba9",
@@ -5240,6 +5541,21 @@ export const agentx = {
     }
    ],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "2"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv4-fp4-gb200-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb200"
+    }
+   },
    "points": [
     {
      "concs": [64],
@@ -5251,7 +5567,8 @@ export const agentx = {
      "pr": "3629",
      "date": "2026-10-02",
      "sha": "2a58623b5a441f1b5c190ba9666a70881301d1d3",
-     "goldenAL": "3.77"
+     "goldenAL": "3.77",
+     "kv": "hicache"
     },
     {
      "concs": [128],
@@ -5264,6 +5581,7 @@ export const agentx = {
      "date": "2026-10-02",
      "sha": "2a58623b5a441f1b5c190ba9666a70881301d1d3",
      "goldenAL": "3.77",
+     "kv": "hicache",
      "patch": {
       "dynamo": [
        null,
@@ -5301,7 +5619,6 @@ export const agentx = {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260910\" \"ai-dynamo==1.5.0.dev20260910\""],
      "files": ["nats.conf#13771a85", "nginx.conf#d0813d43"],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "kind": "etcd",
@@ -5500,7 +5817,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "from": 2,
@@ -5556,7 +5872,7 @@ export const agentx = {
    "hw": "gb200",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Disagg 1P1D · prefill DEP16 (4 nodes) · decode DEP32 (8 nodes)",
-   "detail": "HiCache DRAM · DSpark 6",
+   "detail": "DSpark 6",
    "gpus": 48,
    "configKey": "dsv4-fp4-gb200-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-20260916-c9a8fba9",
@@ -5571,6 +5887,21 @@ export const agentx = {
     }
    ],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "2"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv4-fp4-gb200-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb200"
+    }
+   },
    "points": [
     {
      "concs": [256],
@@ -5582,14 +5913,14 @@ export const agentx = {
      "pr": "3629",
      "date": "2026-10-02",
      "sha": "2a58623b5a441f1b5c190ba9666a70881301d1d3",
-     "goldenAL": "3.77"
+     "goldenAL": "3.77",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260910\" \"ai-dynamo==1.5.0.dev20260910\""],
      "files": ["nats.conf#13771a85", "nginx.conf#d0813d43"],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "kind": "etcd",
@@ -5620,7 +5951,7 @@ export const agentx = {
          "--tp-size": ["16"]
         }
        },
-       "ref": [23, "dynamo", 2]
+       "ref": [21, "dynamo", 2]
       },
       {
        "nodes_per_worker": 8,
@@ -5638,7 +5969,7 @@ export const agentx = {
          "SGLANG_DSV4_MHC_PREWARM": "1"
         }
        },
-       "ref": [23, "dynamo", 3]
+       "ref": [21, "dynamo", 3]
       },
       {
        "kind": "nginx",
@@ -5669,7 +6000,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "from": 2,
@@ -5725,7 +6055,7 @@ export const agentx = {
    "hw": "gb200",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Disagg 2P1D · prefill DEP16 (4 nodes) · decode DEP32 (8 nodes)",
-   "detail": "HiCache DRAM · DSpark 6",
+   "detail": "DSpark 6",
    "gpus": 64,
    "configKey": "dsv4-fp4-gb200-dynamo-sglang-agentic-disagg",
    "image": "lmsysorg/sglang:nightly-dev-20260916-c9a8fba9",
@@ -5740,6 +6070,21 @@ export const agentx = {
     }
    ],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "direct"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-ratio", "2"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "dsv4-fp4-gb200-dynamo-sglang-agentic-disagg",
+     "donorHardware": "gb200"
+    }
+   },
    "points": [
     {
      "concs": [768],
@@ -5751,7 +6096,8 @@ export const agentx = {
      "pr": "3629",
      "date": "2026-10-02",
      "sha": "2a58623b5a441f1b5c190ba9666a70881301d1d3",
-     "goldenAL": "3.77"
+     "goldenAL": "3.77",
+     "kv": "hicache"
     },
     {
      "concs": [1024],
@@ -5763,7 +6109,8 @@ export const agentx = {
      "pr": "3629",
      "date": "2026-10-02",
      "sha": "2a58623b5a441f1b5c190ba9666a70881301d1d3",
-     "goldenAL": "3.77"
+     "goldenAL": "3.77",
+     "kv": "hicache"
     },
     {
      "concs": [1280],
@@ -5775,14 +6122,14 @@ export const agentx = {
      "pr": "3629",
      "date": "2026-10-02",
      "sha": "2a58623b5a441f1b5c190ba9666a70881301d1d3",
-     "goldenAL": "3.77"
+     "goldenAL": "3.77",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260910\" \"ai-dynamo==1.5.0.dev20260910\""],
      "files": ["nats.conf#13771a85", "nginx.conf#d0813d43"],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "kind": "etcd",
@@ -5804,7 +6151,7 @@ export const agentx = {
       },
       {
        "workers": 2,
-       "ref": [24, "dynamo", 2]
+       "ref": [22, "dynamo", 2]
       },
       {
        "diff": {
@@ -5812,7 +6159,7 @@ export const agentx = {
          "--max-running-requests": ["1024"]
         }
        },
-       "ref": [24, "dynamo", 3]
+       "ref": [22, "dynamo", 3]
       },
       {
        "kind": "nginx",
@@ -5843,7 +6190,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": ["rename-dp-attention"],
      "blocks": [
       {
        "from": 2,
@@ -5900,7 +6246,7 @@ export const agentx = {
    "hw": "h200",
    "ckpt": "deepseek-ai/DeepSeek-V4-Pro-0813",
    "label": "Agg TP8",
-   "detail": "HiCache DRAM · DSpark 6",
+   "detail": "DSpark 6",
    "gpus": 8,
    "configKey": "dsv4-fp8-h200-dynamo-sglang-agentic-agg",
    "image": "lmsysorg/sglang:nightly-dev-20260914-4358a161",
@@ -5909,6 +6255,20 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-io-backend", "kernel"],
+      ["--hicache-ratio", "6"],
+      ["--hicache-write-policy", "write_through"]
+     ],
+     "donor": "dsv4-fp8-h200-dynamo-sglang-agentic-agg",
+     "donorHardware": "h200"
+    }
+   },
    "points": [
     {
      "concs": [1, 2, 4, 8, 16],
@@ -5920,14 +6280,14 @@ export const agentx = {
      "pr": "3100",
      "date": "2026-09-16",
      "sha": "63fe0f20ce78fae040939533682ec0a4dd406f96",
-     "goldenAL": "3.77"
+     "goldenAL": "3.77",
+     "kv": "hicache"
     }
    ],
    "routers": {
     "dynamo": {
      "install": ["pip install --pre --extra-index-url https://pypi.nvidia.com \"ai-dynamo-runtime==1.5.0.dev20260910\" \"ai-dynamo==1.5.0.dev20260910\""],
      "files": ["nats.conf#13771a85", "nginx.conf#748c9006"],
-     "notes": [],
      "blocks": [
       {
        "kind": "etcd",
@@ -6028,7 +6388,6 @@ export const agentx = {
     "sglang": {
      "install": [],
      "files": [],
-     "notes": [],
      "blocks": [
       {
        "from": 2,
