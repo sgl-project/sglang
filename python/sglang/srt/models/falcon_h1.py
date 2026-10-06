@@ -37,6 +37,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
@@ -99,6 +106,40 @@ class FalconH1MLP(nn.Module):
 
     def scale_output(self, x):
         return x * self.down_multiplier
+
+
+def _falcon_h1_mamba2_with_output(
+    layer: "FalconH1HybridAttentionDecoderLayer",
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    # Replay calls this with the capture-time arguments; the live batch and its
+    # Mamba2 metadata come from the prefill graph context.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    linear_attn_backend = get_attn_backend().linear_attn_backend
+    metadata = linear_attn_backend.forward_metadata
+    num_tokens = metadata.num_prefill_tokens + (
+        metadata.num_decodes * metadata.draft_token_num
+        if metadata.is_target_verify
+        else metadata.num_decodes
+    )
+    linear_attn_backend.forward(
+        layer.mamba,
+        hidden_states[:num_tokens],
+        output,
+        layer_id=layer.layer_id,
+        forward_batch=forward_batch,
+        mup_vector=layer.mup_vector,
+    )
+    # Rows past num_tokens are capture-bucket padding.
+    output[num_tokens:].zero_()
+
+
+# The chunked-scan metadata depends on the batch's sequence lengths, so the
+# mixer runs eagerly between graph segments instead of being captured.
+_breakable_falcon_h1_mamba2_with_output = eager_on_graph(True)(
+    _falcon_h1_mamba2_with_output
+)
 
 
 class FalconH1HybridAttentionDecoderLayer(nn.Module):
@@ -344,14 +385,26 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
             # Mamba block
             mamba_hidden_states = torch.empty_like(hidden_states)
-            attn_backend.linear_attn_backend.forward(
-                self.mamba,
-                hidden_states * self.ssm_in_multiplier,
-                mamba_hidden_states,
-                layer_id=self.layer_id,
-                forward_batch=forward_batch,
-                mup_vector=self.mup_vector,
-            )
+            # Only the prefill graph runner installs the context; decode graphs
+            # take the inline path.
+            if (
+                is_in_breakable_cuda_graph()
+                and get_tc_piecewise_forward_context() is not None
+            ):
+                _breakable_falcon_h1_mamba2_with_output(
+                    layer=self,
+                    hidden_states=hidden_states * self.ssm_in_multiplier,
+                    output=mamba_hidden_states,
+                )
+            else:
+                attn_backend.linear_attn_backend.forward(
+                    self.mamba,
+                    hidden_states * self.ssm_in_multiplier,
+                    mamba_hidden_states,
+                    layer_id=self.layer_id,
+                    forward_batch=forward_batch,
+                    mup_vector=self.mup_vector,
+                )
             mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
 
             hidden_states = attention_hidden_states + mamba_hidden_states
