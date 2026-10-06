@@ -241,11 +241,10 @@ class DecodingStage(PipelineStage):
             torch.mps.empty_cache()
 
         # Decode latents
-        vae_tiling = server_args.pipeline_config.should_enable_vae_tiling(latents)
         with autocast_context(vae_dtype, server_args.disable_autocast):
             # not every VAE supports toggling tiling at runtime; say so instead
             # of dropping the request, since the OOM advice below points here
-            if vae_tiling:
+            if server_args.pipeline_config.vae_tiling:
                 try:
                     self.vae.enable_tiling()
                 except AttributeError:
@@ -269,7 +268,7 @@ class DecodingStage(PipelineStage):
                         # are idle but may still hold VRAM; freeing them is the
                         # lever here. --vae-cpu-offload is not: it moves VAE
                         # weights, not the activations that overflow.
-                        if not vae_tiling:
+                        if not server_args.pipeline_config.vae_tiling:
                             logger.warning(
                                 "OOM detected during VAE decoding. Enable "
                                 "--vae-tiling to bound the decode working set, "

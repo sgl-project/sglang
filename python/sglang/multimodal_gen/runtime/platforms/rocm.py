@@ -57,7 +57,9 @@ class RocmPlatform(Platform):
     @classmethod
     @lru_cache(maxsize=1)
     def is_gfx1151(cls) -> bool:
-        return cls.get_gcn_arch_name().startswith("gfx1151")
+        return torch.cuda.is_available() and cls.get_gcn_arch_name().startswith(
+            "gfx1151"
+        )
 
     @classmethod
     @lru_cache(maxsize=1)
