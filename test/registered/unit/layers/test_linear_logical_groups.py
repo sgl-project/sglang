@@ -14,6 +14,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.parallel_groups import rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -54,8 +55,8 @@ class TestLinearLogicalGroups(CustomTestCase):
                     x = self.x if axis == 0 else self.x[:, : 8 // size]
                     torch.testing.assert_close(layer(x)[0], F.linear(x, shard))
                     self.assertIs(layer.tp_group, owner)
-                    self.assertNotIn("tp_rank", layer.__dict__)
-                    self.assertNotIn("tp_size", layer.__dict__)
+                    self.assertFalse(hasattr(layer, "tp_rank"))
+                    self.assertFalse(hasattr(layer, "tp_size"))
         qkv = QKVParallelLinear(
             8,
             2,
@@ -65,8 +66,8 @@ class TestLinearLogicalGroups(CustomTestCase):
             parallel_group="tp",
             kv_parallel_group=ReplicatedParallelGroup("tp", 2),
         )
-        self.assertEqual((qkv.tp_rank, qkv.tp_size), (3, 4))
-        self.assertEqual((qkv.kv_tp_rank, qkv.kv_tp_size), (1, 2))
+        self.assertEqual(rank_size(qkv), (3, 4))
+        self.assertEqual(rank_size(qkv, kv=True), (1, 2))
 
 
 if __name__ == "__main__":

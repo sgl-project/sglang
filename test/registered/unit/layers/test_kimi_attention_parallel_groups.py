@@ -14,7 +14,7 @@ from sglang.srt.models.kimi_k3 import KimiK3DeltaAttention, KimiK3MLAAttention
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.parallel_groups import parallel_scope, publish
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -95,7 +95,7 @@ def values(rows, columns, layer, offset=0):
 
 
 def load_projection(layer):
-    rank, size = layer.tp_rank, layer.tp_size
+    rank, size = rank_size(layer)[0], rank_size(layer)[1]
     row = isinstance(layer, RowParallelLinear)
     with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
         if isinstance(layer, QKVParallelLinear):
@@ -170,7 +170,7 @@ class TestKimiAttentionParallelGroups(CustomTestCase):
                                     shard = load_projection(layer)
                                     torch.testing.assert_close(layer.weight, shard)
                                     self.assertEqual(
-                                        (layer.tp_rank, layer.tp_size),
+                                        rank_size(layer),
                                         (rank % (4 // dp), 4 // dp),
                                     )
                                     if name == "qkv_conv1d":

@@ -22,7 +22,6 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
@@ -149,7 +148,9 @@ class BlockInt8LinearMethod(LinearMethodBase):
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        tp_size = get_parallel().tp_size
+        tp_group = getattr(layer, "tp_group", None)
+
+        tp_size = tp_group.world_size if tp_group is not None else 1
 
         block_n, block_k = (
             self.quant_config.weight_block_size[0],
@@ -271,7 +272,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
 
         if self.quant_config.is_checkpoint_int8_serialized:
             params_dtype = torch.int8
-        tp_size = get_parallel().tp_size
+        tp_size = layer.moe_tp_size
 
         block_n, block_k = (
             self.quant_config.weight_block_size[0],

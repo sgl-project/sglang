@@ -14,7 +14,7 @@ from sglang.srt.models.inkling_common.moe import _build_inkling_shared_experts
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.parallel_groups import parallel_scope, publish
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -51,7 +51,7 @@ def build_attention(kv_heads, *, width=32, head_dim=8, quant_config=None, bias=F
 
 def load_projection(layer):
     weights, biases = [], []
-    r, s = layer.tp_rank, layer.tp_size
+    r, s = rank_size(layer)[0], rank_size(layer)[1]
     row = isinstance(layer, linear.RowParallelLinear)
     with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
         if row:
@@ -177,7 +177,7 @@ class TestCustomProjectionParallelGroups(CustomTestCase):
                 )
                 for kv_heads in (1, 4):
                     module = build_attention(kv_heads, bias=True)
-                    self.assertEqual(module.qkvr.inkling_tp_size, 4 // dp)
+                    self.assertEqual(rank_size(module.qkvr)[1], 4 // dp)
                     self.assertEqual(module.qkvr.inkling_num_kv_heads, kv_heads)
                     for name in ("qkvr", "wo_ud"):
                         layer = getattr(module, name)
@@ -185,7 +185,7 @@ class TestCustomProjectionParallelGroups(CustomTestCase):
                         torch.testing.assert_close(layer.weight, expected)
                         x = values((2, expected.shape[1]))
                         used_bias = (
-                            bias if name == "qkvr" or layer.tp_rank == 0 else None
+                            bias if name == "qkvr" or rank_size(layer)[0] == 0 else None
                         )
                         with (
                             parallel_scope(tp_group=Mock(), attn_tp_group=Mock()),

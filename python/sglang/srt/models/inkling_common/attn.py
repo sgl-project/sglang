@@ -17,6 +17,7 @@ from sglang.kernels.ops.attention.score_mod import (
 )
 from sglang.kernels.ops.gemm.inkling_rel_proj import rel_proj_small_t
 from sglang.kernels.ops.memory.row_compact import row_compact_bf16
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -276,7 +277,6 @@ class InklingQKVRLinear(MergedColumnParallelLinear):
         self.inkling_head_dim = inkling_head_dim
         self.inkling_num_heads = inkling_num_heads
         self.inkling_d_rel = inkling_d_rel
-        self.inkling_tp_size = self.tp_size
 
 
 class InklingAttention(nn.Module):
@@ -1000,7 +1000,11 @@ class InklingAttention(nn.Module):
         )
         if buf is not None and type(wo_ud.quant_method) is UnquantizedLinearMethod:
             torch.matmul(attn_output, wo_ud.weight.t(), out=buf)
-            bias_ = None if (wo_ud.tp_rank > 0 or wo_ud.skip_bias_add) else wo_ud.bias
+            bias_ = (
+                None
+                if (get_group_rank_size(wo_ud.tp_group)[0] > 0 or wo_ud.skip_bias_add)
+                else wo_ud.bias
+            )
             if bias_ is not None:
                 buf.add_(bias_)
             if not reduce:

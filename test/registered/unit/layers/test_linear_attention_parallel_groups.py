@@ -14,7 +14,7 @@ from sglang.srt.runtime_context import SpawnRanks, get_parallel, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cpu
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.parallel_groups import parallel_scope, publish
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -103,7 +103,7 @@ def checkpoint_values(rows, columns, layer, offset=0):
 def load_projection(module, name, n_groups=8, checkpoint="fused"):
     """Return an independently sliced checkpoint reference, including copied groups."""
     layer = getattr(module, name)
-    rank, size = layer.tp_rank, layer.tp_size
+    rank, size = rank_size(layer)[0], rank_size(layer)[1]
     row = isinstance(layer, RowParallelLinear)
     mamba = hasattr(module, "intermediate_size")
     duplicate = mamba and n_groups == 1 and size > 1
@@ -231,9 +231,7 @@ class TestLinearAttentionParallelGroups(CustomTestCase):
                                 torch.testing.assert_close(layer.weight, shard)
                                 if bias is not None:
                                     torch.testing.assert_close(layer.bias, bias)
-                                self.assertEqual(
-                                    (layer.tp_rank, layer.tp_size), (rank % size, size)
-                                )
+                                self.assertEqual(rank_size(layer), (rank % size, size))
                                 row = isinstance(layer, RowParallelLinear)
                                 if name == "conv1d":
                                     inputs = checkpoint_values(
@@ -255,7 +253,9 @@ class TestLinearAttentionParallelGroups(CustomTestCase):
                                     continue
                                 inputs = checkpoint_values(2, shard.shape[1], layer, 7)
                                 used_bias = (
-                                    bias if not row or layer.tp_rank == 0 else None
+                                    bias
+                                    if not row or rank_size(layer)[0] == 0
+                                    else None
                                 )
                                 expected = F.linear(inputs, shard, used_bias)
                                 if row and layer.reduce_results:
@@ -321,7 +321,7 @@ class TestLinearAttentionParallelGroups(CustomTestCase):
             if model == "qwen35":
                 projections.append(module.create_ba_proj(32, 8, None, ""))
             for layer in projections:
-                self.assertEqual((layer.tp_rank, layer.tp_size), (3, 4))
+                self.assertEqual(rank_size(layer), (3, 4))
 
 
 if __name__ == "__main__":

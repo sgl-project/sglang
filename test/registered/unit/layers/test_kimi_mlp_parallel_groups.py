@@ -14,7 +14,7 @@ from sglang.srt.models import kimi_k3
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.parallel_groups import parallel_scope, publish
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -86,7 +86,7 @@ def load_projection(layer):
         % 29
         - 14
     ).reshape(layer.output_size, layer.input_size).to(layer.weight.dtype) / 128
-    rank, size = layer.tp_rank, layer.tp_size
+    rank, size = rank_size(layer)[0], rank_size(layer)[1]
     with parallel_scope(
         tp_rank=0, attn_tp_rank=0, attn_dp_rank=0, shared_experts_tp_group=None
     ):
@@ -143,9 +143,7 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                                 self.assertEqual(module._dense_attn_tp, auto_attn)
                                 for name in ("gate_up_proj", "down_proj"):
                                     layer = getattr(module, name)
-                                    self.assertEqual(
-                                        (layer.tp_rank, layer.tp_size), (r, s)
-                                    )
+                                    self.assertEqual(rank_size(layer), (r, s))
                                     expected, _ = load_projection(layer)
                                     torch.testing.assert_close(layer.weight, expected)
                                     x = (
@@ -226,7 +224,7 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                     for name in ("gate_up_proj", "down_proj"):
                         layer = getattr(module, name)
                         self.assertEqual(
-                            (layer.tp_rank, layer.tp_size),
+                            rank_size(layer),
                             (rank % expected_size, expected_size),
                         )
                         expected, _ = load_projection(layer)

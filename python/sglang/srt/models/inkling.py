@@ -15,6 +15,7 @@ from sglang.srt.configs.inkling import (
     InklingModelConfig,
     InklingVisionConfig,
 )
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -1460,7 +1461,7 @@ class InklingForConditionalGeneration(nn.Module):
                     qkvr = getattr(attention.qkvr, "base_layer", attention.qkvr)
                     num_kv_heads = qkvr.inkling_num_kv_heads
                     head_dim = qkvr.inkling_head_dim
-                    attn_tp_size = qkvr.inkling_tp_size
+                    attn_tp_size = get_group_rank_size(qkvr.tp_group)[1]
                     if (
                         attn_tp_size > num_kv_heads
                         and loaded_weight.shape[0] == num_kv_heads * head_dim
@@ -1474,7 +1475,9 @@ class InklingForConditionalGeneration(nn.Module):
                                 .reshape(attn_tp_size * head_dim, -1)
                             )
                         else:
-                            kv_head_idx = qkvr.tp_rank // replicas
+                            kv_head_idx = (
+                                get_group_rank_size(qkvr.tp_group)[0] // replicas
+                            )
                             loaded_weight = loaded_weight.narrow(
                                 0, kv_head_idx * head_dim, head_dim
                             )
@@ -1513,7 +1516,7 @@ class InklingForConditionalGeneration(nn.Module):
                         shard_size = param.data.shape[0]
                         projection = modules_dict[sgl_name.rsplit(".", 1)[0]]
                         projection = getattr(projection, "base_layer", projection)
-                        start = projection.tp_rank * shard_size
+                        start = get_group_rank_size(projection.tp_group)[0] * shard_size
                         loaded_weight = loaded_weight.narrow(0, start, shard_size)
                     if lora_compatible_layout_enabled():
                         # Local interleaved rows -> [gate||up] so contiguous swiglu and
@@ -1953,7 +1956,7 @@ class InklingForConditionalGenerationMTP(nn.Module):
                         shard_size = param.data.shape[0]
                         projection = modules_dict[sgl_name.rsplit(".", 1)[0]]
                         projection = getattr(projection, "base_layer", projection)
-                        start = projection.tp_rank * shard_size
+                        start = get_group_rank_size(projection.tp_group)[0] * shard_size
                         loaded_weight = loaded_weight.narrow(0, start, shard_size)
                     default_weight_loader(param, loaded_weight)
                     loaded_params.add(sgl_name)

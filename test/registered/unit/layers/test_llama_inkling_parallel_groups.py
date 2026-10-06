@@ -12,7 +12,7 @@ from sglang.srt.models.llama import LlamaMLP
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.parallel_groups import parallel_scope, publish
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -60,11 +60,11 @@ def load_projection(layer):
     ).to(layer.weight.dtype) / 64
     layer.weight.weight_loader(layer.weight, weight)
     if row:
-        expected = weight.chunk(layer.tp_size, dim=1)[layer.tp_rank]
+        expected = weight.chunk(rank_size(layer)[1], dim=1)[rank_size(layer)[0]]
     else:
         expected = torch.cat(
             [
-                part.chunk(layer.tp_size)[layer.tp_rank]
+                part.chunk(rank_size(layer)[1])[rank_size(layer)[0]]
                 for part in weight.split(layer.output_sizes)
             ]
         )
@@ -166,8 +166,8 @@ class TestLlamaInklingParallelGroups(CustomTestCase):
                                     )
                                 else:
                                     comm.assert_not_called()
-                            self.assertEqual((up.tp_rank, up.tp_size), (rank, size))
-                            self.assertEqual((down.tp_rank, down.tp_size), (rank, size))
+                            self.assertEqual(rank_size(up), (rank, size))
+                            self.assertEqual(rank_size(down), (rank, size))
                             self.assertEqual(down.reduce_results, row_reduce)
                             self.assertEqual(down.use_dp_attention_reduce, dp_reduce)
 

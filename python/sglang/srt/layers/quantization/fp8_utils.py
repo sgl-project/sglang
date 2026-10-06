@@ -32,7 +32,6 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import (
     get_exec,
-    get_parallel,
     get_platform,
 )
 from sglang.srt.utils import (
@@ -2524,9 +2523,9 @@ def validate_fp8_block_shape(
 ) -> None:
     """Validate block quantization shapes for tensor parallelism."""
 
-    # Lazy: a ``getattr`` default would read the published bag even for a
-    # layer that carries its own tp_size.
-    tp_size = layer.tp_size if hasattr(layer, "tp_size") else get_parallel().tp_size
+    tp_group = getattr(layer, "tp_group", None)
+
+    tp_size = tp_group.world_size if tp_group is not None else 1
     block_n, block_k = block_size[0], block_size[1]
 
     # Required by row parallel

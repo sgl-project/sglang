@@ -13,7 +13,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.parallel_groups import parallel_scope, publish
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -93,7 +93,7 @@ def values(rows, columns, layer, offset=0):
 
 
 def load_projection(layer):
-    rank, size = getattr(layer, "tp_rank", 0), getattr(layer, "tp_size", 1)
+    rank, size = rank_size(layer)[0], rank_size(layer)[1]
     with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
         if isinstance(layer, linear.MergedColumnParallelRepeatedLinear):
             shards = []
@@ -175,7 +175,7 @@ class TestRepeatedBatchedParallelGroups(CustomTestCase):
                 )
                 expected = load_projection(layer)
                 torch.testing.assert_close(layer.weight, expected)
-                self.assertEqual((layer.tp_rank, layer.tp_size), (rank, size))
+                self.assertEqual(rank_size(layer), (rank, size))
                 if cls is linear.MergedColumnParallelRepeatedLinear:
                     x = values(2, 8, layer, 3)
                     actual = layer(x)
@@ -236,8 +236,8 @@ class TestRepeatedBatchedParallelGroups(CustomTestCase):
                                     local_rank = rank % size
                                     self.assertEqual(
                                         (
-                                            getattr(layer, "tp_rank", 0),
-                                            getattr(layer, "tp_size", 1),
+                                            rank_size(layer)[0],
+                                            rank_size(layer)[1],
                                         ),
                                         (local_rank, size),
                                     )

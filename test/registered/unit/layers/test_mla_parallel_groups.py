@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.parallel_groups import parallel_scope, publish
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
@@ -203,7 +203,7 @@ class TestMLAParallelGroups(CustomTestCase):
                                     )
                                 else:
                                     allocator.assert_not_called()
-                            self.assertEqual((layer.tp_rank, layer.tp_size), (1, 2))
+                            self.assertEqual(rank_size(layer), (1, 2))
                             if is_row:
                                 self.assertFalse(layer.use_dp_attention_reduce)
                                 self.assertEqual(

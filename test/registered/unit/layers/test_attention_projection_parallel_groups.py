@@ -13,7 +13,7 @@ from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.runtime_context import SpawnRanks, get_parallel, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.parallel_groups import parallel_scope, publish
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
@@ -223,7 +223,7 @@ def values(rows, columns, layer, offset=0):
 
 def load_projection(layer):
     """Load at rank zero and return the checkpoint shard owned at construction."""
-    rank, size = layer.tp_rank, layer.tp_size
+    rank, size = rank_size(layer)[0], rank_size(layer)[1]
     row = isinstance(layer, RowParallelLinear)
     bias_shard = None
     with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
@@ -304,11 +304,11 @@ class TestAttentionProjectionParallelGroups(CustomTestCase):
                             )
                             if model == "mtp" and dp_size == 1:
                                 size = 4
-                            self.assertEqual(
-                                (layer.tp_rank, layer.tp_size), (rank % size, size)
-                            )
+                            self.assertEqual(rank_size(layer), (rank % size, size))
                             inputs = values(2, shard.shape[1], layer, 7)
-                            used_bias = bias if not row or layer.tp_rank == 0 else None
+                            used_bias = (
+                                bias if not row or rank_size(layer)[0] == 0 else None
+                            )
                             expected = F.linear(inputs, shard, used_bias)
                             if row and layer.reduce_results:
                                 expected *= 4

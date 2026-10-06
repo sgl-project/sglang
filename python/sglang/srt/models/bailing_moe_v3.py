@@ -330,13 +330,12 @@ class BailingMLP(nn.Module):
             parallel_group=parallel_group,
         )
 
-        self.tp_size = self.gate_up_proj.tp_size
+        group = self.gate_up_proj.tp_group
+        tp_size = group.world_size if group is not None else 1
 
         if self.padded_intermediate_size > self.intermediate_size:
-            self.padded_size_per_partition = (
-                self.padded_intermediate_size // self.tp_size
-            )
-            self.effective_size_per_partition = self.intermediate_size // self.tp_size
+            self.padded_size_per_partition = self.padded_intermediate_size // tp_size
+            self.effective_size_per_partition = self.intermediate_size // tp_size
             self.pad_size_per_partition = (
                 self.padded_size_per_partition - self.effective_size_per_partition
             )

@@ -26,7 +26,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.parallel_groups import parallel_scope, publish
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -174,7 +174,7 @@ class TestLinearParallelGroups(CustomTestCase):
                         row.weight.weight_loader(row.weight, self.weight)
                         if bias:
                             row.bias.weight_loader(row.bias, torch.arange(8).float())
-                    self.assertEqual((row.tp_rank, row.tp_size), (1, 2))
+                    self.assertEqual(rank_size(row), (1, 2))
                     self.assertEqual(attention.q_size, row.input_size_per_partition)
                     self.assertFalse(row.reduce_results)
                     # The boundary reduces this partial result. Its allocation
@@ -231,7 +231,7 @@ class TestLinearParallelGroups(CustomTestCase):
                 row = attention.o_proj
                 with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
                     row.weight.weight_loader(row.weight, self.weight)
-                self.assertEqual((row.tp_rank, row.tp_size), (1, 2))
+                self.assertEqual(rank_size(row), (1, 2))
                 self.assertFalse(row.reduce_results)
                 self.assertEqual(row.use_dp_attention_reduce, use_attention_allocation)
                 with (
@@ -512,9 +512,7 @@ class TestLinearParallelGroups(CustomTestCase):
                                         allocator.assert_called_once_with(
                                             tp, disabled=not symmetric
                                         )
-                                    self.assertEqual(
-                                        (layer.tp_rank, layer.tp_size), (rank, size)
-                                    )
+                                    self.assertEqual(rank_size(layer), (rank, size))
 
     def test_replicated_model_mlps_keep_weights_and_tp_output_allocation(self):
         from sglang.srt.models.exaone_moe import ExaoneMoEMLP
@@ -593,8 +591,8 @@ class TestLinearParallelGroups(CustomTestCase):
                         tp.all_reduce.assert_called_once()
                     else:
                         tp.all_reduce.assert_not_called()
-                    self.assertEqual((up.tp_rank, up.tp_size), (rank, size))
-                    self.assertEqual((down.tp_rank, down.tp_size), (rank, size))
+                    self.assertEqual(rank_size(up), (rank, size))
+                    self.assertEqual(rank_size(down), (rank, size))
 
     def test_step_shared_expert_constructs_a_replicated_mlp(self):
         from sglang.srt.models import step3p5
@@ -624,8 +622,8 @@ class TestLinearParallelGroups(CustomTestCase):
             patch.object(step3p5, "append_stages", return_value=(Mock(), Mock())),
         ):
             layer = step3p5.Step3p5DecoderLayer(config)
-        self.assertEqual(layer.share_expert.gate_up_proj.tp_size, 1)
-        self.assertEqual(layer.share_expert.down_proj.tp_size, 1)
+        self.assertEqual(rank_size(layer.share_expert.gate_up_proj)[1], 1)
+        self.assertEqual(rank_size(layer.share_expert.down_proj)[1], 1)
         self.assertFalse(layer.share_expert.down_proj.reduce_results)
 
     def test_replicated_layers_need_no_group_handle(self):
@@ -657,9 +655,9 @@ class TestLinearParallelGroups(CustomTestCase):
             ),
         )
         for build in constructors:
-            self.assertEqual((build().tp_rank, build().tp_size), (3, 4))
+            self.assertEqual(rank_size(build()), (3, 4))
             replicated = build(parallel_group="replicated")
-            self.assertEqual((replicated.tp_rank, replicated.tp_size), (0, 1))
+            self.assertEqual(rank_size(replicated), (0, 1))
             for kwargs in (dict(tp_rank=0), dict(tp_size=1)):
                 with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
                     build(**kwargs)
@@ -671,7 +669,7 @@ class TestLinearParallelGroups(CustomTestCase):
             layer = RowParallelLinear(
                 8, 8, parallel_group="attn_tp", use_dp_attention_reduce=old_reduce
             )
-            self.assertEqual((layer.tp_rank, layer.tp_size), (1, 2))
+            self.assertEqual(rank_size(layer), (1, 2))
             self.assertEqual(layer.use_dp_attention_reduce, old_reduce)
         layer = RowParallelLinear(
             8, 8, parallel_group="attn_tp", use_dp_attention_reduce=True
@@ -686,17 +684,64 @@ class TestLinearParallelGroups(CustomTestCase):
         self.assertIs(layer.tp_group, group)
         self.assertIs(layer.kv_tp_group, group)
         for key in ("tp_rank", "tp_size", "kv_tp_rank", "kv_tp_size"):
-            self.assertNotIn(key, layer.__dict__)
+            self.assertFalse(hasattr(layer, key))
         with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
             self.assertIs(layer.tp_group, group)
             self.assertIsNot(layer.tp_group, get_parallel().attn_tp_group)
-            self.assertEqual((layer.tp_rank, layer.tp_size), (1, 2))
+            self.assertEqual(rank_size(layer), (1, 2))
         with parallel_scope(attn_tp_group=None):
             offline = ColumnParallelLinear(8, 8, bias=False, parallel_group="attn_tp")
         with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
             offline.weight.weight_loader(offline.weight, self.weight)
         torch.testing.assert_close(offline.weight, self.weight[4:])
-        self.assertEqual((offline.tp_rank, offline.tp_size), (1, 2))
+        self.assertEqual(rank_size(offline), (1, 2))
+
+    def test_lora_slicing_reads_retained_query_and_kv_groups(self):
+        from sglang.srt.lora.layers import (
+            ColumnParallelLinearWithLoRA,
+            MergedColumnParallelLinearWithLoRA,
+            QKVParallelLinearWithLoRA,
+            RowParallelLinearWithLoRA,
+        )
+
+        column = ColumnParallelLinear(8, 8, bias=False)
+        merged = MergedColumnParallelLinear(8, [8, 4], bias=False)
+        qkv = QKVParallelLinear(
+            8,
+            2,
+            4,
+            2,
+            bias=False,
+            parallel_group="tp",
+            kv_parallel_group=ReplicatedParallelGroup("tp", 2),
+        )
+        row = RowParallelLinear(8, 8, bias=False, reduce_results=False)
+        for cls, layer, rows in (
+            (ColumnParallelLinearWithLoRA, column, [6, 7]),
+            (MergedColumnParallelLinearWithLoRA, merged, [6, 7, 11]),
+            (QKVParallelLinearWithLoRA, qkv, [6, 7, 10, 11, 14, 15]),
+        ):
+            with self.subTest(wrapper=cls.__name__):
+                wrapped = cls.__new__(cls)
+                torch.nn.Module.__init__(wrapped)
+                wrapped.base_layer = layer
+                if isinstance(layer, QKVParallelLinear):
+                    full_rows = (
+                        layer.total_num_heads + 2 * layer.total_num_kv_heads
+                    ) * layer.head_size
+                else:
+                    full_rows = layer.output_size
+                full = torch.arange(full_rows * 2, dtype=torch.float32).reshape(-1, 2)
+                with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
+                    actual = wrapped.slice_lora_b_weights(full)
+                torch.testing.assert_close(actual, full[rows], rtol=0, atol=0)
+        wrapped = RowParallelLinearWithLoRA.__new__(RowParallelLinearWithLoRA)
+        torch.nn.Module.__init__(wrapped)
+        wrapped.base_layer = row
+        full = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+        with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
+            actual = wrapped.slice_lora_a_weights(full)
+        torch.testing.assert_close(actual, full[:, 6:], rtol=0, atol=0)
 
     def test_quant_initialization_keeps_the_entry_scope_partition(self):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -705,7 +750,9 @@ class TestLinearParallelGroups(CustomTestCase):
 
         class ScopeChangingConfig:
             def get_quant_method(config, layer, prefix):
-                observed.append((layer.tp_rank, layer.tp_size, layer.parallel_group))
+                observed.append(
+                    (rank_size(layer)[0], rank_size(layer)[1], layer.parallel_group)
+                )
                 scope = parallel_scope(
                     tp_size=1,
                     tp_rank=0,
@@ -762,7 +809,7 @@ class TestLinearParallelGroups(CustomTestCase):
             self.assertEqual(get_parallel().tp_size, 4)
             for layer in layers:
                 with self.subTest(group=group, layer=type(layer).__name__):
-                    self.assertEqual((layer.tp_rank, layer.tp_size), (rank, size))
+                    self.assertEqual(rank_size(layer), (rank, size))
                     if isinstance(layer, RowParallelLinear):
                         expected = self.weight.chunk(size, dim=1)[rank]
                         layer.weight.weight_loader(layer.weight, self.weight)
@@ -777,7 +824,7 @@ class TestLinearParallelGroups(CustomTestCase):
                         expected = torch.cat(
                             (self.weight.chunk(size)[rank], pieces[1][1], pieces[2][1])
                         )
-                        self.assertEqual((layer.kv_tp_rank, layer.kv_tp_size), (0, 1))
+                        self.assertEqual(rank_size(layer, kv=True), (0, 1))
                     elif isinstance(
                         layer,
                         (

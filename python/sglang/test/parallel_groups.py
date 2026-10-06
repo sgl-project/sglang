@@ -49,3 +49,9 @@ def publish(*args, **kwargs):
 def parallel_scope(**values):
     with get_parallel().override(**_group_metadata(values)) as parallel:
         yield parallel
+
+
+def rank_size(layer, *, kv=False):
+    """Read the retained query or KV partition used by a native linear layer."""
+    group = layer.kv_tp_group if kv else layer.tp_group
+    return (0, 1) if group is None else (group.rank_in_group, group.world_size)

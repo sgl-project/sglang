@@ -16,7 +16,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.parallel_groups import parallel_scope, publish
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -74,7 +74,7 @@ def build_qwen(model, group=None, *, replicated=False, width=32, quant_config=No
 
 def load_projection(layer):
     """Load known full weights under rank zero, returning the expected owned shard."""
-    rank, size = getattr(layer, "tp_rank", 0), getattr(layer, "tp_size", 1)
+    rank, size = rank_size(layer)[0], rank_size(layer)[1]
     row = isinstance(layer, RowParallelLinear)
     dtype, device = layer.weight.dtype, layer.weight.device
 
@@ -192,6 +192,9 @@ class TestQwenVisionWrapperGroups(CustomTestCase):
                             if selected == "tp"
                             else (3 % (4 // dp), 4 // dp)
                         )
+                        self.assertIs(module.tp_group, layers[0].tp_group)
+                        self.assertFalse(hasattr(module, "tp_rank"))
+                        self.assertFalse(hasattr(module, "tp_size"))
                         for index, layer in enumerate(layers):
                             weight, bias = load_projection(layer)
                             row = isinstance(layer, RowParallelLinear)
@@ -240,8 +243,8 @@ class TestQwenVisionWrapperGroups(CustomTestCase):
                                 )
                             self.assertEqual(
                                 (
-                                    getattr(layer, "tp_rank", 0),
-                                    getattr(layer, "tp_size", 1),
+                                    rank_size(layer)[0],
+                                    rank_size(layer)[1],
                                 ),
                                 (expected_rank, expected_size),
                             )
