@@ -132,7 +132,7 @@ def validate_outer_entries(entries, files, frame_bytes):
                 or type(decoded_offset) is not int
                 or type(decoded) is not int
                 or offset != (end + 15) // 16 * 16
-                or not 0 < decoded <= 1 << 20
+                or not 0 < decoded <= frame_bytes
                 or not 0 < encoded <= 32 + decoded + decoded // 6
                 or decoded_offset % frame_bytes
                 or decoded != min(frame_bytes, entry["nbytes"] - decoded_offset)

@@ -68,6 +68,11 @@ class TestOuterZstd(unittest.TestCase):
                     validate_codec(
                         admitted | {"codec": codec, "frame_bytes": size}, frozen
                     )
+                    record = entry(bytes(50))
+                    record["nbytes"] = size + 16
+                    record["frames"][0]["decoded_bytes"] = size
+                    record["frames"][1]["decoded_offset"] = size
+                    validate_outer_entries([record], {"owner.bin": 50}, size)
                 other = "lz4-zstd" if codec == "snappy-zstd" else "snappy-zstd"
                 os.environ["GPU_DELTA_CODEC"] = other
                 with self.assertRaisesRegex(ValueError, "codec"):
