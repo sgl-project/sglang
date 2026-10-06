@@ -192,6 +192,7 @@ def store_k_slots_kernel(
     loc_ptr,
     stride_dst_slot,
     stride_src_row,
+    stride_loc,
     size_limit,
     ROW_DIM: tl.constexpr,  # head_num * head_dim
     BLOCK: tl.constexpr,
@@ -204,7 +205,7 @@ def store_k_slots_kernel(
     pid_n = tl.program_id(0)
     pid_b = tl.program_id(1)
 
-    loc = tl.load(loc_ptr + pid_n).to(tl.int64)
+    loc = tl.load(loc_ptr + pid_n * stride_loc).to(tl.int64)
     # Padded rows use slot 0, so a negative or too-large slot is stale. This is the
     # only always-on bound: callers check `loc` only under SGLANG_ENABLE_ASYNC_ASSERT.
     if (loc < 0) | (loc >= size_limit):
@@ -238,9 +239,8 @@ def store_k_slots(k_buffer: torch.Tensor, src: torch.Tensor, loc: torch.Tensor) 
     assert src.shape[0] == loc.numel(), (
         f"store_k_slots: src/loc batch mismatch: {src.shape[0]} vs {loc.numel()}"
     )
-    assert loc.ndim == 1 and loc.is_contiguous(), (
-        f"store_k_slots: loc must be 1-D contiguous, got "
-        f"shape={tuple(loc.shape)}, stride={loc.stride()}"
+    assert loc.ndim == 1, (
+        f"store_k_slots: loc must be 1-D, got shape={tuple(loc.shape)}"
     )
     assert loc.dtype in (torch.int32, torch.int64), (
         f"store_k_slots: loc must be int32 or int64, got {loc.dtype}"
@@ -260,6 +260,7 @@ def store_k_slots(k_buffer: torch.Tensor, src: torch.Tensor, loc: torch.Tensor) 
         loc,
         k_buffer.stride(0),
         src.stride(0),
+        loc.stride(0),
         k_buffer.shape[0],
         ROW_DIM=ROW_DIM,
         BLOCK=BLOCK,

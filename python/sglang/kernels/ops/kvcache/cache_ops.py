@@ -176,6 +176,7 @@ def reshape_and_cache_flash(
     size_limit=0,
     HAS_RESERVED_SKIP: tl.constexpr = False,
     HAS_SIZE_LIMIT: tl.constexpr = False,
+    slot_mapping_stride=1,
 ):
     """
     Triton kernel for reshaping per-token K/V tensors into paged KV cache layout.
@@ -221,6 +222,7 @@ def reshape_and_cache_flash(
             swa_slot_mapping lookup.
         HAS_RESERVED_SKIP: Enable the reserved_skip_index skip.
         HAS_SIZE_LIMIT: Enable the size_limit bound.
+        slot_mapping_stride: Element stride between token slot mappings.
     """
 
     # ----------------------------------
@@ -234,7 +236,7 @@ def reshape_and_cache_flash(
     # ----------------------------------
     # slot mapping
     # ----------------------------------
-    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+    slot_idx = tl.load(slot_mapping_ptr + token_idx * slot_mapping_stride)
 
     if HAS_SWA:
         slot_idx = tl.load(swa_slot_mapping_ptr + slot_idx)
@@ -379,6 +381,7 @@ def launch_reshape_and_cache_flash(
         size_limit=size_limit if size_limit is not None else 0,
         HAS_RESERVED_SKIP=(reserved_skip_index >= 0),
         HAS_SIZE_LIMIT=(size_limit is not None),
+        slot_mapping_stride=slot_mapping.stride(0),
     )
 
 

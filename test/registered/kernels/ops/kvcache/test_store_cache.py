@@ -383,6 +383,21 @@ def test_store_k_slots_accepts_token_strided_source() -> None:
     torch.testing.assert_close(k_buffer, expected, rtol=0.0, atol=0.0)
 
 
+def test_store_k_slots_accepts_strided_loc() -> None:
+    head_num, head_dim, batch_size = 4, 128, 64
+    k_buffer = torch.randn(
+        (SMALL_CACHE, head_num, head_dim), dtype=DTYPE, device=DEVICE
+    )
+    src = torch.randn((batch_size, head_num, head_dim), dtype=DTYPE, device=DEVICE)
+    loc = torch.randperm(SMALL_CACHE, device=DEVICE)[: 2 * batch_size : 2]
+    assert not loc.is_contiguous()
+    expected = _ref_scatter(k_buffer, src, loc)
+
+    store_k_slots(k_buffer, src, loc)
+
+    torch.testing.assert_close(k_buffer, expected, rtol=0.0, atol=0.0)
+
+
 def test_store_k_slots_rejects_non_dense_rows() -> None:
     head_num, head_dim = 4, 128
     k_buffer = torch.randn(
@@ -415,12 +430,10 @@ def test_store_k_slots_dtypes(dtype: torch.dtype) -> None:
     torch.testing.assert_close(k_buffer, expected, rtol=0.0, atol=0.0)
 
 
-@pytest.mark.parametrize("layout", ["two_dimensional", "noncontiguous", "float"])
+@pytest.mark.parametrize("layout", ["two_dimensional", "float"])
 def test_store_k_slots_rejects_unsupported_loc(layout: str) -> None:
     if layout == "two_dimensional":
         loc = torch.arange(8, device=DEVICE).view(2, 4)
-    elif layout == "noncontiguous":
-        loc = torch.arange(16, device=DEVICE)[::2]
     else:
         loc = torch.arange(8, device=DEVICE, dtype=torch.float32)
     src = torch.randn((8, 1, 64), dtype=DTYPE, device=DEVICE)
@@ -566,6 +579,10 @@ def test_can_store_kv_fused_cast_rejects_scales_that_divide() -> None:
     assert not _can_store(_PoolStub(), v_scale=0.5)
     # A tensor scale cannot be inspected without a sync, so it must divide.
     assert not _can_store(_PoolStub(), k_scale=torch.ones(1, device=DEVICE))
+
+
+def test_can_store_kv_fused_cast_rejects_e5m2() -> None:
+    assert not _can_store(_PoolStub(dtype=torch.float8_e5m2))
 
 
 @pytest.mark.parametrize(
@@ -732,6 +749,27 @@ def test_reshape_and_cache_flash_writes_slot_zero_by_default() -> None:
     launch_reshape_and_cache_flash(key, key, key_cache, value_cache, loc)
 
     torch.testing.assert_close(key_cache[[0, 5], 0], key, rtol=0.0, atol=0.0)
+
+
+def test_reshape_and_cache_flash_accepts_strided_slot_mapping() -> None:
+    key = torch.randn((3, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
+    key_cache = torch.zeros(
+        (SMALL_CACHE, 1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE
+    )
+    value_cache = torch.zeros_like(key_cache)
+    loc = torch.tensor(
+        [2, 101, 5, 102, SMALL_CACHE - 1, 103],
+        dtype=torch.int64,
+        device=DEVICE,
+    )[::2]
+    assert not loc.is_contiguous()
+    expected = torch.zeros_like(key_cache)
+    expected[loc, 0] = key
+
+    launch_reshape_and_cache_flash(key, key, key_cache, value_cache, loc)
+
+    torch.testing.assert_close(key_cache, expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(value_cache, expected, rtol=0.0, atol=0.0)
 
 
 def test_reshape_and_cache_flash_kernel_launches_with_original_arguments() -> None:

@@ -2848,6 +2848,9 @@ class MHATokenToKVPool(KVCache):
             return False
         if self.is_quantized_kv_cache or self.store_dtype != torch.uint8:
             return False
+        # Triton saturates E5M2 overflow; the fallback preserves infinity.
+        if self.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            return False
         if cache_k.dtype == self.dtype or cache_k.dtype != cache_v.dtype:
             return False
         if self.head_dim != self.v_head_dim:
