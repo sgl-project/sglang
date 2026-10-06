@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import json
 import math
 import string
+from io import BytesIO
 from typing import Any, Dict, Iterator, List, Optional, Tuple
+from urllib.parse import unquote, urlparse
 
 import orjson
+import pybase64
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
+from PIL import Image
 
 from sglang.srt.entrypoints.openai.serving_decisions import (
     EncodedQuestion,
@@ -38,7 +44,7 @@ from sglang.srt.entrypoints.systemone.protocol import (
     SystemOneUsage,
 )
 from sglang.srt.managers.io_struct import EmbeddingReqInput
-from sglang.srt.utils import ImageData
+from sglang.srt.utils import CLIENT_MEDIA_EXCEPTIONS, ImageData, get_image_bytes
 
 # Beyond A to Z, every option gets a two-letter label, in this fixed order.
 _PAIR_LABELS = [a + b for a in string.ascii_uppercase for b in string.ascii_uppercase]
@@ -82,7 +88,7 @@ class SystemOneServing(OpenAIServingDecisions):
                 f"model names the LoRA adapter {adapter!r}, which {route} "
                 "does not support"
             )
-        if request.images and not self.tokenizer_manager.model_config.is_multimodal:
+        if request.images and self.tokenizer_manager.mm_processor is None:
             return f"{route} images require a model served with multimodal input"
         if request.chat_template_kwargs:
             return (
@@ -113,28 +119,59 @@ class SystemOneServing(OpenAIServingDecisions):
     def _joint_schema_request(
         self, request: SystemOneRequest, views: List[QuestionView]
     ) -> EmbeddingReqInput:
-        """All questions in one prompt, which the joint schema head scores in one prefill."""
+        """All questions in one prompt, which the joint schema head scores in one prefill.
+
+        The handler encodes the prompt once it has read the image sizes."""
         for question_id, view in zip(request.questions, views):
             if view.kind == "score":
                 _check_legend(question_id, view)
-        tokenizer_manager = self.tokenizer_manager
-        input_ids, layout = encode_joint_schema(
-            tokenizer_manager.tokenizer,
-            request,
-            # The longest prompt the tokenizer manager accepts.
-            max_length=tokenizer_manager.context_len
-            - tokenizer_manager.num_reserved_tokens
-            - 1,
-        )
         return EmbeddingReqInput(
-            input_ids=input_ids,
             image_data=[
                 ImageData(url=image.url, detail=image.detail or "auto")
                 for image in request.images
             ]
             or None,
-            decision_layout=layout,
         )
+
+    async def _encode_joint_schema_prompt(
+        self, adapted_request: EmbeddingReqInput, request: SystemOneRequest
+    ) -> None:
+        tokenizer_manager = self.tokenizer_manager
+        # The longest prompt the tokenizer manager accepts.
+        max_length = (
+            tokenizer_manager.context_len - tokenizer_manager.num_reserved_tokens - 1
+        )
+        image_token_counts = []
+        if adapted_request.image_data:
+            # The scheduler refuses a multimodal prompt of max_req_input_len or more.
+            max_length = min(max_length, tokenizer_manager.max_req_input_len - 1)
+            adapted_request.image_data, image_token_counts = await self._read_images(
+                adapted_request.image_data
+            )
+        input_ids, layout = encode_joint_schema(
+            tokenizer_manager.tokenizer,
+            request,
+            max_length=max_length,
+            image_token_counts=image_token_counts,
+        )
+        adapted_request.input_ids = input_ids
+        adapted_request.decision_layout = layout
+
+    async def _read_images(
+        self, images: List[ImageData]
+    ) -> Tuple[List[ImageData], List[int]]:
+        """Each image read once, and the tokens it expands to at the size the
+        processor resizes it to."""
+        read = await asyncio.gather(
+            *(
+                asyncio.to_thread(_read_image, index, image)
+                for index, image in enumerate(images)
+            )
+        )
+        counts = self.tokenizer_manager.mm_processor.resolve_image_token_counts(
+            [header for _, header in read]
+        )
+        return [image for image, _ in read], counts
 
     async def _answer_joint_schema(
         self,
@@ -143,6 +180,7 @@ class SystemOneServing(OpenAIServingDecisions):
         views: List[QuestionView],
         raw_request: Request,
     ) -> ORJSONResponse:
+        await self._encode_joint_schema_prompt(adapted_request, request)
         ret = await self.tokenizer_manager.generate_request(
             adapted_request, raw_request
         ).__anext__()
@@ -458,3 +496,21 @@ def _score_confidence(q: List[float]) -> float:
     spread = math.fsum(p * abs(i - top) for i, p in enumerate(q))
     uniform_spread = math.fsum(abs(i - (n - 1) / 2) for i in range(n)) / n
     return max(0.0, 1 - spread / uniform_spread)
+
+
+def _read_image(index: int, image: ImageData) -> Tuple[ImageData, Image.Image]:
+    """The image to forward, and its header opened only as far as its size, read
+    once from the sources load_image reads."""
+    url = image.url
+    source = unquote(urlparse(url).path) if url.startswith("file://") else url
+    try:
+        data = get_image_bytes(source)
+        header = Image.open(BytesIO(data))
+    except CLIENT_MEDIA_EXCEPTIONS as e:
+        raise ValueError(f"image {index} could not be read: {e}") from e
+    if url.startswith(("http://", "https://", "file://", "/")):
+        # A source that can change between reads is forwarded as the bytes counted.
+        mime = Image.MIME.get(header.format, "application/octet-stream")
+        encoded = pybase64.b64encode(data).decode()
+        image = dataclasses.replace(image, url=f"data:{mime};base64,{encoded}")
+    return image, header

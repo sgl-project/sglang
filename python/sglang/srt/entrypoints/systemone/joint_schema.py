@@ -10,7 +10,7 @@ each piece is tokenized on its own.
 from __future__ import annotations
 
 import json
-from typing import Any, List, Tuple
+from typing import Any, List, Sequence, Tuple
 
 from sglang.srt.entrypoints.systemone.protocol import (
     SystemOneChoiceQuestion,
@@ -60,12 +60,16 @@ def joint_schema_options(question: SystemOneQuestion) -> List[Tuple[str, Any]]:
 
 
 def encode_joint_schema(
-    tokenizer: Any, request: SystemOneRequest, max_length: int
+    tokenizer: Any,
+    request: SystemOneRequest,
+    max_length: int,
+    image_token_counts: Sequence[int],
 ) -> Tuple[List[int], List[int]]:
     """The prompt ids and their decision layout.
 
-    The state is truncated so that the prompt, before its image placeholders
-    expand, has at most ``max_length`` tokens.
+    Each image's placeholder expands to its count in ``image_token_counts``, and
+    the state is truncated so that the expanded prompt has at most
+    ``max_length`` tokens, as encode_record budgets the expanded media.
     """
 
     def tokens(text: str) -> List[int]:
@@ -106,7 +110,9 @@ def encode_joint_schema(
     if request.images:
         prefix += tokens(_IMAGE * len(request.images) + "\n")
     suffix = tokens(_SUFFIX)
-    fixed_length = len(prefix) + len(schema) + len(suffix)
+    # Each image's single <|image_pad|> becomes that image's tokens.
+    expansion = sum(count - 1 for count in image_token_counts)
+    fixed_length = len(prefix) + expansion + len(schema) + len(suffix)
     if fixed_length > max_length:
         raise ValueError(
             f"the questions need {fixed_length} prompt tokens before the state, "
