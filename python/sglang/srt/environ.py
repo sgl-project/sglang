@@ -579,6 +579,8 @@ class Envs:
     # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
     # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
+    # Use ASM prefill for gfx950 HD128 FP8 KV, including cached prefixes.
+    SGLANG_AITER_ASM_PREFILL_HD128 = EnvBool(True)
     # Attention (aiter, ROCm): hand chunked prefill the page-level KV view so
     # gfx950 fp8 hd256 takes aiter's paged-varlen asm kernel. That kernel is
     # compiled for 4D LINEAR [N, 64, H, D], so it serves --page-size 64 and
@@ -663,6 +665,8 @@ class Envs:
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
+    # Opt-in: keep receiving prefill requests while forward results are pending.
+    SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
 
     # ===================================================================
     # Radix and sparse KV caches
@@ -687,7 +691,11 @@ class Envs:
     # - Source builds with a missing or unusable Rust toolchain.
     # This also applies when Rust is explicitly selected.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("rust")
-    SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
+    # Once decode passes the sliding window, drop the SWA part of the prefill's
+    # tree lock; its SWA KV becomes evictable rather than freed.
+    SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW"
+    )
 
     # ===================================================================
     # PD disaggregation runtime
@@ -867,6 +875,10 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # Fuse MiniMax-M3 main/index QK norm + RoPE with main KV and index-K cache
+    # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
+    # Enabled by default for supported configurations; set to 0 to disable.
+    SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
@@ -887,6 +899,10 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # aiter opus moe_sorting dispatch policy (0 auto, 1 oneshot, 2 multi-phase). Auto picks
+    # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
+    # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.
+    SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY = EnvInt(2)
     # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
     # permuted in place at load so gate/up land in adjacent columns of the same
     # output tile, which removes intermediate_cache1 and the standalone
@@ -1022,6 +1038,9 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
+    # Disable to save the additional weight memory or allow online updates.
+    SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
@@ -1060,7 +1079,7 @@ class Envs:
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
-    # means each call site keeps its own default.
+    # sizes it from the per-rank prefill chunk, with a 4096 floor.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
     # FlashInfer MegaMOE (generic moe_ep.MoEEpMegaLayer backend). Sizes the
     # per-rank symmetric workspace; must be >= the largest padded per-rank batch
@@ -1262,6 +1281,7 @@ class Envs:
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
+    SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND = EnvBool(None)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     # A5 DSV4 FP4 + DeepEP low-latency dispatch wire format. This is read only
     # by the model-specific dispatcher configuration; all other paths retain
@@ -1590,6 +1610,12 @@ class Envs:
     # DSpark draft block on the HIP radix backend: build the attention metadata inside the
     # draft CUDA graph from the raw inputs instead of eagerly before every replay.
     SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)
+    # gfx950 MXFP8 dense routes (aiter group32 / native): the producer emits fp8 + ue8m0 for its
+    # consumer instead of bf16 plus a separate quant launch -- the shared expert's SwiGLU for
+    # down_proj, the wo_a GEMM for wo_b, and the FFN norm for the shared expert's gate_up.
+    SGLANG_HIP_SHARED_ACT_MXFP8 = EnvBool(_default_hip)
+    SGLANG_HIP_WO_A_MXFP8 = EnvBool(_default_hip)
+    SGLANG_HIP_FFN_NORM_MXFP8 = EnvBool(_default_hip)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
@@ -1750,6 +1776,9 @@ class Envs:
     # 2 is the accuracy-safe default: higher values reuse staler selections
     # in the skip layers.
     SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
+    # Opt-in gfx950 TP4 decode indexer context partitioning. Keeps the index
+    # cache replicated; gathers Q and exchanges local top-k candidates.
+    SGLANG_MINIMAX_M3_INDEXER_CP = EnvBool(False)
     # gfx95: lightning-indexer K cache in fp8_e4m3fn (bf16 q x fp8 k in the scorers);
     # main attention K/V keep kv_cache_dtype.
     SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE = EnvBool(True)

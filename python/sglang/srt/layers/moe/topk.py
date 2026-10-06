@@ -61,7 +61,7 @@ try:
     ):
         if simulated_ep != 1:
             raise NotImplementedError(
-                "simulated_ep routing is not supported with triton_kernels 3.7.1"
+                "simulated_ep routing is not supported with triton_kernels"
             )
 
         if sm_first:
@@ -1128,7 +1128,7 @@ def fused_topk(
         elif packed_out is not None:
             # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): one JIT kernel
             # writes topk_weights/topk_ids AND the FlashInfer packed topk in one launch.
-            from sglang.kernels.ops.moe.trtllm_lora_temp.topk_softmax_pack import (
+            from sglang.kernels.ops.lora.moe.trtllm_lora_temp.topk_softmax_pack import (
                 topk_softmax_pack,
             )
 
@@ -1508,8 +1508,12 @@ def biased_topk_jit_kernel_impl(
     packed_out: Optional[torch.Tensor] = None,
     sqrtsoftplus_log1p: bool = False,
     router_logits_partials: Optional[torch.Tensor] = None,
+    num_shared_append: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """num_shared_append is only workable when router_logits_partials is not None
+    and it is only used by rocm_router_gate"""
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    assert num_shared_append == 0 or router_logits_partials is not None
 
     if _use_aiter and scoring_func == "sqrtsoftplus" and num_fused_shared_experts == 0:
         assert packed_out is None, "aiter topk_gating cannot emit packed ids"
@@ -1522,6 +1526,7 @@ def biased_topk_jit_kernel_impl(
                 renormalize,
                 routed_scaling_factor,
                 partials=router_logits_partials,
+                num_shared=num_shared_append,
             )
 
         from aiter import topk_gating
@@ -2028,7 +2033,7 @@ def biased_grouped_topk_gpu(
                     and lora_envs.SGLANG_OPT_KIMI_GATE_BF16_INPUT.get()
                 )
             if _use_jit_bf16_gate:
-                from sglang.kernels.ops.moe.trtllm_lora_temp.kimi_k2_moe_fused_gate import (
+                from sglang.kernels.ops.lora.moe.trtllm_lora_temp.kimi_k2_moe_fused_gate import (
                     kimi_k2_moe_fused_gate as _kimi_k2_moe_fused_gate,
                 )
 
@@ -2341,10 +2346,26 @@ def _post_process_topk_ids(
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
-    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+    # The router already wrote the aiter shared columns (see _aiter_append below).
+    _gate_appended = (
+        num_fused_shared_experts > 0
+        and _use_aiter
+        and not use_per_rank_shared_slots
+        and topk_ids.shape[-1] == topk_config.top_k
+    )
+    routed_topk_ids = (
+        topk_ids[:, :-num_fused_shared_experts] if _gate_appended else topk_ids
+    )
+    capture_routed_experts_if_allowed(topk_config, layer_id, routed_topk_ids)
     recorder_topk_ids = None
+    _aiter_append = (
+        num_fused_shared_experts > 0
+        and _use_aiter
+        and topk_ids.shape[-1] < topk_config.top_k
+    )
     _fold_pad_into_append = False
     recorder_was_fused = False
+    _fold_pad_weights_into_append = False
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
@@ -2396,21 +2417,20 @@ def _post_process_topk_ids(
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
         #
-        # Fold: when the fused append+remap kernel runs below (aiter per-rank
-        # shared-slot path, EPLB off) it folds this padded fill itself
-        # (pad_fill_id=0 -> remap(0)=0, bit-identical), so skip the separate
-        # _fill_padded_rows launch here.
+        # Let append kernels materialize padded ids when remapping is disabled.
+        eplb_remap_enabled = _eplb_remap_enabled()
         _fold_pad_into_append = (
-            num_fused_shared_experts > 0
-            and _use_aiter
-            and use_per_rank_shared_slots
-            and not _eplb_remap_enabled()
+            _aiter_append
+            and not eplb_remap_enabled
+            and (use_per_rank_shared_slots or not _skip_hip_pad_mask)
+        )
+        _fold_pad_weights_into_append = (
+            _fold_pad_into_append and not use_per_rank_shared_slots
         )
         if not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         if (
-            _is_hip
-            and envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
+            envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
             and envs.SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD.get()
             and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
             and layer_id is not None
@@ -2435,7 +2455,7 @@ def _post_process_topk_ids(
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
-        if not recorder_was_fused and _eplb_remap_enabled():
+        if not recorder_was_fused and eplb_remap_enabled:
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info
             )
@@ -2445,13 +2465,9 @@ def _post_process_topk_ids(
         # second zeroing here would be redundant (zeroing is idempotent).
 
     if recorder_topk_ids is None and not recorder_was_fused:
-        recorder_topk_ids = topk_ids
-
-    _aiter_append = num_fused_shared_experts > 0 and _use_aiter
-    if _aiter_append and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get():
-        # That router emits the shared slots itself; appending again would write
-        # the shared id twice and evict a real routed expert.
-        _aiter_append = topk_ids.shape[-1] < topk_config.top_k
+        recorder_topk_ids = (
+            topk_ids[:, :-num_fused_shared_experts] if _gate_appended else topk_ids
+        )
 
     if _aiter_append and use_per_rank_shared_slots:
         # Fused path: append shared experts AND apply the per-rank shared-slot
@@ -2495,7 +2511,7 @@ def _post_process_topk_ids(
             ),
         )
     elif _aiter_append:
-        M, N = router_logits.shape
+        N = router_logits.shape[1]
         scale_factor = (
             1.0
             if fused_shared_experts_scaling_factor is None
@@ -2513,6 +2529,9 @@ def _post_process_topk_ids(
             num_fused_shared_experts,
             scale_factor,
             N,  # base id for shared experts
+            num_token_non_padded=(
+                num_token_non_padded if _fold_pad_weights_into_append else None
+            ),
         )
 
     elif use_per_rank_shared_slots:
@@ -2539,7 +2558,7 @@ def _post_process_topk_ids(
             fused_shared_experts_scaling_factor
         )
 
-    if _is_hip and not _skip_hip_pad_mask:
+    if _is_hip and not _skip_hip_pad_mask and not _fold_pad_weights_into_append:
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
@@ -2603,6 +2622,7 @@ def select_experts(
         and (
             num_fused_shared_experts == 0
             or has_per_rank_fused_shared_slots(num_fused_shared_experts)
+            or not _eplb_remap_enabled()
         )
     ):
         # only the aiter sqrtsoftplus gate takes the partials; every other route reads router_logits
@@ -2735,6 +2755,13 @@ def select_experts(
                 _packed_kwargs["sqrtsoftplus_log1p"] = True
             if router_logits_partials is not None:
                 _packed_kwargs["router_logits_partials"] = router_logits_partials
+                if (
+                    _use_aiter
+                    and num_fused_shared_experts > 0
+                    and not has_per_rank_fused_shared_slots(num_fused_shared_experts)
+                ):
+                    # the ROCm decode gate writes the aiter shared columns itself
+                    _packed_kwargs["num_shared_append"] = num_fused_shared_experts
             topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,

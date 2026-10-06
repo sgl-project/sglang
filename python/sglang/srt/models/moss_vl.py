@@ -21,9 +21,10 @@ from sglang.srt.layers.attention.vision import (
 )
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
+    layer_stack,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -849,6 +850,7 @@ class MossVLTextMLP(nn.Module):
         hidden_act: str = "silu",
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -863,6 +865,7 @@ class MossVLTextMLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
@@ -996,6 +999,7 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            reduce_results=False,
         )
         norm_kwargs = (
             dict(
@@ -1014,14 +1018,12 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(sparse=False, next_layer_sparse=False),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn() if layer_id != 0 else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -1042,9 +1044,8 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
         # MLP
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlp(hidden_states)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
         return hidden_states
 
 
@@ -1068,25 +1069,26 @@ class MossVLTextModel(nn.Module):
         self.cross_attention_layers = config.cross_attention_layers
 
         layers = []
-        for layer_id in range(config.num_hidden_layers):
-            if layer_id in self.cross_attention_layers:
-                layers.append(
-                    MossVLCrossAttentionDecoderLayer(
-                        config,
-                        layer_id,
-                        quant_config=quant_config,
-                        prefix=add_prefix(f"layers.{layer_id}", prefix),
+        with layer_stack():
+            for layer_id in range(config.num_hidden_layers):
+                if layer_id in self.cross_attention_layers:
+                    layers.append(
+                        MossVLCrossAttentionDecoderLayer(
+                            config,
+                            layer_id,
+                            quant_config=quant_config,
+                            prefix=add_prefix(f"layers.{layer_id}", prefix),
+                        )
                     )
-                )
-            else:
-                layers.append(
-                    MossVLSelfAttentionDecoderLayer(
-                        config,
-                        layer_id,
-                        quant_config=quant_config,
-                        prefix=add_prefix(f"layers.{layer_id}", prefix),
+                else:
+                    layers.append(
+                        MossVLSelfAttentionDecoderLayer(
+                            config,
+                            layer_id,
+                            quant_config=quant_config,
+                            prefix=add_prefix(f"layers.{layer_id}", prefix),
+                        )
                     )
-                )
         self.layers = nn.ModuleList(layers)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
