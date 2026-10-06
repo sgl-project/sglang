@@ -635,7 +635,11 @@ def update_pooled_paged_mqa_metadata(
         return
 
     if forward_mode.is_target_verify():
-        metadata.pooled_real_page_table.copy_(metadata.real_page_table[:, ::kpool])
+        torch.floor_divide(
+            metadata.real_page_table[:, ::kpool],
+            kpool,
+            out=metadata.pooled_real_page_table,
+        )
         return
 
     if (
