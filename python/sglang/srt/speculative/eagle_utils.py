@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from enum import IntEnum
+from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -896,6 +897,8 @@ def eagle_sample(
         # branch not taken, and HIP only reaches here with rejection sampling on.
         if use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton
+            if get_spec().speculative_use_block_verification:
+                sampling_fn = partial(sampling_fn, block_verification=True)
         else:
             if _is_cuda:
                 from sglang.kernels.ops.speculative.sampling import (
