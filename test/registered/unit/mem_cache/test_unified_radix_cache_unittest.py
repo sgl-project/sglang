@@ -3599,8 +3599,6 @@ class UnifiedRadixCacheSuite:
     def _require_host_only_l3_fixture(self):
         if self.cfg.components != (ComponentType.FULL,) or self.cfg.is_eagle:
             self.skipTest("host-only FULL fixture")
-        if _selected_tree_core_test_backend() == "rust":
-            self.skipTest("exclusive host tiering requires the Python tree core")
 
     def _host_only_l3_fixture(self, *, exclusive=True):
         """Real CPU tree/slot allocator; mock only the controller's IO boundary."""
@@ -3610,6 +3608,9 @@ class UnifiedRadixCacheSuite:
             token_to_kv_pool_allocator=None,
             page_size=self.cfg.page_size,
             tree_components=(ComponentType.FULL,),
+            # Exclusive tiering is Python-core only; the env default resolves to rust
+            # wherever the toolchain is present, so pin it instead of skipping there.
+            tree_core_backend="python",
         )
         cache = UnifiedRadixCache(params)
         pool = LogicalHostPool(8 * self.cfg.page_size, self.cfg.page_size)
