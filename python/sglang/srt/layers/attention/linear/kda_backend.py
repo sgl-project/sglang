@@ -55,6 +55,7 @@ class KDAKernelDispatcher:
         verify_backend: LinearAttnKernelBackend,
     ):
         self.verify_backend = verify_backend
+        self.prefill_backend = prefill_backend
         triton_kernel = TritonKDAKernel()
         self.triton_kernel = triton_kernel
         helion_kernel = None
@@ -151,7 +152,7 @@ class KDAKernelDispatcher:
                 FlashInferKDAPrefillKernel,
             )
 
-            self.extend_kernel = FlashInferKDAPrefillKernel(triton_kernel)
+            self.extend_kernel = FlashInferKDAPrefillKernel()
         elif prefill_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("KDA CuTe DSL backend requires CUDA")
@@ -339,10 +340,19 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
-    def effective_extend_kernel(self, lower_bound: Optional[float]):
-        """The kernel ``extend`` will actually run: safe-gate models reroute
-        kernels without ``supports_safe_gate`` to Triton."""
+    def effective_extend_kernel(
+        self, lower_bound: Optional[float], prefill_metadata=None
+    ):
+        """Resolve the configured kernel against this batch's prepared metadata."""
         kernel = self.extend_kernel
+        if self.prefill_backend.is_flashinfer() and (
+            prefill_metadata is None
+            or prefill_metadata.flashinfer_kda_prefill_wrapper is None
+            # Piecewise graph capture can reuse eager metadata. The adapter's
+            # allocation/planning lifecycle currently supports eager prefill.
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return self.triton_kernel
         if lower_bound is not None and not getattr(kernel, "supports_safe_gate", True):
             kernel = self.triton_kernel
         return kernel
@@ -360,7 +370,13 @@ class KDAKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        kernel = self.effective_extend_kernel(kwargs.get("lower_bound"))
+        kernel = self.effective_extend_kernel(
+            kwargs.get("lower_bound"), kwargs.get("prefill_metadata")
+        )
+        if self.prefill_backend.is_flashinfer() and kernel is self.extend_kernel:
+            kwargs["prefill_wrapper"] = kwargs[
+                "prefill_metadata"
+            ].flashinfer_kda_prefill_wrapper
         return kernel.extend(
             q,
             k,
@@ -436,6 +452,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = KDAKernelDispatcher(
             decode_backend, prefill_backend, verify_backend
         )
+        if prefill_backend.is_flashinfer():
+            self.kernel_dispatcher.extend_kernel.validate_model(
+                dtype=model_runner.dtype,
+                state_dtype=self.req_to_token_pool.mamba_pool.mamba_cache.temporal.dtype,
+                layers=(
+                    module
+                    for module in model_runner.model.modules()
+                    if isinstance(module, RadixLinearAttention)
+                ),
+                chunk_size=(
+                    self.mamba_chunk_size
+                    if self.req_to_token_pool.enable_mamba_extra_buffer
+                    else None
+                ),
+            )
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
             "K3 fused KDA decode engaged: --linear-attn-decode-backend "
@@ -540,6 +571,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        if self.kernel_dispatcher.prefill_backend.is_flashinfer():
+            self._init_flashinfer_prefill_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
             if self.forward_metadata.mamba_track_mask_indices is None:
                 self.forward_metadata.mamba_track_mask_indices = (
@@ -550,6 +583,38 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+
+    def _init_flashinfer_prefill_metadata(self, forward_batch: ForwardBatch):
+        """Select and plan eager FlashInfer prefill once for all KDA layers."""
+        metadata = self.forward_metadata
+        if (
+            not forward_batch.forward_mode.is_extend_without_speculative()
+            or torch.cuda.is_current_stream_capturing()
+            # Upstream's packed prefill route requires total_tokens > 1. It
+            # accepts single-token sequences and zero-length padding rows.
+            or metadata.logical_num_tokens <= 1
+            # TBO splits token ranges separately from host checkpoint lengths.
+            # Keep those batches on Triton until that integration is supported.
+            or forward_batch.tbo_parent_token_range is not None
+        ):
+            return
+
+        if (
+            metadata.track_ssm_h_src is not None
+            and metadata.track_ssm_h_src.numel() > 0
+        ):
+            from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
+                build_flashinfer_kda_checkpoint_plan,
+            )
+
+            if not build_flashinfer_kda_checkpoint_plan(
+                forward_batch, metadata, self.device, self.mamba_chunk_size
+            ):
+                return
+
+        metadata.flashinfer_kda_prefill_wrapper = (
+            self.kernel_dispatcher.extend_kernel.plan(metadata.query_start_loc)
+        )
 
     def forward_decode(
         self,
@@ -899,7 +964,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # Check the kernel the dispatcher will actually run (safe-gate
             # reroute included), not just the configured one.
             extend_kernel = self.kernel_dispatcher.effective_extend_kernel(
-                layer.lower_bound
+                layer.lower_bound, self.forward_metadata
             )
             assert extend_kernel.supports_track_state_snapshot, (
                 f"{type(extend_kernel).__name__} cannot write the fp32 track "
@@ -953,8 +1018,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
             state_checkpoint_indices=self.forward_metadata.state_checkpoint_indices,
             track_ssm_h_batch_src=self.forward_metadata.track_ssm_h_batch_src,
             prefill_metadata=self.forward_metadata,
-            prefill_forward_batch=forward_batch,
-            prefill_chunk_size=self.mamba_chunk_size,
         )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary

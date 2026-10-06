@@ -18,11 +18,14 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+if TYPE_CHECKING:
+    from flashinfer.kda import RecurrentKDAPrefillWrapper
 
 
 @dataclass(kw_only=True)
@@ -65,7 +68,8 @@ class ForwardMetadata:
     num_state_checkpoints: int = 0
     state_checkpoint_every_n_tokens: int = 0
     state_checkpoint_indices: Optional[torch.Tensor] = None
-    flashinfer_kda_prefill_wrapper: Optional[object] = None
+    # Non-None selects FlashInfer for this batch; planning precedes layer execution.
+    flashinfer_kda_prefill_wrapper: Optional["RecurrentKDAPrefillWrapper"] = None
     track_ssm_seq_idx: Optional[torch.Tensor] = None
     track_ssm_end_locs: Optional[torch.Tensor] = None
     track_ssm_recompute_dst: Optional[torch.Tensor] = None

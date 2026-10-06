@@ -26,6 +26,7 @@ if Version(flashinfer.__version__) < Version("0.7.0"):
     )
 
 from sglang.srt.layers.attention.linear.kda_backend import (  # noqa: E402
+    KDAAttnBackend,
     KDAKernelDispatcher,
 )
 from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (  # noqa: E402
@@ -51,19 +52,20 @@ from sglang.test.kits.attention_unittest.attention_methods.kda_attention import 
 
 
 @pytest.mark.parametrize(
-    "state_dtype,padded_slots,strided_beta",
+    "state_dtype,padded_slots,strided_beta,padded_row",
     [
-        (torch.bfloat16, False, False),
-        (torch.float32, False, False),
-        (torch.bfloat16, True, False),
-        (torch.float32, False, True),
+        (torch.bfloat16, False, False, False),
+        (torch.float32, False, False, False),
+        (torch.bfloat16, True, False, False),
+        (torch.float32, False, True, False),
+        (torch.bfloat16, False, False, True),
     ],
 )
 def test_kda_prefill_indexed_state_and_130_token_checkpoint(
-    state_dtype, padded_slots, strided_beta
+    state_dtype, padded_slots, strided_beta, padded_row
 ):
     torch.manual_seed(7)
-    lengths = [130, 128]
+    lengths = [130, 128, 0] if padded_row else [130, 128]
     total_tokens = sum(lengths)
     heads = 12
     dim = 128
@@ -76,7 +78,11 @@ def test_kda_prefill_indexed_state_and_130_token_checkpoint(
     q = randn(1, total_tokens, heads, dim, scale=0.01)
     k = randn(1, total_tokens, heads, dim, scale=0.01)
     v = randn(1, total_tokens, heads, dim, scale=0.01)
-    g = randn(1, total_tokens + 14, heads, dim, scale=0.1)
+    g = (
+        randn(1, total_tokens + 14, heads, dim * 2, scale=0.1)[..., :dim]
+        if strided_beta
+        else randn(1, total_tokens + 14, heads, dim, scale=0.1)
+    )
     beta = (
         randn(1, total_tokens + 14, heads * 12)[..., :heads]
         if strided_beta
@@ -98,33 +104,43 @@ def test_kda_prefill_indexed_state_and_130_token_checkpoint(
         fi_state.copy_(initial_values)
     else:
         fi_state = initial.clone()
-    cu_seqlens = torch.tensor([0, 130, total_tokens], device="cuda", dtype=torch.int32)
-    slots = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    cu_seqlens = torch.tensor(
+        [0, 130, total_tokens, total_tokens] if padded_row else [0, 130, total_tokens],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    slots = torch.tensor(
+        [1, 2, 0] if padded_row else [1, 2], device="cuda", dtype=torch.int32
+    )
 
     forward_batch = SimpleNamespace(
         extend_seq_lens_cpu=lengths,
         extend_seq_lens=None,
         mamba_track_seqlens_cpu=lengths,
         mamba_track_seqlens=None,
-        extend_prefix_lens_cpu=[0, 0],
+        extend_prefix_lens_cpu=[0] * len(lengths),
         extend_prefix_lens=None,
-        mamba_prefill_track_mask_cpu=[True, True],
+        mamba_prefill_track_mask_cpu=[True, True, False]
+        if padded_row
+        else [True, True],
         mamba_track_mask=None,
     )
     metadata = SimpleNamespace(
         track_ssm_h_src=torch.tensor([2], device="cuda"),
         track_ssm_h_batch_src=torch.tensor([0], device="cuda"),
     )
-    build_flashinfer_kda_checkpoint_plan(forward_batch, metadata, "cuda", 64)
-    assert metadata.state_checkpoint_cu_starts.tolist() == [0, 2, 4]
+    assert build_flashinfer_kda_checkpoint_plan(forward_batch, metadata, "cuda", 64)
+    assert metadata.state_checkpoint_cu_starts.tolist() == (
+        [0, 2, 4, 4] if padded_row else [0, 2, 4]
+    )
     assert metadata.num_state_checkpoints == 1
     assert metadata.state_checkpoint_indices.tolist() == [-1, 0, -1, -1]
 
     triton = TritonKDAKernel()
-    flashinfer = FlashInferKDAPrefillKernel(triton)
+    flashinfer = FlashInferKDAPrefillKernel()
     ref_state = initial.clone()
     ref_track = torch.full(
-        (2, heads, dim, dim), torch.nan, device="cuda", dtype=torch.float32
+        (len(lengths), heads, dim, dim), torch.nan, device="cuda", dtype=torch.float32
     )
     fi_track = torch.full_like(ref_track, torch.nan)
     common = dict(
@@ -134,7 +150,9 @@ def test_kda_prefill_indexed_state_and_130_token_checkpoint(
         beta_is_raw=True,
         return_intermediate_states=True,
         extend_seq_lens_cpu=lengths,
-        track_chunk_idx=torch.tensor([2, -1], device="cuda", dtype=torch.int32),
+        track_chunk_idx=torch.tensor(
+            [2, -1, -1] if padded_row else [2, -1], device="cuda", dtype=torch.int32
+        ),
     )
     ref_output, _ = triton.extend(
         q.clone(),
@@ -159,11 +177,12 @@ def test_kda_prefill_indexed_state_and_130_token_checkpoint(
             q.clone(),
             k.clone(),
             v.clone(),
-            g.clone(),
+            g,
             beta,
             ssm_states=fi_state,
             cache_indices=slots,
             query_start_loc=cu_seqlens,
+            prefill_wrapper=flashinfer.plan(cu_seqlens),
             track_state=fi_track,
             state_checkpoint_cu_starts=metadata.state_checkpoint_cu_starts,
             num_state_checkpoints=metadata.num_state_checkpoints,
@@ -176,7 +195,9 @@ def test_kda_prefill_indexed_state_and_130_token_checkpoint(
     assert torch.isfinite(fi_output).all()
     assert torch.isfinite(fi_state).all()
     assert torch.isfinite(fi_track[0]).all()
-    assert torch.isnan(fi_track[1]).all()
+    assert torch.isnan(fi_track[1:]).all()
+    if padded_row:
+        torch.testing.assert_close(fi_state[0], initial[0], atol=0, rtol=0)
     assert (fi_output.float() - ref_output.float()).abs().max() < 1e-2
     assert (fi_state.float() - ref_state.float()).abs().max() < 1e-2
     relative_track_error = torch.linalg.vector_norm(fi_track[0] - ref_track[0]) / (
@@ -186,6 +207,7 @@ def test_kda_prefill_indexed_state_and_130_token_checkpoint(
 
     # The reusable state for 130 tokens is the state after token 128.
     prefix_state = initial[1:2].clone()
+    prefix_offsets = torch.tensor([0, 128], device="cuda", dtype=torch.int32)
     flashinfer.extend(
         q[:, :128].clone(),
         k[:, :128].clone(),
@@ -194,7 +216,8 @@ def test_kda_prefill_indexed_state_and_130_token_checkpoint(
         beta[:, :128].clone(),
         ssm_states=prefix_state,
         cache_indices=torch.tensor([0], device="cuda", dtype=torch.int32),
-        query_start_loc=torch.tensor([0, 128], device="cuda", dtype=torch.int32),
+        query_start_loc=prefix_offsets,
+        prefill_wrapper=flashinfer.plan(prefix_offsets),
         A_log=a_log,
         dt_bias=dt_bias,
         lower_bound=-5.0,
@@ -238,13 +261,13 @@ def test_kda_prefill_dcp8_interior_checkpoint_after_cached_prefix():
         track_ssm_h_src=torch.tensor(host_plan.h_src, device="cuda"),
         track_ssm_h_batch_src=torch.tensor(host_plan.unaligned_rows, device="cuda"),
     )
-    build_flashinfer_kda_checkpoint_plan(batch, metadata, "cuda", 64)
+    assert build_flashinfer_kda_checkpoint_plan(batch, metadata, "cuda", 64)
     assert metadata.state_checkpoint_cu_starts.tolist() == [0, 9]
     assert metadata.num_state_checkpoints == 1
     assert metadata.state_checkpoint_indices.tolist() == [-1] * 7 + [0, -1]
 
     triton = TritonKDAKernel()
-    flashinfer = FlashInferKDAPrefillKernel(triton)
+    flashinfer = FlashInferKDAPrefillKernel()
     ref_state, fi_state = initial.clone(), initial.clone()
     fi_track = torch.full((1, heads, dim, dim), torch.nan, device="cuda")
     common = dict(
@@ -283,6 +306,7 @@ def test_kda_prefill_dcp8_interior_checkpoint_after_cached_prefix():
             ssm_states=fi_state,
             cache_indices=slots,
             query_start_loc=offsets,
+            prefill_wrapper=flashinfer.plan(offsets),
             track_state=fi_track,
             state_checkpoint_cu_starts=metadata.state_checkpoint_cu_starts,
             num_state_checkpoints=metadata.num_state_checkpoints,
@@ -300,6 +324,7 @@ def test_kda_prefill_dcp8_interior_checkpoint_after_cached_prefix():
         fi_state.float(), ref_state.float(), atol=1e-2, rtol=1e-2
     )
     truncated_state = initial.clone()
+    truncated_offsets = torch.tensor([0, 512], device="cuda", dtype=torch.int32)
     flashinfer.extend(
         q[:, :512],
         k[:, :512],
@@ -308,7 +333,8 @@ def test_kda_prefill_dcp8_interior_checkpoint_after_cached_prefix():
         beta[:, :512],
         ssm_states=truncated_state,
         cache_indices=slots,
-        query_start_loc=torch.tensor([0, 512], device="cuda", dtype=torch.int32),
+        query_start_loc=truncated_offsets,
+        prefill_wrapper=flashinfer.plan(truncated_offsets),
         A_log=common["A_log"],
         dt_bias=common["dt_bias"],
         lower_bound=-5.0,
@@ -341,18 +367,56 @@ def test_kda_prefill_dcp8_interior_checkpoint_after_cached_prefix():
     )
 
 
-@pytest.mark.parametrize("lower_bound,num_tokens", [(None, 128), (-5.0, 1)])
-def test_kda_prefill_fallback_does_not_plan(lower_bound, num_tokens):
-    kernel = FlashInferKDAPrefillKernel(TritonKDAKernel())
+@pytest.mark.parametrize(
+    "forward_mode,num_tokens,capturing,tbo_range,track_len",
+    [
+        (ForwardMode.EXTEND, 1, False, None, None),
+        (ForwardMode.DRAFT_EXTEND_V2, 128, False, None, None),
+        (ForwardMode.TARGET_VERIFY, 128, False, None, None),
+        (ForwardMode.EXTEND, 128, True, None, None),
+        (ForwardMode.EXTEND, 128, False, (0, 128), None),
+        (ForwardMode.EXTEND, 128, False, None, 1),
+    ],
+)
+def test_kda_prefill_fallback_does_not_plan(
+    forward_mode, num_tokens, capturing, tbo_range, track_len
+):
+    backend = KDAAttnBackend.__new__(KDAAttnBackend)
+    backend.device = "cuda"
+    backend._mamba_chunk_size = 64
+    backend.kernel_dispatcher = KDAKernelDispatcher(
+        LinearAttnKernelBackend.TRITON,
+        LinearAttnKernelBackend.FLASHINFER,
+        LinearAttnKernelBackend.TRITON,
+    )
+    dispatcher = backend.kernel_dispatcher
+    batch = SimpleNamespace(
+        forward_mode=forward_mode,
+        tbo_parent_token_range=tbo_range,
+        extend_seq_lens_cpu=[num_tokens],
+        mamba_track_seqlens_cpu=[track_len],
+        extend_prefix_lens_cpu=[0],
+        mamba_prefill_track_mask_cpu=[track_len is not None],
+    )
     q = torch.empty((1, num_tokens, 1, 128), device="cuda", dtype=torch.bfloat16)
     state = torch.empty((1, 1, 128, 128), device="cuda", dtype=torch.float32)
     offsets = torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32)
     slots = torch.tensor([0], device="cuda", dtype=torch.int32)
+    backend.forward_metadata = SimpleNamespace(
+        logical_num_tokens=num_tokens,
+        query_start_loc=offsets,
+        track_ssm_h_src=(slots if track_len is not None else None),
+        flashinfer_kda_prefill_wrapper=None,
+    )
     with (
-        patch.object(kernel, "plan", side_effect=AssertionError("unused plan")),
-        patch.object(kernel._triton, "extend", return_value=q) as fallback,
+        patch.object(
+            dispatcher.extend_kernel, "plan", side_effect=AssertionError("unused plan")
+        ),
+        patch("torch.cuda.is_current_stream_capturing", return_value=capturing),
+        patch.object(dispatcher.triton_kernel, "extend", return_value=q) as fallback,
     ):
-        output = kernel.extend(
+        backend._init_flashinfer_prefill_metadata(batch)
+        output = dispatcher.extend(
             q,
             q,
             q,
@@ -363,9 +427,10 @@ def test_kda_prefill_fallback_does_not_plan(lower_bound, num_tokens):
             query_start_loc=offsets,
             A_log=torch.zeros(1, device="cuda"),
             dt_bias=torch.zeros((1, 128), device="cuda"),
-            lower_bound=lower_bound,
+            lower_bound=-5.0,
             beta_is_raw=True,
             extend_seq_lens_cpu=[num_tokens],
+            prefill_metadata=backend.forward_metadata,
         )
     assert output is q
     fallback.assert_called_once()
@@ -424,6 +489,12 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(single_dcp_rank):
         FlashInferKDAPrefillKernel,
     )
     kernel = fixture.backend.linear_attn_backend.kernel_dispatcher.extend_kernel
+    kernel.validate_model(
+        dtype=torch.bfloat16,
+        state_dtype=cache.temporal.dtype,
+        layers=[fixture.actual_module.attn],
+        chunk_size=fixture.backend.linear_attn_backend.mamba_chunk_size,
+    )
     with (
         patch.object(kernel, "plan", wraps=kernel.plan) as plan,
         patch(

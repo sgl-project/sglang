@@ -31,6 +31,24 @@ Columns are runner modes; rows are the linear-attention kernel backend. Cells us
 - `test_kda_prefill_flashinfer.py` exercises the 128-D FlashInfer path against
   Triton on B200/GB300, including the 130-token to 128-token cache boundary.
 
+## FlashInfer Prefill Contract
+
+Selecting `--linear-attn-prefill-backend flashinfer` requires SM100/SM103,
+BF16 model activations, BF16 or FP32 SSM state, equal Q/K/V head counts with
+128-D heads, and a finite negative safe-gate lower bound on every KDA layer.
+Radix-cache checkpoints additionally require a positive mamba chunk size
+divisible by 32. Unsupported fixed configurations fail during backend setup;
+use Triton prefill for other configurations.
+
+The backend plans sequence order and radix-cache checkpoints once per batch,
+before layer execution. The adapter consumes raw gate/beta projections and
+normalizes projection strides before calling FlashInfer. Packed batches may
+include single-token sequences and zero-length padding rows; only the total
+packed token count must exceed one.
+
+Capture, speculative extend, TBO, and track points without a supported
+checkpoint plan use Triton. Untracked prefill needs no host sequence lengths.
+
 ## Production-Unsupported
 
 - **CUDA-graph capture/replay outside `DECODE_OR_IDLE` / `TARGET_VERIFY`** —
