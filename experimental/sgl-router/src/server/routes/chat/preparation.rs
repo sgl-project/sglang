@@ -119,15 +119,19 @@ impl PreparedRequest {
             resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
         let value: Value = serde_json::from_slice(&body).map_err(|_| invalid_request())?;
         let prompts = completion_prompts(&value);
-        let batch = batch_prompt_tokens(&prompts);
-        let needs_tokens = has_caller_input_ids(&prompts)
-            || should_tokenize_request(
-                false,
-                policy_needs_request_tokens,
-                ctx.bucket_selector.is_enabled(),
-            );
-        let tokens = (batch.is_none() && needs_tokens)
-            .then(|| request_tokens_for(&ctx.tokenizers, &model, &prompts))
+        let needs_tokens = should_tokenize_request(
+            false,
+            policy_needs_request_tokens,
+            ctx.bucket_selector.is_enabled(),
+        );
+        // Text is tokenized per prompt, as `/generate` does, but only for routing.
+        let text_ids = needs_tokens
+            .then(|| tokenize_text(ctx, &model, &prompts))
+            .flatten();
+        let routed = text_ids.map_or(prompts, |ids| json!({ "input_ids": ids }));
+        let batch = batch_prompt_tokens(&routed);
+        let tokens = (batch.is_none() && has_caller_input_ids(&routed))
+            .then(|| request_tokens_for(&ctx.tokenizers, &model, &routed))
             .flatten();
         let lengths = batch
             .clone()
@@ -1374,6 +1378,21 @@ mod tests {
             let r = PreparedRequest::completion(&ctx, model, fields, body, false).unwrap();
             let got = (r.input_token_count, r.sequence_token_count);
             assert_eq!((r.fans_out, got), (fans_out, counts), "{prompt}");
+        }
+        // With routing on tokens, text is counted by the tokenizer, batched or not.
+        let text = "hi ".repeat(40);
+        let n = ctx
+            .tokenizers
+            .encode_prompt("stub-model", &text)
+            .unwrap()
+            .len();
+        for prompt in [json!(text), json!([text])] {
+            let body = json!({"model": "stub-model", "prompt": prompt});
+            let body = Bytes::from(body.to_string());
+            let fields = parse_routing_fields(&body).unwrap();
+            let model = ModelId("stub-model".into());
+            let r = PreparedRequest::completion(&ctx, model, fields, body, true).unwrap();
+            assert_eq!(r.sequence_token_count, n, "{prompt}");
         }
     }
 
