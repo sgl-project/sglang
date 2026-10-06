@@ -553,6 +553,7 @@ class ServerArgs(DisaggServerArgsMixin):
     batching_delay_ms: float = 0.0
     batching_config: str | None = None
     enable_batching_metrics: bool = False
+    async_output_save: bool = False
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -944,6 +945,18 @@ class ServerArgs(DisaggServerArgsMixin):
             if self.vae_cpu_offload is None:
                 self.vae_cpu_offload = False
             return
+
+        if (
+            self.use_fsdp_inference
+            and self.num_gpus > 1
+            # with data parallelism the FSDP mesh would span the replicas
+            and self.dp_size == 1
+            and self.dit_cpu_offload is None
+            # a GGUF or pre-quantized override may not support FSDP
+            and self.transformer_weights_path is None
+        ):
+            # FSDP shards only resident components; component offload would bypass it
+            self.dit_cpu_offload = False
 
         # TODO: to be handled by each platform
         if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
@@ -2558,7 +2571,8 @@ class ServerArgs(DisaggServerArgsMixin):
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
-            help="Use CPU offload for DiT inference. Enable if run out of memory with FSDP.",
+            help="Keep DiT weights on the CPU and move them onto the GPU whole around each "
+            "use. This takes the DiT out of FSDP, which shards only resident components.",
         )
         parser.add_argument(
             "--direct-gpu-weight-loading",
@@ -2895,6 +2909,18 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
         )
         parser.add_argument(
+            "--async-output-save",
+            action="store_true",
+            default=ServerArgs.async_output_save,
+            help="Finalize outputs (frame materialization, image/video encoding, disk "
+            "write, reply) on a background thread so the scheduler can start the next "
+            "request's GPU work immediately. Applies to save-to-file requests on the "
+            "output rank; requests carrying perf instrumentation keep the synchronous "
+            "path. Memory metrics reported for a request may include the next "
+            "request's allocations, and the per-request allocator cache release is "
+            "skipped.",
+        )
+        parser.add_argument(
             "--host",
             type=str,
             default=ServerArgs.host,
@@ -3141,14 +3167,28 @@ class ServerArgs(DisaggServerArgsMixin):
     def scheduler_endpoint(self):
         """
         Internal endpoint for scheduler.
-        Prefers the configured host but normalizes localhost -> 127.0.0.1 to avoid ZMQ issues.
+        Wildcard, localhost, and IPv6 hosts use IPv4 loopback for internal ZMQ.
         """
         return self.scheduler_endpoint_for(0)
 
     def scheduler_endpoint_for(self, replica: int) -> str:
-        """Ingress endpoint of one DP replica's driver rank."""
+        """Ingress endpoint of one DP replica's driver rank.
+
+        The scheduler ingress is an unauthenticated pickle-RPC endpoint
+        (``managers/scheduler.py`` ``recv_reqs`` deserializes client bytes
+        with ``pickle.loads``), so it must never be derived from the public
+        ``--host``: binding it to ``0.0.0.0`` would expose unsafe
+        deserialization to the network (CVE-2026-3059 family). Wildcard hosts
+        are pinned to loopback; IPv6 hosts also use IPv4 loopback for internal
+        ZMQ compatibility. Explicit non-wildcard IPv4 hosts and hostnames
+        (used for intentional cross-machine deployments) are honored.
+        """
         scheduler_host = self.host
-        if scheduler_host is None or scheduler_host == "localhost":
+        if (
+            scheduler_host is None
+            or scheduler_host in ("localhost", "0.0.0.0")
+            or is_valid_ipv6_address(scheduler_host)
+        ):
             scheduler_host = "127.0.0.1"
         if self.scheduler_ports is not None:
             port = self.scheduler_ports[replica]

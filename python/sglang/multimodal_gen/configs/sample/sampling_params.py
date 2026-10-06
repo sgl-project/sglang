@@ -310,6 +310,9 @@ class SamplingParams:
     # The base __post_init__ will apply them when height/width are not provided.
     _default_height: ClassVar[int | None] = None
     _default_width: ClassVar[int | None] = None
+    # Fewest denoising steps the model's schedule accepts. Warmup requests are
+    # clamped to it, so a generic 1-step warmup stays a valid request.
+    min_num_inference_steps: ClassVar[int] = 1
 
     height: int | None = None
     width: int | None = None

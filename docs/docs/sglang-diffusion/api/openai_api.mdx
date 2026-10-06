@@ -215,6 +215,10 @@ curl -sS -X POST "http://localhost:30010/v1/images/generations" \
 
 This endpoint accepts a multipart form upload with input images and a text prompt. The server can return either a base64-encoded image or a URL to download the image.
 
+Uploaded filenames are sanitized, and saved uploads are constrained to the
+server's upload directory. This also applies to image uploads for video and mesh
+generation.
+
 **Curl Example (b64_json response):**
 
 ```bash Command
