@@ -180,7 +180,21 @@ class SystemOne:
             timeout=600,
         )
         resp.raise_for_status()
-        scores = resp.json()["scores"]
+        try:
+            scores = resp.json()["scores"]
+        except (KeyError, TypeError) as e:
+            raise requests.RequestException(
+                "upstream /v1/score response has no scores list"
+            ) from e
+        if not isinstance(scores, list) or len(scores) != len(questions):
+            raise requests.RequestException(
+                f"upstream /v1/score returned {len(scores) if isinstance(scores, list) else 'invalid'} score rows for {len(questions)} questions"
+            )
+        for i, (probs, labels) in enumerate(zip(scores, labels_per_q)):
+            if not isinstance(probs, list) or len(probs) != len(labels):
+                raise requests.RequestException(
+                    f"upstream /v1/score row {i} has {len(probs) if isinstance(probs, list) else 'invalid'} probabilities for {len(labels)} labels"
+                )
 
         answers = {}
         for q, probs in zip(questions, scores):
