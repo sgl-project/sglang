@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 
 register_xpu_ci(
     est_time=600,
-    suite="nightly-A-xpu-1-gpu",
+    suite="nightly-xpu-kernel-main-1-gpu",
     nightly=True,
     disabled=(
         "XPU fused MoE has no fp8-w8a8 kernel: sgl_kernel/moe.py:505 asserts "

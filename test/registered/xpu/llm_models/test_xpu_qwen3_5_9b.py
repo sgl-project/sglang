@@ -13,7 +13,7 @@ from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.xpu.simple_eval_gsm8k_xpu_mixin import SimpleEvalGSM8KXPUMixin
 
-register_xpu_ci(est_time=2400, suite="nightly-A-xpu-4-gpu", nightly=True)
+register_xpu_ci(est_time=2400, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
 
 
 @unittest.skipUnless(
