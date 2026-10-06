@@ -40,6 +40,7 @@ from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionMetadata,
 )
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -68,10 +69,15 @@ def _translator(req_to_token, page_size, n_pages):
     t.defer_read_translate = False
     t._capture_page_size = page_size
     t._full_v2p_table = v2p.to(_DEV)
-    t._translate_write_full = lambda ids: (
-        t._full_v2p_table[ids // page_size] * page_size + ids % page_size
-    )
-    t._swa_v2p_table = None
+    t._spaces = {
+        IdSpaceKind.FULL: IdSpace(
+            key=(IdSpaceKind.FULL, "test"),
+            write=lambda ids: (
+                t._full_v2p_table[ids // page_size] * page_size + ids % page_size
+            ),
+            read_v2p=t._full_v2p_table,
+        )
+    }
     t._rows = torch.arange(req_to_token.shape[0], dtype=torch.int64, device=_DEV)
     return t
 

@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
@@ -164,7 +165,8 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         _, allocator, _, draft_pool = _build()
         src = _source(allocator, draft_pool)
         self.assertTrue(src.is_translating)
-        self.assertIsNone(src._swa_v2p_table)  # single space: no swa id space
+        # A dense draft pool: no sliding-window sub-pool.
+        self.assertIsNone(src.space(IdSpaceKind.SLIDING_WINDOW))
 
         # Its own plan translates to the HOST's physical ids: the draft parts
         # live inside the same slots.
@@ -178,7 +180,7 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         torch.testing.assert_close(fb.out_cache_loc, expected, rtol=0, atol=0)
         self.assertTrue(torch.equal(fb.out_cache_loc, allocator.translate_kv_loc(v)))
         # A dense draft pool routes no window layers: no swa write loc.
-        self.assertIsNone(fb.out_cache_loc_swa)
+        self.assertIsNone(src.write_ids(fb, IdSpaceKind.SLIDING_WINDOW))
 
     def test_dense_fused_draft_has_no_window_write_loc(self):
         """A dense fused-draft batch binds no sliding-window write ids: the
@@ -191,14 +193,14 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         self.assertIsNotNone(v)
         fb = SimpleNamespace(out_cache_loc=v)
         src.bind_own_plan(fb)
-        self.assertIsNone(fb.out_cache_loc_swa)
+        self.assertIsNone(src.write_ids(fb, IdSpaceKind.SLIDING_WINDOW))
         # Target contrast: a real swa side derives a DIFFERENT loc.
         tgt = _source(allocator, kvcache)
         tv = allocator.alloc(_PS)
         self.assertIsNotNone(tv)
         tfb = SimpleNamespace(out_cache_loc=tv)
         tgt.bind_own_plan(tfb)
-        tswa = tfb.out_cache_loc_swa
+        tswa = tgt.write_ids(tfb, IdSpaceKind.SLIDING_WINDOW)
         self.assertIsNotNone(tswa)
         self.assertIsNot(tswa, tfb.out_cache_loc)
         self.assertTrue(torch.equal(tswa, allocator.translate_loc_from_full_to_swa(tv)))
@@ -469,12 +471,11 @@ class TestDispositionBranchesAgree(unittest.TestCase):
     attribute it naturally adds it to the branches IT knows about; a branch
     added here is silently left short, and nothing fails until the missing
     attribute is read at RUNTIME. That is exactly how the fused-draft branch
-    lost `_translate_write_full` and `defer_read_translate` across a rebase:
+    once lost its write translate and `defer_read_translate` across a rebase:
     py_compile passes (the attribute is only ever read, never declared), the
     undefined-NAME check passes (it is an attribute, not a bare name), and the
     target and passthrough paths both work -- only a fused-draft forward raises
-    `AttributeError: 'KVIndexTranslator' object has no attribute
-    '_translate_write_full'`.
+    `AttributeError`.
 
     Comparing the branches against EACH OTHER needs no list to maintain: a new
     attribute is covered the moment any one branch sets it.

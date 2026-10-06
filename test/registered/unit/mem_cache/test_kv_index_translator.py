@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
 from sglang.srt.state_capturer.base import BaseTopkCapturer
@@ -160,7 +161,6 @@ class TestPassthrough(unittest.TestCase):
         self.assertEqual(view.row_stride, req_to_token.stride(0))
         self.assertEqual(view.entry_page_size, 1)
         self.assertFalse(view.is_translated)
-        self.assertIsNone(view.sliding_window_ids)
 
 
 def _alloc_and_fill(allocator, ps, lens):
@@ -196,7 +196,8 @@ class TestReadTableBuild(unittest.TestCase):
             )
             src = _make_source(allocator, req_to_token, ps)
             self.assertTrue(src.is_translating)
-            view = src.read_table(_plan(src, rows, seq_lens))
+            plan = _plan(src, rows, seq_lens)
+            view = src.read_table(plan)
             width = view.ids.shape[1]
             self.assertEqual(width, 5)  # the widest row's pages
             self.assertTrue(view.is_translated)
@@ -206,7 +207,11 @@ class TestReadTableBuild(unittest.TestCase):
             )
             for table, v2p, side in (
                 (view.ids, allocator.full_v2p_page_table, "full"),
-                (view.sliding_window_ids, allocator.swa_v2p_page_table, "swa"),
+                (
+                    src.read_table(plan, kind=IdSpaceKind.SLIDING_WINDOW).ids,
+                    allocator.swa_v2p_page_table,
+                    "swa",
+                ),
             ):
                 want = _reference_table(req_to_token, rows, seq_lens, v2p, ps, width)
                 self.assertTrue(
@@ -229,8 +234,9 @@ class TestReadTableBuild(unittest.TestCase):
         allocator.full_v2p_page_table[tomb_page] = -1
         allocator.swa_v2p_page_table[tomb_page] = -1
         src = _make_source(allocator, req_to_token, ps)
-        view = src.read_table(_plan(src, rows, seq_lens))
-        for table in (view.ids, view.sliding_window_ids):
+        plan = _plan(src, rows, seq_lens)
+        for kind in (IdSpaceKind.FULL, IdSpaceKind.SLIDING_WINDOW):
+            table = src.read_table(plan, kind=kind).ids
             self.assertTrue(bool((table >= 0).all()))
             self.assertTrue(bool((table[1] == 0).all()), "dead lane not sunk")
             self.assertEqual(int(table[0, 1]), 0, "-1 slot not sunk")
@@ -306,7 +312,8 @@ class TestCopyPageTable(unittest.TestCase):
         # Wider than the req_to_token span and one lane more than the batch.
         out = torch.full((3, req_to_token.shape[1] // ps + 3), 7, dtype=torch.int32)
         out_swa = torch.full_like(out, 7)
-        src.copy_page_table(plan, out=out, sliding_window_out=out_swa)
+        src.copy_page_table(plan, out=out)
+        src.copy_page_table(plan, out=out_swa, kind=IdSpaceKind.SLIDING_WINDOW)
         for v2p, got in (
             (allocator.full_v2p_page_table, out),
             (allocator.swa_v2p_page_table, out_swa),
@@ -625,7 +632,11 @@ class TestWriteIds(CustomTestCase):
         for ps in (1, 4, 64):
             src, _, rows, seq_lens, virt, _, want_swa = self._built(ps=ps, n=3 * ps)
             plan = _plan(src, rows, seq_lens, write_virtual=virt)
-            self.assertTrue(torch.equal(plan.swa_write_ids(), want_swa))
+            self.assertTrue(
+                torch.equal(
+                    plan.write_ids(src, kind=IdSpaceKind.SLIDING_WINDOW), want_swa
+                )
+            )
 
     def test_pad_lanes_read_the_sink(self):
         """The DP pad appends zeros, and id 0 is the reserved padding slot in
@@ -633,7 +644,7 @@ class TestWriteIds(CustomTestCase):
         src, _, rows, seq_lens, virt, _, want_swa = self._built(n=3)
         padded = torch.cat([virt, virt.new_zeros(2)])
         plan = _plan(src, rows, seq_lens, write_virtual=padded)
-        got = plan.swa_write_ids()
+        got = plan.write_ids(src, kind=IdSpaceKind.SLIDING_WINDOW)
         self.assertTrue(torch.equal(got[:3], want_swa))
         self.assertTrue(bool((got[3:] == 0).all()), "pad lanes must land on slot 0")
 
@@ -641,7 +652,8 @@ class TestWriteIds(CustomTestCase):
         src, allocator, rows, seq_lens, virt, _, _ = self._built(ps=1, n=2)
         allocator.swa_v2p_page_table[int(virt[0])] = -1
         plan = _plan(src, rows, seq_lens, write_virtual=virt[:1])
-        self.assertEqual(int(plan.swa_write_ids()[0]), 0)
+        swa_ids = plan.write_ids(src, kind=IdSpaceKind.SLIDING_WINDOW)
+        self.assertEqual(int(swa_ids[0]), 0)
 
     def test_static_swa_pool_derives_via_pool_translate(self):
         """Static SWA pools: the swa ids are the pool's own full->swa
@@ -660,12 +672,16 @@ class TestWriteIds(CustomTestCase):
         fb = _FakeForwardBatch(out_cache_loc=loc)
         src.bind_own_plan(fb)
         self.assertIs(fb.out_cache_loc, loc, "a static pool's ids are its own")
-        self.assertTrue(torch.equal(fb.out_cache_loc_swa, loc + 100))
+        self.assertTrue(
+            torch.equal(src.write_ids(fb, IdSpaceKind.SLIDING_WINDOW), loc + 100)
+        )
 
     def test_no_loc_or_no_swa_side_yields_none(self):
         # Unified swa composite, but there is no write loc this forward.
         src, _, rows, seq_lens, _, _, _ = self._built(n=2)
-        self.assertIsNone(_plan(src, rows, seq_lens).swa_write_ids())
+        self.assertIsNone(
+            _plan(src, rows, seq_lens).write_ids(src, kind=IdSpaceKind.SLIDING_WINDOW)
+        )
         # Passthrough on a non-SWA pool: a loc is given, but there is no swa
         # id space to derive into.
         plain = KVIndexTranslator(
@@ -679,7 +695,7 @@ class TestWriteIds(CustomTestCase):
         self.assertIsNone(
             _plan(
                 plain, torch.tensor([0]), torch.tensor([1]), write_virtual=loc
-            ).swa_write_ids()
+            ).write_ids(plain, kind=IdSpaceKind.SLIDING_WINDOW)
         )
 
 

@@ -33,6 +33,7 @@ from unittest.mock import create_autospec
 import torch
 
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -71,12 +72,19 @@ def _armed_source(v2p, swa_map):
     )
     src.is_translating = True
     src._translate_full = lambda t, out=None: v2p[t.to(torch.int64)]
-    # The WRITE loc has its own translate because under DCP it arrives widened;
-    # at dcp_size == 1 it is the read translate, so arm it with the same fake.
-    src._translate_write_full = src._translate_full
-    # The sliding-window ids derive from the virtual window (ps=1, so the swa
-    # id for virtual t is swa_map[t]).
-    src._swa_write_from_virtual = lambda t: swa_map[t.to(torch.int64)]
+    src._spaces = {
+        # The WRITE loc has its own translate because under DCP it arrives
+        # widened; at dcp_size == 1 it is the read translate.
+        IdSpaceKind.FULL: IdSpace(
+            key=(IdSpaceKind.FULL, "test"), write=src._translate_full
+        ),
+        # The sliding-window ids derive from the virtual window (ps=1, so the
+        # swa id for virtual t is swa_map[t]).
+        IdSpaceKind.SLIDING_WINDOW: IdSpace(
+            key=(IdSpaceKind.SLIDING_WINDOW, "test"),
+            write=lambda t: swa_map[t.to(torch.int64)],
+        ),
+    }
     return src
 
 
@@ -120,9 +128,10 @@ class TestPadComposesWithDerivation(CustomTestCase):
         )
 
     def test_pad_lanes_write_the_sink_in_both_spaces(self):
-        """The REAL `_pad_inputs_to_size` pads the full and the sliding-window
-        write ids together: pad lanes write the slot-0 sink in both spaces,
-        and both stay the same length as the batch's tokens."""
+        """The REAL `_pad_inputs_to_size` pads the batch's write ids, and the
+        sliding-window ids its plan hands out follow them: pad lanes write the
+        slot-0 sink in both spaces, and both stay the same length as the
+        batch's tokens."""
         n, padded = 3, 6
         v2p = torch.arange(64, dtype=torch.int64) * 3
         swa_map = torch.arange(64, dtype=torch.int64) * 5
@@ -132,15 +141,16 @@ class TestPadComposesWithDerivation(CustomTestCase):
         fb.positions = torch.arange(n, dtype=torch.int64)
         fb.lora_ids = [None] * fb.batch_size
         src.bind_own_plan(fb)
+        swa = IdSpaceKind.SLIDING_WINDOW
         self.assertTrue(torch.equal(fb.out_cache_loc, v2p[virt]))
-        self.assertTrue(torch.equal(fb.out_cache_loc_swa, swa_map[virt]))
+        self.assertTrue(torch.equal(src.write_ids(fb, swa), swa_map[virt]))
 
         fb._pad_inputs_to_size(self._fake_runner_for_pad(src), padded, fb.batch_size)
 
         # Padded tail lanes go to slot 0 -- the reserved dummy-write sink.
         for loc, want in (
             (fb.out_cache_loc, v2p[virt]),
-            (fb.out_cache_loc_swa, swa_map[virt]),
+            (src.write_ids(fb, swa), swa_map[virt]),
         ):
             self.assertEqual(loc.shape[0], padded)
             self.assertTrue(torch.equal(loc[:n], want))
@@ -154,7 +164,7 @@ class TestPadComposesWithDerivation(CustomTestCase):
         fb = _make_fb(torch.empty(0, dtype=torch.int64))
         src.bind_own_plan(fb)
         self.assertEqual(fb.out_cache_loc.numel(), 0)
-        self.assertEqual(fb.out_cache_loc_swa.numel(), 0)
+        self.assertEqual(src.write_ids(fb, IdSpaceKind.SLIDING_WINDOW).numel(), 0)
 
 
 class TestReadRailTranslatesAtProduction(CustomTestCase):

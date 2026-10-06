@@ -33,6 +33,7 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view, paged_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -545,7 +546,9 @@ class FlashAttentionBackend(AttentionBackend):
     def _get_swa_write_locations(self, forward_batch: ForwardBatch):
         """This step's sliding-window write ids: the plan's, sliced per
         draft step the way `out_cache_loc` is."""
-        locations = getattr(forward_batch, "out_cache_loc_swa", None)
+        locations = self.kv_index_translator.write_ids(
+            forward_batch, IdSpaceKind.SLIDING_WINDOW
+        )
         if (
             locations is not None
             and forward_batch.forward_mode.is_decode_or_idle()
@@ -758,12 +761,14 @@ class FlashAttentionBackend(AttentionBackend):
             # Unified pool: the plan's page table, physical page ids from this
             # iteration's v2p, copied into these capture-stable buffers.
             self.kv_index_translator.copy_page_table(
-                forward_batch.kv_loc_plan,
-                out=m.page_table,
-                sliding_window_out=(
-                    m.swa_page_table if self.use_sliding_window_kv_pool else None
-                ),
+                forward_batch.kv_loc_plan, out=m.page_table
             )
+            if self.use_sliding_window_kv_pool:
+                self.kv_index_translator.copy_page_table(
+                    forward_batch.kv_loc_plan,
+                    out=m.swa_page_table,
+                    kind=IdSpaceKind.SLIDING_WINDOW,
+                )
         elif max_seq_len_k > 0:
             # Build the block table like the eager extend branch: take every
             # page_size-th token slot from req_to_token and divide by page_size.
@@ -795,7 +800,9 @@ class FlashAttentionBackend(AttentionBackend):
                 self.full_cg_prefill_swa_out_cache_loc[:num_out].zero_()
             else:
                 self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(
-                    forward_batch.out_cache_loc_swa
+                    self.kv_index_translator.write_ids(
+                        forward_batch, IdSpaceKind.SLIDING_WINDOW
+                    )
                 )
             # Captured kernels read the full bucket. Route its inactive tail to
             # SWA's zero dummy slot to prevent stale writes into live slots.
@@ -1229,7 +1236,11 @@ class FlashAttentionBackend(AttentionBackend):
             )
             metadata.page_table = kv_view.ids
             if self.use_sliding_window_kv_pool:
-                metadata.swa_page_table = kv_view.sliding_window_ids
+                metadata.swa_page_table = self.kv_index_translator.read_table(
+                    forward_batch.kv_loc_plan,
+                    kind=IdSpaceKind.SLIDING_WINDOW,
+                    rows=forward_batch.batch_size,
+                ).ids
                 metadata.swa_out_cache_loc = swa_out_cache_loc
         elif self.use_sliding_window_kv_pool:
             # FA3 requires an int32 page_table.
@@ -2862,15 +2873,13 @@ class FlashAttentionBackend(AttentionBackend):
             # The plan's table reaches `cache_seqlens_int32`, which the kernels
             # bound their reads by: a draft decode reads past `seq_lens`.
             bs = int(req_pool_indices.numel())
-            self.kv_index_translator.copy_page_table(
-                plan,
-                out=metadata.page_table[:bs],
-                sliding_window_out=(
-                    None
-                    if metadata.swa_page_table is None
-                    else metadata.swa_page_table[:bs]
-                ),
-            )
+            self.kv_index_translator.copy_page_table(plan, out=metadata.page_table[:bs])
+            if metadata.swa_page_table is not None:
+                self.kv_index_translator.copy_page_table(
+                    plan,
+                    out=metadata.swa_page_table[:bs],
+                    kind=IdSpaceKind.SLIDING_WINDOW,
+                )
 
     def _apply_cuda_graph_metadata(
         self,
@@ -3204,15 +3213,17 @@ class FlashAttentionBackend(AttentionBackend):
                 # their sliding-window twin.
                 rows = int(req_pool_indices.numel())
                 self.kv_index_translator.copy_page_table(
-                    plan,
-                    out=metadata.page_table[:rows],
-                    sliding_window_out=(
-                        metadata.swa_page_table[:rows]
-                        if self.use_sliding_window_kv_pool
-                        and metadata.swa_page_table is not None
-                        else None
-                    ),
+                    plan, out=metadata.page_table[:rows]
                 )
+                if (
+                    self.use_sliding_window_kv_pool
+                    and metadata.swa_page_table is not None
+                ):
+                    self.kv_index_translator.copy_page_table(
+                        plan,
+                        out=metadata.swa_page_table[:rows],
+                        kind=IdSpaceKind.SLIDING_WINDOW,
+                    )
             else:
                 page_indices = self.req_to_token[
                     req_pool_indices[:, None],

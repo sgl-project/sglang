@@ -15,7 +15,6 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.mem_cache.kv_loc_plan import pad_with_sink
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -651,9 +650,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
             kv_loc_plan=forward_batch.kv_loc_plan,
-            out_cache_loc_swa=pad_with_sink(
-                forward_batch.out_cache_loc_swa, num_tokens
-            ),
+            kv_loc_cols=forward_batch.kv_loc_cols,
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             # Virtual input stays separate from the backend's physical buffer.
             mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),

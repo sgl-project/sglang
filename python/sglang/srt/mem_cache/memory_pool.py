@@ -1874,8 +1874,9 @@ class KVWriteLoc:
       PHYSICAL on every pool: by allocation on non-unified pools, the
       iteration's plan's write ids on the unified pool (``KVLocPlan.bind``).
     - ``swa_loc``: the SWA-sub-pool location for hybrid SWA pools (``None``
-      otherwise): the same columns of the same plan, derived once from its
-      virtual window (``out_cache_loc_swa``).
+      otherwise): the same columns of the same plan in the sliding-window
+      sub-pool, derived once from its virtual window
+      (``KVIndexTranslator.write_ids``).
     - ``full_loc``: OPTIONAL full-attention-sub-pool location, in the same id
       space as ``loc``; pools fall back to ``loc`` when it is ``None``.
 
@@ -1906,8 +1907,8 @@ class KVWriteLoc:
         """The batch's ``out_cache_loc`` as a write loc, carrying the batch's
         physical mark. A ``swa_loc`` or ``full_loc`` passed here travels under
         the same mark, so it must come from the same plan (as
-        ``out_cache_loc_swa`` does); a loc produced separately states its own
-        mark with ``KVWriteLoc(loc, physical=...)``."""
+        ``KVIndexTranslator.write_ids`` does); a loc produced separately states
+        its own mark with ``KVWriteLoc(loc, physical=...)``."""
         return cls(
             forward_batch.out_cache_loc,
             swa_loc,

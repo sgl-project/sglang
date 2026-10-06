@@ -533,18 +533,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
-    # This iteration's KV ids, translated once (`KVLocPlan`). Every forward of
-    # the iteration holds the same plan; `out_cache_loc` is its write window in
-    # the space this runner's pool indexes.
+    # This iteration's KV ids, translated once per sub-pool (`KVLocPlan`).
+    # Every forward of the iteration holds the same plan; `out_cache_loc` is
+    # its write window in the full-attention ids this runner's pool indexes,
+    # and a backend that writes another sub-pool asks the plan for its ids
+    # (`KVIndexTranslator.write_ids`).
     kv_loc_plan: Optional[KVLocPlan] = None
+    # The part of the plan's window this forward writes (None: all of it).
+    kv_loc_cols: Optional[Cols] = None
     # The same write ids in the virtual space when `out_cache_loc` holds
     # translated ones (None on a pool that indexes virtual ids), for the
     # scheduler's bookkeeping: lazy compaction's in-flight write set, TBO's
     # split, state capture.
     out_cache_loc_virtual: Optional[torch.Tensor] = None
-    # The same columns' ids in the sliding-window sub-pool, None when this
-    # runner's pool has no sliding-window space.
-    out_cache_loc_swa: Optional[torch.Tensor] = None
     # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
     # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
@@ -1893,11 +1894,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
-        if self.out_cache_loc_swa is not None:
-            # The padded lanes write the sink in the sliding-window space too.
-            self.out_cache_loc_swa = self._pad_tensor_to_size(
-                self.out_cache_loc_swa, num_tokens
-            )
         if self.origin_out_cache_loc is not None:
             self.origin_out_cache_loc = self._pad_tensor_to_size(
                 self.origin_out_cache_loc, num_tokens
@@ -2169,7 +2165,7 @@ def build_inner_fb_view(
         # A caller may hand in another view that does not carry this field.
         out_cache_loc_virtual=getattr(forward_batch, "out_cache_loc_virtual", None),
         kv_loc_plan=getattr(forward_batch, "kv_loc_plan", None),
-        out_cache_loc_swa=getattr(forward_batch, "out_cache_loc_swa", None),
+        kv_loc_cols=getattr(forward_batch, "kv_loc_cols", None),
         origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,

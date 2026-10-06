@@ -35,6 +35,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -869,7 +870,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                    forward_batch.out_cache_loc_swa
+                    self.kv_index_translator.write_ids(
+                        forward_batch, IdSpaceKind.SLIDING_WINDOW
+                    )
                 )
             if in_capture:
                 self.forward_metadata.swa_out_cache_loc = (
@@ -959,7 +962,9 @@ class FlashInferAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            swa_out_cache_loc = forward_batch.out_cache_loc_swa
+            swa_out_cache_loc = self.kv_index_translator.write_ids(
+                forward_batch, IdSpaceKind.SLIDING_WINDOW
+            )
 
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -1739,6 +1744,7 @@ class FlashInferIndicesUpdaterDecode:
         # full->swa translate below must not run on top of them.
         translator = self.attn_backend.kv_index_translator
         use_swa_source = use_sliding_window_kv_pool and translator.reads_are_translated
+        read_kind = IdSpaceKind.SLIDING_WINDOW if use_swa_source else IdSpaceKind.FULL
         if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
             bs = len(paged_kernel_lens)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -1759,7 +1765,7 @@ class FlashInferIndicesUpdaterDecode:
                 indptr=kv_indptr,
                 out=kv_indices,
                 kv_start_idx=kv_start_idx,
-                sliding_window=use_swa_source,
+                kind=read_kind,
             )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
@@ -2181,6 +2187,7 @@ class FlashInferIndicesUpdaterPrefill:
         # full->swa translate below must not run on top of them.
         translator = self.attn_backend.kv_index_translator
         use_swa_source = use_sliding_window_kv_pool and translator.reads_are_translated
+        read_kind = IdSpaceKind.SLIDING_WINDOW if use_swa_source else IdSpaceKind.FULL
         if spec_info is None:
             assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)
@@ -2213,7 +2220,7 @@ class FlashInferIndicesUpdaterPrefill:
                     indptr=kv_indptr,
                     out=kv_indices,
                     kv_start_idx=kv_start_idx,
-                    sliding_window=use_swa_source,
+                    kind=read_kind,
                 )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
@@ -2229,7 +2236,7 @@ class FlashInferIndicesUpdaterPrefill:
                         paged_kernel_lens_sum=paged_kernel_lens_sum,
                         translator=translator,
                         plan=plan,
-                        sliding_window=use_swa_source,
+                        kind=read_kind,
                         kv_start_idx=kv_start_idx,
                     )
                 )
@@ -2241,7 +2248,7 @@ class FlashInferIndicesUpdaterPrefill:
                         paged_kernel_lens_sum=paged_kernel_lens_sum,
                         translator=translator,
                         plan=plan,
-                        sliding_window=use_swa_source,
+                        kind=read_kind,
                     )
                 )
 

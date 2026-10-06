@@ -5,7 +5,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, KVLocPlan
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 
@@ -65,7 +65,7 @@ class NgramVerifyInput(SpecInput):
         paged_kernel_lens_sum: int,
         translator: KVIndexTranslator,
         plan: KVLocPlan,
-        sliding_window: bool = False,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
     ):
         """CSR verify args, gathered straight into the packed stream. The lens
         are widened here and handed to the translator, so nothing materializes
@@ -91,7 +91,7 @@ class NgramVerifyInput(SpecInput):
             seq_lens=paged_kernel_lens,
             indptr=cum_kv_seq_len,
             out=kv_indices,
-            sliding_window=sliding_window,
+            kind=kind,
         )
 
         # Pad custom_mask when CUDA graph pads batch size beyond the actual number of requests.

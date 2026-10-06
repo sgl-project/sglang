@@ -11,23 +11,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""One scheduler iteration's KV slot ids, translated once.
+"""One scheduler iteration's KV slot ids, translated once per sub-pool.
 
 Under the unified pool a KV slot has a virtual id (what the scheduler allocates
-and `req_to_token` stores) and a physical id (what kernels index). Every forward
-of one iteration -- the target's, and a fused draft's, which lives in the
-target's pages -- reads and writes the same slots through the same
-virtual->physical table, and compaction does not move a page while the
-iteration's forwards are in flight. So each id is translated once, here, and
-every consumer reads the result:
+and `req_to_token` stores) and, in each sub-pool of the pool, a physical id
+(what that sub-pool's kernels index). Every forward of one iteration -- the
+target's, and a fused draft's, which lives in the target's pages -- reads and
+writes the same slots through the same tables, and compaction does not move a
+page while the iteration's forwards are in flight. So each id is translated
+once per sub-pool, here, and every consumer reads the result:
 
     writes   `write_ids`      the iteration's write window
     reads    `read_table`     the rows' page table over [0, seq_lens + extent)
 
-A consumer never translates. It asks the plan for ids in the space its pool
-indexes: physical for a translating pool (the target, a fused draft), virtual
-for a pool that indexes virtual ids (a static pool, a private draft pool). On a
-static pool the plan does no work at all.
+A sub-pool is named by its `IdSpace`: how it maps the iteration's virtual ids,
+and the page table its reads go through. A consumer never translates. It asks
+the plan for ids in the space it indexes -- its runner's translator holds one
+per sub-pool its pool has (`KVIndexTranslator.space`) -- and the plan derives
+each space's ids on first use. A space that indexes virtual ids as they are (a
+static pool's, a private draft pool's) costs nothing.
 
 Who builds the plan: `ForwardBatch.init_new` for a forward that is the only one
 in its iteration; a speculative worker, once per iteration, as soon as the
@@ -38,8 +40,10 @@ over its own buffers to capture or warm up with (`write_slots`).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Union
+import enum
+from typing import TYPE_CHECKING, Callable, Dict, Hashable, Optional, Union
 
+import msgspec
 import torch
 
 if TYPE_CHECKING:
@@ -48,6 +52,31 @@ if TYPE_CHECKING:
         KVIndexTranslator,
         KVReadStream,
     )
+
+
+class IdSpaceKind(enum.Enum):
+    """A sub-pool of a runner's KV pool, as the consumers that index it name
+    it."""
+
+    # Full-attention layers: the pool's own token ids.
+    FULL = enum.auto()
+    # The sliding-window layers of a hybrid pool: the same token ids through
+    # the sliding-window sub-pool's table.
+    SLIDING_WINDOW = enum.auto()
+
+
+class IdSpace(msgspec.Struct, frozen=True):
+    """How one sub-pool names the iteration's slots.
+
+    ``write`` maps the iteration's virtual token ids to this sub-pool's ids
+    (None: they index it as they are). ``read_v2p`` is the page table its reads
+    go through (None: reads stay in `req_to_token`, for the consumer to
+    finish). Runners whose pools share a sub-pool share its ``key``, and with
+    it a plan's ids for it."""
+
+    key: Hashable
+    write: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    read_v2p: Optional[torch.Tensor] = None
 
 
 def window_read_extent(forward_mode, spec_info, write_ids, batch_size: int) -> int:
@@ -74,8 +103,8 @@ Cols = Union[slice, torch.Tensor]
 
 def pad_with_sink(ids: Optional[torch.Tensor], n: int) -> Optional[torch.Tensor]:
     """``ids`` padded to ``n`` entries with the sink (id 0 in every space), for
-    a view whose write ids are a runner's padded buffer: its other write ids
-    must cover the same lanes."""
+    a batch whose write ids cover more lanes than its plan's (a padded batch,
+    a captured graph's buffer)."""
     if ids is None or ids.shape[0] >= n:
         return ids
     padded = ids.new_zeros(n)
@@ -84,7 +113,7 @@ def pad_with_sink(ids: Optional[torch.Tensor], n: int) -> Optional[torch.Tensor]
 
 
 class KVLocPlan:
-    """The ids of one iteration, both spaces, each computed once."""
+    """The ids of one iteration, in every sub-pool, each computed once."""
 
     def __init__(
         self,
@@ -104,12 +133,14 @@ class KVLocPlan:
         self.seq_lens = seq_lens
         self.seq_lens_cpu = seq_lens_cpu
         self.read_extent = read_extent
+        full = source.space(IdSpaceKind.FULL)
         if write_slots is not None:
             # A runner's own write buffer, for a graph capture or a warmup run:
-            # physical by construction, naming the sink until a replay fills
-            # it, and kept by address in a captured graph. Used as it is.
+            # in its own pool's ids by construction, naming the sink until a
+            # replay fills it, and kept by address in a captured graph. Used
+            # as it is.
             assert write_virtual is None
-            self.write_virtual = None if source.is_translating else write_slots
+            self.write_virtual = None if full.write is not None else write_slots
             self.write_physical = write_slots
         else:
             # Aliases the ScheduleBatch's tensor, which stays virtual for the
@@ -117,29 +148,33 @@ class KVLocPlan:
             # set.
             self.write_virtual = write_virtual
             self.write_physical = (
-                source._translate_write_full(write_virtual)
-                if source.is_translating and write_virtual is not None
+                full.write(write_virtual)
+                if full.write is not None and write_virtual is not None
                 else write_virtual
             )
-        self._swa_write: Optional[torch.Tensor] = None
-        self._read_table: Optional[KVIndexTable] = None
+        self._full_key = full.key
+        # The window in each sub-pool's ids, and each sub-pool's read table,
+        # by space key.
+        self._write_ids: Dict[Hashable, Optional[torch.Tensor]] = {
+            full.key: self.write_physical
+        }
+        self._read_tables: Dict[Hashable, KVIndexTable] = {}
 
     # -- writes ----------------------------------------------------------------
 
     def bind(self, batch, reader: KVIndexTranslator, *, cols: Optional[Cols] = None):
-        """Give ``batch`` (a ForwardBatch, or a view standing in for one) its
-        write ids from this plan, in the space `reader`'s pool indexes, and
-        the plan itself for its reads. The one way a forward gets its write
-        ids; nothing here translates."""
+        """Give ``batch`` (a ForwardBatch, or a view standing in for one) this
+        plan, the part of its window it writes (``cols``), and its write ids in
+        the full-attention ids `reader`'s pool indexes. The one way a forward
+        gets its write ids; nothing here translates. A consumer of another
+        sub-pool takes its ids from the plan (`KVIndexTranslator.write_ids`)."""
         batch.kv_loc_plan = self
+        batch.kv_loc_cols = cols
         batch.out_cache_loc = self.write_ids(reader, cols=cols)
         batch.out_cache_loc_virtual = (
             self.virtual_write_ids(cols=cols)
             if self.is_translated_for(reader)
             else None
-        )
-        batch.out_cache_loc_swa = (
-            self.swa_write_ids(cols=cols) if reader.writes_sliding_window else None
         )
         # A forward with no write loc writes nothing and stays unmarked.
         batch.out_cache_loc_is_physical = batch.out_cache_loc is not None
@@ -148,27 +183,41 @@ class KVLocPlan:
         """`bind`, for the batch a captured graph replays this iteration's
         forward with. Its write ids are ``slots``, the runner's capture-stable
         buffer that already holds this plan's write ids and names the sink past
-        them; its sliding-window ids are padded the same way. The virtual
-        mirror stays with the live batch."""
+        them. The virtual mirror stays with the live batch."""
         self.bind(batch, reader)
-        batch.out_cache_loc_swa = pad_with_sink(batch.out_cache_loc_swa, slots.shape[0])
         batch.out_cache_loc = slots
         batch.out_cache_loc_virtual = None
 
     def write_ids(
-        self, reader: KVIndexTranslator, *, cols: Optional[Cols] = None
+        self,
+        reader: KVIndexTranslator,
+        *,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
+        cols: Optional[Cols] = None,
     ) -> Optional[torch.Tensor]:
-        """The write window as `reader`'s pool indexes it. ``cols`` selects
-        part of a ``[batch, window]`` window, for a forward that writes only
-        part of it: a slice of columns (a draft step ahead of the verify window
-        it opens), or a flat index into the window, -1 naming the sink (a
-        ragged verify's packed rows)."""
-        ids = (
-            self.write_physical
-            if self.is_translated_for(reader)
-            else self.write_virtual
-        )
-        return self._cols(ids, cols)
+        """The write window as `reader`'s ``kind`` sub-pool indexes it, or None
+        when its pool has no such sub-pool. ``cols`` selects part of a
+        ``[batch, window]`` window, for a forward that writes only part of it:
+        a slice of columns (a draft step ahead of the verify window it opens),
+        or a flat index into the window, -1 naming the sink (a ragged verify's
+        packed rows)."""
+        space = reader.space(kind)
+        if space is None:
+            return None
+        if space.key not in self._write_ids:
+            self._write_ids[space.key] = self._window_in(space)
+        return self._cols(self._write_ids[space.key], cols)
+
+    def _window_in(self, space: IdSpace) -> Optional[torch.Tensor]:
+        if self.write_virtual is None:
+            # No window this iteration, or a runner's own slots, which name
+            # the sink in every other sub-pool too.
+            if self.write_physical is None:
+                return None
+            return torch.zeros_like(self.write_physical)
+        if space.write is None:
+            return self.write_virtual
+        return space.write(self.write_virtual)
 
     def virtual_write_ids(self, *, cols: Optional[Cols] = None):
         """The same columns in the virtual space: the ids the scheduler's
@@ -187,16 +236,20 @@ class KVLocPlan:
             return ids[cols]
         return ids.view(bs, -1)[:, cols].reshape(-1)
 
-    def swa_write_ids(self, *, cols: Optional[Cols] = None) -> Optional[torch.Tensor]:
-        """The sliding-window sub-pool's write ids for the same columns, or
-        None when the pool has no sliding-window space. Derived once for the
-        whole window, from its virtual ids: one lookup, not an inverse lookup
-        of the physical ones. A runner's own slots name the sink here too."""
-        if self._swa_write is None and self.write_physical is not None:
-            self._swa_write = self._source._swa_write_ids(
-                virtual=self.write_virtual, physical=self.write_physical
-            )
-        return self._cols(self._swa_write, cols)
+    def cols_slice(self, cols: Optional[Cols], tokens: slice) -> torch.Tensor:
+        """The ``tokens`` of a forward that writes ``cols``, as a flat index
+        into the window: the columns of one half of a batch split in two
+        (two-batch overlap). Tokens past the window are left out; the consumer
+        pads them with the sink."""
+        if isinstance(cols, torch.Tensor):
+            return cols[tokens]
+        window = (
+            self.write_virtual
+            if self.write_virtual is not None
+            else self.write_physical
+        )
+        index = torch.arange(window.numel(), device=window.device)
+        return self._cols(index, cols)[tokens]
 
     def reads_from(
         self,
@@ -220,43 +273,45 @@ class KVLocPlan:
         )
         plan.write_virtual = self.write_virtual
         plan.write_physical = self.write_physical
-        plan._swa_write = self._swa_write
+        plan._write_ids = self._write_ids
         return plan
 
     # -- reads -----------------------------------------------------------------
 
-    @property
-    def has_read_table(self) -> bool:
-        """Whether a reader has had the table built yet."""
-        return self._read_table is not None
+    def has_read_table(self, kind: IdSpaceKind = IdSpaceKind.FULL) -> bool:
+        """Whether a reader has had the ``kind`` table built yet."""
+        return self._source.space(kind).key in self._read_tables
 
     def read_table(
         self,
         *,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
         rows: Optional[int] = None,
         stream: Optional[KVReadStream] = None,
     ) -> KVIndexTable:
-        """The rows' page table over ``[0, seq_lens + read_extent)``, built on
-        first use and shared by every reader of the iteration. ``rows`` past
-        the plan's batch (a captured graph's padded lanes) are appended reading
-        the sink, by copying, never by translating again. On a pool that reads
-        virtual ids (static, or DCP, where the producing kernel selects this
-        rank's share) it is the ``req_to_token`` passthrough. ``stream`` is the
-        first reader's CSR stream (`has_read_table` False), packed by the
-        launch that builds the table."""
-        table = self._read_table
+        """The rows' page table in the ``kind`` sub-pool over ``[0, seq_lens +
+        read_extent)``, built on first use and shared by every reader of the
+        iteration. ``rows`` past the plan's batch (a captured graph's padded
+        lanes) are appended reading the sink, by copying, never by translating
+        again. On a sub-pool whose reads stay virtual (static, or DCP, where the
+        producing kernel selects this rank's share) it is the `req_to_token`
+        passthrough. ``stream`` is the first reader's CSR stream (no table yet),
+        packed by the launch that builds the table."""
+        space = self._source.space(kind)
+        table = self._read_tables.get(space.key)
         if table is None or (
             table.is_translated and rows is not None and table.ids.shape[0] < rows
         ):
-            self._read_table = table = self._source._build_iteration_table(
-                self, rows=rows, previous=table, stream=stream
+            table = self._source._build_iteration_table(
+                self, space, rows=rows, previous=table, stream=stream
             )
+            self._read_tables[space.key] = table
         else:
             assert stream is None, "a stream is packed by the table's first build"
         return table
 
     def is_read_by(self, reader: KVIndexTranslator) -> bool:
-        """Whether `reader` reads this plan's table: it indexes the plan's
+        """Whether `reader` reads this plan's tables: it indexes the plan's
         physical ids and gathers the same `req_to_token` rows. A reader with a
         table of its own (a draft's compact `req_to_token`) plans its own
         reads."""
@@ -267,9 +322,8 @@ class KVLocPlan:
 
     def is_translated_for(self, reader: KVIndexTranslator) -> bool:
         """Whether `reader`'s pool indexes this plan's physical ids: the
-        target's, and a fused draft's, which translates through the target's
-        table. A pass-through reader (a static pool, a private draft pool)
+        target's, and a fused draft's, which lives in the target's full
+        sub-pool. A pass-through reader (a static pool, a private draft pool)
         indexes the virtual ids."""
-        return reader.is_translating and reader.full_v2p_table is (
-            self._source.full_v2p_table
-        )
+        full = reader.space(IdSpaceKind.FULL)
+        return full.write is not None and full.key == self._full_key

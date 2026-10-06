@@ -30,6 +30,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_view
 from sglang.srt.mem_cache.layout.token_major import ENTRY_ALIGN_BYTES, build_dense_views
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -586,7 +587,11 @@ class TestFactoryViews(unittest.TestCase):
             self.assertTrue(source.is_translating)
             source.bind_own_plan(fb)
             self.assertTrue(torch.equal(fb.out_cache_loc, expected_full))
-            self.assertTrue(torch.equal(fb.out_cache_loc_swa, expected_swa))
+            self.assertTrue(
+                torch.equal(
+                    source.write_ids(fb, IdSpaceKind.SLIDING_WINDOW), expected_swa
+                )
+            )
 
 
 if __name__ == "__main__":

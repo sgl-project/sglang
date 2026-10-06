@@ -42,6 +42,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -1092,14 +1093,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # (the fused metadata call above wrote it); the plan's table
             # reaches that far, a target verify's draft tail included.
             self.kv_index_translator.copy_page_table(
-                forward_batch.kv_loc_plan,
-                out=metadata.page_table[:bs],
-                sliding_window_out=(
-                    None
-                    if metadata.swa_page_table is None
-                    else metadata.swa_page_table[:bs]
-                ),
+                forward_batch.kv_loc_plan, out=metadata.page_table[:bs]
             )
+            if metadata.swa_page_table is not None:
+                self.kv_index_translator.copy_page_table(
+                    forward_batch.kv_loc_plan,
+                    out=metadata.swa_page_table[:bs],
+                    kind=IdSpaceKind.SLIDING_WINDOW,
+                )
             # A capture batch carries no prepared write loc; zeros are the
             # page-0 sink.
             if (
@@ -1112,7 +1113,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     self.cuda_graph_swa_out_cache_loc[:n].zero_()
                 else:
                     self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                        forward_batch.out_cache_loc_swa
+                        self.kv_index_translator.write_ids(
+                            forward_batch, IdSpaceKind.SLIDING_WINDOW
+                        )
                     )
 
     def _assert_ragged_verify_supported(self) -> None:
@@ -1153,7 +1156,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata, req_pool_indices, metadata.cache_seqlens_int32
         )
         # The fused in-graph kernel also skips ragged batches, so refill the
-        # SWA write-target buffer here (out_cache_loc -> SWA locs).
+        # SWA write-target buffer here, from the plan.
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             n = forward_batch.out_cache_loc.shape[0]
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
@@ -1161,8 +1164,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        forward_batch.out_cache_loc
+                    self.kv_index_translator.write_ids(
+                        forward_batch, IdSpaceKind.SLIDING_WINDOW
                     )
                 )
 
@@ -1273,7 +1276,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # No fill kernel: the kernels take the tensor's own width/stride
             # and bound their reads by cache_seqlens.
             metadata.page_table = kv_view.ids
-            metadata.swa_page_table = kv_view.sliding_window_ids
+            metadata.swa_page_table = (
+                self.kv_index_translator.read_table(
+                    forward_batch.kv_loc_plan,
+                    kind=IdSpaceKind.SLIDING_WINDOW,
+                    rows=forward_batch.batch_size,
+                ).ids
+                if self.kv_index_translator.space(IdSpaceKind.SLIDING_WINDOW)
+                is not None
+                else None
+            )
         else:
             has_swa = self._swa_kv_pool is not None
             metadata.page_table = torch.empty(
@@ -1302,7 +1314,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # int64 scatter index (unlike the int32 read page table above).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            metadata.swa_out_cache_loc = forward_batch.out_cache_loc_swa
+            metadata.swa_out_cache_loc = self.kv_index_translator.write_ids(
+                forward_batch, IdSpaceKind.SLIDING_WINDOW
+            )
 
         self.forward_metadata = metadata
 

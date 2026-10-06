@@ -30,6 +30,7 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -795,8 +796,8 @@ class TritonAttnBackend(AttentionBackend):
     def _fill_cuda_graph_swa_out_cache_loc(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ) -> Optional[torch.Tensor]:
-        """Refill the SWA write-target buffer from the batch's derived
-        sliding-window write loc, returning the [:n] view (None for non-SWA /
+        """Refill the SWA write-target buffer with the batch's write ids in the
+        sliding-window sub-pool, returning the [:n] view (None for non-SWA /
         multi-step draft) so the captured store reads fresh slots on replay.
         """
         if not self.use_sliding_window_kv_pool:
@@ -812,7 +813,11 @@ class TritonAttnBackend(AttentionBackend):
         if in_capture:
             self.cuda_graph_swa_out_cache_loc[:n].zero_()
         else:
-            self.cuda_graph_swa_out_cache_loc[:n].copy_(forward_batch.out_cache_loc_swa)
+            self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                self.kv_index_translator.write_ids(
+                    forward_batch, IdSpaceKind.SLIDING_WINDOW
+                )
+            )
         return self.cuda_graph_swa_out_cache_loc[:n]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -1050,7 +1055,9 @@ class TritonAttnBackend(AttentionBackend):
 
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            swa_out_cache_loc = forward_batch.out_cache_loc_swa
+            swa_out_cache_loc = self.kv_index_translator.write_ids(
+                forward_batch, IdSpaceKind.SLIDING_WINDOW
+            )
 
         self.forward_metadata = ForwardMetadata(
             attn_logits,
@@ -2604,9 +2611,11 @@ def update_sliding_window_buffer(
         indptr=window_kv_indptr,
         out=window_kv_indices,
         kv_start_idx=window_kv_start_idx,
-        sliding_window=(
-            translator.reads_are_translated
+        kind=(
+            IdSpaceKind.SLIDING_WINDOW
+            if translator.reads_are_translated
             and isinstance(token_to_kv_pool, BaseSWAKVPool)
+            else IdSpaceKind.FULL
         ),
         token_mapping=token_mapping,
     )

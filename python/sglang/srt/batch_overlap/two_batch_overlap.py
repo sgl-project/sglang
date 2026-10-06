@@ -693,14 +693,19 @@ class TboForwardBatchPreparer:
             )
             output_dict[key] = old_value[start_token_index:end_token_index]
 
-        for key in ["out_cache_loc_virtual", "out_cache_loc_swa"]:
-            old_value = getattr(batch, key)
-            if old_value is not None:
-                output_dict[key] = old_value[start_token_index:end_token_index]
+        if batch.out_cache_loc_virtual is not None:
+            output_dict["out_cache_loc_virtual"] = batch.out_cache_loc_virtual[
+                start_token_index:end_token_index
+            ]
         output_dict["out_cache_loc_is_physical"] = batch.out_cache_loc_is_physical
         # Unified memory refuses two-batch overlap, so the plan's reads stay in
-        # `req_to_token`, which each child indexes at its own rows.
+        # `req_to_token`, which each child indexes at its own rows; each child
+        # writes its own tokens of the plan's window.
         output_dict["kv_loc_plan"] = batch.kv_loc_plan
+        if batch.kv_loc_plan is not None:
+            output_dict["kv_loc_cols"] = batch.kv_loc_plan.cols_slice(
+                batch.kv_loc_cols, slice(start_token_index, end_token_index)
+            )
 
         attention_tp_size = get_parallel().attn_tp_size
         _tbo_padded_len = (

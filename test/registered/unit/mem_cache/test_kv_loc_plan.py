@@ -45,6 +45,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache import kv_index_translator
@@ -52,6 +53,7 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
@@ -67,6 +69,8 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 _PS = 2
+_FULL = IdSpaceKind.FULL
+_SWA = IdSpaceKind.SLIDING_WINDOW
 
 
 def _reference(req_to_token, rows, lens, v2p, width):
@@ -223,30 +227,70 @@ class TestKVLocPlan(unittest.TestCase):
         plan = self._plan()
         self.assertTrue(
             torch.equal(
-                plan.swa_write_ids(),
+                plan.write_ids(self.target, kind=_SWA),
                 self.allocator.translate_loc_from_full_to_swa(self.window),
             )
         )
+
+    def test_each_sub_pool_is_translated_once_and_shared(self):
+        """A sub-pool's ids are derived on first use and handed out again
+        after; a reader whose pool shares the sub-pool (a fused draft's full
+        one) gets the same tensor, and a pool without it gets None."""
+        plan = self._plan()
+        swa = plan.write_ids(self.target, kind=_SWA)
+        self.assertIs(plan.write_ids(self.target, kind=_SWA), swa)
+        self.assertIs(plan.write_ids(self.fused_draft), plan.write_ids(self.target))
+        self.assertIsNone(plan.write_ids(self.fused_draft, kind=_SWA))
+        self.assertIsNone(plan.write_ids(self.private_draft, kind=_SWA))
+
+    def test_cols_slice_names_a_split_batch_s_tokens(self):
+        """Two-batch overlap splits a forward's tokens; each half's columns are
+        the flat window index of its tokens, whatever the forward's own
+        columns were."""
+        plan = self._plan()
+        bs = int(self.rpi.numel())
+        everything = plan.cols_slice(None, slice(1, None))
+        self.assertTrue(torch.equal(everything, torch.arange(1, self.window.numel())))
+        first = plan.cols_slice(slice(0, 1), slice(None))
+        width = self.window.numel() // bs
+        self.assertTrue(torch.equal(first, torch.arange(bs) * width))
+        ragged = torch.tensor([3, -1, 0])
+        self.assertTrue(torch.equal(plan.cols_slice(ragged, slice(1, 3)), ragged[1:]))
+        for cols, tokens in ((None, slice(1, None)), (slice(0, 1), slice(None))):
+            self.assertTrue(
+                torch.equal(
+                    plan.write_ids(self.target, cols=plan.cols_slice(cols, tokens)),
+                    plan.write_ids(self.target, cols=cols)[tokens],
+                )
+            )
 
     def test_one_iteration_translates_once(self):
         writes, builds = [], []
         real_write = self.allocator.translate_write_loc
         real_build = kv_index_translator.build_kv_read_table
 
+        swa_writes = []
+        real_swa_write = self.allocator.translate_loc_from_full_to_swa
+
         def counting_write(ids, *a, **kw):
             writes.append(ids)
             return real_write(ids, *a, **kw)
+
+        def counting_swa_write(ids):
+            swa_writes.append(ids)
+            return real_swa_write(ids)
 
         def counting_build(**kwargs):
             builds.append(kwargs["v2p"])
             return real_build(**kwargs)
 
-        with (
-            patch.object(self.allocator, "translate_write_loc", counting_write),
-            patch.object(kv_index_translator, "build_kv_read_table", counting_build),
-        ):
-            # The translator binds the allocator's translate when built.
-            self.target._translate_write_full = counting_write
+        with patch.object(kv_index_translator, "build_kv_read_table", counting_build):
+            # The spaces hold the allocator's translates from when the
+            # translator was built; count through them.
+            for kind, write in ((_FULL, counting_write), (_SWA, counting_swa_write)):
+                self.target._spaces[kind] = msgspec.structs.replace(
+                    self.target.space(kind), write=write
+                )
             plan = self._plan(read_extent=2)
             draft, verify, extend = (SimpleNamespace() for _ in range(3))
             plan.bind(draft, self.fused_draft, cols=slice(0, 1))
@@ -260,7 +304,15 @@ class TestKVLocPlan(unittest.TestCase):
                 reader.copy_page_table(
                     plan, out=torch.zeros((bs + 2, 4), dtype=torch.int32)
                 )
+            # The target's sliding-window layers, written and read twice.
+            for _ in range(2):
+                self.target.write_ids(verify, _SWA)
+                self.target.read_table(plan, kind=_SWA)
+                self.target.copy_page_table(
+                    plan, out=torch.zeros((bs + 2, 4), dtype=torch.int32), kind=_SWA
+                )
         self.assertEqual(len(writes), 1)
+        self.assertEqual(len(swa_writes), 1)
         # The full and the sliding-window id space, one build each.
         self.assertEqual(len(builds), 2)
         self.assertTrue(torch.equal(verify.out_cache_loc, plan.write_physical))
@@ -301,10 +353,12 @@ class TestKVLocPlan(unittest.TestCase):
                 )
             )
             table = plan.read_table(rows=bs + 1)
-        # One launch for the full space (table and stream), one for the swa.
+        # One launch for the full space's table and stream; nothing read the
+        # sliding-window table, so nothing built it.
         self.assertEqual(fused, [self.allocator.full_v2p_page_table])
-        self.assertEqual(len(builds), 1)
-        self.assertTrue(plan.has_read_table)
+        self.assertEqual(builds, [])
+        self.assertTrue(plan.has_read_table())
+        self.assertFalse(plan.has_read_table(_SWA))
         for b in range(bs):
             row = self.req_to_token[int(self.rpi[b]), : int(lens[b])].to(torch.int64)
             want = self.allocator.translate_write_loc(row)
@@ -362,15 +416,17 @@ class TestKVLocPlan(unittest.TestCase):
             plan = self._plan(read_extent=1)
             table = plan.read_table()
             self.assertIs(plan.read_table(), table)
-            # The full and the sliding-window space, one build each.
+            # Only the space that was read.
+            self.assertEqual(len(builds), 1)
+            swa = plan.read_table(kind=_SWA)
             self.assertEqual(len(builds), 2)
             padded = plan.read_table(rows=4)
+            padded_swa = plan.read_table(kind=_SWA, rows=4)
             self.assertEqual(len(builds), 2)  # copied, not built again
             self.assertTrue(torch.equal(padded.ids[:2], table.ids))
             self.assertEqual(int(padded.ids[2:].abs().sum()), 0)  # the sink
-            self.assertTrue(
-                torch.equal(padded.sliding_window_ids[:2], table.sliding_window_ids)
-            )
+            self.assertTrue(torch.equal(padded_swa.ids[:2], swa.ids))
+            self.assertEqual(int(padded_swa.ids[2:].abs().sum()), 0)
         # The rows cover `seq_lens + read_extent`.
         reference = _reference(
             self.req_to_token,
@@ -445,6 +501,7 @@ class TestKVLocPlan(unittest.TestCase):
         fused = SimpleNamespace()
         plan.bind(fused, self.fused_draft, cols=slice(0, 1))
         self.assertIs(fused.kv_loc_plan, plan)
+        self.assertEqual(fused.kv_loc_cols, slice(0, 1))
         self.assertTrue(
             torch.equal(
                 fused.out_cache_loc, plan.write_ids(self.target, cols=slice(0, 1))
@@ -478,10 +535,12 @@ class TestKVLocPlan(unittest.TestCase):
             self.assertIs(batch.out_cache_loc, slots)
             self.assertIsNone(batch.out_cache_loc_virtual)
             self.assertTrue(batch.out_cache_loc_is_physical)
+            swa = translator.write_ids(batch, _SWA)
             if writes_swa:
-                self.assertTrue(torch.equal(batch.out_cache_loc_swa, slots))
+                # The sink in the sliding-window sub-pool too.
+                self.assertTrue(torch.equal(swa, torch.zeros_like(slots)))
             else:
-                self.assertIsNone(batch.out_cache_loc_swa)
+                self.assertIsNone(swa)
 
     def test_a_replay_batch_writes_the_padded_slots(self):
         plan = self._plan()
@@ -493,8 +552,10 @@ class TestKVLocPlan(unittest.TestCase):
         self.assertIs(batch.kv_loc_plan, plan)
         self.assertIs(batch.out_cache_loc, slots)
         self.assertIsNone(batch.out_cache_loc_virtual)
-        self.assertTrue(torch.equal(batch.out_cache_loc_swa[:n], plan.swa_write_ids()))
-        self.assertEqual(int(batch.out_cache_loc_swa[n:].abs().sum()), 0)
+        swa = self.target.write_ids(batch, _SWA)
+        self.assertEqual(swa.shape[0], n + 2)
+        self.assertTrue(torch.equal(swa[:n], plan.write_ids(self.target, kind=_SWA)))
+        self.assertEqual(int(swa[n:].abs().sum()), 0)
 
 
 if __name__ == "__main__":

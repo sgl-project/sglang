@@ -190,7 +190,7 @@ def build_replay_fb_view(
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
         kv_loc_plan=forward_batch.kv_loc_plan,
-        out_cache_loc_swa=forward_batch.out_cache_loc_swa,
+        kv_loc_cols=forward_batch.kv_loc_cols,
         origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         max_seq_len_override=forward_batch.max_seq_len_override,

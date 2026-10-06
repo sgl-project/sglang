@@ -31,6 +31,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
     MHATokenToKVPool,
@@ -66,7 +67,11 @@ def _plain_translator():
 def _translating_translator(v2p):
     src = _plain_translator()
     src.is_translating = True
-    src._translate_write_full = lambda t, out=None: v2p[t.to(torch.int64)]
+    src._spaces = {
+        IdSpaceKind.FULL: IdSpace(
+            key=(IdSpaceKind.FULL, "test"), write=lambda t: v2p[t.to(torch.int64)]
+        )
+    }
     return src
 
 

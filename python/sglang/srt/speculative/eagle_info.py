@@ -5,7 +5,7 @@ from typing import Callable, List, Optional
 import torch
 
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -95,7 +95,7 @@ class EagleVerifyInput(SpecInput):
         paged_kernel_lens_sum: int,
         translator: KVIndexTranslator,
         plan: KVLocPlan,
-        sliding_window: bool = False,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
     ):
         """CSR verify args, gathered straight into the packed stream. The lens
         are widened here and handed to the translator, so nothing materializes
@@ -124,7 +124,7 @@ class EagleVerifyInput(SpecInput):
             seq_lens=paged_kernel_lens,
             indptr=cum_kv_seq_len,
             out=kv_indices,
-            sliding_window=sliding_window,
+            kind=kind,
         )
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
@@ -408,7 +408,7 @@ class EagleDraftExtendInput(SpecInput):
         paged_kernel_lens_sum: Optional[int],
         translator: KVIndexTranslator,
         plan: KVLocPlan,
-        sliding_window: bool = False,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
     ):
         """Draft-extend CSR args. The lens already include the window, so
         unlike verify nothing is widened here."""
@@ -438,6 +438,6 @@ class EagleDraftExtendInput(SpecInput):
             seq_lens=paged_kernel_lens,
             indptr=cum_kv_seq_len,
             out=kv_indices,
-            sliding_window=sliding_window,
+            kind=kind,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
