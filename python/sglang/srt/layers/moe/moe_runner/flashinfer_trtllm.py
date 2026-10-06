@@ -1098,6 +1098,11 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         from flashinfer.tllm_enums import ActivationType, RoutingMethodType
 
         if is_standard:
+            from sglang.kernels.ops.moe.trtllm_prepared_fp4 import (
+                try_prepared_k3_mxfp4,
+            )
+            from sglang.srt.layers.moe import route_quant_handoff
+
             routing = (
                 prepared_packed_topk
                 if prepared_packed_topk is not None
@@ -1106,7 +1111,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             routed_top_k = _routing_top_k(routing)
 
             defer_finalize = _deferred_finalize_enabled.get()
-            result = trtllm_fp4_block_scale_routed_moe(
+            routed_kwargs = dict(
                 topk_ids=routing,
                 routing_bias=None,
                 hidden_states=x_quant,
@@ -1138,6 +1143,13 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 do_finalize=not defer_finalize,
                 enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
             )
+            result = try_prepared_k3_mxfp4(
+                quant_info.w13_weight,
+                prepared_metadata=route_quant_handoff.take_metadata(routing),
+                **routed_kwargs,
+            )
+            if result is None:
+                result = trtllm_fp4_block_scale_routed_moe(**routed_kwargs)
             if defer_finalize:
                 gemm2_out, topk_weights, expanded_idx = result
                 result = FlashInferTrtllmDeferredFinalizeOutput(

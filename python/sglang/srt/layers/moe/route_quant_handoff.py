@@ -42,6 +42,9 @@ class _Handoff(msgspec.Struct):
     packed: Optional[torch.Tensor] = None
     x_q: Optional[torch.Tensor] = None
     x_s: Optional[torch.Tensor] = None
+    # native expert-tile routing metadata (M<=8), keyed by the packed ids
+    metadata: Optional[list[torch.Tensor]] = None
+    metadata_routing: Optional[torch.Tensor] = None
 
 
 _handoff = _Handoff()
@@ -60,6 +63,8 @@ def clear() -> None:
     _handoff.packed = None
     _handoff.x_q = None
     _handoff.x_s = None
+    _handoff.metadata = None
+    _handoff.metadata_routing = None
 
 
 def try_route_quant_fused(
@@ -80,6 +85,9 @@ def try_route_quant_fused(
         return None
 
     from sglang.kernels.ops.moe import moe_route_quant_fused
+    from sglang.kernels.ops.moe.trtllm_prepared_fp4 import (
+        prepared_routing_sm_supported,
+    )
 
     if (
         not moe_route_quant_fused.covered(gating_output, correction_bias, topk, x)
@@ -87,6 +95,13 @@ def try_route_quant_fused(
     ):
         return None
 
+    metadata = None
+    if (
+        x.shape[0] <= 8
+        and prepared_routing_sm_supported()
+        and moe_route_quant_fused.metadata_available()
+    ):
+        metadata = moe_route_quant_fused.allocate_metadata(x.device, x.shape[0])
     weights, ids, packed, x_q, x_s = moe_route_quant_fused.route_quant_fused(
         gating_output,
         correction_bias,
@@ -97,9 +112,12 @@ def try_route_quant_fused(
             routed_scaling_factor if routed_scaling_factor is not None else 1.0
         ),
         apply_scale=apply_routed_scaling_factor_on_output,
+        metadata=metadata,
     )
     _handoff.request_x = None
     _handoff.produced_x = x
+    _handoff.metadata = metadata
+    _handoff.metadata_routing = packed
     _handoff.packed = packed
     _handoff.x_q = x_q
     _handoff.x_s = x_s
@@ -128,3 +146,11 @@ def take(
     _handoff.x_q = None
     _handoff.x_s = None
     return out
+
+
+def take_metadata(routing: torch.Tensor) -> Optional[list[torch.Tensor]]:
+    """Consume the metadata only for the exact packed ids that produced it."""
+    metadata = _handoff.metadata if routing is _handoff.metadata_routing else None
+    _handoff.metadata = None
+    _handoff.metadata_routing = None
+    return metadata
