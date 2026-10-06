@@ -108,6 +108,23 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
         )
 
 
+def handle_mxfp4_kv_cache_compatibility(server_args: Any) -> None:
+    """Native OCP MXFP4 DSA KV cache is served by FlashMLA on SM100+ only."""
+    cfg = resolving_view(server_args)
+    if cfg.kv_cache_dtype != "mxfp4":
+        return
+    if not get_platform().is_blackwell:
+        raise ValueError(
+            "--kv-cache-dtype mxfp4 requires an SM100+ (Blackwell) GPU for the "
+            "native block-size-32 MXFP4 DSA FlashMLA decode path."
+        )
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "MXFP4 KV cache does not support --enable-unified-memory: the "
+            "unified pool does not allocate the E8M0 block scales."
+        )
+
+
 def handle_kv4_compatibility(server_args: Any) -> None:
     """Check FP4 KV cache compatibility with the attention backend"""
 

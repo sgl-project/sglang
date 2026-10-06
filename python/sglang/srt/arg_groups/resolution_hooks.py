@@ -88,6 +88,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "apply_glm5_prefill_cuda_graph_policy",
         "handle_kv4_compatibility",
         "handle_mxfp8_kv_cache_compatibility",
+        "handle_mxfp4_kv_cache_compatibility",
         "handle_amd_specifics",
         "handle_nccl_pre_warm",
         "handle_grammar_backend",

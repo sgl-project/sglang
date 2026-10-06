@@ -4,6 +4,15 @@ from typing import Optional, Tuple
 import torch
 
 try:
+    from flash_mla.flash_mla_interface import (
+        dsv4_flash_mla_with_kvcache as _dsv4_flash_mla_with_kvcache,
+        dsv4_get_mla_metadata as _dsv4_get_mla_metadata,
+    )
+except Exception:
+    _dsv4_flash_mla_with_kvcache = None
+    _dsv4_get_mla_metadata = None
+
+try:
     from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
 except Exception as _e:
     _flashmla_import_error = _e
@@ -45,6 +54,7 @@ def get_mla_metadata(
     num_heads_q: Optional[int] = None,
     is_fp8_kvcache: bool = False,
     topk: Optional[int] = None,
+    is_mxfp4_kvcache: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -68,6 +78,13 @@ def get_mla_metadata(
     assert num_q_tokens_per_head_k is not None
     assert num_heads_k is not None
 
+    if is_mxfp4_kvcache and topk is not None and _dsv4_get_mla_metadata is not None:
+        return _dsv4_get_mla_metadata(
+            cache_seqlens, num_q_tokens_per_head_k, num_heads_k, num_heads_q,
+            is_fp8_kvcache, topk
+        )
+    if is_mxfp4_kvcache and topk is not None and _dsv4_get_mla_metadata is None:
+        raise RuntimeError("MXFP4 sparse FlashMLA bridge is unavailable")
     if is_fp8_kvcache and topk is None:
         return torch.ops.sgl_kernel.get_mla_decoding_metadata_dense_fp8.default(
             cache_seqlens,
@@ -103,6 +120,7 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    is_mxfp4_kvcache: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -127,6 +145,25 @@ def flash_mla_with_kvcache(
     if _flashmla_import_error is not None:
         raise _IMPORT_ERROR from _flashmla_import_error
 
+    if is_mxfp4_kvcache and k_cache.shape[-1] != 400:
+        raise ValueError(f"MXFP4 FlashMLA expects 400-byte rows, got {k_cache.shape[-1]}")
+    if is_mxfp4_kvcache and indices is not None and _dsv4_flash_mla_with_kvcache is None:
+        raise RuntimeError("MXFP4 sparse FlashMLA bridge is unavailable")
+    if is_mxfp4_kvcache and indices is not None and _dsv4_flash_mla_with_kvcache is not None:
+        original_hq = q.shape[2]
+        q_kernel = q
+        if original_hq not in (64, 128):
+            target_hq = 64 if original_hq < 64 else 128
+            q_kernel = q.new_zeros((*q.shape[:2], target_hq, q.shape[3]))
+            q_kernel[:, :, :original_hq, :].copy_(q)
+        out, lse = _dsv4_flash_mla_with_kvcache(
+            q=q_kernel, k_cache=k_cache, block_table=block_table,
+            cache_seqlens=cache_seqlens, head_dim_v=head_dim_v,
+            tile_scheduler_metadata=tile_scheduler_metadata, num_splits=num_splits,
+            softmax_scale=softmax_scale, causal=causal,
+            is_fp8_kvcache=is_fp8_kvcache, indices=indices
+        )
+        return out[:, :, :original_hq, :], lse[:, :original_hq, :]
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     if isinstance(tile_scheduler_metadata, FlashMLASchedMeta):

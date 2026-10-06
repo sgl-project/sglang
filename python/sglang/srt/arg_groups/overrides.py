@@ -608,7 +608,10 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     assert kv_cache_dtype in [
         "bfloat16",
         "fp8_e4m3",
-    ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+        "mxfp4",
+    ], "DeepSeek DSA only supports bf16/bfloat16, fp8_e4m3, or mxfp4 kv_cache_dtype"
+    if kv_cache_dtype == "mxfp4" and (major < 10 or get_platform().is_hip):
+        raise ValueError("MXFP4 DSA KV cache requires an SM100+ CUDA device")
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
     return {}
@@ -724,6 +727,19 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             f"decode={declared.get('dsa_decode_backend', view.dsa_decode_backend)}."
         )
         return declared
+
+    if kv_cache_dtype == "mxfp4":
+        prefill = view.dsa_prefill_backend or "flashmla_auto"
+        decode = view.dsa_decode_backend or "flashmla_kv"
+        if view.enable_hisparse:
+            raise ValueError("MXFP4 DSA KV cache does not support HiSparse")
+        if prefill not in ("flashmla_auto", "flashmla_sparse", "flashmla_kv"):
+            raise ValueError("MXFP4 DSA KV cache requires a FlashMLA prefill backend")
+        if decode != "flashmla_kv":
+            raise ValueError(
+                "MXFP4 DSA KV cache requires --dsa-decode-backend flashmla_kv"
+            )
+        return {"dsa_prefill_backend": prefill, "dsa_decode_backend": decode}
 
     if is_glm_sm12_fp8:
         backend = "flashinfer_sparse_mla"
@@ -1255,6 +1271,11 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
     handler: the TRT-LLM and tokenspeed MLA backends constrain the resolved
     kv-cache dtype (declarations never reach the field, so the checks read
     the view)."""
+    if view.kv_cache_dtype == "mxfp4":
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+
+        if not is_deepseek_dsa(model_config_of(view).hf_config):
+            raise ValueError("MXFP4 KV cache is only supported for DSA models")
     if (
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"

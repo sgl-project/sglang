@@ -2108,6 +2108,52 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 },
             )
 
+    def test_dsa_mxfp4_backend_resolution(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _dsa_kv_cache_dtype_default,
+            _dsa_split_backend_resolution,
+        )
+
+        def make_view(**changes):
+            values = dict(
+                kv_cache_dtype="mxfp4",
+                dsa_prefill_backend=None,
+                dsa_decode_backend=None,
+                enable_hisparse=False,
+                _model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+                ),
+            )
+            values.update(changes)
+            return ResolvedView(SimpleNamespace(**values))
+
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            self.assertEqual(_dsa_kv_cache_dtype_default(make_view()), {})
+            self.assertEqual(
+                _dsa_split_backend_resolution(make_view()),
+                {
+                    "dsa_prefill_backend": "flashmla_auto",
+                    "dsa_decode_backend": "flashmla_kv",
+                },
+            )
+            for invalid in (
+                {"dsa_prefill_backend": "trtllm"},
+                {"dsa_decode_backend": "fa3"},
+                {"enable_hisparse": True},
+            ):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    _dsa_split_backend_resolution(make_view(**invalid))
+            with patch("torch.cuda.get_device_capability", return_value=(9, 0)):
+                with self.assertRaisesRegex(ValueError, "SM100"):
+                    _dsa_kv_cache_dtype_default(make_view())
+
     def test_flashinfer_allreduce_fusion_passes(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,

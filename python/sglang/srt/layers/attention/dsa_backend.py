@@ -335,6 +335,12 @@ class DeepseekSparseAttnBackend(
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
+        self.dsa_kv_cache_store_mxfp4 = getattr(
+            model_runner.token_to_kv_pool, "dsa_kv_cache_store_mxfp4", False
+        )
+        self.dsa_kv_cache_store_quantized = (
+            self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_mxfp4
+        )
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
@@ -2124,9 +2130,15 @@ class DeepseekSparseAttnBackend(
                         self.forward_metadata.page_table_1_flattened
                     )
                     assert page_table_1_flattened is not None
-                    kv_cache = dequantize_k_cache_paged(
-                        kv_cache, page_table_1_flattened
-                    )
+                    if self.dsa_kv_cache_store_mxfp4:
+                        cache_k_nope, cache_k_rope = self.token_to_kv_pool.get_mla_kv_buffer(
+                            layer, page_table_1_flattened
+                        )
+                        kv_cache = torch.cat((cache_k_nope, cache_k_rope), dim=-1)
+                    else:
+                        kv_cache = dequantize_k_cache_paged(
+                            kv_cache, page_table_1_flattened
+                        )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 
@@ -2896,7 +2908,7 @@ class DeepseekSparseAttnBackend(
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
-        if not self.dsa_kv_cache_store_fp8:
+        if not self.dsa_kv_cache_store_quantized:
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
@@ -2919,6 +2931,7 @@ class DeepseekSparseAttnBackend(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
             is_fp8_kvcache=True,
+            is_mxfp4_kvcache=self.dsa_kv_cache_store_mxfp4,
         )
 
         if target_q_heads != num_q_heads:
@@ -3558,7 +3571,7 @@ class DeepseekSparseAttnBackend(
 
         # Set MLA implementation only if not using MHA
         if not self.use_mha and self.enable_auto_select_prefill_impl:
-            if self.dsa_kv_cache_store_fp8:
+            if self.dsa_kv_cache_store_quantized:
                 if (
                     is_blackwell()
                     and forward_batch is not None
@@ -3584,7 +3597,7 @@ class DeepseekSparseAttnBackend(
         """
         if (
             # disable for MTP
-            self.dsa_kv_cache_store_fp8
+            self.dsa_kv_cache_store_quantized
             # flashmla_sparse_q8 shares flashmla_sparse's RAGGED prefill routing — the q8
             # dispatch lives inside the RAGGED branch of forward_extend; without this the
             # transform is PAGED, the q8 path is skipped, and the bf16 kernel crashes on
@@ -3629,6 +3642,7 @@ class DeepseekSparseAttnBackend(
             num_heads_q=num_heads_q,
             is_fp8_kvcache=True,
             topk=self.dsa_index_topk,
+            is_mxfp4_kvcache=self.dsa_kv_cache_store_mxfp4,
         )
 
         return DSAFlashMLAMetadata(
