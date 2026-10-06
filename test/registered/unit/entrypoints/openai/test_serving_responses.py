@@ -36,6 +36,7 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     _should_emit_normal_text_as_message,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import (
@@ -707,13 +708,18 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         }
 
     def _respond(
-        self, stream, constraint, outputs=None, tool_call_parser="response_template"
+        self,
+        stream,
+        constraint,
+        outputs=None,
+        reasoning_parser="beam",
+        tool_call_parser="beam",
     ):
         serving = make_serving()
         serving.default_chat_template_kwargs = None
-        serving.reasoning_parser = "response_template"
+        serving.reasoning_parser = reasoning_parser
         serving.tool_call_parser = tool_call_parser
-        serving._reasoning_detector = ResponseTemplateReasoningDetector(
+        serving._reasoning_detector = ReasoningParser.DetectorMap[reasoning_parser](
             response_template=self.TEMPLATE
         )
         serving.template_manager.reasoning_config = ReasoningToggleConfig(
@@ -785,7 +791,7 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         grammar = Grammar.from_structural_tag(params["structural_tag"])
         call = '<call:get_weather>{"city": "Paris"}</call>'
         for text, expected in (
-            (call, True),
+            (call, False),
             ("<think>Plan</think>" + call, True),
             ("<answer>Paris</answer>", False),
         ):
@@ -823,7 +829,12 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
                 )
                 for text, expected in accepted.items():
                     self.assertIs(_is_grammar_accept_string(grammar, text), expected)
-        self._respond(stream=False, constraint={})
+        self._respond(
+            stream=False,
+            constraint={},
+            reasoning_parser="response_template",
+            tool_call_parser="response_template",
+        )
         self.assertNotIn("structural_tag", self.sampling_params)
 
     def test_tool_call_is_parsed_under_delimited_template(self):

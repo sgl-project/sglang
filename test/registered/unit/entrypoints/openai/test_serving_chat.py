@@ -50,6 +50,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import (
     GRAMMAR_AFTER_REASONING,
     GRAMMAR_AT_ANSWER,
@@ -753,17 +754,20 @@ class ServingChatTestCase(CustomTestCase):
         self.tm.tokenizer.decode.assert_not_called()
 
     def _use_delimited_response_template(
-        self, reasoning_parser, template=_DELIMITED_RESPONSE_TEMPLATE
+        self,
+        reasoning_parser,
+        template=_DELIMITED_RESPONSE_TEMPLATE,
+        tool_call_parser="beam",
     ):
         self.tm.tokenizer.response_template = template
         self.tm.tokenizer.encode.side_effect = lambda text, **_: (
             [7] if text == "</call>" else [1, 2, 3] if text else []
         )
         self.tm.model_config.is_multimodal = True
-        self.chat.tool_call_parser = "response_template"
+        self.chat.tool_call_parser = tool_call_parser
         self.chat.reasoning_parser = reasoning_parser
         self.chat._reasoning_detector = (
-            ResponseTemplateReasoningDetector(response_template=template)
+            ReasoningParser.DetectorMap[reasoning_parser](response_template=template)
             if reasoning_parser
             else None
         )
@@ -821,14 +825,14 @@ class ServingChatTestCase(CustomTestCase):
         }
         json_object = {"response_format": {"type": "json_object"}}
         cases = {
-            "auto tool choice": ("response_template", {"tools": [_WEATHER_TOOL]}, None),
+            "auto tool choice": ("beam", {"tools": [_WEATHER_TOOL]}, None),
             "named tool with a template grammar": (
-                "response_template",
+                "beam",
                 {"tools": [_WEATHER_TOOL], "tool_choice": named},
                 None,
             ),
             "response_format after reasoning": (
-                "response_template",
+                "beam",
                 json_object,
                 GRAMMAR_AT_ANSWER,
             ),
@@ -838,7 +842,7 @@ class ServingChatTestCase(CustomTestCase):
                 GRAMMAR_FROM_START,
             ),
             "response_format, reasoning without an end token": (
-                "response_template",
+                "beam",
                 json_object,
                 GRAMMAR_FROM_START,
                 pattern_closed,
@@ -853,17 +857,17 @@ class ServingChatTestCase(CustomTestCase):
     def test_call_ended_by_another_stop_token_is_complete(self):
         """A complete call ended by a stop token other than its closer must not be
         dropped."""
-        self._use_delimited_response_template("response_template")
         text = '<think>Plan</think><call:get_weather>{"city": "Paris"}'
         stopped = self._stopped_on_token(text, 2)
         cut_off = copy.deepcopy(stopped)
         cut_off["meta_info"]["finish_reason"] = {"type": "length", "length": 9}
         weather = [("get_weather", {"city": "Paris"})]
-        for tool_choice, output, expected in (
-            ("required", stopped, weather),
-            ("required", cut_off, []),
-            ("auto", stopped, []),
+        for parser, tool_choice, output, expected in (
+            ("beam", "required", stopped, weather),
+            ("beam", "required", cut_off, []),
+            ("response_template", "auto", stopped, []),
         ):
+            self._use_delimited_response_template(parser, tool_call_parser=parser)
             for stream, incremental in ((False, False), (True, False), (True, True)):
                 with self.subTest(
                     choice=tool_choice, stream=stream, incremental=incremental
@@ -884,8 +888,8 @@ class ServingChatTestCase(CustomTestCase):
         keeps."""
         for reasoning_parser, constraint in (
             (None, {"tool_choice": "required"}),
-            ("response_template", {"tool_choice": "required"}),
-            ("response_template", {"response_format": {"type": "json_object"}}),
+            ("beam", {"tool_choice": "required"}),
+            ("beam", {"response_format": {"type": "json_object"}}),
         ):
             self._use_delimited_response_template(reasoning_parser)
             reasoning = "Check the forecast." if reasoning_parser else ""
@@ -911,7 +915,7 @@ class ServingChatTestCase(CustomTestCase):
     def test_kept_tool_closer_after_json_answer_is_trimmed(self):
         """A kept tool closer must not leak into a JSON answer, whichever increment
         brings it."""
-        self._use_delimited_response_template("response_template")
+        self._use_delimited_response_template("beam")
         output = self._stopped_on_token('<think>Plan</think><answer>{"a": 1}</call>', 7)
         for stream in (False, True):
             with self.subTest(stream=stream):
@@ -995,7 +999,7 @@ class ServingChatTestCase(CustomTestCase):
     def test_markers_in_call_arguments_under_json_answer_stay_arguments(self):
         """Answer or thinking markers in call arguments must not open a region before a
         JSON answer."""
-        self._use_delimited_response_template("response_template")
+        self._use_delimited_response_template("beam")
         for city in ("<answer>Paris", "<think>Plan</think>"):
             call = "<call:get_weather>" + json.dumps({"city": city}) + "</call>"
             for text, reasoning in ((call, ""), ("<think>Hm</think>" + call, "Hm")):
@@ -1014,7 +1018,7 @@ class ServingChatTestCase(CustomTestCase):
 
     def test_kept_tool_closer_after_answer_is_trimmed(self):
         """A kept tool closer that stopped an answer must not leak into its content."""
-        self._use_delimited_response_template("response_template")
+        self._use_delimited_response_template("beam")
         function = {**_WEATHER_TOOL["function"], "strict": True}
         answer = "<think>Hm</think><answer>Sunny.</call>"
         call = '<think>Hm</think><call:get_weather>{"city": "Paris"}</call>'
@@ -1038,16 +1042,16 @@ class ServingChatTestCase(CustomTestCase):
     def test_json_answer_keeps_the_answer_framing(self):
         """JSON output must not skip the answer opener, while a forced tool array stays
         bare JSON."""
-        self._use_delimited_response_template("response_template")
+        self._use_delimited_response_template("beam")
         answer, call = '<answer>{"a": 1}', '<call:get_weather>{"a": 1}</call>'
         for prompt, from_start, texts in (
             (
                 "<assistant>",
                 True,
                 {
-                    answer: True,
+                    answer: False,
                     "<think>Plan</think>" + answer: True,
-                    call: True,
+                    call: False,
                     "<answer>no": False,
                     '{"a": 1}': False,
                 },
@@ -1078,7 +1082,7 @@ class ServingChatTestCase(CustomTestCase):
         # the array.
         fields = _DELIMITED_RESPONSE_TEMPLATE["fields"]
         self._use_delimited_response_template(
-            "response_template",
+            "beam",
             {
                 **_DELIMITED_RESPONSE_TEMPLATE,
                 "fields": {
@@ -1103,7 +1107,7 @@ class ServingChatTestCase(CustomTestCase):
     def test_json_answer_is_served_as_the_json_it_ends_with(self):
         """The grammar must not admit an answer closer after the JSON, which would be
         served as JSON."""
-        self._use_delimited_response_template("response_template")
+        self._use_delimited_response_template("beam")
         fields = {"tools": [_WEATHER_TOOL], "response_format": {"type": "json_object"}}
         adapted, _ = self._convert_rendered_as("<assistant>", **fields)
         grammar = Grammar.from_structural_tag(adapted.sampling_params["structural_tag"])
@@ -1127,7 +1131,7 @@ class ServingChatTestCase(CustomTestCase):
     def test_json_answer_admits_only_calls_the_tool_parser_reads(self):
         """Before a JSON answer, the grammar must not admit calls the tool parser cannot
         read."""
-        self._use_delimited_response_template("response_template")
+        self._use_delimited_response_template("beam")
         fields = {"tools": [_WEATHER_TOOL], "response_format": {"type": "json_object"}}
         call = '<think>Hm</think><call:get_weather>{"city": "Paris"}</call>'
         answer = '<think>Hm</think><answer>{"a": 1}'
@@ -1160,7 +1164,7 @@ class ServingChatTestCase(CustomTestCase):
 
     def test_json_answer_admits_only_calls_the_tools_allow(self):
         """Before a JSON answer, the grammar must not admit calls to undeclared tools."""
-        self._use_delimited_response_template("response_template")
+        self._use_delimited_response_template("beam")
         fields = {"tools": [_WEATHER_TOOL], "response_format": {"type": "json_object"}}
         valid = '<think>Hm</think><call:get_weather>{"city": "Paris"}</call>'
         answer = '<think>Hm</think><answer>{"a": 1}'
@@ -1189,7 +1193,7 @@ class ServingChatTestCase(CustomTestCase):
     def test_other_output_constraints_reject_constrained_automatic_calls(self):
         """A client grammar must not silently drop the strictness or count of the tag it
         replaces."""
-        self._use_delimited_response_template("response_template")
+        self._use_delimited_response_template("beam")
         strict = copy.deepcopy(_WEATHER_TOOL)
         strict["function"]["strict"] = True
         structural_tag = {
@@ -1234,7 +1238,7 @@ class ServingChatTestCase(CustomTestCase):
             "open_pattern": r"<think>\s*",
             "close": "</think>",
         }
-        self._use_delimited_response_template("response_template", template)
+        self._use_delimited_response_template("beam", template)
         strict = {**_WEATHER_TOOL, "function": {**_WEATHER_TOOL["function"]}}
         strict["function"]["strict"] = True
         for tool, parallel_tool_calls in ((strict, True), (_WEATHER_TOOL, False)):
@@ -1278,7 +1282,7 @@ class ServingChatTestCase(CustomTestCase):
             "regex": {"regex": regex},
             "ebnf": {"ebnf": ebnf},
         }
-        self._use_delimited_response_template("response_template")
+        self._use_delimited_response_template("beam")
         for name, fields in constraints.items():
             with self.subTest(name):
                 _, request = self._convert_rendered_as(
@@ -1802,7 +1806,9 @@ class ServingChatTestCase(CustomTestCase):
         self.assertNotIn("structural_tag", adapted.sampling_params)
         del self.tm._config_overrides["grammar_backend"]
 
-        self._use_delimited_response_template("response_template")
+        self._use_delimited_response_template(
+            "response_template", tool_call_parser="response_template"
+        )
         adapted, _ = self._convert_rendered_as("<assistant>", tools=[_WEATHER_TOOL])
         self.assertNotIn("structural_tag", adapted.sampling_params)
 

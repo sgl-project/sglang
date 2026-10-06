@@ -16,10 +16,12 @@ from sglang.srt.entrypoints.openai.protocol import (
     Tool,
     ToolChoice,
 )
+from sglang.srt.function_call.beam_detector import BeamDetector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.gemma4_detector import (
     Gemma4Detector as Gemma4ToolDetector,
 )
+from sglang.srt.parser.beam import BeamReasoningDetector
 from sglang.srt.parser.reasoning_parser import Gemma4Detector as Gemma4ReasoningDetector
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import (
@@ -699,9 +701,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
     def test_json_after_reasoning_is_framed_as_the_answer(self):
         """JSON started at the reasoning end must not skip the answer opener, unless a
         call starts."""
-        detector = ResponseTemplateReasoningDetector(
-            response_template=DELIMITED_TEMPLATE
-        )
+        detector = BeamReasoningDetector(response_template=DELIMITED_TEMPLATE)
         call = '<call:get_weather>{"days": 3}</call>'
         declared = ["get_weather"]
         cases = [
@@ -739,9 +739,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
         template["fields"]["tool_calls"]["open_pattern"] = (
             r"<assistant><call:(?P<name>\w+)>"
         )
-        detector = ResponseTemplateToolDetector(
-            response_template=template, prefix="<assistant>"
-        )
+        detector = BeamDetector(response_template=template, prefix="<assistant>")
         call = '<call:get_weather>{"days": 3}</call>'
 
         tag = detector.get_structural_tag(
@@ -760,9 +758,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
     def test_message_start_call_opener_may_nest_its_name(self):
         template = copy.deepcopy(DELIMITED_TEMPLATE)
         template["fields"]["tool_calls"]["open_pattern"] = r"(?:<call:(?P<name>\w+)>)"
-        detector = ResponseTemplateToolDetector(
-            response_template=template, prefix="<assistant>"
-        )
+        detector = BeamDetector(response_template=template, prefix="<assistant>")
         call = '<call:get_weather>{"days": 3}</call>'
 
         tag = detector.get_structural_tag(
@@ -1161,7 +1157,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
             with self.subTest(requested):
                 kind, tag = FunctionCallParser(
                     tools=tools,
-                    tool_call_parser="response_template",
+                    tool_call_parser="beam",
                     tokenizer=SimpleNamespace(response_template=DELIMITED_TEMPLATE),
                 ).get_structure_constraint("auto", parallel_tool_calls=parallel)
                 grammar = Grammar.from_structural_tag(tag.model_dump_json())
@@ -1170,7 +1166,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
 
                 parser = FunctionCallParser(
                     tools=tools,
-                    tool_call_parser="response_template",
+                    tool_call_parser="beam",
                     tokenizer=SimpleNamespace(
                         response_template=GEMMA4_RESPONSE_TEMPLATE
                     ),
@@ -1219,7 +1215,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
                 untyped.function.strict = strict
                 parser = FunctionCallParser(
                     tools=[untyped],
-                    tool_call_parser="response_template",
+                    tool_call_parser="beam",
                     tokenizer=SimpleNamespace(response_template=XML_TOOL_TEMPLATE),
                 )
                 self.assertEqual(
