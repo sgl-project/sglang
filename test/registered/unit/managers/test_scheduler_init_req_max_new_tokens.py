@@ -1,13 +1,15 @@
 import logging
 import unittest
 from array import array
+from http import HTTPStatus
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import validate_input_length
@@ -404,6 +406,7 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
         scheduler.processed_tokens_counter = 0
         scheduler.enable_overlap = False
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.req_to_token_pool = SimpleNamespace(
             available_size=lambda: 8, device="cpu"
         )
@@ -428,7 +431,7 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
         scheduler.waiting_queue = [oversized]
         running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
 
-        with get_parallel().override(pp_max_micro_batch_size=8):
+        with get_parallel().override(pp_max_micro_batch_size=8, tp_rank=0):
             batch, running_batch = scheduler._get_new_batch_prefill_raw(
                 None, running_batch
             )
@@ -454,21 +457,18 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
         self.assertEqual(scheduler.waiting_queue, [])
         self.assertFalse(running_batch.batch_is_full)
 
-    @patch("sglang.srt.managers.scheduler.Req")
-    def test_oversized_embedding_request_is_finished_before_queueing(self, req_cls):
+    def test_oversized_embedding_request_is_finished_before_queueing(self):
         scheduler = object.__new__(Scheduler)
         scheduler.tokenizer = object()
         scheduler.max_req_input_len = 448
-        scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
-        scheduler._add_request_to_queue = MagicMock()
+        scheduler.waiting_queue = []
+        scheduler._add_request_to_queue = scheduler.waiting_queue.append
 
-        req = req_cls.return_value
-        req.origin_input_ids = [1] * 448
         recv_req = SimpleNamespace(
             rid="oversized-embedding",
             input_text=None,
-            input_ids=req.origin_input_ids,
-            sampling_params=SimpleNamespace(max_new_tokens=0),
+            input_ids=array("q", [1] * 448),
+            sampling_params=SamplingParams(max_new_tokens=0),
             positional_embed_overrides=None,
             token_type_ids=None,
             routed_dp_rank=None,
@@ -483,11 +483,16 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
             mm_inputs=None,
         )
 
-        scheduler.handle_embedding_request(recv_req)
+        with get_parallel().override(tp_rank=0):
+            scheduler.handle_embedding_request(recv_req)
 
-        error_msg = req.set_finish_with_abort.call_args.args[0]
-        self.assertIn("Input length (448 tokens)", error_msg)
-        scheduler._add_request_to_queue.assert_called_once_with(req)
+        self.assertEqual(len(scheduler.waiting_queue), 1)
+        req = scheduler.waiting_queue[0]
+        self.assertEqual(req.rid, "oversized-embedding")
+        self.assertIsInstance(req.to_finish, FINISH_ABORT)
+        self.assertEqual(req.to_finish.status_code, HTTPStatus.BAD_REQUEST)
+        self.assertIn("Input length (448 tokens)", req.to_finish.message)
+        self.assertEqual(len(req.origin_input_ids), 1)
 
 
 if __name__ == "__main__":
