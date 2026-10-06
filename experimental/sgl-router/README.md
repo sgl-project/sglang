@@ -259,7 +259,8 @@ the prefill rank.
 `--retry-max-attempts N` (default 1, which disables retries; 3 is typical) lets
 a request that fails before any response reaches the client be sent again to a
 worker it has not tried yet. A failure is a transport error, an open circuit
-breaker, a 5xx, or a 429. Once a streaming response's 2xx status has been sent,
+breaker, a 5xx, a 429, or a timeout: `--request-timeout-secs` bounds a whole
+non-streaming response, and a streaming one until its headers arrive. Once a streaming response's 2xx status has been sent,
 it is never retried, and neither is any other 2xx or 4xx. In PD mode the failed
 side is excluded, or both sides when the caller set `rid`, which an engine still
 running it would refuse; a new pair gets a new bootstrap room. Retries share the
