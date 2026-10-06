@@ -93,7 +93,7 @@ def auto_size_hicache(
         return
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)
-    budget = int(host_memory_budget_bytes() * fraction)
+    budget = int(host_memory_budget_bytes(auto_size=True) * fraction)
     ratio = min(requested, budget * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes)
     # One collective before any pool is built: PP stages own different pool
     # counts, so a per-pool collective could deadlock.

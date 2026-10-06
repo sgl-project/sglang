@@ -349,7 +349,8 @@ class DeepseekSparseAttnBackend(
     extend_dummy_seqs_capped_by_req_pool: bool = True
     # Decode/verify/draft graph replay rebuilds metadata from static buffers
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
-    # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
+    # the D2H sync. The eager fallback derives lengths from GPU seq_lens, and the
+    # KPool indexer reads the host mirror only for extend, which always has it.
     needs_cpu_seq_lens: bool = False
     # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
     # branch of __init__ allocates one.
@@ -368,7 +369,6 @@ class DeepseekSparseAttnBackend(
         self.forward_metadata: DSAMetadata
         self.device = model_runner.device
         assert isinstance(model_runner.page_size, int)
-        self.real_page_size = model_runner.page_size
         self.num_splits = (
             1 if get_exec().deterministic.enable_deterministic_inference else 0
         )
@@ -380,7 +380,7 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
-        self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
+        self.real_page_size = model_runner.page_size // self.dsa_index_kpool
         self._init_kpool_metadata_fusion()
         self.max_context_len = model_runner.model_config.context_len
         self._memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -394,6 +394,8 @@ class DeepseekSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        # FlashMLA cannot tell the 528 B/token zero-RoPE cache from V4.1 by shape.
+        self.flashmla_kv_format = "V32_NO_ROPE" if self.qk_rope_head_dim == 0 else "V32"
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -2984,6 +2986,7 @@ class DeepseekSparseAttnBackend(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
             is_fp8_kvcache=True,
+            kv_format=self.flashmla_kv_format,
         )
 
         if target_q_heads != num_q_heads:

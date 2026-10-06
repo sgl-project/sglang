@@ -96,37 +96,24 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                     reset_context()
 
     def test_step3_shared_and_routed_outputs_have_one_completion(self):
+        """The MoE adds its shared and routed partial outputs and leaves their
+        one sum to the stage boundary."""
         from sglang.srt.models.step3_vl import Step3TextDecoderLayer
 
-        parallel = SimpleNamespace(tp_size=2)
         for fused_shared in (False, True):
-            for deferred in (False, True):
-                calls = []
-                layer = SimpleNamespace(
-                    num_fused_shared_experts=int(fused_shared),
-                    moe=lambda x: x * (0.75 if fused_shared else 0.25),
-                    share_expert=lambda x: x * 0.5,
-                )
-                with (
-                    patch.object(moe_utils, "get_parallel", return_value=parallel),
-                    patch.object(
-                        moe_utils, "post_experts_output_is_complete", return_value=False
-                    ),
-                    patch(
-                        "sglang.srt.distributed.communication_op.tensor_model_parallel_all_reduce",
-                        side_effect=lambda x: calls.append("AR") or x * 2,
-                    ),
-                    get_forward().scoped(
-                        fuse_mlp_allreduce=deferred, mlp_reduce_scatter=False
-                    ),
-                ):
-                    result = Step3TextDecoderLayer.moe_mlp_forward(
-                        layer, torch.ones(2, 4)
-                    )
-                self.assertEqual(calls, [] if deferred else ["AR"])
-                torch.testing.assert_close(
-                    result, torch.full((2, 4), 0.75 if deferred else 1.5)
-                )
+            calls = []
+            layer = SimpleNamespace(
+                num_fused_shared_experts=int(fused_shared),
+                moe=lambda x: x * (0.75 if fused_shared else 0.25),
+                share_expert=lambda x: x * 0.5,
+            )
+            with patch(
+                "sglang.srt.distributed.communication_op.tensor_model_parallel_all_reduce",
+                side_effect=lambda x: calls.append("AR") or x * 2,
+            ):
+                result = Step3TextDecoderLayer.moe_mlp_forward(layer, torch.ones(2, 4))
+            self.assertEqual(calls, [])
+            torch.testing.assert_close(result, torch.full((2, 4), 0.75))
 
     def test_dp_skip_and_collective_are_selected_together(self):
         import itertools
@@ -147,6 +134,10 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                     calls.append(step.__name__)
                     return value[:1]
 
+                def summed(value, *args, **kwargs):
+                    calls.append("AR")
+                    return value * 2
+
                 selected = (
                     "dp_reduce_scatterv"
                     if varlen and policy in ("rsv", "rs+rsv")
@@ -159,21 +150,25 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                     patch_communicator("should_use_dp_reduce_scatterv", lambda: varlen),
                     patch_communicator("can_use_dp_reduce_scatter", lambda: can_rs),
                     patch_communicator("to_dp_local", move),
+                    patch_communicator("sum_output", summed),
                 ):
                     with layer.ffn.plan.output.ffn_exit(
                         self.batch(max_len), stream=ResidualStream()
                     ) as output:
-                        self.assertEqual(
-                            get_forward().mlp_reduce_scatter,
-                            selected != "_dp_scatter_step",
-                        )
+                        self.assertFalse(get_forward().mlp_reduce_scatter)
                     result, _ = finish_exit(output, torch.ones(2, 4), torch.zeros(1, 4))
-                self.assertEqual(calls, [selected])
+                # A reduce-scatter completes the sum on the way back; a scatter
+                # follows the exit's own all-reduce.
+                self.assertEqual(
+                    calls,
+                    ["AR", selected] if selected == "_dp_scatter_step" else [selected],
+                )
                 self.assertEqual(result.shape, (1, 4))
 
-    def test_postprocess_only_scatters_an_already_reduced_output(self):
-        # The operation-scheduled API used by LongCat NextN receives an MLP
-        # output that was already summed. An enabled RSv must not sum it again.
+    def test_complete_now_sums_then_only_scatters(self):
+        # The operation-scheduled path (two-batch overlap) never defers: it
+        # completes the sum its output owes, then only scatters, whatever the
+        # reduce-scatter policy.
         for policy in ("ar", "rs", "rsv", "rs+rsv"):
             for varlen in (False, True):
                 with self.subTest(policy=policy, varlen=varlen):
@@ -191,6 +186,10 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                         calls.append(step.__name__)
                         return value[:1]
 
+                    def summed(value, *args, **kwargs):
+                        calls.append("AR")
+                        return value * 2
+
                     with (
                         fixture.planning(parallel),
                         patch_communicator(
@@ -198,11 +197,12 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                         ),
                         patch_communicator("can_use_dp_reduce_scatter", lambda: True),
                         patch_communicator("to_dp_local", move),
+                        patch_communicator("sum_output", summed),
                     ):
-                        output = layer.ffn.finish_complete_output(hidden, batch)
+                        output = layer.ffn.complete_now(hidden, batch)
                         value, saved_residual = batch.residual_stream.export(output)
-                    self.assertEqual(calls, ["_dp_scatter_step"])
-                    torch.testing.assert_close(value, hidden[:1])
+                    self.assertEqual(calls, ["AR", "_dp_scatter_step"])
+                    torch.testing.assert_close(value, hidden[:1] * 2)
                     self.assertIs(saved_residual, residual)
 
     def test_moe_cannot_skip_from_topology_without_boundary_request(self):
@@ -213,17 +213,15 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
             ),
         ):
             for skip in (False, True):
-                with get_forward().scoped(
-                    fuse_mlp_allreduce=False, mlp_reduce_scatter=skip
-                ):
+                with get_forward().scoped(mlp_reduce_scatter=skip):
                     self.assertEqual(
                         moe_utils.should_skip_post_experts_all_reduce(is_tp_path=True),
                         skip,
                     )
 
-    def test_output_transform_stays_before_transport_and_after_producer_ar(self):
-        # The compute stub obeys the same skip flag as RowParallelLinear.
-        # Its trace distinguishes AR -> multiply from multiply -> RS.
+    def test_output_transform_stays_before_transport_and_after_the_sum(self):
+        # The trace distinguishes AR -> multiply from multiply -> RS; the
+        # exit runs the all-reduce, the compute never does.
         for disabled in (False, True):
             with self.subTest(disabled=disabled):
                 calls = []
@@ -248,19 +246,21 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                         calls.append("slice")
                     return value[:1]
 
+                def summed(value, *args, **kwargs):
+                    calls.append("AR")
+                    return value * 2
+
                 with (
                     fixture.planning(parallel),
                     patch_communicator("should_use_dp_reduce_scatterv", lambda: False),
                     patch_communicator("can_use_dp_reduce_scatter", lambda: True),
                     patch_communicator("to_dp_local", move),
+                    patch_communicator("sum_output", summed),
                 ):
                     with layer.ffn.plan.output.ffn_exit(
                         self.batch(), stream=ResidualStream()
                     ) as output:
                         value = torch.ones(2, 4)
-                        if not get_forward().mlp_reduce_scatter:
-                            calls.append("AR")
-                            value = value * 2
                     value, _ = finish_exit(output, value, torch.zeros(1, 4))
                 self.assertEqual(
                     calls,
