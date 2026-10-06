@@ -753,8 +753,7 @@ class MiniScheduler:
         req.init_next_round_input(cache)
         result.host_hits[req.rid] = req.host_hit_length
 
-        guard = cache.inc_lock_ref(req.last_node)
-        guard_node = req.last_node
+        guard = cache.lock(req.last_node)
         if req.needs_host_load_back():
             new_indices, req.last_node = cache.init_load_back(
                 InitLoadBackParams(
@@ -765,10 +764,9 @@ class MiniScheduler:
             )
             req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
             req.kv.cache_protected_len = len(req.prefix_indices)
-        # _req_inc_lock_ref, then release the guard.
-        cache.inc_lock_ref(req.last_node)
-        req.skip_lock_node_ids = {}
-        cache.dec_lock_ref(guard_node, guard.to_dec_params())
+        # _commit_prefill_admission, then release the guard.
+        req.lock = cache.lock(req.last_node)
+        cache.unlock(guard)
 
         prefix_len = len(req.prefix_indices)
         take = min(len(req.origin_input_ids) - prefix_len, self.max_prefill_tokens)
