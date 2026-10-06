@@ -28,6 +28,7 @@ from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -121,16 +122,17 @@ class DeepseekModelNextN(nn.Module):
             layer_name = "layers." + str(config.num_hidden_layers)
 
         self.quant_config = quant_config
-        self.decoder = DeepseekV2DecoderLayer(
-            config,
-            0,
-            quant_config=quant_config,
-            moe_quant_config_override=moe_quant_config_override,
-            is_nextn=True,
-            prefix=add_prefix(layer_name, prefix),
-            alt_stream=self.alt_stream,
-            skip_rope=config.qk_rope_head_dim == 0,
-        )
+        with layer_stack():
+            self.decoder = DeepseekV2DecoderLayer(
+                config,
+                0,
+                quant_config=quant_config,
+                moe_quant_config_override=moe_quant_config_override,
+                is_nextn=True,
+                prefix=add_prefix(layer_name, prefix),
+                alt_stream=self.alt_stream,
+                skip_rope=config.qk_rope_head_dim == 0,
+            )
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -228,7 +230,7 @@ class DeepseekModelNextN(nn.Module):
                 )
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                hidden_states = residual_batch.norm(
+                hidden_states = residual_batch.final_norm(
                     hidden_states, forward_batch, self.shared_head.norm
                 )
 
@@ -277,7 +279,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_parallel().pp_group

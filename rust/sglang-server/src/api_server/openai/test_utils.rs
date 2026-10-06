@@ -20,7 +20,7 @@ use serde_json::json;
 use tower::util::ServiceExt;
 
 use super::{indexed_decode_stream, openai_error, routes};
-use crate::frontend::{FrontendCall, FrontendHandle};
+use crate::frontend::{FrontendCall, FrontendEvent, FrontendHandle};
 use crate::message::config::ServerArgs;
 use crate::message::response::{ChunkEvent, ResponseItem};
 pub(super) fn frontend() -> FrontendHandle {
@@ -33,6 +33,7 @@ pub(super) fn frontend() -> FrontendHandle {
             startup_ready: false,
             is_disaggregation: false,
             mm_limits: Default::default(),
+            metadata: crate::frontend::FrontendMetadata::from(server_args().as_ref()),
         },
     )
 }
@@ -130,6 +131,7 @@ pub(super) fn frontend_closed() -> FrontendHandle {
             startup_ready: false,
             is_disaggregation: false,
             mm_limits: Default::default(),
+            metadata: crate::frontend::FrontendMetadata::from(server_args().as_ref()),
         },
     )
 }
@@ -170,7 +172,7 @@ async fn dropping_indexed_stream_aborts_its_live_call() {
     response_tx.send(chunk("live", "x", false)).await.unwrap();
     assert!(matches!(
         stream.next().await,
-        Some((0, Some(ResponseItem::Frame(_))))
+        Some((0, FrontendEvent::Delta(_)))
     ));
 
     drop(stream);

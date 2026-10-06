@@ -24,9 +24,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -37,11 +37,10 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import should_add_replicated_moe_output
+from sglang.srt.layers.moe.utils import adds_replicated_output_to_partial
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -55,7 +54,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import LazyValue, add_prefix, make_layers
+from sglang.srt.utils import LazyValue, add_prefix, make_pp_layers
 
 logger = logging.getLogger(__name__)
 
@@ -105,8 +104,6 @@ class LagunaMLP(nn.Module):
     ) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        # RowParallelLinear honors ForwardFlags (fuse_mlp_allreduce /
-        # mlp_reduce_scatter) published by the decoder via scoped().
         x, _ = self.down_proj(x)
         return x
 
@@ -226,8 +223,7 @@ class LagunaMoE(nn.Module):
         else:
             final = routed_out + shared_out
 
-        final = reduce_moe_output(final)
-        if self._shared_expert_tp1 and should_add_replicated_moe_output():
+        if self._shared_expert_tp1 and adds_replicated_output_to_partial():
             final = final + shared_out
         return final
 
@@ -429,7 +425,6 @@ class LagunaDecoderLayer(nn.Module):
 
         mlp_types = config.mlp_layer_types
         self.is_layer_sparse = mlp_types[layer_id] == "sparse"
-        is_previous_layer_sparse = layer_id > 0 and mlp_types[layer_id - 1] == "sparse"
         is_next_layer_sparse = (
             layer_id + 1 < config.num_hidden_layers
             and mlp_types[layer_id + 1] == "sparse"
@@ -448,7 +443,7 @@ class LagunaDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                reduce_results=True,
+                reduce_results=False,
                 prefix=add_prefix("mlp", prefix),
             )
 
@@ -457,21 +452,15 @@ class LagunaDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -482,7 +471,7 @@ class LagunaDecoderLayer(nn.Module):
         capture_output=None,
     ) -> torch.Tensor:
         hidden_states = self.attn_boundary.prepare(
-            hidden_states, forward_batch, capture_output=capture_output
+            hidden_states, forward_batch, capture=capture_output
         )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -493,12 +482,11 @@ class LagunaDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch=forward_batch,
-            )
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.mlp(
+            hidden_states,
+            forward_batch=forward_batch,
+        )
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
         return hidden_states
 
 
@@ -527,7 +515,7 @@ class LagunaModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         decoder_layer_type = decoder_layer_type or LagunaDecoderLayer
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
@@ -535,8 +523,6 @@ class LagunaModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -607,17 +593,15 @@ class LagunaModel(nn.Module):
 
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
-        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
-
-        if hidden_states.shape[0] != 0:
-            hidden_states = residual_batch.norm(
-                hidden_states,
-                forward_batch,
-                self.norm,
-                capture_output=aux_hidden_states.append
-                if self.end_layer in self.layers_to_capture
-                else None,
-            )
+        hidden_states = residual_batch.final_norm(
+            hidden_states,
+            forward_batch,
+            self.norm,
+            capture=aux_hidden_states.append
+            if self.end_layer in self.layers_to_capture
+            else None,
+            skip_empty=True,
+        )
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
