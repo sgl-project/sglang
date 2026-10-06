@@ -506,17 +506,13 @@ class AscendAttnBackend(AttentionBackend):
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
 
-    def _use_dense_mla_dcp(self, *, target_only: bool = True) -> bool:
-        """Read the live DCP context, restricting metadata to target workers.
-
-        Ordinary decode uses the caller's DCP context directly (target_only=False),
-        preserving its existing dispatch contract.
-        """
+    def _use_dense_mla_dcp(self) -> bool:
+        """Whether target dense MLA uses DCP; excludes DSA and draft workers."""
         return (
             self.use_mla
             and not self.use_dsa
             and get_parallel().dcp_enabled
-            and (not target_only or not self.is_draft_worker)
+            and not self.is_draft_worker
         )
 
     def _use_dsa_dcp(self) -> bool:
@@ -3311,7 +3307,9 @@ class AscendAttnBackend(AttentionBackend):
         **kwargs,
     ):
         return_softmax_lse = bool(kwargs.pop("return_softmax_lse", False))
-        dense_mla_dcp_decode = self._use_dense_mla_dcp(target_only=False)
+        dense_mla_dcp_decode = (
+            self.use_mla and not self.use_dsa and get_parallel().dcp_enabled
+        )
         if dense_mla_dcp_decode and not self.use_fia:
             raise NotImplementedError(
                 "Kimi-K3 NPU DCP decode requires Ascend FIA. Set ASCEND_USE_FIA=1."
