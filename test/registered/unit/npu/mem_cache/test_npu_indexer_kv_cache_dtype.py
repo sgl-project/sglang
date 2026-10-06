@@ -95,21 +95,26 @@ if HAVE_NPU:
         NPUMLATokenToKVPool,
     )
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+    from sglang.srt.runtime_context import get_parallel
 
     def _make_pool(indexer_quant_mode=None) -> NPUMLATokenToKVPool:
-        return NPUMLATokenToKVPool(
-            size=SIZE,
-            page_size=PAGE_SIZE,
-            dtype=torch.float8_e4m3fn,
-            kv_lora_rank=KV_LORA_RANK,
-            qk_rope_head_dim=QK_ROPE_HEAD_DIM,
-            layer_num=LAYER_NUM,
-            device="npu",
-            enable_memory_saver=False,
-            index_head_dim=INDEX_HEAD_DIM,
-            kv_cache_dim=KV_CACHE_DIM,
-            indexer_quant_mode=indexer_quant_mode,
-        )
+        # The pool reads the DCP topology from the runtime parallel context,
+        # which nothing publishes in a unit test; state the single-rank
+        # widths explicitly.
+        with get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0):
+            return NPUMLATokenToKVPool(
+                size=SIZE,
+                page_size=PAGE_SIZE,
+                dtype=torch.float8_e4m3fn,
+                kv_lora_rank=KV_LORA_RANK,
+                qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+                layer_num=LAYER_NUM,
+                device="npu",
+                enable_memory_saver=False,
+                index_head_dim=INDEX_HEAD_DIM,
+                kv_cache_dim=KV_CACHE_DIM,
+                indexer_quant_mode=indexer_quant_mode,
+            )
 
     def _make_host_pool(pool: NPUMLATokenToKVPool) -> MLATokenToKVPoolHost:
         # The host mirror is only allocated in the page_first_kv_split
