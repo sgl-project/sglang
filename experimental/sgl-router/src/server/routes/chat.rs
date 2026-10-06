@@ -173,8 +173,17 @@ impl<'a> ModelRouting<'a> {
         let mut duration = None;
         for attempt in 0..ctx.config.proxy.max_attempts.get() {
             if attempt > 0 {
-                // Back off before selecting, so the pick sees fresh breaker and load state.
-                tokio::time::sleep(ctx.config.proxy.backoff(attempt)).await;
+                // A retry never starts past the request's stale deadline, so the
+                // backoff is capped by what remains of it. Backing off before
+                // selecting lets the pick see fresh breaker and load state.
+                let deadline = ctx.router_inflight_load.stale_request_timeout();
+                let Some(remaining) = deadline.checked_sub(start.elapsed()) else {
+                    break;
+                };
+                tokio::time::sleep(ctx.config.proxy.backoff(attempt).min(remaining)).await;
+                if start.elapsed() >= deadline {
+                    break;
+                }
             }
             let workers = match self
                 .select_workers(ctx, &request, &headers, &excluded)
@@ -192,13 +201,11 @@ impl<'a> ModelRouting<'a> {
             let attempt =
                 forward_request(ctx, &mut request, workers, headers.clone(), start, duration)
                     .await?;
-            match attempt.retry_excluding {
-                Some(worker) => {
-                    excluded.push(worker);
-                    failed = Some(attempt.response);
-                }
-                None => return Ok(attempt.response),
+            if attempt.retry_excluding.is_empty() {
+                return Ok(attempt.response);
             }
+            excluded.extend(attempt.retry_excluding);
+            failed = Some(attempt.response);
         }
         Ok(failed.expect("at least one attempt"))
     }

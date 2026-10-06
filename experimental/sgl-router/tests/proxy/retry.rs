@@ -18,6 +18,9 @@ use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::{AppContext, ChatRouting};
+use sgl_router::state::load_monitor::router_inflight_load::{
+    RouterInflightLoadRegistry, SystemTimeClock,
+};
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
 use std::num::NonZeroU32;
@@ -104,16 +107,16 @@ fn router_ctx(
 }
 
 fn chat(stream: bool) -> Request<Body> {
+    chat_with(json!({"stream": stream}))
+}
+
+/// A chat request carrying `fields` on top of the model and one message.
+fn chat_with(mut fields: Value) -> Request<Body> {
+    fields["model"] = json!("tiny");
+    fields["messages"] = json!([{"role": "user", "content": "hi"}]);
     Request::post("/v1/chat/completions")
         .header("content-type", "application/json")
-        .body(Body::from(
-            json!({
-                "model": "tiny",
-                "stream": stream,
-                "messages": [{"role": "user", "content": "hi"}],
-            })
-            .to_string(),
-        ))
+        .body(Body::from(fields.to_string()))
         .unwrap()
 }
 
@@ -333,4 +336,71 @@ async fn pd_retry_repairs_around_the_failed_side() {
         );
         assert!(retries(&ctx) >= 1);
     }
+}
+
+/// A caller's rid may still be live on the failed pair's prefill, so the retry
+/// avoids both sides; with a single prefill there is nothing left to retry on.
+#[tokio::test]
+async fn pd_retry_with_a_caller_rid_avoids_the_whole_pair() {
+    for reorg in [false, true] {
+        let prefill = MockWorker::start(vec![]).await;
+        let failing_decode =
+            MockWorker::start_returning_error(StatusCode::SERVICE_UNAVAILABLE, rejected()).await;
+        let decode = MockWorker::start(vec![]).await;
+        let ctx = router_ctx(
+            &[
+                ("p", &prefill.url, WorkerMode::Prefill),
+                ("d-failing", &failing_decode.url, WorkerMode::Decode),
+                ("d", &decode.url, WorkerMode::Decode),
+            ],
+            3,
+            reorg,
+        );
+        let app = build_router(ctx.clone());
+        for _ in 0..50 {
+            let request = chat_with(json!({"rid": "caller-rid"}));
+            let status = app.clone().oneshot(request).await.unwrap().status();
+            if hit(&failing_decode) {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "reorg={reorg}");
+                break;
+            }
+            assert_eq!(status, StatusCode::OK, "reorg={reorg}");
+        }
+        assert!(
+            hit(&failing_decode),
+            "reorg={reorg}: failing decode never picked"
+        );
+        assert_eq!(retries(&ctx), 0, "reorg={reorg}");
+    }
+}
+
+/// Retries share the request's stale deadline: none starts once it has passed.
+#[tokio::test]
+async fn retries_stop_at_the_request_deadline() {
+    let workers = [
+        MockWorker::start_hanging(Duration::from_secs(5)).await,
+        MockWorker::start_hanging(Duration::from_secs(5)).await,
+        MockWorker::start_hanging(Duration::from_secs(5)).await,
+    ];
+    let mut ctx = router_ctx(
+        &[
+            ("a", &workers[0].url, WorkerMode::Plain),
+            ("b", &workers[1].url, WorkerMode::Plain),
+            ("c", &workers[2].url, WorkerMode::Plain),
+        ],
+        3,
+        false,
+    );
+    // Each attempt times out after 200 ms; the request may live 300 ms.
+    let context = Arc::get_mut(&mut ctx).unwrap();
+    context.proxy = Arc::new(Proxy::new(Duration::from_millis(200)).unwrap());
+    context.router_inflight_load =
+        RouterInflightLoadRegistry::new(Arc::new(SystemTimeClock), Duration::from_millis(300));
+    let response = build_router(ctx.clone())
+        .oneshot(chat(false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(workers.iter().filter(|worker| hit(worker)).count(), 2);
+    assert_eq!(retries(&ctx), 1);
 }
