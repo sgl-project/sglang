@@ -111,6 +111,7 @@ from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_strea
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
+    get_memory,
     get_parallel,
     get_spec,
 )
@@ -395,6 +396,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         enable_mamba_track = (
             get_exec().mamba.enable_mamba_extra_buffer
+            and not get_memory().radix_cache_skip_decode_insert
             and self.model_runner.spec_algorithm.is_none()
         )
 

@@ -113,7 +113,13 @@ def _platform_supports_mamba_cache_extra_buffer() -> bool:
 
 
 def validate_mamba_extra_buffer(view, hf_config: Any, *, mamba_cache_chunk_size_of):
-
+    if view.radix_cache_skip_decode_insert:
+        assert view.disaggregation_mode == "null", (
+            "skip-decode-insert supports AGG only"
+        )
+        assert not view.enable_session_radix_cache, (
+            "skip-decode-insert excludes sessions"
+        )
     assert supports_mamba_cache_extra_buffer(view, hf_config), (
         f"extra_buffer is not supported for {hf_config.architectures[0]}; use no_buffer."
     )

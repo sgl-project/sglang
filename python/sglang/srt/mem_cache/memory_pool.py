@@ -1787,6 +1787,20 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
 
+    def free_mamba_track_cache(self, req: Req):
+        """Release request-owned snapshots after prefill, keeping its live state."""
+        buf = req.kv.mamba_ping_pong_track_buffer
+        if buf is None:
+            return
+        self.mamba_allocator.free(buf[buf != -1])
+        self.req_index_to_mamba_ping_pong_track_buffer_mapping[
+            req.kv.req_pool_idx
+        ].fill_(-1)
+        req.kv.mamba_ping_pong_track_buffer = None
+        req.kv.mamba_next_track_idx = req.kv.mamba_last_track_idx = None
+        req.kv.mamba_last_track_seqlen = None
+        req.kv.mamba_prev_track_seqlen = None
+
     def free_mamba_cache(
         self, req: Req, mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
     ):
@@ -1795,7 +1809,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_allocator.free(mamba_index.unsqueeze(0))
         req.kv.mamba_pool_idx = None
 
-        if self.enable_mamba_extra_buffer:
+        if (
+            self.enable_mamba_extra_buffer
+            and req.kv.mamba_ping_pong_track_buffer is not None
+        ):
             mamba_ping_pong_track_buffer_to_free = (
                 self.req_index_to_mamba_ping_pong_track_buffer_mapping[
                     req.kv.req_pool_idx
@@ -1845,9 +1862,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             req.kv.mamba_next_track_idx = None
             req.kv.mamba_last_track_idx = None
             req.kv.mamba_last_track_seqlen = None
-            req.kv.mamba_prev_track_seqlen = None
-            req.kv.mamba_cow_src_index = None
-            req.kv.mamba_needs_clear = False
+        req.kv.mamba_prev_track_seqlen = None
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
