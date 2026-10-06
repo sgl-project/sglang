@@ -73,7 +73,7 @@ def _residual_gate_add_cuda_impl(
 
 
 @triton.jit
-def _round16_f32(x, IS_BF16: tl.constexpr):
+def _cuda_round16_f32(x, IS_BF16: tl.constexpr):
     if IS_BF16:
         bits = tl.inline_asm_elementwise(
             "cvt.rn.bf16.f32 $0, $1;", "=h,r", [x], dtype=tl.int16, is_pure=True, pack=1
@@ -118,7 +118,7 @@ def _rga_transposed(
     uv = tl.load(upd + base + t[None, :] * hid + h[:, None], mask=m2, other=0.0)
     if IS_16:
         p32 = uv.to(tl.float32) * gv[:, None].to(tl.float32)
-        pf = _round16_f32(p32, IS_BF16)
+        pf = _cuda_round16_f32(p32, IS_BF16)
         o32 = rv.to(tl.float32) + pf
         if IS_BF16:
             bits = tl.inline_asm_elementwise(
