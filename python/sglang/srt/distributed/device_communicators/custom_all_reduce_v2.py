@@ -145,7 +145,7 @@ class CustomAllReduceV2:
         if max_pull_size is None:
             max_pull_size = min(base_config.max_pull_bytes, max_size)
         if max_push_size is None:
-            max_push_size = min(base_config.max_push_bytes, max_size)
+            max_push_size = min(base_config.max_push_bytes(self.world_size), max_size)
         if _FORCE_PULL_SIZE_KB is not None:
             max_pull_size = int(_FORCE_PULL_SIZE_KB) * 1024
         if _FORCE_PUSH_SIZE_KB is not None:
@@ -185,7 +185,9 @@ class CustomAllReduceV2:
         if max_push_blocks is not None:
             num_push_blocks = max(max_push_blocks, 1)
         self.config = base_config.clip(
-            max_push_bytes=self.max_push_size, max_pull_bytes=self.max_pull_size
+            max_push_bytes=self.max_push_size,
+            max_pull_bytes=self.max_pull_size,
+            world_size=self.world_size,
         )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
         self.override_algo: Optional[AllReduceAlgo] = None
         # On a multi-node (MNNVL) group the symm-mem workspace plane works
@@ -338,6 +340,8 @@ class CustomAllReduceV2:
         can_use_multicast = self.config.num_mc_blocks is not None
         if nbytes <= heuristic.one_shot_push_threshold:
             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
+        if nbytes <= heuristic.two_shot_push_threshold:
+            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PUSH)
         if nbytes <= heuristic.one_shot_pull_threshold:
             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PULL, use_graph=can_use_graph)
         if can_use_multicast and heuristic.mc.contains(nbytes):
