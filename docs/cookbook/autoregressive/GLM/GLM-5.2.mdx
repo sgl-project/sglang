@@ -61,7 +61,7 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.2-benchmarks.jsx
 
 ## Playground
 
-The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+The Playground is where you experiment with **SGLang features beyond the documented recipes**. Check each recipe's verification badge in the Deploy panel above; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
@@ -374,3 +374,31 @@ sglang serve \
 ```
 
 With `--attn-dp-size 4`, `--chunked-prefill-size` is a global budget divided across the attention DP ranks, so the balanced and high-throughput commands prefill 2048 tokens per rank per chunk.
+
+### 3.7 Multi-node GB300 NVFP4
+
+<a id="gb300-nvfp4-multi-node" />
+
+Select **GB300 → NVFP4 → Low-Latency → Multi-Nodes** in the Deployment panel
+for one TP8 worker spanning two four-GPU nodes. Both nodes must use the same
+SGLang build and have access to `nvidia/GLM-5.2-NVFP4`. This recipe uses the
+GB300 NVLink fabric with NCCL MNNVL enabled and requires both nodes to share
+that fabric.
+
+Set **Head node IP** to a reachable address on the first node. Run the generated
+command on both nodes, with **This node rank** set to `0` on the first and `1`
+on the second. Allow inter-node communication, including the distributed
+initialization port `20000`, and send requests to port `30000` on node 0.
+For Docker, use the same image on both nodes and expose the host's fabric
+devices as described in the [multi-node installation guidance](/docs/get-started/install#method-3-using-docker).
+
+HiCache reserves 135 GB of host memory per GPU rank, or 540 GB per node, in
+addition to memory needed for model loading and the runtime. Make that host
+memory available to each process or container before launching.
+
+<Note>
+  The source configuration passed an InferenceX sweep behind a Dynamo frontend.
+  The standalone `sglang serve` adaptation shown here has not been validated on
+  GPUs, so it is marked **Not Verified** and has no benchmark results in the
+  command panel. FP8 multi-node serving is not qualified by this NVFP4 result.
+</Note>
