@@ -54,9 +54,9 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 
 # Layers - Attention
@@ -447,7 +447,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             eps=self.layer_norm_epsilon,
             group_size=None,
             norm_before_gate=True,
-            device=torch.get_device_module().current_device(),
             dtype=torch.get_default_dtype(),
             **(
                 {"activation": self.output_gate_type}
@@ -1049,6 +1048,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
+        build_stages: bool = True,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1073,9 +1073,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=not _disable_shared_experts_fusion(),
+                # The stage boundary completes this stage's sum.
+                reduce_results=False,
             )
             is_layer_sparse = True
-            is_previous_layer_sparse = True
             is_next_layer_sparse = True
         elif config.model_type == "qwen3_5_text":
             self.mlp = Qwen2MoeMLP(
@@ -1084,10 +1085,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                # The stage boundary completes this stage's sum.
+                reduce_results=False,
             )
             _maybe_enable_silu_fp4_quant_fusion(self.mlp)
             is_layer_sparse = False
-            is_previous_layer_sparse = False
             is_next_layer_sparse = False
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
@@ -1101,33 +1103,31 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # it. Otherwise, stay on the plain AR+RMSNorm path.
         accepts_fp8_input = _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
         boundary_fusions = _layer_fusions(config, is_nextn)
-        self.attn_boundary, self.ffn_boundary = make_stages(
-            (
-                declare_attn(
-                    read=NormQuantReadout(
-                        fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None
-                    )
+        # A subclass that brings its own residual builds the stages itself.
+        if build_stages:
+            self.attn_boundary, self.ffn_boundary = append_stages(
+                (
+                    declare_attn(
+                        read=NormQuantReadout(
+                            fp8_input=Fp8Input.TUPLE_AND_BF16
+                            if accepts_fp8_input
+                            else None
+                        )
+                    ),
+                    self.input_layernorm,
+                    {
+                        "fusions": boundary_fusions,
+                    },
                 ),
-                self.input_layernorm,
-                {
-                    "fusions": boundary_fusions,
-                },
-            ),
-            (
-                declare_ffn(
-                    sparse=is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
+                (
+                    declare_ffn(
+                        sparse=is_layer_sparse,
+                        next_layer_sparse=is_next_layer_sparse,
+                    ),
+                    self.post_attention_layernorm,
+                    {"fusions": boundary_fusions},
                 ),
-                self.post_attention_layernorm,
-                {"fusions": boundary_fusions},
-            ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=is_layer_sparse
             )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
-        )
 
     def forward(
         self,
@@ -1177,6 +1177,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
+        build_stages: bool = True,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1271,9 +1272,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                # The stage boundary completes this stage's sum.
+                reduce_results=False,
             )
             is_layer_sparse = False
-            is_previous_layer_sparse = False
             is_next_layer_sparse = False
         elif config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
             self.mlp = Qwen2MoeSparseMoeBlock(
@@ -1288,9 +1290,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=not _disable_shared_experts_fusion(),
+                # The stage boundary completes this stage's sum.
+                reduce_results=False,
             )
             is_layer_sparse = True
-            is_previous_layer_sparse = True
             is_next_layer_sparse = True
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
@@ -1307,33 +1310,29 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # when qkv_proj can consume the returned quantized tuple.
         accepts_fp8_input = _linear_accepts_fp8_tuple(self.qkv_proj)
         boundary_fusions = _layer_fusions(config, is_nextn)
-        self.attn_boundary, self.ffn_boundary = make_stages(
-            (
-                declare_attn(
-                    read=NormQuantReadout(
-                        fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
-                    )
+        # A subclass that brings its own residual builds the stages itself.
+        if build_stages:
+            self.attn_boundary, self.ffn_boundary = append_stages(
+                (
+                    declare_attn(
+                        read=NormQuantReadout(
+                            fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
+                        )
+                    ),
+                    self.input_layernorm,
+                    {
+                        "fusions": boundary_fusions,
+                    },
                 ),
-                self.input_layernorm,
-                {
-                    "fusions": boundary_fusions,
-                },
-            ),
-            (
-                declare_ffn(
-                    sparse=is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
+                (
+                    declare_ffn(
+                        sparse=is_layer_sparse,
+                        next_layer_sparse=is_next_layer_sparse,
+                    ),
+                    self.post_attention_layernorm,
+                    {"fusions": boundary_fusions},
                 ),
-                self.post_attention_layernorm,
-                {"fusions": boundary_fusions},
-            ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=is_layer_sparse
             )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
-        )
 
         self.alt_stream = alt_stream
 

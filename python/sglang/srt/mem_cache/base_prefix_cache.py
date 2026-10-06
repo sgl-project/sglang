@@ -32,7 +32,7 @@ from sglang.srt.runtime_context import get_observability, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -307,8 +307,8 @@ class MatchResult(NamedTuple):
 def zero_match_result(
     tree_cache, match_result: MatchResult, extra_key: Optional[str] = None
 ) -> MatchResult:
-    if tree_cache.is_chunk_cache():
-        # Chunk caches' match_prefix already returns a miss; no root_node to walk back to.
+    if not tree_cache.supports_prefix_sharing():
+        # match_prefix already returns a miss; no root_node to walk back to.
         return match_result
     root = tree_cache.root_node_handle(extra_key=extra_key)
     return match_result._replace(
@@ -516,14 +516,18 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
+    def maybe_hand_to_session(self, req: Req) -> None:
+        """A cache that keeps records across requests (a streaming session) takes
+        the just-allocated row and the request's tree lock; the request borrows it."""
+
     def claim_kv_row(self, req: Req) -> bool:
         """A streaming session keeps the request's kv row for the next turn.
         Return True after taking the row; the caller then releases nothing."""
         return False
 
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        """The row is freed and the lock dropped; ``inserted`` says whether the
-        KV went into the tree first. Drop per-request state kept outside the tree."""
+    def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        """The row is freed and the lock dropped; ``checkpointed`` says whether
+        the KV went into the tree first. Drop per-request state kept outside the tree."""
 
     def evictable_size(self):
         return 0
@@ -624,7 +628,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             page_size=self.page_size,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            is_chunk_cache=self.is_chunk_cache(),
+            supports_prefix_sharing=self.supports_prefix_sharing(),
             retain_floor=self.swa_retain_floor(req),
             eviction_interval=eviction_interval,
         )
@@ -651,26 +655,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def release_radix_session(self, session_id: str) -> None:
         pass
 
-    def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
+    def session_records(self) -> dict[str, ReqKvInfo]:
+        """The KV records sessions own, by session id. Pool accounting counts them
+        as session-held, including while a request runs on one."""
+        return {}
 
-    def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def is_chunk_cache(self) -> bool:
-        return False
-
-    def is_tree_cache(self) -> bool:
-        return not self.is_chunk_cache()
+    def supports_prefix_sharing(self) -> bool:
+        """Whether a request's prefix stays in the cache for other requests to
+        share, including after the request finishes."""
+        return True
 
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()

@@ -208,6 +208,28 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         create_unified.assert_not_called()
         self.assertIs(result, PureSWAChunkCache.return_value)
 
+    def test_mamba_with_disable_radix_routes_to_unified(self):
+        ctx = _make_ctx(
+            self,
+            effective_chunked_prefill_size=512,
+            disable_radix_cache=True,
+            is_hybrid_ssm=True,
+        )
+        with patch(
+            "sglang.srt.mem_cache.registry.create_unified_radix_cache"
+        ) as create_unified:
+            result = default_radix_cache_factory(ctx)
+        create_unified.assert_called_once_with(ctx)
+        self.assertIs(result, create_unified.return_value)
+
+    def test_mamba_rejected_on_cache_without_mamba(self):
+        inner = MagicMock()
+        inner.supports_mamba.return_value = False
+        register_radix_cache_backend("nomamba", MagicMock(return_value=inner))
+
+        with self.assertRaisesRegex(NotImplementedError, "not verified"):
+            create_tree_cache(_make_ctx(self, backend="nomamba", is_hybrid_ssm=True))
+
     def test_unified_radix_cache_is_the_default(self):
         ctx = _make_ctx(
             self,
