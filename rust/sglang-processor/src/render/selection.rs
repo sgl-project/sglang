@@ -6,7 +6,8 @@ use dynamo_renderer::deepseek::v4::DeepSeekV4Formatter;
 use dynamo_renderer::deepseek::v32::DeepSeekV32Formatter;
 use dynamo_renderer::{PromptFormatter, kimi_k3_formatter_for, native_formatter_for};
 
-use super::{ChatFormatter, DeepSeekV4Profile, ThinkingTemplates, load_chat_formatter};
+use super::models::resolve_dsv4_profile;
+use super::{ChatFormatter, ThinkingTemplates, load_chat_formatter};
 use crate::model_files::{resolve_chat_template_file, resolve_model_file};
 
 const DSV4_REASONING_EFFORT_ENV: &str = "SGLANG_DSV4_REASONING_EFFORT";
@@ -225,157 +226,9 @@ fn load_model_identity(config_file: &str) -> Result<ModelIdentity, String> {
     })
 }
 
-pub(super) fn resolve_dsv4_profile(
-    profile: Option<&str>,
-    model_source: &str,
-    revision: Option<&str>,
-) -> Result<DeepSeekV4Profile, String> {
-    if let Some(profile) = profile {
-        return match profile {
-            "preview" => Ok(DeepSeekV4Profile::Preview),
-            "official" => Ok(DeepSeekV4Profile::Official),
-            _ => Err(format!(
-                "invalid dsv4_reasoning_effort_profile: {profile:?}; expected \"preview\" or \"official\""
-            )),
-        };
-    }
-    let Some(encoder) = resolve_model_file(model_source, revision, "encoding/encoding_dsv4.py")
-    else {
-        return Ok(DeepSeekV4Profile::Preview);
-    };
-    let Ok(metadata) = std::fs::metadata(&encoder) else {
-        return Ok(DeepSeekV4Profile::Preview);
-    };
-    if metadata.len() > 1 << 20 {
-        return Ok(DeepSeekV4Profile::Preview);
-    }
-    let Ok(source) = std::fs::read_to_string(encoder) else {
-        return Ok(DeepSeekV4Profile::Preview);
-    };
-    let default = top_level_python_assignment(&source, "DEFAULT_REASONING_EFFORT")
-        .and_then(python_string_literal);
-    let prompt_keys = top_level_python_assignment(&source, "REASONING_EFFORT_PROMPTS")
-        .and_then(python_dict_keys)
-        .unwrap_or_default();
-    if default.as_deref() == Some("low")
-        && ["low", "high", "max"]
-            .iter()
-            .all(|key| prompt_keys.iter().any(|candidate| candidate == key))
-    {
-        Ok(DeepSeekV4Profile::Official)
-    } else {
-        Ok(DeepSeekV4Profile::Preview)
-    }
-}
-
-fn top_level_python_assignment<'a>(source: &'a str, name: &str) -> Option<&'a str> {
-    let mut offset = 0;
-    for line in source.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if !trimmed.starts_with(char::is_whitespace)
-            && let Some((target, _)) = trimmed.split_once('=')
-            && target
-                .split(':')
-                .next()
-                .is_some_and(|target| target.trim() == name)
-        {
-            let equals = line.find('=')?;
-            return Some(&source[offset + equals + 1..]);
-        }
-        offset += line.len();
-    }
-    None
-}
-
-fn python_string_literal(source: &str) -> Option<String> {
-    let source = source.trim_start();
-    let quote = source.chars().next()?;
-    if !matches!(quote, '\'' | '"') {
-        return None;
-    }
-    let mut escaped = false;
-    let mut value = String::new();
-    for character in source[quote.len_utf8()..].chars() {
-        if escaped {
-            value.push(character);
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else if character == quote {
-            return Some(value);
-        } else {
-            value.push(character);
-        }
-    }
-    None
-}
-
-fn python_dict_keys(source: &str) -> Option<Vec<String>> {
-    let source = source.trim_start();
-    if !source.starts_with('{') {
-        return None;
-    }
-    let mut keys = Vec::new();
-    let mut depth = 0usize;
-    let mut index = 0usize;
-    let bytes = source.as_bytes();
-    while index < bytes.len() {
-        match bytes[index] {
-            b'{' | b'[' | b'(' => {
-                depth += 1;
-                index += 1;
-            }
-            b'}' | b']' | b')' => {
-                depth = depth.checked_sub(1)?;
-                index += 1;
-                if depth == 0 {
-                    return Some(keys);
-                }
-            }
-            quote @ (b'\'' | b'"') => {
-                let start = index + 1;
-                index = start;
-                let mut escaped = false;
-                while index < bytes.len() {
-                    if escaped {
-                        escaped = false;
-                    } else if bytes[index] == b'\\' {
-                        escaped = true;
-                    } else if bytes[index] == quote {
-                        break;
-                    }
-                    index += 1;
-                }
-                if index == bytes.len() {
-                    return None;
-                }
-                let value = std::str::from_utf8(&bytes[start..index]).ok()?;
-                index += 1;
-                if depth == 1 {
-                    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-                        index += 1;
-                    }
-                    if bytes.get(index) == Some(&b':') {
-                        keys.push(value.to_owned());
-                    }
-                }
-            }
-            b'#' => {
-                while index < bytes.len() && bytes[index] != b'\n' {
-                    index += 1;
-                }
-            }
-            _ => index += 1,
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        ChatFormatterOptions, DeepSeekV4Profile, resolve_dsv4_profile, select_chat_formatter,
-    };
+    use super::{ChatFormatterOptions, select_chat_formatter};
     use crate::OneOrMany;
 
     #[test]
@@ -390,42 +243,5 @@ mod tests {
             panic!("chatml declares multiple stop strings");
         };
         assert_eq!(stops, ["<|endoftext|>", "<|im_end|>"]);
-    }
-
-    #[test]
-    fn deepseek_v4_profile_resolution_uses_override_then_checkpoint_source() {
-        let directory = std::env::temp_dir().join(format!(
-            "sglang-processor-deepseek-v4-profile-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(directory.join("encoding")).unwrap();
-        std::fs::write(
-            directory.join("encoding/encoding_dsv4.py"),
-            "DEFAULT_REASONING_EFFORT: str = 'low'\n\
-REASONING_EFFORT_PROMPTS = {'low': '', 'high': 'absolute', 'max': 'beyond'}",
-        )
-        .unwrap();
-        let source = directory.to_string_lossy();
-        assert_eq!(
-            resolve_dsv4_profile(None, &source, None).unwrap(),
-            DeepSeekV4Profile::Official
-        );
-        assert_eq!(
-            resolve_dsv4_profile(Some("preview"), &source, None).unwrap(),
-            DeepSeekV4Profile::Preview
-        );
-        assert!(resolve_dsv4_profile(Some("future"), &source, None).is_err());
-
-        std::fs::write(
-            directory.join("encoding/encoding_dsv4.py"),
-            r#"DEFAULT_REASONING_EFFORT = "high"
-REASONING_EFFORT_PROMPTS = {"low": "", "high": "absolute", "max": "Beyond maximum"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            resolve_dsv4_profile(None, &source, None).unwrap(),
-            DeepSeekV4Profile::Preview
-        );
-        std::fs::remove_dir_all(directory).unwrap();
     }
 }
