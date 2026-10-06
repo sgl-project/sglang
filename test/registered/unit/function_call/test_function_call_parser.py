@@ -2545,16 +2545,8 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertIsInstance(params["dry_run"], bool)
         self.assertEqual(params["dry_run"], True)
 
-    def test_string_null_and_invalid_boolean_stay_raw(self):
-        """
-        A string parameter whose text is the word null, and a boolean
-        parameter that is neither true nor false, must not be rewritten.
-
-        The Qwen chat template writes string values raw, so "null" is the
-        string null. Numeric conversion already keeps the raw text when it
-        fails; boolean used to collapse that case to false.
-        """
-        tools = [
+    def _grep_null_tools(self):
+        return [
             Tool(
                 type="function",
                 function=Function(
@@ -2565,11 +2557,32 @@ class TestQwen3CoderDetector(unittest.TestCase):
                             "pattern": {"type": "string"},
                             "regex": {"type": "boolean"},
                             "note": {"type": ["string", "null"]},
+                            "count": {"type": "integer"},
+                            "items": {"type": "array", "items": {"type": "string"}},
                         },
                     },
                 ),
             )
         ]
+
+    def _assert_non_nullable_null_stays_raw(self, params):
+        """Text null stays text unless the schema itself allows null."""
+        self.assertEqual(params["pattern"], "null")
+        self.assertEqual(params["regex"], "yes")
+        self.assertIsNone(params["note"])
+        self.assertEqual(params["count"], "null")
+        self.assertEqual(params["items"], "null")
+
+    def test_string_null_and_invalid_boolean_stay_raw(self):
+        """
+        A string parameter whose text is the word null, and a boolean
+        parameter that is neither true nor false, must not be rewritten.
+
+        The Qwen chat template writes string values raw, so "null" is the
+        string null. A non-nullable integer or array used to become JSON
+        null as well; those tokens now stay text. A schema that lists null
+        still becomes None.
+        """
         text = """<tool_call>
 <function=grep>
 <parameter=pattern>
@@ -2581,14 +2594,46 @@ yes
 <parameter=note>
 null
 </parameter>
+<parameter=count>
+null
+</parameter>
+<parameter=items>
+null
+</parameter>
 </function>
 </tool_call>"""
-        result = self.detector.detect_and_parse(text, tools)
+        result = self.detector.detect_and_parse(text, self._grep_null_tools())
 
+        self.assertEqual(len(result.calls), 1)
         params = json.loads(result.calls[0].parameters)
-        self.assertEqual(params["pattern"], "null")
-        self.assertEqual(params["regex"], "yes")
-        self.assertIsNone(params["note"])
+        self._assert_non_nullable_null_stays_raw(params)
+
+    def test_streaming_string_null_and_invalid_boolean_stay_raw(self):
+        """
+        Streaming emits json.dumps of the converted value. The same null
+        and invalid-boolean tokens must stay raw there too.
+        """
+        chunks = [
+            "<tool_call>",
+            "<function=grep>",
+            "<parameter=pattern>null</parameter>",
+            "<parameter=regex>yes</parameter>",
+            "<parameter=note>null</parameter>",
+            "<parameter=count>null</parameter>",
+            "<parameter=items>null</parameter>",
+            "</function>",
+            "</tool_call>",
+        ]
+        detector = Qwen3CoderDetector()
+        collected_params = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self._grep_null_tools())
+            for call in result.calls:
+                if call.parameters:
+                    collected_params += call.parameters
+
+        params = json.loads(collected_params)
+        self._assert_non_nullable_null_stays_raw(params)
 
     def test_complex_array_parameter(self):
         """

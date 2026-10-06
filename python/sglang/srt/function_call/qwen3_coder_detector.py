@@ -119,7 +119,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self, param_value: str, param_name: str, param_config: dict, func_name: str
     ) -> Any:
         """Convert parameter value based on its type in the schema."""
-        # No schema: keep the historical "null" -> None coercion.
+        # Undeclared parameter: keep the historical "null" -> None coercion.
+        # This also skips the "not defined" warning for that token.
         if param_name not in param_config:
             if param_value.lower() == "null":
                 return None
@@ -130,8 +131,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 )
             return param_value
 
-        # A declared string (or other non-nullable type) wrote the token raw.
-        # Only schemas that include null should turn the text "null" into None.
+        # Only a schema that explicitly allows null turns the text "null" into None.
+        # Every other declared type keeps that token as text.
         if param_value.lower() == "null" and self._schema_allows_null(
             param_config[param_name]
         ):
@@ -170,6 +171,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 )
             return param_value
         elif param_type in ["boolean", "bool", "binary"]:
+            # binary shares this branch: anything other than true/false stays
+            # the raw text instead of collapsing to false.
             lowered = param_value.lower()
             if lowered not in ["true", "false"]:
                 logger.warning(
@@ -183,6 +186,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 or param_type.startswith("dict")
                 or param_type.startswith("list")
             ):
+                # json.loads("null") is None. Nullability was already decided
+                # above, so a non-nullable container keeps the raw token.
+                if param_value.lower() == "null":
+                    return param_value
                 try:
                     param_value = json.loads(param_value)
                     return param_value
