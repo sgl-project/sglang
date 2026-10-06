@@ -1149,9 +1149,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             has_active_lora=has_active_lora,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             cg_buffers=cg_buffers,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            hidden_size=getattr(self.base_layer, "hidden_size", 0),
             lora_use_virtual_experts=self.lora_use_virtual_experts,
         )
 

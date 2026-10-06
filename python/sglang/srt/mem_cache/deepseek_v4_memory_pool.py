@@ -699,6 +699,12 @@ class DeepSeekV4IndexerPool(KVCache):
         from the page layout [page_size * 64 payload | page_size * 4 scale]."""
         assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        if buf.is_cuda:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                gather_fp4_index_k,
+            )
+
+            return gather_fp4_index_k(buf, slots, page_size=self.page_size)
         slots = slots.to(torch.int64)
         p = self.page_size
         page, off = (slots // p).unsqueeze(-1), slots % p
@@ -1859,6 +1865,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_swa_key_layout(self) -> KVLayout:
         # swa_kv_pool is None under the request window and unified_kv.
         return self.kv_layout
+
+    def get_swa_key_page_size(self) -> int:
+        if self.request_window is not None:
+            return self.request_window.page_size
+        return self.swa_kv_pool.page_size
 
     def get_swa_key_bytes_per_token(self) -> int:
         """Last dim of the ``(pages, page_size, 1, bytes)`` view the attention
