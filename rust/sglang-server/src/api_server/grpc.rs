@@ -27,9 +27,7 @@ use crate::utils::environ;
 
 mod info;
 mod response;
-mod server;
-
-pub(crate) use server::serve;
+pub(crate) mod server;
 
 #[cfg(test)]
 mod tests;

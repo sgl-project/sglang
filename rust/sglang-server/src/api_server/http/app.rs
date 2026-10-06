@@ -12,8 +12,9 @@ use axum::{
     response::Response,
 };
 
-use super::disaggregation::bootstrap as pd_bootstrap;
-use super::{common, log, native_api, openai};
+use super::{common, native_api, openai};
+use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
+use crate::api_server::log;
 use crate::frontend::FrontendHandle;
 use crate::message::config::ServerArgs;
 

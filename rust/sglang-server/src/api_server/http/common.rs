@@ -15,8 +15,8 @@ use axum::{
 use std::sync::Arc;
 
 use super::app::AppState;
-use super::frontend_error_status;
 use super::native_api::native_error;
+use crate::api_server::frontend_error_status;
 use crate::frontend::{FrontendError, ServerInfo};
 
 /// The routes this module owns, mounted by `api_server::serve`.

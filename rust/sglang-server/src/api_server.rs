@@ -3,13 +3,10 @@
 //! [`crate::frontend::FrontendHandle`] to enter the shared runtime pipeline.
 //! Generation handlers render semantic frontend events as unary JSON or SSE;
 //! control handlers serialize typed frontend results such as server metadata.
-pub mod app;
-mod common;
 mod disaggregation;
-mod frame;
+pub mod grpc;
+pub mod http;
 mod log;
-mod native_api;
-mod openai;
 
 use axum::http::StatusCode;
 

@@ -14,7 +14,7 @@ use super::app::AppState;
 use super::frame::{
     OutputAccumulator, cumulative_frame_string, frame_value, stream_frame_string, tag_value,
 };
-use super::frontend_error_status;
+use crate::api_server::frontend_error_status;
 use crate::frontend::{
     FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest, HealthStatus,
     recv_indexed,

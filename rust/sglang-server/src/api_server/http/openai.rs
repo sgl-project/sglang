@@ -22,7 +22,7 @@ pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
 
 use super::app::AppState;
 use super::frame::OutputAccumulator;
-use super::frontend_error_status;
+use crate::api_server::frontend_error_status;
 use crate::frontend::{
     FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest,
 };

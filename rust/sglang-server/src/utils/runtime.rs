@@ -320,7 +320,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let shutdown_rx = shutdown_rx.clone();
         let grpc_server = grpc_listener.map(|listener| {
-            let service = crate::grpc::GrpcService::new(frontend.clone(), &cfg.server_args);
+            let service = api_server::grpc::GrpcService::new(frontend.clone(), &cfg.server_args);
             (listener, service)
         });
         let handle = std::thread::Builder::new()
@@ -341,14 +341,17 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 }
                 let rt = builder.build().expect("build api runtime");
                 rt.block_on(async move {
-                    let http = api_server::app::serve(
+                    let http = api_server::http::app::serve(
                         http_listener,
                         frontend,
                         cfg.server_args.clone(),
                         shutdown_rx.clone(),
                     );
                     if let Some((listener, service)) = grpc_server {
-                        tokio::join!(http, crate::grpc::serve(listener, service, shutdown_rx));
+                        tokio::join!(
+                            http,
+                            api_server::grpc::server::serve(listener, service, shutdown_rx)
+                        );
                     } else {
                         http.await;
                     }
