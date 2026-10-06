@@ -3821,6 +3821,7 @@ dependencies = [
  "serde_json",
  "sglang-api-types",
  "sglang-mm",
+ "sglang-processor",
  "socket2",
  "thiserror",
  "tokio",
