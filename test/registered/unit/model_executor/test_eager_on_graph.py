@@ -1,5 +1,6 @@
 """CPU tests of scoped eager replay without requiring CUDA graph capture."""
 
+import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -167,3 +168,7 @@ def test_batch_scope_is_isolated_between_execution_contexts():
         with pytest.raises(RuntimeError, match="No forward batch"):
             Context().run(get_forward_batch)
         assert get_forward_batch().scale == 2
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
