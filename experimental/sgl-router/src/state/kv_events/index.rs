@@ -109,7 +109,7 @@ const BOOTSTRAP_QUEUE_DEPTH: usize = 1024;
 /// have stored blocks, so the rank keeps waiting for a snapshot. A batch 0
 /// arriving later is a publisher restart instead; see the regression arms in
 /// `pump_loop`.
-const STREAM_ORIGIN_SEQ: i64 = 0;
+pub(super) const STREAM_ORIGIN_SEQ: i64 = 0;
 
 /// Control-plane messages for the pump task.
 ///
@@ -380,29 +380,30 @@ impl KvEventIndex {
                  --kv-bootstrap-timeout-ms (the fetch cap cannot lift this on its own)",
             );
         }
-        let snapshot_http = match reqwest::Client::builder()
+        let snapshot_http = reqwest::Client::builder()
             .connect_timeout(SNAPSHOT_FETCH_CONNECT_TIMEOUT)
             .read_timeout(SNAPSHOT_FETCH_READ_TIMEOUT)
             .timeout(per_fetch)
+            // A sibling router never redirects this route, so a redirect is
+            // either a misconfigured peer or a hostile one steering the fetch
+            // — and its multi-gigabyte buffering budget — at an arbitrary
+            // in-cluster URL. Refuse to follow: the 3xx lands as
+            // `FetchAnswer::NoBody` and the peer is just not a source.
+            .redirect(reqwest::redirect::Policy::none())
+            // No fallback to the introspection client: it follows redirects,
+            // which would silently reopen the hole the policy above closes
+            // (and its total timeout cannot fit a large snapshot anyway).
+            // Every option set here is an infallible setter — `build()` only
+            // fails when the TLS backend cannot initialize, and `new()`
+            // already treats that as fatal for the introspection client.
             .build()
-        {
-            Ok(client) => client,
-            Err(e) => {
-                // Not silent: the fallback's total timeout is sized for
-                // `/server_info`, so every large snapshot would then time out
-                // and be booked `unreachable` with nothing pointing here.
-                warn!(
-                    error = %e,
-                    "kv-bootstrap: snapshot client failed to build; falling back to the \
-                     introspection client, whose timeout cannot fit a large snapshot",
-                );
-                http.clone()
-            }
-        };
+            .expect("snapshot http client builds: no fallible builder options are set");
         let tree = Arc::new(HashTree::new());
         let (tx, rx) = mpsc::channel::<WorkerEvent>(EVENT_CHANNEL_BUFFER);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<PumpControl>(16);
-        let subscribers = Arc::new(KvEventSubscriberRegistry::new(tx.clone()));
+        let tally = Arc::new(EventTally::new());
+        let subscribers =
+            Arc::new(KvEventSubscriberRegistry::new(tx.clone()).with_tally(Arc::clone(&tally)));
         let load_subscribers = Arc::new(KvEventSubscriberRegistry::with_kind(tx, SubKind::Load));
         let engine_reported_load = EngineReportedLoadTable::new();
         let cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -410,7 +411,6 @@ impl KvEventIndex {
         let pump_cancel = CancellationToken::new();
         let peers = Arc::new(PeerRegistry::new());
         let (bootstrap_tx, bootstrap_rx) = mpsc::channel(BOOTSTRAP_QUEUE_DEPTH);
-        let tally = Arc::new(EventTally::new());
         let pump = tokio::spawn(pump_loop(
             PumpDeps {
                 tally: Arc::clone(&tally),

@@ -17,6 +17,7 @@ import pickle
 import queue
 import threading
 import time
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -177,20 +178,16 @@ def _is_tensor_like(value) -> bool:
 
 
 def _to_json_serializable(value):
+    if isinstance(value, Enum):
+        return value.name
     if isinstance(value, (torch.Tensor, np.ndarray)):
         return value.tolist()
     if isinstance(value, np.generic):
         return value.item()
+    if isinstance(value, dict):
+        return {key: _to_json_serializable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        converted = []
-        for item in value:
-            if isinstance(item, (torch.Tensor, np.ndarray)):
-                converted.append(item.tolist())
-            elif isinstance(item, np.generic):
-                converted.append(item.item())
-            else:
-                converted.append(item)
-        return converted
+        return [_to_json_serializable(item) for item in value]
     return value
 
 

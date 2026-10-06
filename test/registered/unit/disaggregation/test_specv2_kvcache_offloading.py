@@ -256,10 +256,12 @@ class TestReleaseFinishedReq(unittest.TestCase):
             prefix_indices_len=5,
         )
         req.kv.cache_protected_len = 5
+        lock = req.lock
 
         manager._release_finished_req(req)
 
-        manager.tree_cache.unpin.assert_called_once_with(req)
+        manager.tree_cache.unlock.assert_called_once_with(lock)
+        self.assertIsNone(req.lock)
         self.assertTrue(torch.equal(freed[0], torch.arange(5, 20, dtype=torch.int64)))
 
     def test_release_finished_req_frees_prefill_and_pops_state(self):

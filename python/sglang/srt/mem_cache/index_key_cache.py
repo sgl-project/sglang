@@ -35,7 +35,7 @@ class IndexKeyCache:
         pool = self.pool
         return (
             num_pages,
-            pool.page_size
+            pool.slots_per_page
             * (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
         )
 
