@@ -298,8 +298,8 @@ def discard_kv_cache_backup(
     req.kv.retraction_backup = None
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-    """Give the request's kv row back; with ``is_insert`` the tree first keeps
+def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
+    """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
@@ -320,8 +320,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     owned_kv_len = req.owned_kv_len()
-    is_insert = is_insert and not req.skip_radix_cache_insert
-    if is_insert:
+    checkpoint = checkpoint and not req.skip_radix_cache_insert
+    if checkpoint:
         # A tree that takes over component state (mamba) must see the request
         # finished, or the insert forks the state and the slot leaks.
         assert req.finished() or not tree_cache.supports_mamba(), (
@@ -332,11 +332,12 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         tree_cache.checkpoint(req, up_to=owned_kv_len)
     # The protected prefix is not this req's to free.
     tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
-    tree_cache.unpin(req)
+    tree_cache.unlock(req.lock)
+    req.lock = None
     _release_overallocated_kv_indices(
         req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
     )
-    tree_cache.on_release(req, inserted=is_insert)
+    tree_cache.on_release(req, checkpointed=checkpoint)
 
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.

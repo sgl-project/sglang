@@ -7,12 +7,12 @@ mod reorg;
 
 use crate::buckets_reorg::BucketResolver;
 use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
-use crate::discovery::{ModelId, WorkerMode};
+use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
-use crate::policies::{ExternalPrefixSignal, Policy};
+use crate::policies::{Policy, PrefixLookupResult};
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
@@ -23,7 +23,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
-use forward::{forward_request, SelectedWorkers};
+use forward::{forward_request, RequestDurationGuard, SelectedWorkers};
 use preparation::{
     parse_embedding_request, parse_routing_fields, PreparedRequest, CLASSIFY_PATH, EMBEDDINGS_PATH,
 };
@@ -60,8 +60,7 @@ pub async fn chat_completions(
         body,
         routing.needs_request_tokens(&ctx),
     )?;
-    let workers = routing.select_workers(&ctx, &request, &headers).await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    routing.dispatch(&ctx, request, headers, start).await
 }
 
 /// SGLang's native `/generate`: same request and response schema as the engine.
@@ -75,8 +74,7 @@ pub async fn generate(
     let model = ModelId(ctx.config.model.id.clone());
     let routing = ModelRouting::lookup(&ctx, &model)?;
     let request = PreparedRequest::generate(&ctx, model, body)?;
-    let workers = routing.select_workers(&ctx, &request, &headers).await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    routing.dispatch(&ctx, request, headers, start).await
 }
 
 /// OpenAI `/v1/embeddings`, forwarded to the engine's with the same request and response.
@@ -108,8 +106,7 @@ async fn embedding_input(
     let routing = ModelRouting::lookup(&ctx, &model)?;
     require_plain_workers(&ctx, &model, path)?;
     let request = PreparedRequest::embeddings(&ctx, path, model, body, value)?;
-    let workers = routing.select_workers(&ctx, &request, &headers).await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    routing.dispatch(&ctx, request, headers, start).await
 }
 
 /// SGLang's `/v1/rerank`, forwarded as sent to the model this router serves.
@@ -123,8 +120,7 @@ pub async fn rerank(
     let routing = ModelRouting::lookup(&ctx, &model)?;
     require_plain_workers(&ctx, &model, "/v1/rerank")?;
     let request = PreparedRequest::rerank(model, body)?;
-    let workers = routing.select_workers(&ctx, &request, &headers).await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    routing.dispatch(&ctx, request, headers, start).await
 }
 
 /// Prefill and decode engines serve generation only.
@@ -162,17 +158,32 @@ impl<'a> ModelRouting<'a> {
         }
     }
 
-    /// Pick a plain worker, or a prefill worker followed by a decode peer in PD mode.
+    /// Select workers for `request` and forward it to them.
+    async fn dispatch(
+        &self,
+        ctx: &AppContext,
+        mut request: PreparedRequest,
+        headers: HeaderMap,
+        start: Instant,
+    ) -> Result<Response<Body>, ApiError> {
+        let workers = self.select_workers(ctx, &request, &headers, &[]).await?;
+        let duration = RequestDurationGuard::new(ctx, &request.model, start);
+        forward_request(ctx, &mut request, workers, headers, start, &duration).await
+    }
+
+    /// Pick a plain worker, or a prefill worker followed by a decode peer in PD mode,
+    /// never one in `excluded`.
     async fn select_workers(
         &self,
         ctx: &AppContext,
         request: &PreparedRequest,
         headers: &HeaderMap,
+        excluded: &[WorkerId],
     ) -> Result<SelectedWorkers, ApiError> {
         match self {
             Self::Legacy(policy) => {
                 // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
-                let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
+                let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry)).excluding(excluded);
                 let candidates = resolver
                     .prefill_candidates(&request.model)
                     .map_err(|error| pool_error(error, &request.model))?;
@@ -186,7 +197,9 @@ impl<'a> ModelRouting<'a> {
                 )
                 .await
             }
-            Self::Reorg(resolver) => reorg::select_workers(ctx, resolver, request, headers).await,
+            Self::Reorg(resolver) => {
+                reorg::select_workers(ctx, resolver, request, headers, excluded).await
+            }
         }
     }
 }
@@ -229,11 +242,7 @@ async fn select_workers(
 /// Credit the chosen prefill with the prompt's prefix until KV events confirm
 /// it. Called only once the whole selection succeeded, so a request that is
 /// never dispatched credits nobody.
-fn record_prefill_route(
-    ctx: &AppContext,
-    signal: Option<&ExternalPrefixSignal>,
-    prefill_url: &str,
-) {
+fn record_prefill_route(ctx: &AppContext, signal: Option<&PrefixLookupResult>, prefill_url: &str) {
     if let (Some(provider), Some(signal)) = (&ctx.radix_tree_prefix_provider, signal) {
         provider.record_route(signal, prefill_url);
     }
@@ -287,7 +296,7 @@ fn capture_load_snapshot(
 }
 
 struct RoutingContext<'a> {
-    prefix_matches: Option<ExternalPrefixSignal>,
+    prefix_matches: Option<PrefixLookupResult>,
     load_snapshot: Option<EngineReportedLoadSnapshot>,
     ttft_slo_ms: Option<u64>,
     tps_slo: Option<f64>,
@@ -414,7 +423,7 @@ fn pick_decode_worker(
 async fn lookup_prefix_matches(
     ctx: &AppContext,
     request: &PreparedRequest,
-) -> Result<Option<ExternalPrefixSignal>, ApiError> {
+) -> Result<Option<PrefixLookupResult>, ApiError> {
     let signal = match (
         ctx.prefix_index.as_ref(),
         request.tokens.as_ref(),
@@ -433,7 +442,7 @@ async fn lookup_prefix_matches(
             } else {
                 resolve_prefix_query(index.match_prefix(hashes).await, &request.model.0)?
             };
-            Some(ExternalPrefixSignal {
+            Some(PrefixLookupResult {
                 outcome,
                 query_blocks,
                 block_hashes: None,

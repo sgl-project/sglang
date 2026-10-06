@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
     request_extra_value,
     resolve_sampling_params_cls,
+    sanitize_upload_filename,
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -309,6 +310,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "output_path": request.output_path,
         "quality": _extra_value(request, "quality"),
         "output_compression": request.output_compression,
+        "x264_preset": request.x264_preset,
         "output_quality": request.output_quality,
         "perf_dump_path": request.perf_dump_path,
         "profile": request.profile,
@@ -370,9 +372,13 @@ async def _save_first_input_image(
     os.makedirs(uploads_dir, exist_ok=True)
 
     filename = image.filename if hasattr(image, "filename") else "url_image"
-    target_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
+    safe_name = sanitize_upload_filename(filename, "url_image")
+    target_path = os.path.join(uploads_dir, f"{request_id}_{safe_name}")
     return await save_image_to_path(
-        image, target_path, prefer_remote_source=prefer_remote_source
+        image,
+        target_path,
+        prefer_remote_source=prefer_remote_source,
+        uploads_root=uploads_dir,
     )
 
 
@@ -503,6 +509,7 @@ async def create_video(
     upscaling_scale: Optional[int] = Form(None),
     output_quality: Optional[str] = Form(None),
     output_compression: Optional[int] = Form(None),
+    x264_preset: Optional[str] = Form(None),
     output_path: Optional[str] = Form(None),
     perf_dump_path: Optional[str] = Form(None),
     extra_params: Optional[str] = Form(None),
@@ -649,6 +656,7 @@ async def create_video(
             ),
             upscaling_scale=form_value("upscaling_scale", upscaling_scale),
             output_compression=form_value("output_compression", output_compression),
+            x264_preset=form_value("x264_preset", x264_preset),
             output_quality=form_value("output_quality", output_quality),
             output_path=form_value("output_path", output_path),
             perf_dump_path=form_value("perf_dump_path", perf_dump_path),

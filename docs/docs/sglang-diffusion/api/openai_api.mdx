@@ -215,6 +215,10 @@ curl -sS -X POST "http://localhost:30010/v1/images/generations" \
 
 This endpoint accepts a multipart form upload with input images and a text prompt. The server can return either a base64-encoded image or a URL to download the image.
 
+Uploaded filenames are sanitized, and saved uploads are constrained to the
+server's upload directory. This also applies to image uploads for video and mesh
+generation.
+
 **Curl Example (b64_json response):**
 
 ```bash Command
@@ -314,6 +318,15 @@ curl -sS -X POST "http://localhost:30010/v1/videos" \
         "size": "1280x720"
       }'
 ```
+
+#### MP4 encoding
+
+`x264_preset` picks the libx264 preset for the returned MP4: `ultrafast`,
+`superfast`, `veryfast`, `faster`, `fast` (the default), `medium`, `slow`,
+`slower`, `veryslow` or `placebo`. Faster presets finish encoding sooner and
+trade file size and fidelity at the same `output_compression`/`output_quality`.
+Send it at the top level of a JSON body or as a multipart form field;
+`sglang generate` takes `--x264-preset`.
 
 **List videos**
 
