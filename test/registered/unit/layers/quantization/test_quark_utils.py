@@ -198,6 +198,16 @@ class TestMXFP4LinearActResolution(CustomTestCase):
     def test_rocm_fp4_keeps_packed_weights(self):
         self.assertFalse(_resolve_dequant_linear_to_bf16("fp4", is_hip=True))
 
+    def test_force_a8w4_overrides_fp4(self):
+        # gfx1250 cannot run the a4w4 GEMM; AITER_FORCE_A8W4 marks that arch.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.assertTrue(
+                _resolve_dequant_linear_to_bf16("fp4", is_hip=True, force_a8w4=True)
+            )
+        self.assertEqual(len(caught), 1)
+        self.assertIn("AITER_FORCE_A8W4", str(caught[0].message))
+
     def test_rocm_rejects_unknown_value(self):
         with self.assertRaises(ValueError):
             _resolve_dequant_linear_to_bf16("fp8", is_hip=True)

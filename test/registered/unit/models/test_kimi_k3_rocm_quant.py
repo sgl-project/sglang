@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
 from sglang.srt.models.kimi_k3 import _is_unquantized_mergeable
 from sglang.srt.models.kimi_k3_rocm_quant import (
     _k3_channel_fp8_to_bf16,
+    _k3_channel_fp8_to_tensor_fp8,
     _k3_densify_quark_shared_experts,
     _k3_merge_kda_inproj_fp8,
 )
@@ -70,6 +71,42 @@ class TestChannelFp8ToBf16(CustomTestCase):
         )
 
         torch.testing.assert_close(flat, column)
+
+
+class TestChannelFp8ToTensorFp8(CustomTestCase):
+    """SGLANG_ROCM_K3_MLA_ABSORB_FP8 requantizes kv_b to one per-tensor scale
+    so the absorb BMMs can run aiter's a8w8 kernel."""
+
+    def test_folds_channel_scales_into_one_tensor_scale(self):
+        weight, scale, _ = _per_channel_fp8(out_features=8, in_features=16)
+        module = SimpleNamespace(weight_scale=scale.squeeze(1))
+
+        q, tensor_scale = _k3_channel_fp8_to_tensor_fp8(module, weight)
+
+        self.assertEqual(q.dtype, weight.dtype)
+        self.assertEqual(q.shape, weight.shape)
+        self.assertEqual(tensor_scale.numel(), 1)
+        # The largest channel saturates the FP8 range, so it is not clipped.
+        exact = weight.to(torch.float32) * scale
+        self.assertAlmostEqual(
+            q.float().abs().max().item(), torch.finfo(weight.dtype).max
+        )
+        # Error is bounded by one FP8 step at the tensor-wide scale.
+        err = (q.float() * tensor_scale - exact).abs().max()
+        self.assertLess(err.item(), 0.07 * exact.abs().max().item())
+
+    def test_accepts_a_column_vector_scale(self):
+        weight, scale, _ = _per_channel_fp8(out_features=8, in_features=16)
+
+        flat = _k3_channel_fp8_to_tensor_fp8(
+            SimpleNamespace(weight_scale=scale.squeeze(1)), weight
+        )
+        column = _k3_channel_fp8_to_tensor_fp8(
+            SimpleNamespace(weight_scale=scale.clone()), weight
+        )
+
+        torch.testing.assert_close(flat[0].float(), column[0].float())
+        torch.testing.assert_close(flat[1], column[1])
 
 
 class TestMergeDtypeGuard(CustomTestCase):
