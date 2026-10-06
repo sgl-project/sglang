@@ -134,13 +134,8 @@ class TokenReplayStash(msgspec.Struct):
 
 class OutputStore:
     def __init__(self, config: OutputStoreConfig) -> None:
+        import mooncake.structured_object_store as structured_object_store
         from mooncake.store import MooncakeDistributedStore, ReplicateConfig
-        from mooncake.structured_object_store import (
-            FieldSchema,
-            MooncakeBundleTransfer,
-            export_ref,
-            import_ref,
-        )
 
         store = MooncakeDistributedStore()
         setup_error = store.setup(
@@ -157,15 +152,22 @@ class OutputStore:
         if setup_error:
             raise RuntimeError(f"Mooncake output store setup failed: {setup_error}")
 
-        self._config = config
-        self._transfer = MooncakeBundleTransfer(store, key_prefix=config.key_prefix)
-        self._field_schema_cls = FieldSchema
-        self._export_ref = export_ref
-        self._import_ref = import_ref
-        self._replicate_config = None
+        replicate_config = None
         if config.replica_num > 1:
-            self._replicate_config = ReplicateConfig()
-            self._replicate_config.replica_num = config.replica_num
+            replicate_config = ReplicateConfig()
+            replicate_config.replica_num = config.replica_num
+
+        self._mooncake = structured_object_store
+        self._transfer = structured_object_store.MooncakeBundleTransfer(
+            store, key_prefix=config.key_prefix
+        )
+        self._put_options = {
+            "type": "dict",
+            "namespace": config.namespace,
+            "partition": config.partition,
+            "chunk_bytes": config.chunk_bytes,
+            "config": replicate_config,
+        }
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=_MAX_STORE_WORKERS, thread_name_prefix="output-store"
         )
@@ -184,13 +186,9 @@ class OutputStore:
         fields = stash.to_bundle_fields()
         ref = self._transfer.put(
             {name: [array] for name, array in fields.items()},
-            type="dict",
-            namespace=self._config.namespace,
-            partition=self._config.partition,
-            chunk_bytes=self._config.chunk_bytes,
-            config=self._replicate_config,
+            **self._put_options,
             field_schemas={
-                name: self._field_schema_cls(
+                name: self._mooncake.FieldSchema(
                     codec="typed_ragged",
                     nullable=False,
                     metadata={"section": "non_tensor_batch", "dtype": str(array.dtype)},
@@ -199,7 +197,7 @@ class OutputStore:
             },
         )
         return {
-            "handle": self._export_ref(ref),
+            "handle": self._mooncake.export_ref(ref),
             "fields": {
                 name: {"dtype": str(array.dtype), "shape": list(array.shape)}
                 for name, array in fields.items()
@@ -216,7 +214,7 @@ class OutputStore:
     def _cleanup(self, output_store_ref: Dict[str, Any]) -> None:
         handle = output_store_ref["handle"]
         try:
-            self._transfer.cleanup_dataproto(self._import_ref(handle))
+            self._transfer.cleanup_dataproto(self._mooncake.import_ref(handle))
         except Exception:
             # Not retried here; the logged handle is the only record of the object.
             logger.error(
