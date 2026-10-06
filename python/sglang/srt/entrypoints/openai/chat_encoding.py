@@ -250,13 +250,8 @@ def encode_simple_chat(
     """
     if spec == "inkling":
         from sglang.srt.parser.inkling_renderer import render_inkling_messages
-        from sglang.srt.parser.inkling_tokenizer import InklingTokenizer
 
-        return render_inkling_messages(
-            messages,
-            InklingTokenizer(tokenizer=tokenizer),
-            add_generation_prompt=False,
-        )
+        return render_inkling_messages(messages)
 
     if spec in ("dsv4", "dsv32", "dsv41"):
         if spec != "dsv41" and messages and messages[0]["role"] != "system":

@@ -4773,13 +4773,8 @@ class InklingReasoningEffortTest(unittest.TestCase):
     def test_serving_does_not_prefill_model_message(self):
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
 
-        class Tokenizer:
-            def encode(self, text, add_special_tokens=False):
-                return list(text.encode())
-
         serving = object.__new__(OpenAIServingChat)
         serving.chat_encoding_spec = "inkling"
-        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
         request = ChatCompletionRequest(
             model="test-model",
             messages=[{"role": "user", "content": "hello"}],
@@ -4800,13 +4795,8 @@ class InklingReasoningEffortTest(unittest.TestCase):
         render as an OPEN model text block."""
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
 
-        class Tokenizer:
-            def encode(self, text, add_special_tokens=False):
-                return list(text.encode())
-
         serving = object.__new__(OpenAIServingChat)
         serving.chat_encoding_spec = "inkling"
-        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
         request = ChatCompletionRequest(
             model="test-model",
             messages=[
@@ -4821,10 +4811,12 @@ class InklingReasoningEffortTest(unittest.TestCase):
             request,
             thinking_mode=None,
         )
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
         open_block = [
             INKLING_SPECIAL_TOKEN_IDS["<|message_model|>"],
             INKLING_SPECIAL_TOKEN_IDS["<|content_text|>"],
-            *list(b"The answer"),
+            *load_tml_renderers().tokenizer.encode_ordinary("The answer"),
         ]
         self.assertEqual(prompt_ids[-len(open_block) :], open_block)
         self.assertNotIn(
@@ -4836,13 +4828,8 @@ class InklingReasoningEffortTest(unittest.TestCase):
         it must keep rendering as a closed historical turn."""
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
 
-        class Tokenizer:
-            def encode(self, text, add_special_tokens=False):
-                return list(text.encode())
-
         serving = object.__new__(OpenAIServingChat)
         serving.chat_encoding_spec = "inkling"
-        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
         request = ChatCompletionRequest(
             model="test-model",
             messages=[
@@ -4871,6 +4858,135 @@ class InklingReasoningEffortTest(unittest.TestCase):
             prompt_ids[-1],
             INKLING_SPECIAL_TOKEN_IDS["<|content_model_end_sampling|>"],
         )
+
+
+class InklingTokenOutputTest(CustomTestCase):
+    """Inkling chat responses are parsed from output token IDs, not text."""
+
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.serving = object.__new__(OpenAIServingChat)
+        self.serving.chat_encoding_spec = "inkling"
+        self.serving.reasoning_parser = "inkling"
+        self.serving.tool_call_parser = "inkling"
+        self.serving._inkling_token_output = True
+        self.request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "weather?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": {"type": "object"}},
+                }
+            ],
+        )
+
+    @staticmethod
+    def _output_ids() -> list[int]:
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        special = tokenizer.encode_special
+        return [
+            special("message_model"),
+            special("content_thinking"),
+            *tokenizer.encode_ordinary("plan"),
+            special("end_message"),
+            special("message_model"),
+            *tokenizer.encode_ordinary("weather"),
+            special("content_invoke_tool_json"),
+            *tokenizer.encode_ordinary('{"name":"weather","args":{"city":"SF"}}'),
+            special("end_message"),
+            special("content_model_end_sampling"),
+        ]
+
+    def test_non_stream_maps_calls_and_finish_reason(self):
+        reasoning, content, tool_calls, finish_reason = (
+            self.serving._parse_inkling_response(
+                self.request, self._output_ids(), {"type": "stop", "matched": 200006}
+            )
+        )
+        self.assertEqual(reasoning, "plan")
+        self.assertEqual(content, "")
+        self.assertEqual(finish_reason, {"type": "tool_calls", "matched": None})
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].index, 0)
+        self.assertEqual(tool_calls[0].function.name, "weather")
+        self.assertEqual(json.loads(tool_calls[0].function.arguments), {"city": "SF"})
+        self.assertTrue(tool_calls[0].id.startswith("call_"))
+
+    def test_each_output_token_is_parsed_once(self):
+        """Non-incremental chunks carry the cumulative ids and an incremental
+        abort chunk re-sends streamed ids; either way a token parsed twice
+        would duplicate text."""
+        new_ids = OpenAIServingChat._new_inkling_output_ids
+        self.assertEqual(
+            new_ids(
+                output_ids=[1, 2, 3, 4],
+                num_consumed_tokens=3,
+                completion_tokens=4,
+                finish_reason_type=None,
+                incremental=False,
+            ),
+            [4],
+        )
+        self.assertEqual(
+            new_ids(
+                output_ids=[3, 4],
+                num_consumed_tokens=3,
+                completion_tokens=4,
+                finish_reason_type=None,
+                incremental=True,
+            ),
+            [3, 4],
+        )
+        self.assertEqual(
+            new_ids(
+                output_ids=[3, 4],
+                num_consumed_tokens=3,
+                completion_tokens=4,
+                finish_reason_type="abort",
+                incremental=True,
+            ),
+            [3],
+        )
+
+    def test_stream_emits_reasoning_then_one_complete_tool_call(self):
+        output_ids = self._output_ids()
+        split = 4
+        parser_dict, has_tool_calls, chunks = {}, {}, []
+        for cumulative, finish in (
+            (output_ids[:split], None),
+            (output_ids, "stop"),
+        ):
+            chunks += self.serving._inkling_stream_chunks(
+                content={
+                    "output_ids": cumulative,
+                    "meta_info": {"id": "chatcmpl-1", "completion_tokens": 0},
+                },
+                index=0,
+                request=self.request,
+                parser_dict=parser_dict,
+                has_tool_calls=has_tool_calls,
+                choice_logprobs=None,
+                finish_reason_type=finish,
+                continuous_usage_stats=False,
+            )
+        deltas = [
+            json.loads(chunk[len("data: ") :])["choices"][0]["delta"]
+            for chunk in chunks
+        ]
+        self.assertEqual(
+            "".join(d.get("reasoning_content") or "" for d in deltas), "plan"
+        )
+        calls = [call for d in deltas for call in d.get("tool_calls") or []]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "weather")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"city": "SF"})
+        self.assertEqual(has_tool_calls, {0: True})
 
 
 class TestRequestChatTemplateTrustGate(CustomTestCase):

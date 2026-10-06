@@ -102,6 +102,15 @@ from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,
     uses_hunyuan_reasoning_effort,
 )
+from sglang.srt.parser.inkling_output import (
+    InklingOutputParser,
+    InklingToolCall,
+)
+from sglang.srt.parser.inkling_renderer import (
+    load_tml_renderers,
+    render_inkling_assistant_prefix,
+    render_inkling_messages,
+)
 from sglang.srt.parser.jinja_template_utils import (
     MEDIA_URL_PART_TYPES,
     process_content_for_template_format,
@@ -350,6 +359,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if self.chat_encoding_spec == "inkling"
             else None
         )
+        if self.chat_encoding_spec == "inkling":
+            load_tml_renderers()
+        self._inkling_token_output = self.chat_encoding_spec == "inkling" and (
+            "inkling" in (self.reasoning_parser, self.tool_call_parser)
+        )
         self._dsv41_default_reasoning_effort: Optional[Union[str, int]] = (
             chat_encoding.default_dsv41_reasoning_effort_from_env(
                 envs.SGLANG_DSV41_REASONING_EFFORT.get()
@@ -586,20 +600,6 @@ class OpenAIServingChat(OpenAIServingBase):
         Returns prompt_ids if handled, None to use default encoding.
         """
         if self.chat_encoding_spec == "inkling":
-            # Inkling: render messages -> input_ids with framing tokens + ONE placeholder per
-            # media (encoding/expansion happens later in InklingMultimodalProcessor). The
-            # server's tokenizer is the base tiktoken backend; wrap it so encode_special
-            # supplies the framing-token overlay.
-            from sglang.srt.parser.inkling_renderer import render_inkling_messages
-            from sglang.srt.parser.inkling_tokenizer import (
-                CONTENT_TEXT,
-                MESSAGE_MODEL,
-                InklingTokenizer,
-            )
-
-            inkling_tokenizer = InklingTokenizer(
-                tokenizer=self.tokenizer_manager.tokenizer
-            )
             reasoning_effort = self._parse_inkling_reasoning_effort(
                 request.reasoning_effort
             )
@@ -607,21 +607,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 reasoning_effort = self._inkling_default_reasoning_effort
             assistant_prefix = self._pop_inkling_assistant_prefix(messages, request)
             prompt_ids = render_inkling_messages(
-                messages,
-                inkling_tokenizer,
-                add_generation_prompt=False,
-                tools=tools,
-                reasoning_effort=reasoning_effort,
+                messages, tools=tools, reasoning_effort=reasoning_effort
             )
             if assistant_prefix is not None:
-                # Continue the final assistant message inside an OPEN model text
-                # block: header + payload, no <|end_message|> and no
-                # <|content_model_end_sampling|>, so the model resumes the turn.
-                prompt_ids += [
-                    inkling_tokenizer.encode_special(MESSAGE_MODEL),
-                    inkling_tokenizer.encode_special(CONTENT_TEXT),
-                    *inkling_tokenizer.encode_text(assistant_prefix),
-                ]
+                prompt_ids += render_inkling_assistant_prefix(assistant_prefix)
             return prompt_ids
         if self.chat_encoding_spec == "kimi_k3":
             messages, image_count, assistant_prefix = self._prepare_kimi_k3_messages(
@@ -689,6 +678,151 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             return prompt_ids
         return None
+
+    def _new_inkling_output_parser(
+        self, request: ChatCompletionRequest
+    ) -> InklingOutputParser:
+        return InklingOutputParser(
+            separate_reasoning=bool(self.reasoning_parser)
+            and request.separate_reasoning,
+            parse_tool_calls=self._tool_call_parsing_active(request),
+            stream_reasoning=request.stream_reasoning,
+        )
+
+    def _parse_inkling_response(
+        self,
+        request: ChatCompletionRequest,
+        output_ids: list[int],
+        finish_reason: dict[str, Any],
+    ) -> tuple[str | None, str, list[ToolCall] | None, dict[str, Any]]:
+        parser = self._new_inkling_output_parser(request)
+        parsed = parser.feed(output_ids).merge(parser.finish())
+        if not parsed.tool_calls:
+            return parsed.reasoning or None, parsed.content, None, finish_reason
+        history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
+        tool_calls = [
+            self._inkling_tool_call(call, history_tool_calls_cnt)
+            for call in parsed.tool_calls
+        ]
+        if finish_reason["type"] == "stop":
+            finish_reason = {**finish_reason, "type": "tool_calls", "matched": None}
+        return parsed.reasoning or None, parsed.content, tool_calls, finish_reason
+
+    def _inkling_tool_call(
+        self, call: InklingToolCall, history_tool_calls_cnt: int
+    ) -> ToolCall:
+        call_item = ToolCallItem(
+            tool_index=call.index, name=call.name, parameters=call.arguments
+        )
+        return ToolCall(
+            id=self._process_tool_call_id(call_item, history_tool_calls_cnt),
+            index=call.index,
+            function=FunctionResponse(name=call.name, arguments=call.arguments),
+        )
+
+    def _inkling_stream_chunks(
+        self,
+        *,
+        content: dict[str, Any],
+        index: int,
+        request: ChatCompletionRequest,
+        parser_dict: dict,
+        has_tool_calls: dict[int, bool],
+        choice_logprobs: dict | None,
+        finish_reason_type: str | None,
+        continuous_usage_stats: bool,
+    ) -> list[str]:
+        if index not in parser_dict:
+            parser_dict[index] = self._new_inkling_output_parser(request)
+        parser = parser_dict[index]
+        delta = parser.feed(
+            self._new_inkling_output_ids(
+                output_ids=content["output_ids"],
+                num_consumed_tokens=parser.num_consumed_tokens,
+                completion_tokens=content["meta_info"].get("completion_tokens", 0),
+                finish_reason_type=finish_reason_type,
+                incremental=get_serving().incremental_streaming_output,
+            )
+        )
+        if finish_reason_type is not None:
+            delta = delta.merge(parser.finish())
+
+        usage = None
+        if continuous_usage_stats:
+            usage = UsageProcessor.calculate_token_usage(
+                prompt_tokens=self._reported_prompt_tokens(content["meta_info"]),
+                reasoning_tokens=content["meta_info"].get("reasoning_tokens", 0),
+                completion_tokens=content["meta_info"].get("completion_tokens", 0),
+                cached_tokens=self._continuous_usage_cached_details(content),
+            ).model_dump()
+        chunk_fields = dict(
+            chunk_id=content["meta_info"]["id"],
+            created=int(time.time()),
+            model=request.model,
+            index=index,
+            usage=usage,
+        )
+
+        chunks = []
+        remaining_logprobs = choice_logprobs
+        if delta.reasoning:
+            chunks.append(
+                build_sse_content(
+                    reasoning_content=delta.reasoning,
+                    logprobs=remaining_logprobs,
+                    **chunk_fields,
+                )
+            )
+            remaining_logprobs = None
+        if delta.content:
+            chunks.append(
+                build_sse_content(
+                    content=delta.content, logprobs=remaining_logprobs, **chunk_fields
+                )
+            )
+            remaining_logprobs = None
+        history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
+        for call in delta.tool_calls:
+            has_tool_calls[index] = True
+            tool_call_chunk = ChatCompletionStreamResponse(
+                id=content["meta_info"]["id"],
+                created=chunk_fields["created"],
+                choices=[
+                    ChatCompletionResponseStreamChoice(
+                        index=index,
+                        delta=DeltaMessage(
+                            tool_calls=[
+                                self._inkling_tool_call(call, history_tool_calls_cnt)
+                            ]
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                model=request.model,
+                usage=usage,
+            )
+            chunks.append(f"data: {tool_call_chunk.model_dump_json()}\n\n")
+        if remaining_logprobs is not None:
+            chunks.append(
+                build_sse_content(logprobs=remaining_logprobs, **chunk_fields)
+            )
+        return chunks
+
+    @staticmethod
+    def _new_inkling_output_ids(
+        *,
+        output_ids: list[int],
+        num_consumed_tokens: int,
+        completion_tokens: int,
+        finish_reason_type: str | None,
+        incremental: bool,
+    ) -> list[int]:
+        if not incremental:
+            return output_ids[num_consumed_tokens:]
+        if finish_reason_type == "abort":
+            # The abort chunk re-sends already-streamed tokens.
+            return output_ids[: max(completion_tokens - num_consumed_tokens, 0)]
+        return output_ids
 
     @staticmethod
     def _pop_inkling_assistant_prefix(
@@ -896,6 +1030,20 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens: dict[int, int],
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content."""
+        if self._inkling_token_output:
+            for chunk in self._inkling_stream_chunks(
+                content=content,
+                index=index,
+                request=request,
+                parser_dict=parser_dict,
+                has_tool_calls=has_tool_calls,
+                choice_logprobs=choice_logprobs,
+                finish_reason_type=finish_reason_type,
+                continuous_usage_stats=continuous_usage_stats,
+            ):
+                yield chunk
+            return
+
         offset = stream_offsets.get(index, 0)
         if get_serving().incremental_streaming_output:
             delta = content["text"]
@@ -2384,43 +2532,52 @@ class OpenAIServingChat(OpenAIServingBase):
             if isinstance(text, ErrorResponse):
                 return ORJSONResponse(content=text.model_dump(), status_code=text.code)
 
-            # Handle reasoning content
-            reasoning_text = None
-            if self.reasoning_parser and request.separate_reasoning:
-                force_reasoning = (
-                    self.template_manager.force_reasoning
-                    or self._get_reasoning_from_request(request)
+            if self._inkling_token_output:
+                reasoning_text, text, tool_calls, finish_reason = (
+                    self._parse_inkling_response(
+                        request, ret_item["output_ids"], finish_reason
+                    )
                 )
-                try:
-                    parser = ReasoningParser(
-                        model_type=self.reasoning_parser,
-                        stream_reasoning=False,
-                        force_reasoning=force_reasoning,
-                        request=request,
-                        tokenizer=self.tokenizer_manager.tokenizer,
-                        tool_call_parser_active=self._tool_call_parsing_active(request),
+            else:
+                # Handle reasoning content
+                reasoning_text = None
+                if self.reasoning_parser and request.separate_reasoning:
+                    force_reasoning = (
+                        self.template_manager.force_reasoning
+                        or self._get_reasoning_from_request(request)
                     )
-                    reasoning_text, text = parser.parse_non_stream(text)
-                except Exception as e:
-                    logger.error(f"Reasoning parsing error: {e}")
-                    return self.create_error_response(
-                        "Failed to parse reasoning content",
-                        err_type="InternalServerError",
-                        status_code=500,
-                    )
+                    try:
+                        parser = ReasoningParser(
+                            model_type=self.reasoning_parser,
+                            stream_reasoning=False,
+                            force_reasoning=force_reasoning,
+                            request=request,
+                            tokenizer=self.tokenizer_manager.tokenizer,
+                            tool_call_parser_active=self._tool_call_parsing_active(
+                                request
+                            ),
+                        )
+                        reasoning_text, text = parser.parse_non_stream(text)
+                    except Exception as e:
+                        logger.error(f"Reasoning parsing error: {e}")
+                        return self.create_error_response(
+                            "Failed to parse reasoning content",
+                            err_type="InternalServerError",
+                            status_code=500,
+                        )
 
-            # Handle tool calls
-            tool_calls = None
-            effective_tools = self._effective_tools(request)
-            if self._tool_call_parsing_active(request):
-                history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
-                tool_calls, text, finish_reason = self._process_tool_calls(
-                    text,
-                    effective_tools,
-                    finish_reason,
-                    request.tool_choice,
-                    history_tool_calls_cnt,
-                )
+                # Handle tool calls
+                tool_calls = None
+                effective_tools = self._effective_tools(request)
+                if self._tool_call_parsing_active(request):
+                    history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
+                    tool_calls, text, finish_reason = self._process_tool_calls(
+                        text,
+                        effective_tools,
+                        finish_reason,
+                        request.tool_choice,
+                        history_tool_calls_cnt,
+                    )
 
             # Extract prompt_token_ids if requested
             choice_prompt_token_ids = (
