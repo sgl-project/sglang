@@ -167,7 +167,28 @@ class TestBeamAllReduce(CustomTestCase):
         model._beam_all_reduce_comm = None
         hidden = torch.empty(1, 5120, device="cuda", dtype=torch.bfloat16)
         with patch.object(get_parallel().tp_group, "ca_comm", self.comm):
-            self.assertIs(model._all_reduce_comm(hidden), self.comm.obj)
+            limits = model._all_reduce_limits(hidden)
+            self.assertIsNotNone(limits)
+            self.assertIsNone(model._beam_all_reduce_comm)
+            # Eligibility does not allocate; first use during capture must fall back.
+            with patch("torch.cuda.is_current_stream_capturing", return_value=True):
+                self.assertIsNone(model._prepare_all_reduce_comm(hidden, max(limits)))
+            self.assertIsNone(model._beam_all_reduce_comm)
+            self.assertIs(
+                model._prepare_all_reduce_comm(hidden, max(limits)), self.comm.obj
+            )
+            with patch("torch.cuda.is_current_stream_capturing", return_value=True):
+                self.assertIs(
+                    model._prepare_all_reduce_comm(hidden, max(limits)), self.comm.obj
+                )
+            self.assertFalse(self.comm.supports_push(nbytes=1, num_blocks=10**9))
+            self.assertFalse(
+                self.comm.supports_push(
+                    nbytes=self.comm.max_push_size + 1, num_blocks=1
+                )
+            )
+            with patch.object(self.comm, "disabled", True):
+                self.assertFalse(self.comm.supports_push(nbytes=1, num_blocks=1))
             for guard in (
                 get_exec().comm.override(disable_custom_all_reduce=True),
                 get_exec().deterministic.override(enable_deterministic_inference=True),
@@ -175,13 +196,13 @@ class TestBeamAllReduce(CustomTestCase):
                 get_forward().scoped(sp_active=True),
             ):
                 with guard:
-                    self.assertIsNone(model._all_reduce_comm(hidden))
+                    self.assertIsNone(model._all_reduce_limits(hidden))
             with patch.object(self.comm, "max_push_size", 1024):
-                self.assertIsNone(model._all_reduce_comm(hidden))
+                self.assertIsNone(model._prepare_all_reduce_comm(hidden, max(limits)))
             for unsupported in (hidden.float(), hidden[:, ::2], hidden[:0]):
-                self.assertIsNone(model._all_reduce_comm(unsupported))
+                self.assertIsNone(model._all_reduce_limits(unsupported))
             with patch("torch.cuda.get_device_capability", return_value=(8, 0)):
-                self.assertIsNone(model._all_reduce_comm(hidden))
+                self.assertIsNone(model._all_reduce_limits(hidden))
 
     def test_attention_projection_reduction_ownership(self):
         """Deferring o_proj must perform exactly one collective before its norm."""
