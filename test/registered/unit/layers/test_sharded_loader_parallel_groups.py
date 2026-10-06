@@ -11,11 +11,11 @@ from sglang.srt.layers.linear import ReplicatedParallelGroup
 from sglang.srt.model_loader import weight_utils
 from sglang.srt.runtime_context import SpawnRanks, get_parallel, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.parallel_groups import parallel_scope, publish
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 
 def values(shape, *, device="cpu", dtype=torch.float32, offset=0):

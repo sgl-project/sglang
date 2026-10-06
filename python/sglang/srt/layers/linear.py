@@ -104,8 +104,16 @@ def resolve_linear_parallel_group(
 
 
 @dataclass(frozen=True)
+class _LogicalGroup:
+    """Own a weight partition before distributed communication is initialized."""
+
+    rank_in_group: int
+    world_size: int
+
+
+@dataclass(frozen=True)
 class _ReplicatedGroup:
-    group: GroupCoordinator
+    group: GroupCoordinator | _LogicalGroup
     replica_size: int
 
     def __post_init__(self):
@@ -122,7 +130,7 @@ class _ReplicatedGroup:
 
 def _resolve_linear_group(
     parallel_group: Optional[LinearParallelGroup],
-) -> GroupCoordinator | _ReplicatedGroup | None:
+) -> GroupCoordinator | _LogicalGroup | _ReplicatedGroup | None:
     if isinstance(parallel_group, ReplicatedParallelGroup):
         group = _resolve_linear_group(parallel_group.group)
         if group is None:
@@ -140,15 +148,17 @@ def _resolve_linear_group(
         group = getattr(parallel, f"{name}_group")
     except RuntimeError:
         group = None
-    if group is None and (
-        name == "shared_experts_tp" or getattr(parallel, f"{name}_size") > 1
-    ):
-        raise ValueError(f"The {name} group must exist before construction")
+    if group is None:
+        if name == "shared_experts_tp":
+            raise ValueError(f"The {name} group must exist before construction")
+        size = getattr(parallel, f"{name}_size")
+        if size > 1:
+            return _LogicalGroup(getattr(parallel, f"{name}_rank"), size)
     return group
 
 
 class _ParallelGroupMixin:
-    tp_group: GroupCoordinator | _ReplicatedGroup | None = None
+    tp_group: GroupCoordinator | _LogicalGroup | _ReplicatedGroup | None = None
 
     @property
     def tp_rank(self):
@@ -479,7 +489,7 @@ class ColumnParallelLinear(LinearBase):
         output_sizes: Optional[List[int]] = None,
         prefix: str = "",
         *,
-        tp_group: GroupCoordinator | _ReplicatedGroup | None,
+        tp_group: GroupCoordinator | _LogicalGroup | _ReplicatedGroup | None,
         use_presharded_weights: bool = False,
         skip_block_quant_check: bool = False,
         parallel_group: Optional[LinearParallelGroup] = None,

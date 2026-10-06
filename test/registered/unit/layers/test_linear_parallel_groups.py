@@ -692,8 +692,11 @@ class TestLinearParallelGroups(CustomTestCase):
             self.assertIsNot(layer.tp_group, get_parallel().attn_tp_group)
             self.assertEqual((layer.tp_rank, layer.tp_size), (1, 2))
         with parallel_scope(attn_tp_group=None):
-            with self.assertRaisesRegex(ValueError, "group must exist"):
-                ColumnParallelLinear(8, 8, parallel_group="attn_tp")
+            offline = ColumnParallelLinear(8, 8, bias=False, parallel_group="attn_tp")
+        with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
+            offline.weight.weight_loader(offline.weight, self.weight)
+        torch.testing.assert_close(offline.weight, self.weight[4:])
+        self.assertEqual((offline.tp_rank, offline.tp_size), (1, 2))
 
     def test_quant_initialization_keeps_the_entry_scope_partition(self):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
