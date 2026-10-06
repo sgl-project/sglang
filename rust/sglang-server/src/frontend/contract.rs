@@ -12,7 +12,7 @@ use crate::message::config::{DisaggregationMode, PreferredSamplingParams};
 use crate::message::finish_reason::FinishReason;
 use crate::message::request::GenerateRequest;
 use crate::message::response::{ChunkEvent, ChunkExtras};
-use crate::message::types::TokenIds;
+use crate::message::types::OutputTokenIds;
 
 /// Canonical transport-neutral input for one generation operation.
 ///
@@ -31,7 +31,7 @@ pub(crate) type FrontendRequest = GenerateRequest;
 /// [`crate::frontend::FrontendCall`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FrontendOutput {
-    pub(crate) token_ids: TokenIds,
+    pub(crate) token_ids: OutputTokenIds,
     pub(crate) finish_reason: Option<FinishReason>,
     pub(crate) prompt_tokens: u32,
     pub(crate) text: String,
@@ -70,6 +70,13 @@ impl FrontendOutput {
     /// boundary rather than in either wire adapter.
     pub(crate) fn append_delta(&mut self, delta: &Self) {
         self.text.push_str(&delta.text);
+        if !self.token_ids.spilled()
+            && delta.token_ids.len() > self.token_ids.capacity() - self.token_ids.len()
+        {
+            // On the first spill, skip capacity 2 while keeping single-token output inline.
+            self.token_ids
+                .reserve(delta.token_ids.len().max(4 - self.token_ids.len()));
+        }
         self.token_ids.extend_from_slice(&delta.token_ids);
         self.completion_tokens += delta.completion_tokens;
         self.prompt_tokens = delta.prompt_tokens;

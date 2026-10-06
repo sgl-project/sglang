@@ -87,7 +87,7 @@ pub(super) fn frame_value(out: &FrontendOutput, rid: &str) -> serde_json::Value 
         "meta_info": meta_info_value(out, rid),
     });
     if !out.token_ids.is_empty() {
-        v["output_ids"] = serde_json::json!(out.token_ids);
+        v["output_ids"] = serde_json::json!(out.token_ids.as_slice());
     }
     v
 }
@@ -463,31 +463,59 @@ mod tests {
     #[test]
     fn accumulator_snapshot_is_cumulative() {
         let mut acc = OutputAccumulator::default();
+        acc.fold(&FrontendOutput::default());
+        assert!(acc.snapshot().token_ids.is_empty());
+        assert!(!acc.snapshot().token_ids.spilled());
         acc.fold(&FrontendOutput {
             text: "he".into(),
-            token_ids: vec![1, 2],
-            completion_tokens: 2,
-            ..Default::default()
-        });
-        {
-            let s = acc.snapshot();
-            assert_eq!(s.text, "he");
-            assert_eq!(s.token_ids, vec![1, 2]);
-        }
-        acc.fold(&FrontendOutput {
-            text: "llo".into(),
-            token_ids: vec![3],
+            token_ids: vec![1].into(),
             completion_tokens: 1,
             ..Default::default()
         });
+        assert!(!acc.snapshot().token_ids.spilled());
+        {
+            let s = acc.snapshot();
+            assert_eq!(s.text, "he");
+            assert_eq!(s.token_ids.as_slice(), vec![1]);
+        }
+        acc.fold(&FrontendOutput {
+            text: "l".into(),
+            token_ids: vec![2].into(),
+            completion_tokens: 1,
+            ..Default::default()
+        });
+        let capacity = acc.snapshot().token_ids.capacity();
+        assert!(acc.snapshot().token_ids.spilled());
+        assert!(capacity >= 4);
+        for (id, text) in [(3, "l"), (4, "o")] {
+            acc.fold(&FrontendOutput {
+                text: text.into(),
+                token_ids: vec![id].into(),
+                completion_tokens: 1,
+                ..Default::default()
+            });
+            assert_eq!(acc.snapshot().token_ids.capacity(), capacity);
+        }
         {
             let s = acc.snapshot();
             assert_eq!(s.text, "hello"); // cumulative
-            assert_eq!(s.token_ids, vec![1, 2, 3]);
-            assert_eq!(s.completion_tokens, 3);
+            assert_eq!(s.token_ids.as_slice(), vec![1, 2, 3, 4]);
+            assert_eq!(s.completion_tokens, 4);
         }
         let out = acc.into_output();
         assert_eq!(out.text, "hello");
+
+        let mut large = OutputAccumulator::default();
+        let ids: Vec<i64> = (1..=9).collect();
+        large.fold(&FrontendOutput {
+            token_ids: ids.clone().into(),
+            completion_tokens: ids.len() as u64,
+            ..Default::default()
+        });
+        assert_eq!(large.snapshot().token_ids.as_slice(), ids);
+        assert_eq!(large.snapshot().completion_tokens, 9);
+        assert!(large.snapshot().token_ids.spilled());
+        assert!(large.snapshot().token_ids.capacity() >= ids.len());
     }
 
     /// A populated text column (decoded on the detok shard) → `Some`; empty
@@ -514,28 +542,28 @@ mod tests {
         let deltas = [
             FrontendOutput {
                 text: String::new(),
-                token_ids: vec![],
+                token_ids: vec![].into(),
                 completion_tokens: 0,
                 prompt_tokens: 128,
                 ..Default::default()
             },
             FrontendOutput {
                 text: "He\"llo\n\t".into(),
-                token_ids: vec![1000],
+                token_ids: vec![1000].into(),
                 completion_tokens: 1,
                 prompt_tokens: 128,
                 ..Default::default()
             },
             FrontendOutput {
                 text: " 世界 🌍 \\".into(),
-                token_ids: vec![-2, 3],
+                token_ids: vec![-2, 3].into(),
                 completion_tokens: 2,
                 prompt_tokens: 128,
                 ..Default::default()
             },
             FrontendOutput {
                 text: "!".into(),
-                token_ids: vec![9],
+                token_ids: vec![9].into(),
                 completion_tokens: 1,
                 prompt_tokens: 128,
                 finish_reason: serde_json::from_value(
@@ -599,7 +627,7 @@ mod tests {
                 },
                 FrontendOutput {
                     text: "He\"llo".into(),
-                    token_ids: vec![100],
+                    token_ids: vec![100].into(),
                     completion_tokens: 1,
                     prompt_tokens: 4,
                     extras: Some(Box::new(ChunkExtras {
@@ -620,7 +648,7 @@ mod tests {
                 },
                 FrontendOutput {
                     text: " 世界".into(),
-                    token_ids: vec![-2, 3],
+                    token_ids: vec![-2, 3].into(),
                     completion_tokens: 2,
                     prompt_tokens: 4,
                     finish_reason: serde_json::from_value(

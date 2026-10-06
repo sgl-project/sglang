@@ -3811,6 +3811,7 @@ dependencies = [
  "serde_json",
  "sglang-grpc-types",
  "sglang-mm",
+ "smallvec",
  "socket2 0.6.5",
  "thiserror",
  "tokio",
