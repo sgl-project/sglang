@@ -373,8 +373,9 @@ def _kpool_plan_to_gpu(
             pool_pool_id_t, slots_per_page, rounding_mode="floor"
         )
         token_page_row = pool_page_group * pool_size
-        packed_page = full_real_page_table[pool_batch_idx_t, token_page_row].to(
-            torch.int64
+        packed_page = (
+            full_real_page_table[pool_batch_idx_t, token_page_row].to(torch.int64)
+            // pool_size
         )
         pool_write_locs = packed_page * slots_per_page + torch.remainder(
             pool_pool_id_t, slots_per_page
@@ -584,16 +585,23 @@ def init_pooled_paged_mqa_metadata(
     if (
         not _is_kpool_layout_enabled(pool_size, real_page_size)
         or not is_cuda()
-        or not forward_mode.is_decode_or_idle()
+        or not (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
     ):
         return metadata
+
+    pooled_page_table = build_pooled_page_table_64(
+        metadata.real_page_table, pool_size
+    ).contiguous()
+    if forward_mode.is_target_verify():
+        return dataclasses.replace(
+            metadata,
+            pooled_index_kpool=pool_size,
+            pooled_real_page_table=pooled_page_table,
+        )
 
     pool_seqlens = torch.div(seqlens_32, pool_size, rounding_mode="floor").to(
         torch.int32
     )
-    pooled_page_table = build_pooled_page_table_64(
-        metadata.real_page_table, pool_size
-    ).contiguous()
     schedule = (
         _compute_pool_schedule_metadata(
             pool_seqlens,
@@ -624,8 +632,12 @@ def update_pooled_paged_mqa_metadata(
     if (
         not _is_kpool_layout_enabled(pool_size, real_page_size)
         or not is_cuda()
-        or not forward_mode.is_decode_or_idle()
+        or not (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
     ):
+        return
+
+    if forward_mode.is_target_verify():
+        metadata.pooled_real_page_table.copy_(metadata.real_page_table[:, ::pool_size])
         return
 
     if (
