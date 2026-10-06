@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
     request_extra_value,
     resolve_sampling_params_cls,
+    sanitize_upload_filename,
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -371,9 +372,13 @@ async def _save_first_input_image(
     os.makedirs(uploads_dir, exist_ok=True)
 
     filename = image.filename if hasattr(image, "filename") else "url_image"
-    target_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
+    safe_name = sanitize_upload_filename(filename, "url_image")
+    target_path = os.path.join(uploads_dir, f"{request_id}_{safe_name}")
     return await save_image_to_path(
-        image, target_path, prefer_remote_source=prefer_remote_source
+        image,
+        target_path,
+        prefer_remote_source=prefer_remote_source,
+        uploads_root=uploads_dir,
     )
 
 
