@@ -254,6 +254,36 @@ class TestDFlashPenalizerCumulate(CustomTestCase):
         )
         assert torch.equal(logits, expected)
 
+    def test_verify_adjustments_add_logit_bias_after_repetition(self):
+        reqs = [_make_req(repetition_penalty=2.0)]
+        orchestrator = _make_orchestrator(reqs, vocab_size=4)
+        orchestrator.cumulate_output_tokens_multi(
+            torch.tensor([[1]], dtype=torch.int64),
+            torch.tensor([1], dtype=torch.int64),
+        )
+
+        class FakeSamplingInfo:
+            has_custom_logit_processor = False
+            penalizer_orchestrator = orchestrator
+            grammar_mask = None
+            logit_bias = torch.tensor([[0.0, 10.0, 0.0, 0.0]])
+            acc_scaling_penalties = None
+
+            def __len__(self):
+                return 1
+
+        draft_token_num = 2
+        logits = torch.tensor([[1.0, 4.0, 1.0, -4.0]]).repeat(draft_token_num, 1)
+
+        apply_dflash_verify_logits_adjustments(
+            next_token_logits=logits,
+            sampling_info=FakeSamplingInfo(),
+            draft_token_num=draft_token_num,
+        )
+
+        expected = torch.tensor([[1.0, 12.0, 1.0, -4.0]] * draft_token_num)
+        assert torch.equal(logits, expected)
+
     def test_spec_prepare_for_decode_gates_penalty_cumulate(self):
         calls = []
         batch = SimpleNamespace(

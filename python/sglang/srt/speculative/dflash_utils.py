@@ -276,7 +276,13 @@ def apply_dflash_verify_logits_adjustments(
             dtype=torch.float32,
             device=next_token_logits.device,
         )
-        sampling_info.apply_logits_bias(linear_penalty)
+        acc_additive_penalties = getattr(sampling_info, "acc_additive_penalties", None)
+        if acc_additive_penalties is not None:
+            linear_penalty.add_(acc_additive_penalties)
+        if penalizer is not None and penalizer.is_required:
+            penalizer.accumulate_additive_penalties(linear_penalty)
+        if grammar_mask is not None:
+            grammar_mask.apply(linear_penalty)
         get_logits_3d().add_(
             linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
         )
@@ -292,9 +298,7 @@ def apply_dflash_verify_logits_adjustments(
                 get_logits_3d(),
                 scaling_penalties[:, None, :].to(dtype=next_token_logits.dtype),
             )
-        return
-
-    if acc_linear_penalties is not None:
+    elif acc_linear_penalties is not None:
         if (
             acc_linear_penalties.device != next_token_logits.device
             or acc_linear_penalties.dtype != next_token_logits.dtype
