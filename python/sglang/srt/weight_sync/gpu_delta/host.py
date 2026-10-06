@@ -13,8 +13,8 @@
 
 """Verified engine-host encoded cache and rank-owned direct-DE host arenas.
 
-Encoded publication files are shared through tmpfs. Every scheduler
-decodes its local tensors into its own original CUDA HOST_NUMA allocation.
+Encoded publication files and multi-consumer inner compressed bytes are shared
+through tmpfs. Each scheduler retains its original CUDA HOST_NUMA allocation.
 """
 
 import fcntl
@@ -26,8 +26,10 @@ import re
 import stat
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
 
+import numpy as np
 import orjson
 
 from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation
@@ -94,7 +96,7 @@ def _identity(info):
 _CAPACITY_ALIGNMENT = 64 << 20
 
 
-def _reserve_encoded_cache(directory, previous, size, metrics):
+def _reserve_cache(directory, previous, size, metrics, kind):
     if previous is not None and size <= previous["capacity"]:
         return previous
     capacity = size if previous is None else 2 * size
@@ -104,7 +106,7 @@ def _reserve_encoded_cache(directory, previous, size, metrics):
         * _CAPACITY_ALIGNMENT
     )
     generation = previous["generation"] + 1 if previous else 1
-    path = directory / f"encoded-{generation}.bin"
+    path = directory / f"{kind}-{generation}.bin"
     started = time.perf_counter()
     with path.open("xb+") as target:
         if capacity:
@@ -112,9 +114,9 @@ def _reserve_encoded_cache(directory, previous, size, metrics):
             # truncate or resize the retained encoded-cache inode.
             os.posix_fallocate(target.fileno(), 0, capacity)
         identity = _identity(os.fstat(target.fileno()))
-    metrics["host_encoded_cache_allocation_s"] += time.perf_counter() - started
-    metrics["host_encoded_cache_allocation_calls"] += 1
-    metrics["host_encoded_cache_allocation_bytes"] += capacity
+    metrics[f"host_{kind}_cache_allocation_s"] += time.perf_counter() - started
+    metrics[f"host_{kind}_cache_allocation_calls"] += 1
+    metrics[f"host_{kind}_cache_allocation_bytes"] += capacity
     return {
         "file": path.name,
         "generation": generation,
@@ -259,12 +261,17 @@ def _decode_group(jobs, destination, files, pool):
         metrics["host_rank_outer_zstd_decoded_bytes"] += outer["decoded_bytes"]
         metrics["host_rank_outer_zstd_tensors"] += 1
         metrics["host_rank_outer_zstd_frames"] += len(outer["frames"])
+    metrics["finished_at"] = time.perf_counter()
     return metrics
 
 
-def _decode_arena(destination, layout, files, entries, pool, metrics):
+def _decode_arena(destination, layout, files, entries, pool, metrics, shared):
     started = time.perf_counter()
-    jobs, futures, error = [], [], None
+    jobs, futures, common_futures, copies, error = [], [], [], [], None
+    shared_layout = shared.index["shared"]["tensors"]
+    common_metrics = {
+        key.replace("host_rank_", "host_shared_"): 0 for key in _DECODE_METRICS
+    }
     try:
         for entry in entries:
             record = layout.get(entry["name"])
@@ -277,26 +284,103 @@ def _decode_arena(destination, layout, files, entries, pool, metrics):
                 destination[offset : offset + count] = files[raw["file"]][
                     start : start + count
                 ]
-            else:
+            elif entry["name"] not in shared_layout:
                 jobs.append((entry, record))
-        count = min(4 * pool.workers, len(jobs))
-        for index in range(count):
-            futures.append(
+        common = [
+            (entry, shared_layout[entry["name"]])
+            for entry in shared.entries
+            if entry["name"] in shared_layout
+        ]
+        common_count = min(pool.workers, len(common))
+        private_count = min(4 * pool.workers, len(jobs))
+        # Submit common and private tasks directly, interleaved. No pool task
+        # submits work and waits on that same executor, even with one worker.
+        for i in range(max(common_count, private_count)):
+            if i < common_count:
+                common_futures.append(
+                    pool.executor.submit(
+                        _decode_group,
+                        common[i::common_count],
+                        shared.data,
+                        files,
+                        pool,
+                    )
+                )
+            if i < private_count:
+                futures.append(
+                    pool.executor.submit(
+                        _decode_group,
+                        jobs[i::private_count],
+                        destination,
+                        files,
+                        pool,
+                    )
+                )
+        for future in common_futures:
+            partial = future.result()
+            for key in _DECODE_METRICS:
+                common_metrics[key.replace("host_rank_", "host_shared_")] += partial[
+                    key
+                ]
+        metrics["host_shared_outer_zstd_decode_s"] = (
+            time.perf_counter() - started if shared.creator else 0
+        )
+        waiting = time.perf_counter()
+        shared.ready()
+        metrics["host_shared_cache_wait_s"] = time.perf_counter() - waiting
+        copying = time.perf_counter()
+        ranges = []
+        for entry in entries:
+            source = shared_layout.get(entry["name"])
+            if source is None:
+                continue
+            target = layout[entry["name"]]
+            if source["nbytes"] != target["nbytes"]:
+                raise ValueError("shared and private decoded tensor extents differ")
+            row = (source["offset"], target["offset"], target["nbytes"])
+            if ranges:
+                before = ranges[-1]
+                gap = row[0] - (before[0] + before[2])
+                # Only identical inter-tensor alignment padding may be included.
+                if 0 <= gap < 16 and row[1] - (before[1] + before[2]) == gap:
+                    ranges[-1] = (before[0], before[1], before[2] + gap + row[2])
+                    continue
+            ranges.append(row)
+        count = min(pool.workers, len(ranges))
+        for i in range(count):
+            copies.append(
                 pool.executor.submit(
-                    _decode_group, jobs[index::count], destination, files, pool
+                    _copy_group,
+                    ranges[i::count],
+                    shared.data,
+                    destination,
                 )
             )
-    except BaseException as exc:  # noqa: BLE001 - drain submitted jobs before re-raise
+        for future in copies:
+            future.result()
+        metrics["host_rank_shared_copy_s"] = time.perf_counter() - copying
+        metrics["host_rank_shared_copy_bytes"] = sum(row[2] for row in ranges)
+        metrics["host_rank_shared_copy_ranges"] = len(ranges)
+    except BaseException as exc:  # noqa: BLE001 - drain every submitted reader/writer
         error = exc
+    for future in common_futures + copies:
+        try:
+            future.result()
+        except BaseException as exc:  # noqa: BLE001 - preserve the first failure
+            if error is None:
+                error = exc
+    private_finished = started
     for future in futures:
         try:
             partial = future.result()
+            private_finished = max(private_finished, partial["finished_at"])
             for key in _DECODE_METRICS:
                 metrics[key] += partial[key]
-        except BaseException as exc:  # noqa: BLE001 - drain peers before re-raise
+        except BaseException as exc:  # noqa: BLE001 - private destinations stay alive
             if error is None:
                 error = exc
-    metrics["host_rank_outer_zstd_decode_s"] = time.perf_counter() - started
+    metrics.update(common_metrics)
+    metrics["host_rank_outer_zstd_decode_s"] = private_finished - started
     if error is not None:
         raise error
 
@@ -320,6 +404,65 @@ def _map_files(directory, encoded, definitions):
     return files
 
 
+class SharedDecodeLease:
+    """CPU-only common bytes; the producer holds the lock until workers drain."""
+
+    def __init__(self, directory, index, entries, lock=None):
+        self.directory, self.index = directory, index
+        self.entries, self.lock = entries, lock
+        self.creator = lock is not None
+        descriptor = index["shared"]
+        with (directory / descriptor["file"]).open("r+b") as source:
+            if _identity(os.fstat(source.fileno())) != descriptor["identity"]:
+                raise ValueError("shared decoded cache inode or extent changed")
+            self.data = (
+                memoryview(
+                    mmap.mmap(
+                        source.fileno(),
+                        0,
+                        access=mmap.ACCESS_WRITE if self.creator else mmap.ACCESS_READ,
+                    )
+                )
+                if descriptor["capacity"]
+                else memoryview(b"")
+            )
+
+    def ready(self):
+        expected = {
+            "token": self.index["token"],
+            "generation": self.index["shared"]["generation"],
+            "state": "READY",
+        }
+        if self.creator:
+            _write_record(self.directory, "shared-state", expected)
+            self.lock.close()
+            self.lock = None
+        else:
+            with (self.directory / ".shared-lock").open("a+b") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                if (
+                    orjson.loads((self.directory / "shared-state.json").read_bytes())
+                    != expected
+                ):
+                    raise ValueError("shared decoded publication failed before READY")
+
+    def close(self):
+        # The caller has drained submitted work. Failed preparation leaves the
+        # shared state BUILDING; dropping the lock wakes peers to reject it.
+        if self.lock is not None:
+            self.lock.close()
+            self.lock = None
+        self.data = self.entries = None
+
+
+def _copy_group(ranges, source, destination):
+    # Numeric contiguous copies release the GIL; each job owns disjoint output.
+    source = np.frombuffer(source, dtype=np.uint8)
+    destination = np.frombuffer(destination, dtype=np.uint8)
+    for start, target, size in ranges:
+        np.copyto(destination[target : target + size], source[start : start + size])
+
+
 class HostArena:
     """Persistent rank-owned DE storage with an engine-host encoded cache.
 
@@ -337,6 +480,39 @@ class HostArena:
         self.capacity = None
         self.directory = None
         self.tensor_order = None
+        self.rank_identity = self.shared_names = self.cohort = None
+
+    def register_rank(self, identity, names):
+        """Publish immutable local membership before the existing describe barrier."""
+        root = _cache_root(self.engine_id)
+        record = {"identity": identity, "names": sorted(names)}
+        path = root / (identity["rank_id"] + ".json")
+        with path.open("xb") as target:
+            target.write(orjson.dumps(record))
+        path.chmod(0o400)
+        self.rank_identity = dict(identity)
+
+    def _shared_names(self, metadata):
+        participants = metadata["participants"]
+        if self.cohort is not None:
+            if participants != self.cohort:
+                raise ValueError("shared decoded cache original cohort changed")
+            return self.shared_names
+        root = _cache_root(self.engine_id)
+        counts = Counter()
+        if self.rank_identity not in participants:
+            raise ValueError("shared decoded cache rank was not admitted")
+        for identity in participants:
+            if identity["host_cache_id"] == self.rank_identity["host_cache_id"]:
+                record = orjson.loads(
+                    (root / (identity["rank_id"] + ".json")).read_bytes()
+                )
+                if record["identity"] != identity:
+                    raise ValueError("shared decoded cache rank identity changed")
+                counts.update(record["names"])
+        self.shared_names = {name for name, count in counts.items() if count > 1}
+        self.cohort = [dict(identity) for identity in participants]
+        return self.shared_names
 
     def _reserve_rank_arena(self, size, metrics):
         import torch
@@ -383,6 +559,7 @@ class HostArena:
         """Admit READY encoded bytes; returned file views own their mmap lease."""
         started = time.perf_counter()
         root = _cache_root(self.engine_id)
+        shared_names = self._shared_names(metadata)
         publication = Path(manifest_path).resolve(strict=True)
         namespace = {
             "stream_id": metadata["stream_id"],
@@ -434,8 +611,12 @@ class HostArena:
                 "host_encoded_cache_allocation_s",
                 "host_encoded_cache_allocation_calls",
                 "host_encoded_cache_allocation_bytes",
+                "host_shared_cache_allocation_s",
+                "host_shared_cache_allocation_calls",
+                "host_shared_cache_allocation_bytes",
             )
         }
+        shared_lock, shared_entries = None, []
         waiting = time.perf_counter()
         directory.mkdir(mode=0o700, exist_ok=True)
         # Only encoded-cache construction is serialized. Rank-local Zstd and
@@ -484,11 +665,12 @@ class HostArena:
                     )
                 build_started = time.perf_counter()
                 encoded_size = sum(record["nbytes"] for record in definitions.values())
-                encoded = _reserve_encoded_cache(
+                encoded = _reserve_cache(
                     directory,
                     previous["encoded"] if previous else None,
                     encoded_size,
                     metrics,
+                    "encoded",
                 )
                 index = {
                     "namespace": namespace,
@@ -520,6 +702,38 @@ class HostArena:
                 if not self.skip_payload_hash:
                     metrics["host_encoded_cache_hash_bytes"] = encoded_size
                     metrics["host_encoded_cache_hash_files"] = len(definitions)
+                shared_entries = sorted(
+                    (
+                        entry
+                        for entry in manifest["tensors"]
+                        if entry["name"] in shared_names
+                        and entry["encoding"] == "xor_bytes"
+                    ),
+                    key=lambda entry: _natural_key(entry["name"]),
+                )
+                shared_layout, shared_size = _tensor_layout(shared_entries)
+                shared = dict(
+                    _reserve_cache(
+                        directory,
+                        previous["shared"] if previous else None,
+                        shared_size,
+                        metrics,
+                        "shared",
+                    )
+                )
+                index["shared"] = shared | {
+                    "tensors": shared_layout,
+                    "arena_bytes": shared_size,
+                }
+                _write_record(
+                    directory,
+                    "shared-state",
+                    {
+                        "token": token,
+                        "generation": shared["generation"],
+                        "state": "BUILDING",
+                    },
+                )
                 index["build_s"] = time.perf_counter() - build_started
                 _write_record(directory, "index", index)
                 _write_record(
@@ -533,6 +747,10 @@ class HostArena:
                 )
                 if previous and previous["encoded"]["file"] != encoded["file"]:
                     (directory / previous["encoded"]["file"]).unlink()
+                if previous and previous["shared"]["file"] != shared["file"]:
+                    (directory / previous["shared"]["file"]).unlink()
+                shared_lock = (directory / ".shared-lock").open("a+b")
+                fcntl.flock(shared_lock, fcntl.LOCK_EX)
                 metrics["host_encoded_cache_created"] = 1
         metrics["host_encoded_cache_access_s"] = time.perf_counter() - started
         self.directory = directory
@@ -541,11 +759,23 @@ class HostArena:
             host_encoded_cache_capacity_generation=index["encoded"]["generation"],
             host_encoded_cache_build_s=index["build_s"],
             host_encoded_cache_skip_payload_hash=int(self.skip_payload_hash),
+            host_shared_cache_capacity_bytes=index["shared"]["capacity"],
+            host_shared_cache_capacity_generation=index["shared"]["generation"],
+            host_shared_cache_created=metrics["host_encoded_cache_created"],
+            host_shared_cache_reused=metrics["host_encoded_cache_reused"],
         )
         timings.update(metrics)
-        return index, files
+        try:
+            shared_lease = SharedDecodeLease(
+                directory, index, shared_entries, shared_lock
+            )
+        except BaseException:
+            if shared_lock is not None:
+                shared_lock.close()
+            raise
+        return index, files, shared_lease
 
-    def decode_local(self, index, files, local_entries, pool, timings):
+    def decode_local(self, index, files, local_entries, pool, timings, shared_lease):
         """Decode local entries; the caller retains file views until this returns."""
         metrics = {
             name: 0
@@ -579,6 +809,7 @@ class HostArena:
             entries,
             pool,
             metrics,
+            shared_lease,
         )
         metrics["host_rank_decode_call_s"] = time.perf_counter() - decode_started
         metrics.update(

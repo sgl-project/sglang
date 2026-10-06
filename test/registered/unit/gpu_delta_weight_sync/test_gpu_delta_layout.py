@@ -45,7 +45,11 @@ def cpu_host_snapshot(backend, metadata, directory):
     from sglang.srt.weight_sync.gpu_delta import host as host
     from sglang.srt.weight_sync.gpu_delta.payload import OuterZstdPool
 
-    backend.identity = {"engine_id": "cpu-engine", "host_cache_id": "cpu-host"}
+    backend.identity = {
+        "engine_id": "cpu-engine",
+        "host_cache_id": "cpu-host",
+        "rank_id": "cpu-rank",
+    }
     metadata["host_tensor_names"] = {
         "cpu-host": sorted({binding.name for binding in backend.layout.bindings})
     }
@@ -78,6 +82,9 @@ def cpu_host_snapshot(backend, metadata, directory):
             patch.object(host, "HostAllocation", CpuHostAllocation),
             patch.object(host, "_CAPACITY_ALIGNMENT", 64),
         ):
+            backend.host_arena.register_rank(
+                backend.identity, [binding.name for binding in backend.layout.bindings]
+            )
             yield
     finally:
         backend.host_arena.close()
@@ -885,8 +892,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         def local_layout(entries):
             # Global validation already drained; foreign descriptors must be
             # released before allocating local layout/decode job containers.
-            self.assertTrue(foreign_refs)
-            self.assertIsNone(foreign_refs[-1]())
+            if entries:  # The common-cache layout is empty for this one-rank case.
+                self.assertTrue(foreign_refs)
+                self.assertIsNone(foreign_refs[-1]())
             return tensor_layout(entries)
 
         class CpuStream:

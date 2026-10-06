@@ -22,12 +22,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def fixture(directory):
+def fixture(directory, extra_expert=False):
     expected = {
         "dense": bytes(range(251)) * 100,
         "expert": b"snappy-bytes" * 50,
         "raw": b"abcd",
     }
+    if extra_expert:
+        expected["expert_peer"] = b"peer-expert" * 73
     blob, tensors = bytearray(), []
     for name, data in expected.items():
         blob.extend(bytes((-len(blob)) % 16))
@@ -137,10 +139,13 @@ def local_entries(manifest, names):
 
 
 def prepare_snapshot(arena, path, digest, manifest, entries, pool, timings, metadata):
-    index, files = arena.prepare_encoded(
+    index, files, shared = arena.prepare_encoded(
         path, digest, manifest, pool, timings, metadata
     )
-    return arena.decode_local(index, files, entries, pool, timings)
+    try:
+        return arena.decode_local(index, files, entries, pool, timings, shared)
+    finally:
+        shared.close()
 
 
 def fake_fallocate(fd, offset, length):
@@ -165,8 +170,8 @@ def metadata(version=1, engine="a"):
         base_version=version - 1,
         target_version=version,
         participants=[
-            {"engine_id": engine, "rank": 0},
-            {"engine_id": engine, "rank": 1},
+            {"engine_id": engine, "rank_id": engine + "-0", "host_cache_id": engine},
+            {"engine_id": engine, "rank_id": engine + "-1", "host_cache_id": engine},
         ],
     )
 
@@ -176,6 +181,9 @@ def _child(root, path, digest, manifest, names, barrier, output):
     try:
         with patch.object(host, "_cache_base", return_value=Path(root)):
             identity = host.host_cache_id("a")
+            arena.register_rank(
+                metadata()["participants"][int("expert" in names)], names
+            )
             barrier.wait(timeout=10)
             metrics = {}
             snapshot = prepare_snapshot(
@@ -226,6 +234,16 @@ class TestHostSnapshot(unittest.TestCase):
 
     def arena(self, engine="a"):
         arena = host.HostArena(engine, 0)
+        # Most legacy cases mock separate snapshots of rank0; rank1 owns no
+        # compressed names. The process case registers its real two memberships.
+        for rank, identity in enumerate(metadata(engine=engine)["participants"]):
+            path = host._cache_root(engine) / (identity["rank_id"] + ".json")
+            if not path.exists():
+                target = arena if rank == 0 else host.HostArena(engine, 0)
+                target.register_rank(
+                    identity, ["dense", "expert", "raw"] if rank == 0 else []
+                )
+        arena.rank_identity = metadata(engine=engine)["participants"][0]
         self.addCleanup(arena.close)
         return arena
 
@@ -329,6 +347,136 @@ class TestHostSnapshot(unittest.TestCase):
         self.assertEqual(follower_metrics["host_rank_outer_zstd_tensors"], 1)
         follower.close()
         snapshot.close()
+
+    def test_common_decode_overlaps_both_private_ranks_and_reuses_shared_capacity(self):
+        path, digest, manifest, expected = fixture(self.root, extra_expert=True)
+        identities = metadata(engine="shared")["participants"]
+        names = [["dense", "expert", "raw"], ["dense", "expert_peer", "raw"]]
+        arenas, pools = [], []
+        for identity, local in zip(identities, names):
+            arena = host.HostArena("shared", 0)
+            arena.register_rank(identity, local)
+            arenas.append(arena)
+            pool = OuterZstdPool(2)
+            pools.append(pool)
+            self.addCleanup(arena.close)
+            self.addCleanup(pool.close)
+        common_entered, common_release = threading.Event(), threading.Event()
+        private_entered = [threading.Event(), threading.Event()]
+        errors, snapshots, metrics = [], {}, [{}, {}]
+
+        def decode(rank, original, payload, chunks, destination):
+            if len(destination) == len(expected["dense"]):
+                common_entered.set()
+                assert common_release.wait(5)
+            else:
+                private_entered[rank].set()
+            return original(payload, chunks, destination)
+
+        def prepare(rank, version):
+            try:
+                snapshots[rank] = prepare_snapshot(
+                    arenas[rank],
+                    path,
+                    digest,
+                    manifest,
+                    local_entries(manifest, names[rank]),
+                    pools[rank],
+                    metrics[rank],
+                    metadata(version, "shared"),
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        decode0, decode1 = pools[0].decode, pools[1].decode
+        with (
+            patch.object(
+                pools[0], "decode", side_effect=lambda *args: decode(0, decode0, *args)
+            ),
+            patch.object(
+                pools[1], "decode", side_effect=lambda *args: decode(1, decode1, *args)
+            ),
+        ):
+            threads = [
+                threading.Thread(target=prepare, args=(rank, 1)) for rank in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            try:
+                self.assertTrue(common_entered.wait(5))
+                self.assertTrue(private_entered[0].wait(5))
+                self.assertTrue(private_entered[1].wait(5))
+                self.assertEqual(snapshots, {})
+            finally:
+                common_release.set()
+                for thread in threads:
+                    thread.join(5)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            sum(row["host_shared_outer_zstd_tensors"] for row in metrics), 1
+        )
+        self.assertEqual(sum(row["host_rank_outer_zstd_tensors"] for row in metrics), 2)
+        capacity = snapshots[0].index["shared"]
+        for rank, snapshot in snapshots.items():
+            self.assertEqual(
+                {name: bytes(snapshot.get(name).numpy()) for name in names[rank]},
+                {name: expected[name] for name in names[rank]},
+            )
+            self.assertEqual(
+                metrics[rank]["host_rank_shared_copy_bytes"], len(expected["dense"])
+            )
+            snapshot.mark_reusable()
+            snapshot.close()
+        metrics = [{}, {}]
+        for rank in range(2):
+            prepare(rank, 2)
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            sum(row["host_shared_outer_zstd_tensors"] for row in metrics), 1
+        )
+        for rank, snapshot in snapshots.items():
+            self.assertEqual(snapshot.index["shared"], capacity)
+            self.assertEqual(metrics[rank]["host_shared_cache_allocation_calls"], 0)
+            snapshot.mark_reusable()
+            snapshot.close()
+        snapshots.clear()
+        errors.clear()
+
+        def broken_common(original, payload, chunks, destination):
+            if len(destination) == len(expected["dense"]):
+                raise ValueError("broken common frame")
+            return original(payload, chunks, destination)
+
+        with (
+            patch.object(
+                pools[0],
+                "decode",
+                side_effect=lambda *args: broken_common(decode0, *args),
+            ),
+            patch.object(
+                pools[1],
+                "decode",
+                side_effect=lambda *args: broken_common(decode1, *args),
+            ),
+        ):
+            threads = [
+                threading.Thread(target=prepare, args=(rank, 3)) for rank in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(5)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(snapshots, {})
+        self.assertEqual(len(errors), 2)
+        self.assertEqual(
+            {str(error) for error in errors},
+            {
+                "broken common frame",
+                "shared decoded publication failed before READY",
+            },
+        )
 
     def test_payload_hash_policy_is_cached_and_shared_cache_requires_agreement(self):
         path, digest, manifest, expected = fixture(self.root)
@@ -503,7 +651,7 @@ class TestHostSnapshot(unittest.TestCase):
         path, digest, manifest, expected = fixture(self.root)
         context = multiprocessing.get_context("fork")
         barrier, output = context.Barrier(2), context.Queue()
-        names = [["dense", "raw"], ["expert", "raw"]]
+        names = [["dense", "raw"], ["dense", "expert", "raw"]]
         children = [
             context.Process(
                 target=_child,
@@ -532,8 +680,17 @@ class TestHostSnapshot(unittest.TestCase):
                 sum(row[1]["host_encoded_cache_" + field] for row in records),
                 2 if field == "hash_files" else 1,
             )
+        self.assertEqual(
+            sum(row[1]["host_shared_outer_zstd_tensors"] for row in records), 1
+        )
+        self.assertEqual(
+            sum(row[1]["host_rank_outer_zstd_tensors"] for row in records), 1
+        )
         self.assertTrue(
-            all(row[1]["host_rank_outer_zstd_tensors"] == 1 for row in records)
+            all(
+                row[1]["host_rank_shared_copy_bytes"] == len(expected["dense"])
+                for row in records
+            )
         )
         self.assertEqual(
             {tuple(sorted(row[2])) for row in records},
@@ -593,9 +750,7 @@ class TestHostSnapshot(unittest.TestCase):
                 finished.set()
 
         with (
-            patch.object(
-                host, "_reserve_encoded_cache", wraps=host._reserve_encoded_cache
-            ) as allocate,
+            patch.object(host, "_reserve_cache", wraps=host._reserve_cache) as allocate,
             patch.object(
                 host, "_read_verify_payload", side_effect=delayed_read
             ) as read,
@@ -928,7 +1083,19 @@ def test_bounded_jobs_decode_raw_and_compressed_bytes_exactly():
             pool.executor, "submit", wraps=pool.executor.submit
         ) as submit:
             host._decode_arena(
-                memoryview(destination), layout, files, entries, pool, metrics
+                memoryview(destination),
+                layout,
+                files,
+                entries,
+                pool,
+                metrics,
+                SimpleNamespace(
+                    index={"shared": {"tensors": {}}},
+                    entries=[],
+                    creator=False,
+                    data=memoryview(b""),
+                    ready=lambda: None,
+                ),
             )
         assert submit.call_count == 4 * pool.workers
         assert metrics["host_rank_outer_zstd_tensors"] == 97
@@ -984,6 +1151,13 @@ def test_failed_tensor_drains_other_groups_before_releasing_views():
                 entries,
                 pool,
                 {name: 0 for name in host._DECODE_METRICS},
+                SimpleNamespace(
+                    index={"shared": {"tensors": {}}},
+                    entries=[],
+                    creator=False,
+                    data=memoryview(b""),
+                    ready=lambda: None,
+                ),
             )
         except ValueError as error:
             errors.append(str(error))
