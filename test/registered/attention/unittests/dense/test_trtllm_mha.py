@@ -12,9 +12,13 @@ from sglang.srt.utils.common import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+    DENSE_ATOL,
+    DENSE_RTOL,
     DenseAttentionCase,
     build_dense_attention_fixture,
+    expected_dense_fixture_output,
     run_dense_attention_case,
+    run_dense_fixture_eager,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dense_cuda_graph_decode_case,
@@ -29,7 +33,7 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=17, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(
@@ -261,6 +265,60 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
             hidden_size=self.HIDDEN_SIZE,
             max_context_len=512,
         )
+
+    # SM90/SM120 trtllm_mha prefills with fmha_v2 and decodes with XQA; XQA keeps
+    # semaphores at the head of the shared workspace, read only in long-KV decode.
+    @unittest.skipUnless(
+        is_sm90_supported() or is_sm120_supported(),
+        "fmha_v2 prefill + XQA decode run on SM90/SM120",
+    )
+    def test_fmha_v2_extend_then_xqa_long_kv_decode(self):
+        """An fmha_v2 extend must not change a following long-KV XQA decode."""
+        extend_case = DenseAttentionCase(
+            name="trtllm_mha_fmha_v2_extend",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=8,
+            num_kv_heads=1,
+            page_size=64,
+            prefix_lens=(0, 0),
+            extend_lens=(1500, 1500),
+        )
+        decode_case = DenseAttentionCase(
+            name="trtllm_mha_xqa_long_kv_decode",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=8,
+            num_kv_heads=1,
+            page_size=64,
+            prefix_lens=(1100, 2900, 1700, 2300) * 4,
+        )
+        decode, extend = (
+            build_dense_attention_fixture(
+                self,
+                case,
+                head_dim=self.HEAD_DIM,
+                hidden_size=self.HIDDEN_SIZE,
+                max_context_len=4096,
+            )
+            for case in (decode_case, extend_case)
+        )
+        # XQA only sees what fmha_v2 left behind through this sharing.
+        self.assertIs(decode.backend.workspace_buffer, extend.backend.workspace_buffer)
+
+        before = run_dense_fixture_eager(decode)
+        extended = run_dense_fixture_eager(extend)
+        after = run_dense_fixture_eager(decode)
+
+        for fixture, actual in ((decode, before), (extend, extended)):
+            torch.testing.assert_close(
+                actual,
+                expected_dense_fixture_output(fixture),
+                atol=DENSE_ATOL,
+                rtol=DENSE_RTOL,
+            )
+        # Exact: a partially merged multi-block XQA decode can stay within DENSE_ATOL.
+        torch.testing.assert_close(after, before, atol=0, rtol=0)
 
 
 @unittest.skipIf(

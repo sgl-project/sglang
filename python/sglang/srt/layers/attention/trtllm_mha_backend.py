@@ -77,6 +77,7 @@ if TYPE_CHECKING:
 # Default workspace size in MB for TRTLLM MHA
 # Can be configured via SGLANG_FLASHINFER_WORKSPACE_SIZE environment variable
 DEFAULT_WORKSPACE_SIZE_MB = 512
+FMHA_V2_WORKSPACE_SIZE_MB = 16
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
 
@@ -349,6 +350,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         # fmha_v2 prefill kernel supports SM90 and SM120
         self.use_fmha_v2 = get_platform().is_sm90 or get_platform().is_sm120
+        # Use a separate workspace buffer for fmha_v2 prefill to avoid perturbing
+        # the workspace buffer used by XQA decode.
+        self.fmha_v2_workspace_buffer = (
+            get_buffer(
+                "trtllm_mha_fmha_v2_workspace",
+                lambda: torch.zeros(
+                    FMHA_V2_WORKSPACE_SIZE_MB * 1024 * 1024,
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                ),
+            )
+            if self.use_fmha_v2
+            else None
+        )
         # trtllm-gen serves page_size >= 128 only through its dynamic
         # tokens-per-page kernels, which exist solely for GQA with equal QK/V
         # head dims (power-of-2 pages). Mirror that precondition here so an
@@ -1738,7 +1753,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             o = flashinfer.prefill.trtllm_fmha_v2_prefill(
                 (q, paged_kv),
                 input_layout="Q_PAGED_KV_NHD",
-                workspace_buffer=self.workspace_buffer,
+                workspace_buffer=self.fmha_v2_workspace_buffer,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
                 max_q_len=self.forward_metadata.max_seq_len_q,
                 max_kv_len=self.max_context_len,
