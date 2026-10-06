@@ -213,9 +213,14 @@ impl SamplingParams {
         if !(0.0..=1.0).contains(&self.min_p) {
             return Err(bad(format!("min_p must be in [0, 1], got {}", self.min_p)));
         }
-        if self.top_k < 1 {
+        // TOP_K_ALL is the post-normalize form of -1 (whole vocabulary).
+        // Any other value must fit the vocab so the int32 top_ks tensor and
+        // torch top-k paths cannot overflow or index past the row.
+        if self.top_k != TOP_K_ALL
+            && (self.top_k < 1 || self.top_k as u64 > vocab_size)
+        {
             return Err(bad(format!(
-                "top_k must be -1 (disable) or at least 1, got {}",
+                "top_k must be -1 (disable) or in [1, vocab_size({vocab_size})], got {}",
                 self.top_k
             )));
         }
@@ -474,6 +479,14 @@ mod tests {
             ),
             (
                 SamplingParams {
+                    top_k: 1001,
+                    temperature: 0.7,
+                    ..Default::default()
+                },
+                "top_k",
+            ),
+            (
+                SamplingParams {
                     min_p: 1.5,
                     ..Default::default()
                 },
@@ -588,6 +601,11 @@ mod tests {
                 ..Default::default()
             },
             SamplingParams {
+                top_k: 1000,
+                temperature: 0.7,
+                ..Default::default()
+            },
+            SamplingParams {
                 frequency_penalty: 2.0,
                 ..Default::default()
             },
@@ -653,6 +671,11 @@ mod tests {
             }, // exclusive lower bound
             SamplingParams {
                 top_k: 0,
+                temperature: 0.7,
+                ..Default::default()
+            },
+            SamplingParams {
+                top_k: 1001,
                 temperature: 0.7,
                 ..Default::default()
             },

@@ -537,9 +537,14 @@ impl SamplingParams {
         if !(0.0..=1.0).contains(&self.min_p) {
             return Err(bad(format!("min_p must be in [0, 1], got {}", self.min_p)));
         }
-        if self.top_k < 1 {
+        // TOP_K_ALL is the post-normalize form of -1 (whole vocabulary).
+        // Any other value must fit the vocab so the int32 top_ks tensor and
+        // torch top-k paths cannot overflow or index past the row.
+        if self.top_k != TOP_K_ALL
+            && (self.top_k < 1 || self.top_k as u64 > vocab_size)
+        {
             return Err(bad(format!(
-                "top_k must be -1 (disable) or at least 1, got {}",
+                "top_k must be -1 (disable) or in [1, vocab_size({vocab_size})], got {}",
                 self.top_k
             )));
         }
@@ -929,6 +934,7 @@ mod tests {
         for (json, want) in [
             (r#"{"top_p": 2.0}"#, "top_p"),
             (r#"{"top_k": 0, "temperature": 0.7}"#, "top_k"),
+            (r#"{"top_k": 1001, "temperature": 0.7}"#, "top_k"),
             (r#"{"min_p": 1.5}"#, "min_p"),
             (r#"{"frequency_penalty": 3.0}"#, "frequency_penalty"),
             (r#"{"presence_penalty": -3.0}"#, "presence_penalty"),
@@ -963,6 +969,7 @@ mod tests {
             r#"{"min_p": 0.0, "temperature": 0.7}"#,
             r#"{"min_p": 1.0, "temperature": 0.7}"#,
             r#"{"top_k": 1, "temperature": 0.7}"#,
+            r#"{"top_k": 1000, "temperature": 0.7}"#,
             r#"{"frequency_penalty": 2.0}"#,
             r#"{"frequency_penalty": -2.0}"#,
             r#"{"presence_penalty": 2.0}"#,
@@ -990,6 +997,7 @@ mod tests {
             r#"{"top_p": 0.0, "temperature": 0.7}"#, // exclusive lower bound
             r#"{"repetition_penalty": 0.0}"#,        // exclusive lower bound
             r#"{"top_k": 0, "temperature": 0.7}"#,
+            r#"{"top_k": 1001, "temperature": 0.7}"#,
             r#"{"min_p": 1.0000001, "temperature": 0.7}"#,
             r#"{"frequency_penalty": 2.0000001}"#,
             r#"{"presence_penalty": -2.0000001}"#,

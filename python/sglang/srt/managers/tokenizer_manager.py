@@ -154,7 +154,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
-from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import SamplingParams, check_top_logprobs_num
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -1489,6 +1489,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
+            check_top_logprobs_num(
+                obj.top_logprobs_num, self.model_config.vocab_size
+            )
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )

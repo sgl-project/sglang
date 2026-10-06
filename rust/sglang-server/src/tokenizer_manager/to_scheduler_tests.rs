@@ -641,6 +641,36 @@ fn negative_and_logprob_token_ids_rejected() {
     }
 }
 
+/// `k == vocab_size` is the whole logit row (`torch.topk` allows it). One past
+/// that is a validation error, not a dropped scheduler message.
+#[test]
+fn top_logprobs_num_is_bounded_by_vocab() {
+    let limits = test_limits();
+    let mut req = generate_req(24, SamplingParams::default());
+    let RequestKind::Generate(g) = &mut req.kind else {
+        unreachable!()
+    };
+    g.top_logprobs_num = 1001;
+    let err = validate(&mut req, &limits).unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, Error::Validation(_)));
+    assert!(
+        msg.contains("top_logprobs_num must be an integer in [0, vocab_size(1000)]"),
+        "{msg}"
+    );
+    assert!(msg.contains("got 1001"), "{msg}");
+
+    let mut req = generate_req(25, SamplingParams::default());
+    let RequestKind::Generate(g) = &mut req.kind else {
+        unreachable!()
+    };
+    g.top_logprobs_num = limits.vocab_size as i64;
+    assert!(
+        validate(&mut req, &limits).is_ok(),
+        "k == vocab_size must be admitted"
+    );
+}
+
 #[test]
 fn multimodal_sentinel_is_validated_after_expansion() {
     let mut req = generate_req(24, SamplingParams::default());

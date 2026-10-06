@@ -58,6 +58,14 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
                 }
             }
         }
+        // Same bound as Python `check_top_logprobs_num`: torch.topk rejects
+        // a k past the vocab row, which kills the scheduler.
+        if g.top_logprobs_num < 0 || g.top_logprobs_num as u64 > vocab_size {
+            return Err(Error::Validation(format!(
+                "top_logprobs_num must be an integer in [0, vocab_size({vocab_size})], got {}",
+                g.top_logprobs_num
+            )));
+        }
     }
 
     // Detokenize ids must fit the shard's `&[u32]` decode domain. No vocab

@@ -64,7 +64,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
-from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import SamplingParams, check_n
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgpack_utils import dec_hook, enc_hook, ext_hook
@@ -518,6 +518,13 @@ class GenerateReqInput:
             return 1
         return self.parallel_sample_num
 
+    @staticmethod
+    def _coerce_parallel_n(n):
+        # An explicit null matches SamplingParams.__post_init__: missing and
+        # null both mean one sample. .get("n", 1) does not, because the key
+        # is present.
+        return 1 if n is None else n
+
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
         # Determine parallel sample count
@@ -525,14 +532,20 @@ class GenerateReqInput:
             self.parallel_sample_num = 1
             return
         elif isinstance(self.sampling_params, dict):
-            self.parallel_sample_num = self.sampling_params.get("n", 1)
+            n = self._coerce_parallel_n(self.sampling_params.get("n", 1))
         else:  # isinstance(self.sampling_params, list):
-            self.parallel_sample_num = self.sampling_params[0].get("n", 1)
+            n = self._coerce_parallel_n(self.sampling_params[0].get("n", 1))
             for sampling_params in self.sampling_params:
-                if self.parallel_sample_num != sampling_params.get("n", 1):
+                if n != self._coerce_parallel_n(sampling_params.get("n", 1)):
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
+
+        # Bound n before any list replication. Beam search does not replicate
+        # the prompt, so its n is limited by beam_width instead of MAX_N.
+        beam_width = self._sampling_params_beam_width()
+        check_n(n, beam_width=beam_width if beam_width > 1 else None)
+        self.parallel_sample_num = n
 
         self.parallel_sample_num = self._handle_beam_search_parallel_sampling()
 
