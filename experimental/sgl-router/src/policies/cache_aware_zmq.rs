@@ -211,6 +211,7 @@ struct MatchOutcome {
     owner_depth_gaps: HashMap<String, usize>,
     /// Deepest owned match across modes, including below-threshold matches.
     owned_matched_blocks: usize,
+    has_owner_path_gap: bool,
     /// Best (max-rate) mode's matched-block count — logging / metrics only.
     matched_blocks: usize,
     /// Best mode's query-block count — the match_rate denominator and the
@@ -448,6 +449,7 @@ impl CacheAwareZmqPolicy {
         let mut owner_depths: HashMap<String, usize> = HashMap::new();
         let mut owner_depth_gaps: HashMap<String, usize> = HashMap::new();
         let mut owned_matched_blocks = 0;
+        let mut has_owner_path_gap = false;
         let mut mode_hashes: Vec<Vec<i64>> = Vec::with_capacity(modes.len());
         let mut had_blocks = false;
         let mut any_above_threshold = false;
@@ -479,6 +481,7 @@ impl CacheAwareZmqPolicy {
             }
             had_blocks = true;
             let matched = self.tree.match_prefix(None, &hashes);
+            has_owner_path_gap |= matched.has_owner_path_gap;
             debug_assert!(matched.matched_blocks <= hashes.len());
             let rate = matched.matched_blocks as f32 / hashes.len() as f32;
             if best.is_none_or(|(r, m, _)| (rate, matched.matched_blocks) > (r, m)) {
@@ -527,6 +530,7 @@ impl CacheAwareZmqPolicy {
             owner_depths,
             owner_depth_gaps,
             owned_matched_blocks,
+            has_owner_path_gap,
             matched_blocks,
             query_blocks,
             match_rate,
@@ -667,6 +671,7 @@ impl CacheAwareZmqPolicy {
         } else {
             decision
         };
+        m.record_owner_path_gap(model_id, outcome.has_owner_path_gap);
         m.record_cache_aware_decision(model_id, decision);
         m.observe_overlap_blocks(model_id, outcome.matched_blocks as u64);
         m.observe_owned_overlap_blocks(model_id, outcome.owned_matched_blocks as u64);
@@ -1211,7 +1216,10 @@ impl CacheAwareZmqPolicy {
             // matched/selected counters under `decision="cache_worker_queued"`.
             if matches!(decision, CacheAwareDecision::CacheWorkerQueued) {
                 if let Some(m) = self.metrics.get() {
-                    m.observe_diverted_overlap_blocks(model_id, outcome.matched_blocks as u64);
+                    m.observe_diverted_overlap_blocks(
+                        model_id,
+                        outcome.owned_matched_blocks as u64,
+                    );
                 }
             }
             if should_log(&MATCHED_FALLBACK_LOG_COUNTER) {
@@ -4219,8 +4227,32 @@ mod tests {
     }
 
     #[test]
+    fn owner_gap_is_counted_once_per_selection() {
+        let (tree, _) = ancestor_fixture(false);
+        // The fixture retains a deeper owner beyond its deleted interior.
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy(
+            queue_cfg(4),
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let tokens: Vec<u32> = (0..24).collect();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&tokens));
+        policy
+            .select(&[worker("http://w0:30000", "tiny")], &ctx)
+            .unwrap();
+        assert!(metrics
+            .render()
+            .contains("sgl_router_owner_path_gap_total{model_id=\"tiny\"} 1"));
+    }
+
+    #[test]
     fn ancestor_owner_still_respects_queue_gate() {
         let (tree, tokens) = ancestor_fixture(false);
+        let metrics = MetricsRegistry::new();
         let load = EngineLoadTable::new();
         load.set("http://w0:30000", 0, load_stat(10, 9), Instant::now());
         load.set("http://w1:30000", 0, load_stat(1, 0), Instant::now());
@@ -4230,7 +4262,8 @@ mod tests {
             tokenizer_registry_with_tiny(),
             oracle_for_tests(4),
             load,
-        );
+        )
+        .with_metrics(Arc::clone(&metrics));
         let model = ModelId("tiny".into());
         let body = br#"{"prompt":"irrelevant"}"#;
         let ctx = SelectionContext::new(&model, Some(body)).with_request_tokens(Some(&tokens));
@@ -4244,6 +4277,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(chosen.url, "http://w1:30000");
+        let rendered = metrics.render();
+        assert!(rendered.contains("sgl_router_diverted_overlap_blocks_sum{model_id=\"tiny\"} 3"));
+        assert!(rendered.contains("sgl_router_diverted_overlap_blocks_count{model_id=\"tiny\"} 1"));
+        assert!(rendered.contains("sgl_router_owner_path_gap_total{model_id=\"tiny\"} 0"));
     }
 
     // ---- per-worker queue gate ----

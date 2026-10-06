@@ -375,6 +375,9 @@ pub struct MatchResult {
     /// Depth of the deepest matched node with owners, or zero if none exists.
     /// May be shorter than the structural `matched_blocks` path.
     pub owned_matched_blocks: usize,
+    /// At least one returned worker lacks an ancestor on every tier.
+    /// Diagnostic only: node ownership is not proof of a usable prefix.
+    pub has_owner_path_gap: bool,
     /// Workers holding the deepest OWNED matched node on ANY tier.
     pub workers: HashSet<KvWorkerId>,
     /// The tiers each of `workers` holds the deepest owned matched node on. A worker
@@ -982,7 +985,29 @@ impl TreeState {
             .and_then(|id| self.nodes.get(&id))
             .map(|n| n.workers.clone())
             .unwrap_or_default();
+        // Check the same worker (including DP rank) across ANY tier. A host
+        // ancestor followed by a device block is not a gap. Parent links avoid
+        // allocating a second path; stop at the first inconsistent owner.
+        let has_owner_path_gap = tiers.keys().any(|worker| {
+            let mut ancestor = last_owned_node
+                .and_then(|id| self.nodes.get(&id))
+                .and_then(|node| node.parent);
+            while let Some(id) = ancestor {
+                if id == ROOT_ID {
+                    break;
+                }
+                let Some(node) = self.nodes.get(&id) else {
+                    return true;
+                };
+                if !node.workers.contains_key(worker) {
+                    return true;
+                }
+                ancestor = node.parent;
+            }
+            false
+        });
         MatchResult {
+            has_owner_path_gap,
             matched_blocks: matched,
             owned_matched_blocks,
             workers: tiers.keys().cloned().collect(),
@@ -1822,14 +1847,32 @@ mod tests {
         assert_eq!((m.matched_blocks, m.owned_matched_blocks), (3, 2));
         assert_eq!(m.workers, HashSet::from([a.clone()]));
         assert_eq!(m.tiers[&a], Tiers::HOST);
-        // An interior hole must not hide a deeper owner.
+        assert!(!m.has_owner_path_gap);
+        // Preserve the existing node-owner lookup, but flag that B's deeper
+        // ownership does NOT establish a usable four-block prefix.
         let m = tree.match_prefix(None, &[10, 20, 30, 40]);
         assert_eq!((m.matched_blocks, m.owned_matched_blocks), (4, 4));
         assert_eq!(m.workers, HashSet::from([b]));
+        assert!(m.has_owner_path_gap);
         tree.clear_worker(&a);
         let m = tree.match_prefix(None, &[10, 20, 30]);
         assert_eq!((m.matched_blocks, m.owned_matched_blocks), (3, 0));
         assert!(m.workers.is_empty());
+    }
+
+    #[test]
+    fn owner_path_gap_checks_worker_identity_across_tiers() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let other_rank = worker("http://a", 1);
+        tree.insert_tiered(&a, None, &[10, 20], Tiers::HOST);
+        tree.insert(&a, Some(20), &[30]);
+        assert!(!tree.match_prefix(None, &[10, 20, 30]).has_owner_path_gap);
+        tree.insert(&other_rank, None, &[10, 20]);
+        tree.remove_tiered(&a, &[10, 20], Tiers::HOST);
+        assert!(tree.match_prefix(None, &[10, 20, 30]).has_owner_path_gap);
+        assert!(tree.match_prefix(Some(20), &[30]).has_owner_path_gap);
+        assert!(!tree.match_prefix(None, &[99]).has_owner_path_gap);
     }
 
     #[test]
