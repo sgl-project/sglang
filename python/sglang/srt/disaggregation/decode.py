@@ -77,7 +77,6 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     ScheduleBatch,
 )
-from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
@@ -792,9 +791,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             max_prefix_len = fill_len - self._swa_tail_len(fill_len)
         # Match and lock only reusable FULL KV. The entire SWA tail must be
         # freshly allocated, including when the prefix comes from L2/L3.
-        result = match_prefix_for_req(
+        result = req.match_prefix(
             self.tree_cache,
-            req,
             req.origin_input_ids,
             cow_mamba=self.tree_cache.supports_mamba(),
             include_req=True,

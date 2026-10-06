@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
     InitLoadBackParams,
@@ -64,7 +63,7 @@ class DecodeHiCachePreallocMixin:
     def _build_decode_prefix_match(
         self, req: Req, result: Any, *, max_prefix_len: Optional[int] = None
     ) -> DecodePrefixMatch:
-        """Convert a ``match_prefix_for_req`` result into ``DecodePrefixMatch``.
+        """Convert a ``Req.match_prefix`` result into ``DecodePrefixMatch``.
 
         Performs the optional L3 storage hit length query when decode-side
         HiCache is enabled and the last host node is backed up.
@@ -212,9 +211,8 @@ class DecodeHiCacheTransferMixin:
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
 
         # Re-match: req.last_node / prefix_indices updated to current device state.
-        rematch = match_prefix_for_req(
+        rematch = dr.req.match_prefix(
             self.tree_cache,
-            dr.req,
             dr.req.origin_input_ids,
             cow_mamba=False,
             include_req=True,
