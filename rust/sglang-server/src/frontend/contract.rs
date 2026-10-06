@@ -64,7 +64,7 @@ impl From<ChunkEvent> for FrontendOutput {
 impl FrontendOutput {
     /// Fold one runtime delta into this cumulative native-generation output.
     ///
-    /// Runtime events are always incremental. Native HTTP and `runtime.v1`
+    /// Runtime events are always incremental. Native HTTP and `api.v1`
     /// gRPC independently decide whether to expose those deltas or the
     /// cumulative result, so the fold itself lives at their shared semantic
     /// boundary rather than in either wire adapter.

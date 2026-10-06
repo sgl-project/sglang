@@ -1,26 +1,31 @@
-//! Tonic adapter for the canonical `sglang.runtime.v1` API.
+//! Tonic adapter for the native `sglang.api.v1` service.
 //!
-//! This module translates protobuf requests and responses and mounts that thin
-//! adapter on Tonic. The shared [`FrontendHandle`] owns preprocessing,
-//! admission, runtime communication, and request cancellation.
+//! The service is the gRPC rendering of the contract the native HTTP endpoints
+//! serve: `Generate` is `/generate`, `HealthCheck` is `/health_generate`, and
+//! `GetModelInfo` / `GetServerInfo` are their HTTP namesakes. Requests decode
+//! through the shared `/generate` fan-out and responses stream through the
+//! shared [`FrontendHandle`], which owns preprocessing, admission, runtime
+//! communication, and request cancellation.
 //!
 //! The thin Tonic-service structure, streamed response approach, and test
 //! strategy build on Rain Jiang's multi-protocol prototype in
-//! `sgl-project/sglang#36923`. This stack keeps those ideas while using the
-//! canonical `runtime.v1` contract and the narrower [`FrontendHandle`] seam.
+//! `sgl-project/sglang#36923`.
 
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::Stream;
-use sglang_api_types::runtime::v1 as proto;
-use sglang_api_types::runtime::v1::sglang_service_server::SglangService;
+use sglang_api_types::api::v1 as api;
+use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Request, Response, Status};
 
-use crate::frontend::FrontendHandle;
+use crate::frontend::{FrontendHandle, HealthStatus};
 use crate::message::config::{PreferredSamplingParams, ServerArgs};
+use crate::message::request::into_requests;
+use crate::message::wire::fill_preferred_sampling;
+use crate::utils::environ;
 
-mod convert;
+mod info;
 mod response;
 mod server;
 
@@ -33,14 +38,18 @@ const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
-/// Narrow snapshot of launch policy required to preserve the existing
-/// `runtime.v1` generation behavior. It intentionally excludes listener,
-/// authentication, TLS, and lifecycle configuration.
+/// Narrow snapshot of launch policy the adapter needs per call. It
+/// intentionally excludes listener, authentication, TLS, and lifecycle
+/// configuration.
 #[derive(Clone)]
 struct AdapterConfig {
     preferred_sampling_params: Option<PreferredSamplingParams>,
     incremental_streaming_output: bool,
+    /// Longest wait for the next event of any in-flight call before the RPC
+    /// ends with DEADLINE_EXCEEDED.
     response_timeout: Duration,
+    /// `/health_generate`'s heartbeat window (`SGLANG_HEALTH_CHECK_TIMEOUT`).
+    health_timeout: Duration,
 }
 
 /// Tonic-facing implementation backed by the transport-neutral Rust frontend.
@@ -57,6 +66,9 @@ impl GrpcService {
                 preferred_sampling_params: server_args.preferred_sampling_params.clone(),
                 incremental_streaming_output: server_args.incremental_streaming_output,
                 response_timeout: DEFAULT_RESPONSE_TIMEOUT,
+                health_timeout: Duration::from_secs(
+                    environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
+                ),
             },
         }
     }
@@ -74,230 +86,91 @@ impl GrpcService {
                 preferred_sampling_params,
                 incremental_streaming_output,
                 response_timeout,
+                health_timeout: Duration::from_millis(20),
             },
         }
     }
 }
 
-fn unimplemented_rpc(name: &'static str) -> Status {
-    Status::unimplemented(format!(
-        "{name} is not implemented by the Rust frontend gRPC adapter"
-    ))
-}
-
 #[tonic::async_trait]
 impl SglangService for GrpcService {
-    async fn text_generate(
-        &self,
-        request: Request<proto::TextGenerateRequest>,
-    ) -> Result<Response<ResponseStream<proto::TextGenerateResponse>>, Status> {
-        let request = convert::text_generate(
-            request.into_inner(),
-            self.config.preferred_sampling_params.as_ref(),
-        )
-        .map_err(Status::from)?;
-        let call = self
-            .frontend
-            .generate(request)
-            .await
-            .map_err(response::status)?;
-        Ok(Response::new(response::text_generate_stream(
-            call,
-            self.config.incremental_streaming_output,
-            self.config.response_timeout,
-        )))
-    }
+    type GenerateStream = ResponseStream<api::GenerateStreamItem>;
 
+    /// `/generate` over gRPC: one schema, one fan-out, one admission path. A
+    /// body that fails normalization ends the RPC with INVALID_ARGUMENT before
+    /// anything reaches the scheduler, as the HTTP 400 does.
     async fn generate(
         &self,
-        request: Request<proto::GenerateRequest>,
-    ) -> Result<Response<ResponseStream<proto::GenerateResponse>>, Status> {
-        let request = convert::generate(
-            request.into_inner(),
-            self.config.preferred_sampling_params.as_ref(),
-        )
-        .map_err(Status::from)?;
-        let call = self
+        request: Request<api::GenerateRequest>,
+    ) -> Result<Response<Self::GenerateStream>, Status> {
+        let mut request = request.into_inner();
+        if let Some(preferred) = &self.config.preferred_sampling_params {
+            request.sampling_params =
+                fill_preferred_sampling(request.sampling_params.take(), &preferred.0)
+                    .map_err(Status::internal)?;
+        }
+        let stream = request.stream.unwrap_or(false);
+        let (payloads, is_batch) =
+            into_requests(request).map_err(|error| Status::invalid_argument(error.to_string()))?;
+        // Python starts its request clock after normalization and before
+        // tokenization / multimodal preprocessing; `e2e_latency` measures from
+        // the same boundary here.
+        let created_at = Instant::now();
+        let calls = self
             .frontend
-            .generate(request)
+            .generate_batch(payloads)
             .await
             .map_err(response::status)?;
         Ok(Response::new(response::generate_stream(
-            call,
-            self.config.incremental_streaming_output,
-            self.config.response_timeout,
+            calls,
+            response::StreamOptions {
+                stream,
+                incremental: self.config.incremental_streaming_output,
+                with_index: is_batch,
+                response_timeout: self.config.response_timeout,
+                created_at,
+            },
         )))
-    }
-
-    // runtime.v1 is shared with the broader Python-backed service, so its
-    // generated trait contains more operations than this initial Rust adapter.
-    // Keep that support boundary explicit: adding an RPC is a deliberate future
-    // change, never an accidental empty success.
-    async fn text_embed(
-        &self,
-        _request: Request<proto::TextEmbedRequest>,
-    ) -> Result<Response<proto::TextEmbedResponse>, Status> {
-        Err(unimplemented_rpc("text_embed"))
-    }
-
-    async fn embed(
-        &self,
-        _request: Request<proto::EmbedRequest>,
-    ) -> Result<Response<proto::EmbedResponse>, Status> {
-        Err(unimplemented_rpc("embed"))
-    }
-
-    async fn classify(
-        &self,
-        _request: Request<proto::ClassifyRequest>,
-    ) -> Result<Response<proto::ClassifyResponse>, Status> {
-        Err(unimplemented_rpc("classify"))
-    }
-
-    async fn tokenize(
-        &self,
-        _request: Request<proto::TokenizeRequest>,
-    ) -> Result<Response<proto::TokenizeResponse>, Status> {
-        Err(unimplemented_rpc("tokenize"))
-    }
-
-    async fn detokenize(
-        &self,
-        _request: Request<proto::DetokenizeRequest>,
-    ) -> Result<Response<proto::DetokenizeResponse>, Status> {
-        Err(unimplemented_rpc("detokenize"))
     }
 
     async fn health_check(
         &self,
-        _request: Request<proto::HealthCheckRequest>,
-    ) -> Result<Response<proto::HealthCheckResponse>, Status> {
-        Err(unimplemented_rpc("health_check"))
+        _request: Request<api::HealthCheckRequest>,
+    ) -> Result<Response<api::HealthCheckResponse>, Status> {
+        match self.frontend.probe_health(self.config.health_timeout).await {
+            Ok(HealthStatus::Healthy) => {
+                Ok(Response::new(api::HealthCheckResponse { healthy: true }))
+            }
+            Ok(HealthStatus::NotReady) => Err(Status::unavailable(
+                "server is still completing its startup warmup",
+            )),
+            Ok(HealthStatus::Stalled) => Err(Status::unavailable(
+                "no scheduler output within the health-check timeout",
+            )),
+            Err(error) => Err(response::status(error)),
+        }
     }
 
     async fn get_model_info(
         &self,
-        _request: Request<proto::GetModelInfoRequest>,
-    ) -> Result<Response<proto::GetModelInfoResponse>, Status> {
-        Err(unimplemented_rpc("get_model_info"))
+        _request: Request<api::GetModelInfoRequest>,
+    ) -> Result<Response<api::GetModelInfoResponse>, Status> {
+        info::model_info(self.frontend.model_info())
+            .map(Response::new)
+            .map_err(Status::internal)
     }
 
     async fn get_server_info(
         &self,
-        _request: Request<proto::GetServerInfoRequest>,
-    ) -> Result<Response<proto::GetServerInfoResponse>, Status> {
-        Err(unimplemented_rpc("get_server_info"))
-    }
-
-    async fn list_models(
-        &self,
-        _request: Request<proto::ListModelsRequest>,
-    ) -> Result<Response<proto::ListModelsResponse>, Status> {
-        Err(unimplemented_rpc("list_models"))
-    }
-
-    async fn get_load(
-        &self,
-        _request: Request<proto::GetLoadRequest>,
-    ) -> Result<Response<proto::GetLoadResponse>, Status> {
-        Err(unimplemented_rpc("get_load"))
-    }
-
-    async fn abort(
-        &self,
-        _request: Request<proto::AbortRequest>,
-    ) -> Result<Response<proto::AbortResponse>, Status> {
-        Err(unimplemented_rpc("abort"))
-    }
-
-    async fn flush_cache(
-        &self,
-        _request: Request<proto::FlushCacheRequest>,
-    ) -> Result<Response<proto::FlushCacheResponse>, Status> {
-        Err(unimplemented_rpc("flush_cache"))
-    }
-
-    async fn pause_generation(
-        &self,
-        _request: Request<proto::PauseGenerationRequest>,
-    ) -> Result<Response<proto::PauseGenerationResponse>, Status> {
-        Err(unimplemented_rpc("pause_generation"))
-    }
-
-    async fn watch_engine_state(
-        &self,
-        _request: Request<proto::WatchEngineStateRequest>,
-    ) -> Result<Response<ResponseStream<proto::EngineStateSnapshot>>, Status> {
-        Err(unimplemented_rpc("watch_engine_state"))
-    }
-
-    async fn continue_generation(
-        &self,
-        _request: Request<proto::ContinueGenerationRequest>,
-    ) -> Result<Response<proto::ContinueGenerationResponse>, Status> {
-        Err(unimplemented_rpc("continue_generation"))
-    }
-
-    async fn chat_complete(
-        &self,
-        _request: Request<proto::OpenAiRequest>,
-    ) -> Result<Response<ResponseStream<proto::OpenAiStreamChunk>>, Status> {
-        Err(unimplemented_rpc("chat_complete"))
-    }
-
-    async fn complete(
-        &self,
-        _request: Request<proto::OpenAiRequest>,
-    ) -> Result<Response<ResponseStream<proto::OpenAiStreamChunk>>, Status> {
-        Err(unimplemented_rpc("complete"))
-    }
-
-    async fn open_ai_embed(
-        &self,
-        _request: Request<proto::OpenAiRequest>,
-    ) -> Result<Response<proto::OpenAiResponse>, Status> {
-        Err(unimplemented_rpc("open_ai_embed"))
-    }
-
-    async fn open_ai_classify(
-        &self,
-        _request: Request<proto::OpenAiRequest>,
-    ) -> Result<Response<proto::OpenAiResponse>, Status> {
-        Err(unimplemented_rpc("open_ai_classify"))
-    }
-
-    async fn score(
-        &self,
-        _request: Request<proto::OpenAiRequest>,
-    ) -> Result<Response<proto::OpenAiResponse>, Status> {
-        Err(unimplemented_rpc("score"))
-    }
-
-    async fn rerank(
-        &self,
-        _request: Request<proto::OpenAiRequest>,
-    ) -> Result<Response<proto::OpenAiResponse>, Status> {
-        Err(unimplemented_rpc("rerank"))
-    }
-
-    async fn start_profile(
-        &self,
-        _request: Request<proto::StartProfileRequest>,
-    ) -> Result<Response<proto::StartProfileResponse>, Status> {
-        Err(unimplemented_rpc("start_profile"))
-    }
-
-    async fn stop_profile(
-        &self,
-        _request: Request<proto::StopProfileRequest>,
-    ) -> Result<Response<proto::StopProfileResponse>, Status> {
-        Err(unimplemented_rpc("stop_profile"))
-    }
-
-    async fn update_weights_from_disk(
-        &self,
-        _request: Request<proto::UpdateWeightsRequest>,
-    ) -> Result<Response<proto::UpdateWeightsResponse>, Status> {
-        Err(unimplemented_rpc("update_weights_from_disk"))
+        _request: Request<api::GetServerInfoRequest>,
+    ) -> Result<Response<api::GetServerInfoResponse>, Status> {
+        let server_info = self
+            .frontend
+            .server_info()
+            .await
+            .map_err(response::status)?;
+        info::server_info(server_info)
+            .map(Response::new)
+            .map_err(Status::internal)
     }
 }

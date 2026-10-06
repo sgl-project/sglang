@@ -3,7 +3,7 @@
 //! `__post_init__` → `normalize` → `verify` pipeline (run in that order, as
 //! `TokenizerManager._create_tokenized_object` does).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -238,23 +238,6 @@ pub struct SamplingParams {
     /// strip that wrapper from its own grammar, so it is a pipeline output only.
     #[serde(skip_deserializing)]
     pub ebnf_full_assistant: bool,
-    /// API fields present in the request object. Serde defaults erase this
-    /// distinction, but preferred sampling parameters must not overwrite an
-    /// explicit request value, including an explicit default or null.
-    #[serde(skip)]
-    pub(crate) explicit_fields: BTreeSet<String>,
-}
-
-fn sampling_params_from_value(value: serde_json::Value) -> Result<SamplingParams, String> {
-    let explicit_fields = value
-        .as_object()
-        .ok_or_else(|| "sampling_params must be an object".to_string())?
-        .keys()
-        .cloned()
-        .collect();
-    let mut params: SamplingParams = serde_json::from_value(value).map_err(|e| e.to_string())?;
-    params.explicit_fields = explicit_fields;
-    Ok(params)
 }
 
 impl Default for SamplingParams {
@@ -296,39 +279,11 @@ impl Default for SamplingParams {
             stop_regex_max_len: 0,
             is_normalized: false,
             ebnf_full_assistant: false,
-            explicit_fields: BTreeSet::new(),
         }
     }
 }
 
 impl SamplingParams {
-    /// Record a field supplied by a non-Serde adapter. Preferred launch values
-    /// are merged underneath these fields just as they are underneath keys
-    /// present in an HTTP sampling object.
-    pub(crate) fn mark_explicit(&mut self, field: &'static str) {
-        self.explicit_fields.insert(field.to_owned());
-    }
-
-    /// Merge operator-provided sampling defaults beneath explicitly supplied
-    /// request fields. HTTP and gRPC adapters use the same precedence policy.
-    pub(crate) fn apply_preferred(&mut self, preferred: &serde_json::Value) -> Result<(), String> {
-        let mut merged = preferred
-            .as_object()
-            .ok_or_else(|| "preferred_sampling_params must be a JSON object".to_string())?
-            .clone();
-        let request_value = serde_json::to_value(&*self).map_err(|e| e.to_string())?;
-        let request = request_value
-            .as_object()
-            .ok_or_else(|| "SamplingParams did not serialize as an object".to_string())?;
-        for field in &self.explicit_fields {
-            if let Some(value) = request.get(field) {
-                merged.insert(field.clone(), value.clone());
-            }
-        }
-        *self = sampling_params_from_value(serde_json::Value::Object(merged))?;
-        Ok(())
-    }
-
     /// `__post_init__` → `normalize` → `verify`, the order
     /// `TokenizerManager._create_tokenized_object` runs them in. `Err` is a
     /// request-local 400. `skip_tokenizer_init` stands in for Python's

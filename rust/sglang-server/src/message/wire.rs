@@ -228,6 +228,18 @@ pub fn merge_preferred_sampling(
     Ok(())
 }
 
+/// The same fill for a request that arrived already decoded (gRPC): the
+/// carrier round-trips through its JSON form so protobuf and HTTP share one
+/// precedence rule. Protobuf has no null, so "sent" is simply "set".
+pub fn fill_preferred_sampling(
+    params: Option<api::SamplingParamsOrList>,
+    preferred: &serde_json::Value,
+) -> Result<Option<api::SamplingParamsOrList>, String> {
+    let mut body = serde_json::json!({ "sampling_params": params });
+    merge_preferred_sampling(&mut body, preferred)?;
+    serde_json::from_value(body["sampling_params"].take()).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +367,33 @@ mod tests {
             Some(1.5)
         );
         assert_eq!(p.temperature, 1.0, "schema default applied by the decoder");
+    }
+
+    /// The protobuf entry fills the same keys the JSON entry does: a set field
+    /// wins, an unset one takes the preferred value, and an absent carrier
+    /// takes them all.
+    #[test]
+    fn preferred_params_fill_unset_protobuf_fields() {
+        use api::sampling_params_or_list::Value;
+        let preferred = serde_json::json!({"temperature": 0.25, "max_new_tokens": 4096});
+        let sent = api::SamplingParamsOrList {
+            value: Some(Value::One(api::SamplingParams {
+                temperature: Some(1.0),
+                ..Default::default()
+            })),
+        };
+        let filled = fill_preferred_sampling(Some(sent), &preferred)
+            .unwrap()
+            .unwrap();
+        let Some(Value::One(p)) = filled.value else {
+            panic!("one object in, one object out");
+        };
+        assert_eq!((p.temperature, p.max_new_tokens), (Some(1.0), Some(4096)));
+
+        let filled = fill_preferred_sampling(None, &preferred).unwrap().unwrap();
+        let Some(Value::One(p)) = filled.value else {
+            panic!("an absent carrier becomes the preferred object");
+        };
+        assert_eq!((p.temperature, p.max_new_tokens), (Some(0.25), Some(4096)));
     }
 }

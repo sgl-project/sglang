@@ -1,12 +1,14 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use sglang_api_types::runtime::v1 as proto;
-use sglang_api_types::runtime::v1::sglang_service_server::SglangService;
+use sglang_api_types::api::v1 as api;
+use sglang_api_types::api::v1::generate_stream_item::Item;
+use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Code, Request};
 
 use super::GrpcService;
 use crate::frontend::{FrontendConfig, FrontendHandle, FrontendMetadata};
+use crate::message::config::PreferredSamplingParams;
 use crate::message::finish_reason::FinishReason;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, Request as RuntimeRequest, RequestKind};
@@ -28,6 +30,16 @@ struct GenerationIntake {
 
 impl Harness {
     fn new(response_capacity: usize, incremental: bool, response_timeout: Duration) -> Self {
+        Self::build(response_capacity, incremental, response_timeout, true, None)
+    }
+
+    fn build(
+        response_capacity: usize,
+        incremental: bool,
+        response_timeout: Duration,
+        startup_ready: bool,
+        preferred: Option<PreferredSamplingParams>,
+    ) -> Self {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
         let frontend = FrontendHandle::new(
@@ -36,14 +48,14 @@ impl Harness {
             FrontendConfig {
                 response_capacity,
                 response_activity: Default::default(),
-                startup_ready: true,
+                startup_ready,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
                 metadata: FrontendMetadata::default(),
             },
         );
         Self {
-            service: GrpcService::for_test(frontend, None, incremental, response_timeout),
+            service: GrpcService::for_test(frontend, preferred, incremental, response_timeout),
             intake_rx,
             abort_rx,
         }
@@ -92,20 +104,83 @@ fn stop_reason() -> FinishReason {
     serde_json::from_value(serde_json::json!({"type": "stop"})).unwrap()
 }
 
+fn one_string(value: &str) -> api::StringOrList {
+    api::StringOrList {
+        value: Some(api::string_or_list::Value::One(value.into())),
+    }
+}
+
+fn many_strings(values: &[&str]) -> api::StringOrList {
+    api::StringOrList {
+        value: Some(api::string_or_list::Value::Many(api::StringList {
+            items: values.iter().map(|value| (*value).to_owned()).collect(),
+        })),
+    }
+}
+
+fn one_token_ids(ids: &[i64]) -> api::TokenIdsOrList {
+    api::TokenIdsOrList {
+        value: Some(api::token_ids_or_list::Value::One(api::TokenIds {
+            ids: ids.to_vec(),
+        })),
+    }
+}
+
+fn text_request(text: &str, rid: &str) -> api::GenerateRequest {
+    api::GenerateRequest {
+        text: Some(one_string(text)),
+        rid: Some(one_string(rid)),
+        stream: Some(true),
+        ..Default::default()
+    }
+}
+
+fn ids_request(ids: &[i64], rid: Option<&str>) -> api::GenerateRequest {
+    api::GenerateRequest {
+        input_ids: Some(one_token_ids(ids)),
+        rid: rid.map(one_string),
+        stream: Some(true),
+        ..Default::default()
+    }
+}
+
+fn frame(item: api::GenerateStreamItem) -> api::GenerateResponse {
+    match item.item {
+        Some(Item::Frame(frame)) => frame,
+        other => panic!("expected a frame, got {other:?}"),
+    }
+}
+
+fn stream_error(item: api::GenerateStreamItem) -> api::GenerateStreamError {
+    match item.item {
+        Some(Item::Error(error)) => error,
+        other => panic!("expected an error item, got {other:?}"),
+    }
+}
+
+fn meta(frame: &api::GenerateResponse) -> &api::GenerateMetaInfo {
+    frame
+        .meta_info
+        .as_ref()
+        .expect("every frame carries meta_info")
+}
+
+fn output_ids(frame: &api::GenerateResponse) -> &[i64] {
+    frame
+        .output_ids
+        .as_ref()
+        .map_or(&[], |ids| ids.ids.as_slice())
+}
+
 #[tokio::test]
-async fn text_generate_maps_request_and_streams_cumulative_responses() {
+async fn generate_streams_cumulative_frames_for_a_text_prompt() {
     let harness = Harness::new(2, false, Duration::from_secs(1));
-    let response = harness
+    let mut stream = harness
         .service
-        .text_generate(Request::new(proto::TextGenerateRequest {
-            text: "prompt".into(),
-            stream: Some(true),
-            rid: Some("request-1".into()),
-            ..Default::default()
-        }))
+        .generate(Request::new(text_request("prompt", "request-1")))
         .await
-        .unwrap();
-    let mut stream = response.into_inner();
+        .unwrap()
+        .into_inner();
 
     let intake = harness.next_generation().await;
     assert!(intake.admission.try_accept());
@@ -113,46 +188,52 @@ async fn text_generate_maps_request_and_streams_cumulative_responses() {
     assert!(intake.request.input_ids.is_none());
     assert!(intake.request.stream);
     assert_eq!(intake.rid.client_facing(), "request-1");
+    // One chunk at a time: a queued backlog of cumulative frames collapses to
+    // its last, so sending both up front would yield only the terminal frame.
     intake
         .sink
         .try_send(ResponseItem::Frame(chunk(&intake.rid, "Hel", 1, false)))
         .unwrap();
+    let first = frame(stream.next().await.unwrap().unwrap());
+    assert_eq!(first.text, "Hel");
+    assert_eq!(output_ids(&first), [1]);
+    assert_eq!(first.index, None);
+    let first_meta = meta(&first);
+    assert_eq!(first_meta.id, "request-1");
+    assert_eq!(first_meta.prompt_tokens, 3);
+    assert_eq!(first_meta.completion_tokens, 1);
+    assert!(first_meta.finish_reason.is_none());
+    assert!(first_meta.e2e_latency.is_none());
+
     intake
         .sink
         .try_send(ResponseItem::Done(chunk(&intake.rid, "lo", 2, true)))
         .unwrap();
-
-    let first = stream.next().await.unwrap().unwrap();
-    assert_eq!(first.text, "Hel");
-    assert!(!first.finished);
-    assert_eq!(first.meta_info["id"], r#""request-1""#);
-    assert_eq!(first.meta_info["prompt_tokens"], "3");
-    assert_eq!(first.meta_info["completion_tokens"], "1");
-    assert_eq!(first.meta_info["finish_reason"], "null");
-
-    let finished = stream.next().await.unwrap().unwrap();
+    let finished = frame(stream.next().await.unwrap().unwrap());
     assert_eq!(finished.text, "Hello");
-    assert!(finished.finished);
-    assert_eq!(finished.meta_info["completion_tokens"], "2");
-    assert!(finished.meta_info["finish_reason"].contains(r#""type":"stop""#));
+    assert_eq!(output_ids(&finished), [1, 2]);
+    let finished_meta = meta(&finished);
+    assert_eq!(finished_meta.completion_tokens, 2);
+    assert!(matches!(
+        finished_meta.finish_reason,
+        Some(api::FinishReason {
+            kind: Some(api::finish_reason::Kind::Stop(_))
+        })
+    ));
+    assert!(finished_meta.e2e_latency.is_some());
     assert!(stream.next().await.is_none());
     assert!(harness.abort_rx.try_recv().is_err());
 }
 
 #[tokio::test]
-async fn generate_streams_incremental_token_ids_with_cumulative_count() {
+async fn incremental_frames_carry_deltas_with_cumulative_count() {
     let harness = Harness::new(2, true, Duration::from_secs(1));
-    let response = harness
+    let mut stream = harness
         .service
-        .generate(Request::new(proto::GenerateRequest {
-            input_ids: vec![4, 5],
-            stream: Some(true),
-            rid: Some("tokens".into()),
-            ..Default::default()
-        }))
+        .generate(Request::new(ids_request(&[4, 5], Some("tokens"))))
         .await
-        .unwrap();
-    let mut stream = response.into_inner();
+        .unwrap()
+        .into_inner();
 
     let intake = harness.next_generation().await;
     assert!(intake.admission.try_accept());
@@ -167,12 +248,46 @@ async fn generate_streams_incremental_token_ids_with_cumulative_count() {
         .try_send(ResponseItem::Done(chunk(&intake.rid, "B", 11, true)))
         .unwrap();
 
-    let first = stream.next().await.unwrap().unwrap();
-    let finished = stream.next().await.unwrap().unwrap();
-    assert_eq!(first.output_ids, vec![10]);
-    assert_eq!(finished.output_ids, vec![11]);
-    assert_eq!(finished.meta_info["completion_tokens"], "2");
-    assert!(finished.finished);
+    let first = frame(stream.next().await.unwrap().unwrap());
+    let finished = frame(stream.next().await.unwrap().unwrap());
+    assert_eq!(output_ids(&first), [10]);
+    assert_eq!(output_ids(&finished), [11]);
+    assert_eq!(finished.text, "B");
+    assert_eq!(meta(&finished).completion_tokens, 2);
+    assert!(stream.next().await.is_none());
+}
+
+/// `stream: false` is a one-frame stream: deltas fold into the terminal
+/// result, and the server's incremental policy does not split a unary reply.
+#[tokio::test]
+async fn unary_request_yields_only_the_cumulative_terminal_frame() {
+    let harness = Harness::new(2, true, Duration::from_secs(1));
+    let mut request = text_request("prompt", "unary");
+    request.stream = Some(false);
+    let mut stream = harness
+        .service
+        .generate(Request::new(request))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let intake = harness.next_generation().await;
+    assert!(intake.admission.try_accept());
+    assert!(!intake.request.stream);
+    intake
+        .sink
+        .try_send(ResponseItem::Frame(chunk(&intake.rid, "Hel", 1, false)))
+        .unwrap();
+    intake
+        .sink
+        .try_send(ResponseItem::Done(chunk(&intake.rid, "lo", 2, true)))
+        .unwrap();
+
+    let only = frame(stream.next().await.unwrap().unwrap());
+    assert_eq!(only.text, "Hello");
+    assert_eq!(output_ids(&only), [1, 2]);
+    assert_eq!(meta(&only).completion_tokens, 2);
+    assert!(stream.next().await.is_none());
 }
 
 #[tokio::test]
@@ -180,11 +295,7 @@ async fn stream_drop_aborts_admitted_request() {
     let harness = Harness::new(1, false, Duration::from_secs(1));
     let mut stream = harness
         .service
-        .generate(Request::new(proto::GenerateRequest {
-            input_ids: vec![1],
-            rid: Some("cancel-me".into()),
-            ..Default::default()
-        }))
+        .generate(Request::new(ids_request(&[1], Some("cancel-me"))))
         .await
         .unwrap()
         .into_inner();
@@ -201,15 +312,14 @@ async fn stream_drop_aborts_admitted_request() {
     assert!(harness.abort_rx.try_recv().is_err());
 }
 
+/// A runtime failure after admission is this request's in-stream error item
+/// (the SSE error frame's twin), not an RPC status; the call is disarmed.
 #[tokio::test]
-async fn runtime_failure_is_an_in_stream_status_and_disarms_abort() {
+async fn runtime_failure_rides_the_stream_as_an_error_item() {
     let harness = Harness::new(1, false, Duration::from_secs(1));
     let mut stream = harness
         .service
-        .generate(Request::new(proto::GenerateRequest {
-            input_ids: vec![1],
-            ..Default::default()
-        }))
+        .generate(Request::new(ids_request(&[1], None)))
         .await
         .unwrap()
         .into_inner();
@@ -222,8 +332,12 @@ async fn runtime_failure_is_an_in_stream_status_and_disarms_abort() {
         )))
         .unwrap();
 
-    let error = stream.next().await.unwrap().unwrap_err();
-    assert_eq!(error.code(), Code::InvalidArgument);
+    let error = stream_error(stream.next().await.unwrap().unwrap());
+    assert_eq!(error.index, None);
+    let body = error.error.unwrap();
+    assert_eq!(body.code, 400);
+    assert!(body.message.contains("bad sampling"));
+    assert!(stream.next().await.is_none());
     drop(stream);
     assert!(harness.abort_rx.try_recv().is_err());
 }
@@ -233,11 +347,7 @@ async fn per_chunk_timeout_after_progress_returns_deadline_exceeded_and_aborts()
     let harness = Harness::new(1, false, Duration::from_millis(10));
     let mut stream = harness
         .service
-        .generate(Request::new(proto::GenerateRequest {
-            input_ids: vec![1],
-            rid: Some("too-slow".into()),
-            ..Default::default()
-        }))
+        .generate(Request::new(ids_request(&[1], Some("too-slow"))))
         .await
         .unwrap()
         .into_inner();
@@ -276,10 +386,7 @@ async fn closed_intake_is_a_top_level_unavailable_status() {
     let service = GrpcService::for_test(frontend, None, false, Duration::from_secs(1));
 
     let result = service
-        .generate(Request::new(proto::GenerateRequest {
-            input_ids: vec![1],
-            ..Default::default()
-        }))
+        .generate(Request::new(ids_request(&[1], None)))
         .await;
     let error = match result {
         Ok(_) => panic!("closed intake must reject the RPC"),
@@ -288,74 +395,134 @@ async fn closed_intake_is_a_top_level_unavailable_status() {
     assert_eq!(error.code(), Code::Unavailable);
 }
 
+/// Normalization failures end the RPC before anything is submitted, with the
+/// status that mirrors the HTTP 400.
 #[tokio::test]
-async fn new_proto_fields_and_engine_watch_are_explicitly_unsupported() {
+async fn malformed_request_is_rejected_before_submission() {
     let harness = Harness::new(1, false, Duration::from_secs(1));
-    let text_error = harness
+    let mut both = text_request("prompt", "both");
+    both.input_ids = Some(one_token_ids(&[1]));
+    let error = harness
         .service
-        .text_generate(Request::new(proto::TextGenerateRequest {
-            text: "hello".into(),
-            kv_hints: Some(Default::default()),
-            ..Default::default()
-        }))
+        .generate(Request::new(both))
         .await
         .err()
-        .expect("KV hints must not be silently ignored");
-    assert_eq!(text_error.code(), Code::Unimplemented);
-    let token_error = harness
+        .expect("text and input_ids together must be rejected");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error.message().contains("text"));
+
+    let error = harness
         .service
-        .generate(Request::new(proto::GenerateRequest {
-            input_ids: vec![1],
-            kv_hints: Some(Default::default()),
-            ..Default::default()
-        }))
+        .generate(Request::new(ids_request(&[], None)))
         .await
         .err()
-        .expect("KV hints must not be silently ignored");
-    assert_eq!(token_error.code(), Code::Unimplemented);
-    let watch_error = harness
-        .service
-        .watch_engine_state(Request::new(proto::WatchEngineStateRequest {}))
-        .await
-        .err()
-        .expect("engine watch is outside the generation adapter");
-    assert_eq!(watch_error.code(), Code::Unimplemented);
+        .expect("empty input_ids must be rejected");
+    assert_eq!(error.code(), Code::InvalidArgument);
     assert!(harness.intake_rx.try_recv().is_err());
 }
 
+/// A list-form request fans out like the HTTP batch: every item is tagged
+/// with its position, and one item's failure neither ends the stream nor
+/// touches its siblings.
 #[tokio::test]
-async fn output_token_overflow_returns_error_instead_of_truncating() {
-    let harness = Harness::new(1, true, Duration::from_secs(1));
+async fn batch_items_are_indexed_and_fail_independently() {
+    let harness = Harness::new(2, false, Duration::from_secs(1));
     let mut stream = harness
         .service
-        .generate(Request::new(proto::GenerateRequest {
-            input_ids: vec![i32::MAX],
+        .generate(Request::new(api::GenerateRequest {
+            text: Some(many_strings(&["a", "b"])),
+            stream: Some(true),
             ..Default::default()
         }))
         .await
         .unwrap()
         .into_inner();
-    let intake = harness.next_generation().await;
-    assert!(intake.admission.try_accept());
-    assert_eq!(
-        intake.request.input_ids.as_deref(),
-        Some(&[i64::from(i32::MAX)][..])
-    );
-    intake
+
+    let first = harness.next_generation().await;
+    let second = harness.next_generation().await;
+    assert!(first.admission.try_accept());
+    assert!(second.admission.try_accept());
+    assert_eq!(first.request.text.as_deref(), Some("a"));
+    assert_eq!(second.request.text.as_deref(), Some("b"));
+    first
         .sink
-        .try_send(ResponseItem::Frame(chunk(
-            &intake.rid,
-            "",
-            i64::from(i32::MAX) + 1,
-            false,
+        .try_send(ResponseItem::Error(crate::utils::error::Error::Validation(
+            "first failed".into(),
         )))
         .unwrap();
-    assert_eq!(
-        stream.next().await.unwrap().unwrap_err().code(),
-        Code::Internal
-    );
-    assert!(stream.next().await.is_none());
-    assert!(
-        matches!(harness.abort_rx.recv_async().await.unwrap(), AbortSource::Guard(rid) if rid == intake.rid)
-    );
+    second
+        .sink
+        .try_send(ResponseItem::Done(chunk(&second.rid, "ok", 5, true)))
+        .unwrap();
+
+    let mut items = Vec::new();
+    while let Some(item) = stream.next().await {
+        items.push(item.unwrap());
+    }
+    assert_eq!(items.len(), 2);
+    let (errors, frames): (Vec<_>, Vec<_>) = items
+        .into_iter()
+        .partition(|item| matches!(item.item, Some(Item::Error(_))));
+    let error = stream_error(errors.into_iter().next().unwrap());
+    assert_eq!(error.index, Some(0));
+    assert!(error.error.unwrap().message.contains("first failed"));
+    let ok = frame(frames.into_iter().next().unwrap());
+    assert_eq!(ok.index, Some(1));
+    assert_eq!(ok.text, "ok");
+    assert_eq!(meta(&ok).id, second.rid.client_facing());
+    assert!(harness.abort_rx.try_recv().is_err());
+}
+
+/// Launch-time preferred sampling params fill the fields a protobuf request
+/// left unset, beneath the ones it set: the HTTP precedence at the gRPC entry.
+#[tokio::test]
+async fn preferred_sampling_params_fill_unset_fields() {
+    let preferred = PreferredSamplingParams(serde_json::json!({
+        "temperature": 0.25,
+        "max_new_tokens": 32,
+    }));
+    let harness = Harness::build(1, false, Duration::from_secs(1), true, Some(preferred));
+    let mut request = ids_request(&[1], None);
+    request.sampling_params = Some(api::SamplingParamsOrList {
+        value: Some(api::sampling_params_or_list::Value::One(
+            api::SamplingParams {
+                temperature: Some(0.8),
+                ..Default::default()
+            },
+        )),
+    });
+    let _stream = harness
+        .service
+        .generate(Request::new(request))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let intake = harness.next_generation().await;
+    assert_eq!(intake.request.sampling_params.temperature, 0.8);
+    assert_eq!(intake.request.sampling_params.max_new_tokens, Some(32));
+}
+
+/// `HealthCheck` is `/health_generate`: not ready and stalled are both
+/// UNAVAILABLE, and the stalled probe is a real generation submission.
+#[tokio::test]
+async fn health_check_reports_not_ready_and_stalled_as_unavailable() {
+    let not_ready = Harness::build(1, false, Duration::from_secs(1), false, None);
+    let error = not_ready
+        .service
+        .health_check(Request::new(api::HealthCheckRequest {}))
+        .await
+        .expect_err("warmup must not report healthy");
+    assert_eq!(error.code(), Code::Unavailable);
+    assert!(not_ready.intake_rx.try_recv().is_err());
+
+    let stalled = Harness::new(1, false, Duration::from_secs(1));
+    let error = stalled
+        .service
+        .health_check(Request::new(api::HealthCheckRequest {}))
+        .await
+        .expect_err("no heartbeat within the window must not report healthy");
+    assert_eq!(error.code(), Code::Unavailable);
+    let probe = stalled.next_generation().await;
+    assert_eq!(probe.request.input_ids.as_deref(), Some(&[0][..]));
 }

@@ -17,6 +17,7 @@ use super::frame::{
 use super::frontend_error_status;
 use crate::frontend::{
     FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest, HealthStatus,
+    recv_indexed,
 };
 #[cfg(test)]
 use crate::message::ids::Rid;
@@ -333,23 +334,6 @@ async fn generate_batch(
         .await;
         (StatusCode::OK, Json(serde_json::Value::Array(drained))).into_response()
     }
-}
-
-/// Await the next event from `call`, then drain whatever queued behind it (so the
-/// caller can coalesce a backlog, as Python's `state.out_list` does), handing the
-/// call back for `FuturesUnordered` to re-poll. An empty result means the semantic
-/// stream was already exhausted.
-async fn recv_indexed(
-    index: usize,
-    mut call: FrontendCall,
-) -> (usize, FrontendCall, Vec<FrontendEvent>) {
-    let mut items = Vec::new();
-    match call.recv().await {
-        Some(item) => items.push(item),
-        None => return (index, call, items), // already exhausted
-    }
-    call.drain_ready(&mut items);
-    (index, call, items)
 }
 
 /// Multiplex calls into SSE `data` strings + a final `[DONE]`; `with_index` tags

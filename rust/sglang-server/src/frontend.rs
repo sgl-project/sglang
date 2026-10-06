@@ -446,6 +446,23 @@ impl FrontendCall {
     }
 }
 
+/// Await the next event from `call`, then drain whatever queued behind it (so the
+/// caller can coalesce a backlog, as Python's `state.out_list` does), handing the
+/// call back for `FuturesUnordered` to re-poll. An empty result means the semantic
+/// stream was already exhausted. Shared by the HTTP and gRPC batch multiplexers.
+pub(crate) async fn recv_indexed(
+    index: usize,
+    mut call: FrontendCall,
+) -> (usize, FrontendCall, Vec<FrontendEvent>) {
+    let mut items = Vec::new();
+    match call.recv().await {
+        Some(item) => items.push(item),
+        None => return (index, call, items), // already exhausted
+    }
+    call.drain_ready(&mut items);
+    (index, call, items)
+}
+
 fn generation_event(item: ResponseItem) -> FrontendEvent {
     match item {
         ResponseItem::Frame(output) => FrontendEvent::Delta(output.into()),

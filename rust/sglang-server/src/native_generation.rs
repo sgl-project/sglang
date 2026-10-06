@@ -1,9 +1,9 @@
 //! Shared wire semantics for SGLang-native generation responses.
 //!
-//! Native HTTP places these values in a JSON `meta_info` object, while
-//! `runtime.v1` gRPC JSON-encodes each value into `map<string, string>`. Keeping
-//! the logical shape here prevents the sibling adapters from drifting without
-//! making either adapter depend on the other.
+//! Native HTTP places these values in a JSON `meta_info` object, while the
+//! `api.v1` gRPC adapter builds the typed `GenerateMetaInfo` from the same
+//! columns (`grpc::response`). Keeping the logical shape here prevents the
+//! sibling adapters from drifting without making either depend on the other.
 
 use crate::frontend::FrontendOutput;
 
