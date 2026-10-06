@@ -7,7 +7,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.model_loader.weight_utils import (
+    _load_pt_file,
     filter_duplicate_safetensors_files,
     maybe_add_mtp_safetensors,
 )
@@ -197,6 +200,37 @@ class TestMaybeAddMtpSafetensors(CustomTestCase):
                     [model, mtp],
                 )
                 listing.assert_not_called()
+
+
+class _OpenOnUnpickle:
+    def __init__(self, marker):
+        self.marker = marker
+
+    def __reduce__(self):
+        return (open, (self.marker, "w"))
+
+
+class TestLoadPtFile(CustomTestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.folder = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_tensor_state_dict_loads(self):
+        path = os.path.join(self.folder, "pytorch_model.bin")
+        torch.save({"w": torch.arange(4)}, path)
+        loaded = _load_pt_file(path)
+        self.assertTrue(torch.equal(loaded["w"], torch.arange(4)))
+
+    def test_pickle_payload_is_not_executed(self):
+        marker = os.path.join(self.folder, "pwned")
+        path = os.path.join(self.folder, "pytorch_model.bin")
+        torch.save({"w": _OpenOnUnpickle(marker)}, path)
+        with self.assertRaises(Exception):
+            _load_pt_file(path)
+        self.assertFalse(os.path.exists(marker))
 
 
 if __name__ == "__main__":
