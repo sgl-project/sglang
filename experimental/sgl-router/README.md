@@ -176,8 +176,8 @@ an engine whose KV tokens have reached 95% of its capacity.
 Unsupported legacy options fail at startup.
 
 `--bucket-config buckets.json` replaces the default plain and P/D buckets. Each
-bucket is plain or P/D, and each group may set its own engines, policy and
-admission; see [POLICY_DESIGN.md](POLICY_DESIGN.md#7-configuration-and-compatibility):
+bucket is plain or P/D, and each group may set its own engines, policy,
+admission and affinity; see [POLICY_DESIGN.md](POLICY_DESIGN.md#7-configuration-and-compatibility):
 
 ```json
 {"buckets": [{
@@ -207,10 +207,20 @@ Omitting `--chat-routing` keeps the existing policies and defaults.
 Both reorg affinity policies accept `--affinity-mode prefer` (default) or
 `balanced`. Prefer keeps an admissible session binding or the best admissible
 prefix owner. Balanced samples a power-of-two alternative and switches only
-when the affinity engine's waiting uncached tokens exceed both
+when the affinity engine's load exceeds both
 `alternative * --affinity-load-factor` (default 2) and
-`alternative + --affinity-load-gap` (default 1024). Missing fresh native load
-preserves admissible affinity; ties also preserve it.
+`alternative + --affinity-load-gap`. `--affinity-balanced-by` picks the load:
+`prefill-tokens` (default; gap default 1024) is the engine's waiting uncached
+tokens plus the prompt tokens it would prefill for this request, so a cache owner
+is credited for its prefix (session-aware assumes the whole prompt on either
+engine); `running-requests` (gap default 4) ignores the request. Missing fresh load preserves admissible
+affinity; ties also preserve it.
+
+A bucket group may override these with `"affinity": {"mode", "balanced_by",
+"load_factor", "load_gap"}`; unset fields take the CLI values, and the balanced
+fields require `"mode": "balanced"`. For example, a session-aware group balanced
+by running requests:
+`"plain": {"affinity": {"mode": "balanced", "balanced_by": "running_requests"}}`.
 
 Both modes fall back within the group when affinity fails admission, excluding
 rejected engines. The fallback winner must pass admission; failure advances to

@@ -1672,20 +1672,24 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
 OOM_MSG = """
 OOM detected. Possible solutions:
-  - If the OOM occurs during loading:
+  - If the OOM occurs during loading, or on the first request with a component on
+    CPU offload (which moves the whole component onto the GPU when it runs):
     1. Check available memory on every selected GPU, not only total capacity.
        In multi-GPU runs, the least-free selected GPU is the bottleneck.
-    2. For single-GPU deployment, use `--performance-mode memory`, component CPU offload,
-       or `--dit-layerwise-offload` for supported Wan/MOVA DiTs.
-    3. For multi-GPU deployment, keep the default `--performance-mode auto` or set
-       `--use-fsdp-inference true` to shard DiT weights with FSDP. FSDP is not a
-       single-GPU substitute for CPU offload.
+    2. For single-GPU deployment, stream weights layer by layer by listing components
+       in `--layerwise-offload-components`, e.g. `dit,text_encoder,image_encoder,vae`.
+       `--dit-layerwise-offload` streams only the DiT, and `--performance-mode memory`
+       streams the DiT only for models that validate it. Component CPU offload helps
+       only when each component fits on its own.
+    3. For multi-GPU deployment, set `--use-fsdp-inference true` to shard DiT weights
+       with FSDP. FSDP is not a single-GPU substitute for offload.
   - If the OOM occurs during runtime:
     1. Reduce resolution, `--num-frames`, or batch size.
     2. Use `--performance-mode memory` for lower memory usage.
     3. Enable SP/Ulysses/Ring for sequence-heavy workloads in multi-GPU setups.
     4. Use FSDP, with CFG parallelism when supported, for validated multi-GPU workloads.
     5. Use a lower-memory attention backend or quantization when available.
+  Tested launch commands per model: https://docs.sglang.io/cookbook
   Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
 """
 
