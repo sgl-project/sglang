@@ -64,12 +64,21 @@ class KVCacheEventRecorder:
                 if (
                     tail.medium == event.medium
                     and tail.lora_id == event.lora_id
+                    and tail.lora_name == event.lora_name
                     and tail.block_size == event.block_size
                     and tail.cache_salt == event.cache_salt
                     and tail.session_id == event.session_id
                     and tail.block_hashes
                     and event.parent_block_hash == tail.block_hashes[-1]
                 ):
+                    if tail.extra_keys is not None or event.extra_keys is not None:
+                        if tail.extra_keys is None:
+                            tail.extra_keys = [None] * len(tail.block_hashes)
+                        tail.extra_keys.extend(
+                            event.extra_keys
+                            if event.extra_keys is not None
+                            else [None] * len(event.block_hashes)
+                        )
                     tail.block_hashes.extend(event.block_hashes)
                     tail.token_ids.extend(event.token_ids)
                     return
@@ -141,6 +150,12 @@ class KVCacheEventRecorder:
                     block_size=len(page_tokens),
                     lora_id=None,
                     medium=medium,
+                    lora_name=None,
+                    extra_keys=cache_salt_extra_keys(
+                        parent_block_hash=parent_block_hash,
+                        cache_salt=node.key.cache_salt,
+                        num_blocks=1,
+                    ),
                     cache_salt=node.key.cache_salt,
                     session_id=session_id,
                 )
@@ -191,3 +206,16 @@ class KVCacheEventRecorder:
         events = self._queue
         self._queue = []
         return events
+
+
+def cache_salt_extra_keys(
+    *, parent_block_hash: Optional[int], cache_salt: Optional[str], num_blocks: int
+) -> Optional[list[Optional[tuple[str]]]]:
+    """Expose the salt on block zero of a prefix, including coalesced stores.
+
+    Both tree cores already identify a prefix root by its absent parent hash.
+    Deriving this wire metadata here keeps the Rust binding's tuple unchanged.
+    """
+    if parent_block_hash is not None or not cache_salt or num_blocks == 0:
+        return None
+    return [(cache_salt,)] + [None] * (num_blocks - 1)
