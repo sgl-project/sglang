@@ -99,7 +99,6 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.require_mlp_tp_gather = require_mlp_tp_gather()
         self.require_mlp_sync = require_mlp_sync()
         self.require_attn_tp_gather = require_attn_tp_gather()
-        self.tp_size = self.model_runner.tp_size
         self.attn_dp_size = deployment_attn_dp_size()
         self.pp_size = get_parallel().pp_size
         self.speculative_num_steps = get_spec().speculative_num_steps
@@ -303,6 +302,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.DECODE,
+            out_cache_loc_is_physical=True,
             batch_size=expanded_bs,
             input_ids=None,
             req_pool_indices=req_pool_indices,
