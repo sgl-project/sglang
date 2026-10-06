@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List
 
 import torch
 
+from sglang.srt.elastic_ep.errors import ElasticLayoutFatal
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
@@ -157,7 +158,7 @@ def shrink_expert_metadata(
     try:
         reload_relabelled(relabelled)
     except Exception as exc:
-        raise RuntimeError(
+        raise ElasticLayoutFatal(
             "Elastic EP shrink left this rank's expert weights out of sync with "
             f"its expert map ({exc}). It must not continue serving."
         ) from exc

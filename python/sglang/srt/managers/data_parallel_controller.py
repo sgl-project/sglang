@@ -37,10 +37,12 @@ from sglang.srt.elastic_ep.topology import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    ElasticDrainClearReq,
     ElasticScaleUpdateReq,
     ProfileReq,
     ScaleElasticEPReqInput,
@@ -101,6 +103,14 @@ class WorkerPortHandshake:
     worker_ports: list[int]
     attn_tp_size: int
     attn_cp_size: int
+
+
+class DPRoutingUnavailable(RuntimeError):
+    """No DP worker can take this request.
+
+    Its own type so the event loop can absorb exactly this and nothing else. Every
+    other failure in a dispatch is a bug, and swallowing those hides them.
+    """
 
 
 class LoadBalanceMethod(Enum):
@@ -179,9 +189,16 @@ class DataParallelController:
 
         # Init inter-process communication
         self.context = zmq.Context(1 + get_parallel().num_dp_ranks)
+        self.send_to_tokenizer = None
         if get_parallel().node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+            )
+            # The only path back. Everything else here pushes down to the schedulers,
+            # so a request this process cannot route has nowhere to be reported and
+            # the client is left waiting on a rid nothing will ever complete.
+            self.send_to_tokenizer = get_zmq_socket(
+                self.context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
 
         # Dispatch method
@@ -356,6 +373,16 @@ class DataParallelController:
                 slot for slot in self._active_workers if slot >= obj.new_ep_size
             }
 
+    def _clear_elastic_draining(self, msg: ElasticDrainClearReq) -> None:
+        """Route to the retiring slots again: the shrink was rejected or it failed.
+
+        Nothing else clears this on those paths. A rejection produces no scale update,
+        and a failure is dropped by the tokenizer before dispatch, so without this the
+        pickers skip the tail for the rest of the deployment's life while
+        /is_scaling_elastic_ep still reports it idle at full width.
+        """
+        self._draining_slots = set()
+
     def _dispatch_elastic_scale_update(self, msg: ElasticScaleUpdateReq) -> None:
         # Terminal either way: the slots are gone, or the shrink failed and they stay.
         self._draining_slots = set()
@@ -444,6 +471,7 @@ class DataParallelController:
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self._dispatch_elastic_scale_update),
+                (ElasticDrainClearReq, self._clear_elastic_draining),
                 (ScaleElasticEPReqInput, self._dispatch_elastic_scale_request),
             ]
         )
@@ -905,7 +933,7 @@ class DataParallelController:
                 or rank not in self._active_workers
                 or self.workers[rank] is None
             ):
-                raise ValueError(f"DP rank {rank} is not active.")
+                raise DPRoutingUnavailable(f"DP rank {rank} is not active.")
             logger.debug(f"Direct routing to DP rank {rank}")
             sock_send(self.workers[rank], req)
             return True
@@ -917,7 +945,9 @@ class DataParallelController:
 
         active = self._routable_workers()
         if not active:
-            raise RuntimeError("No active DP workers are available for routing.")
+            raise DPRoutingUnavailable(
+                "No active DP workers are available for routing."
+            )
 
         slot = active[self.round_robin_counter % len(active)]
         self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
@@ -961,10 +991,27 @@ class DataParallelController:
             return slot
         routable = self._routable_workers()
         if not routable:
-            raise RuntimeError("No active DP workers are available for routing.")
+            raise DPRoutingUnavailable(
+                "No active DP workers are available for routing."
+            )
         chosen = routable[self.round_robin_counter % len(routable)]
         self.round_robin_counter = (self.round_robin_counter + 1) % len(routable)
         return chosen
+
+    def _abort_undispatchable(self, recv_req, message: str) -> None:
+        """Fail the request back to the tokenizer instead of dropping it.
+
+        Dropped, its rid_to_state entry is never completed and the client waits
+        forever, so a router holding a stale routed_dp_rank sees hangs where it should
+        see failures. An abort completes the rid and the client fails fast.
+        """
+        rid = getattr(recv_req, "rid", None)
+        if not rid or self.send_to_tokenizer is None:
+            return
+        try:
+            sock_send(self.send_to_tokenizer, AbortReq(rid=rid, abort_message=message))
+        except Exception:
+            logger.exception("[DPC] could not report rid=%s back to the tokenizer", rid)
 
     def event_loop(self):
         while True:
@@ -976,14 +1023,14 @@ class DataParallelController:
                     break
                 try:
                     self._request_dispatcher(recv_req)
-                except Exception:
+                except DPRoutingUnavailable as exc:
                     # Per-request, not fatal: routing rejects a request pinned to a
                     # slot that has retired, and letting that escape here would take
-                    # the controller down and with it every other DP worker.
-                    logger.exception(
-                        "[DPC] dropping request that could not be dispatched: %s",
-                        type(recv_req).__name__,
-                    )
+                    # the controller down and with it every other DP worker. Only this
+                    # one, though. Every other failure in a dispatch is a bug, and on
+                    # main it took the controller down rather than going unnoticed.
+                    logger.warning("[DPC] %s (%s)", exc, type(recv_req).__name__)
+                    self._abort_undispatchable(recv_req, str(exc))
 
 
 def run_scheduler_process_with_init_pipe(run_scheduler_process_func: Callable, pipe):
