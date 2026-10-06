@@ -1194,13 +1194,15 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         enable_linear_replayssm_spec: bool = False,
+        allocate_intermediate_ssm: bool = True,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape=None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
     ):
         # mamba_envelope_layout / speculative_eagle_topk / enable_linear_replayssm /
-        # linear_replayssm_cache_len / enable_linear_replayssm_spec: accepted to match
+        # linear_replayssm_cache_len / enable_linear_replayssm_spec /
+        # allocate_intermediate_ssm: accepted to match
         # the parent signature but NOT forwarded — the shared pool's conv/temporal
         # state are fixed-shape views (replayssm/spec are gated off under unified).
         if short_conv_layer_ids or ngram_context_len:
