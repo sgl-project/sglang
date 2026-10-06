@@ -3021,8 +3021,7 @@
             "warmup_peak_vram_mb": 28396,
             "load_peak_allocated_mb": 1876.14,
             "runtime_peak_allocated_mb": 48399,
-            "estimated_full_test_time_s": 545.1,
-            "timing_tolerance": 1.0
+            "estimated_full_test_time_s": 545.1
         },
         "ltx_2_3_two_stage_ti2v_2gpus": {
             "expected_load_ms": 50003.37,
