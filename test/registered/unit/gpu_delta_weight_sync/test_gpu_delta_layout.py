@@ -695,7 +695,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             "tail": {
                 "frames": [
                     dict(
-                        encoded_offset=8,
+                        encoded_offset=0,
                         encoded_bytes=7,
                         decoded_offset=16,
                         decoded_bytes=8,
@@ -705,18 +705,18 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             "omitted": {"frames": []},
         }
         records = {
-            "sparse": {"offset": 64},
-            "tail": {"offset": 128},
-            "omitted": {"offset": 192},
+            "sparse": {"offset": 64, "nbytes": 21},
+            "tail": {"offset": 128, "nbytes": 7},
+            "omitted": {"offset": 192, "nbytes": 0},
         }
-        table, counts, gaps = layout._plan_decode(plans, entries, records)
+        table, counts, gaps = layout._plan_decode(plans, entries, records, 8)
         self.assertEqual(table.dtype, np.int64)
         self.assertTrue(table.flags.c_contiguous)
         # Native rows are input, encoded size, decoded size, output; batches
         # retain their index even when empty and output offsets restart at zero.
         np.testing.assert_array_equal(
             table,
-            [[64, 80, 136], [3, 5, 7], [8, 8, 8], [8, 24, 16]],
+            [[64, 80, 128], [3, 5, 7], [8, 8, 8], [8, 24, 16]],
         )
         self.assertEqual(counts, [2, 0, 1, 0])
         self.assertEqual(
@@ -730,13 +730,65 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         )  # Tensor alignment padding at [48,64) is deliberately excluded.
         # Exhausting the iterator is required to emit the last trailing gap
         # and the later fully omitted batch, even with no frame yields at all.
-        empty, counts, gaps = layout._plan_decode(plans[-1:], entries, records)
+        empty, counts, gaps = layout._plan_decode(plans[-1:], entries, records, 8)
         self.assertEqual(empty.shape, (4, 0))
         self.assertEqual(counts, [0])
         self.assertEqual(gaps, [[(0, 24)]])
-        empty, counts, gaps = layout._plan_decode([], entries, records)
+        empty, counts, gaps = layout._plan_decode([], entries, records, 8)
         self.assertEqual(empty.shape, (4, 0))
         self.assertEqual((counts, gaps), ([], []))
+        # Same natural-tensor invariants formerly checked globally. A whole
+        # input allocation or decoded batch bound alone cannot admit these.
+        for mutate in (
+            lambda f: f[0].update(encoded_offset=16),
+            lambda f: f[1].update(encoded_offset=15),
+            lambda f: f[0].update(encoded_offset=False),
+            lambda f: f[0].update(encoded_bytes=3.5),
+            lambda f: f[0].update(encoded_bytes=0),
+            lambda f: f[1].update(encoded_bytes=43),
+            lambda f: f[0].update(decoded_offset=True),
+            lambda f: f[0].update(decoded_offset=-8),
+            lambda f: f[0].update(decoded_bytes=8.0),
+            lambda f: f[0].update(decoded_bytes=7),
+            lambda f: f[0].update(decoded_bytes=9),
+            lambda f: f[1].update(decoded_offset=1),
+            lambda f: f[1].update(decoded_offset=8),
+            lambda f: f[1].update(decoded_offset=48),
+        ):
+            bad = copy.deepcopy(entries)
+            mutate(bad["sparse"]["frames"])
+            with (
+                self.subTest(mutation=mutate),
+                self.assertRaisesRegex(ValueError, "invalid relative inner"),
+            ):
+                layout._plan_decode(plans, bad, records, 8)
+        for size in (20, 22):
+            bad = copy.deepcopy(records)
+            bad["sparse"]["nbytes"] = size
+            with (
+                self.subTest(input_span=size),
+                self.assertRaisesRegex(ValueError, "outer decoded length"),
+            ):
+                layout._plan_decode(plans, entries, bad, 8)
+        # Expanded compressed tails remain admitted with exact natural length.
+        tail_plan = [([(tail, 0, 18)], 18, None, [])]
+        tail_entry = {
+            "tail": {
+                "frames": [
+                    dict(
+                        encoded_offset=0,
+                        encoded_bytes=4,
+                        decoded_offset=16,
+                        decoded_bytes=2,
+                    )
+                ]
+            }
+        }
+        tail_table, _, tail_gaps = layout._plan_decode(
+            tail_plan, tail_entry, {"tail": {"offset": 128, "nbytes": 4}}, 8
+        )
+        np.testing.assert_array_equal(tail_table[:, 0], [128, 4, 2, 16])
+        self.assertEqual(tail_gaps, [[(0, 16)]])
 
     def test_host_direct_batches_defer_outputs_and_reuse_decoded_slots(self):
         for stages in (2, 3, 4):

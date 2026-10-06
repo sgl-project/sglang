@@ -246,8 +246,8 @@ def _plan_layers(backend, bindings, entries, layers_per_batch=1):
     return backend.batch_plan[1]
 
 
-def _plan_decode(plans, entries, records):
-    """Pack fresh frame rows and omitted ranges for every cached layer batch."""
+def _plan_decode(plans, entries, records, frame_bytes):
+    """Admit consumed inner spans while packing numeric rows and omitted ranges."""
     counts = [
         sum(len(entries[binding.name]["frames"]) for binding, _, _ in outputs)
         for outputs, _, _, _ in plans
@@ -257,19 +257,40 @@ def _plan_decode(plans, entries, records):
     def rows():
         for batch, (outputs, _, _, _) in enumerate(plans):
             for binding, output_offset, size in outputs:
-                input_offset = records[binding.name]["offset"]
-                cursor = 0
+                record = records[binding.name]
+                input_offset = record["offset"]
+                cursor = encoded_end = 0
                 for frame in entries[binding.name]["frames"]:
+                    offset, encoded = frame["encoded_offset"], frame["encoded_bytes"]
                     start, decoded = frame["decoded_offset"], frame["decoded_bytes"]
+                    if (
+                        type(offset) is not int
+                        or type(encoded) is not int
+                        or type(start) is not int
+                        or type(decoded) is not int
+                        or offset != (encoded_end + 15) // 16 * 16
+                        or not 0 < decoded <= frame_bytes
+                        or not 0 < encoded <= 32 + decoded + decoded // 6
+                        or start % frame_bytes
+                        or decoded != min(frame_bytes, size - start)
+                        or start < cursor
+                        or start + decoded > size
+                    ):
+                        raise ValueError("invalid relative inner compressed frame")
                     if cursor < start:
                         gaps[batch].append((output_offset + cursor, start - cursor))
                     yield (
-                        input_offset + frame["encoded_offset"],
-                        frame["encoded_bytes"],
+                        input_offset + offset,
+                        encoded,
                         decoded,
                         output_offset + start,
                     )
                     cursor = start + decoded
+                    encoded_end = offset + encoded
+                if encoded_end != record["nbytes"]:
+                    raise ValueError(
+                        "outer decoded length differs from the inner tensor span"
+                    )
                 if cursor < size:
                     gaps[batch].append((output_offset + cursor, size - cursor))
 
@@ -406,6 +427,7 @@ class PreparedDelta:
         plan_started = time.perf_counter()
         validate_codec(manifest)
         self.codec = manifest["codec"]
+        frame_bytes = manifest["frame_bytes"]
         if (
             type(manifest["base_version"]) is not int
             or manifest["target_version"] != manifest["base_version"] + 1
@@ -434,7 +456,7 @@ class PreparedDelta:
             metadata,
         )
         release_started = time.perf_counter()
-        # READY admission drained global validation; local decode only needs this rank.
+        # READY bounds outer payloads. Inner admission follows in local planning.
         entries = {name: entries[name] for name in local_names}
         del manifest, content
         self.timings["host_rank_metadata_release_s"] = (
@@ -466,7 +488,7 @@ class PreparedDelta:
             previous_plan is not None and backend.batch_plan is previous_plan
         )
         frame_table, frame_counts, self.gaps = _plan_decode(
-            self.static_plans, entries, self.host_snapshot.index["tensors"]
+            self.static_plans, entries, self.host_snapshot.index["tensors"], frame_bytes
         )
         self.max_decoded = max((plan[1] for plan in self.static_plans), default=0)
         self.matrix_tensor_count = len(compressed)
