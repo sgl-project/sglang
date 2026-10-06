@@ -490,6 +490,9 @@ class TreeCacheNamespace(SimpleNamespace):
     def evict(self, params: EvictParams):
         pass
 
+    def maybe_hand_to_session(self, req):
+        pass
+
 
 @torch.no_grad
 def extend(reqs, model_runner):
