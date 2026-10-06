@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Iterator, Optional, Sequence
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
+from sglang.kernels.ops.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
@@ -29,6 +29,7 @@ from sglang.srt.kv_canary.single_forward_manager.manager import (
 )
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
+from sglang.srt.utils import create_device_stream
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -61,8 +62,10 @@ class CanaryManager:
         self._swa_allocator: Optional[SWATokenToKVPoolAllocator] = swa_allocator
         self._outer_step_counter: int = 0
         self._active_single_forward_manager_index: Optional[int] = None
+        self._model_forward_bracket_depth: int = 0
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
+        self._launch_capacities = launch_capacities
 
         self._device_state = CanaryDeviceState.allocate(
             config=config,
@@ -89,7 +92,7 @@ class CanaryManager:
             )
         )
 
-        self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
+        self._d2h_stream: torch.Stream = create_device_stream(device)
 
         swa_divergence_interval = (
             envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.get()
@@ -166,11 +169,16 @@ class CanaryManager:
             for _ in range(num_sfms)
         )
 
+    def per_forward_workspace_bytes(self) -> int:
+        return self._launch_capacities.per_forward_workspace_bytes(
+            num_buffer_groups=len(self._buffer_groups)
+        )
+
     @contextlib.contextmanager
     def with_active_single_forward_manager(self, index: int) -> Iterator[None]:
-        assert (
-            self._active_single_forward_manager_index is None
-        ), "kv-canary: nested with_active_single_forward_manager is forbidden"
+        assert self._active_single_forward_manager_index is None, (
+            "kv-canary: nested with_active_single_forward_manager is forbidden"
+        )
         self._active_single_forward_manager_index = index
         try:
             yield
@@ -181,6 +189,22 @@ class CanaryManager:
                 f"{self._active_single_forward_manager_index}; nested or mismatched bracket"
             )
             self._active_single_forward_manager_index = None
+
+    @contextlib.contextmanager
+    def model_forward_bracket_scope(self) -> Iterator[bool]:
+        """Return whether this is the outermost patched ``model.forward`` call.
+
+        Some model implementations enter another patched forward from inside the
+        top-level forward (for example, a vision-language model calling its inner
+        language model). Kv-canary owns one pre/post bracket per active
+        SingleForwardManager; nested brackets would run a second pre-op while the
+        phase checker is already in the first bracket.
+        """
+        self._model_forward_bracket_depth += 1
+        try:
+            yield self._model_forward_bracket_depth == 1
+        finally:
+            self._model_forward_bracket_depth -= 1
 
     def pre_ops_maybe_inside_graph(
         self, forward_batch: ForwardBatch

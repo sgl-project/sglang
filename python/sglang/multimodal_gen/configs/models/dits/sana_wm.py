@@ -3,15 +3,10 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_transformer_blocks
 
 
 @dataclass
 class SanaWMArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [is_blocks_or_transformer_blocks]
-    )
-
     # --- Core dims (upstream: depth=20, hidden=2240, heads=20, linear_head_dim=112) ---
     patch_size: int = 1
     in_channels: int = 128  # LTX-2 VAE latent channels

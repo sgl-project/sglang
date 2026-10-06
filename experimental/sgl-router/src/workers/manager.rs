@@ -4,15 +4,32 @@
 use crate::config::Config;
 use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
-use crate::policies::active_load::ActiveLoadRegistry;
-use crate::policies::kv_events::KvEventIndex;
-use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
-use crate::workers::WorkerRegistry;
+use crate::state::kv_events::KvEventIndex;
+use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
+use crate::workers::introspect::{
+    worker_client, DisaggregationRole, WorkerIntrospector, SERVER_INFO_TIMEOUT,
+};
+use crate::workers::{EngineProfile, WireProtocol, Worker, WorkerRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+/// Production reconcile cadence. Workers that register without resolving
+/// their model IDs (an introspection that failed at `Added` time — e.g. the
+/// EndpointSlice flipped `ready=true` before the engine's HTTP server could
+/// answer) are re-introspected on this interval until they join their model
+/// pool. The worst-case "registered but invisible" window is about one
+/// interval plus the introspection round-trip; steady state costs one cheap
+/// registry scan per interval. See `reconcile_unresolved_workers` for the
+/// (benign) case of a worker that answers but never advertises a model name.
+/// Prefills whose bootstrap port is unknown are revisited on this interval too.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Faster cadence for prefills held unroutable by the bootstrap-port grace, so
+/// they get several retries before it expires.
+const BOOTSTRAP_PORT_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Resolve the circuit-breaker config for all model IDs carried by a spec.
 ///
@@ -31,6 +48,59 @@ fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerC
     None
 }
 
+/// Whether `worker_url` is one the router will dial in cleartext.
+///
+/// The scheme test cannot be `Url::parse(worker_url)?.scheme() == "http"`: a
+/// schemeless `worker-0.engines.svc:8000` parses with `worker-0.engines.svc`
+/// as the *scheme*, so that test answers "not cleartext" for a shape that is
+/// nothing of the sort. Normalize the way `parse_bootstrap_host` does — retry
+/// under an explicit `http://` — and read the scheme off that.
+///
+/// A schemeless URL therefore reads as cleartext here. That answer never
+/// reaches the wire: `proxy::parse_worker_url` is a bare `Url::parse`, which
+/// *accepts* `worker-0.engines.svc:8000` (scheme `worker-0.engines.svc`,
+/// opaque path `8000`), and the request then dies at `worker_url.join(path)`
+/// with `RelativeUrlWithCannotBeABaseBase` before any client is used. So
+/// `Some(true)` costs nothing today and stays correct if that path ever grows
+/// the same normalization; answering `None` would only mislabel the reason in
+/// the log.
+fn dials_cleartext(worker_url: &str) -> Option<bool> {
+    if worker_url.contains("://") {
+        return url::Url::parse(worker_url)
+            .ok()
+            .map(|u| u.scheme() == "http");
+    }
+    url::Url::parse(&format!("http://{worker_url}"))
+        .ok()
+        .map(|_| true)
+}
+
+/// Resolve the wire protocol for a worker from its `/server_info`
+/// (`enable_http2`) and whether the router dials it in cleartext
+/// (`dials_cleartext`, `None` when the URL did not parse).
+///
+/// Both inputs are fixed for the worker's lifetime, so this runs once per
+/// worker, before it is registered.
+///
+/// Upgrades to [`WireProtocol::H2c`] only when the engine self-reports
+/// `--enable-http2` **and** the worker URL is cleartext. h2c is HTTP/2 with
+/// prior knowledge — no negotiation — so sending it anywhere that is not
+/// known to serve it fails every request; the cleartext gate is what bounds
+/// that risk.
+///
+/// [`WireProtocol::Http1`] is the fallback for everything else, and it does
+/// not mean "HTTP/1.1 on the wire". It selects the negotiating client, which
+/// advertises ALPN `h2, http/1.1`, so an `https://` worker running
+/// `--enable-http2` reaches HTTP/2 over TLS on its own — the correct outcome,
+/// arrived at by negotiation rather than by assumption. Only cleartext workers
+/// need prior-knowledge h2c. See [`WireProtocol`].
+fn resolve_protocol(enable_http2: Option<bool>, cleartext: Option<bool>) -> WireProtocol {
+    match (enable_http2, cleartext) {
+        (Some(true), Some(true)) => WireProtocol::H2c,
+        _ => WireProtocol::Http1,
+    }
+}
+
 pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistry>) {
     run_with_config(rx, registry, None, None, None).await;
 }
@@ -40,38 +110,68 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// on every worker add / remove, and an optional active-load registry
 /// that is asked to forget per-worker counters on `Removed`.
 ///
-/// When `kv_index` is `None` the cache-aware-zmq path is disabled
-/// (selection falls through to the non-cache-aware policies); when
-/// `active_load` is `None` the active-load bookkeeping is not pruned
+/// The forwarding wire protocol (HTTP/1.1 vs cleartext h2c) is resolved per
+/// worker from its `/server_info` and carried into the registered
+/// [`crate::workers::Worker`] at construction (see `register_one`), so the
+/// manager does not need a handle to the proxy.
+///
+/// When `kv_index` is `None`, KV-event and load-subscriber state is disabled; when
+/// `router_inflight_load` is `None` the active-load bookkeeping is not pruned
 /// on worker removal (leaks one `WorkerCounters` slot per departed
 /// worker — fine for tests, but production passes `Some(...)`); when
 /// `cfg` is `None` the default CB config is used for every worker
 /// (threshold = 3).
 ///
-/// Uses the default HTTP client (2-second timeout) for `/server_info`
-/// introspection.  Tests that want a tighter timeout call
+/// Introspects workers with a 2-second timeout, sending `--worker-api-key`
+/// when set.  Tests that want a tighter timeout call
 /// [`run_with_introspector`] directly.
 pub async fn run_with_config(
     rx: mpsc::Receiver<DiscoveryEvent>,
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
-    active_load: Option<Arc<ActiveLoadRegistry>>,
+    router_inflight_load: Option<Arc<RouterInflightLoadRegistry>>,
 ) {
+    let auth = cfg.as_ref().and_then(|c| c.server.worker_auth.clone());
+    let introspector = WorkerIntrospector::with_client(worker_client(SERVER_INFO_TIMEOUT, auth));
     run_with_introspector(
         rx,
         registry,
         cfg,
         kv_index,
-        active_load,
-        Arc::new(WorkerIntrospector::default()),
+        router_inflight_load,
+        Arc::new(introspector),
     )
     .await
 }
 
 /// Internal entry point used by tests so they can supply a custom
 /// [`WorkerIntrospector`] (e.g. shorter timeout, fake transport).
-/// Production callers use [`run_with_config`].
+/// Production callers use [`run_with_config`]. Reconciles unresolved
+/// workers on [`RECONCILE_INTERVAL`]; tests that need a tighter cadence
+/// call [`run_with_introspector_and_reconcile`] directly.
+pub async fn run_with_introspector(
+    rx: mpsc::Receiver<DiscoveryEvent>,
+    registry: Arc<WorkerRegistry>,
+    cfg: Option<Arc<Config>>,
+    kv_index: Option<Arc<KvEventIndex>>,
+    router_inflight_load: Option<Arc<RouterInflightLoadRegistry>>,
+    introspector: Arc<WorkerIntrospector>,
+) {
+    run_with_introspector_and_reconcile(
+        rx,
+        registry,
+        cfg,
+        kv_index,
+        router_inflight_load,
+        introspector,
+        RECONCILE_INTERVAL,
+    )
+    .await
+}
+
+/// As [`run_with_introspector`], but with a caller-chosen reconcile
+/// cadence (tests use a short interval to converge quickly).
 ///
 /// # Concurrency model
 ///
@@ -85,114 +185,86 @@ pub async fn run_with_config(
 ///   Without this await, a `Removed` queued while `Added` is still
 ///   fetching would no-op (registry empty), then the deferred Added
 ///   write would leak the worker indefinitely.
-pub async fn run_with_introspector(
+/// - **Reconcile tick:** every `reconcile_interval`, re-introspects any
+///   registered worker whose `model_ids` are still empty or that is a
+///   prefill without a bootstrap port (see [`reconcile_unresolved_workers`]).
+///   Runs on the same loop and shares `pending` with the discovery events so
+///   re-registrations stay serialized per id against concurrent `Added` /
+///   `Removed`.
+pub async fn run_with_introspector_and_reconcile(
     mut rx: mpsc::Receiver<DiscoveryEvent>,
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
-    active_load: Option<Arc<ActiveLoadRegistry>>,
+    router_inflight_load: Option<Arc<RouterInflightLoadRegistry>>,
     introspector: Arc<WorkerIntrospector>,
+    reconcile_interval: Duration,
 ) {
-    // In-flight `Added` registrations, keyed by worker id. Subsequent
-    // `Removed` / `ModeChanged` events for the same id `await` the
-    // handle so they observe the registry write the spawned task is
-    // about to perform.  Entries are removed on completion (Added's
-    // own task drops the slot before returning).
+    // In-flight registrations, keyed by worker id. Subsequent
+    // `Removed` / `ModeChanged` events (and reconcile passes) for the
+    // same id `await` the handle so they observe the registry write the
+    // spawned task is about to perform. The spawned task does NOT remove
+    // its own slot; slots are reaped by the `retain(!is_finished())`
+    // sweeps below, or drained by a `Removed` / `Added` / reconcile for
+    // the same id.
     let mut pending: HashMap<WorkerId, JoinHandle<()>> = HashMap::new();
 
-    while let Some(event) = rx.recv().await {
-        // Opportunistically reap handles whose tasks have already
-        // completed so the map doesn't grow without bound under steady-
-        // state churn.  This is O(map.len()) per event but the map only
-        // holds in-flight Added events (typically << total workers).
-        pending.retain(|_, h| !h.is_finished());
+    // Periodic reconcile. `interval_at` delays the first tick by one
+    // interval (no point scanning an empty registry at t=0); `Skip` means
+    // a reconcile pass that runs long never builds a backlog of catch-up
+    // ticks.
+    let ticker = |period| {
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker
+    };
+    let mut reconcile = ticker(reconcile_interval);
+    let mut port_retry = ticker(reconcile_interval.min(BOOTSTRAP_PORT_RETRY_INTERVAL));
 
-        match event {
-            DiscoveryEvent::Added(spec) => {
-                tracing::info!("discovery: +worker {} ({:?})", spec.id, spec.mode);
-                let id = spec.id.clone();
-                // If a previous Added for the same id is still in-flight,
-                // drain it first so the upsert observes a consistent
-                // pre-state (and so the new spawn doesn't race with the
-                // old).
-                if let Some(prev) = pending.remove(&id) {
-                    let _ = prev.await;
-                }
-                let registry_t = registry.clone();
-                let cfg_t = cfg.clone();
-                let kv_index_t = kv_index.clone();
-                let introspector_t = introspector.clone();
-                let handle = tokio::spawn(async move {
-                    register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
-                });
-                pending.insert(id, handle);
+    loop {
+        tokio::select! {
+            maybe_event = rx.recv() => {
+                let Some(event) = maybe_event else {
+                    break;
+                };
+                // Opportunistically reap handles whose tasks have already
+                // completed so the map doesn't grow without bound under
+                // steady-state churn. O(map.len()) per event, but the map
+                // only holds in-flight registrations (typically << total
+                // workers).
+                pending.retain(|_, h| !h.is_finished());
+                handle_discovery_event(
+                    event,
+                    &registry,
+                    &cfg,
+                    &kv_index,
+                    &router_inflight_load,
+                    &introspector,
+                    &mut pending,
+                )
+                .await;
             }
-            DiscoveryEvent::Removed { id } => {
-                tracing::info!("discovery: -worker {id}");
-                if let Some(prev) = pending.remove(&id) {
-                    // Wait for the matching Added to finish its registry
-                    // write so the Removed observes (and clears) it.
-                    let _ = prev.await;
-                }
-                // Look up the URL before dropping the entry so the
-                // KV-event index can clear its per-(url, dp_rank) state.
-                let worker_url = registry.get(&id).map(|w| w.url.clone());
-                registry.remove(&id);
-                match (&kv_index, worker_url) {
-                    (Some(idx), Some(url)) => {
-                        idx.remove_worker(&url).await;
-                    }
-                    (Some(_), None) => {
-                        // Registry didn't know this worker but kv-events
-                        // is enabled — duplicate Removed or out-of-order
-                        // event. KvEventIndex state for this id (if any)
-                        // leaks until process shutdown; log so it's
-                        // detectable.
-                        tracing::warn!(
-                            id = %id,
-                            "discovery: Removed without a known URL; kv-events state (if any) not cleared",
-                        );
-                    }
-                    (None, _) => {}
-                }
-                // Drop the active-load per-worker counters slot.
-                // Idempotent on the registry side, so we call it
-                // unconditionally — a Removed for an unknown worker
-                // (duplicate event) is a no-op. In-flight guards
-                // pointing at this id are NOT invalidated; their drop
-                // still removes the per-request entry cleanly, but the
-                // per-worker counters slot will not be re-created
-                // (selectors no longer see the worker, so no new
-                // requests can register against it).
-                if let Some(al) = &active_load {
-                    al.forget_worker(&id);
-                }
+            _ = reconcile.tick() => {
+                pending.retain(|_, h| !h.is_finished());
+                reconcile_unresolved_workers(
+                    &registry,
+                    &cfg,
+                    &kv_index,
+                    &introspector,
+                    &mut pending,
+                    |w| w.model_ids.is_empty() || w.lacks_bootstrap_port(),
+                );
             }
-            DiscoveryEvent::ModeChanged { id, mode } => {
-                if let Some(prev) = pending.remove(&id) {
-                    // Same rationale as Removed: wait for the registry
-                    // write so the mode flip lands on the new entry.
-                    let _ = prev.await;
-                }
-                // Mutate mode in place — preserves active_requests counter
-                // (in-flight LoadGuards stay valid) and CircuitBreaker state
-                // (open/half-open survives PD role flips).
-                //
-                // workers_for_mode filters at query time via w.mode(), so no
-                // secondary index needs updating.
-                match registry.get(&id) {
-                    Some(w) => {
-                        tracing::info!("discovery: ~worker {id} mode→{mode:?}");
-                        w.set_mode(mode);
-                    }
-                    None => {
-                        tracing::warn!(
-                            id = %id,
-                            mode = ?mode,
-                            "discovery: ModeChanged for unknown worker — out-of-order event from backend",
-                        );
-                    }
-                }
+            _ = port_retry.tick() => {
+                pending.retain(|_, h| !h.is_finished());
+                reconcile_unresolved_workers(
+                    &registry,
+                    &cfg,
+                    &kv_index,
+                    &introspector,
+                    &mut pending,
+                    Worker::awaiting_bootstrap_port,
+                );
             }
         }
     }
@@ -202,6 +274,247 @@ pub async fn run_with_introspector(
     // mutations land before the future resolves.
     for (_, h) in pending.drain() {
         let _ = h.await;
+    }
+}
+
+/// Apply a single discovery event to the registry (and the optional
+/// KV-event index / active-load registry). Extracted from the manager
+/// loop so the loop can also service reconcile ticks via
+/// `tokio::select!`. See the concurrency-model doc on
+/// [`run_with_introspector_and_reconcile`] for the per-id ordering
+/// contract `pending` enforces.
+async fn handle_discovery_event(
+    event: DiscoveryEvent,
+    registry: &Arc<WorkerRegistry>,
+    cfg: &Option<Arc<Config>>,
+    kv_index: &Option<Arc<KvEventIndex>>,
+    router_inflight_load: &Option<Arc<RouterInflightLoadRegistry>>,
+    introspector: &Arc<WorkerIntrospector>,
+    pending: &mut HashMap<WorkerId, JoinHandle<()>>,
+) {
+    match event {
+        DiscoveryEvent::Added(spec) => {
+            tracing::info!("discovery: +worker {} ({:?})", spec.id, spec.mode);
+            let id = spec.id.clone();
+            // If a previous Added for the same id is still in-flight,
+            // drain it first so the upsert observes a consistent
+            // pre-state (and so the new spawn doesn't race with the
+            // old).
+            if let Some(prev) = pending.remove(&id) {
+                let _ = prev.await;
+            }
+            let registry_t = registry.clone();
+            let cfg_t = cfg.clone();
+            let kv_index_t = kv_index.clone();
+            let introspector_t = introspector.clone();
+            let handle = tokio::spawn(async move {
+                register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
+            });
+            pending.insert(id, handle);
+        }
+        DiscoveryEvent::Removed { id } => {
+            tracing::info!("discovery: -worker {id}");
+            if let Some(prev) = pending.remove(&id) {
+                // Wait for the matching Added (or in-flight reconcile) to
+                // finish its registry write so the Removed observes (and
+                // clears) it — this is what prevents a mid-reconcile
+                // worker from being resurrected after it genuinely left.
+                let _ = prev.await;
+            }
+            // Look up the URL before dropping the entry so the
+            // KV-event index can clear its per-(url, dp_rank) state.
+            let worker_url = registry.get(&id).map(|w| w.url.clone());
+            registry.remove(&id);
+            match (kv_index, worker_url) {
+                (Some(idx), Some(url)) => {
+                    idx.remove_worker(&url).await;
+                }
+                (Some(_), None) => {
+                    // Registry didn't know this worker but kv-events
+                    // is enabled — duplicate Removed or out-of-order
+                    // event. KvEventIndex state for this id (if any)
+                    // leaks until process shutdown; log so it's
+                    // detectable.
+                    tracing::warn!(
+                        id = %id,
+                        "discovery: Removed without a known URL; kv-events state (if any) not cleared",
+                    );
+                }
+                (None, _) => {}
+            }
+            // Drop the active-load per-worker counters slot.
+            // Idempotent on the registry side, so we call it
+            // unconditionally — a Removed for an unknown worker
+            // (duplicate event) is a no-op. In-flight guards
+            // pointing at this id are NOT invalidated; their drop
+            // still removes the per-request entry cleanly, but the
+            // per-worker counters slot will not be re-created
+            // (selectors no longer see the worker, so no new
+            // requests can register against it).
+            if let Some(al) = router_inflight_load {
+                al.forget_worker(&id);
+            }
+        }
+        DiscoveryEvent::ServicesChanged { id, services } => {
+            if let Some(prev) = pending.remove(&id) {
+                let _ = prev.await;
+            }
+            if let Some(worker) = registry.get(&id) {
+                worker.set_services(services);
+            }
+        }
+        DiscoveryEvent::ModeChanged { id, mode } => {
+            if let Some(prev) = pending.remove(&id) {
+                // Same rationale as Removed: wait for the registry
+                // write so the mode flip lands on the new entry.
+                let _ = prev.await;
+            }
+            // Mutate mode in place — preserves active_requests counter
+            // (in-flight LoadGuards stay valid) and CircuitBreaker state
+            // (open/half-open survives PD role flips).
+            //
+            // workers_for_mode filters at query time via w.mode(), so no
+            // secondary index needs updating.
+            match registry.get(&id) {
+                Some(w) => {
+                    tracing::info!("discovery: ~worker {id} mode→{mode:?}");
+                    w.set_mode(mode);
+                }
+                None => {
+                    tracing::warn!(
+                        id = %id,
+                        mode = ?mode,
+                        "discovery: ModeChanged for unknown worker — out-of-order event from backend",
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Re-introspect the workers matching `unresolved`: those that registered
+/// without resolving their model IDs, or prefills without a bootstrap port.
+///
+/// A worker lands in the registry with empty `model_ids` when its
+/// introspection failed at `Added` time (e.g. the EndpointSlice flips
+/// `ready=true` before the engine's HTTP server can answer, and the
+/// introspector's bounded retry budget is exhausted). Such a worker is
+/// present in `by_id` but absent from every `by_model` pool, so it gets zero
+/// traffic — and it never recovers on its own: discovery re-lists carry the
+/// same empty `model_ids` the backend always emits, so they produce no new
+/// `Added` event.
+///
+/// This pass re-runs `register_one` (an idempotent registry upsert +
+/// idempotent kv-events subscribe) for each such worker until the
+/// introspection succeeds and the worker joins its model pool. A portless
+/// prefill is likewise revisited, keeping its model, until the port is
+/// reported (see [`crate::workers::worker::BOOTSTRAP_PORT_GRACE`]). A worker
+/// already being (re-)registered is skipped via `pending`, so a slow
+/// `/server_info` never stacks duplicate tasks for one id; and because
+/// `pending` is shared with the event loop, a `Removed` that arrives
+/// mid-reconcile awaits the in-flight handle before clearing the
+/// registry, so a worker that genuinely left is not resurrected.
+///
+/// A worker that answers but never advertises a `served_model_name` (or,
+/// for a prefill, its bootstrap port) also stays in this set and is
+/// re-introspected every interval — a benign, bounded poll, not a leak.
+/// It is never escalated, so the per-attempt logging stays at `debug!`;
+/// the introspector emits the `warn!` that surfaces a persistently failing
+/// worker.
+fn reconcile_unresolved_workers(
+    registry: &Arc<WorkerRegistry>,
+    cfg: &Option<Arc<Config>>,
+    kv_index: &Option<Arc<KvEventIndex>>,
+    introspector: &Arc<WorkerIntrospector>,
+    pending: &mut HashMap<WorkerId, JoinHandle<()>>,
+    unresolved: impl Fn(&Worker) -> bool,
+) {
+    for worker in registry.all() {
+        if !unresolved(&worker) {
+            continue;
+        }
+        let id = worker.id.clone();
+        if pending.contains_key(&id) {
+            // A registration for this id is already in flight; let it
+            // finish rather than racing a second introspection.
+            continue;
+        }
+        let registry_t = registry.clone();
+        let introspector_t = introspector.clone();
+        let worker_url = worker.url.clone();
+        // Keep any resolved model so retrying a missing prefill port cannot drop
+        // the worker from its pool when `/server_info` fails.
+        let spec = WorkerSpec {
+            id: id.clone(),
+            url: worker_url.clone(),
+            mode: worker.mode(),
+            model_ids: worker.model_ids.clone(),
+            bootstrap_port: worker.bootstrap_port(),
+            version_group: worker.version_group().map(str::to_owned),
+            services: worker.services(),
+        };
+        // `debug!` not `info!`: this fires every interval for each
+        // still-unresolved worker, so info-level would spam for one that is
+        // permanently model-less or portless. The introspector logs the
+        // underlying failure at `warn!` on each attempt, which is the
+        // operator-facing signal.
+        tracing::debug!(
+            worker_id = %id,
+            worker_url = %worker_url,
+            "reconcile: re-introspecting worker with unresolved model or prefill bootstrap port",
+        );
+        let cfg_t = cfg.clone();
+        let kv_index_t = kv_index.clone();
+        // The upsert keeps the live load and breaker state of a routable worker.
+        let handle = tokio::spawn(async move {
+            register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
+        });
+        pending.insert(id, handle);
+    }
+}
+
+/// Explain a resolved protocol at the level an operator needs: the h2c upgrade
+/// is a behaviour change worth an `info!`, an engine that asked for HTTP/2 and
+/// did not get it should say why, and a worker whose flag was never read should
+/// not look the same as one that reported `false`.
+///
+/// Takes the same `cleartext` that `resolve_protocol` was given, so the log and
+/// the decision cannot disagree about what the router would dial.
+fn log_protocol_resolution(worker_url: &str, enable_http2: Option<bool>, cleartext: Option<bool>) {
+    match (enable_http2, cleartext) {
+        (Some(true), Some(true)) => tracing::info!(
+            worker_url = %worker_url,
+            "/server_info reports --enable-http2 on a cleartext worker; forwarding over h2c",
+        ),
+        // A TLS worker. h2c is unsendable there, but the negotiating client
+        // advertises ALPN h2, so a TLS engine still reaches HTTP/2 on its own.
+        (Some(true), Some(false)) => tracing::info!(
+            worker_url = %worker_url,
+            "/server_info reports --enable-http2 on a TLS worker; using the \
+             negotiating client, which reaches HTTP/2 over TLS via ALPN",
+        ),
+        // `dials_cleartext` could not parse the URL. Reaching this at all means
+        // `/server_info` answered over a URL the scheme check then rejected, so
+        // the worker is misconfigured rather than merely un-upgradable — every
+        // forward to it will fail in `proxy::parse_worker_url` or at
+        // `worker_url.join(path)`. Warn rather than inform.
+        (Some(true), None) => tracing::warn!(
+            worker_url = %worker_url,
+            "/server_info reports --enable-http2 but the worker URL did not \
+             parse; cannot classify the endpoint, and forwards to it are \
+             expected to fail",
+        ),
+        // Never read: `/server_info` did not answer, or the engine predates the
+        // flag. Distinct from an explicit `false`, and worth saying out loud —
+        // `reconcile_unresolved_workers` never revisits a fully resolved
+        // worker, so this reading may be the only one it gets.
+        (None, _) => tracing::info!(
+            worker_url = %worker_url,
+            "no --enable-http2 reading from /server_info; using the negotiating \
+             client (HTTP/1.1 in cleartext)",
+        ),
+        // The engine explicitly disabled it. Nothing to explain.
+        (Some(false), _) => {}
     }
 }
 
@@ -252,8 +565,22 @@ async fn register_one(
             spec.bootstrap_port = new_port;
         }
     }
+    let cleartext = dials_cleartext(&worker_url);
+    let protocol = resolve_protocol(info.enable_http2, cleartext);
+    // Captured before the insert: `reconcile_unresolved_workers` re-runs this
+    // function every interval for a worker missing a model name or prefill port,
+    // so logging unconditionally would repeat the same line for the life of the
+    // process. Logging only a new or changed resolution keeps the reconcile
+    // path quiet, matching why its own progress message stays at `debug!`.
+    let previous_protocol = registry.get(&spec.id).map(|w| w.protocol());
     let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
-    if let Err(e) = registry.add_with_cb(spec, cb) {
+    // The profile rides beside the spec rather than on it: `WorkerSpec` is the
+    // serde wire type for `DiscoveryEvent`, and no discovery backend can know it.
+    let profile = EngineProfile {
+        protocol,
+        dp_ranks: info.dp_ranks,
+    };
+    if let Err(e) = registry.add_with_cb(spec, cb, profile) {
         // Mixed PD + plain on the same model is rejected at registration
         // time. Log loudly so the operator notices the conflicting
         // worker — the alternative (silently dropping into either pool)
@@ -267,6 +594,11 @@ async fn register_one(
         );
         return;
     }
+    // After the insert, so the log describes a worker that is actually taking
+    // traffic — a spec refused above never reaches the wire at all.
+    if previous_protocol != Some(protocol) {
+        log_protocol_resolution(&worker_url, info.enable_http2, cleartext);
+    }
     if let Some(idx) = kv_index {
         // Pass the pre-resolved EventConfig so the KvEventIndex does
         // not issue a second `/server_info` round-trip.
@@ -278,7 +610,7 @@ async fn register_one(
 mod tests {
     use super::*;
     use crate::config::{
-        ActiveLoadConfig, CircuitBreakerConfig as RawCbConfig, DiscoveryBackend, ModelConfig,
+        CircuitBreakerConfig as RawCbConfig, DiscoveryBackend, InflightLoadConfig, ModelConfig,
         PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
     };
     use crate::discovery::{WorkerId, WorkerMode};
@@ -293,24 +625,37 @@ mod tests {
             server: ServerConfig {
                 host: "0".into(),
                 port: 0,
+                ..Default::default()
             },
             observability: Default::default(),
             model: ModelConfig {
                 id: id.into(),
-                tokenizer_path: "/tmp/x".into(),
+                tokenizer_path: Some("/tmp/x".into()),
+                disable_input_ids_forwarding: false,
+                tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
+                decode_policy: Default::default(),
+                dp_aware: false,
+                bucket_config: None,
+                reorg_buckets: None,
+                reorg_admission: Default::default(),
                 circuit_breaker: Some(RawCbConfig {
                     threshold: NonZeroU32::new(threshold).unwrap(),
                     cool_down_secs,
                 }),
                 cache_aware: None,
                 sticky: None,
+                affinity: None,
+                fused: None,
+                eligibility: None,
+                sampling_overrides: Default::default(),
+                default_chat_template_kwargs: Default::default(),
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://test:30000".into()],
             }),
             proxy: ProxyConfig::default(),
-            active_load: ActiveLoadConfig::default(),
+            router_inflight_load: InflightLoadConfig::default(),
         }
     }
 
@@ -322,26 +667,61 @@ mod tests {
             url: "http://x".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
-            bootstrap_port: None,
+            ..Default::default()
         };
         let cb = cb_config_for_spec(&spec, &cfg).expect("model has cb config");
         assert_eq!(cb.threshold.get(), 5);
         assert_eq!(cb.cool_down, Duration::from_secs(60));
     }
 
-    /// Helper: spawn a tiny fake worker that returns the supplied JSON body
-    /// on `GET /server_info`. Returns the worker URL + a shutdown channel.
-    async fn spawn_fake_server_info_worker(body: Value) -> (String, oneshot::Sender<()>) {
-        let body = Arc::new(body);
+    #[test]
+    fn resolve_protocol_upgrades_to_h2c_only_for_cleartext_http2_engine() {
+        // The one case that gets h2c: engine self-reports --enable-http2 and
+        // we dial cleartext http://.
+        assert_eq!(
+            resolve_protocol(Some(true), dials_cleartext("http://10.0.0.1:30000")),
+            WireProtocol::H2c,
+        );
+    }
+
+    #[test]
+    fn resolve_protocol_stays_http1_for_https_even_with_http2() {
+        // A TLS engine with --enable-http2 serves h2-over-TLS, not cleartext
+        // h2c; the router dials cleartext, so it must stay on HTTP/1.1
+        // (which negotiates fine over TLS) rather than break every request.
+        assert_eq!(
+            resolve_protocol(Some(true), dials_cleartext("https://10.0.0.1:30000")),
+            WireProtocol::Http1,
+        );
+    }
+
+    #[test]
+    fn resolve_protocol_stays_http1_when_http2_disabled_or_unknown() {
+        // Explicit false (HTTP/1.1-only Uvicorn) and absent field (older
+        // SGLang) both keep the safe default.
+        assert_eq!(
+            resolve_protocol(Some(false), dials_cleartext("http://10.0.0.1:30000")),
+            WireProtocol::Http1,
+        );
+        assert_eq!(
+            resolve_protocol(None, dials_cleartext("http://10.0.0.1:30000")),
+            WireProtocol::Http1,
+        );
+    }
+
+    #[test]
+    fn resolve_protocol_stays_http1_for_unparsable_url() {
+        assert_eq!(
+            resolve_protocol(Some(true), dials_cleartext("not a url")),
+            WireProtocol::Http1,
+        );
+    }
+
+    /// Serve `app` on an ephemeral port. Returns its base URL + a shutdown
+    /// channel; every fake worker in this module is a `Router` plus this.
+    async fn serve(app: Router) -> (String, oneshot::Sender<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let app = Router::new().route(
-            "/server_info",
-            get(move || {
-                let body = body.clone();
-                async move { Json((*body).clone()) }
-            }),
-        );
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
             let _ = axum::serve(listener, app)
@@ -351,6 +731,19 @@ mod tests {
                 .await;
         });
         (format!("http://127.0.0.1:{port}"), tx)
+    }
+
+    /// Answers the supplied JSON body on `GET /server_info` only.
+    async fn spawn_fake_server_info_worker(body: Value) -> (String, oneshot::Sender<()>) {
+        let body = Arc::new(body);
+        serve(Router::new().route(
+            "/server_info",
+            get(move || {
+                let body = body.clone();
+                async move { Json((*body).clone()) }
+            }),
+        ))
+        .await
     }
 
     /// Reserve a TCP port and immediately drop the listener so subsequent
@@ -389,7 +782,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -433,7 +826,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -482,7 +875,7 @@ mod tests {
                 url,
                 mode: WorkerMode::Plain,
                 model_ids: Vec::new(),
-                bootstrap_port: None,
+                ..Default::default()
             };
             tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
             let registered = tokio::time::timeout(Duration::from_secs(2), async {
@@ -504,7 +897,7 @@ mod tests {
         let _ = manager_handle.await;
     }
 
-    /// End-to-end wiring smoke test: spin up a fake worker, run the
+    /// End-to-end wiring check: spin up a fake worker, run the
     /// manager with a real `KvEventIndex` against that worker URL, and
     /// verify both `Added` and `Removed` propagate through to the
     /// index's internal worker map.
@@ -552,7 +945,7 @@ mod tests {
             url: worker_url.clone(),
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         // Wait until the manager has both registered the worker AND
@@ -622,7 +1015,7 @@ mod tests {
     }
 
     /// Task B: `DiscoveryEvent::Removed` calls
-    /// `ActiveLoadRegistry::forget_worker` so the per-worker counters
+    /// `RouterInflightLoadRegistry::forget_worker` so the per-worker counters
     /// slot is reaped. Without this, a long-lived cluster with worker
     /// churn would leak one `WorkerCounters` entry per departed worker.
     #[tokio::test]
@@ -636,14 +1029,14 @@ mod tests {
             spawn_fake_server_info_worker(json!({"served_model_name": "m"})).await;
 
         let registry = Arc::new(WorkerRegistry::default());
-        let active_load = ActiveLoadRegistry::with_defaults();
+        let router_inflight_load = RouterInflightLoadRegistry::with_defaults();
         let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
         let manager_handle = tokio::spawn(run_with_introspector(
             rx,
             registry.clone(),
             None,
             None,
-            Some(Arc::clone(&active_load)),
+            Some(Arc::clone(&router_inflight_load)),
             fast_introspector(),
         ));
 
@@ -653,7 +1046,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         // Wait for the manager to land the registry write so the
@@ -671,8 +1064,8 @@ mod tests {
 
         // Mint a guard to force the active-load registry to create a
         // per-worker counters slot for this id.
-        let _g = active_load.register(id.clone(), "test://", 10, 1);
-        assert!(active_load.is_known(&id));
+        let _g = router_inflight_load.register(id.clone(), "test://", 10, 1);
+        assert!(router_inflight_load.is_known(&id));
 
         // Now drive the Removed event and assert the counters slot is
         // gone.  We tear down the guard last so the request entry is
@@ -682,7 +1075,7 @@ mod tests {
             .unwrap();
         let removed = timeout(Duration::from_secs(2), async {
             loop {
-                if !active_load.is_known(&id) && registry.get(&id).is_none() {
+                if !router_inflight_load.is_known(&id) && registry.get(&id).is_none() {
                     return true;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -691,7 +1084,7 @@ mod tests {
         .await;
         assert!(
             removed.is_ok(),
-            "manager must call active_load.forget_worker on Removed",
+            "manager must call router_inflight_load.forget_worker on Removed",
         );
 
         drop(tx);
@@ -733,7 +1126,7 @@ mod tests {
             url: worker_url,
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
-            bootstrap_port: None,
+            ..Default::default()
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -759,5 +1152,667 @@ mod tests {
 
         drop(tx);
         let _ = manager_handle.await;
+    }
+
+    /// Fake worker whose readiness is switchable at runtime. While `ready` is
+    /// false both introspection endpoints answer `503` (mimicking an engine
+    /// whose EndpointSlice flipped `ready=true` before its HTTP server could
+    /// answer anything); flip `ready` to true and both serve `body`.
+    async fn spawn_switchable_worker(
+        body: Value,
+        ready: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (String, oneshot::Sender<()>) {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let body = Arc::new(body);
+        let when_ready = move || {
+            let body = body.clone();
+            let ready = ready.clone();
+            async move {
+                if ready.load(std::sync::atomic::Ordering::SeqCst) {
+                    Json((*body).clone()).into_response()
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+            }
+        };
+        serve(
+            Router::new()
+                .route("/model_info", get(when_ready.clone()))
+                .route("/server_info", get(when_ready)),
+        )
+        .await
+    }
+
+    /// Fake worker that resolves a model name but 503s `/server_info`: the
+    /// warming-engine shape, where the scheduler round-trip behind
+    /// `/server_info` is not answerable yet.
+    async fn spawn_worker_without_server_info(
+        model_info_body: Value,
+    ) -> (String, oneshot::Sender<()>) {
+        use axum::http::StatusCode;
+
+        let body = Arc::new(model_info_body);
+        serve(
+            Router::new()
+                .route(
+                    "/model_info",
+                    get(move || {
+                        let body = body.clone();
+                        async move { Json((*body).clone()) }
+                    }),
+                )
+                .route(
+                    "/server_info",
+                    get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "warming up") }),
+                ),
+        )
+        .await
+    }
+
+    /// A worker whose `/server_info` never answers joins its model pool on
+    /// the HTTP/1.1 default.
+    ///
+    /// `enable_http2` comes from `/server_info`, so a worker that cannot
+    /// serve it has no readable protocol. It still resolves a model name and
+    /// becomes routable, and `reconcile_unresolved_workers` keys on empty
+    /// `model_ids`, so it is never revisited — the worker forwards over
+    /// HTTP/1.1 for its lifetime. A throughput cost, never a correctness one.
+    ///
+    /// The reconcile interval here is far longer than the timeout, so the
+    /// result cannot be the repair loop arriving late either way.
+    #[tokio::test]
+    async fn warming_worker_without_server_info_registers_on_http1() {
+        let (worker_url, _shutdown) =
+            spawn_worker_without_server_info(json!({"served_model_name": "m"})).await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_secs(600),
+        ));
+
+        let id = WorkerId("w-warming".into());
+        tx.send(DiscoveryEvent::Added(WorkerSpec {
+            id: id.clone(),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+        let resolved = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(w) = registry.get(&id) {
+                    if !w.model_ids.is_empty() {
+                        return w.protocol();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert_eq!(
+            resolved.expect("worker must join its model pool"),
+            WireProtocol::Http1,
+            "a worker whose /server_info never answered has no readable \
+             protocol, so it must take traffic on the HTTP/1.1 default rather \
+             than on a guess",
+        );
+
+        drop(tx);
+        let _ = manager_handle.await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_repairs_portless_prefill_with_known_model() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::timeout;
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let (url, _shutdown) = spawn_switchable_worker(
+            json!({"served_model_name": "m", "disaggregation_mode": "prefill",
+                   "disaggregation_bootstrap_port": 8997}),
+            ready.clone(),
+        )
+        .await;
+        let registry = Arc::new(WorkerRegistry::default());
+        let model = ModelId("m".into());
+        let id = WorkerId("warming-prefill".into());
+        let (tx, rx) = mpsc::channel(8);
+        let manager = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_millis(50),
+        ));
+        tx.send(DiscoveryEvent::Added(WorkerSpec {
+            id: id.clone(),
+            url,
+            mode: WorkerMode::Prefill,
+            model_ids: vec![model.clone()],
+            bootstrap_port: None,
+            version_group: Some("v1".into()),
+            services: ["ns/prefill".into()].into(),
+        }))
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(3), async {
+            while registry.get(&id).is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(registry.workers_for(&model).len(), 1);
+        assert!(registry.healthy_workers_for(&model).is_empty());
+        ready.store(true, Ordering::SeqCst);
+        timeout(Duration::from_secs(3), async {
+            while registry.get(&id).unwrap().bootstrap_port() != Some(8997) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(registry.healthy_workers_for(&model).len(), 1);
+        assert_eq!(registry.get(&id).unwrap().version_group(), Some("v1"));
+        assert_eq!(
+            registry.get(&id).unwrap().services(),
+            ["ns/prefill".into()].into()
+        );
+        drop(tx);
+        manager.await.unwrap();
+    }
+
+    /// A worker that registers with empty `model_ids` because
+    /// `/server_info` was failing at `Added` time must be re-introspected
+    /// by the periodic reconcile loop and join its model pool once
+    /// `/server_info` recovers — with NO new discovery event. This is the
+    /// regression guard for the "EndpointSlice flips ready before the
+    /// engine can answer /server_info → worker invisible forever" bug.
+    #[tokio::test]
+    async fn reconcile_re_introspects_worker_that_failed_initial_server_info() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::timeout;
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let (worker_url, _shutdown) =
+            spawn_switchable_worker(json!({"served_model_name": "m"}), ready.clone()).await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        // Short reconcile cadence so the test converges quickly.
+        let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_millis(150),
+        ));
+
+        let id = WorkerId("w-slow".into());
+        let model = ModelId("m".into());
+        let spec = WorkerSpec {
+            id: id.clone(),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            ..Default::default()
+        };
+        tx.send(DiscoveryEvent::Added(spec)).await.unwrap();
+
+        // Phase 1: the worker registers (present in `by_id`) but stays out
+        // of the model pool while `/server_info` keeps failing.
+        let stuck = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(w) = registry.get(&id) {
+                    if w.model_ids.is_empty() && registry.workers_for(&model).is_empty() {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            stuck.is_ok(),
+            "worker should register with empty model_ids (invisible to routing) while /server_info fails",
+        );
+
+        // The engine finishes coming up: `/server_info` now answers.
+        ready.store(true, Ordering::SeqCst);
+
+        // Phase 2: the reconcile loop must re-introspect and move the
+        // worker into the model pool with no new discovery event.
+        let recovered = timeout(Duration::from_secs(3), async {
+            loop {
+                if !registry.workers_for(&model).is_empty() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            recovered.is_ok(),
+            "reconcile loop must re-introspect the worker and add it to the model pool once /server_info recovers",
+        );
+        assert_eq!(
+            registry.get(&id).unwrap().model_ids,
+            vec![ModelId("m".into())],
+            "recovered worker must carry the resolved model id",
+        );
+
+        drop(tx);
+        let _ = manager_handle.await;
+    }
+
+    /// A worker whose introspection failed entirely (so it registered with no
+    /// model IDs and the HTTP/1.1 default) must come back as h2c once the
+    /// engine is ready and reports `enable_http2: true`. The repair is the
+    /// re-registration `reconcile_unresolved_workers` already performs for a
+    /// model-less worker: the fresh `Worker` it builds carries the protocol
+    /// resolved by that same fetch, so a transient startup failure does not
+    /// strand an h2c-capable engine on HTTP/1.1 forever.
+    #[tokio::test]
+    async fn reconcile_upgrades_worker_to_h2c_after_transient_failure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::timeout;
+
+        // While not-ready the worker answers 503 (introspection fails → Http1,
+        // empty model_ids); once ready it reports a model AND enable_http2.
+        let ready = Arc::new(AtomicBool::new(false));
+        let (worker_url, _shutdown) = spawn_switchable_worker(
+            json!({"served_model_name": "m", "enable_http2": true}),
+            ready.clone(),
+        )
+        .await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_millis(150),
+        ));
+
+        let id = WorkerId("w-warming".into());
+        tx.send(DiscoveryEvent::Added(WorkerSpec {
+            id: id.clone(),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+        // Phase 1: the warming worker is registered on the safe HTTP/1.1
+        // default (introspection failed → empty model_ids, no h2c).
+        let stuck = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(w) = registry.get(&id) {
+                    if w.model_ids.is_empty() && w.protocol() == WireProtocol::Http1 {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            stuck.is_ok(),
+            "a worker that failed initial introspection must register on the HTTP/1.1 default",
+        );
+
+        // The engine finishes coming up.
+        ready.store(true, Ordering::SeqCst);
+
+        // Phase 2: reconcile re-introspects and upgrades the worker to h2c.
+        let upgraded = timeout(Duration::from_secs(3), async {
+            loop {
+                if registry
+                    .get(&id)
+                    .is_some_and(|w| w.protocol() == WireProtocol::H2c)
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            upgraded.is_ok(),
+            "reconcile must upgrade the worker to h2c once /server_info reports enable_http2; got {:?}",
+            registry.get(&id).map(|w| w.protocol()),
+        );
+
+        drop(tx);
+        let _ = manager_handle.await;
+    }
+
+    /// Resurrection safety: a `Removed` that arrives while a reconcile
+    /// re-introspection for the same id is in-flight must NOT resurrect
+    /// the worker. The `Removed` handler awaits the in-flight handle (which
+    /// re-adds the worker), then clears it — so the worker ends up gone and
+    /// stays gone. Guards the per-id ordering contract that `pending`
+    /// enforces for the reconcile path specifically (distinct from the
+    /// Added path's `removed_awaits_in_flight_added`).
+    #[tokio::test]
+    async fn reconcile_does_not_resurrect_worker_removed_mid_reintrospection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::Notify;
+        use tokio::time::timeout;
+
+        // While unarmed, /server_info returns 200 with no model name (the
+        // worker registers unresolved). Once armed, the next call signals
+        // `entered` and blocks on `release` — parking the reconcile
+        // re-introspection's register_one task in `pending` — then returns
+        // a valid body so the late re-add is real.
+        let arm = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let arm_h = arm.clone();
+        let entered_h = entered.clone();
+        let release_h = release.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route(
+            "/server_info",
+            get(move || {
+                let arm = arm_h.clone();
+                let entered = entered_h.clone();
+                let release = release_h.clone();
+                async move {
+                    if arm.load(Ordering::SeqCst) {
+                        entered.notify_one();
+                        release.notified().await;
+                        Json(json!({"served_model_name": "m"}))
+                    } else {
+                        Json(json!({}))
+                    }
+                }
+            }),
+        );
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+        let url = format!("http://127.0.0.1:{port}");
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        // Timeout well above the release latency so the parked fetch
+        // completes on release, not by timing out.
+        let introspector = Arc::new(WorkerIntrospector::new(Duration::from_secs(5)));
+        let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            introspector,
+            Duration::from_millis(80),
+        ));
+
+        let id = WorkerId("w-race".into());
+        let model = ModelId("m".into());
+        tx.send(DiscoveryEvent::Added(WorkerSpec {
+            id: id.clone(),
+            url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+        // Phase 1: registered but unresolved.
+        let stuck = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(w) = registry.get(&id) {
+                    if w.model_ids.is_empty() && registry.workers_for(&model).is_empty() {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(stuck.is_ok(), "worker should register unresolved");
+
+        // Arm so the next reconcile re-introspection parks in-flight, and
+        // wait until it provably reaches the handler.
+        arm.store(true, Ordering::SeqCst);
+        timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("a reconcile re-introspection should reach the handler within a few ticks");
+
+        // The worker genuinely leaves while its re-introspection is parked.
+        tx.send(DiscoveryEvent::Removed { id: id.clone() })
+            .await
+            .unwrap();
+        // Let the manager dequeue the Removed and reach the
+        // `pending.remove(&id).await` join point before we release.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        release.notify_one();
+
+        // The late re-add must lose to the Removed: worker absent and stays
+        // absent (reconcile never re-sees it — it's gone from the registry).
+        let gone = timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.get(&id).is_none() && registry.workers_for(&model).is_empty() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            gone.is_ok(),
+            "Removed must win over the in-flight reconcile re-add (no resurrection)",
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            registry.get(&id).is_none(),
+            "worker must not reappear after removal",
+        );
+        assert!(
+            registry.workers_for(&model).is_empty(),
+            "removed worker must not re-enter the model pool",
+        );
+
+        drop(tx);
+        let _ = timeout(Duration::from_secs(2), manager_handle).await;
+        let _ = shutdown_tx.send(());
+    }
+
+    /// Single-flight: while one re-introspection for a worker is in-flight,
+    /// subsequent reconcile ticks must NOT spawn a second `/server_info`
+    /// fetch for the same id (the `pending` guard). A slow, never-resolving
+    /// worker is hammered by ticks faster than the fetch completes; the max
+    /// observed concurrency must stay at 1.
+    #[tokio::test]
+    async fn reconcile_does_not_stack_concurrent_introspections_per_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let in_flight_h = in_flight.clone();
+        let max_h = max_in_flight.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route(
+            "/server_info",
+            get(move || {
+                let in_flight = in_flight_h.clone();
+                let max = max_h.clone();
+                async move {
+                    let cur = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max.fetch_max(cur, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    // No served_model_name => worker stays unresolved, so
+                    // reconcile keeps trying every interval.
+                    Json(json!({}))
+                }
+            }),
+        );
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+        let url = format!("http://127.0.0.1:{port}");
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        // Timeout above the 200ms handler so each fetch completes.
+        let introspector = Arc::new(WorkerIntrospector::new(Duration::from_secs(2)));
+        // Reconcile faster than the handler so ticks pile up against one
+        // in-flight fetch.
+        let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            introspector,
+            Duration::from_millis(60),
+        ));
+
+        tx.send(DiscoveryEvent::Added(WorkerSpec {
+            id: WorkerId("w-stuck".into()),
+            url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+        // Several reconcile intervals elapse while the handler is slow.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            1,
+            "reconcile must keep re-introspection single-flight per worker; \
+             the `pending` guard should prevent stacking concurrent /server_info calls",
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), manager_handle).await;
+        let _ = shutdown_tx.send(());
+    }
+
+    /// A worker that resolved on its initial `Added` must NOT be
+    /// re-introspected by later reconcile ticks — the `model_ids.is_empty()`
+    /// skip is the steady-state cost guarantee. Asserts the `/server_info`
+    /// hit count stays at the single onboarding fetch across many ticks.
+    #[tokio::test]
+    async fn reconcile_skips_workers_that_already_resolved() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::time::timeout;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_h = hits.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route(
+            "/server_info",
+            get(move || {
+                let hits = hits_h.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"served_model_name": "m"}))
+                }
+            }),
+        );
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+        let url = format!("http://127.0.0.1:{port}");
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_millis(80),
+        ));
+
+        let id = WorkerId("w-resolved".into());
+        tx.send(DiscoveryEvent::Added(WorkerSpec {
+            id: id.clone(),
+            url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+        // Wait until it resolves into the model pool.
+        let resolved = timeout(Duration::from_secs(2), async {
+            loop {
+                if !registry.workers_for(&ModelId("m".into())).is_empty() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            resolved.is_ok(),
+            "worker should resolve on the initial Added"
+        );
+
+        // Let many reconcile intervals (80ms) pass.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a resolved worker must not be re-introspected by reconcile; only the \
+             initial Added fetch should hit /server_info",
+        );
+
+        drop(tx);
+        let _ = manager_handle.await;
+        let _ = shutdown_tx.send(());
     }
 }

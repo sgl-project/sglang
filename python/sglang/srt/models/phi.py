@@ -7,7 +7,6 @@ import torch
 from torch import nn
 from transformers import PhiConfig
 
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -24,11 +23,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
 
 class PhiAttention(nn.Module):
-
     def __init__(
         self,
         config: PhiConfig,
@@ -41,7 +40,7 @@ class PhiAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.head_size = self.hidden_size // self.total_num_heads
 
-        tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
+        tensor_model_parallel_world_size = get_parallel().tp_size
         assert self.total_num_heads % tensor_model_parallel_world_size == 0
         self.num_heads = self.total_num_heads // tensor_model_parallel_world_size
 
@@ -98,7 +97,6 @@ class PhiAttention(nn.Module):
 
 
 class PhiMLP(nn.Module):
-
     def __init__(
         self, config: PhiConfig, quant_config: Optional[QuantizationConfig] = None
     ):
@@ -127,7 +125,6 @@ class PhiMLP(nn.Module):
 
 
 class PhiLayer(nn.Module):
-
     def __init__(
         self,
         config: PhiConfig,
@@ -166,7 +163,6 @@ class PhiLayer(nn.Module):
 
 
 class PhiModel(nn.Module):
-
     def __init__(
         self,
         config: PhiConfig,
@@ -179,7 +175,7 @@ class PhiModel(nn.Module):
             config.vocab_size, config.hidden_size
         )
 
-        pp_group = get_pp_group()
+        pp_group = get_parallel().pp_group
         pp_size = pp_group.world_size
         pp_rank = pp_group.rank
 

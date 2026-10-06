@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, cast
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -22,7 +22,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
-from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -155,7 +154,6 @@ class W8A8Int8Config(QuantizationConfig):
 
 
 class W8A8Int8LinearMethod(LinearMethodBase):
-
     def __init__(self, quantization_config: W8A8Int8Config):
         self.quantization_config = quantization_config
 
@@ -259,8 +257,6 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
-        tp_size = get_tensor_model_parallel_world_size()
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
@@ -380,6 +376,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
                 None,  # alpha
                 None,  # limit
                 True,  # is_vnni
+                self.moe_runner_config.activation,  # activation
             )
             return StandardCombineInput(hidden_states=output)
 

@@ -9,6 +9,7 @@ Thresholds are read off ``self`` so a config can tune them as class attributes.
 
 import concurrent.futures
 import json
+import math
 import random
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -161,6 +162,11 @@ class SpecParityKit:
                 "--dtype",
                 cls.dtype,
                 *(["--trust-remote-code"] if cls.trust_remote_code else []),
+                *(
+                    ["--enable-deterministic-inference"]
+                    if cls.enable_deterministic_inference
+                    else []
+                ),
             ],
         )
         try:
@@ -381,8 +387,8 @@ class SpecLogprobKit:
         with ThreadPoolExecutor(8) as executor:
             list(executor.map(func, args))
 
-    def test_logprob_spec_v2_match(self):
-        """Verify spec v2 decode logprobs match prefill scoring logprobs."""
+    def test_logprob_decode_match_prefill(self):
+        """Decode logprobs from the spec path must match prefill scoring."""
         top_k = 5
         probe_token_ids = [1, 2, 10, 100, 1000]
         prompts = [
@@ -574,3 +580,181 @@ class SpecFeatureKit:
             self.assertIsInstance(content, dict)
         except Exception:
             self.fail(f"parse JSON failed: {content_json}")
+
+
+class SpecHiddenStatesKit:
+    """return_hidden_states under spec V2 (regression for issue #26163).
+
+    Requires the server launched with --enable-return-hidden-states
+    (set ``enable_return_hidden_states = True`` on the fixture class).
+    """
+
+    def test_return_hidden_states(self):
+        # Two prompts of different lengths to exercise the per-req stride
+        # window: under spec V2 hidden_states is [bs * num_draft_tokens, dim],
+        # so a wrong index aliases a neighbor request's accepted rows.
+        prompts = [
+            "Repeat: the quick brown fox the quick brown fox the quick brown fox",
+            "Count down from ten: ten nine eight",
+        ]
+        res = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": prompts,
+                "sampling_params": {"temperature": 0, "max_new_tokens": 32},
+                "return_hidden_states": True,
+            },
+        )
+        self.assertEqual(res.status_code, 200)
+        outputs = res.json()
+
+        for out in outputs:
+            meta = out["meta_info"]
+            hs = meta["hidden_states"]
+            ct = meta["completion_tokens"]
+            # One hidden-state entry per completion token: hs[0] is the prefill
+            # block (List[List[float]]), hs[1:] are per-decode-token rows.
+            self.assertEqual(
+                len(hs),
+                ct,
+                f"len(hidden_states)={len(hs)} but completion_tokens={ct}",
+            )
+            decode_rows = hs[1:]
+            self.assertGreater(len(decode_rows), 0)
+            hidden_dim = len(decode_rows[0])
+            self.assertGreater(hidden_dim, 0)
+            for row in decode_rows:
+                self.assertIsInstance(row, list)
+                self.assertEqual(len(row), hidden_dim)
+
+
+class SpecGrammarKit:
+    """Grammar-constrained structured output under spec decoding.
+
+    Regression for spec verify accepting tokens past grammar termination: the
+    output must be valid JSON with nothing emitted after completion, and the
+    logprob count must match the (truncated) completion-token count.
+    """
+
+    # Override per config if a different schema is desired.
+    grammar_json_schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "pattern": "^[\\w]+$"},
+                "population": {"type": "integer"},
+                "country": {"type": "string", "pattern": "^[\\w ]+$"},
+                "capital": {"type": "string", "pattern": "^[\\w ]+$"},
+            },
+            "required": ["name", "population", "country", "capital"],
+        }
+    )
+
+    def _generate_grammar(self, return_logprob: bool):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "Here is the information of the capital of France in the JSON format.\n",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 256,
+                    "json_schema": self.grammar_json_schema,
+                },
+                "return_logprob": return_logprob,
+                "logprob_start_len": 0,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        out = response.json()
+        self.assertGreater(
+            out["meta_info"]["spec_verify_ct"],
+            0,
+            "expected spec decoding to run (spec_verify_ct > 0)",
+        )
+        return out
+
+    def test_grammar_structured_output_no_trailing_tokens(self):
+        """Output is valid JSON with nothing emitted past grammar completion."""
+        out = self._generate_grammar(return_logprob=False)
+        text = out["text"]
+        parsed = json.loads(text)
+        for key in ("name", "population", "country", "capital"):
+            self.assertIn(key, parsed)
+        self.assertTrue(
+            text.strip().endswith("}"), f"unexpected trailing tokens: {text!r}"
+        )
+
+    def test_grammar_logprob_count_matches_completion_tokens(self):
+        """Trimmed spec tokens keep logprob count == completion token count."""
+        out = self._generate_grammar(return_logprob=True)
+        meta = out["meta_info"]
+        completion_tokens = meta["completion_tokens"]
+        output_logprobs = meta["output_token_logprobs"]
+        self.assertEqual(
+            len(output_logprobs),
+            completion_tokens,
+            "output logprobs must align with retained (trimmed) tokens: "
+            f"got {len(output_logprobs)} logprobs vs {completion_tokens} completion tokens",
+        )
+        json.loads(out["text"])
+
+
+class SpecSamplingMaskKit:
+    """return_sampling_mask on a mixed greedy/sampling batch: one mask per output
+    token, each output token inside its mask, and greedy rows as singletons."""
+
+    def test_sampling_mask(self):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": ["The capital of France is"] * 4,
+                "sampling_params": [
+                    {
+                        "temperature": 0.0,
+                        "top_k": 1,
+                        "max_new_tokens": 7,
+                        "ignore_eos": True,
+                    },
+                    {
+                        "temperature": 1.0,
+                        "top_k": 10,
+                        "top_p": 0.95,
+                        "max_new_tokens": 7,
+                        "ignore_eos": True,
+                    },
+                ]
+                * 2,
+                "return_sampling_mask": True,
+                "sampling_logprobs_mode": [
+                    "selected",
+                    "selected",
+                    "support",
+                    "support",
+                ],
+            },
+            timeout=60,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        outputs = response.json()
+        self.assertEqual(len(outputs), 4)
+        for request_idx, output in enumerate(outputs):
+            output_ids = output["output_ids"]
+            meta_info = output["meta_info"]
+            masks = meta_info["output_token_sampling_mask"]
+            logprobs = meta_info["output_token_sampling_logprobs"]
+            self.assertEqual(len(output_ids), 7)
+            self.assertEqual(len(masks), len(output_ids))
+            self.assertEqual(len(logprobs), len(output_ids))
+            for output_id, mask, logprob in zip(output_ids, masks, logprobs):
+                self.assertIn(output_id, mask)
+                if request_idx >= 2:
+                    self.assertEqual(len(logprob), len(mask))
+                    self.assertTrue(all(math.isfinite(value) for value in logprob))
+                    self.assertAlmostEqual(
+                        sum(math.exp(value) for value in logprob), 1.0, places=5
+                    )
+                else:
+                    self.assertTrue(math.isfinite(logprob))
+                if request_idx % 2 == 0:
+                    self.assertEqual(mask, [output_id])
+                    self.assertEqual(logprob, [0.0] if request_idx >= 2 else 0.0)

@@ -51,8 +51,8 @@ class ChunkCache(BasePrefixCache):
 
         self.protected_size_ = 0
 
-    def is_chunk_cache(self) -> bool:
-        return True
+    def supports_prefix_sharing(self) -> bool:
+        return False
 
     # NOTE (csy): this is to determine if a cache has prefix matching feature.
     # Chunk cache always return True to indicate no prefix matching.
@@ -76,18 +76,8 @@ class ChunkCache(BasePrefixCache):
         # ChunkCache does not support prefix caching, so insert is a no-op
         return InsertResult(prefix_len=0)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
-        kv_committed_len = req.pop_committed_kv_cache()
-        # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
-        ]
-        self.token_to_kv_pool_allocator.free(kv_indices)
-
-    def cache_unfinished_req(self, req: Req, chunked=False):
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.fill_len
-        ]
+    def checkpoint(self, req: Req, *, up_to: int):
+        kv_indices = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :up_to]
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
@@ -128,10 +118,15 @@ class SWAChunkCache(ChunkCache):
         self.chunked_prefill_size = params.chunked_prefill_size
 
     def supports_swa(self) -> bool:
-        assert (
-            self.sliding_window_size is not None
-        ), "sliding_window_size must be set for SWAChunkCache"
+        assert self.sliding_window_size is not None, (
+            "sliding_window_size must be set for SWAChunkCache"
+        )
         return True
 
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()
+
+
+class PureSWAChunkCache(SWAChunkCache):
+    """ChunkCache for all-SWA models (no full attention layers): no
+    full_to_swa_index_mapping, so free_kv_row must skip the window-evicted span."""

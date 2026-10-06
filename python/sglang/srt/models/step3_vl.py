@@ -1,5 +1,6 @@
 import logging
 import math
+from array import array
 from math import sqrt
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -15,21 +16,20 @@ from sglang.srt.configs.step3_vl import (
     Step3VisionEncoderConfig,
     Step3VLConfig,
 )
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
+    reject_attn_tp_shard_with_tp_reduce,
 )
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -60,6 +60,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, log_info_on_rank0, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -79,6 +80,7 @@ class Step3TextMLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -94,11 +96,11 @@ class Step3TextMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
+            reduce_results=reduce_results,
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -119,7 +121,7 @@ class Step3TextMoEMLP(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.layer_id = layer_id
         if self.tp_size > config.moe_num_experts:
             raise ValueError(
@@ -165,8 +167,6 @@ class Step3TextMoEMLP(nn.Module):
             hidden_states=hidden_states, topk_output=topk_output
         )
 
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
@@ -189,12 +189,10 @@ class Step3TextAttention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
-        self.all_tp_rank = get_tensor_model_parallel_rank()
         self.total_num_heads = num_heads
-        self.attn_tp_rank = attn_tp_rank
         self.layer_id = layer_id
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -336,18 +334,7 @@ class Step3TextDecoderLayer(nn.Module):
 
         self.layer_id = layer_id
         self.is_layer_sparse = True if layer_id in moe_layers_idx else False
-        self.is_previous_layer_sparse = (
-            True if layer_id - 1 in moe_layers_idx else False
-        )
         self.is_next_layer_sparse = True if layer_id + 1 in moe_layers_idx else False
-
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=self.is_previous_layer_sparse,
-            is_next_layer_sparse=self.is_next_layer_sparse,
-        )
 
         if not self.is_layer_sparse:
             self.mlp = Step3TextMLP(
@@ -356,6 +343,7 @@ class Step3TextDecoderLayer(nn.Module):
                 hidden_act="silu",
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
             )
         else:
             self.use_moe = True
@@ -372,6 +360,7 @@ class Step3TextDecoderLayer(nn.Module):
                     hidden_act="silu",
                     quant_config=quant_config,
                     prefix=add_prefix("share_expert", prefix),
+                    reduce_results=False,
                 )
             else:
                 self.moe = Step3TextMoEMLP(
@@ -381,10 +370,15 @@ class Step3TextDecoderLayer(nn.Module):
                     prefix=add_prefix("mlp", prefix),
                 )
 
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=self.is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
         )
 
     def moe_mlp_forward(self, hidden_states):
@@ -401,12 +395,9 @@ class Step3TextDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -415,19 +406,15 @@ class Step3TextDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         if self.use_moe:
             hidden_states = self.moe_mlp_forward(hidden_states)
         else:
             hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
-
-        return hidden_states, residual
+        return hidden_states
 
 
 class Step3TextModel(nn.Module):
@@ -475,18 +462,14 @@ class Step3TextModel(nn.Module):
         else:
             hidden_states = input_embeds
 
-        residual = None
+        residual_batch.start(forward_batch)
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
-            )
+            hidden_states = layer(positions, hidden_states, forward_batch)
 
-        if hidden_states.shape[0] != 0:
-            if residual is None:
-                hidden_states = self.norm(hidden_states)
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
         return hidden_states
 
 
@@ -541,8 +524,8 @@ class Step3VisionMLP(nn.Module):
         # Since this is a dense model,
         # the MLP component likewise adopts a DP-MLP approach modeled after DP Attention.
         # This choice may not represent the optimal solution and remains open to further deliberation.
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
         self.fc1 = ColumnParallelLinear(
             dim,
             intermediate_size,
@@ -553,6 +536,15 @@ class Step3VisionMLP(nn.Module):
             prefix=add_prefix("gate_proj", prefix),
         )
         self.act = ACT2FN[hidden_act]  # quick_gelu
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group; reduce over the attention-TP group so attention DP and attention
+        # CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=attn_tp_size,
+            reduces_over_attn_tp=False,
+            multimodal_encoder=True,
+        )
         self.fc2 = RowParallelLinear(
             intermediate_size,
             dim,
@@ -607,7 +599,6 @@ class Step3VisionAttention(nn.Module):
 
 
 class Step3VisionEmbeddings(nn.Module):
-
     def __init__(self, config: Step3VisionEncoderConfig):
         super().__init__()
         self.config = config
@@ -734,7 +725,6 @@ class Step3VisionEncoder(nn.Module):
 
 
 class Step3VLForConditionalGeneration(nn.Module):
-
     def __init__(
         self,
         config: Step3VLConfig,
@@ -812,49 +802,96 @@ class Step3VLForConditionalGeneration(nn.Module):
         return image_features
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        assert len(items) == 1  # We only have images.
+        # Phase 1: Collect thumbnails and patches separately (different resolutions).
+        all_thumbnails = []
+        all_patches = []
+        # Per-item metadata: (thumb_count, num_patches_list, patch_count)
+        item_metadata = []
 
-        item = items[0]
-        pixel_values = item.feature.type(self.vision_model.dtype)
-        num_patches = item.model_specific_data.get("num_patches")
-        patch_pixel_values = item.model_specific_data.get("patch_pixel_values", None)
-        if patch_pixel_values is not None:
-            patch_pixel_values = patch_pixel_values.type(self.vision_model.dtype)
-
-        if patch_pixel_values is not None:
-            patch_pixel_values = patch_pixel_values.to("cuda")
-
-        image_features = self._get_vision_model_output(pixel_values)
-        patch_image_features = (
-            self._get_vision_model_output(patch_pixel_values)
-            if patch_pixel_values is not None
-            else None
-        )
-
-        image_features = self._process_image_features(image_features)
-        patch_image_features = (
-            self._process_image_features(patch_image_features)
-            if patch_image_features is not None
-            else None
-        )
-
-        merged_image_features = []
-        cur_patch_idx = 0
-        for i, num_patch in enumerate(num_patches):
-            cur_feature = []
-            if num_patch > 0:
-                patch_slice = patch_image_features[
-                    cur_patch_idx : cur_patch_idx + num_patch
+        for item in items:
+            pixel_values = item.feature.type(self.vision_model.dtype)
+            num_patches = item.model_specific_data.get("num_patches")
+            if num_patches is None:
+                raise ValueError("Step3-VL image item is missing num_patches.")
+            if isinstance(num_patches, torch.Tensor):
+                num_patches = [int(x) for x in num_patches.flatten().cpu().tolist()]
+            elif isinstance(num_patches, (list, tuple)):
+                num_patches = [
+                    int(x.item()) if isinstance(x, torch.Tensor) else int(x)
+                    for x in num_patches
                 ]
-                cur_feature.append(patch_slice.view(-1, patch_slice.shape[-1]))
-            cur_feature.append(image_features[i].view(-1, image_features.shape[-1]))
-            cur_patch_idx += num_patch
-            merged_image_features.append(
-                torch.cat(cur_feature) if len(cur_feature) > 1 else cur_feature[0]
+            else:
+                num_patches = [int(num_patches)]
+
+            patch_pixel_values = item.model_specific_data.get(
+                "patch_pixel_values", None
             )
+            if patch_pixel_values is not None and patch_pixel_values.shape[0] == 0:
+                patch_pixel_values = None
+            if patch_pixel_values is not None:
+                patch_pixel_values = patch_pixel_values.type(
+                    self.vision_model.dtype
+                ).to(self.device)
+
+            all_thumbnails.append(pixel_values)
+            thumb_count = pixel_values.shape[0]
+            patch_count = 0
+            if patch_pixel_values is not None:
+                all_patches.append(patch_pixel_values)
+                patch_count = patch_pixel_values.shape[0]
+            item_metadata.append((thumb_count, num_patches, patch_count))
+
+        # Phase 2: Batched ViT + projector forward (one pass per resolution).
+        all_thumbnails = torch.cat(all_thumbnails, dim=0)
+        all_thumb_features = self._process_image_features(
+            self._get_vision_model_output(all_thumbnails)
+        )
+
+        all_patch_features = None
+        if all_patches:
+            all_patches = torch.cat(all_patches, dim=0)
+            all_patch_features = self._process_image_features(
+                self._get_vision_model_output(all_patches)
+            )
+
+        # Phase 3: Split results back and merge per-image features.
+        merged_image_features = []
+        thumb_offset = 0
+        patch_offset = 0
+        for thumb_count, num_patches_list, patch_count in item_metadata:
+            item_thumb_features = all_thumb_features[
+                thumb_offset : thumb_offset + thumb_count
+            ]
+            thumb_offset += thumb_count
+            item_patch_features = (
+                all_patch_features[patch_offset : patch_offset + patch_count]
+                if patch_count > 0
+                else None
+            )
+            patch_offset += patch_count
+
+            cur_patch_idx = 0
+            for i, num_patch in enumerate(num_patches_list):
+                cur_feature = []
+                if num_patch > 0:
+                    if item_patch_features is None:
+                        raise ValueError(
+                            "Step3-VL image item has num_patches > 0 but no patch_pixel_values."
+                        )
+                    patch_slice = item_patch_features[
+                        cur_patch_idx : cur_patch_idx + num_patch
+                    ]
+                    cur_feature.append(patch_slice.view(-1, patch_slice.shape[-1]))
+                cur_feature.append(
+                    item_thumb_features[i].view(-1, item_thumb_features.shape[-1])
+                )
+                cur_patch_idx += num_patch
+                merged_image_features.append(
+                    torch.cat(cur_feature) if len(cur_feature) > 1 else cur_feature[0]
+                )
         return self._flatten_embeddings(merged_image_features)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

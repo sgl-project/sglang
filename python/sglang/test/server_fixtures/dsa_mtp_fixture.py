@@ -3,7 +3,7 @@
 Variants combine `DsaMtpServerBase` (server lifecycle) with
 `DsaMtpEvalConfigDefaults` (shared eval thresholds/params),
 `GSM8KMixin` and `SpecDecodingMixin`, then set `model` and per-variant
-overrides (`enable_dp_attention`, `mem_fraction_static`, `bs_1_speed_thres`).
+overrides (`attn_dp_size`, `mem_fraction_static`, `bs_1_speed_thres`).
 
 Example:
     class TestDsv32DP(
@@ -13,34 +13,35 @@ Example:
         SpecDecodingMixin,
     ):
         model = "deepseek-ai/DeepSeek-V3.2"
-        enable_dp_attention = True
+        attn_dp_size = 8
         bs_1_speed_thres = 90
 
 The base itself is NOT a runnable test (no `test_*` methods until a subclass
 mixes in the kits), so unittest discovery picks it up as empty.
 """
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 
 class DsaMtpEvalConfigDefaults:
     """Eval thresholds & params shared across DSA-MTP regression variants."""
 
-    # GSM8KMixin defaults.
-    gsm8k_accuracy_thres = 0.94
-    gsm8k_accept_length_thres = 2.7
+    # GSM8KMixin defaults. `gsm8k_accuracy_thres` is measured on the FP8
+    # variants; lower-scoring quantizations override it per variant.
+    gsm8k_accuracy_thres = 0.925
+    gsm8k_accept_length_thres = 3.7
     gsm8k_num_questions = 500
     gsm8k_num_threads = 500
     gsm8k_num_shots = 20
 
     # SpecDecodingMixin default; per-variant subclasses set `bs_1_speed_thres`.
-    accept_length_thres = 2.7
+    accept_length_thres = 4.0
 
 
 class DsaMtpServerBase(CustomTestCase):
@@ -48,21 +49,23 @@ class DsaMtpServerBase(CustomTestCase):
 
     # Subclasses must set `model`; the others have sensible defaults.
     model: str = ""
+    tp_size: int = 8
+    attn_dp_size: int = 1
     mem_fraction_static: float = 0.7
-    enable_dp_attention: bool = False
+    extra_server_args = ()
 
     # EAGLE MTP config (fixed across DSA-MTP variants).
     speculative_algorithm: str = "EAGLE"
-    speculative_num_steps: int = 3
+    speculative_num_steps: int = 5
     speculative_eagle_topk: int = 1
-    speculative_num_draft_tokens: int = 4
+    speculative_num_draft_tokens: int = 6
 
     @classmethod
     def get_server_args(cls):
         assert cls.model, f"{cls.__name__} must set `model`"
-        args = ["--trust-remote-code", "--tp", "8"]
-        if cls.enable_dp_attention:
-            args += ["--dp", "8", "--enable-dp-attention"]
+        args = ["--trust-remote-code", "--tp", str(cls.tp_size)]
+        if cls.attn_dp_size > 1:
+            args += ["--attn-dp-size", str(cls.attn_dp_size)]
         args += [
             "--speculative-algorithm",
             cls.speculative_algorithm,
@@ -77,6 +80,7 @@ class DsaMtpServerBase(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
+        args += list(cls.extra_server_args)
         return args
 
     @classmethod
@@ -90,4 +94,5 @@ class DsaMtpServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)

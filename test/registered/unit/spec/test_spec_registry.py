@@ -1,8 +1,11 @@
 """Unit tests for the speculative algorithm plugin registry."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import (
     _REGISTRY,
@@ -13,7 +16,7 @@ from sglang.srt.speculative.spec_registry import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _RegistryIsolated(CustomTestCase):
@@ -192,19 +195,41 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
             self.algo.create_worker(server_args)
 
 
-class TestValidatorHook(_RegistryIsolated):
-    def test_validator_invocation_is_caller_driven(self):
-        validator = MagicMock()
+class TestServerArgsHook(_RegistryIsolated):
+    def test_handle_speculative_decoding_invokes_custom_handle_server_args(self):
+        class CustomHandleServerArgs(CustomSpecAlgo):
+            def handle_server_args(self, server_args):
+                server_args.custom_spec_handle_seen = self.name
+                server_args.speculative_num_draft_tokens = 7
 
-        @SpeculativeAlgorithm.register("MY_FOO", validate_server_args=validator)
+        @SpeculativeAlgorithm.register(
+            "MY_HANDLE_ARGS", supports_overlap=True, spec_class=CustomHandleServerArgs
+        )
         def _factory(server_args):
             return MagicMock
 
-        algo = SpeculativeAlgorithm.from_string("MY_FOO")
-        self.assertIs(algo.validate_server_args, validator)
-        # Callers (e.g. ServerArgs.__post_init__) must invoke the hook themselves;
-        # CustomSpecAlgo does not call it from create_worker.
-        validator.assert_not_called()
+        server_args = SimpleNamespace(
+            speculative_draft_model_path=None,
+            speculative_draft_model_revision=None,
+            speculative_moe_runner_backend=None,
+            moe_runner_backend="auto",
+            speculative_algorithm="my_handle_args",
+            speculative_use_block_verification=False,
+            decrypted_draft_config_file=None,
+            trust_remote_code=False,
+            speculative_draft_window_size=None,
+            speculative_draft_sink_size=None,
+            speculative_skip_dp_mlp_sync=False,
+            speculative_adaptive=False,
+        )
+
+        handle_speculative_decoding(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "speculative_algorithm"), "MY_HANDLE_ARGS"
+        )
+        self.assertEqual(server_args.custom_spec_handle_seen, "MY_HANDLE_ARGS")
+        self.assertEqual(server_args.speculative_num_draft_tokens, 7)
 
 
 class TestSubclassOverride(_RegistryIsolated):

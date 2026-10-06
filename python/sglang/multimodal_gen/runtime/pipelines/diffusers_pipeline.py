@@ -24,8 +24,8 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentResidencyStrategy,
     get_global_component_residency_manager,
 )
-from sglang.multimodal_gen.runtime.models.vision_utils import (
-    load_image as load_vision_image,
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    resolve_diffusers_pipeline_offload,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -45,6 +45,8 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
+from sglang.multimodal_gen.runtime.utils.vision import load_image as load_vision_image
 
 logger = init_logger(__name__)
 
@@ -369,6 +371,12 @@ class DiffusersPipeline(ComposedPipelineBase):
         loaded_modules: dict[str, torch.nn.Module] | None = None,
         executor: PipelineExecutor | None = None,
     ):
+        if server_args.has_requested_component_attention_backends():
+            raise ValueError(
+                "--component-attention-backends is supported only by native "
+                "SGLang diffusion pipelines; use --attention-backend with the "
+                "Diffusers backend"
+            )
         self.server_args = server_args
         self.model_path = model_path
         self._stages: list[PipelineStage] = []
@@ -456,11 +464,22 @@ class DiffusersPipeline(ComposedPipelineBase):
                 raise
 
         # Use CPU offload (all-or-nothing in diffusers) if any component offload is requested.
+        explicit_pipeline_offload = resolve_diffusers_pipeline_offload(
+            server_args.component_residency
+        )
         any_offload = (
-            server_args.dit_cpu_offload
-            or server_args.text_encoder_cpu_offload
-            or server_args.image_encoder_cpu_offload
-            or server_args.vae_cpu_offload
+            explicit_pipeline_offload
+            if explicit_pipeline_offload is not None
+            else any(
+                server_args.should_cpu_offload_component(component_name)
+                for component_name in {
+                    *pipe.components,
+                    "transformer",
+                    "text_encoder",
+                    "image_encoder",
+                    "vae",
+                }
+            )
         )
         if any_offload:
             device = get_local_torch_device()
@@ -638,10 +657,18 @@ class DiffusersPipeline(ComposedPipelineBase):
             if hasattr(pipe, comp):
                 try:
                     component = getattr(pipe, comp)
-                    # TODO(DefTruth): Add support for 'compile_repeated_blocks' for 'transformer'
-                    # modules which can significantly reduce compilation time for large models
-                    # with repeated blocks.
-                    if isinstance(component, torch.nn.Module) and hasattr(
+                    repeated_blocks = getattr(component, "_repeated_blocks", None)
+                    if (
+                        isinstance(component, torch.nn.Module)
+                        and repeated_blocks
+                        and hasattr(component, "compile_repeated_blocks")
+                    ):
+                        # Regional compilation: compile a single instance of each
+                        # repeated transformer block and let inductor's cache reuse
+                        # it for all repeats, instead of compiling the whole DiT as
+                        # one graph
+                        component.compile_repeated_blocks()
+                    elif isinstance(component, torch.nn.Module) and hasattr(
                         component, "compile"
                     ):
                         # Prefer in-place compilation if supported. According to PyTorch documentation:
@@ -659,21 +686,15 @@ class DiffusersPipeline(ComposedPipelineBase):
         return pipe
 
     def _get_dtype(self, server_args: ServerArgs) -> torch.dtype:
-        dtype = (
-            torch.bfloat16
-            if torch.get_device_module().is_bf16_supported()
-            else torch.float16
-        )
+        """
+        Determine the dtype to use for model loading.
+        """
+        if hasattr(server_args, "pipeline_config") and server_args.pipeline_config:
+            return resolve_precision(server_args, "dit", precision_attr="dit_precision")
 
-        dit_precision = server_args.pipeline_config.dit_precision
-        if dit_precision == "fp16":
-            dtype = torch.float16
-        elif dit_precision == "bf16":
-            dtype = torch.bfloat16
-        elif dit_precision == "fp32":
-            dtype = torch.float32
-
-        return dtype
+        # precision-constraint: legacy fallback for callers without pipeline_config;
+        # prefer explicit dit_precision policy when available.
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     def _detect_pipeline_type(self) -> None:
         """Detect if this is an image or video pipeline."""

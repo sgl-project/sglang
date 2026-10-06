@@ -17,7 +17,7 @@ Columns are runner modes; rows are attention backends. Cells use:
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | `torch_native` | ✓ no-prefix + prefix window edges, MHA + GQA decode window edges (uses explicit SDPA local-attention mask) | — (no CG hooks) | — (no CG path) | — (no CG path) | — | — | — | — | — | — | — | — |
 | `triton` | ✓ no-prefix lengths below/equal/above window + prefix lengths below/equal/above window | ✓ within-window decode (`prefix_lens=(1,2,3)`, `window=4`) + above-window decode (`prefix_lens=(7,8,9)`, `window=4`) | ✓ no-prefix window edges, prefix-within-window MHA extend | ✓ same as PCG | ✓ EAGLE chain (topk=1) + EAGLE tree (topk=2), `window=4` | ✓ EAGLE tree within-window + EAGLE chain above-window (`prefix_lens=(6,8)`, `window=4`) | — | — | — | — | — | — |
-| `flashinfer` | ✓ no-prefix lengths below/equal/above window (`head_dim=64` for SM90) | ✓ within-window decode | ✓ no-prefix window edges (MHA extend) | ✓ same as PCG | blocked: SWA prefill updater needs `prefix_lens != None`, target-verify passes `None` (`flashinfer_backend.py:1296-1344` consumed by `init_forward_metadata` at `flashinfer_backend.py:742,754`) | blocked: same prefill updater contract | — | — | — | — | — | — |
+| `flashinfer` | ✓ no-prefix lengths below/equal/above window (`head_dim=64` for SM90) | ✓ within-window decode | ✓ no-prefix window edges (MHA extend) | ✓ same as PCG | ✓ DFLASH chain (`topk=1`, `window=4`) | ✓ DFLASH chain (`topk=1`, `window=4`) | — | — | — | — | — | — |
 
 ## Input And Config Coverage
 
@@ -50,12 +50,8 @@ Columns are runner modes; rows are attention backends. Cells use:
 
 ## Production-Unsupported
 
-- **FlashInfer SWA `TARGET_VERIFY` / `DRAFT_EXTEND`** — the SWA prefill updater
-  (`FlashInferIndicesUpdaterPrefill.update_sliding_window`,
-  `flashinfer_backend.py:1296-1344`) requires non-`None` `prefix_lens`. The
-  target-verify and draft-extend code paths pass `prefix_lens=None` at
-  `flashinfer_backend.py:742,754`, so the SWA prefill kernel cannot be reached
-  without a separate fix to the prefill metadata contract.
+- **FlashInfer SWA `DRAFT_EXTEND`** — not covered here. The FlashInfer SWA
+  coverage added for this path is limited to DFLASH `TARGET_VERIFY`.
 - **`torch_native` SWA speculative / CUDA graph** — no CG hooks; all graph
   integration is structurally unsupported.
 
@@ -65,6 +61,3 @@ Columns are runner modes; rows are attention backends. Cells use:
   separately (the above-window case currently asserts within tolerance with the
   matching reference rule; if a real backend regression appears, lower the
   tolerance).
-- FlashInfer SWA verify path would need a new metadata contract that threads
-  `prefix_lens` through the target-verify replay; until that lands the fixture
-  is intentionally inactive.

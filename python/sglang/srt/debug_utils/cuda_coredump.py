@@ -86,7 +86,7 @@ def report():
     if not coredump_files:
         return
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"CUDA coredump(s) detected ({len(coredump_files)} file(s)):")
     for f in coredump_files:
         size_mb = os.path.getsize(f) / (1024 * 1024)
@@ -98,7 +98,7 @@ def report():
         repo = os.environ.get("GITHUB_REPOSITORY", "sgl-project/sglang")
         print(f"Download from CI: gh run download {run_id} --repo {repo}")
 
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
 
 # Auto-inject CUDA coredump env vars at import time.

@@ -5,11 +5,11 @@ import einops
 import torch
 import torch.nn as nn
 
-from sglang.srt.configs.jet_nemotron import JetBlockConfig, JetNemotronConfig
-from sglang.srt.layers.attention.fla.fused_recurrent import (
+from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_update,
 )
-from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.srt.configs.jet_nemotron import JetBlockConfig, JetNemotronConfig
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     MambaAttnBackendBase,
@@ -32,6 +32,7 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 
 class DynamicShortConvolutionKernelGenerator(nn.Module):
@@ -286,7 +287,7 @@ class JetBlock(nn.Module):
         k = nn.functional.silu(k)
         k = einops.rearrange(k, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
 
-        conv_cache = layer_cache.conv
+        conv_cache = layer_cache.conv[0]
         assert isinstance(conv_cache, torch.Tensor)
         v, new_conv_state = self.dynamic_conv1d(
             v,
@@ -369,12 +370,13 @@ class JetNemotronAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
+        rope_theta, rope_scaling = get_rope_config(self.config)
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=self.config.max_position_embeddings,
-            base=int(self.config.rope_parameters["rope_theta"]),
-            rope_scaling=self.config.rope_parameters,
+            base=int(rope_theta),
+            rope_scaling=rope_scaling,
         )
 
         match self.config.layer_types[layer_id]:
@@ -420,10 +422,12 @@ class JetNemotronDecoderLayer(nn.Module):
         config: JetNemotronConfig,
         alt_stream: torch.cuda.Stream | None = None,
         layer_id: int = 0,
+        start_layer: int = 0,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.start_layer = start_layer
 
         match config.layer_types[layer_id]:
             case "attn" | "swa":
@@ -462,8 +466,7 @@ class JetNemotronDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
         # Self Attention
         residual = hidden_states
 
@@ -486,7 +489,29 @@ class JetNemotronDecoderLayer(nn.Module):
 
         hidden_states = residual + hidden_states
 
-        return hidden_states, None
+        return hidden_states
+
+
+class JetNemotronModel(Qwen2Model):
+    """Each decoder layer adds its own residual, so the stack runs without a
+    residual stream and ends with the final norm alone."""
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
+        for i in range(self.start_layer, self.end_layer):
+            hidden_states = self.layers[i](positions, hidden_states, forward_batch)
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.norm(hidden_states)
+        return hidden_states
 
 
 class JetNemotronForCausalLM(nn.Module):
@@ -501,7 +526,7 @@ class JetNemotronForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
-        self.model = Qwen2Model(
+        self.model = JetNemotronModel(
             config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
@@ -520,6 +545,12 @@ class JetNemotronForCausalLM(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(PoolingType.LAST, normalize=True)
+
+    def get_attention_sliding_window_size(self) -> int | None:
+        swa = self.config.efficient_attention_config.get("swa")
+        if swa is None or "swa" not in self.config.layer_types:
+            return None
+        return swa["window_size"]
 
     @torch.no_grad()
     def forward(

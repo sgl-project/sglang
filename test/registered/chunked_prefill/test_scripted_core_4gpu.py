@@ -11,7 +11,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until_finished,
 )
 
-register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=55, stage="extra-b", runner_config="4-gpu-h100")
 
 
 _CHUNK_SIZE = 64
@@ -77,7 +77,10 @@ class TestScriptedPpChunkSweep(ScriptedTestCase):
                 scheduler.chunked_req is None
                 and len(scheduler.waiting_queue) == 0
                 and all(x.is_empty() for x in scheduler.running_mbs)
-                and (scheduler.cur_batch is None or scheduler.cur_batch.is_empty())
+                and (
+                    scheduler.cur_batch_for_debug is None
+                    or scheduler.cur_batch_for_debug.is_empty()
+                )
                 and (scheduler.last_batch is None or scheduler.last_batch.is_empty())
             )
             if in_flight and queues_clear:

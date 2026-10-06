@@ -27,27 +27,24 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-    parallel_state,
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerScatterModes,
-    enable_moe_dense_fully_dp,
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_dp_size,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+    is_dense_ffn_fully_dp,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -58,13 +55,16 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
+from sglang.srt.layers.multi_gate import (
+    create_multi_gate_mm_indices,
+    multi_gate_triton_kernel,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -81,8 +81,13 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    is_non_idle_and_non_empty,
+    make_pp_layers,
+)
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
@@ -131,17 +136,13 @@ class BailingMoEMLP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if (self.tp_size == 1) and hidden_states.shape[0] == 0:
             return hidden_states
 
         gate_up, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(gate_up)
-        hidden_states, _ = self.down_proj(
-            hidden_states, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
-        )
+        hidden_states, _ = self.down_proj(hidden_states)
         return hidden_states
 
 
@@ -188,13 +189,16 @@ class BailingMoESparseMoeBlock(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.alt_stream = alt_stream
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
         self.hidden_size = config.hidden_size
         self.num_shared_experts = config.num_shared_experts
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.score_function = getattr(config, "score_function", None)
+        self.multi_gate = getattr(config, "multi_gate", False) or (
+            getattr(config, "router_type", "topN") == "MultiRouter"
+        )
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -212,7 +216,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             self.router_dtype = torch.bfloat16
 
         # TODO global_server_args.ep_num_redundant_experts is used for eplb, not supported now
-        assert get_global_server_args().ep_num_redundant_experts == 0
+        assert get_exec().moe.ep_num_redundant_experts == 0
         # check group topk
         self.num_expert_group = getattr(config, "n_group", 0)
         self.topk_group = getattr(config, "topk_group", 0)
@@ -226,9 +230,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             self.num_expert_group = self.topk_group = None
             self.use_grouped_topk = False
 
-        self.num_experts = (
-            config.num_experts + get_global_server_args().ep_num_redundant_experts
-        )
+        self.num_experts = config.num_experts + get_exec().moe.ep_num_redundant_experts
 
         self.gate = BailingMoEGate(
             config=config,
@@ -239,21 +241,63 @@ class BailingMoESparseMoeBlock(nn.Module):
             self.gate.expert_bias.data if self.gate.expert_bias is not None else None
         )
 
+        self.image_gate = None
+        self.audio_gate = None
+        self.image_correction_bias = None
+        self.audio_correction_bias = None
+        if self.multi_gate:
+            self.image_gate = BailingMoEGate(
+                config=config,
+                params_dtype=self.router_dtype,
+                prefix=add_prefix("image_gate", prefix),
+            )
+            self.audio_gate = BailingMoEGate(
+                config=config,
+                params_dtype=self.router_dtype,
+                prefix=add_prefix("audio_gate", prefix),
+            )
+            self.image_correction_bias = (
+                self.image_gate.expert_bias.data
+                if self.image_gate.expert_bias is not None
+                else None
+            )
+            self.audio_correction_bias = (
+                self.audio_gate.expert_bias.data
+                if self.audio_gate.expert_bias is not None
+                else None
+            )
+            if any(
+                bias is None
+                for bias in (
+                    self.correction_bias,
+                    self.image_correction_bias,
+                    self.audio_correction_bias,
+                )
+            ):
+                raise ValueError(
+                    "Bailing MultiRouter requires expert bias for text, image, and audio gates"
+                )
+
         if self.score_function is not None:
             assert (
                 self.score_function == "softmax" and self.correction_bias is None
             ) or (
                 self.score_function == "sigmoid" and self.correction_bias is not None
-            ), "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            ), (
+                "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            )
 
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=self.layer_id,
             renormalize=self.norm_topk_prob,
             use_grouped_topk=self.use_grouped_topk,
             num_expert_group=self.num_expert_group,
             # num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=self.topk_group,
             correction_bias=self.correction_bias,
+            scoring_func=self.score_function
+            or ("sigmoid" if self.correction_bias is not None else "softmax"),
             routed_scaling_factor=self.routed_scaling_factor,
         )
 
@@ -289,11 +333,8 @@ class BailingMoESparseMoeBlock(nn.Module):
             )
         # dispatcher
         if get_moe_a2a_backend().is_deepep():
-            # TODO: we will support tp < ep in the future
-            self.ep_size = get_tensor_model_parallel_world_size()
-
             self.deepep_dispatcher = DeepEPDispatcher(
-                group=parallel_state.get_tp_group().device_group,
+                group=get_parallel().tp_group.device_group,
                 router_topk=self.top_k,
                 permute_fusion=True,
                 num_experts=self.num_experts,
@@ -309,15 +350,9 @@ class BailingMoESparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if not get_moe_a2a_backend().is_deepep():
-            return self.forward_normal(
-                hidden_states,
-                should_allreduce_fusion,
-                use_reduce_scatter,
-            )
+            return self.forward_normal(hidden_states, forward_batch)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
@@ -337,22 +372,64 @@ class BailingMoESparseMoeBlock(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         return shared_output
 
-    def _forward_router_experts(self, hidden_states: torch.Tensor):
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+    def _forward_gate(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if (
+            self.multi_gate
+            and forward_batch is not None
+            and forward_batch.mm_token_modalities is not None
+        ):
+            if forward_batch.mm_token_modalities.shape[0] != hidden_states.shape[0]:
+                raise ValueError(
+                    "Bailing modality metadata must align with MoE tokens: "
+                    f"modalities={forward_batch.mm_token_modalities.shape[0]}, "
+                    f"hidden_states={hidden_states.shape[0]}"
+                )
+            if forward_batch.multi_gate_indices is None:
+                forward_batch.multi_gate_indices = create_multi_gate_mm_indices(
+                    forward_batch.mm_token_modalities
+                )
+            return multi_gate_triton_kernel(
+                hidden_states,
+                forward_batch.multi_gate_indices,
+                self.gate.weight,
+                self.image_gate.weight,
+                self.audio_gate.weight,
+                self.correction_bias,
+                self.image_correction_bias,
+                self.audio_correction_bias,
+            )
+        return self.gate(hidden_states), None
+
+    def _forward_router_experts(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch],
+    ):
+        router_logits, dynamic_expert_bias = self._forward_gate(
+            hidden_states, forward_batch
+        )
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            dynamic_expert_bias=dynamic_expert_bias,
+        )
         return self.experts(hidden_states, topk_output)
 
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch],
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states.clone())
 
         with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(hidden_states)
+            router_output = self._forward_router_experts(hidden_states, forward_batch)
         current_stream.wait_stream(self.alt_stream)
 
         return router_output, shared_output
@@ -360,8 +437,7 @@ class BailingMoESparseMoeBlock(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
@@ -372,21 +448,17 @@ class BailingMoESparseMoeBlock(nn.Module):
             and get_is_capture_mode()
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
-                hidden_states
+                hidden_states, forward_batch
             )
         else:
             shared_output = self._forward_shared_experts(hidden_states)
-            final_hidden_states = self._forward_router_experts(hidden_states)
+            final_hidden_states = self._forward_router_experts(
+                hidden_states, forward_batch
+            )
 
         if self.num_shared_experts > 0:
             final_hidden_states = final_hidden_states + shared_output
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
     def forward_deepep(
@@ -395,14 +467,17 @@ class BailingMoESparseMoeBlock(nn.Module):
         shared_output = None
         forward_mode = forward_batch.forward_mode
         if is_non_idle_and_non_empty(forward_mode, hidden_states):
-            router_logits = self.gate(hidden_states)
+            router_logits, dynamic_expert_bias = self._forward_gate(
+                hidden_states, forward_batch
+            )
             if self.num_shared_experts > 0:
                 shared_output = self.shared_experts(hidden_states)
 
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                dynamic_expert_bias=dynamic_expert_bias,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -434,9 +509,8 @@ class BailingMoEAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
         self.total_kv_heads = config.num_key_value_heads
-        self.dp_size = get_attention_dp_size()
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
         if self.total_kv_heads >= attn_tp_size:
@@ -500,6 +574,7 @@ class BailingMoEAttention(nn.Module):
             base=config.rope_parameters["rope_theta"],
             rope_scaling=config.rope_parameters,
         )
+        self.is_mrope_enabled = "mrope_section" in config.rope_parameters
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -534,6 +609,7 @@ class BailingMoEAttention(nn.Module):
         can_fuse_set_kv = (
             self.head_dim == self.rotary_emb.rotary_dim
             and enable_fused_set_kv_buffer(forward_batch)
+            and not self.is_mrope_enabled
         )
         q, k = self.rotary_emb(
             positions,
@@ -568,13 +644,13 @@ class BailingMoEBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
     ):
         super().__init__()
         self.config = config
         hidden_size = config.hidden_size
 
         self.input_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
-        self.dp_size = get_attention_dp_size()
         self.attention = BailingMoEAttention(
             config,
             layer_id,
@@ -584,28 +660,13 @@ class BailingMoEBlock(nn.Module):
             alt_stream=alt_stream,
         )
         self.layer_id = layer_id
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
 
         self.is_layer_sparse = self._is_layer_sparse(
-            config, layer_id=layer_id, is_nextn=False
-        )
-        is_previous_layer_sparse = self._is_layer_sparse(
-            config, layer_id=layer_id - 1, is_nextn=False
+            config, layer_id=layer_id, is_nextn=is_nextn
         )
         is_next_layer_sparse = self._is_layer_sparse(
             config, layer_id=layer_id + 1, is_nextn=False
         )
-
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
-
-        self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
 
         if self.is_layer_sparse:
             self.mlp = BailingMoESparseMoeBlock(
@@ -616,7 +677,7 @@ class BailingMoEBlock(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -627,16 +688,20 @@ class BailingMoEBlock(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
+                reduce_results=False,
             )
 
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
         )
 
     def _is_layer_sparse(
@@ -651,16 +716,14 @@ class BailingMoEBlock(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
+        capture_output=None,
     ) -> torch.Tensor:
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-            )
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            capture_gathered=captured_last_layer_outputs,
+            capture=capture_output,
         )
 
         if hidden_states.shape[0] != 0:
@@ -670,39 +733,19 @@ class BailingMoEBlock(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(
             hidden_states=hidden_states,
-            residual=residual,
             forward_batch=forward_batch,
         )
 
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
+        hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-        )
-
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-
-        return hidden_states, residual
+        return hidden_states
 
 
 class BailingMoEModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -711,11 +754,14 @@ class BailingMoEModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.vocab_size = config.vocab_size
         self.embed_dim = config.hidden_size
-        if self.pp_group.is_first_rank:
+        keep_word_embeddings = self.pp_group.is_first_rank or (
+            config.tie_word_embeddings and self.pp_group.is_last_rank
+        )
+        if keep_word_embeddings:
             self.word_embeddings = VocabParallelEmbedding(
                 self.vocab_size,
                 self.embed_dim,
@@ -728,7 +774,7 @@ class BailingMoEModel(nn.Module):
 
         self.embedding_dropout = torch.nn.Dropout(config.embedding_dropout)
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: BailingMoEBlock(
                 layer_id=idx,
@@ -737,8 +783,6 @@ class BailingMoEModel(nn.Module):
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -761,44 +805,36 @@ class BailingMoEModel(nn.Module):
                 hidden_states = self.word_embeddings(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                if i in self.layers_to_capture:
-                    aux_hidden_states.append(
-                        hidden_states if residual is None else hidden_states + residual
-                    )
                 layer = self.layers[i]
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     positions,
                     hidden_states,
                     forward_batch,
-                    residual,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
+                    captured_last_layer_outputs=aux_hidden_states
+                    if getattr(layer, "_is_layer_to_capture", False)
+                    else None,
+                    capture_output=aux_hidden_states.capture
+                    if i in self.layers_to_capture
+                    else None,
                 )
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         else:
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                hidden_states = residual_batch.final_norm(
+                    hidden_states, forward_batch, self.norm
+                )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -813,10 +849,10 @@ class BailingMoEForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda else None
 
         self.model = BailingMoEModel(
             config,
@@ -835,11 +871,14 @@ class BailingMoEForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config)
 
         self.capture_aux_hidden_states = False
+
+    def get_input_embeddings(self):
+        return self.model.word_embeddings
 
     @property
     def start_layer(self):
@@ -909,6 +948,10 @@ class BailingMoEForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
+        replaced_params_mapping = {
+            "key_layernorm": "k_norm",
+            "query_layernorm": "q_norm",
+        }
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
@@ -944,6 +987,11 @@ class BailingMoEForCausalLM(nn.Module):
                 import torch.nn.functional as F
 
                 loaded_weight = F.normalize(loaded_weight, dim=0, p=2, eps=1e-7)
+
+            for param_name, weight_name in replaced_params_mapping.items():
+                if weight_name in name:
+                    name = name.replace(weight_name, param_name)
+                    break
 
             if is_nextn:
                 if not name.startswith(nextn_layer_prefix):

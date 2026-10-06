@@ -6,190 +6,79 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
-    BasePrefixCache,
     DecLockRefParams,
     DecLockRefResult,
-    EvictParams,
-    EvictResult,
     IncLockRefResult,
-    InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 
 logger = logging.getLogger(__name__)
 
 
 class _VirtualNode:
-    """Sentinel node for streaming session requests.
-
-    Passed to inc_lock_ref / dec_lock_ref so the cache can distinguish
-    streaming-session locks (no-op) from real radix-tree locks (forwarded).
-    """
+    """Lock target for session-owned KV; locking it is a no-op."""
 
     pass
 
 
 @dataclass
 class SessionSlot:
-    """Holds KV state between streaming session turns."""
+    """A streaming session's KV record and the tree lock on its prefix. The
+    session owns both from its first turn's row allocation until it closes or
+    a turn aborts; every turn runs on the record as a borrower."""
 
     virtual_node: _VirtualNode = field(default_factory=_VirtualNode)
 
-    # KV pool state (None means no KV is currently held by this slot)
-    req_pool_idx: Optional[int] = None
-    kv_committed_len: int = 0
-    kv_allocated_len: int = 0
+    # KV pool state
+    kv: ReqKvInfo = field(default_factory=ReqKvInfo)
 
-    # First req's radix tree node (for dec_lock_ref on session close)
+    # Tree lock on the session's tree-owned prefix, and its receipt.
     last_node: Any = None
-    cache_protected_len: int = 0
-    swa_uuid_for_lock: Optional[str] = None
-
-    # SWA state
-    swa_evicted_seqlen: int = 0
-
-    # Mamba states
-    mamba_pool_idx: Any = None
-    mamba_ping_pong_track_buffer: Any = None
-    mamba_next_track_idx: Any = None
-    mamba_last_track_seqlen: Any = None
-    mamba_branching_seqlen: Any = None
-
-    @property
-    def is_holding_kv(self) -> bool:
-        """Whether this slot currently holds KV pool resources."""
-        return self.req_pool_idx is not None
-
-    def save_from_req(self, req: Req, is_first: bool):
-        """Save KV state from a finishing request into this slot."""
-        self.req_pool_idx = req.req_pool_idx
-        self.kv_committed_len = req.kv_committed_len
-        self.kv_allocated_len = req.kv_allocated_len
-        self.swa_evicted_seqlen = req.swa_evicted_seqlen
-
-        if is_first:
-            self.last_node = req.last_node
-            self.cache_protected_len = req.cache_protected_len
-            self.swa_uuid_for_lock = req.swa_uuid_for_lock
-
-        self.mamba_pool_idx = req.mamba_pool_idx
-        self.mamba_ping_pong_track_buffer = req.mamba_ping_pong_track_buffer
-        self.mamba_next_track_idx = req.mamba_next_track_idx
-        self.mamba_last_track_seqlen = req.mamba_last_track_seqlen
-        self.mamba_branching_seqlen = req.mamba_branching_seqlen
-
-        # Ownership has transferred to the slot. Null *all* of the req's
-        # references so any later alloc()/free path that inspects the req
-        # (e.g. the alloc-skip check on `req.mamba_ping_pong_track_buffer
-        # is None`, or the retract cleanup) sees no dangling pointers
-        # into slot-owned tensors. Without this the alloc path can decide
-        # the req still has a ping-pong buffer and skip alloc, causing
-        # the slot's tensor to be reused by a new req and leaked when
-        # the slot is later freed.
-        req.req_pool_idx = None
-        req.mamba_pool_idx = None
-        req.mamba_ping_pong_track_buffer = None
-        req.mamba_next_track_idx = None
-        req.mamba_last_track_seqlen = None
-        req.mamba_branching_seqlen = None
-
-    def restore_to_req(self, req: Req):
-        """Restore KV state from this slot into an incoming request."""
-        req.req_pool_idx = self.req_pool_idx
-        req.kv_committed_len = self.kv_committed_len
-        req.kv_allocated_len = self.kv_allocated_len
-        req.swa_evicted_seqlen = self.swa_evicted_seqlen
-        req.swa_uuid_for_lock = self.swa_uuid_for_lock
-
-        req.mamba_pool_idx = self.mamba_pool_idx
-        req.mamba_ping_pong_track_buffer = self.mamba_ping_pong_track_buffer
-        req.mamba_next_track_idx = self.mamba_next_track_idx
-        req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
-        req.mamba_branching_seqlen = self.mamba_branching_seqlen
-
-        # NOTE: req_pool_idx and mamba_pool_idx are intentionally NOT cleared
-        # from the slot. During chunked prefill, a request may be rejected by
-        # the scheduler (e.g. budget exhausted) and retried in the next cycle.
-        # Each retry calls match_prefix -> restore_to_req again, so the slot
-        # must remain intact for idempotent restoration.
+    lock_receipt: DecLockRefParams = field(default_factory=DecLockRefParams)
+    # Whether the SWA part of that lock was released early.
+    swa_prefix_lock_released: bool = False
+    # Until the first turn finishes or is retracted, its checkpoints publish
+    # the prompt into the tree and move the lock onto the deepest published node.
+    publishes_prompt: bool = False
 
 
 def _is_streaming(req: Optional[Req]) -> bool:
     return req is not None and req.session is not None and req.session.streaming
 
 
-class StreamingSession(BasePrefixCache):
-    """Adds streaming-session KV save/restore on top of any BasePrefixCache.
+def _move_tree_lock(src: Any, dst: Any) -> None:
+    """Hand the tree lock ``src`` holds (a request or a slot) to ``dst``."""
+    dst.last_node = src.last_node
+    dst.lock_receipt = src.lock_receipt
+    dst.swa_prefix_lock_released = src.swa_prefix_lock_released
 
-    Works both as an external wrapper (``StreamingSession(RadixCache(...))``)
-    and in embedded composition (``StreamingSession(inner=self)``). For the
-    embedded case, the composing cache must pre-check dispatch conditions
-    (``_is_streaming`` / ``find_active_slot`` / ``has_slot``) so the internal
-    fall-through to ``self.inner.xxx`` never fires -- otherwise it recurses.
+
+class StreamingSession:
+    """Streaming-session KV records, owned by ``UnifiedRadixCache``.
+
+    A session takes its first turn's record and tree lock at row allocation
+    (``take``); every turn then borrows them. The cache calls the ``try_*``
+    entries first; each runs the session body when it applies and tells the
+    cache whether to run its own path.
     """
 
-    def __init__(self, inner: BasePrefixCache):
-        self.inner = inner
+    def __init__(self, cache: UnifiedRadixCache):
+        self.cache = cache
         self.slots: Dict[str, SessionSlot] = {}
 
-    # -- Forward PrefixCacheTrait properties to inner cache --
-
-    @property
-    def req_to_token_pool(self):
-        return self.inner.req_to_token_pool
-
-    @req_to_token_pool.setter
-    def req_to_token_pool(self, value):
-        self.inner.req_to_token_pool = value
-
-    @property
-    def token_to_kv_pool_allocator(self):
-        return self.inner.token_to_kv_pool_allocator
-
-    @token_to_kv_pool_allocator.setter
-    def token_to_kv_pool_allocator(self, value):
-        self.inner.token_to_kv_pool_allocator = value
-
-    @property
-    def page_size(self):
-        return self.inner.page_size
-
-    @page_size.setter
-    def page_size(self, value):
-        self.inner.page_size = value
-
-    @property
-    def disable(self):
-        return self.inner.disable
-
-    @disable.setter
-    def disable(self, value):
-        self.inner.disable = value
-
-    @property
-    def metrics_collector(self):
-        return self.inner.metrics_collector
-
-    @metrics_collector.setter
-    def metrics_collector(self, value):
-        self.inner.metrics_collector = value
-
-    # -- Condition helpers (used by embedded-mode callers for pre-dispatch) --
-
-    def has_slot(self, session_id: str) -> bool:
-        return session_id in self.slots
-
     def any_holding_kv(self) -> bool:
-        return any(s.is_holding_kv for s in self.slots.values())
+        return any(s.kv.holds_kv for s in self.slots.values())
 
-    # -- Try-handle entries for composition (see class docstring) --
+    # -- Try-handle entries (see class docstring) --
 
     def try_inc_lock_ref(self, node: Any) -> Optional[IncLockRefResult]:
         """No-op lock if ``node`` is a session-internal sentinel; returns
@@ -206,33 +95,18 @@ class StreamingSession(BasePrefixCache):
         return None
 
     def find_active_slot(self, req: Req) -> Optional[SessionSlot]:
-        """Returns an active slot for this req, or None.
-
-        Side effect: if req is pre-aborted (to_finish set, e.g. input too
-        long), detach it from the session so cache_finished_req treats it
-        as a normal req. The slot stays intact for the next request.
-        """
+        """A pre-aborted req (to_finish set) is detached from the session and
+        gets None; the slot stays for the next request."""
         if not _is_streaming(req):
             return None
         slot = self.slots.get(req.session.session_id)
-        if slot is None or slot.req_pool_idx is None:
+        if slot is None or not slot.kv.holds_kv:
             return None
         if req.to_finish is not None:
             req.session.abort_req()
             req.session = None
             return None
         return slot
-
-    # -- BasePrefixCache abstract methods --
-
-    def reset(self):
-        self.slots.clear()
-        self.inner.reset()
-
-    # -- Streaming entries: contract with embedded composers (e.g.
-    # UnifiedRadixCache) is a uniform "try_handle_*" pattern. Each method
-    # executes the streaming body if applicable and signals whether the
-    # caller still needs to run its raw path.
 
     def try_match_prefix(self, params: MatchPrefixParams) -> Optional[MatchResult]:
         """Returns a MatchResult iff the request hits an active session slot;
@@ -242,29 +116,51 @@ class StreamingSession(BasePrefixCache):
             return None
 
         req = params.req
-        slot.restore_to_req(req)
+
+        # [NPU] Below one aligned page, drop the slot's KV and fully prefill.
+        if is_npu() and self.cache.page_size > 1:
+            expected_prefix_len = min(slot.kv.kv_committed_len, len(params.key))
+            aligned_prefix_len = (
+                expected_prefix_len // self.cache.page_size
+            ) * self.cache.page_size
+            if (
+                aligned_prefix_len < slot.kv.cache_protected_len
+                or aligned_prefix_len == 0
+            ):
+                # Release KV to avoid leak and fallback to full prefill.
+                # req remains unassigned, so alloc_for_extend treats it as new.
+                self.release_session(req.session.session_id)
+                return None
+
+        # Lend the record; the slot keeps the tree lock. A rejected chunked
+        # request matches again next cycle and borrows the same record.
+        req.kv = slot.kv
 
         # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
         # already applied). min handles retract retry where committed_len
         # can exceed len(token_ids) by 1.
-        prefix_len = min(req.kv_committed_len, len(params.key.token_ids))
+        prefix_len = min(req.kv.kv_committed_len, len(params.key))
 
         # Streaming sessions are append-only (session_controller rollback
         # ensures req_nodes always points to the last successful req).
-        assert prefix_len >= slot.cache_protected_len, (
+        assert prefix_len >= slot.kv.cache_protected_len, (
             f"streaming session prefix shrank: {prefix_len=} < "
-            f"{slot.cache_protected_len=}"
+            f"{slot.kv.cache_protected_len=}"
         )
 
-        # Free orphaned tail: alloc_for_extend will overwrite
-        # req_to_token[prefix_len:] with new indices. The range
-        # [prefix_len, kv_allocated_len) has stale indices from the
-        # previous turn's decode (e.g. alloc-commit gap on retract,
-        # or speculative draft tokens).
-        self._free_tail(slot, req, prefix_len)
+        # NPU requires page-aligned KV reuse; a rewind below the SWA eviction
+        # cursor must also land on a page boundary -- free_kv_row_segments
+        # splits dead/alive at the cursor, and a mid-page cut frees a page twice.
+        if self.cache.page_size > 1 and (
+            is_npu() or req.kv.max_evicted_seqlen > prefix_len
+        ):
+            prefix_len = (prefix_len // self.cache.page_size) * self.cache.page_size
+            req.kv.kv_committed_len = min(req.kv.kv_committed_len, prefix_len)
 
-        device_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :prefix_len
+        self._free_tail(req.kv, prefix_len)
+
+        device_indices = self.cache.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, :prefix_len
         ].to(dtype=torch.int64)
 
         return MatchResult(
@@ -272,129 +168,85 @@ class StreamingSession(BasePrefixCache):
             last_device_node=slot.virtual_node,
             last_host_node=slot.virtual_node,
             best_match_node=slot.virtual_node,
-            cache_protected_len=slot.cache_protected_len,
+            cache_protected_len=slot.kv.cache_protected_len,
         )
 
-    def try_cache_finished_req(
-        self, req: Req, is_insert: bool = True, **kwargs
-    ) -> bool:
-        """Handles a streaming-session finish (save slot / mid-abort nuke).
-        Returns True if handled; False means caller runs its raw path."""
+    def try_cache_finished_req(self, req: Req) -> bool:
+        """Keeps a finished or retracted turn's record in the session slot.
+        An aborted turn gets the record and the tree lock back and is released
+        like any request (returns False); the session re-prefills from its
+        last finished request next turn."""
         if not _is_streaming(req):
             return False
 
         from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
-        session_id = req.session.session_id
-        slot = self.slots.get(session_id)
-        is_first = slot is None
-
-        # Mid-processing abort only. Pre-aborted reqs have session=None
-        # (set in find_active_slot) and never reach here.
-        # Nuke all KV via release_session, delete slot. Token IDs stay
-        # in req_nodes (finish_req was never called -> last successful
-        # req). Next request re-prefills from scratch.
+        slot = self.borrowed_slot(req)
+        assert slot is not None, f"streaming {req.rid=} does not run on its slot"
         if isinstance(req.finished_reason, FINISH_ABORT):
-            if slot is None:
-                # First-request mid-processing abort: create ephemeral
-                # slot from req state so release_session handles cleanup.
-                # Include last_node/cache_protected_len from the req so
-                # release_session calls dec_lock_ref on the tree lock.
-                # Also carry the mamba refs over so _free_slot_mamba can
-                # return the (possibly extra_buffer ping-pong) slots to
-                # the mamba pool; otherwise the abort orphans them.
-                slot = SessionSlot(
-                    req_pool_idx=req.req_pool_idx,
-                    kv_allocated_len=req.kv_allocated_len,
-                    last_node=req.last_node,
-                    cache_protected_len=req.cache_protected_len,
-                    swa_uuid_for_lock=req.swa_uuid_for_lock,
-                    mamba_pool_idx=req.mamba_pool_idx,
-                    mamba_ping_pong_track_buffer=req.mamba_ping_pong_track_buffer,
-                )
-                self.slots[session_id] = slot
-                # Slot now owns the mamba state — drop the req's refs so
-                # the abort fall-through doesn't double-free.
-                req.mamba_pool_idx = None
-                req.mamba_ping_pong_track_buffer = None
-            slot.kv_allocated_len = max(slot.kv_allocated_len, req.kv_allocated_len)
-            self.release_session(session_id)
-            req.req_pool_idx = None
+            # Hand the record and the tree lock back; the caller releases them.
+            del self.slots[req.session.session_id]
+            _move_tree_lock(slot, req)
             req.session.abort_req()
-            self._mark_kv_freed(req)
-            return True
-
-        if is_first:
-            slot = SessionSlot()
-            self.slots[session_id] = slot
+            return False
 
         finished_len = (
             req.finished_len if req.finished_len is not None else len(req.output_ids)
         )
+        target = len(req.origin_input_ids) + finished_len
         self._trim_overshoot(req, finished_len)
 
-        slot.save_from_req(req, is_first=is_first)
+        req.detach_kv()
+        req.swa_branching_seqlen = None
+        slot.publishes_prompt = False
+        # Use the finished length, not the req clock (it lags an in-flight verify
+        # by ~1 under overlap); clamp so committed <= allocated.
+        slot.kv.kv_committed_len = min(target, slot.kv.kv_allocated_len)
 
         # Update req_nodes to this successfully finished request.
         req.session.finish_req(req)
 
-        self._mark_kv_freed(req)
         return True
 
-    def try_cache_unfinished_req(
-        self, req: Req, chunked: bool = False, **kwargs
-    ) -> bool:
-        """Handles a streaming-session mid-flight cache op:
-          - chunked prefill: snapshot current KV as prefix, skip radix
-          - subsequent turn: skip radix (slot already holds KV)
-        Returns False for first-turn non-chunked (caller must run raw radix
-        insert to set up the initial tree lock)."""
-        if not _is_streaming(req):
+    def try_checkpoint(self, req: Req, *, up_to: int, **kwargs) -> bool:
+        """A turn on the slot's record publishes nothing of its own, so only
+        the chunk cursor is kept. The exception is the first prompt: the slot
+        publishes it for other requests to share, and its lock follows the
+        insert."""
+        slot = self.borrowed_slot(req)
+        if slot is None:
             return False
-        if chunked:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.fill_len
-            ]
-            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        if slot.publishes_prompt:
+            _move_tree_lock(slot, req)
+            self.cache.checkpoint_into_tree(req, up_to=up_to, **kwargs)
+            self._lock_to_slot(req, slot)
             return True
-        if req.session.session_id in self.slots:
-            return True
-        return False
+        kv_indices = self.cache.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, :up_to
+        ]
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        return True
 
-    # -- BasePrefixCache abstract methods: thin adapters over try_handle_* --
+    # -- Record ownership --
 
-    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        result = self.try_match_prefix(params)
-        if result is not None:
-            return result
-        return self.inner.match_prefix(params)
-
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
-        if self.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
+    def take(self, req: Req) -> None:
+        """A streaming turn's first row allocation: the session takes the
+        request's record and the tree lock it took at admission, and the
+        request borrows them from here on."""
+        if not _is_streaming(req) or self.borrowed_slot(req) is not None:
             return
-        self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
+        session_id = req.session.session_id
+        assert session_id not in self.slots, f"{session_id=} already has a slot"
+        slot = SessionSlot(kv=req.kv, publishes_prompt=True)
+        self._lock_to_slot(req, slot)
+        self.slots[session_id] = slot
 
-    def cache_unfinished_req(self, req: Req, **kwargs):
-        if self.try_cache_unfinished_req(req, **kwargs):
-            return
-        self.inner.cache_unfinished_req(req, **kwargs)
-
-    def evict(self, params: EvictParams) -> EvictResult:
-        return self.inner.evict(params)
-
-    def inc_lock_ref(self, node: Any) -> IncLockRefResult:
-        result = self.try_inc_lock_ref(node)
-        if result is not None:
-            return result
-        return self.inner.inc_lock_ref(node)
-
-    def dec_lock_ref(
-        self, node: Any, params: Optional[DecLockRefParams] = None
-    ) -> DecLockRefResult:
-        result = self.try_dec_lock_ref(node, params)
-        if result is not None:
-            return result
-        return self.inner.dec_lock_ref(node, params)
+    def borrowed_slot(self, req: Req) -> Optional[SessionSlot]:
+        """The slot whose record the request runs on, if any."""
+        if not _is_streaming(req):
+            return None
+        slot = self.slots.get(req.session.session_id)
+        return slot if slot is not None and slot.kv is req.kv else None
 
     # -- Session lifecycle --
 
@@ -402,237 +254,78 @@ class StreamingSession(BasePrefixCache):
         slot = self.slots.pop(session_id, None)
         if slot is None:
             return
-        protected_len = slot.cache_protected_len
+        protected_len = slot.kv.cache_protected_len
         lock_node = slot.last_node
         tokens_freed = (
-            max(0, slot.kv_allocated_len - protected_len) if slot.is_holding_kv else 0
+            max(0, slot.kv.kv_allocated_len - protected_len) if slot.kv.holds_kv else 0
         )
         logger.info(
             "Session KV released: %s (%d tokens freed)", session_id, tokens_freed
         )
 
         if lock_node is not None:
-            if slot.swa_uuid_for_lock is not None:
-                self.inner.dec_lock_ref(
-                    lock_node,
-                    DecLockRefParams(swa_uuid_for_lock=slot.swa_uuid_for_lock),
-                )
-            else:
-                self.inner.dec_lock_ref(lock_node)
+            # skip_swa is an SWA-cache extension kwarg; a slot can only have
+            # early-released when the cache supports SWA locks.
+            skip = {"skip_swa": True} if slot.swa_prefix_lock_released else {}
+            self.cache.dec_lock_ref(lock_node, slot.lock_receipt, **skip)
 
-        if slot.is_holding_kv:
-            start = protected_len
-            end = slot.kv_allocated_len
-            if start < end:
-                kv_indices = self.req_to_token_pool.req_to_token[
-                    slot.req_pool_idx, start:end
-                ]
-                self.token_to_kv_pool_allocator.free(kv_indices)
-            self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
+        if slot.kv.holds_kv:
+            self.cache.free_kv_row(slot.kv, [(protected_len, slot.kv.kv_allocated_len)])
+            self.cache.req_to_token_pool.free(slot)
 
         self._free_slot_mamba(slot)
 
-    def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        """Total KV tokens held by session slots, not tracked by the tree.
-
-        Excludes slots whose KV is currently owned by an owning request --
-        those tokens are counted via uncached_size in the busy mem check.
-        A slot's pool_idx being in active_pool_idxs indicates a req owns it.
-        """
-        total = 0
-        for slot in self.slots.values():
-            in_batch = (
-                active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
-            )
-            if slot.is_holding_kv and not in_batch:
-                allocated = ceil_align(slot.kv_allocated_len, self.page_size)
-                total += allocated - slot.cache_protected_len
-        return total
-
-    def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        """An alias to align the naming style of SWA"""
-        return self.session_held_tokens(active_pool_idxs)
-
-    def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        """Total SWA tokens held by session slots, not tracked by the tree."""
-        total = 0
-        for slot in self.slots.values():
-            in_batch = (
-                active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
-            )
-            if slot.is_holding_kv and not in_batch:
-                allocated = ceil_align(slot.kv_allocated_len, self.page_size)
-                total += allocated - max(
-                    slot.cache_protected_len, slot.swa_evicted_seqlen
-                )
-        return total
-
-    def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
-        """Number of req pool slots held by session slots."""
-
-        def _owned(s):
-            in_batch = (
-                active_pool_idxs is not None and s.req_pool_idx in active_pool_idxs
-            )
-            return s.is_holding_kv and not in_batch
-
-        return sum(_owned(s) for s in self.slots.values())
-
-    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
-        """Total mamba_pool entries held by session slots (mamba_pool_idx +
-        mamba_ping_pong_track_buffer). Excludes slots whose owning req is
-        currently in the batch -- those slots are counted via the normal
-        alloc/free paths (same convention as the sibling ``session_held_*``
-        accessors).
-        """
-        total = 0
-        for slot in self.slots.values():
-            in_batch = (
-                active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
-            )
-            if in_batch:
-                continue
-            if slot.mamba_pool_idx is not None:
-                total += slot.mamba_pool_idx.numel()
-            if slot.mamba_ping_pong_track_buffer is not None:
-                total += slot.mamba_ping_pong_track_buffer.numel()
-        return total
-
     def _free_slot_mamba(self, slot: SessionSlot) -> None:
         """Return a session slot's mamba pool state to the allocator."""
-        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        mamba_allocator = getattr(self.cache.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is None:
             return
-        if slot.mamba_pool_idx is not None:
-            mamba_allocator.free(slot.mamba_pool_idx.unsqueeze(0))
-            slot.mamba_pool_idx = None
-        if slot.mamba_ping_pong_track_buffer is not None:
-            mamba_allocator.free(slot.mamba_ping_pong_track_buffer)
-            slot.mamba_ping_pong_track_buffer = None
+        if slot.kv.holds_mamba:
+            mamba_allocator.free(slot.kv.mamba_pool_idx.unsqueeze(0))
+            slot.kv.mamba_pool_idx = None
+        if slot.kv.mamba_ping_pong_track_buffer is not None:
+            indices = slot.kv.mamba_ping_pong_track_buffer
+            mamba_allocator.free(indices[indices != -1])
+            slot.kv.mamba_ping_pong_track_buffer = None
 
     # -- Internal helpers (streaming body bits) --
 
-    def _free_tail(self, slot: SessionSlot, req: Req, prefix_len: int) -> None:
-        """match_prefix path: free orphaned KV in [prefix_len, kv_allocated_len)
-        before alloc_for_extend overwrites it. The gap appears when spec
-        decoding pushes allocated above committed, or when retract retry's
-        logit-reserve pulls prefix_len below committed.
-        """
-        self._free_kv_aligned(slot.req_pool_idx, prefix_len, slot.kv_allocated_len)
-        slot.kv_allocated_len = prefix_len
-        slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
-        slot.swa_evicted_seqlen = min(slot.swa_evicted_seqlen, prefix_len)
-        req.kv_allocated_len = prefix_len
-        req.kv_committed_len = min(req.kv_committed_len, prefix_len)
-        req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, prefix_len)
+    def _lock_to_slot(self, req: Req, slot: SessionSlot) -> None:
+        """Move the request's tree lock to the slot; the request is left on the
+        slot's virtual node, where locking is a no-op."""
+        _move_tree_lock(req, slot)
+        req.last_node = slot.virtual_node
+        req.lock_receipt = DecLockRefParams()
+        req.swa_prefix_lock_released = False
+
+    def _free_tail(self, kv: ReqKvInfo, prefix_len: int) -> None:
+        """Free [prefix_len, allocated) before alloc_for_extend overwrites it:
+        spec decoding or a retract retry leaves stale indices there."""
+        self._free_kv_aligned(kv, prefix_len, kv.kv_allocated_len)
+        kv.kv_allocated_len = prefix_len
+        kv.kv_committed_len = min(kv.kv_committed_len, prefix_len)
+        kv.clamp_evicted_seqlens(prefix_len)
 
     def _trim_overshoot(self, req: Req, finished_len: int) -> None:
-        """Trim slot KV to finished_len boundary. Spec v2 may overshoot
-        max_new_tokens (verify round commits M+1 at a time); next turn's
-        input is output_ids[:finished_len], so positions past that must
-        be released to avoid token/KV mismatch.
-        """
+        """Spec v2 can commit past max_new_tokens; the next turn's input is
+        output_ids[:finished_len], so release the KV past it."""
         target = len(req.origin_input_ids) + finished_len
-        self._free_kv_aligned(req.req_pool_idx, target, req.kv_allocated_len)
-        req.kv_allocated_len = min(req.kv_allocated_len, target)
-        req.kv_committed_len = min(req.kv_committed_len, target)
-        req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, target)
+        if self.cache.page_size > 1 and req.kv.max_evicted_seqlen > target:
+            # Same hazard as the match-path rewind: the cursor must stay
+            # page-aligned; the partial page is re-prefilled next turn.
+            target = (target // self.cache.page_size) * self.cache.page_size
+        self._free_kv_aligned(req.kv, target, req.kv.kv_allocated_len)
+        req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
+        req.kv.kv_committed_len = min(req.kv.kv_committed_len, target)
+        req.kv.clamp_evicted_seqlens(target)
         req.output_ids = req.output_ids[:finished_len]
 
-    def _free_kv_aligned(self, pool_idx: int, target: int, end: int) -> None:
-        """Free req_to_token[pool_idx, ceil_align(target):end). Page-aligned
-        because PagedTokenToKVPoolAllocator.free returns whole pages
-        (free_index // page_size), so partial-page free would corrupt pages
-        still holding committed tokens. The range [target, ceil_align(target))
-        stays attached until release_session frees the whole page.
-        """
+    def _free_kv_aligned(self, kv: ReqKvInfo, target: int, end: int) -> None:
+        """Free [ceil_align(target), end): paged free returns whole pages, so
+        the partial page stays until release_session."""
         if end <= target:
             return
         start = target
-        if self.page_size > 1:
-            start = ceil_align(start, self.page_size)
-        if start < end:
-            tail = self.req_to_token_pool.req_to_token[pool_idx, start:end]
-            self.token_to_kv_pool_allocator.free(tail)
-
-    @staticmethod
-    def _mark_kv_freed(req: Req) -> None:
-        """Set bookkeeping flags so busy check skips this finished req."""
-        if not req.kv_committed_freed:
-            req.pop_committed_kv_cache()
-        if not req.kv_overallocated_freed:
-            req.pop_overallocated_kv_cache()
-
-    # -- Pass-through methods --
-
-    def evictable_size(self):
-        return self.inner.evictable_size()
-
-    def full_evictable_size(self):
-        return self.inner.full_evictable_size()
-
-    def swa_evictable_size(self):
-        return self.inner.swa_evictable_size()
-
-    def protected_size(self):
-        return self.inner.protected_size()
-
-    def full_protected_size(self):
-        return self.inner.full_protected_size()
-
-    def swa_protected_size(self):
-        return self.inner.swa_protected_size()
-
-    def total_size(self):
-        return self.inner.total_size()
-
-    def pretty_print(self):
-        return self.inner.pretty_print()
-
-    def init_load_back(self, params: InitLoadBackParams):
-        return self.inner.init_load_back(params)
-
-    def ready_to_load_host_cache(self):
-        return self.inner.ready_to_load_host_cache()
-
-    def flush_write_through_acks(self) -> None:
-        return self.inner.flush_write_through_acks()
-
-    def check_hicache_events(self):
-        return self.inner.check_hicache_events()
-
-    def take_events(self):
-        return self.inner.take_events()
-
-    def supports_swa(self):
-        return self.inner.supports_swa()
-
-    def supports_mamba(self):
-        return self.inner.supports_mamba()
-
-    def supports_streaming_session(self) -> bool:
-        return True
-
-    def is_chunk_cache(self):
-        return self.inner.is_chunk_cache()
-
-    def is_tree_cache(self):
-        return self.inner.is_tree_cache()
-
-    def available_and_evictable_str(self):
-        return self.inner.available_and_evictable_str()
-
-    def init_metrics_collector(self):
-        return self.inner.init_metrics_collector()
-
-    def sanity_check(self):
-        # Skip inner sanity check when sessions hold tree locks, because
-        # the check asserts all nodes are unlocked during idle.
-        if self.any_holding_kv():
-            return
-        self.inner.sanity_check()
-
-    # Forward attribute access for cache-specific methods (e.g.
-    # sliding_window_size, all_values_flatten, etc.)
-    def __getattr__(self, name):
-        return getattr(self.inner, name)
+        if self.cache.page_size > 1:
+            start = ceil_align(start, self.cache.page_size)
+        self.cache.free_kv_row(kv, [(start, end)])

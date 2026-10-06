@@ -6,9 +6,14 @@ from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
+    get_decode_parallel_group_coordinator,
+    get_decode_parallel_rank,
+    get_decode_parallel_world_size,
     get_dp_group,
     get_dp_rank,
     get_dp_world_size,
+    get_encoder_data_parallel_group,
+    get_replica_group,
     get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
@@ -41,6 +46,8 @@ __all__ = [
     "get_world_size",
     # Data parallel group
     "get_dp_group",
+    "get_replica_group",
+    "get_encoder_data_parallel_group",
     "get_dp_rank",
     "get_dp_world_size",
     # Sequence parallel group
@@ -51,6 +58,10 @@ __all__ = [
     "get_tp_group",
     "get_tp_rank",
     "get_tp_world_size",
+    # Decode parallel group
+    "get_decode_parallel_group_coordinator",
+    "get_decode_parallel_rank",
+    "get_decode_parallel_world_size",
     # Get torch device
     "get_local_torch_device",
 ]

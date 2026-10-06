@@ -23,7 +23,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -32,14 +31,13 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_next import Qwen3NextForCausalLM, Qwen3NextModel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_model, get_parallel, get_spec
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
 
 
 class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -50,15 +48,11 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
-        if (
-            is_npu()
-            and get_global_server_args().speculative_draft_model_quantization is None
-        ):
+        if is_npu() and get_spec().speculative_draft_model_quantization is None:
             quant_config = None
         self.quant_config = quant_config
         # if not set, model load will be broken in Qwen3NextForCausalLM load_weights()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         # currently based on the provided ckpt, we:
         # (1) do not use_dedicated_mtp_embeddings provided in ckpt since not provided and directly use the target model embeddings
@@ -69,10 +63,11 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
             config.hidden_size, config.rms_norm_eps
         )
         self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
-        config.num_hidden_layers = 1
-        config.full_attention_interval = 1
+        mtp_config = copy.deepcopy(config)
+        mtp_config.num_hidden_layers = 1
+        mtp_config.full_attention_interval = 1
         self.model = Qwen3NextModel(
-            config,
+            mtp_config,
             quant_config,
             prefix=add_prefix("model", prefix),
             is_nextn=True,
@@ -82,7 +77,7 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         # Mirror Qwen3NextForCausalLM.__init__'s shared-expert fusion setup so
@@ -112,7 +107,7 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         if (
             is_npu()
             and self.quant_config is None
-            and get_global_server_args().quantization is not None
+            and get_model().quantization is not None
         ):
             # ascend mtp unquant
             exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))

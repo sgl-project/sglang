@@ -6,7 +6,8 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.layer_boundary import layer_stack
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -41,7 +42,6 @@ def get_spec_layer_idx_from_weight_name(
 
 
 class SharedHead(nn.Module):
-
     def __init__(
         self,
         config,
@@ -80,9 +80,12 @@ class Step3p5AMultiTokenPredictor(nn.Module):
         self.hnorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
         self.shared_head = SharedHead(config=config, quant_config=quant_config)
-        self.mtp_block = Step3p5DecoderLayer(
-            config=config, layer_id=layer_id, prefix=f"{prefix}.mtp_block"
-        )
+        with layer_stack():
+            self.mtp_block = Step3p5DecoderLayer(
+                config=config,
+                layer_id=layer_id,
+                prefix=f"{prefix}.mtp_block",
+            )
         self.lm_head = self.shared_head.head
 
     def forward(
@@ -107,22 +110,22 @@ class Step3p5AMultiTokenPredictor(nn.Module):
                     dim=-1,
                 )
             )
-        hidden_states, residual = self.mtp_block(
+        residual_batch.start(forward_batch)
+        hidden_states = self.mtp_block(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
-            residual=None,
         )
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         hidden_states_before_norm = None
         if not forward_batch.forward_mode.is_idle():
             # if forward_batch.return_hidden_states_before_norm:
-            hidden_states_before_norm = (
-                hidden_states if residual is None else hidden_states + residual
+            hidden_states_before_norm = residual_batch.snapshot(
+                hidden_states, forward_batch
             )
-            if residual is not None:
-                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-            else:
-                hidden_states = self.shared_head.norm(hidden_states)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.shared_head.norm
+            )
 
         return hidden_states, hidden_states_before_norm
 
@@ -148,7 +151,6 @@ class Step3p5MTP(Step3p5ForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.draft_model_idx = draft_model_idx
 

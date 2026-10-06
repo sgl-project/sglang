@@ -8,7 +8,8 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.layer_boundary import layer_stack
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -19,10 +20,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2DecoderLayer
+from sglang.srt.platforms import current_platform
 
 
 class MiMoMultiTokenPredictorLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -40,9 +41,10 @@ class MiMoMultiTokenPredictorLayer(nn.Module):
         self.input_proj = nn.Linear(
             config.hidden_size * 2, config.hidden_size, bias=False
         )
-        self.mtp_block = Qwen2DecoderLayer(
-            config=config, quant_config=quant_config, prefix=prefix
-        )
+        with layer_stack():
+            self.mtp_block = Qwen2DecoderLayer(
+                config=config, quant_config=quant_config, prefix=prefix
+            )
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -70,13 +72,14 @@ class MiMoMultiTokenPredictorLayer(nn.Module):
             )
         )
 
-        hidden_states, residual = self.mtp_block(
+        residual_batch.start(forward_batch)
+        hidden_states = self.mtp_block(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
-            residual=None,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = residual_batch.fold(hidden_states, forward_batch)
+        hidden_states = residual_batch.take_output(hidden_states, forward_batch)
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states
 
@@ -90,7 +93,6 @@ class MiMoMTP(nn.Module):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
 
         self.model = MiMoMultiTokenPredictorLayer(
@@ -198,8 +200,8 @@ class MiMoMTP(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
 
 EntryClass = MiMoMTP

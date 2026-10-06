@@ -25,8 +25,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
@@ -49,6 +47,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -60,7 +59,7 @@ if _is_cpu and _is_cpu_amx_available:
     import sgl_kernel  # noqa: F401
 
 if _is_npu:
-    from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
         fused_moe_npu as fused_moe,
     )
 else:
@@ -68,7 +67,6 @@ else:
 
 
 class DeepseekMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -96,8 +94,7 @@ class DeepseekMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -109,17 +106,16 @@ class DeepseekMLP(nn.Module):
 
 
 class DeepseekMoE(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__()
         self.config = config
-        self.rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.n_routed_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
         if self.tp_size > self.n_routed_experts:
@@ -129,6 +125,7 @@ class DeepseekMoE(nn.Module):
             )
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=layer_id,
             renormalize=config.norm_topk_prob,
         )
         self.experts = nn.ModuleList(
@@ -229,7 +226,6 @@ class DeepseekMoE(nn.Module):
 
 
 class DeepseekAttention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -244,7 +240,7 @@ class DeepseekAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -315,7 +311,6 @@ class DeepseekAttention(nn.Module):
 
 
 class DeepseekDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -345,6 +340,7 @@ class DeepseekDecoderLayer(nn.Module):
         ):
             self.mlp = DeepseekMoE(
                 config=config,
+                layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
@@ -387,7 +383,6 @@ class DeepseekDecoderLayer(nn.Module):
 
 
 class DeepseekModel(nn.Module):
-
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -441,7 +436,6 @@ class DeepseekModel(nn.Module):
 
 
 class DeepseekForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

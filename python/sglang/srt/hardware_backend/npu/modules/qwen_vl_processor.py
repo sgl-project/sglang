@@ -29,7 +29,7 @@ def transform_patches_to_flatten(
     patch_size: int,
     merge_size: int,
 ) -> torch.Tensor:
-    patches = patches.view(
+    patches = patches.reshape(
         batch_size * grid_t,
         temporal_patch_size * channel,
         grid_h // merge_size,

@@ -41,10 +41,10 @@ class PrefixCacheBranchingMixin:
                 expected_cached_tokens = (
                     branching_pos // cls.cache_chunk_size * cls.cache_chunk_size
                 )
-                assert (
-                    cached_tokens == expected_cached_tokens
-                ), f"{i=}, {cache_hit=}, {cached_tokens=} is not equal to {expected_cached_tokens=}, {branching_pos=}"
+                assert cached_tokens == expected_cached_tokens, (
+                    f"{i=}, {cache_hit=}, {cached_tokens=} is not equal to {expected_cached_tokens=}, {branching_pos=}"
+                )
             else:
-                assert (
-                    cached_tokens == 0
-                ), f"{i=}, {cache_hit=}, {cached_tokens=} is not 0"
+                assert cached_tokens == 0, (
+                    f"{i=}, {cache_hit=}, {cached_tokens=} is not 0"
+                )

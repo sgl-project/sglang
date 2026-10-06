@@ -2,12 +2,12 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
-from sglang.srt.layers.attention.fla.op import safe_exp
-from sglang.srt.layers.attention.fla.utils import (
+from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+from sglang.kernels.ops.attention.fla.op import safe_exp
+from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
 )
-from sglang.srt.layers.attention.fla.wy_fast import recompute_w_u_fwd
+from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd
 
 _MERGE_DOT_PRECISION = tl.constexpr("ieee")
 
@@ -62,12 +62,14 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel_low_reg(
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
-        ).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
+        i_n, i_t = (
+            tl.load(chunk_indices + i_t * 2).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+        )
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
