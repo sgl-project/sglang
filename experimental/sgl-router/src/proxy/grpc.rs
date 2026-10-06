@@ -52,6 +52,15 @@ fn status_breaker_outcome(code: Code) -> BreakerOutcome {
     }
 }
 
+/// The router gave up waiting on the engine: HTTP's 504 `upstream_timeout`.
+fn upstream_timeout() -> Status {
+    router_grpc_status(
+        Code::DeadlineExceeded,
+        "upstream_timeout",
+        "upstream request timed out",
+    )
+}
+
 /// The engine's own status when it ended the stream; the router's own endings
 /// keep the HTTP path's error codes.
 fn into_status(error: std::io::Error) -> Status {
@@ -66,11 +75,7 @@ fn into_status(error: std::io::Error) -> Status {
         return Status::unavailable("upstream stream failed");
     };
     let (code, error_code, message) = match router.reason {
-        StreamEndReason::IdleTimeout => (
-            Code::DeadlineExceeded,
-            "upstream_timeout",
-            "upstream request timed out",
-        ),
+        StreamEndReason::IdleTimeout => return upstream_timeout(),
         StreamEndReason::Expired => (
             Code::DeadlineExceeded,
             "stale_request_expired",
@@ -187,7 +192,7 @@ impl Proxy {
             };
             let chunks = tokio::time::timeout(self.request_timeout, call)
                 .await
-                .unwrap_or_else(|_| Err(Status::deadline_exceeded("upstream request timed out")))
+                .unwrap_or_else(|_| Err(upstream_timeout()))
                 .inspect_err(failed)
                 .map_err(ApiError::UpstreamGrpc)?;
             let status = chunks
@@ -209,11 +214,7 @@ impl Proxy {
             Ok(result) => result.inspect_err(failed).map_err(ApiError::UpstreamGrpc)?,
             Err(_) => {
                 breaker.record_failure();
-                return Err(ApiError::UpstreamGrpc(router_grpc_status(
-                    Code::DeadlineExceeded,
-                    "upstream_timeout",
-                    "upstream request timed out",
-                )));
+                return Err(ApiError::UpstreamGrpc(upstream_timeout()));
             }
         };
         if let Some(status) = first
