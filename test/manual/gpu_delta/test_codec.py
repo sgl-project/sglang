@@ -18,6 +18,7 @@ from sglang.srt.weight_sync.gpu_delta.apply import prepare_status_check
 from sglang.srt.weight_sync.gpu_delta.codec import NvcompDecoder
 from sglang.srt.weight_sync.gpu_delta.layout import (
     PreparedDelta,
+    _plan_decode,
     _PreparedBatch,
 )
 from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation
@@ -128,15 +129,26 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
     with torch.cuda.device(device), torch.cuda.stream(stream):
         prepared.error = torch.zeros(1, dtype=torch.int32, device=device)
         for index, (plan, frames, size) in enumerate(zip(plans, batches, output_sizes)):
-            # This ABI fixture intentionally uses arbitrary frame sizes/offsets,
-            # unlike one publication's fixed natural-tensor frame grid.
-            gaps, cursor = [], 0
-            for _, _, length, offset in frames:
-                if cursor < offset:
-                    gaps.append((cursor, offset - cursor))
-                cursor = offset + length
-            if cursor < size:
-                gaps.append((cursor, size - cursor))
+            binding = SimpleNamespace(name="tensor")
+            mapped, mapped_counts, gaps = _plan_decode(
+                [([(binding, 0, size)], size, None, [])],
+                {
+                    "tensor": {
+                        "frames": [
+                            {
+                                "encoded_offset": f[0],
+                                "encoded_bytes": f[1],
+                                "decoded_offset": f[3],
+                                "decoded_bytes": f[2],
+                            }
+                            for f in frames
+                        ]
+                    }
+                },
+                {"tensor": {"offset": 0}},
+            )
+            np.testing.assert_array_equal(mapped, _frame_table([frames])[0])
+            assert mapped_counts == [len(frames)]
             prepared_batches.append(
                 _PreparedBatch(
                     plan,
@@ -144,7 +156,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
                     [],
                     [
                         decoded[index % stages][offset : offset + length]
-                        for offset, length in gaps
+                        for offset, length in gaps[0]
                     ],
                     prepare_status_check(plan, prepared.error),
                 )

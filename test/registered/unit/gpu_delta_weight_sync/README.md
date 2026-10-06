@@ -73,17 +73,14 @@ Preparation reads, validates and hashes encoded publication files once per engin
 cache index and READY token bind the policy, and all ranks in the original cohort
 must agree. Skipping trusts payload contents without SHA authentication; manifest
 SHA, file identity/size, path, frame-range and decode checks remain in force.
-After encoded-cache READY admission drains global outer validation, the caller keeps
+After encoded-cache READY admission drains global validation, the caller keeps
 only its rank's entries and releases the global manifest before local arena
 planning and decode. Encoded file views remain owned until all decode jobs drain;
 failed preparation never authorizes cache reuse.
 Each rank unwraps only its local tensors directly into its own retained, original
 DE-capable host allocation for CPU and GPU access.
-Preparation validates each consumed tensor's integer offsets, packed input span,
-frame grid, full/tail lengths and nonoverlapping output bounds while packing one
-contiguous numeric table of input offsets, encoded sizes, decoded sizes and output
-offsets. Invalid inner descriptors fail before any DE or model application; foreign
-inner descriptors are checked by their consuming ranks. Vectorized checks
+Preparation packs each publication's frames into one contiguous numeric table of
+input offsets, encoded sizes, decoded sizes and output offsets. Vectorized checks
 also derive workspace geometry and per-slot output bounds. Static layer membership
 is cached; frame lengths, arena offsets and omitted ranges are rebuilt per update.
 Only an independent output-offset row survives alongside pinned/GPU metadata, so
@@ -261,15 +258,13 @@ and omitted-byte ranges in one pass. Frames and payloads remain
 publication-specific. Private arena index/state records use `orjson`; atomic
 replacement and canonical namespace/publication digests are unchanged.
 
-One creator per engine-host validates outer/raw allocation and file ranges,
-including foreign experts, alongside owner-file read/SHA tasks in its existing
-CPU pool. Canonical tensor size and frame count bound each outer allocation
-without scanning inner descriptors. Each task copies into its disjoint retained tmpfs slice and
+One creator per engine-host validates all publication frame metadata, including
+foreign experts, then reads and SHA-256 checks owner files in parallel using its
+existing CPU pool. Each task copies into its disjoint retained tmpfs slice and
 checks source identity/extent across the read; all tasks drain before READY or failure. The
 namespace and build/release mutex bind the original engine participants and delta
 stream; publication metadata binds the manifest path, digest, session and versions.
-READY certifies encoded bytes under the selected hash policy and bounded outer
-geometry; it does not certify inner descriptors. Ranks then
+READY certifies the encoded cache only after verification succeeds. Ranks then
 release the cache lock and independently decode local tensors into their own
 arenas; raw targets are copied beside the inner-codec frames. There is no second
 source-file read, full decoded temporary or intermediate decoded host copy.
@@ -308,11 +303,10 @@ packed path rather than being split into layer batches.
 `host_raw_pack_s` is preparation CPU packing; raw H2D also occurs in preparation.
 
 Preparation reports manifest loading/parsing (`host_manifest_read_parse_s`), plan
-validation (`host_plan_validate_s`), global outer/raw validation
-(`host_encoded_cache_frames_validate_s`), local inner admission and tensor planning
-(`host_tensor_prepare_s`) and full preparation (`host_prepare_s`). The global
-manifest and foreign entries are released after READY, before local decode;
-`host_rank_metadata_release_s` records that release inside full preparation.
+validation (`host_plan_validate_s`), frame validation (`host_encoded_cache_frames_validate_s`),
+local tensor planning (`host_tensor_prepare_s`) and full preparation
+(`host_prepare_s`). Local planning releases the global manifest and foreign
+entries after host verification/decode; that release is included in both spans.
 `host_metadata_prepare_s` covers small GPU input setup and
 status-callback preparation, including its own stream waits (`host_metadata_wait_s`).
 `paused_setup_host_s` includes decoded-slot allocation, output-pointer binding and
@@ -337,8 +331,8 @@ call, so host enqueue durations can contain GPU backpressure.
 
 `host_encoded_cache_created`/`host_encoded_cache_reused` identify the creator
 and followers. Creator-only `host_encoded_cache_read_hash_s` measures submission
-through file verification joins, before waiting for global outer/raw validation.
-Outer/raw validation runs in the same pool and can overlap this span; both are nested
+through file verification joins, before waiting for global frame validation.
+Frame validation runs in the same pool and can overlap this span; both are nested
 inside cache build and must not be added to obtain elapsed time.
 `host_encoded_cache_read_worker_sum_s` and `host_encoded_cache_sha256_worker_sum_s`
 sum file-read and SHA intervals. Each file is read directly into its final retained
@@ -347,7 +341,7 @@ sum is additive with the enclosing wall span, which also includes scheduling and
 `host_encoded_cache_hash_files`, `hash_bytes` and `frames_validations` (with the
 same prefix) count shared work once. `host_encoded_cache_skip_payload_hash` reports
 the cached policy on every rank; skipped SHA worker time, hash bytes and hash files
-are zero, including on the creator. All reads and outer/raw validation drain before
+are zero, including on the creator. All reads and frame validation drain before
 READY or failure returns; rank allocation and local decode start only after both
 pass. `host_encoded_cache_wait_s` isolates the
 cache mutex wait. `host_encoded_cache_build_s` repeats the cached build duration

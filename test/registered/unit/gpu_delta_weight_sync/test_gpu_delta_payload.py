@@ -150,34 +150,26 @@ class TestOuterZstd(unittest.TestCase):
                 memoryview(bytearray(len(raw))),
             ).result()
 
-    def test_outer_span_bounds_before_rank_inner_admission(self):
+    def test_relative_span_accepts_expanded_snappy_without_raw_fallback(self):
         record = entry(bytes(50))
         validate_outer_entries([record], {"owner.bin": 50}, 1 << 16)
         mutations = (
             lambda r: r["outer"].update(decoded_bytes=37),
             lambda r: r["outer"].update(encoded_bytes=51),
             lambda r: r["outer"].update(encoded_bytes=50.0),
+            lambda r: r["frames"][0].update(encoded_offset=16),
+            lambda r: r["frames"][1].update(encoded_offset=15),
+            lambda r: r["frames"][0].update(encoded_offset=False),
+            lambda r: r["frames"][0].update(encoded_bytes=8.5),
+            lambda r: r["frames"][1].update(encoded_bytes=51),
+            lambda r: r["frames"][0].update(decoded_bytes=8),
+            lambda r: r["frames"][1].update(decoded_offset=1),
         )
         for mutate in mutations:
             bad = copy.deepcopy(record)
             mutate(bad)
             with self.subTest(mutation=mutate), self.assertRaises(ValueError):
                 validate_outer_entries([bad], {"owner.bin": 50}, 1 << 16)
-        # Foreign inner descriptors are admitted only by their consuming rank.
-        deferred = copy.deepcopy(record)
-        deferred["frames"] = [{}]
-        validate_outer_entries([deferred], {"owner.bin": 50}, 1 << 16)
-        # Even before inner admission, coherent outer chunks cannot request an
-        # allocation beyond the canonical tensor's maximum encoded span.
-        oversized = copy.deepcopy(record)
-        oversized["outer"]["decoded_bytes"] = record["nbytes"] * 2
-        oversized["outer"]["frames"][0]["decoded_bytes"] = record["nbytes"] * 2
-        with self.assertRaisesRegex(ValueError, "tensor bounds"):
-            validate_outer_entries([oversized], {"owner.bin": 50}, 1 << 16)
-        excess = copy.deepcopy(record)
-        excess["frames"].append(copy.deepcopy(excess["frames"][-1]))
-        with self.assertRaisesRegex(ValueError, "tensor bounds"):
-            validate_outer_entries([excess], {"owner.bin": 50}, 1 << 16)
         with self.assertRaisesRegex(ValueError, "overlapping"):
             validate_outer_entries(
                 [record, copy.deepcopy(record)], {"owner.bin": 50}, 1 << 16
@@ -239,10 +231,10 @@ class TestOuterZstd(unittest.TestCase):
                 ),
             ],
         )
-        validate_outer_entries([record], {"owner.bin": 50}, 1 << 16)
+        validate_outer_entries([record], {"owner.bin": 50}, 1 << 20)
         record["outer"]["frames"][0]["decoded_bytes"] -= 1
         with self.assertRaisesRegex(ValueError, "chunk range"):
-            validate_outer_entries([record], {"owner.bin": 50}, 1 << 16)
+            validate_outer_entries([record], {"owner.bin": 50}, 1 << 20)
 
 
 class TestRawPayload(unittest.TestCase):

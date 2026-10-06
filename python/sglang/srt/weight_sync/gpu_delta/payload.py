@@ -79,10 +79,7 @@ def _reject_overlapping_ranges(ranges):
 
 
 def validate_outer_entries(entries, files, frame_bytes):
-    """Bound outer allocation and file spans, including foreign EP tensors.
-
-    Consuming ranks validate inner frames while constructing their numeric plan.
-    """
+    """Bound reconstructed spans before allocation, including foreign EP tensors."""
     ranges = {name: [] for name in files}
     for entry in entries:
         if entry["encoding"] == "raw_bytes":
@@ -98,11 +95,6 @@ def validate_outer_entries(entries, files, frame_bytes):
             if "outer" in entry:
                 raise ValueError("empty tensor must omit the outer envelope")
             continue
-        nbytes, frame_count = entry["nbytes"], len(frames)
-        # Preserve a pre-allocation cap without walking inner descriptors:
-        # disjoint decoded spans total <= nbytes, each with <=32-byte codec
-        # overhead and at most 15 bytes between aligned encoded frames.
-        maximum = nbytes + nbytes // 6 + 32 * frame_count + 15 * (frame_count - 1)
         name = outer["file"]
         start = outer["encoded_offset"]
         count = outer["encoded_bytes"]
@@ -116,11 +108,32 @@ def validate_outer_entries(entries, files, frame_bytes):
             or count <= 0
             or size <= 0
             or start + count > files[name]
-            or frame_count > (nbytes + frame_bytes - 1) // frame_bytes
-            or size > maximum
         ):
-            raise ValueError("outer Zstd descriptor exceeds payload or tensor bounds")
+            raise ValueError("outer Zstd descriptor exceeds immutable payload")
         _validate_outer_frames(outer)
+        end = decoded_end = 0
+        for frame in frames:
+            offset = frame["encoded_offset"]
+            encoded = frame["encoded_bytes"]
+            decoded_offset = frame["decoded_offset"]
+            decoded = frame["decoded_bytes"]
+            if (
+                type(offset) is not int
+                or type(encoded) is not int
+                or type(decoded_offset) is not int
+                or type(decoded) is not int
+                or offset != (end + 15) // 16 * 16
+                or not 0 < decoded <= frame_bytes
+                or not 0 < encoded <= 32 + decoded + decoded // 6
+                or decoded_offset % frame_bytes
+                or decoded != min(frame_bytes, entry["nbytes"] - decoded_offset)
+                or decoded_offset < decoded_end
+                or decoded_offset + decoded > entry["nbytes"]
+            ):
+                raise ValueError("invalid relative inner compressed frame")
+            end, decoded_end = offset + encoded, decoded_offset + decoded
+        if end != size:
+            raise ValueError("outer decoded length differs from the inner tensor span")
         ranges[name].append((start, start + count))
     _reject_overlapping_ranges(ranges)
 
