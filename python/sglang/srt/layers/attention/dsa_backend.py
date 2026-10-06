@@ -2134,7 +2134,7 @@ class DeepseekSparseAttnBackend(
             ).to(torch.int32)
 
         if dsa_impl == "tilelang":
-            if q_all is None:
+            if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
@@ -2445,7 +2445,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
             )
         elif dsa_impl == "tilelang":
-            if q_all is None:
+            if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
