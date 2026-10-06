@@ -217,9 +217,13 @@ def _natural_key(name):
     )
 
 
-def _tensor_layout(entries):
+def _tensor_layout(entries, records):
     layout, size = {}, 0
     for entry in entries:
+        name = entry["name"]
+        record = records.get(name)
+        if record is None:
+            record = records[name] = {"offset": 0, "nbytes": 0}
         count = (
             (entry["nbytes"] if entry["changed_bytes"] else 0)
             if entry["encoding"] == "raw_bytes"
@@ -227,8 +231,11 @@ def _tensor_layout(entries):
         )
         if count:
             size = (size + 15) // 16 * 16
-            layout[entry["name"]] = {"offset": size, "nbytes": count}
+            record["offset"], record["nbytes"] = size, count
+            layout[name] = record
             size += count
+        else:
+            record["offset"] = record["nbytes"] = 0
     return layout, size
 
 
@@ -337,6 +344,9 @@ class HostArena:
         self.capacity = None
         self.directory = None
         self.tensor_order = None
+        # Like the rank arena, records are reused only after prior apply drains.
+        # Retain names and integers, never publication entries or frame views.
+        self.tensor_records = {}
 
     def _reserve_rank_arena(self, size, metrics):
         import torch
@@ -568,7 +578,7 @@ class HostArena:
                 ),
             )
         entries = [local_entries[i] for i in self.tensor_order]
-        layout, size = _tensor_layout(entries)
+        layout, size = _tensor_layout(entries, self.tensor_records)
         metrics["host_rank_layout_s"] = time.perf_counter() - layout_started
         self._reserve_rank_arena(size, metrics)
         decode_started = time.perf_counter()
