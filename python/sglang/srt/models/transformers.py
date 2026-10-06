@@ -52,7 +52,7 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -936,18 +936,8 @@ class TransformersBase(nn.Module):
         if is_encoder_only:
             logger.info(
                 "Detected encoder-only model (non-causal attention). "
-                "Using RadixAttention with attn_type=ENCODER_ONLY."
+                "Using RadixAttention with is_cross_attention=True."
             )
-        # NOTE: this is a pure self-attention encoder (e.g. BERT/ModernBERT), not
-        # genuine cross-attention to a separately-allocated encoder sequence (e.g.
-        # T5/Whisper). is_cross_attention routes attention backends (xpu_backend,
-        # triton_backend) to forward_batch.encoder_out_cache_loc, which is never
-        # populated for this model shape and crashes with it None. attn_type=
-        # ENCODER_ONLY already gets the same non-causal/bidirectional masking
-        # treatment in those backends without that misrouting.
-        attn_type = (
-            AttentionType.ENCODER_ONLY if is_encoder_only else AttentionType.DECODER
-        )
 
         instances = {}
         for idx in range(self.start_layer, self.end_layer):
@@ -969,7 +959,7 @@ class TransformersBase(nn.Module):
                 layer_id=idx,
                 quant_config=self.quant_config,
                 sliding_window_size=per_layer_sliding_window,
-                attn_type=attn_type,
+                is_cross_attention=is_encoder_only,
                 prefix=f"{idx}.attn",
             )
         return instances
