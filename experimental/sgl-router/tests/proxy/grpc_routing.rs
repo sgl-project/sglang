@@ -406,6 +406,58 @@ async fn typed_unary_rpc_returns_the_engine_reply() {
 }
 
 #[tokio::test]
+async fn text_rpcs_reach_the_engine_as_router_tokens() {
+    let (generates, embeds) = (Seen::new(), Seen::new());
+    let (record_generate, record_embed) = (generates.record(), embeds.record());
+    let port = MockEngine::default()
+        .stream("Generate", move |request: proto::GenerateRequest| {
+            record_generate(request);
+            let reply = proto::GenerateResponse {
+                text: Some("Paris".into()),
+                finished: true,
+                ..Default::default()
+            };
+            stream::iter([Ok(reply)]).boxed()
+        })
+        .unary("Embed", move |request: proto::EmbedRequest| {
+            record_embed(request);
+            proto::EmbedResponse {
+                embedding: vec![0.5],
+                meta_info: Default::default(),
+            }
+        })
+        .start()
+        .await;
+    let mut client = serve_grpc(router_ctx(&[(
+        WorkerMode::Plain,
+        "http://127.0.0.1:1",
+        Some(port),
+    )]))
+    .await;
+
+    let request = proto::TextGenerateRequest {
+        text: "hello world".into(),
+        ..Default::default()
+    };
+    let replies = collect(client.text_generate(request).await).await.unwrap();
+    assert_eq!(replies[0].text, "Paris");
+    let sent = generates.last().await;
+    assert!(!sent.input_ids.is_empty() && sent.return_text == Some(true));
+
+    let request = proto::TextEmbedRequest {
+        text: "hello world".into(),
+        ..Default::default()
+    };
+    let reply = client.text_embed(request).await.unwrap().into_inner();
+    assert_eq!(reply.embedding, [0.5]);
+    assert_eq!(
+        embeds.last().await.input_ids,
+        sent.input_ids,
+        "both tokenize alike"
+    );
+}
+
+#[tokio::test]
 async fn client_cancel_drops_the_engine_call() {
     struct Dropped(tokio::sync::mpsc::UnboundedSender<()>);
     impl Drop for Dropped {

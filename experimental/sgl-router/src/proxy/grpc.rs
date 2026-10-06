@@ -13,7 +13,7 @@ use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, StreamExt};
-use serde_json::{json, Map, Value};
+use serde_json::Value;
 use sglang_grpc_types::sglang::runtime::v1 as proto;
 use sglang_grpc_types::sglang::runtime::v1::sglang_service_client::SglangServiceClient;
 use std::collections::HashMap;
@@ -35,11 +35,12 @@ pub struct GrpcResponse<T> {
 pub trait EngineRpc: Send + Sync + 'static {
     type Reply: PumpItem;
 
-    /// Call the engine; typed requests take the router's additions from `body`.
+    /// Call the engine: OpenAI RPCs send the prepared `body`, typed ones apply `additions`.
     fn call(
         &self,
         client: SglangServiceClient<Channel>,
         body: Bytes,
+        additions: &Additions,
         trace_headers: HashMap<String, String>,
     ) -> RpcFuture<Self::Reply>;
 
@@ -98,6 +99,7 @@ impl EngineRpc for OpenAiRpc {
         &self,
         mut client: SglangServiceClient<Channel>,
         body: Bytes,
+        _: &Additions,
         trace_headers: HashMap<String, String>,
     ) -> RpcFuture<Self::Reply> {
         let request = proto::OpenAiRequest {
@@ -134,6 +136,7 @@ impl EngineRpc for OpenAiUnaryRpc {
         &self,
         mut client: SglangServiceClient<Channel>,
         body: Bytes,
+        _: &Additions,
         trace_headers: HashMap<String, String>,
     ) -> RpcFuture<Self::Reply> {
         let request = proto::OpenAiRequest {
@@ -156,16 +159,34 @@ impl EngineRpc for OpenAiUnaryRpc {
     }
 }
 
-/// A typed RPC, routed through the JSON its HTTP sibling reads.
+/// What routing reads from a typed request, in place of its HTTP route's body.
+pub struct RoutingView<'a> {
+    pub input_ids: &'a [i32],
+    /// The prompt, when it was sent as text rather than `input_ids`.
+    pub text: Option<&'a str>,
+    pub sampling_params: Option<&'a proto::SamplingParams>,
+    pub stream: bool,
+    pub rid: Option<&'a str>,
+}
+
+/// What the router adds to a typed request, as it adds it to an HTTP body.
+#[derive(Clone, Default)]
+pub struct Additions {
+    pub rid: Option<String>,
+    pub bootstrap: Option<proto::DisaggregatedParams>,
+    pub sampling_defaults: Vec<(SamplingField, f64)>,
+    /// Set when the router owns the DP rank; `Some(None)` unpins it.
+    pub routed_dp_rank: Option<Option<u32>>,
+}
+
+/// A typed RPC, prepared from its fields like its HTTP route.
 pub trait TypedRpc: Clone + Send + Sync + 'static {
     type Reply: PumpItem;
 
-    /// The body its HTTP sibling would receive, for the router's preparation.
-    fn view(&self) -> Value;
+    fn view(&self) -> RoutingView<'_>;
 
-    /// Take what the router added to the prepared body: rid, PD bootstrap,
-    /// DP rank and sampling defaults. Fields the proto cannot carry are dropped.
-    fn patch(&mut self, prepared: &Map<String, Value>);
+    /// Take the router's additions; a caller's own values win.
+    fn apply(&mut self, additions: &Additions);
 
     fn send(self, client: SglangServiceClient<Channel>) -> RpcFuture<Self::Reply>;
 }
@@ -178,111 +199,87 @@ impl<T: TypedRpc> EngineRpc for T {
     fn call(
         &self,
         client: SglangServiceClient<Channel>,
-        body: Bytes,
+        _: Bytes,
+        additions: &Additions,
         _: HashMap<String, String>,
     ) -> RpcFuture<T::Reply> {
         let mut request = self.clone();
-        match serde_json::from_slice(&body) {
-            Ok(Value::Object(prepared)) => request.patch(&prepared),
-            _ => return Box::pin(async { Err(Status::internal("unparsable prepared body")) }),
-        }
+        request.apply(additions);
         request.send(client)
     }
 }
 
-/// `sampling_params` as `/generate` reads them: the contract's fields and the output budget.
-fn sampling_view(params: &Option<proto::SamplingParams>) -> Value {
-    let Some(p) = params else {
-        return Value::Null;
-    };
-    json!({
-        "temperature": p.temperature,
-        "top_p": p.top_p,
-        "top_k": p.top_k,
-        "min_p": p.min_p,
-        "repetition_penalty": p.repetition_penalty,
-        "frequency_penalty": p.frequency_penalty,
-        "presence_penalty": p.presence_penalty,
-        "n": p.n,
-        "max_new_tokens": p.max_new_tokens,
-    })
-}
-
-/// The prepared `rid`, unless the caller set one.
-fn patch_rid(rid: &mut Option<String>, prepared: &Map<String, Value>) {
-    if rid.is_none() {
-        *rid = prepared
-            .get("rid")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+/// A sampling contract field as the proto carries it.
+pub fn sampling_value(params: &proto::SamplingParams, field: SamplingField) -> Option<f64> {
+    let float = |value: Option<f32>| value.map(f64::from);
+    match field {
+        SamplingField::Temperature => float(params.temperature),
+        SamplingField::TopP => float(params.top_p),
+        SamplingField::MinP => float(params.min_p),
+        SamplingField::RepetitionPenalty => float(params.repetition_penalty),
+        SamplingField::FrequencyPenalty => float(params.frequency_penalty),
+        SamplingField::PresencePenalty => float(params.presence_penalty),
+        SamplingField::TopK => params.top_k.map(f64::from),
+        SamplingField::N => params.n.map(f64::from),
     }
 }
 
-/// Copy `/generate`'s additions onto a typed generate request.
-fn patch_generation(
-    prepared: &Map<String, Value>,
+fn set_sampling_default(params: &mut proto::SamplingParams, field: SamplingField, value: f64) {
+    let float = Some(value as f32);
+    let slot = match field {
+        SamplingField::Temperature => &mut params.temperature,
+        SamplingField::TopP => &mut params.top_p,
+        SamplingField::MinP => &mut params.min_p,
+        SamplingField::RepetitionPenalty => &mut params.repetition_penalty,
+        SamplingField::FrequencyPenalty => &mut params.frequency_penalty,
+        SamplingField::PresencePenalty => &mut params.presence_penalty,
+        SamplingField::TopK => return params.top_k = params.top_k.or(Some(value as i32)),
+        SamplingField::N => return params.n = params.n.or(Some(value as i32)),
+    };
+    *slot = slot.or(float);
+}
+
+/// Apply `/generate`'s additions to a typed generate request's fields.
+fn apply_generation(
+    additions: &Additions,
     rid: &mut Option<String>,
     routed_dp_rank: &mut Option<i32>,
     disaggregated: &mut Option<proto::DisaggregatedParams>,
     params: &mut Option<proto::SamplingParams>,
 ) {
-    patch_rid(rid, prepared);
-    // The router owns the DP rank when it sets one, as over HTTP; null unpins it.
-    if let Some(rank) = prepared.get("routed_dp_rank") {
-        *routed_dp_rank = rank.as_i64().and_then(|rank| i32::try_from(rank).ok());
+    if rid.is_none() {
+        rid.clone_from(&additions.rid);
     }
-    if let Some(room) = prepared.get("bootstrap_room").and_then(Value::as_i64) {
-        *disaggregated = Some(proto::DisaggregatedParams {
-            bootstrap_host: prepared["bootstrap_host"]
-                .as_str()
-                .unwrap_or_default()
-                .into(),
-            bootstrap_port: prepared["bootstrap_port"].as_i64().unwrap_or_default() as i32,
-            bootstrap_room: room,
-        });
+    if let Some(rank) = additions.routed_dp_rank {
+        *routed_dp_rank = rank.and_then(|rank| i32::try_from(rank).ok());
     }
-    let defaults = &prepared.get("sampling_params").unwrap_or(&Value::Null);
-    let params = params.get_or_insert_with(Default::default);
-    for field in SamplingField::ALL {
-        let Some(value) = defaults[field.wire_name()].as_f64() else {
-            continue;
-        };
-        let (float, int) = (Some(value as f32), Some(value as i32));
-        let slot = match field {
-            SamplingField::Temperature => &mut params.temperature,
-            SamplingField::TopP => &mut params.top_p,
-            SamplingField::MinP => &mut params.min_p,
-            SamplingField::RepetitionPenalty => &mut params.repetition_penalty,
-            SamplingField::FrequencyPenalty => &mut params.frequency_penalty,
-            SamplingField::PresencePenalty => &mut params.presence_penalty,
-            SamplingField::TopK => {
-                params.top_k = params.top_k.or(int);
-                continue;
-            }
-            SamplingField::N => {
-                params.n = params.n.or(int);
-                continue;
-            }
-        };
-        *slot = slot.or(float);
+    if additions.bootstrap.is_some() {
+        disaggregated.clone_from(&additions.bootstrap);
+    }
+    if !additions.sampling_defaults.is_empty() {
+        let params = params.get_or_insert_with(Default::default);
+        for &(field, value) in &additions.sampling_defaults {
+            set_sampling_default(params, field, value);
+        }
     }
 }
 
 impl TypedRpc for proto::GenerateRequest {
     type Reply = proto::GenerateResponse;
 
-    fn view(&self) -> Value {
-        json!({
-            "input_ids": self.input_ids,
-            "sampling_params": sampling_view(&self.sampling_params),
-            "stream": self.stream,
-            "rid": self.rid,
-        })
+    fn view(&self) -> RoutingView<'_> {
+        RoutingView {
+            input_ids: &self.input_ids,
+            text: None,
+            sampling_params: self.sampling_params.as_ref(),
+            stream: self.stream.unwrap_or(false),
+            rid: self.rid.as_deref(),
+        }
     }
 
-    fn patch(&mut self, prepared: &Map<String, Value>) {
-        patch_generation(
-            prepared,
+    fn apply(&mut self, additions: &Additions) {
+        apply_generation(
+            additions,
             &mut self.rid,
             &mut self.routed_dp_rank,
             &mut self.disaggregated_params,
@@ -298,18 +295,19 @@ impl TypedRpc for proto::GenerateRequest {
 impl TypedRpc for proto::TextGenerateRequest {
     type Reply = proto::TextGenerateResponse;
 
-    fn view(&self) -> Value {
-        json!({
-            "text": self.text,
-            "sampling_params": sampling_view(&self.sampling_params),
-            "stream": self.stream,
-            "rid": self.rid,
-        })
+    fn view(&self) -> RoutingView<'_> {
+        RoutingView {
+            input_ids: &[],
+            text: Some(&self.text),
+            sampling_params: self.sampling_params.as_ref(),
+            stream: self.stream.unwrap_or(false),
+            rid: self.rid.as_deref(),
+        }
     }
 
-    fn patch(&mut self, prepared: &Map<String, Value>) {
-        patch_generation(
-            prepared,
+    fn apply(&mut self, additions: &Additions) {
+        apply_generation(
+            additions,
             &mut self.rid,
             &mut self.routed_dp_rank,
             &mut self.disaggregated_params,
@@ -322,19 +320,84 @@ impl TypedRpc for proto::TextGenerateRequest {
     }
 }
 
-/// Unary typed RPCs routed like embeddings: the view is an `input` and only the rid comes back.
+/// `TextGenerate` as `Generate` with the router's tokens, asking for the text back.
+/// Text logprobs are lost, so a request asking for them stays `TextGenerate`.
+pub fn text_to_generate(
+    request: proto::TextGenerateRequest,
+    input_ids: Vec<i32>,
+) -> proto::GenerateRequest {
+    let proto::TextGenerateRequest {
+        text: _,
+        sampling_params,
+        stream,
+        return_logprob,
+        top_logprobs_num,
+        logprob_start_len,
+        return_text_in_logprobs: _,
+        rid,
+        lora_path,
+        routing_key,
+        routed_dp_rank,
+        trace_headers,
+        session_id,
+        disaggregated_params,
+        priority,
+        require_reasoning,
+        max_thinking_tokens,
+        kv_hints,
+    } = request;
+    proto::GenerateRequest {
+        input_ids,
+        sampling_params,
+        stream,
+        return_logprob,
+        top_logprobs_num,
+        logprob_start_len,
+        rid,
+        lora_path,
+        routing_key,
+        routed_dp_rank,
+        trace_headers,
+        session_id,
+        disaggregated_params,
+        priority,
+        require_reasoning,
+        max_thinking_tokens,
+        kv_hints,
+        return_text: Some(true),
+    }
+}
+
+/// The reply a `TextGenerate` caller expects, from `Generate` with `return_text`.
+pub fn generate_to_text(reply: proto::GenerateResponse) -> proto::TextGenerateResponse {
+    proto::TextGenerateResponse {
+        text: reply.text.unwrap_or_default(),
+        meta_info: reply.meta_info,
+        finished: reply.finished,
+    }
+}
+
+/// Unary typed RPCs routed like embeddings: only the rid is added.
 macro_rules! embedding_rpc {
-    ($request:ident -> $reply:ident, $method:ident, |$this:ident| $input:expr) => {
+    ($request:ident -> $reply:ident, $method:ident, |$this:ident| $input_ids:expr, $text:expr) => {
         impl TypedRpc for proto::$request {
             type Reply = proto::$reply;
 
-            fn view(&self) -> Value {
+            fn view(&self) -> RoutingView<'_> {
                 let $this = self;
-                json!({ "input": $input, "rid": self.rid })
+                RoutingView {
+                    input_ids: $input_ids,
+                    text: $text,
+                    sampling_params: None,
+                    stream: false,
+                    rid: self.rid.as_deref(),
+                }
             }
 
-            fn patch(&mut self, prepared: &Map<String, Value>) {
-                patch_rid(&mut self.rid, prepared);
+            fn apply(&mut self, additions: &Additions) {
+                if self.rid.is_none() {
+                    self.rid.clone_from(&additions.rid);
+                }
             }
 
             fn send(self, mut client: SglangServiceClient<Channel>) -> RpcFuture<Self::Reply> {
@@ -347,13 +410,27 @@ macro_rules! embedding_rpc {
     };
 }
 
-embedding_rpc!(EmbedRequest -> EmbedResponse, embed, |r| r.input_ids);
-embedding_rpc!(TextEmbedRequest -> TextEmbedResponse, text_embed, |r| r.text);
-embedding_rpc!(ClassifyRequest -> ClassifyResponse, classify, |r| if r.input_ids.is_empty() {
-    json!(r.text)
-} else {
-    json!(r.input_ids)
-});
+embedding_rpc!(EmbedRequest -> EmbedResponse, embed, |r| &r.input_ids, None);
+embedding_rpc!(TextEmbedRequest -> TextEmbedResponse, text_embed, |r| &[], Some(&r.text));
+embedding_rpc!(ClassifyRequest -> ClassifyResponse, classify, |r| &r.input_ids,
+    Some(r.text.as_str()).filter(|_| r.input_ids.is_empty()));
+
+/// `TextEmbed` as `Embed` with the router's tokens; both reply with an embedding.
+pub fn text_to_embed(request: proto::TextEmbedRequest, input_ids: Vec<i32>) -> proto::EmbedRequest {
+    proto::EmbedRequest {
+        input_ids,
+        rid: request.rid,
+        routing_key: request.routing_key,
+        trace_headers: request.trace_headers,
+    }
+}
+
+pub fn embed_to_text(reply: proto::EmbedResponse) -> proto::TextEmbedResponse {
+    proto::TextEmbedResponse {
+        embedding: reply.embedding,
+        meta_info: reply.meta_info,
+    }
+}
 
 /// A failed call's effect on the breaker; only faults count toward opening it.
 fn status_breaker_outcome(status: &Status) -> BreakerOutcome {
@@ -396,6 +473,7 @@ impl Proxy {
         rpc: &R,
         headers: &HeaderMap,
         body: Bytes,
+        additions: &Additions,
         streaming: bool,
         stream_guards: Option<Box<dyn Send + 'static>>,
         on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
@@ -411,7 +489,7 @@ impl Proxy {
         let permit = breaker.acquire().ok_or_else(|| ApiError::BreakerOpen {
             worker: worker.url.clone(),
         })?;
-        let call = rpc.call(client, body, trace_headers(headers));
+        let call = rpc.call(client, body, additions, trace_headers(headers));
         if !streaming {
             let collect = async { call.await?.collect::<Vec<_>>().await.into_iter().collect() };
             let replies: Vec<_> = tokio::time::timeout(self.request_timeout, collect)
@@ -463,7 +541,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn patch_takes_router_additions_without_overriding_the_caller() {
+    fn apply_adds_router_fields_without_overriding_the_caller() {
         let mut request = proto::GenerateRequest {
             rid: Some("caller".into()),
             routed_dp_rank: Some(3),
@@ -473,26 +551,28 @@ mod tests {
             }),
             ..Default::default()
         };
-        let prepared = json!({
-            "rid": "router",
-            "routed_dp_rank": null,
-            "bootstrap_host": "p", "bootstrap_port": 8998, "bootstrap_room": 42,
-            "sampling_params": {"temperature": 1.0, "top_k": 20},
+        let room = proto::DisaggregatedParams {
+            bootstrap_host: "p".into(),
+            bootstrap_port: 8998,
+            bootstrap_room: 42,
+        };
+        request.apply(&Additions {
+            rid: Some("router".into()),
+            bootstrap: Some(room.clone()),
+            sampling_defaults: vec![
+                (SamplingField::Temperature, 1.0),
+                (SamplingField::TopK, 20.0),
+            ],
+            routed_dp_rank: Some(None),
         });
-        request.patch(prepared.as_object().unwrap());
 
         assert_eq!(request.rid.as_deref(), Some("caller"));
-        assert_eq!(request.routed_dp_rank, None, "a null rank unpins");
+        assert_eq!(
+            request.routed_dp_rank, None,
+            "the router's unpinned rank wins"
+        );
         let params = request.sampling_params.unwrap();
         assert_eq!((params.temperature, params.top_k), (Some(0.5), Some(20)));
-        let room = request.disaggregated_params.unwrap();
-        assert_eq!(
-            (
-                room.bootstrap_host.as_str(),
-                room.bootstrap_port,
-                room.bootstrap_room
-            ),
-            ("p", 8998, 42)
-        );
+        assert_eq!(request.disaggregated_params, Some(room));
     }
 }

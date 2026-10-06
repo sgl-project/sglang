@@ -582,10 +582,13 @@ over HTTP.
 | `Rerank` | `/v1/rerank` |
 
 The OpenAI RPCs carry the HTTP route's JSON body, so they are prepared exactly as
-over HTTP. A typed RPC is prepared through the JSON its HTTP route reads, and the
+over HTTP. A typed RPC is prepared from its fields with the same rules, and the
 router's additions (rid, PD bootstrap, DP rank, sampling defaults) are set on the
-proto it forwards; tokens it computes for `text` steer routing, while the engine
-still tokenizes, since those protos carry no `input_ids`. Other RPCs, such as
+proto it forwards. A text prompt is tokenized once, as its HTTP route forwards
+`input_ids`: `TextGenerate` is sent as `Generate` with `return_text`, so the engine
+still supplies the text, and `TextEmbed` as `Embed`. They stay text RPCs under
+`--disable-input-ids-forwarding`, without a tokenizer, or, for `TextGenerate`, with
+`return_text_in_logprobs`. Other RPCs, such as
 `Tokenize`, `HealthCheck` and the admin RPCs, answer `UNIMPLEMENTED`. Request metadata and `trace_headers`
 act as HTTP headers for routing and forwarding, and a cancelled call aborts the
 engine request. Router errors arrive as a gRPC status carrying the HTTP path's

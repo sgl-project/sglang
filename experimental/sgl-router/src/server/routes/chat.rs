@@ -26,7 +26,8 @@ use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_request, forward_request_grpc, SelectedWorkers};
 use preparation::{
-    parse_embedding_request, parse_routing_fields, PreparedRequest, CLASSIFY_PATH, EMBEDDINGS_PATH,
+    forwarded_prompt_ids, parse_embedding_request, parse_routing_fields, PreparedRequest,
+    CHAT_PATH, CLASSIFY_PATH, COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -137,7 +138,7 @@ pub async fn route_grpc<R: EngineRpc>(
     }
 }
 
-/// [`route_grpc`] for a typed request, prepared through the JSON `endpoint` reads.
+/// [`route_grpc`] for a typed request, prepared from its fields as `endpoint` prepares a body.
 pub async fn route_typed<R: TypedRpc>(
     ctx: &AppContext,
     endpoint: Endpoint,
@@ -147,11 +148,45 @@ pub async fn route_typed<R: TypedRpc>(
     Result<GrpcResponse<R::Reply>, ApiError>,
     Option<RequestLogContext>,
 ) {
-    let mut view = request.view();
-    // Embeddings and classify bodies name a model; it is always the one served here.
-    view["model"] = ctx.config.model.id.clone().into();
-    let body = Bytes::from(view.to_string());
-    route_grpc(ctx, endpoint, request, headers, body).await
+    let start = Instant::now();
+    let prepared = async {
+        let model = ModelId(ctx.config.model.id.clone());
+        let routing = ModelRouting::lookup(ctx, &model)?;
+        let path = endpoint.path();
+        if path != GENERATE_PATH {
+            require_plain_workers(ctx, &model, path)?;
+        }
+        let prepared = PreparedRequest::typed(ctx, path, model, &request.view())?;
+        let workers = routing.select_workers(ctx, &prepared, &headers).await?;
+        Ok((prepared, workers))
+    };
+    match prepared.await {
+        Ok((prepared, workers)) => {
+            forward_request_grpc(request, ctx, prepared, workers, headers, start).await
+        }
+        Err(error) => (Err(error), None),
+    }
+}
+
+/// `text` as the ids `endpoint` would forward in its place over HTTP; `None`
+/// when it keeps the text, as under `--disable-input-ids-forwarding`.
+pub fn prompt_ids(ctx: &AppContext, endpoint: Endpoint, text: &str) -> Option<Vec<i32>> {
+    let model = ModelId(ctx.config.model.id.clone());
+    let ids = forwarded_prompt_ids(ctx, &model, endpoint.path(), text)?;
+    ids.into_iter().map(|id| i32::try_from(id).ok()).collect()
+}
+
+impl Endpoint {
+    fn path(self) -> &'static str {
+        match self {
+            Endpoint::Chat => CHAT_PATH,
+            Endpoint::Completions => COMPLETIONS_PATH,
+            Endpoint::Generate => GENERATE_PATH,
+            Endpoint::Embeddings => EMBEDDINGS_PATH,
+            Endpoint::Classify => CLASSIFY_PATH,
+            Endpoint::Rerank => RERANK_PATH,
+        }
+    }
 }
 
 /// Validate the body and select workers, as `endpoint` does over HTTP.
@@ -195,7 +230,7 @@ async fn prepare(
         Endpoint::Rerank => {
             let model = served_model();
             let routing = ModelRouting::lookup(ctx, &model)?;
-            require_plain_workers(ctx, &model, "/v1/rerank")?;
+            require_plain_workers(ctx, &model, RERANK_PATH)?;
             (routing, PreparedRequest::rerank(model, body)?)
         }
     };

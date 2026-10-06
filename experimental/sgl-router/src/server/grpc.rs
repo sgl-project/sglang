@@ -5,12 +5,17 @@
 //! served so a gRPC client can point at the router or at an engine. Each served
 //! RPC is routed like its HTTP route and forwarded to the same RPC on an engine.
 
-use crate::proxy::grpc::{GrpcResponse, OpenAiRpc, OpenAiUnaryRpc, Replies};
+use crate::proxy::grpc::{
+    embed_to_text, generate_to_text, text_to_embed, text_to_generate, GrpcResponse, OpenAiRpc,
+    OpenAiUnaryRpc, Replies,
+};
 use crate::server::app::pod_id;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{outcome_from_status, RequestLogContext};
-use crate::server::routes::chat::{route_grpc, route_typed, Endpoint, MAX_CHAT_BODY_BYTES};
+use crate::server::routes::chat::{
+    prompt_ids, route_grpc, route_typed, Endpoint, MAX_CHAT_BODY_BYTES,
+};
 use crate::workers::GRPC_MAX_MESSAGE_BYTES;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use bytes::Bytes;
@@ -170,6 +175,45 @@ impl RouterGrpc {
         self.finish(name, headers, call).await.map(Response::new)
     }
 
+    /// Tokenized here, as `/generate` tokenizes `text`, then sent as `Generate` for its text.
+    async fn text_generate(
+        &self,
+        request: Request<proto::TextGenerateRequest>,
+    ) -> Result<Replies<proto::TextGenerateResponse>, Status> {
+        let (headers, request) = request_headers(request, |r| &r.trace_headers);
+        let ids = (request.return_text_in_logprobs != Some(true))
+            .then(|| prompt_ids(&self.ctx, Endpoint::Generate, &request.text))
+            .flatten();
+        let Some(ids) = ids else {
+            let call = route_typed(&self.ctx, Endpoint::Generate, request, headers.clone());
+            return self.finish("TextGenerate", headers, call).await;
+        };
+        let request = text_to_generate(request, ids);
+        let call = route_typed(&self.ctx, Endpoint::Generate, request, headers.clone());
+        let replies = self.finish("TextGenerate", headers, call).await?;
+        Ok(replies.map(|reply| reply.map(generate_to_text)).boxed())
+    }
+
+    /// Tokenized here, as `/v1/embeddings` tokenizes text, then sent as `Embed`.
+    async fn text_embed(
+        &self,
+        request: Request<proto::TextEmbedRequest>,
+    ) -> RpcResult<proto::TextEmbedResponse> {
+        let (headers, request) = request_headers(request, |r| &r.trace_headers);
+        let Some(ids) = prompt_ids(&self.ctx, Endpoint::Embeddings, &request.text) else {
+            let call = route_typed(&self.ctx, Endpoint::Embeddings, request, headers.clone());
+            return self.finish_unary("TextEmbed", headers, call).await;
+        };
+        let call = route_typed(
+            &self.ctx,
+            Endpoint::Embeddings,
+            text_to_embed(request, ids),
+            headers.clone(),
+        );
+        let reply = self.finish_unary("TextEmbed", headers, call).await?;
+        Ok(reply.map(embed_to_text))
+    }
+
     async fn openai_unary(
         &self,
         rpc: OpenAiUnaryRpc,
@@ -242,7 +286,7 @@ sglang_service! {
 
         type TextGenerateStream = Replies<proto::TextGenerateResponse>;
         async fn text_generate(&self, request: Request<proto::TextGenerateRequest>) -> RpcResult<Self::TextGenerateStream> {
-            typed!(self, request, Generate, "TextGenerate", finish).map(Response::new)
+            self.text_generate(request).await.map(Response::new)
         }
 
         async fn embed(&self, request: Request<proto::EmbedRequest>) -> RpcResult<proto::EmbedResponse> {
@@ -250,10 +294,17 @@ sglang_service! {
         }
 
         async fn text_embed(&self, request: Request<proto::TextEmbedRequest>) -> RpcResult<proto::TextEmbedResponse> {
-            typed!(self, request, Embeddings, "TextEmbed", finish_unary)
+            self.text_embed(request).await
         }
 
-        async fn classify(&self, request: Request<proto::ClassifyRequest>) -> RpcResult<proto::ClassifyResponse> {
+        async fn classify(&self, mut request: Request<proto::ClassifyRequest>) -> RpcResult<proto::ClassifyResponse> {
+            // A text prompt is sent as ids, as `/v1/classify` forwards it.
+            let classify = request.get_mut();
+            if classify.input_ids.is_empty() {
+                if let Some(ids) = prompt_ids(&self.ctx, Endpoint::Classify, &classify.text) {
+                    (classify.input_ids, classify.text) = (ids, String::new());
+                }
+            }
             typed!(self, request, Classify, "Classify", finish_unary)
         }
 
