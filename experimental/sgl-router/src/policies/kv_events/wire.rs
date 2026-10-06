@@ -72,7 +72,7 @@ pub struct BlockStored {
     pub block_hashes: Vec<i64>,
     /// Hash of the parent block, or `None` for the first block in a chain.
     pub parent_block_hash: Option<i64>,
-    /// Tokens covered by this block. SGLang uses 32-bit token IDs.
+    /// Informational wire field, skipped during decoding. Always empty.
     pub token_ids: Vec<u32>,
     /// Block size (tokens per block).
     pub block_size: u32,
@@ -98,12 +98,6 @@ pub struct BlockRemoved {
 /// defense-in-depth — but the cost of *not* capping is unbounded memory
 /// amplification, so we cap.
 pub(crate) const MAX_HASHES_PER_EVENT: usize = 65_536;
-/// Same rationale as [`MAX_HASHES_PER_EVENT`], but for `token_ids`. A
-/// 1M-token block list is already absurdly larger than any realistic
-/// `BlockStored` payload — the cap exists to bound the worst case, not
-/// to constrain normal operation.
-pub(crate) const MAX_TOKENS_PER_EVENT: usize = 1_048_576;
-
 /// Errors produced by [`decode_event_batch`].
 #[derive(thiserror::Error, Debug)]
 pub enum DecodeError {
@@ -132,8 +126,8 @@ const PAYLOAD_TOO_LARGE_TAG: &str = "kv_events::wire::PAYLOAD_TOO_LARGE";
 /// payload))` — the topic and 8-byte big-endian sequence number are separate
 /// frames and are NOT part of the msgpack input here.
 ///
-/// Caps the per-event `block_hashes` and `token_ids` lengths
-/// ([`MAX_HASHES_PER_EVENT`], [`MAX_TOKENS_PER_EVENT`]) so a misbehaving
+/// Caps per-event `block_hashes` at [`MAX_HASHES_PER_EVENT`]. Informational
+/// `token_ids` are traversed without retaining their contents, so a misbehaving
 /// worker — or a corrupted msgpack length prefix — cannot trigger an
 /// unbounded allocation in the gateway.
 pub fn decode_event_batch(bytes: &[u8]) -> Result<KvEventBatch, DecodeError> {
@@ -141,7 +135,7 @@ pub fn decode_event_batch(bytes: &[u8]) -> Result<KvEventBatch, DecodeError> {
         Ok(b) => Ok(b),
         Err(e) => {
             // Rewrap the size-cap sentinel into the typed variant. The
-            // sentinel string is set by `BoundedI64Vec` / `BoundedU32Vec`
+            // sentinel string is set by `BoundedI64Vec`
             // below; everything else is a true msgpack decode failure.
             let s = e.to_string();
             if let Some(rest) = s.strip_prefix(PAYLOAD_TOO_LARGE_TAG) {
@@ -153,7 +147,6 @@ pub fn decode_event_batch(bytes: &[u8]) -> Result<KvEventBatch, DecodeError> {
                     if let (Ok(len), Ok(cap)) = (len.parse::<usize>(), cap.parse::<usize>()) {
                         let field = match field {
                             "block_hashes" => "block_hashes",
-                            "token_ids" => "token_ids",
                             // Unknown — fall through to Msgpack.
                             _ => return Err(DecodeError::Msgpack(e)),
                         };
@@ -214,123 +207,6 @@ impl<'de> Deserialize<'de> for BoundedI64Vec {
         }
         let v = deserializer.deserialize_seq(V)?;
         Ok(BoundedI64Vec(v))
-    }
-}
-
-/// One element of a `token_ids` array. SGLang emits a flat `u32` per token for
-/// unigram pages, but a 2-element `[t_i, t_{i+1}]` array per token for *bigram*
-/// pages (`mem_cache/events.py`, `is_bigram` branch — DeepSeek-V4-class models).
-/// `token_ids` is purely informational for the gateway (routing keys off the
-/// engine-provided `block_hashes`), so we accept either shape and flatten the
-/// ints rather than model the bigram pairing.
-enum TokenCell {
-    One(u32),
-    Many(Vec<u32>),
-}
-
-impl<'de> Deserialize<'de> for TokenCell {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = TokenCell;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a token id (u32) or an array of token ids")
-            }
-            // serde's default visit_u8/u16/u32 forward to visit_u64, and
-            // visit_i8/i16/i32 forward to visit_i64, so these two cover every
-            // integer width msgpack might use for a scalar token id.
-            fn visit_u64<E: de::Error>(self, v: u64) -> Result<TokenCell, E> {
-                Ok(TokenCell::One(v as u32))
-            }
-            fn visit_i64<E: de::Error>(self, v: i64) -> Result<TokenCell, E> {
-                Ok(TokenCell::One(v as u32))
-            }
-            fn visit_seq<A>(self, mut seq: A) -> Result<TokenCell, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let mut ts: Vec<u32> = match seq.size_hint() {
-                    Some(h) => Vec::with_capacity(h.min(8)),
-                    None => Vec::new(),
-                };
-                while let Some(t) = seq.next_element::<u32>()? {
-                    if ts.len() >= MAX_TOKENS_PER_EVENT {
-                        return Err(de::Error::custom(format!(
-                            "{PAYLOAD_TOO_LARGE_TAG}:token_ids:{}:{MAX_TOKENS_PER_EVENT}",
-                            ts.len() + 1
-                        )));
-                    }
-                    ts.push(t);
-                }
-                Ok(TokenCell::Many(ts))
-            }
-        }
-        deserializer.deserialize_any(V)
-    }
-}
-
-/// `BoundedI64Vec`'s `u32` twin. Same shape, different cap. Accepts both flat
-/// (unigram) token ids and bigram `[t_i, t_{i+1}]` pairs via [`TokenCell`],
-/// flattening the latter.
-#[derive(Debug, Clone, PartialEq)]
-struct BoundedU32Vec(Vec<u32>);
-
-impl<'de> Deserialize<'de> for BoundedU32Vec {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Vec<u32>;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a msgpack array of u32 values")
-            }
-            fn visit_seq<A>(self, mut seq: A) -> Result<Vec<u32>, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                if let Some(hint) = seq.size_hint() {
-                    if hint > MAX_TOKENS_PER_EVENT {
-                        return Err(de::Error::custom(format!(
-                            "{PAYLOAD_TOO_LARGE_TAG}:token_ids:{hint}:{MAX_TOKENS_PER_EVENT}"
-                        )));
-                    }
-                }
-                let mut out: Vec<u32> = match seq.size_hint() {
-                    Some(h) => Vec::with_capacity(h),
-                    None => Vec::new(),
-                };
-                // Each element is either a scalar token id (unigram) or a
-                // `[t_i, t_{i+1}]` pair (bigram); flatten both into `out`.
-                while let Some(cell) = seq.next_element::<TokenCell>()? {
-                    let push = |t: u32, out: &mut Vec<u32>| -> Result<(), A::Error> {
-                        if out.len() >= MAX_TOKENS_PER_EVENT {
-                            return Err(de::Error::custom(format!(
-                                "{PAYLOAD_TOO_LARGE_TAG}:token_ids:{}:{MAX_TOKENS_PER_EVENT}",
-                                out.len() + 1
-                            )));
-                        }
-                        out.push(t);
-                        Ok(())
-                    };
-                    match cell {
-                        TokenCell::One(t) => push(t, &mut out)?,
-                        TokenCell::Many(ts) => {
-                            for t in ts {
-                                push(t, &mut out)?;
-                            }
-                        }
-                    }
-                }
-                Ok(out)
-            }
-        }
-        let v = deserializer.deserialize_seq(V)?;
-        Ok(BoundedU32Vec(v))
     }
 }
 
@@ -455,7 +331,7 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                             .next_element()?
                             .ok_or_else(|| de::Error::missing_field("block_hashes"))?;
                         let parent_block_hash: Option<i64> = seq.next_element()?.unwrap_or(None);
-                        let token_ids: BoundedU32Vec = seq
+                        let _: IgnoredAny = seq
                             .next_element()?
                             .ok_or_else(|| de::Error::missing_field("token_ids"))?;
                         let block_size: u32 = seq
@@ -470,7 +346,7 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                         Ok(KvCacheEvent::BlockStored(BlockStored {
                             block_hashes: block_hashes.0,
                             parent_block_hash,
-                            token_ids: token_ids.0,
+                            token_ids: Vec::new(),
                             block_size,
                             lora_id,
                             medium,
@@ -505,7 +381,7 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                 let mut tag: Option<String> = None;
                 let mut block_hashes: Option<BoundedI64Vec> = None;
                 let mut parent_block_hash: Option<i64> = None;
-                let mut token_ids: Option<BoundedU32Vec> = None;
+                let mut token_ids: Option<IgnoredAny> = None;
                 let mut block_size: Option<u32> = None;
                 let mut lora_id: Option<i64> = None;
                 let mut medium: Option<String> = None;
@@ -531,9 +407,10 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                             .ok_or_else(|| de::Error::missing_field("block_hashes"))?
                             .0,
                         parent_block_hash,
-                        token_ids: token_ids
-                            .ok_or_else(|| de::Error::missing_field("token_ids"))?
-                            .0,
+                        token_ids: {
+                            token_ids.ok_or_else(|| de::Error::missing_field("token_ids"))?;
+                            Vec::new()
+                        },
                         block_size: block_size
                             .ok_or_else(|| de::Error::missing_field("block_size"))?,
                         lora_id,
@@ -568,7 +445,7 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use rmp::encode as mp;
@@ -591,6 +468,102 @@ mod tests {
         mp::write_array_len(buf, values.len() as u32).unwrap();
         for v in values {
             mp::write_uint(buf, *v as u64).unwrap();
+        }
+    }
+
+    // Realistic long stores followed by a deletion in the same batch.
+    pub(crate) fn long_store_batch(
+        map: bool,
+        bigram: bool,
+        positions: usize,
+        hashes: usize,
+    ) -> Vec<u8> {
+        let mut event = Vec::new();
+        if map {
+            mp::write_map_len(&mut event, 7).unwrap();
+            write_key(&mut event, "type");
+            mp::write_str(&mut event, "BlockStored").unwrap();
+            write_key(&mut event, "block_hashes");
+        } else {
+            write_event_array(&mut event, "BlockStored", 7);
+        }
+        write_i64_array(&mut event, &(100..100 + hashes as i64).collect::<Vec<_>>());
+        if map {
+            write_key(&mut event, "parent_block_hash");
+        }
+        mp::write_nil(&mut event).unwrap();
+        if map {
+            write_key(&mut event, "token_ids");
+        }
+        mp::write_array_len(&mut event, positions as u32).unwrap();
+        for _ in 0..positions {
+            if bigram {
+                mp::write_array_len(&mut event, 2).unwrap();
+            }
+            mp::write_uint(&mut event, 10).unwrap();
+            if bigram {
+                mp::write_uint(&mut event, 20).unwrap();
+            }
+        }
+        if map {
+            write_key(&mut event, "block_size");
+        }
+        mp::write_uint(&mut event, 64).unwrap();
+        if map {
+            write_key(&mut event, "lora_id");
+        }
+        mp::write_nil(&mut event).unwrap();
+        if map {
+            write_key(&mut event, "medium");
+        }
+        mp::write_str(&mut event, "GPU").unwrap();
+        let removed = if map {
+            let mut v = Vec::new();
+            mp::write_map_len(&mut v, 3).unwrap();
+            write_key(&mut v, "type");
+            mp::write_str(&mut v, "BlockRemoved").unwrap();
+            write_key(&mut v, "block_hashes");
+            write_i64_array(&mut v, &[42, 43]);
+            write_key(&mut v, "medium");
+            mp::write_str(&mut v, "GPU").unwrap();
+            v
+        } else {
+            build_block_removed_bytes(&[42, 43], Some("GPU"))
+        };
+        build_batch_bytes(0.0, &[event, removed], Some(0), false)
+    }
+
+    #[test]
+    fn long_tokens_are_discarded_but_hashes_and_sibling_removals_survive() {
+        for map in [false, true] {
+            for (bigram, positions) in [(true, 600_000usize), (false, 1_048_577usize)] {
+                let hashes = positions.div_ceil(64);
+                let bytes = long_store_batch(map, bigram, positions, hashes);
+                let batch = decode_event_batch(&bytes).unwrap();
+                let KvCacheEvent::BlockStored(b) = &batch.events[0] else {
+                    panic!("store")
+                };
+                assert!(b.token_ids.is_empty());
+                assert_eq!(
+                    b.block_hashes,
+                    (100..100 + hashes as i64).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    batch.events[1],
+                    KvCacheEvent::BlockRemoved(BlockRemoved {
+                        block_hashes: vec![42, 43],
+                        medium: Some("GPU".into()),
+                    })
+                );
+            }
+            let bytes = long_store_batch(map, false, 0, MAX_HASHES_PER_EVENT + 1);
+            assert!(matches!(
+                decode_event_batch(&bytes),
+                Err(DecodeError::PayloadTooLarge {
+                    field: "block_hashes",
+                    ..
+                })
+            ));
         }
     }
 
@@ -644,7 +617,7 @@ mod tests {
     /// `[[t_i, t_{i+1}], ...]`. The decoder previously read `token_ids` as a
     /// flat `u32` array and failed the entire batch with
     /// "wrong msgpack marker FixArray(2)", silently disabling cache-aware
-    /// routing. It must instead accept the bigram shape (flattening the ints).
+    /// routing. It must accept and discard the informational bigram field.
     #[test]
     fn decodes_block_stored_with_bigram_token_ids() {
         let event = build_block_stored_bigram_bytes(
@@ -665,8 +638,8 @@ mod tests {
                 assert_eq!(b.block_hashes, vec![111]);
                 assert_eq!(b.parent_block_hash, None);
                 assert_eq!(b.block_size, 2);
-                // bigram pairs are flattened into the (informational) token vec
-                assert_eq!(b.token_ids, vec![10, 20, 20, 30]);
+                // Informational bigram pairs are consumed without retaining tokens.
+                assert!(b.token_ids.is_empty());
             }
             other => panic!("expected BlockStored, got {other:?}"),
         }
@@ -770,7 +743,7 @@ mod tests {
             KvCacheEvent::BlockStored(b) => {
                 assert_eq!(b.block_hashes, vec![1234567890123_i64, -987654321_i64]);
                 assert_eq!(b.parent_block_hash, Some(42));
-                assert_eq!(b.token_ids, vec![10, 20, 30, 40]);
+                assert!(b.token_ids.is_empty());
                 assert_eq!(b.block_size, 4);
                 assert_eq!(b.lora_id, Some(7));
                 assert_eq!(b.medium.as_deref(), Some("GPU"));
@@ -932,7 +905,7 @@ mod tests {
                 KvCacheEvent::BlockStored(b) => {
                     assert_eq!(b.block_hashes, vec![1234567890123_i64, -987654321_i64]);
                     assert_eq!(b.parent_block_hash, Some(42));
-                    assert_eq!(b.token_ids, vec![10, 20, 30, 40]);
+                    assert!(b.token_ids.is_empty());
                     assert_eq!(b.block_size, 4);
                     assert_eq!(b.lora_id, Some(7));
                     assert_eq!(b.medium.as_deref(), Some("GPU"));
@@ -954,7 +927,7 @@ mod tests {
                 KvCacheEvent::BlockStored(b) => {
                     assert_eq!(b.block_hashes, vec![1, 2, 3]);
                     assert_eq!(b.parent_block_hash, None);
-                    assert_eq!(b.token_ids, vec![5, 6]);
+                    assert!(b.token_ids.is_empty());
                     assert_eq!(b.block_size, 16);
                     assert_eq!(b.lora_id, None);
                     assert_eq!(b.medium, None);
@@ -1007,7 +980,7 @@ mod tests {
                 KvCacheEvent::BlockStored(b) => {
                     assert_eq!(b.block_hashes, vec![10]);
                     assert_eq!(b.parent_block_hash, Some(1));
-                    assert_eq!(b.token_ids, vec![1, 2]);
+                    assert!(b.token_ids.is_empty());
                     assert_eq!(b.block_size, 2);
                     assert_eq!(b.lora_id, None);
                     assert_eq!(b.medium.as_deref(), Some("GPU"));
@@ -1062,38 +1035,19 @@ mod tests {
         }
     }
 
-    /// `token_ids` cap — uses an oversize msgpack array length prefix.
-    /// rmp-serde reports `size_hint` from the prefix (an `array_len` is a
-    /// known length), so the visitor refuses before reading any element.
-    /// We deliberately under-fill the array to keep the test cheap; the
-    /// decoder rejects on the prefix alone.
     #[test]
-    fn block_stored_oversize_token_ids_prefix_rejected() {
-        let claimed = (MAX_TOKENS_PER_EVENT + 1) as u32;
-
+    fn truncated_token_ids_still_fail() {
         let mut event = Vec::new();
         write_event_array(&mut event, "BlockStored", 7);
-        write_i64_array(&mut event, &[42_i64]); // block_hashes (small)
-        mp::write_nil(&mut event).unwrap(); // parent_block_hash
-                                            // Oversize token_ids: announce huge length but only write a
-                                            // single element. The visitor's size_hint check fires
-                                            // immediately and we never reach the truncated payload.
-        mp::write_array_len(&mut event, claimed).unwrap();
+        write_i64_array(&mut event, &[42]);
+        mp::write_nil(&mut event).unwrap();
+        mp::write_array_len(&mut event, 1_048_577).unwrap();
         mp::write_uint(&mut event, 0).unwrap();
-        // Trailing bytes after the truncated array are ignored — the
-        // decoder errors out on the size_hint check before reading them.
-
         let bytes = build_batch_bytes(0.0, &[event], None, true);
-
-        let err = decode_event_batch(&bytes).expect_err("oversize token prefix should fail");
-        match err {
-            DecodeError::PayloadTooLarge { field, len, cap } => {
-                assert_eq!(field, "token_ids");
-                assert_eq!(cap, MAX_TOKENS_PER_EVENT);
-                assert_eq!(len, claimed as usize);
-            }
-            other => panic!("expected PayloadTooLarge, got {other:?}"),
-        }
+        assert!(matches!(
+            decode_event_batch(&bytes),
+            Err(DecodeError::Msgpack(_))
+        ));
     }
 
     /// `BlockRemoved` is also covered. Uses the `block_hashes` cap.
@@ -1221,7 +1175,7 @@ mod tests {
             KvCacheEvent::BlockStored(b) => {
                 assert_eq!(b.block_hashes, vec![1234567890123_i64, -987654321_i64]);
                 assert_eq!(b.parent_block_hash, Some(42));
-                assert_eq!(b.token_ids, vec![10, 20, 30, 40]);
+                assert!(b.token_ids.is_empty());
                 assert_eq!(b.block_size, 4);
                 assert_eq!(b.lora_id, Some(7));
                 assert_eq!(b.medium.as_deref(), Some("CPU_PINNED"));
@@ -1274,7 +1228,7 @@ mod tests {
     }
 
     /// Bigram models emit `token_ids` as `[[t_i, t_{i+1}], ...]` in the map
-    /// shape too; the flattening must work through `visit_map`.
+    /// shape too; skipping must work through `visit_map`.
     #[test]
     fn decodes_map_block_stored_with_bigram_token_ids() {
         let mut event = Vec::new();
@@ -1294,7 +1248,7 @@ mod tests {
         let batch = decode_event_batch(&bytes).expect("decode");
         match &batch.events[0] {
             KvCacheEvent::BlockStored(b) => {
-                assert_eq!(b.token_ids, vec![10, 20, 20, 30]);
+                assert!(b.token_ids.is_empty());
             }
             other => panic!("unexpected variant: {:?}", other),
         }

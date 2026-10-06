@@ -71,10 +71,19 @@ pub struct TallyRow {
     pub blocks: u64,
 }
 
-/// Local stream observations, not a proof of complete engine state.
-/// Counters persist across publisher resets and disappear on worker removal.
+/// Fixed decoder failure labels; never include raw error strings.
+pub const DECODE_FAILURE_REASONS: [&str; 4] = [
+    "msgpack",
+    "block_hashes_limit",
+    "frame_count",
+    "sequence_frame",
+];
+
+/// Local observations, not proof of complete engine state.
+/// Counters persist across resets and disappear on worker removal.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamHealth {
+    pub decode_failures: [u64; 4],
     pub gaps: u64,
     pub missing_sequences: u64,
     pub skipped_batches: u64,
@@ -93,6 +102,17 @@ pub struct EventTally {
 impl EventTally {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn record_decode_failure(&self, worker: &KvWorkerId, reason: &'static str) {
+        let slot = DECODE_FAILURE_REASONS
+            .iter()
+            .position(|r| *r == reason)
+            .expect("fixed reason");
+        let mut streams = self.streams.lock();
+        let state = streams.entry(worker.clone()).or_default();
+        state.decode_failures[slot] += 1;
+        state.untrusted = true;
     }
 
     pub fn record_gap(&self, worker: &KvWorkerId, missing: u64) -> bool {

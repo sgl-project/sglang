@@ -232,11 +232,18 @@ fn render_kv_tiers(index: &Arc<crate::policies::kv_events::KvEventIndex>) -> Str
         ("missing_sequences_total", "counter", "Unobserved sequence numbers inside detected forward gaps."),
         ("skipped_batches_total", "counter", "Batches skipped because sequence is no newer than the applied cursor, including duplicates and rollbacks."),
         ("publisher_resets_total", "counter", "Publisher reset sentinels handled by clearing this worker rank's tree and cursor."),
-        ("stream_untrusted", "gauge", "Local index may be stale after an observed gap; cleared by publisher reset or AllBlocksCleared. Zero does not prove complete cache coverage."),
+        ("stream_untrusted", "gauge", "Local index may be stale after an observed gap, rollback, or decode failure; cleared by publisher reset or AllBlocksCleared. Zero does not prove complete cache coverage."),
     ] {
         out.push_str(&format!("# HELP sgl_router_kv_event_{name} {help}\n# TYPE sgl_router_kv_event_{name} {kind}\n"));
     }
+    out.push_str("# HELP sgl_router_kv_event_decode_failures_total KV messages rejected during decoding, by bounded reason.\n# TYPE sgl_router_kv_event_decode_failures_total counter\n");
     for (worker, health) in index.event_tally().stream_snapshot() {
+        for (reason, count) in crate::policies::kv_events::tally::DECODE_FAILURE_REASONS
+            .iter()
+            .zip(health.decode_failures)
+        {
+            out.push_str(&format!("sgl_router_kv_event_decode_failures_total{{worker_url=\"{}\",dp_rank=\"{}\",reason=\"{}\"}} {}\n", escape_label(&worker.url), worker.dp_rank, reason, count));
+        }
         for (name, value) in [
             ("sequence_gaps_total", health.gaps),
             ("missing_sequences_total", health.missing_sequences),
@@ -325,8 +332,10 @@ mod tests {
         let worker = KvWorkerId::new("http://w".into(), 2);
         let tally = index.event_tally();
         tally.record_gap(&worker, 3);
+        tally.record_decode_failure(&worker, "block_hashes_limit");
         tally.record_skipped_batch(&worker, false);
         let text = render_kv_tiers(&index);
+        assert!(text.contains("sgl_router_kv_event_decode_failures_total{worker_url=\"http://w\",dp_rank=\"2\",reason=\"block_hashes_limit\"} 1"));
         for (name, count) in [
             ("sequence_gaps_total", 1),
             ("missing_sequences_total", 3),

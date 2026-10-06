@@ -761,7 +761,12 @@ impl KvEventIndex {
         let tree = Arc::new(HashTree::new());
         let (tx, rx) = mpsc::channel::<WorkerEvent>(EVENT_CHANNEL_BUFFER);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<PumpControl>(16);
-        let subscribers = Arc::new(KvEventSubscriberRegistry::new(tx.clone()));
+        let tally = Arc::new(EventTally::new());
+        let subscribers = Arc::new(KvEventSubscriberRegistry::with_tally(
+            tx.clone(),
+            SubKind::Kv,
+            tally.clone(),
+        ));
         let load_subscribers = Arc::new(KvEventSubscriberRegistry::with_kind(tx, SubKind::Load));
         let engine_load = EngineLoadTable::new();
         let cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -769,7 +774,6 @@ impl KvEventIndex {
         let pump_cancel = CancellationToken::new();
         let peers = Arc::new(PeerRegistry::new());
         let (bootstrap_tx, bootstrap_rx) = mpsc::channel(BOOTSTRAP_QUEUE_DEPTH);
-        let tally = Arc::new(EventTally::new());
         let pump = tokio::spawn(pump_loop(
             PumpDeps {
                 tally: Arc::clone(&tally),
@@ -2938,6 +2942,33 @@ mod tests {
         assert!(h.tally.stream_snapshot().is_empty());
         assert_eq!(rank_count(&tracker, "warm"), 1);
         assert_eq!(h.cursors.lock().get(&id).copied(), Some(7));
+    }
+
+    #[test]
+    fn long_token_batch_applies_sibling_deletions() {
+        use super::super::wire::{decode_event_batch, tests::long_store_batch};
+        for map in [false, true] {
+            for (bigram, positions) in [(true, 600_000usize), (false, 1_048_577usize)] {
+                let tree = HashTree::new();
+                let id = worker_id("http://w1", 0);
+                tree.insert_tiered(&id, None, &[42, 43], Tiers::ALL);
+                let decoded = decode_event_batch(&long_store_batch(
+                    map,
+                    bigram,
+                    positions,
+                    positions.div_ceil(64),
+                ))
+                .unwrap();
+                let cursors = Mutex::new(HashMap::new());
+                let tally = EventTally::new();
+                apply_batch(&tree, &cursors, &tally, &id, 0, &decoded);
+                let counts = tree.tier_occupancy();
+                let (_, counts) = counts.iter().find(|(w, _)| w == &id).unwrap();
+                assert_eq!(counts[0], positions.div_ceil(64) as u64);
+                assert_eq!(counts[1], 2); // device removal preserves host copies
+                assert_eq!(cursors.lock().get(&id).copied(), Some(0));
+            }
+        }
     }
 
     // ---- bootstrap fan-in (take_pending / drain_ready) ----
