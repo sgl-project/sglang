@@ -203,9 +203,7 @@ def test_gluon_ep_keeps_shared_expert_native(monkeypatch):
 def test_gluon_glm_target_ep_fuses_shared_expert(monkeypatch):
     from sglang.srt.models import glm4_moe
 
-    model = glm4_moe.GlmMoeDsaForCausalLM.__new__(
-        glm4_moe.GlmMoeDsaForCausalLM
-    )
+    model = glm4_moe.GlmMoeDsaForCausalLM.__new__(glm4_moe.GlmMoeDsaForCausalLM)
     model.config = SimpleNamespace(n_shared_experts=1)
     monkeypatch.setattr(glm4_moe, "is_shared_experts_fusion_disabled", lambda: False)
 
@@ -481,9 +479,7 @@ def test_glm_nextn_low_m_reuses_three_kernel_target_schedule():
     assert _kernel_name(8, 1, True, 24) == "fused_moe_tp8_m32_256_mtp"
 
 
-@pytest.mark.parametrize(
-    "total_tp,ep_size", ((4, 1), (4, 4), (8, 2), (8, 4), (8, 8))
-)
+@pytest.mark.parametrize("total_tp,ep_size", ((4, 1), (4, 4), (8, 2), (8, 4), (8, 8)))
 @pytest.mark.parametrize("m", (17, 31, 32, 48, 63, 64))
 def test_glm_low_m_uses_exact_kernel(total_tp, ep_size, m):
     from sglang.srt.layers.moe.glm_mxfp4_gluon import _kernel_name
