@@ -14,8 +14,8 @@ from sglang.kernels.ops.diffusion import (
     indexed_scale_shift_mxfp8_,
     mxfp8_quantize_swizzled,
     silu_mul_mxfp8,
-    swiglu_oai_mxfp8,
 )
+from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import swiglu_oai_mxfp8
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     swiglu_no_interleaved_with_alpha_and_limit,
 )

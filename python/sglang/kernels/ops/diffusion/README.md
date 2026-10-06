@@ -37,7 +37,7 @@ norm/        RMSNorm / LayerNorm / GroupNorm and their fused epilogues
 modulate/    adaLN modulate, gating, timestep conditioning
 rope/        rotary embeddings and the QK-norm chains fused into them
 activation/  SiLU / GLU / GELU fusions
-quantization/ MXFP8 producers whose scales land in the GEMM's swizzled layout
+quantization/ FP8 rowwise producers fused into the GEMM input path
 attention/   sparse linear attention, gated delta-net
 routing/     diffusion-model MoE routing and expert selection
 layout/      pure data movement: USP/Ulysses relayout, varlen pack, causal pad
@@ -190,6 +190,8 @@ tensor copy at each residual site.
 | `vdn_delta_factors` | JIT CUDA | `(alpha * inv(I + A), B @ inv(I + A))` in one launch; same fp32 accuracy class as the cholesky + solve_triangular chain (cond-dominated); head_dim 128 |
 
 ### MXFP8 producers (online `mxfp8`, cuBLASLt block-scaled GEMM on SM100)
+
+Defined in `sglang.kernels.ops.quantization.mxfp8_swizzled_triton` and re-exported here.
 
 | Entry point | Backend | Contract |
 |---|---|---|
