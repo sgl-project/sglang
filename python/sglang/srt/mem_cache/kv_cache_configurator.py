@@ -34,7 +34,10 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
 )
-from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_mamba_tracking_slots,
+    get_req_to_token_extra_context_len,
+)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -179,9 +182,6 @@ def mm_runtime_reservation_gb(
 # which the decode-time drop does not shrink.
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
 MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP = 1
-MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
-MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
-MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER = 1
 
 
@@ -723,6 +723,7 @@ class KVCacheConfigurator:
             max_num_reqs=max_num_reqs,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
+            enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
@@ -835,6 +836,7 @@ class KVCacheConfigurator:
             max_num_reqs=max_num_reqs,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
+            enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
@@ -927,6 +929,7 @@ class KVCacheConfigurator:
             swa_max_total_num_tokens=swa_max_total_num_tokens,
             total_bytes=total_bytes,
             enable_memory_saver=get_exec().features.enable_memory_saver,
+            post_capture_active=self.post_capture_kv_active,
             need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
             # Overlap mode: same wait_stream(forward_stream) rationale as
             # `_init_unified_mamba_pools`.
@@ -2173,6 +2176,7 @@ class KVCacheConfigurator:
                     swa_allocator = token_to_kv_pool_allocator.logical_attn_allocator
                 else:
                     swa_allocator = token_to_kv_pool_allocator
+                assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
                 uses_unified_virtual_ids = isinstance(
                     swa_allocator, UnifiedSWAAllocatorBase
                 )
@@ -2193,7 +2197,6 @@ class KVCacheConfigurator:
                     identity_mapping[-1] = -1
                     token_to_kv_pool.register_mapping(identity_mapping)
                 elif not uses_unified_virtual_ids:
-                    assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
                     token_to_kv_pool.register_mapping(
                         swa_allocator.full_to_swa_index_mapping
                     )
@@ -2265,18 +2268,15 @@ class KVCacheConfigurator:
 
         additional_ratio = 0
         if get_exec().mamba.enable_mamba_extra_buffer:
-            # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
-            # Lazy mode saves 1 slot (2 → 1) for overlap; non-overlap already uses 1.
-            if not get_schedule().disable_overlap_schedule:
-                if get_exec().mamba.enable_mamba_extra_buffer_lazy:
-                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY
-                else:
-                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
-            else:
+            if get_schedule().disable_overlap_schedule:
                 assert not get_exec().mamba.enable_mamba_extra_buffer_lazy, (
                     "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
                 )
-                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
+            additional_ratio = get_mamba_tracking_slots(
+                extra_buffer=True,
+                overlap=not get_schedule().disable_overlap_schedule,
+                lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+            )
         elif skip_decode_lock:
             # no_buffer under skip: add the base drop back so effective stays 3,
             # the prefill->decode peak needs ~3 slots/req and this leaf-only mode
