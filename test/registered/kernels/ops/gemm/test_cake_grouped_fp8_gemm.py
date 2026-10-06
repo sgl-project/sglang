@@ -6,7 +6,7 @@ result matches a pure-torch reference within FP8 tolerance; the block-scaled
 contract (packed UE8M0 int32 scales, native ``-1`` padding rows, ``alignment``,
 ``launch(a=..., ...)`` rebinding) is covered when the installed FlashInfer
 provides it. Skips (with the reason) when FlashInfer lacks the Cake modules /
-generated programs or the GPU is not SM100a.
+generated programs or the GPU is not SM100a / SM103a.
 """
 
 import sys
