@@ -43,6 +43,7 @@ _DECOMPRESS_OPTIONS = {
     "lz4-zstd": ("LZ4", _Lz4Options),
 }
 _MAX_FRAME_BYTES = 4 << 20
+_INT64_MAX = np.iinfo(np.int64).max
 
 
 def _require_hardware_device(device: torch.device, algorithm: str) -> int:
@@ -70,14 +71,6 @@ class _Alignments(ctypes.Structure):
         ("output", ctypes.c_size_t),
         ("temp", ctypes.c_size_t),
     ]
-
-
-@dataclass(frozen=True)
-class DecodeFrame:
-    input_offset: int
-    encoded_bytes: int
-    output_offset: int
-    decoded_bytes: int
 
 
 @dataclass
@@ -191,14 +184,9 @@ class NvcompDecoder:
                 f"nvCOMP {self.codec}/{self.backend} failed: status={status}"
             )
 
-    def temporary_bytes(self, frames: Sequence[DecodeFrame]) -> int:
-        if not frames:
+    def temporary_bytes(self, geometry: tuple[int, int, int]) -> int:
+        if not geometry[0]:
             return 0
-        geometry = (
-            len(frames),
-            max(f.decoded_bytes for f in frames),
-            sum(f.decoded_bytes for f in frames),
-        )
         cached = self._temporary_sizes.get(geometry)
         if cached is not None:
             return cached
@@ -216,56 +204,98 @@ class NvcompDecoder:
         self._temporary_sizes[geometry] = size.value
         return size.value
 
-    def allocate_workspace(
-        self, batches: Sequence[Sequence[DecodeFrame]], slot_count: int = 2
-    ) -> DecodeWorkspace:
-        """Allocate small workspace during prepare; retain the decoder to cache queries.
-
-        DE submissions use one stream and share temporary storage. Status and
-        actual-size rows belong to each decoded slot until apply consumes them.
-        """
+    def _allocate_workspace(self, geometry, slot_count) -> DecodeWorkspace:
+        """DE uses one temporary buffer; statuses/sizes belong to decoded slots."""
         from sglang.srt.weight_sync.gpu_delta.memory import require_de_capable
 
-        if slot_count not in (2, 3, 4):
-            raise ValueError("nvCOMP requires 2, 3 or 4 decoded output slots")
-        maximum_count = max((len(batch) for batch in batches), default=0)
-        temporary = max((self.temporary_bytes(batch) for batch in batches), default=0)
-        with torch.cuda.device(self.device):
-            workspace = DecodeWorkspace(
-                torch.empty(temporary, dtype=torch.uint8, device=self.device),
-                torch.empty(
-                    (slot_count, maximum_count), dtype=torch.int64, device=self.device
-                ),
-                torch.empty(
-                    (slot_count, maximum_count), dtype=torch.int32, device=self.device
-                ),
-            )
-            for tensor in (
-                workspace.temporary,
-                workspace.actual_sizes,
-                workspace.statuses,
-            ):
-                if tensor.numel():
-                    require_de_capable(tensor.data_ptr())
+        maximum_count = max((batch[0] for batch in geometry), default=0)
+        temporary = max((self.temporary_bytes(batch) for batch in geometry), default=0)
+        workspace = DecodeWorkspace(
+            torch.empty(temporary, dtype=torch.uint8, device=self.device),
+            torch.empty(
+                (slot_count, maximum_count), dtype=torch.int64, device=self.device
+            ),
+            torch.empty(
+                (slot_count, maximum_count), dtype=torch.int32, device=self.device
+            ),
+        )
+        if temporary and workspace.temporary.data_ptr() % self.alignments.temp:
+            raise ValueError("Misaligned decoder workspace")
+        for tensor in (
+            workspace.temporary,
+            workspace.actual_sizes,
+            workspace.statuses,
+        ):
+            if tensor.numel():
+                require_de_capable(tensor.data_ptr())
         return workspace
+
+    def _frame_geometry(self, table, counts, input_base, input_bytes, slot_count):
+        """Validate numeric rows and derive workspace/output bounds in one pass."""
+        if (
+            table.dtype != np.int64
+            or table.shape != (4, sum(counts))
+            or not table.flags.c_contiguous
+        ):
+            raise ValueError("Expected contiguous int64(4,N) frame metadata")
+        if not 0 <= input_base <= _INT64_MAX - input_bytes:
+            raise ValueError("Input pointer arithmetic exceeds signed metadata")
+        bounds, remainders, geometry = [0] * slot_count, [None] * slot_count, []
+        maximum = self.maximum_chunk_bytes
+        offset = 0
+        for index, count in enumerate(counts):
+            inputs, encoded, decoded, outputs = table[:, offset : offset + count]
+            offset += count
+            slot = index % slot_count
+            if not count:
+                geometry.append((0, 0, 0))
+                continue
+            # HARDWARE does not check oversized buffers. Check actual lengths,
+            # not the compressor's worst-case allocation: compressible 4 MiB
+            # frames can fit the device limit.
+            if (
+                np.any(decoded <= 0)
+                or np.any(decoded > min(_MAX_FRAME_BYTES, maximum))
+                or np.any(encoded <= 0)
+                or np.any(encoded > maximum)
+            ):
+                raise ValueError(
+                    "GPU-delta frames require positive lengths, <=4 MiB "
+                    f"output and both lengths <= device limit {maximum}"
+                )
+            if np.any(inputs < 0) or np.any(inputs > input_bytes - encoded):
+                raise ValueError("Encoded frame outside input allocation")
+            if np.any(outputs < 0) or np.any(outputs > _INT64_MAX - decoded):
+                raise ValueError("Output arithmetic exceeds signed metadata")
+            if np.any(outputs[1:] < outputs[:-1] + decoded[:-1]):
+                raise ValueError("Overlapping or unordered decoded frames")
+            if np.any((inputs + input_base) % self.alignments.input):
+                raise ValueError("Misaligned encoded frame")
+            remainder = outputs % self.alignments.output
+            first = int(remainder[0])
+            if np.any(remainder != first) or remainders[slot] not in (None, first):
+                raise ValueError("Misaligned decoded frame")
+            remainders[slot] = first
+            bounds[slot] = max(bounds[slot], int(outputs[-1] + decoded[-1]))
+            if count > _INT64_MAX // maximum:
+                raise ValueError("Decoded geometry sum exceeds signed metadata")
+            geometry.append((count, int(decoded.max()), int(decoded.sum())))
+        return geometry, bounds, remainders
 
     def prepare_batches(
         self,
-        batches: Sequence[Sequence[DecodeFrame]],
+        table: np.ndarray,
+        counts: Sequence[int],
         host_input: torch.Tensor,
-        workspace: DecodeWorkspace,
         stream: torch.cuda.Stream,
+        slot_count: int = 2,
     ) -> PreparedDecodePlan:
-        """Prepare immutable host-input metadata without allocating decoded output.
+        """Prepare numeric metadata and small workspace without decoded output.
 
-        The host arena admits its allocation's hardware-DE capability once per
-        capacity generation. Its CPU byte view is device-accessible and must stay
-        immutable until the captured DE stream drains. Input and size rows are
-        uploaded now; the output pointer row is filled by ``bind_outputs`` under
-        the serving pause. No decompression is submitted during preparation.
-        All DE submissions share the captured stream and temporary workspace;
-        status validation and weight writes belong to the separate apply stream.
-        ``workspace`` must be allocated for these batches with ``allocate_workspace``.
+        Rows contain relative input offsets, encoded sizes, decoded sizes and
+        relative output offsets. The admitted host arena must stay immutable
+        until the DE stream drains. Only input/size rows are uploaded now;
+        ``bind_outputs`` fills output pointers under the serving pause.
         """
         from sglang.srt.weight_sync.gpu_delta.memory import require_de_capable
 
@@ -275,94 +305,37 @@ class NvcompDecoder:
             or not host_input.is_contiguous()
         ):
             raise ValueError("nvCOMP input must be a contiguous host arena byte view")
-        if (
-            workspace.temporary.device != self.device
-            or workspace.temporary.dtype != torch.uint8
-            or not workspace.temporary.is_contiguous()
-        ):
-            raise ValueError(
-                "nvCOMP workspace must be contiguous bytes on the decoder device"
-            )
         if stream.device != self.device:
             raise ValueError("Decoder stream/device mismatch")
-        maximum_count = max(map(len, batches), default=0)
-        for tensor, dtype in (
-            (workspace.statuses, torch.int32),
-            (workspace.actual_sizes, torch.int64),
-        ):
-            if (
-                tensor.device != self.device
-                or tensor.dtype != dtype
-                or not tensor.is_contiguous()
-                or tensor.ndim != 2
-                or tensor.shape[0] not in (2, 3, 4)
-                or tensor.shape[1] < maximum_count
-            ):
-                raise ValueError("Invalid per-slot status/actual-size capacity")
-        slot_count = workspace.statuses.shape[0]
-        if workspace.actual_sizes.shape[0] != slot_count:
-            raise ValueError("Status and actual-size slot counts differ")
-        if (
-            workspace.temporary.numel()
-            and workspace.temporary.data_ptr() % self.alignments.temp
-        ):
-            raise ValueError("Misaligned decoder workspace")
-        input_base, input_bytes = host_input.data_ptr(), host_input.numel()
-        output_bounds, output_remainders = [0] * slot_count, [None] * slot_count
-        for index, frames in enumerate(batches):
-            slot = index % slot_count
-            prior_output_end = 0
-            for frame in frames:
-                # HARDWARE does not check oversized buffers in nvCOMP. Check
-                # actual lengths, not the compressor's worst-case allocation:
-                # a compressible 4 MiB frame can fit a 4 MiB device limit.
-                if (
-                    not 0 < frame.decoded_bytes <= _MAX_FRAME_BYTES
-                    or frame.decoded_bytes > self.maximum_chunk_bytes
-                    or not 0 < frame.encoded_bytes <= self.maximum_chunk_bytes
-                ):
-                    raise ValueError(
-                        "GPU-delta frames require positive lengths, <=4 MiB "
-                        f"output and both lengths <= device limit {self.maximum_chunk_bytes}"
-                    )
-                if not 0 <= frame.input_offset <= input_bytes - frame.encoded_bytes:
-                    raise ValueError("Encoded frame outside input allocation")
-                if frame.output_offset < prior_output_end:
-                    raise ValueError("Overlapping or unordered decoded frames")
-                if (input_base + frame.input_offset) % self.alignments.input:
-                    raise ValueError("Misaligned encoded frame")
-                remainder = frame.output_offset % self.alignments.output
-                if output_remainders[slot] is None:
-                    output_remainders[slot] = remainder
-                elif remainder != output_remainders[slot]:
-                    raise ValueError("Misaligned decoded frame")
-                prior_output_end = frame.output_offset + frame.decoded_bytes
-            output_bounds[slot] = max(output_bounds[slot], prior_output_end)
-        all_frames = [frame for frames in batches for frame in frames]
+        if slot_count not in (2, 3, 4):
+            raise ValueError("nvCOMP requires 2, 3 or 4 decoded output slots")
+        input_base = host_input.data_ptr()
+        geometry, bounds, remainders = self._frame_geometry(
+            table, counts, input_base, host_input.numel(), slot_count
+        )
         with torch.cuda.device(self.device), torch.cuda.stream(stream):
+            workspace = self._allocate_workspace(geometry, slot_count)
             host = torch.empty(
-                (4, len(all_frames)), dtype=torch.int64, device="cpu", pin_memory=True
+                table.shape, dtype=torch.int64, device="cpu", pin_memory=True
             )
-            host[:3].numpy()[:] = [
-                [input_base + f.input_offset for f in all_frames],
-                [f.encoded_bytes for f in all_frames],
-                [f.decoded_bytes for f in all_frames],
-            ]
+            host_rows = host.numpy()
+            np.add(table[0], input_base, out=host_rows[0])
+            host_rows[1:3] = table[1:3]
             metadata = torch.empty(host.shape, dtype=torch.int64, device=self.device)
             if metadata.numel():
                 require_de_capable(metadata.data_ptr())
                 metadata[:3].copy_(host[:3], non_blocking=True)
         return PreparedDecodePlan(
             self,
-            batches,
+            counts,
             host_input,
             workspace,
             host,
             metadata,
             stream,
-            np.fromiter((frame.output_offset for frame in all_frames), dtype=np.int64),
-            output_bounds,
-            output_remainders,
+            table[3].copy(),
+            bounds,
+            remainders,
         )
 
 
@@ -372,7 +345,7 @@ class PreparedDecodePlan:
     def __init__(
         self,
         decoder,
-        batches,
+        counts,
         host_input,
         workspace,
         host_metadata,
@@ -383,6 +356,7 @@ class PreparedDecodePlan:
         output_remainders,
     ):
         self.decoder, self.stream = decoder, stream
+        self.workspace = workspace
         self.host_metadata, self.metadata = host_metadata, metadata
         self.output_bounds, self.output_remainders = output_bounds, output_remainders
         self.slot_count = len(output_bounds)
@@ -395,8 +369,8 @@ class PreparedDecodePlan:
             workspace.temporary.data_ptr(),
             workspace.temporary.numel(),
         )
-        for index, frames in enumerate(batches):
-            count, slot = len(frames), index % self.slot_count
+        for index, count in enumerate(counts):
+            slot = index % self.slot_count
             rows = metadata[:, offset : offset + count]
             host_rows = host_metadata[:, offset : offset + count]
             statuses = workspace.statuses[slot, :count]

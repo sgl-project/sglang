@@ -70,7 +70,13 @@ source views, failure gating and destination addresses across CUDA graph replay.
 Preparation reads, validates and hashes encoded publication files once per engine-host.
 Each rank unwraps only its local tensors directly into its own retained, original
 DE-capable host allocation for CPU and GPU access.
-Preparation constructs CPU descriptors without reading weights or stopping serving;
+Preparation packs each publication's frames into one contiguous numeric table of
+input offsets, encoded sizes, decoded sizes and output offsets. Vectorized checks
+also derive workspace geometry and per-slot output bounds. Static layer membership
+is cached; frame lengths, arena offsets and omitted ranges are rebuilt per update.
+Only an independent output-offset row survives alongside pinned/GPU metadata, so
+binding paused output pointers cannot overwrite relative offsets or retain the
+transient table. Preparation does not read weights or stop serving;
 it prepares small GPU metadata/workspace and raw-target inputs, but never
 allocates large decoded-mask slots or runs DE/model application.
 There is no staging selector or full-publication HBM copy. Every retained changed

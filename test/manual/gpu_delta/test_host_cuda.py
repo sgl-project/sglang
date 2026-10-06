@@ -14,6 +14,7 @@ import random
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pytest
 import snappy
 import zstandard as zstd
@@ -101,7 +102,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
 
     from sglang.srt.weight_sync.gpu_delta import host as host
     from sglang.srt.weight_sync.gpu_delta import memory as memory
-    from sglang.srt.weight_sync.gpu_delta.codec import DecodeFrame, NvcompDecoder
+    from sglang.srt.weight_sync.gpu_delta.codec import NvcompDecoder
     from sglang.srt.weight_sync.gpu_delta.payload import OuterZstdPool
 
     os.environ["GPU_DELTA_HOST_CACHE_DIR"] = cache
@@ -153,18 +154,17 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                 size = (size + 15) // 16 * 16
                 offsets[name] = size
                 frames.append(
-                    DecodeFrame(
+                    (
                         snapshot.index["tensors"][name]["offset"],
                         entry["frames"][0]["encoded_bytes"],
-                        size,
                         len(expected[name]),
+                        size,
                     )
                 )
                 size += len(expected[name])
             decoder = NvcompDecoder(device, "snappy-zstd")
-            with torch.cuda.stream(stream):
-                workspace = decoder.allocate_workspace([frames])
-            plan = decoder.prepare_batches([frames], source, workspace, stream)
+            table = np.asarray(frames, dtype=np.int64).T.copy()
+            plan = decoder.prepare_batches(table, [len(frames)], source, stream)
             decoded = [
                 torch.empty(size, dtype=torch.uint8, device=device) for _ in range(2)
             ]
@@ -176,9 +176,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                 complete.record(stream)
             complete.synchronize()
             assert plans[0].statuses.tolist() == [0] * len(frames)
-            assert plans[0].actual_sizes.tolist() == [
-                frame.decoded_bytes for frame in frames
-            ]
+            assert plans[0].actual_sizes.tolist() == [frame[2] for frame in frames]
             host_copy = decoded[0].cpu()
             for name, offset in offsets.items():
                 assert (
@@ -192,7 +190,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
             snapshot.close()
             source = None
             assert arena.allocation is not None
-            del plan, plans, workspace, decoded
+            del plan, plans, decoded
             properties, granularity = memory._AllocationProperties(), ctypes.c_size_t()
             driver = arena.allocation.driver
             memory._check(

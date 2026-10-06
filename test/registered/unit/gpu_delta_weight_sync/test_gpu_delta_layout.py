@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -663,6 +664,79 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         self.assertTrue(torch.all(layer.w13_input_scale == 7))
         self.assertTrue(torch.all(layer.w2_input_scale == 11))
 
+    def test_decode_table_preserves_sparse_rows_and_natural_zero_ranges(self):
+        sparse = SimpleNamespace(name="sparse")
+        tail = SimpleNamespace(name="tail")
+        omitted = SimpleNamespace(name="omitted")
+        plans = [
+            ([(sparse, 0, 48), (omitted, 64, 16)], 80, None, []),
+            ([], 0, None, []),
+            ([(tail, 0, 32)], 32, None, []),
+            ([(omitted, 0, 24)], 24, None, []),
+        ]
+        entries = {
+            "sparse": {
+                "frames": [
+                    dict(
+                        encoded_offset=0,
+                        encoded_bytes=3,
+                        decoded_offset=8,
+                        decoded_bytes=8,
+                    ),
+                    dict(
+                        encoded_offset=16,
+                        encoded_bytes=5,
+                        decoded_offset=24,
+                        decoded_bytes=8,
+                    ),
+                ]
+            },
+            "tail": {
+                "frames": [
+                    dict(
+                        encoded_offset=8,
+                        encoded_bytes=7,
+                        decoded_offset=16,
+                        decoded_bytes=8,
+                    )
+                ]
+            },
+            "omitted": {"frames": []},
+        }
+        records = {
+            "sparse": {"offset": 64},
+            "tail": {"offset": 128},
+            "omitted": {"offset": 192},
+        }
+        table, counts, gaps = layout._plan_decode(plans, entries, records)
+        self.assertEqual(table.dtype, np.int64)
+        self.assertTrue(table.flags.c_contiguous)
+        # Native rows are input, encoded size, decoded size, output; batches
+        # retain their index even when empty and output offsets restart at zero.
+        np.testing.assert_array_equal(
+            table,
+            [[64, 80, 136], [3, 5, 7], [8, 8, 8], [8, 24, 16]],
+        )
+        self.assertEqual(counts, [2, 0, 1, 0])
+        self.assertEqual(
+            gaps,
+            [
+                [(0, 8), (16, 8), (32, 16), (64, 16)],
+                [],
+                [(0, 16), (24, 8)],
+                [(0, 24)],
+            ],
+        )  # Tensor alignment padding at [48,64) is deliberately excluded.
+        # Exhausting the iterator is required to emit the last trailing gap
+        # and the later fully omitted batch, even with no frame yields at all.
+        empty, counts, gaps = layout._plan_decode(plans[-1:], entries, records)
+        self.assertEqual(empty.shape, (4, 0))
+        self.assertEqual(counts, [0])
+        self.assertEqual(gaps, [[(0, 24)]])
+        empty, counts, gaps = layout._plan_decode([], entries, records)
+        self.assertEqual(empty.shape, (4, 0))
+        self.assertEqual((counts, gaps), ([], []))
+
     def test_host_direct_batches_defer_outputs_and_reuse_decoded_slots(self):
         for stages in (2, 3, 4):
             with self.subTest(stages=stages):
@@ -815,18 +889,17 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 self.device, self.codec = device, codec
                 operations.append(("decoder_created", codec))
 
-            def allocate_workspace(self, batches, slot_count):
+            def prepare_batches(self, table, counts, host, stream, slot_count=2):
                 assert slot_count == stages
-                return SimpleNamespace(temporary=torch.empty(0))
-
-            def prepare_batches(self, batches, host, workspace, stream):
-                operations.append(("prepare_decoder", len(batches)))
+                operations.append(("prepare_decoder", len(counts)))
 
                 decoded_slots = []
-                plans = [
-                    self._prepare(index, frames, host, decoded_slots)
-                    for index, frames in enumerate(batches)
-                ]
+                plans, offset = [], 0
+                for index, count in enumerate(counts):
+                    frames = table[:, offset : offset + count].T.tolist()
+                    plans.append(self._prepare(index, frames, host, decoded_slots))
+                    offset += count
+                assert offset == table.shape[1]
 
                 def bind_outputs(decoded):
                     operations.append(("bind_outputs", len(decoded)))
@@ -836,29 +909,34 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         slot.fill_(0xA5)
                     return plans
 
-                return SimpleNamespace(bind_outputs=bind_outputs, batches=plans)
+                return SimpleNamespace(
+                    bind_outputs=bind_outputs,
+                    batches=plans,
+                    workspace=SimpleNamespace(temporary=torch.empty(0)),
+                )
 
             def _prepare(self, index, frames, host, decoded_slots):
                 def enqueue():
                     decoded = decoded_slots[index % stages]
                     operations.append(("decode", index))
                     decoded_batches.append((index, decoded.data_ptr(), frames))
-                    for frame in frames:
-                        data = host[
-                            frame.input_offset : frame.input_offset
-                            + frame.encoded_bytes
-                        ]
+                    for (
+                        input_offset,
+                        encoded_bytes,
+                        decoded_bytes,
+                        output_offset,
+                    ) in frames:
+                        data = host[input_offset : input_offset + encoded_bytes]
                         if self.codec == "snappy-zstd":
-                            assert data[0] == frame.decoded_bytes
-                            assert data[1] == (frame.decoded_bytes - 1) << 2
+                            assert data[0] == decoded_bytes
+                            assert data[1] == (decoded_bytes - 1) << 2
                             payload = data[2:]
                         else:
-                            assert data[0] == min(frame.decoded_bytes, 15) << 4
-                            payload = data[2 if frame.decoded_bytes >= 15 else 1 :]
-                        decoded[
-                            frame.output_offset : frame.output_offset
-                            + frame.decoded_bytes
-                        ].copy_(payload)
+                            assert data[0] == min(decoded_bytes, 15) << 4
+                            payload = data[2 if decoded_bytes >= 15 else 1 :]
+                        decoded[output_offset : output_offset + decoded_bytes].copy_(
+                            payload
+                        )
 
                 return SimpleNamespace(enqueue=enqueue, index=index)
 

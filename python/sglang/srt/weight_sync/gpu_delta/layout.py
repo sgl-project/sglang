@@ -16,8 +16,10 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
+from itertools import chain
 from typing import Callable
 
+import numpy as np
 import orjson
 import torch
 
@@ -244,30 +246,37 @@ def _plan_layers(backend, bindings, entries, layers_per_batch=1):
     return backend.batch_plan[1]
 
 
-def _plan_decode(outputs, entries, records):
-    """Point DE at host frames and collect omitted output bytes in one pass."""
-    from sglang.srt.weight_sync.gpu_delta.codec import DecodeFrame
+def _plan_decode(plans, entries, records):
+    """Pack fresh frame rows and omitted ranges for every cached layer batch."""
+    counts = [
+        sum(len(entries[binding.name]["frames"]) for binding, _, _ in outputs)
+        for outputs, _, _, _ in plans
+    ]
+    gaps = [[] for _ in plans]
 
-    frames, gaps = [], []
-    for binding, decoded_offset, size in outputs:
-        encoded_offset = records[binding.name]["offset"]
-        cursor = 0
-        for frame in entries[binding.name]["frames"]:
-            start, count = frame["decoded_offset"], frame["decoded_bytes"]
-            if cursor < start:
-                gaps.append((decoded_offset + cursor, start - cursor))
-            frames.append(
-                DecodeFrame(
-                    encoded_offset + frame["encoded_offset"],
-                    frame["encoded_bytes"],
-                    decoded_offset + start,
-                    count,
-                )
-            )
-            cursor = start + count
-        if cursor < size:
-            gaps.append((decoded_offset + cursor, size - cursor))
-    return frames, gaps
+    def rows():
+        for batch, (outputs, _, _, _) in enumerate(plans):
+            for binding, output_offset, size in outputs:
+                input_offset = records[binding.name]["offset"]
+                cursor = 0
+                for frame in entries[binding.name]["frames"]:
+                    start, decoded = frame["decoded_offset"], frame["decoded_bytes"]
+                    if cursor < start:
+                        gaps[batch].append((output_offset + cursor, start - cursor))
+                    yield (
+                        input_offset + frame["encoded_offset"],
+                        frame["encoded_bytes"],
+                        decoded,
+                        output_offset + start,
+                    )
+                    cursor = start + decoded
+                if cursor < size:
+                    gaps[batch].append((output_offset + cursor, size - cursor))
+
+    # Exhaust the iterator: its final yield can precede trailing gaps and fully
+    # omitted tensors. Contiguous rows match nvCOMP's pointer/size arrays.
+    table = np.fromiter(chain.from_iterable(rows()), dtype=np.int64)
+    return table.reshape(sum(counts), 4).T.copy(order="C"), counts, gaps
 
 
 def _canonical_views(views):
@@ -444,12 +453,9 @@ class PreparedDelta:
         self.timings["host_batch_plan_reused"] = int(
             previous_plan is not None and backend.batch_plan is previous_plan
         )
-        planned = [
-            _plan_decode(outputs, entries, self.host_snapshot.index["tensors"])
-            for outputs, _, _, _ in self.static_plans
-        ]
-        frame_plans = [frames for frames, _ in planned]
-        self.gaps = [gaps for _, gaps in planned]
+        frame_table, frame_counts, self.gaps = _plan_decode(
+            self.static_plans, entries, self.host_snapshot.index["tensors"]
+        )
         self.max_decoded = max((plan[1] for plan in self.static_plans), default=0)
         self.matrix_tensor_count = len(compressed)
         self.raw_tensor_count = len(raw_entries)
@@ -490,16 +496,14 @@ class PreparedDelta:
             decode_stages=self.decode_stages,
             layers_per_batch=layers_per_batch,
             compressed_tensors=self.matrix_tensor_count,
-            de_host_input_bytes=sum(
-                frame.encoded_bytes for frames in frame_plans for frame in frames
-            ),
+            de_host_input_bytes=int(frame_table[1].sum()),
             decoded_zero_ranges=sum(map(len, self.gaps)),
             decoded_zero_bytes=sum(size for gaps in self.gaps for _, size in gaps),
         )
-        self._prepare_gpu_metadata(frame_plans, raw_targets)
+        self._prepare_gpu_metadata(frame_table, frame_counts, raw_targets)
         self.timings["host_prepare_s"] = time.perf_counter() - preparation_started
 
-    def _prepare_gpu_metadata(self, frame_plans, raw_targets):
+    def _prepare_gpu_metadata(self, frame_table, frame_counts, raw_targets):
         """Prepare small GPU inputs; retain their leases, not wire-frame objects."""
         from sglang.srt.weight_sync.gpu_delta.codec import NvcompDecoder
 
@@ -540,15 +544,14 @@ class PreparedDelta:
                 backend.decoders[self.codec] = NvcompDecoder(self.device, self.codec)
             decoder = backend.decoders[self.codec]
             with torch.cuda.stream(self.de_stream):
-                self.workspace = decoder.allocate_workspace(
-                    frame_plans, slot_count=self.decode_stages
-                )
                 self.decode_plan = decoder.prepare_batches(
-                    frame_plans,
+                    frame_table,
+                    frame_counts,
                     backend.host_arena.tensor,
-                    self.workspace,
                     self.de_stream,
+                    slot_count=self.decode_stages,
                 )
+                self.workspace = self.decode_plan.workspace
             from sglang.srt.weight_sync.gpu_delta.apply import prepare_status_check
 
             with torch.cuda.stream(self.stream):
@@ -567,7 +570,7 @@ class PreparedDelta:
         self.timings.update(
             host_metadata_prepare_s=time.perf_counter() - started,
             host_metadata_wait_s=time.perf_counter() - waiting,
-            decoder_metadata_h2d_bytes=4 * 8 * sum(map(len, frame_plans)),
+            decoder_metadata_h2d_bytes=frame_table.nbytes,
             decoder_workspace_bytes=self.workspace.temporary.numel()
             if self.workspace
             else 0,

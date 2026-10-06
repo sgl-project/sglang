@@ -10,17 +10,24 @@ import sys
 import weakref
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 from sglang.srt.weight_sync.gpu_delta.apply import prepare_status_check
-from sglang.srt.weight_sync.gpu_delta.codec import DecodeFrame, NvcompDecoder
+from sglang.srt.weight_sync.gpu_delta.codec import NvcompDecoder
 from sglang.srt.weight_sync.gpu_delta.layout import (
     PreparedDelta,
     _plan_decode,
     _PreparedBatch,
 )
 from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation
+
+
+def _frame_table(batches):
+    rows = [row for batch in batches for row in batch]
+    table = np.asarray(rows, dtype=np.int64).reshape(-1, 4).T.copy()
+    return table, list(map(len, batches))
 
 
 def _encode(values, codec, offsets=None):
@@ -40,7 +47,7 @@ def _encode(values, codec, offsets=None):
             offset = offsets[index]
         payload.extend(bytes((-len(payload)) % 16))
         encoded = compress(value)
-        frames.append(DecodeFrame(len(payload), len(encoded), offset, len(value)))
+        frames.append((len(payload), len(encoded), len(value), offset))
         payload.extend(encoded)
         offset += len(value)
     return payload, frames
@@ -61,7 +68,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
         [bytes([7]) * (64 << 10), bytes(range(251)) * 3],
     ]
     payload_a, frames_a = _encode(values[0], codec)
-    assert frames_a[1].decoded_bytes == 4 << 20
+    assert frames_a[1][2] == 4 << 20
     assert decoder.backend == "hardware" and decoder._options.backend == 1
     # A different frame count, partial final frame and sparse output offsets
     # exercise views whose row stride is the complete metadata slab's width.
@@ -74,20 +81,16 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
     batches = [
         frames_a,
         [
-            DecodeFrame(
-                input_b + f.input_offset,
-                f.encoded_bytes,
-                f.output_offset,
-                f.decoded_bytes,
-            )
-            for f in frames_b
+            (input_b + offset, encoded, decoded, output)
+            for offset, encoded, decoded, output in frames_b
         ],
     ]
     batches = [batches[index % 2] for index in range(2 * stages + 1)]
     stream = torch.cuda.Stream(device=device)
     de_stream = torch.cuda.Stream(device=device)
-    workspace = decoder.allocate_workspace(batches, slot_count=stages)
-    plan = decoder.prepare_batches(batches, host, workspace, de_stream)
+    table, counts = _frame_table(batches)
+    plan = decoder.prepare_batches(table, counts, host, de_stream, stages)
+    workspace = plan.workspace
     # Large outputs are allocated only at the paused binding boundary.
     decoded = [
         torch.empty(sum(map(len, values[0])), dtype=torch.uint8, device=device)
@@ -116,9 +119,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
     # B leaves a prefix, an interior hole and a short tail; the unused part of
     # larger scratch retains its prior bytes and is not read by B's apply plan.
     output_sizes = [
-        decoded[0].numel()
-        if index % 2 == 0
-        else frames_b[-1].output_offset + frames_b[-1].decoded_bytes + 64
+        decoded[0].numel() if index % 2 == 0 else frames_b[-1][3] + frames_b[-1][2] + 64
         for index in range(len(batches))
     ]
     prepared_batches = []
@@ -129,16 +130,16 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
         prepared.error = torch.zeros(1, dtype=torch.int32, device=device)
         for index, (plan, frames, size) in enumerate(zip(plans, batches, output_sizes)):
             binding = SimpleNamespace(name="tensor")
-            mapped, gaps = _plan_decode(
-                [(binding, 0, size)],
+            mapped, mapped_counts, gaps = _plan_decode(
+                [([(binding, 0, size)], size, None, [])],
                 {
                     "tensor": {
                         "frames": [
                             {
-                                "encoded_offset": f.input_offset,
-                                "encoded_bytes": f.encoded_bytes,
-                                "decoded_offset": f.output_offset,
-                                "decoded_bytes": f.decoded_bytes,
+                                "encoded_offset": f[0],
+                                "encoded_bytes": f[1],
+                                "decoded_offset": f[3],
+                                "decoded_bytes": f[2],
                             }
                             for f in frames
                         ]
@@ -146,7 +147,8 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
                 },
                 {"tensor": {"offset": 0}},
             )
-            assert mapped == frames
+            np.testing.assert_array_equal(mapped, _frame_table([frames])[0])
+            assert mapped_counts == [len(frames)]
             prepared_batches.append(
                 _PreparedBatch(
                     plan,
@@ -154,7 +156,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
                     [],
                     [
                         decoded[index % stages][offset : offset + length]
-                        for offset, length in gaps
+                        for offset, length in gaps[0]
                     ],
                     prepare_status_check(plan, prepared.error),
                 )
@@ -194,7 +196,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
         expected[: output_sizes[index]] = bytes(output_sizes[index])
         source_values = values[index % 2]
         for frame, value in zip(batches[index], source_values):
-            expected[frame.output_offset : frame.output_offset + len(value)] = value
+            expected[frame[3] : frame[3] + len(value)] = value
         assert statuses.tolist() == [0] * len(batches[index])
         assert sizes.tolist() == list(map(len, source_values))
         assert plans[index].expected_sizes.tolist() == sizes.tolist()
@@ -266,17 +268,13 @@ def test_rejects_frame_range_before_decode():
         torch.empty(256, dtype=torch.uint8, device=device) for _ in range(2)
     )
     stream = torch.cuda.Stream(device=device)
-    good = [DecodeFrame(0, 32, 0, 128)]
-    workspace = decoder.allocate_workspace([good])
+    good = [(0, 32, 128, 0)]
     with pytest.raises(ValueError, match="outside input"):
         decoder.prepare_batches(
-            [good, [DecodeFrame(240, 32, 0, 128)]],
-            host,
-            workspace,
-            stream,
+            *_frame_table([good, [(240, 32, 128, 0)]]), host, stream
         )
     plan = decoder.prepare_batches(
-        [good, [DecodeFrame(0, 32, 250, 128)]], host, workspace, stream
+        *_frame_table([good, [(0, 32, 128, 240)]]), host, stream
     )
     with pytest.raises(ValueError, match="Out-of-bounds"):
         plan.bind_outputs(decoded)
