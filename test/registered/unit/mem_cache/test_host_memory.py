@@ -34,13 +34,20 @@ class TestHostMemory(unittest.TestCase):
             f"1 0 0:1 {mount_root} {escaped} rw - {filesystem} cgroup {options}\n"
         )
 
-    def memory(self, path, usage, maximum="max", high="max", v1=False, stat=None):
+    def memory(
+        self, path, usage, maximum="max", high="max", v1=False, stat=None, minimum=0
+    ):
         directory = self.mount / path
         directory.mkdir(parents=True, exist_ok=True)
         files = (
             {"memory.limit_in_bytes": maximum, "memory.usage_in_bytes": usage}
             if v1
-            else {"memory.max": maximum, "memory.high": high, "memory.current": usage}
+            else {
+                "memory.max": maximum,
+                "memory.high": high,
+                "memory.current": usage,
+                "memory.min": minimum,
+            }
         )
         prefix = "total_" if v1 else ""
         stat = {f"{prefix}active_file": 0, f"{prefix}inactive_file": 0} | (stat or {})
@@ -106,6 +113,77 @@ class TestHostMemory(unittest.TestCase):
                 self.memory("task/engine", usage, 1000, v1=is_v1, stat=stat)
                 self.assertEqual(
                     host_memory._cgroup_memory_headroom(self.proc), expected
+                )
+
+    def test_protected_sibling_cache_stays_charged(self):
+        self.configure()
+        self.memory("task/engine", 250, 1000)
+        self.memory("task/sibling", 600, minimum=600, stat={"inactive_file": 600})
+        for maximum, high in [(900, "max"), ("max", 900), (1000, 900)]:
+            with self.subTest(maximum=maximum, high=high):
+                self.memory("task", 850, maximum, high, stat={"inactive_file": 600})
+                # Parent reclaim preserves the sibling's min even if its own min is 0.
+                for allow_fallback in [False, True]:
+                    self.assertEqual(
+                        self.available(allow_cgroup_fallback=allow_fallback), 50
+                    )
+
+    def test_unprotected_sibling_cache_is_reclaimable(self):
+        self.configure()
+        self.memory("task", 850, 900, stat={"inactive_file": 600})
+        self.memory("task/engine", 250, 1000)
+        self.memory("task/sibling", 600, stat={"inactive_file": 600})
+        # Unlike memory.min, memory.low can be breached under pressure.
+        (self.mount / "task/sibling/memory.low").write_text("600")
+        self.assertEqual(self.available(), 650)
+
+    def test_nested_protection_conservatively_keeps_cache_charged(self):
+        self.configure()
+        self.memory("task", 850, 900, stat={"inactive_file": 600})
+        self.memory("task/engine", 250, 1000)
+        self.memory("task/sibling", 600, stat={"inactive_file": 600})
+        self.memory("task/sibling/child", 600, minimum=600)
+        # A configured min is enough to fall back; effective protection is not modeled.
+        self.assertEqual(self.available(), 50)
+
+    def test_reclaim_target_own_min_allows_cache_credit(self):
+        self.configure()
+        self.memory("task/engine", 90, 100, minimum=90, stat={"inactive_file": 80})
+        self.assertEqual(self.available(), 90)
+
+    def test_unknown_descendant_protection_keeps_cgroup_bound(self):
+        self.configure()
+        self.memory("task", 850, 900, stat={"inactive_file": 600})
+        self.memory("task/engine", 250, 1000)
+        self.memory("task/sibling", 600, stat={"inactive_file": 600})
+        protection = self.mount / "task/sibling/memory.min"
+        for contents in [None, "invalid"]:
+            with self.subTest(contents=contents):
+                if contents is None:
+                    protection.unlink()
+                else:
+                    protection.write_text(contents)
+                for allow_fallback in [False, True]:
+                    # Unknown protection must not trigger a fallback to host RAM.
+                    self.assertEqual(
+                        self.available(allow_cgroup_fallback=allow_fallback), 50
+                    )
+
+    def test_unreadable_descendant_tree_keeps_cgroup_bound(self):
+        self.configure()
+        self.memory("task", 850, 900, stat={"inactive_file": 600})
+        self.memory("task/engine", 250, 1000)
+        iterdir = Path.iterdir
+
+        def deny_parent(directory):
+            if directory == self.mount / "task":
+                raise PermissionError("Cannot inspect descendants")
+            return iterdir(directory)
+
+        with patch.object(Path, "iterdir", deny_parent):
+            for allow_fallback in [False, True]:
+                self.assertEqual(
+                    self.available(allow_cgroup_fallback=allow_fallback), 50
                 )
 
     def test_independent_engines_have_separate_allowances(self):
@@ -189,7 +267,10 @@ class TestHostMemory(unittest.TestCase):
                         self.without_cgroupfs(v1=v1)
                     with self.assertRaisesRegex(RuntimeError, "set --hicache-size"):
                         self.available()
-                    self.assertEqual(self.available(allow_cgroup_fallback=True), 5000)
+                    with self.assertLogs(host_memory.logger, level="WARNING"):
+                        self.assertEqual(
+                            self.available(allow_cgroup_fallback=True), 5000
+                        )
 
     def test_missing_counters_for_known_limit_requires_explicit_sizing(self):
         for name in ("memory.current", "memory.stat"):
@@ -199,7 +280,8 @@ class TestHostMemory(unittest.TestCase):
                 (self.mount / "task/engine" / name).unlink()
                 with self.assertRaisesRegex(RuntimeError, "set --hicache-size"):
                     self.available()
-                self.assertEqual(self.available(allow_cgroup_fallback=True), 5000)
+                with self.assertLogs(host_memory.logger, level="WARNING"):
+                    self.assertEqual(self.available(allow_cgroup_fallback=True), 5000)
 
 
 if __name__ == "__main__":
