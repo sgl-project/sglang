@@ -746,7 +746,7 @@ class TestResolveDeferredReleases(CustomTestCase):
                 # Both ranks acked -> released exactly once.
                 mgr.note_abort_ack(room, 1, generation)
                 q.resolve_deferred_releases()
-                rel.assert_called_once_with(dreq.req, q.tree_cache, is_insert=False)
+                rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
 
         # Held state fully cleaned up.
         self.assertEqual(q._deferred_releases, [])
@@ -773,7 +773,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             patch.object(decode_mod, "release_kv_cache") as rel,
         ):
             q.resolve_deferred_releases()
-            rel.assert_called_once_with(dreq.req, q.tree_cache, is_insert=False)
+            rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
 
         self.assertEqual(q._deferred_releases, [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
@@ -796,7 +796,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         ):
             q.resolve_deferred_releases()
 
-        rel.assert_called_once_with(dreq.req, q.tree_cache, is_insert=False)
+        rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
         self.assertEqual(q.num_pending_deferred_releases(), 0)
         q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_not_called()
 
@@ -813,7 +813,7 @@ class TestResolveDeferredReleases(CustomTestCase):
 
         calls = []
 
-        def fake_release(req, tree_cache, is_insert):
+        def fake_release(req, tree_cache, checkpoint):
             calls.append(req)
             if req is bad.req:
                 raise RuntimeError("boom")
