@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
     MatchPrefixParams,
+    TreeLock,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
@@ -603,7 +604,7 @@ def bench_release(
 ):
     """Request release throughput — full request lifecycle.
 
-    Simulates: match_prefix → inc_lock_ref → alloc → fill req_to_token → checkpoint + free + unpin.
+    Simulates: match_prefix → lock → alloc → fill req_to_token → checkpoint + free + unlock.
     """
     env = _make_env(num_seqs, chunk_len, kv_size, components, page_size)
 
@@ -640,7 +641,7 @@ def bench_release(
         req.kv.cache_protected_len = matched_len
         req.kv.kv_committed_len = len(seq)
         if hasattr(lr, "to_dec_params"):
-            req.lock_receipt = lr.to_dec_params()
+            req.lock = TreeLock(node, lr.to_dec_params())
         env.rtp.req_to_token[req.kv.req_pool_idx, : len(kv_indices)] = kv_indices
         req_items.append(req)
 
