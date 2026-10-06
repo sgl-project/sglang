@@ -1104,11 +1104,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             for bias_name in ("w13_weight_bias", "w2_weight_bias"):
                 bias = getattr(layer, bias_name, None)
                 if bias is not None and bias.dtype != torch.float32:
-                    setattr(
-                        layer,
-                        bias_name,
-                        Parameter(bias.data.float(), requires_grad=False),
-                    )
+                    # Rebind .data in place (as the aiter branch does) so the
+                    # Parameter keeps its weight_loader attrs: online updates
+                    # then copy_ into this fp32 storage and stay current.
+                    bias.data = bias.data.to(torch.float32)
             return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
