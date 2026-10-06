@@ -3584,7 +3584,7 @@ class TestGlm47MoeDetector(unittest.TestCase):
 
         self.assertEqual(len(result.calls), 1)
         params = json.loads(result.calls[0].parameters)
-        self.assertEqual(params["city"], r"\C|\.")
+        self.assertEqual(params["city"], r'"\C|\."')
         self.assertFalse(
             any(isinstance(w.message, SyntaxWarning) for w in caught),
             [str(w.message) for w in caught],

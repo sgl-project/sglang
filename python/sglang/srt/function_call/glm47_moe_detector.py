@@ -885,10 +885,9 @@ class Glm47MoeDetector(BaseFormatDetector):
             )
 
             if arg_type == "string":
-                if isinstance(parsed_value, str):
-                    arguments[arg_key] = parsed_value
-                else:
-                    arguments[arg_key] = arg_value
+                # The chat template writes string values raw, so the raw text
+                # is the value, as in the streaming path.
+                arguments[arg_key] = arg_value
             elif arg_type is None:
                 # A value whose parsed JSON type is inadmissible stays the raw
                 # string when the schema allows a string (e.g. enum ["7", 8]).

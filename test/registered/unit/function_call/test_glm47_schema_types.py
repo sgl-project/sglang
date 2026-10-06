@@ -196,6 +196,33 @@ class TestGlm47SchemaTypes(unittest.TestCase):
             for field in ({"type": "string"}, {"const": value}):
                 self.check_arguments({"properties": {"value": field}}, {"value": value})
 
+    def test_quoted_string_values_are_kept_verbatim(self):
+        # The chat template writes string values raw, so quotes are part of the value.
+        for value in ('"hello"', "'hello'", '"a\\nb"', '""'):
+            self.check_arguments(
+                {"type": "object", "properties": {"value": {"type": "string"}}},
+                {"value": value},
+            )
+        self.check_arguments(
+            {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "count": {"type": "integer"},
+                    "ratio": {"type": "number"},
+                    "options": {"type": "object"},
+                    "tags": {"type": "array"},
+                },
+            },
+            {
+                "text": '"quoted"',
+                "count": 7,
+                "ratio": 0.5,
+                "options": {"ok": False},
+                "tags": ["a"],
+            },
+        )
+
     def test_nonstream_numeric_strings_with_integer_enum(self):
         tools = [
             Tool(
