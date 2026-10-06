@@ -95,17 +95,27 @@ renders the model:
 - **Tools**: all request tools or only those `tool_choice` allows; field order
   and defaults of `Function.model_dump`; message-level tools; empty lists.
   (`tools`, `tools_none`, `tools_named`, `message_tools`, `empty_message_tools`)
+- **Pydantic coercion**: typed request fields are coerced before rendering. For
+  example, `strict: 1` and `defer_loading: "false"` become booleans, and
+  `strict: null` is rejected. Probe the pydantic model in Python to get its exact
+  rules; don't guess them. (`tool_bool_coercion`)
 - **Tool-call arguments**: how the encoder wants them. DeepSeek-V4 takes a compact
   JSON string; other encoders format them their own way. Keep key order
-  (`serde_json` `preserve_order` is declared in `Cargo.toml`). (`tool_results`, `agentic_thinking`)
+  (`serde_json` `preserve_order` is declared in `Cargo.toml`). Floats must print as
+  Python's `json.dumps` prints them (`1e-06`, `1e+16`, `100.0`).
+  (`tool_results`, `agentic_thinking`, `tool_float_values`, `history_float_arguments`)
 - **Thinking**: kwargs `thinking` > request effort (`!= "none"`) > `reasoning.enabled`
-  > server default kwargs > `SGLANG_DEFAULT_THINKING`. (`thinking_false`, `thinking_none`, `drop_thinking_ignored`)
+  > server default kwargs > `SGLANG_DEFAULT_THINKING`. `enabled` follows Python
+  truthiness (`1` is on); strings use Python's yes-word set.
+  (`thinking_false`, `thinking_none`, `drop_thinking_ignored`, `reasoning_enabled_numeric`, `reasoning_enable_string`)
 - **Effort**: precedence between kwargs, `reasoning`, `reasoning_effort` and env;
   the checkpoint's profile mapping. (`effort_high`, `effort_max`, `kwargs_effort`, `effort_conflict`, `reasoning_object`)
 - **Final assistant turn**: becomes a user turn, or with `continue_final_message`
   a separately tokenized prefix. Check whether content is flattened before the
-  split (it is for DeepSeek-V4).
-  (`final_assistant`, `continuation_parts`, `continuation_bos`)
+  split (it is for DeepSeek-V4). Run each check where Python runs it: a final
+  assistant turn's tool calls are discarded, so object checks on their arguments
+  belong after the split.
+  (`final_assistant`, `continuation_parts`, `continuation_bos`, `final_tool_call_no_arguments`, `continuation_tool_call_null_arguments`)
 - **Model-specific fields and turns**: `task` placement, a system turn mid-conversation,
   inserted empty system turns. (`task_action`, `task_after_developer`, `consecutive_task`, `mid_system`)
 - **History**: the encoder's rules for earlier turns: reasoning kept or dropped,
@@ -118,6 +128,10 @@ renders the model:
   `error`, and `tests/parity.rs` then requires `render_request` to fail.
   (`invalid_tool_arguments`) If Dynamo rejects a shape Python accepts, say in the
   PR that hosts fall back to the engine for it.
+- **Known gaps**: when a mismatch is inside Dynamo and out of the processor's
+  reach, fix it upstream and mark the case `known_gap` with the reason. The test
+  reports the case without failing, and fails once it matches so the marker gets
+  removed. (`tool_float_values`: Dynamo's `deepseek::common::to_json`)
 
 ## Generating fixtures
 
@@ -125,7 +139,7 @@ renders the model:
 spec and per-checkpoint state with SGLang's own resolvers. It then renders every
 case through the real `OpenAIServingChat._apply_jinja_template` and writes:
 - `prompt`, `token_count` and `token_sha256` for each case, or `error` when
-  Python raises;
+  Python raises (`name`, `request` and `known_gap` are kept as written);
 - the fixture-level `config` (the `config.json` fields the processor reads, plus
   resolved overrides such as the effort profile) and `bos_token_id`.
 
@@ -153,9 +167,9 @@ cargo clippy -p sglang-processor --all-targets --locked -- -D warnings
 cargo check -p sglang-processor --no-default-features --features render,tokenizer --locked
 ```
 
-The token check needs the pinned snapshot to be the cache's `main` ref, because
-hf-hub resolves refs, not commit hashes. Watch the test time: if the tokenizer
-was not found, the run finishes in about 0.00s, so confirm it actually loaded.
+The token check loads the pinned commit's snapshot from the cache. When the
+snapshot is missing, the test prints `token ids not checked` (visible with
+`-- --nocapture`), so confirm that line is absent before claiming token parity.
 
 ## Pitfalls
 

@@ -89,7 +89,8 @@ def generate(fixture_path):
     if server._dsv4_reasoning_effort_profile:
         fixture["config"][DSV4_PROFILE] = server._dsv4_reasoning_effort_profile
     fixture["bos_token_id"] = tok.bos_token_id
-    fixture["cases"] = [{k: c[k] for k in ("name", "request")} for c in fixture["cases"]]
+    inputs = ("name", "request", "known_gap")
+    fixture["cases"] = [{k: c[k] for k in inputs if k in c} for c in fixture["cases"]]
     for case in fixture["cases"]:
         tok.texts.clear()
         request = ChatCompletionRequest(**copy.deepcopy(case["request"]))

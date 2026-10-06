@@ -23,7 +23,10 @@ pub(crate) fn render(
         .iter()
         .map(engine_message)
         .collect::<Vec<_>>();
-    normalize_messages(&mut messages)?;
+    for message in &mut messages {
+        flatten_content(message);
+        parse_tool_arguments(message)?;
+    }
     let mut prefix = String::new();
     if let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant")
         && let Some(content) = last["content"].as_str().map(str::to_owned)
@@ -52,6 +55,7 @@ pub(crate) fn render(
             message.remove("task");
         }
     }
+    normalize_messages(&mut messages)?;
     if messages.first().is_none_or(|m| m["role"] != "system") {
         messages.insert(0, json!({"role": "system", "content": ""}));
     }
@@ -95,11 +99,11 @@ pub(crate) fn thinking(request: &Value) -> bool {
         .filter(|v| !v.is_null())
         .or_else(|| reasoning.get("enable"))
     {
-        Some(Value::Bool(enabled)) => *enabled,
         Some(Value::String(enabled)) => {
             ["1", "true", "yes", "y", "on"].contains(&enabled.trim().to_lowercase().as_str())
         }
-        _ => false,
+        Some(enabled) => minijinja::Value::from_serialize(enabled).is_true(),
+        None => false,
     };
     enabled
         || std::env::var("SGLANG_DEFAULT_THINKING")
@@ -157,27 +161,50 @@ fn engine_message(message: &Value) -> Value {
     out.into()
 }
 
-/// SGLang flattens text parts with spaces and requires assistant tool arguments
-/// to be JSON objects; Dynamo takes them serialized, without its lenient fallback.
+/// `process_content_for_template_format`: text parts joined with spaces.
+fn flatten_content(message: &mut Value) {
+    if let Some(parts) = message["content"].as_array() {
+        message["content"] = parts
+            .iter()
+            .filter(|part| matches!(part["type"].as_str(), Some("text" | "input_text")))
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .into();
+    }
+}
+
+/// `serving_chat.normalize_assistant_tool_call_arguments`: string arguments must
+/// parse to a JSON object; other values wait for the final-turn handling.
+fn parse_tool_arguments(message: &mut Value) -> Result<(), String> {
+    for arguments in tool_arguments(message) {
+        if let Some(text) = arguments.as_str() {
+            let parsed = serde_json::from_str::<Value>(text)
+                .map_err(|_| "assistant tool arguments must be valid JSON")?;
+            if !parsed.is_object() {
+                return Err("assistant tool arguments must be a JSON object".into());
+            }
+            *arguments = parsed;
+        }
+    }
+    Ok(())
+}
+
+/// The messages the encoder sees: empty tool lists dropped, message tools dumped,
+/// and tool arguments serialized, since Dynamo takes them as JSON object text.
 fn normalize_messages(messages: &mut [Value]) -> Result<(), String> {
     for message in messages {
-        if let Some(parts) = message["content"].as_array() {
-            message["content"] = parts
-                .iter()
-                .filter(|part| matches!(part["type"].as_str(), Some("text" | "input_text")))
-                .filter_map(|part| part["text"].as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-                .into();
+        for arguments in tool_arguments(message) {
+            if !arguments.is_object() {
+                return Err("assistant tool arguments must be a JSON object".into());
+            }
+            *arguments = arguments.to_string().into();
         }
         let message = message.as_object_mut().ok_or("message must be an object")?;
         match message.get("tools").and_then(Value::as_array) {
             Some(tools) if tools.is_empty() => _ = message.remove("tools"),
             Some(tools) => _ = message.insert("tools".into(), normalize_tools(tools)?.into()),
             None => {}
-        }
-        if message["role"] != "assistant" {
-            continue;
         }
         if message
             .get("tool_calls")
@@ -186,25 +213,21 @@ fn normalize_messages(messages: &mut [Value]) -> Result<(), String> {
         {
             message.remove("tool_calls");
         }
-        for call in message
-            .get_mut("tool_calls")
-            .and_then(Value::as_array_mut)
-            .into_iter()
-            .flatten()
-        {
-            let arguments = &mut call["function"]["arguments"];
-            let parsed = match arguments.as_str() {
-                Some(text) => serde_json::from_str::<Value>(text)
-                    .map_err(|_| "assistant tool arguments must be valid JSON")?,
-                None => arguments.clone(),
-            };
-            if !parsed.is_object() {
-                return Err("assistant tool arguments must be a JSON object".into());
-            }
-            *arguments = parsed.to_string().into();
-        }
     }
     Ok(())
+}
+
+/// Each assistant tool call's `function.arguments`, absent ones as `null`.
+fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
+    let is_assistant = message["role"] == "assistant";
+    message
+        .get_mut("tool_calls")
+        .filter(|_| is_assistant)
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+        .filter_map(|call| call.get_mut("function")?.as_object_mut())
+        .map(|function| function.entry("arguments").or_insert(Value::Null))
 }
 
 /// `protocol.py::Function.model_dump()`, in declared field order; the encoder
@@ -219,20 +242,37 @@ fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
             function.insert("description".into(), f["description"].clone());
             function.insert("name".into(), name.into());
             function.insert("parameters".into(), f["parameters"].clone());
-            function.insert(
-                "strict".into(),
-                f.get("strict").cloned().unwrap_or(false.into()),
-            );
+            let strict = f.get("strict").map_or(Ok(false), pydantic_bool)?;
+            function.insert("strict".into(), strict.into());
             if let Some(defer) = [f.get("defer_loading"), tool.get("defer_loading")]
                 .into_iter()
                 .flatten()
                 .find(|v| !v.is_null())
             {
-                function.insert("defer_loading".into(), defer.clone());
+                function.insert("defer_loading".into(), pydantic_bool(defer)?.into());
             }
             Ok(json!({"type": "function", "function": function}))
         })
         .collect()
+}
+
+/// pydantic's lax `bool`: booleans, 0 and 1, and the yes/no words in any case.
+fn pydantic_bool(value: &Value) -> Result<bool, String> {
+    let parsed = match value {
+        Value::Bool(value) => Some(*value),
+        Value::Number(number) => match number.as_f64() {
+            Some(0.0) => Some(false),
+            Some(1.0) => Some(true),
+            _ => None,
+        },
+        Value::String(text) => match text.to_lowercase().as_str() {
+            "0" | "off" | "f" | "false" | "n" | "no" => Some(false),
+            "1" | "on" | "t" | "true" | "y" | "yes" => Some(true),
+            _ => None,
+        },
+        _ => None,
+    };
+    parsed.ok_or_else(|| format!("tool flag must be a boolean, got {value}"))
 }
 
 pub(crate) fn resolve_dsv4_profile(
