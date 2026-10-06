@@ -25,6 +25,12 @@ done
 
 OPTIONAL_DEPS="${1:-}"
 
+if [[ ",${OPTIONAL_DEPS}," == *,diffusion,* ]]; then
+  # MiniMax H3 uses ffprobe for input admission and output audio validation.
+  docker exec ci_sglang apt-get update
+  docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang apt-get install -y --no-install-recommends ffmpeg
+fi
+
 # Build python extras
 EXTRAS="dev_hip,tracing"
 if [ -n "$OPTIONAL_DEPS" ]; then

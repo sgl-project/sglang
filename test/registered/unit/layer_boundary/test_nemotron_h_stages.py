@@ -28,7 +28,7 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 def layer_stage(pattern, index):
     from sglang.srt.layers.layer_boundary.construction import BatchVariant
-    from sglang.srt.layers.layer_boundary.factories import _connections
+    from sglang.srt.layers.layer_boundary.factories import _connect, _incoming
 
     previous = utils._declaration(pattern, index - 1) if index else None
     declaration = replace(
@@ -41,7 +41,8 @@ def layer_stage(pattern, index):
         if index + 1 < len(pattern)
         else None
     )
-    incoming, outgoing = _connections(declaration, following)
+    incoming = _incoming(declaration)
+    outgoing = _connect(declaration, following, residual_from=incoming)
     return SimpleNamespace(
         kind=declaration.kind,
         edges=(
