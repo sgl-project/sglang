@@ -611,6 +611,7 @@ pub struct MetricsRegistry {
     overlap_blocks: Mutex<HashMap<String, Histogram>>,
     owned_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     owner_path_gap: Mutex<HashMap<String, u64>>,
+    owner_path_gap_samples: Mutex<HashMap<String, u64>>,
     ancestor_fallback_blocks: Mutex<HashMap<String, Histogram>>,
     diverted_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     /// The three block counters that decompose cache-aware locality, kept in
@@ -715,6 +716,7 @@ impl Default for MetricsRegistry {
             overlap_blocks: Default::default(),
             owned_overlap_blocks: Default::default(),
             owner_path_gap: Default::default(),
+            owner_path_gap_samples: Default::default(),
             ancestor_fallback_blocks: Default::default(),
             diverted_overlap_blocks: Default::default(),
             cache_aware_blocks: Default::default(),
@@ -939,9 +941,14 @@ impl MetricsRegistry {
         hist.observe(blocks as f64);
     }
 
-    /// Count once per recorded selection if any hash mode returned an owner
+    /// Count once per sampled selection if any hash mode returned an owner
     /// missing an ancestor. Includes below-threshold and unselected owners.
     pub fn record_owner_path_gap(&self, model_id: &str, has_gap: bool) {
+        *self
+            .owner_path_gap_samples
+            .lock()
+            .entry(model_id.to_owned())
+            .or_default() += 1;
         *self
             .owner_path_gap
             .lock()
@@ -1722,7 +1729,21 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        out.push_str("# HELP sgl_router_owner_path_gap_total Recorded selections with at least one deepest-node owner missing an ancestor across all tiers in any hash mode; not necessarily the chosen worker.\n");
+        out.push_str("# HELP sgl_router_owner_path_gap_samples_total Selections sampled for ownership continuity checks; denominator for owner_path_gap_total.\n");
+        out.push_str("# TYPE sgl_router_owner_path_gap_samples_total counter\n");
+        let guard = self.owner_path_gap_samples.lock();
+        let mut entries: Vec<_> = guard.iter().collect();
+        entries.sort_by_key(|(model, _)| *model);
+        for (model, count) in entries {
+            out.push_str(&format!(
+                "sgl_router_owner_path_gap_samples_total{{model_id=\"{}\"}} {}\n",
+                escape_label(model),
+                count
+            ));
+        }
+        drop(guard);
+
+        out.push_str("# HELP sgl_router_owner_path_gap_total Sampled selections with at least one deepest-node owner missing an ancestor across all tiers in any hash mode; not necessarily the chosen worker.\n");
         out.push_str("# TYPE sgl_router_owner_path_gap_total counter\n");
         let guard = self.owner_path_gap.lock();
         let mut entries: Vec<_> = guard.iter().collect();

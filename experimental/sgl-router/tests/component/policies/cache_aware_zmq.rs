@@ -132,6 +132,7 @@ async fn run_zmq_routing(ancestor: bool) {
     let policy = CacheAwareZmqPolicy::new(
         CacheAwareConfig {
             cache_threshold: 0.0,
+            ancestor_fallback: true,
             bootstrap_timeout_ms: 5_000,
             ..Default::default()
         },

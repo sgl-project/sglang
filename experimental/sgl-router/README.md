@@ -10,67 +10,9 @@ discovery.
 
 ## Cache-aware ancestor fallback
 
-With `--policy cache_aware_zmq`, a matched node without owners falls back to
-its deepest matched ancestor that still has owners. `--cache-threshold` is
-applied to that owned prefix, not the longer structural path. Existing
-worker eligibility, queue gates, and storage-tier preferences still apply.
-No additional flag is required.
-
-The existing structural-overlap metrics keep their meaning. Two histograms
-with the `model_id` label distinguish recorded node ownership from empty paths:
-
-- `sgl_router_owned_overlap_blocks`: deepest owned prefix before threshold
-  and load filtering.
-- `sgl_router_ancestor_fallback_blocks`: structural suffix skipped when an
-  ancestor owner is selected. Its `_count` counts those selections; `_sum`
-  counts skipped blocks, **not** recovered engine cache hits.
-
-Ordinary affinity selections that fall back to an ancestor use
-`decision="ancestor_hit"` for the decision counter and all three
-query/matched/selected block counters. Queue and admission outcomes keep their
-existing decision labels; the ancestor histogram can also include those picks.
-
-Update Grafana filters from `decision="cache_hit"` to
-`decision=~"cache_hit|ancestor_hit"` wherever the panel should include both
-ordinary affinity outcomes. For their selected/query ratio, apply the same
-filter to numerator and denominator:
-
-```promql
-sum(rate(sgl_router_selected_overlap_blocks_total{decision=~"cache_hit|ancestor_hit"}[5m]))
-/
-sum(rate(sgl_router_cache_aware_query_blocks_total{decision=~"cache_hit|ancestor_hit"}[5m]))
-```
-
-Apply the same model/endpoint scope to both sides. For the overall predicted
-hit ratio, include **all** decisions in both sides instead. This example only
-measures ordinary affinity selections.
-
-If structural overlap clears the threshold but owned overlap does not, the
-decision remains `matched_node_unowned`, even when a shallower owner exists.
-Use `owned_overlap_blocks` to assess whether an absolute-length threshold is
-needed. Queue diversions report owned depth in `diverted_overlap_blocks`.
-
-Node ownership still does not require continuous ownership along the path.
-`sgl_router_owner_path_gap_total{model_id}` counts a recorded selection once
-when any hash mode returns at least one deepest-node owner missing an ancestor
-on all tiers. It includes below-threshold and unselected owners, so it is a
-diagnostic of the index, not a count of misrouted requests. Worker identity
-includes DP rank; mixed host/device ownership for the same worker is valid.
-The check walks parent links without allocating another path and stops at the
-first gap. Continuous-owner filtering is deferred; a positive counter means
-the reported owned/selected depth may overstate the usable prefix.
-
-Use `sgl_router_selected_overlap_blocks_total` for the selected destination's
-prefix depth. Actual cache-hit and TTFT gains require an engine replay A/B;
-router ownership does not guarantee that an SWA window is still available.
-
-Unowned interior nodes remain in the tree while they have descendants. This
-fallback does not establish why their ownership disappeared or reconcile
-stale owners. Event continuity, restart cleanup,
-and occupancy accounting need separate verification; an ancestor owner can also be stale. The optional
-absolute-length affinity threshold is deferred pending measured owned-depth
-distributions. Roll out router changes separately after engine configuration
-changes stabilize so their effects can be distinguished.
+Opt in with `--cache-aware-ancestor-fallback` when using `cache_aware_zmq`.
+It defaults to off for same-image A/B testing. See
+[behavior, metrics, and rollout guidance](docs/ancestor-fallback.md).
 
 ## Building
 

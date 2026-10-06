@@ -376,7 +376,8 @@ pub struct MatchResult {
     /// May be shorter than the structural `matched_blocks` path.
     pub owned_matched_blocks: usize,
     /// At least one returned worker lacks an ancestor on every tier.
-    /// Diagnostic only: node ownership is not proof of a usable prefix.
+    /// False when diagnostics were not requested. Node ownership alone is
+    /// not proof of a usable prefix.
     pub has_owner_path_gap: bool,
     /// Workers holding the deepest OWNED matched node on ANY tier.
     pub workers: HashSet<KvWorkerId>,
@@ -939,7 +940,13 @@ impl TreeState {
     /// no worker context to do the same, so multiple candidates fall back
     /// to root. The asymmetry is intentional; the public doc on
     /// [`HashTree::match_prefix`] documents the policy for callers.
-    fn match_prefix(&self, parent_hash: Option<i64>, block_hashes: &[i64]) -> MatchResult {
+    fn match_prefix(
+        &self,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+        ancestor_fallback: bool,
+        diagnose: bool,
+    ) -> MatchResult {
         if block_hashes.is_empty() {
             return MatchResult::default();
         }
@@ -981,31 +988,39 @@ impl TreeState {
                 None => break,
             }
         }
-        let tiers: HashMap<KvWorkerId, Tiers> = last_owned_node
+        let owner_node = if ancestor_fallback {
+            last_owned_node
+        } else if matched > 0 {
+            Some(current)
+        } else {
+            None
+        };
+        let tiers: HashMap<KvWorkerId, Tiers> = owner_node
             .and_then(|id| self.nodes.get(&id))
             .map(|n| n.workers.clone())
             .unwrap_or_default();
         // Check the same worker (including DP rank) across ANY tier. A host
         // ancestor followed by a device block is not a gap. Parent links avoid
         // allocating a second path; stop at the first inconsistent owner.
-        let has_owner_path_gap = tiers.keys().any(|worker| {
-            let mut ancestor = last_owned_node
-                .and_then(|id| self.nodes.get(&id))
-                .and_then(|node| node.parent);
-            while let Some(id) = ancestor {
-                if id == ROOT_ID {
-                    break;
+        let has_owner_path_gap = diagnose
+            && tiers.keys().any(|worker| {
+                let mut ancestor = owner_node
+                    .and_then(|id| self.nodes.get(&id))
+                    .and_then(|node| node.parent);
+                while let Some(id) = ancestor {
+                    if id == ROOT_ID {
+                        break;
+                    }
+                    let Some(node) = self.nodes.get(&id) else {
+                        return true;
+                    };
+                    if !node.workers.contains_key(worker) {
+                        return true;
+                    }
+                    ancestor = node.parent;
                 }
-                let Some(node) = self.nodes.get(&id) else {
-                    return true;
-                };
-                if !node.workers.contains_key(worker) {
-                    return true;
-                }
-                ancestor = node.parent;
-            }
-            false
-        });
+                false
+            });
         MatchResult {
             has_owner_path_gap,
             matched_blocks: matched,
@@ -1368,13 +1383,28 @@ impl HashTree {
     /// preferring a worker-owned candidate; `match_prefix` has no worker
     /// context, so the asymmetry is intentional.)
     pub fn match_prefix(&self, parent_hash: Option<i64>, block_hashes: &[i64]) -> MatchResult {
+        self.match_prefix_with_options(parent_hash, block_hashes, true, false)
+    }
+
+    /// Routing controls and an explicitly requested, expensive diagnostic.
+    /// Ordinary lookups never walk each owner's ancestors.
+    pub fn match_prefix_with_options(
+        &self,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+        ancestor_fallback: bool,
+        diagnose: bool,
+    ) -> MatchResult {
         if block_hashes.is_empty() {
             return MatchResult::default();
         }
         let (idx, effective_parent) = self.route_match(parent_hash, block_hashes);
-        self.shards[idx]
-            .read()
-            .match_prefix(effective_parent, block_hashes)
+        self.shards[idx].read().match_prefix(
+            effective_parent,
+            block_hashes,
+            ancestor_fallback,
+            diagnose,
+        )
     }
 
     /// How many leading blocks of `block_hashes` the worker at `url` holds
@@ -1843,19 +1873,19 @@ mod tests {
         tree.insert_tiered(&a, None, &[10, 20], Tiers::HOST);
         tree.insert(&b, None, &[10, 20, 30, 40]);
         tree.remove(&b, &[10, 20, 30]);
-        let m = tree.match_prefix(None, &[10, 20, 30]);
+        let m = tree.match_prefix_with_options(None, &[10, 20, 30], true, true);
         assert_eq!((m.matched_blocks, m.owned_matched_blocks), (3, 2));
         assert_eq!(m.workers, HashSet::from([a.clone()]));
         assert_eq!(m.tiers[&a], Tiers::HOST);
         assert!(!m.has_owner_path_gap);
         // Preserve the existing node-owner lookup, but flag that B's deeper
         // ownership does NOT establish a usable four-block prefix.
-        let m = tree.match_prefix(None, &[10, 20, 30, 40]);
+        let m = tree.match_prefix_with_options(None, &[10, 20, 30, 40], true, true);
         assert_eq!((m.matched_blocks, m.owned_matched_blocks), (4, 4));
         assert_eq!(m.workers, HashSet::from([b]));
         assert!(m.has_owner_path_gap);
         tree.clear_worker(&a);
-        let m = tree.match_prefix(None, &[10, 20, 30]);
+        let m = tree.match_prefix_with_options(None, &[10, 20, 30], true, true);
         assert_eq!((m.matched_blocks, m.owned_matched_blocks), (3, 0));
         assert!(m.workers.is_empty());
     }
@@ -1867,12 +1897,26 @@ mod tests {
         let other_rank = worker("http://a", 1);
         tree.insert_tiered(&a, None, &[10, 20], Tiers::HOST);
         tree.insert(&a, Some(20), &[30]);
-        assert!(!tree.match_prefix(None, &[10, 20, 30]).has_owner_path_gap);
+        assert!(
+            !tree
+                .match_prefix_with_options(None, &[10, 20, 30], true, true)
+                .has_owner_path_gap
+        );
         tree.insert(&other_rank, None, &[10, 20]);
         tree.remove_tiered(&a, &[10, 20], Tiers::HOST);
-        assert!(tree.match_prefix(None, &[10, 20, 30]).has_owner_path_gap);
-        assert!(tree.match_prefix(Some(20), &[30]).has_owner_path_gap);
-        assert!(!tree.match_prefix(None, &[99]).has_owner_path_gap);
+        assert!(
+            tree.match_prefix_with_options(None, &[10, 20, 30], true, true)
+                .has_owner_path_gap
+        );
+        assert!(
+            tree.match_prefix_with_options(Some(20), &[30], true, true)
+                .has_owner_path_gap
+        );
+        assert!(
+            !tree
+                .match_prefix_with_options(None, &[99], true, true)
+                .has_owner_path_gap
+        );
     }
 
     #[test]

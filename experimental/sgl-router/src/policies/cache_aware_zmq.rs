@@ -159,6 +159,7 @@ pub struct CacheAwareZmqPolicy {
     /// (tests) or the `Policy::attach_metrics` hook (production, called by
     /// `PolicyRegistry::attach_metrics` after the registry is built).
     metrics: OnceLock<Arc<MetricsRegistry>>,
+    diagnostic_sequence: AtomicU64,
     /// Worker pins for image-carrying conversations.
     ///
     /// Prefix matching cannot route these: the engine encodes an image as token
@@ -212,6 +213,7 @@ struct MatchOutcome {
     /// Deepest owned match across modes, including below-threshold matches.
     owned_matched_blocks: usize,
     has_owner_path_gap: bool,
+    diagnostic_sampled: bool,
     /// Best (max-rate) mode's matched-block count — logging / metrics only.
     matched_blocks: usize,
     /// Best mode's query-block count — the match_rate denominator and the
@@ -260,6 +262,7 @@ impl CacheAwareZmqPolicy {
             block_size_oracle,
             engine_load,
             metrics: OnceLock::new(),
+            diagnostic_sequence: AtomicU64::new(0),
             mm_affinity: MultimodalAffinity::new(mm_affinity_idle, mm_affinity_sweep),
         }
     }
@@ -450,6 +453,10 @@ impl CacheAwareZmqPolicy {
         let mut owner_depth_gaps: HashMap<String, usize> = HashMap::new();
         let mut owned_matched_blocks = 0;
         let mut has_owner_path_gap = false;
+        // One in 128 metered selections, independent of routing mode.
+        // Short-circuit before touching the counter when metrics are absent.
+        let diagnostic_sampled = self.metrics.get().is_some()
+            && self.diagnostic_sequence.fetch_add(1, Ordering::Relaxed) % 128 == 0;
         let mut mode_hashes: Vec<Vec<i64>> = Vec::with_capacity(modes.len());
         let mut had_blocks = false;
         let mut any_above_threshold = false;
@@ -480,7 +487,12 @@ impl CacheAwareZmqPolicy {
                 continue;
             }
             had_blocks = true;
-            let matched = self.tree.match_prefix(None, &hashes);
+            let matched = self.tree.match_prefix_with_options(
+                None,
+                &hashes,
+                self.config.ancestor_fallback,
+                diagnostic_sampled,
+            );
             has_owner_path_gap |= matched.has_owner_path_gap;
             debug_assert!(matched.matched_blocks <= hashes.len());
             let rate = matched.matched_blocks as f32 / hashes.len() as f32;
@@ -531,6 +543,7 @@ impl CacheAwareZmqPolicy {
             owner_depth_gaps,
             owned_matched_blocks,
             has_owner_path_gap,
+            diagnostic_sampled,
             matched_blocks,
             query_blocks,
             match_rate,
@@ -656,13 +669,12 @@ impl CacheAwareZmqPolicy {
             return;
         };
         let selected = self.selected_overlap(outcome, chosen.url.as_str()) as u64;
+        // Classify the affinity that admitted this URL, not a later metric
+        // re-read of a different hash mode (or a concurrently changed tree).
         let ancestor_gap = outcome
             .owner_depth_gaps
             .get(chosen.url.as_str())
             .copied()
-            .filter(|_| {
-                outcome.owner_depths.get(chosen.url.as_str()).copied() == Some(selected as usize)
-            })
             .unwrap_or(0);
         // Split ordinary affinity hits without hiding queue/admission outcomes.
         // Every counter below uses the same effective decision.
@@ -671,7 +683,9 @@ impl CacheAwareZmqPolicy {
         } else {
             decision
         };
-        m.record_owner_path_gap(model_id, outcome.has_owner_path_gap);
+        if outcome.diagnostic_sampled {
+            m.record_owner_path_gap(model_id, outcome.has_owner_path_gap);
+        }
         m.record_cache_aware_decision(model_id, decision);
         m.observe_overlap_blocks(model_id, outcome.matched_blocks as u64);
         m.observe_owned_overlap_blocks(model_id, outcome.owned_matched_blocks as u64);
@@ -4076,6 +4090,28 @@ mod tests {
         (tree, tokens[..if bigram { 21 } else { 20 }].to_vec())
     }
 
+    fn ancestor_cfg() -> CacheAwareConfig {
+        CacheAwareConfig {
+            ancestor_fallback: true,
+            ..queue_cfg(4)
+        }
+    }
+
+    #[test]
+    fn ancestor_fallback_disabled_preserves_unowned_fallback() {
+        let (tree, tokens) = ancestor_fixture(false);
+        let policy = new_policy(
+            queue_cfg(4),
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let outcome = policy.match_request(&tokens, 4, false, false);
+        assert!(outcome.owner_urls.is_empty());
+        assert_eq!(outcome.owned_matched_blocks, 3);
+        assert!(!outcome.diagnostic_sampled);
+    }
+
     #[test]
     fn ancestor_owner_routes_without_overstating_selected_overlap() {
         let (tree, tokens) = ancestor_fixture(false);
@@ -4083,7 +4119,7 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.5,
-                ..queue_cfg(4)
+                ..ancestor_cfg()
             },
             tree,
             tokenizer_registry_with_tiny(),
@@ -4128,7 +4164,7 @@ mod tests {
                 let policy = new_policy(
                     CacheAwareConfig {
                         cache_threshold: threshold,
-                        ..Default::default()
+                        ..ancestor_cfg()
                     },
                     tree,
                     tokenizer_registry_with_tiny(),
@@ -4152,7 +4188,7 @@ mod tests {
     fn ancestor_owner_must_be_in_eligible_worker_slice() {
         let (tree, tokens) = ancestor_fixture(false);
         let policy = new_policy(
-            queue_cfg(4),
+            ancestor_cfg(),
             tree,
             tokenizer_registry_with_tiny(),
             oracle_for_tests(4),
@@ -4174,7 +4210,7 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.8,
-                ..queue_cfg(4)
+                ..ancestor_cfg()
             },
             tree,
             tokenizer_registry_with_tiny(),
@@ -4194,7 +4230,7 @@ mod tests {
         let (tree, tokens) = ancestor_fixture(false);
         let metrics = MetricsRegistry::new();
         let policy = new_policy(
-            queue_cfg(4),
+            ancestor_cfg(),
             tree,
             tokenizer_registry_with_tiny(),
             oracle_for_tests(4),
@@ -4232,7 +4268,7 @@ mod tests {
         // The fixture retains a deeper owner beyond its deleted interior.
         let metrics = MetricsRegistry::new();
         let policy = new_policy(
-            queue_cfg(4),
+            ancestor_cfg(),
             tree,
             tokenizer_registry_with_tiny(),
             oracle_for_tests(4),
@@ -4250,6 +4286,59 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_require_metrics_and_sample_every_128_lookups() {
+        let (tree, tokens) = ancestor_fixture(false);
+        let policy = new_policy(
+            ancestor_cfg(),
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        for _ in 0..256 {
+            assert!(
+                !policy
+                    .match_request(&tokens, 4, false, false)
+                    .diagnostic_sampled
+            );
+        }
+        assert_eq!(policy.diagnostic_sequence.load(Ordering::Relaxed), 0);
+        let policy = policy.with_metrics(MetricsRegistry::new());
+        for i in 0..257 {
+            assert_eq!(
+                policy
+                    .match_request(&tokens, 4, false, false)
+                    .diagnostic_sampled,
+                i % 128 == 0
+            );
+        }
+    }
+
+    #[test]
+    fn dual_mode_ancestor_label_uses_selection_snapshot() {
+        let (tree, tokens) = ancestor_fixture(false);
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy(
+            ancestor_cfg(),
+            Arc::clone(&tree),
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let outcome = policy.match_request(&tokens, 4, false, true);
+        let chosen = worker("http://w0:30000", "tiny");
+        // A different mode changes between selection and metric collection.
+        let owner = KvWorkerId::new(chosen.url.clone(), 0);
+        tree.insert(&owner, None, &compute_block_hashes_bigram(&tokens, 4));
+        assert_ne!(
+            policy.selected_overlap(&outcome, &chosen.url),
+            outcome.owner_depths[&chosen.url]
+        );
+        policy.record_match_outcome("tiny", CacheAwareDecision::CacheHit, &outcome, &chosen);
+        assert!(metrics.render().contains("decision=\"ancestor_hit\""));
+        assert!(!metrics.render().contains("decision=\"cache_hit\""));
+    }
+
+    #[test]
     fn ancestor_owner_still_respects_queue_gate() {
         let (tree, tokens) = ancestor_fixture(false);
         let metrics = MetricsRegistry::new();
@@ -4257,7 +4346,7 @@ mod tests {
         load.set("http://w0:30000", 0, load_stat(10, 9), Instant::now());
         load.set("http://w1:30000", 0, load_stat(1, 0), Instant::now());
         let policy = new_policy_with_load(
-            queue_cfg(4),
+            ancestor_cfg(),
             tree,
             tokenizer_registry_with_tiny(),
             oracle_for_tests(4),

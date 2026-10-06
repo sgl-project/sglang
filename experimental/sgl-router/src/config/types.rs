@@ -669,6 +669,8 @@ pub struct CacheAwareConfig {
     /// signal but not so weak that random hash collisions could trigger
     /// affinity to an arbitrary worker.
     pub cache_threshold: f32,
+    /// Opt in to deepest-owned-ancestor affinity for unowned matches.
+    pub ancestor_fallback: bool,
     /// Which load signal is allowed to override cache affinity.
     pub load_gate: LoadGate,
     /// How long a freshly started replica may hold `/readyz` at 503 while it
@@ -746,6 +748,7 @@ impl Default for CacheAwareConfig {
     fn default() -> Self {
         Self {
             cache_threshold: default_cache_threshold(),
+            ancestor_fallback: false,
             load_gate: LoadGate::default(),
             bootstrap_timeout_ms: default_bootstrap_timeout_ms(),
             bootstrap_fetch_timeout_cap_ms: default_bootstrap_fetch_timeout_cap_ms(),
