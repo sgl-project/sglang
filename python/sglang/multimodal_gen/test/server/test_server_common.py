@@ -123,18 +123,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     server_args = case.server_args
     _print_case_log_separator(case.id, "BEGIN diffusion testcase")
 
-    # Skip ring attention tests on AMD/ROCm - Ring Attention requires Flash Attention
-    # which is not available on AMD. Use Ulysses parallelism instead.
-    if (
-        current_platform.is_hip()
-        and server_args.ring_degree is not None
-        and server_args.ring_degree > 1
-    ):
-        pytest.skip(
-            f"Skipping {case.id}: Ring Attention (ring_degree={server_args.ring_degree}) "
-            "requires Flash Attention which is not available on AMD/ROCm"
-        )
-
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")

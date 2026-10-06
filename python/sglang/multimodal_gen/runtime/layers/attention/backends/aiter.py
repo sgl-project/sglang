@@ -232,6 +232,10 @@ class AITerBackend(AttentionBackend):
     Backend for AITemplate attention implementation.
     """
 
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        return True
+
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
         return AttentionBackendEnum.AITER
@@ -286,7 +290,9 @@ class AITerImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
-    ) -> torch.Tensor:
+        *,
+        return_softmax_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Performs attention using one of:
           - _fmha_fp8_prefill_attention (FP8, SGLANG_DIFFUSION_AITER_FP8_ATTN=1 when eligible)
@@ -297,11 +303,19 @@ class AITerImpl(AttentionImpl):
             key: Key tensor of shape [batch_size, seq_len, num_heads, head_dim]
             value: Value tensor of shape [batch_size, seq_len, num_heads, head_dim]
             attn_metadata: Metadata for the attention operation (unused).
+            return_softmax_lse: Also return the softmax LSE, [batch_size, num_heads, seq_len].
 
         Returns:
             Output tensor of shape [batch_size, seq_len, num_heads, head_dim]
         """
-        if _use_fp8_attn:
+        # The FP8 FMHA ASM path has no LSE output, so ring attention, which
+        # LSE-merges every hop, has to go through the BF16 kernel.
+        if _use_fp8_attn and return_softmax_lse:
+            logger.warning_once(
+                "FP8 FMHA prefill cannot return the softmax LSE. Falling back to BF16."
+            )
+
+        if _use_fp8_attn and not return_softmax_lse:
             if query.dtype != _fp8_dtype:
                 q_fp8, q_scale = _per_tensor_quant_fp8(query)
                 k_fp8, k_scale = _per_tensor_quant_fp8(key)
@@ -349,9 +363,12 @@ class AITerImpl(AttentionImpl):
             dropout_p=self.dropout_p,
             causal=self.causal,
             return_attn_probs=False,
-            return_lse=False,
+            return_lse=return_softmax_lse,
             how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
         )
+        if return_softmax_lse:
+            output, softmax_lse = output
+            return output, softmax_lse
         return output
 
     @torch.compiler.disable

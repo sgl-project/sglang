@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
 from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args.server_args import (
     RING_CAPABLE_ATTENTION_BACKENDS,
 )
@@ -36,6 +37,19 @@ class TestRingAdmission(unittest.TestCase):
         )
         self.assertNotIn(
             SDPABackend.get_enum().name.lower(), RING_CAPABLE_ATTENTION_BACKENDS
+        )
+
+    @unittest.skipUnless(
+        current_platform.is_rocm(), "the aiter package only imports on ROCm"
+    )
+    def test_aiter_names_match_capabilities(self):
+        from sglang.multimodal_gen.runtime.layers.attention.backends.aiter import (
+            AITerBackend,
+        )
+
+        self.assertTrue(AITerBackend.supports_ring_rotation())
+        self.assertIn(
+            AITerBackend.get_enum().name.lower(), RING_CAPABLE_ATTENTION_BACKENDS
         )
 
     def test_local_usp_backend_does_not_require_ring_capability(self):

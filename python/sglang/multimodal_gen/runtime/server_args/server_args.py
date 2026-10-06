@@ -105,7 +105,7 @@ LORA_MERGE_MODES = ("auto", "merge", "dynamic")
 MAX_SCHEDULER_RPC_TIMEOUT_S = 2_147_483
 # Mirrors AttentionBackend.supports_ring_rotation; the name-level check
 # runs before backend classes are importable on every platform.
-RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn")
+RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn", "aiter")
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
