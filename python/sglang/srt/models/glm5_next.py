@@ -65,6 +65,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
+from sglang.srt.lora.utils import get_default_hidden_dim
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -1206,6 +1207,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
     fall_back_to_pt_during_load = False
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        if self.config.layer_types[layer_idx] == "linear_attention":
+            linear = self.config.linear_attn_config
+            width = linear["num_heads"] * linear["head_dim"]
+            if module_name == "qkv_proj":
+                return self.config.hidden_size, 3 * width
+            if module_name == "o_proj":
+                return width, self.config.hidden_size
+        return get_default_hidden_dim(module_name, self.config, layer_idx)
 
     def __init__(
         self,
