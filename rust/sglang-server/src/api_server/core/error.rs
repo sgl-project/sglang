@@ -2,6 +2,7 @@
 //! into its own status space.
 
 use http::StatusCode;
+use sglang_api_types::api::v1 as api;
 
 /// Protocol-independent error category used by transport adapters.
 ///
@@ -105,6 +106,18 @@ impl CoreError {
 
     /// The HTTP status for this failure. Response bodies and stream framing
     /// remain the responsibility of each HTTP API surface.
+    /// This failure as one `/generate` item: the native error body with the
+    /// HTTP status as `code`, plus the batch position where there is one.
+    pub(crate) fn stream_error(&self, index: Option<u32>) -> api::GenerateStreamError {
+        api::GenerateStreamError {
+            error: Some(api::ErrorBody {
+                message: self.to_string(),
+                code: u32::from(self.http_status().as_u16()),
+            }),
+            index,
+        }
+    }
+
     pub(crate) fn http_status(&self) -> StatusCode {
         if let CoreError::RuntimeRejected {
             legacy_http_status, ..

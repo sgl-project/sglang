@@ -11,9 +11,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::app::AppState;
-use super::frame::{
-    OutputAccumulator, cumulative_frame_string, frame_value, stream_frame_string, tag_value,
-};
 use crate::api_server::core::{
     CoreCall, CoreError, CoreEvent, CoreOutput, HealthStatus, recv_indexed,
 };
@@ -226,7 +223,7 @@ async fn generate_single(
     timing: RequestTiming,
 ) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
-    // `frame_value` just reads them — no tokenizer needed here.
+    // the frame builder just reads them — no tokenizer needed here.
     let mut call = match state.core.generate(req).await {
         Ok(call) => call,
         Err(error) => return native_core_error(error, stream),
@@ -245,9 +242,20 @@ async fn generate_single(
     } else {
         // Unary: fold to the terminal and respond once. `CoreCall` disarms
         // itself on a terminal item; truncation leaves it armed for drop cleanup.
-        let (status, value) = drain_unary(&mut call, &rid, timing).await;
-        (status, Json(value)).into_response()
+        let (status, item) = drain_unary(&mut call, &rid, timing).await;
+        (status, Json(item)).into_response()
     }
+}
+
+/// One unary `/generate` result: the frame, or the item's own error body (a
+/// failed batch item is its own `{ "error": ... }` entry in the array).
+#[derive(Debug, serde::Serialize)]
+#[serde(untagged)]
+enum GenerateItem {
+    // Boxed: a frame is ~300 bytes against the error's ~40, and a batch
+    // array holds one per item.
+    Frame(Box<api::GenerateResponse>),
+    Error(api::GenerateStreamError),
 }
 
 /// Fold a unary request to its terminal HTTP result. Shared by single + batch.
@@ -255,35 +263,36 @@ async fn drain_unary(
     call: &mut CoreCall,
     rid_str: &str,
     mut timing: RequestTiming,
-) -> (StatusCode, serde_json::Value) {
-    let mut acc = OutputAccumulator::default();
+) -> (StatusCode, GenerateItem) {
+    let mut accumulated = CoreOutput::default();
     while let Some(item) = call.recv().await {
         match item {
             CoreEvent::Delta(out) => {
                 timing.observe_first_output();
-                acc.fold(&out);
+                accumulated.append_delta(&out);
             }
             CoreEvent::Finished(out) => {
                 timing.observe_first_output();
                 timing.finish();
-                acc.fold(&out);
-                let final_out = acc.into_output();
-                let mut value = frame_value(&final_out, rid_str);
-                add_e2e_latency(&mut value, &timing);
-                return (StatusCode::OK, value);
+                accumulated.append_delta(&out);
+                let frame = accumulated.frame(rid_str, None, Some(e2e_latency(&timing)));
+                return (StatusCode::OK, GenerateItem::Frame(Box::new(frame)));
             }
             CoreEvent::Failed(error) => {
                 timing.finish();
-                let status = error.http_status();
-                return (status, error_value(status.as_u16(), &error.to_string()));
+                return (
+                    error.http_status(),
+                    GenerateItem::Error(error.stream_error(None)),
+                );
             }
         }
     }
     // Defensive fallback: CoreCall normally turns premature runtime
     // termination into a terminal Failed event before exposing stream end.
+    let truncated = CoreError::ResponseTruncated;
     (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        error_value(500, "response truncated before completion"),
+        truncated.http_status(),
+        GenerateItem::Error(truncated.stream_error(None)),
     )
 }
 
@@ -325,12 +334,12 @@ async fn generate_batch(
         let drained = futures::future::join_all(calls.into_iter().map(
             |(mut call, request_timing)| async move {
                 let client_rid = call.public_id().to_owned();
-                let (_status, value) = drain_unary(&mut call, &client_rid, request_timing).await;
-                value
+                let (_status, item) = drain_unary(&mut call, &client_rid, request_timing).await;
+                item
             },
         ))
         .await;
-        (StatusCode::OK, Json(serde_json::Value::Array(drained))).into_response()
+        (StatusCode::OK, Json(drained)).into_response()
     }
 }
 
@@ -354,11 +363,10 @@ fn generation_event_stream(
             .iter()
             .map(|(_, timing)| timing.clone())
             .collect();
-        let mut accs: Vec<OutputAccumulator> =
-            (0..n).map(|_| OutputAccumulator::default()).collect();
+        let mut accumulated: Vec<CoreOutput> = (0..n).map(|_| CoreOutput::default()).collect();
 
         // Batch position, tagged onto every frame (a single request omits it).
-        let idx = |i: usize| with_index.then_some(i);
+        let idx = |i: usize| with_index.then_some(i as u32);
 
         // Poll all receivers concurrently; re-arm a receiver's future after each
         // non-terminal frame so its stream keeps flowing.
@@ -372,7 +380,7 @@ fn generation_event_stream(
                 // Defensive fallback: a premature runtime close is normally a
                 // Failed event produced by CoreCall. Keep this item's call
                 // armed if its semantic stream somehow ends unexpectedly.
-                yield tag_value(error_value(500, "response truncated before completion"), idx(i));
+                yield json_string(&CoreError::ResponseTruncated.stream_error(idx(i)));
                 continue;
             }
 
@@ -386,9 +394,9 @@ fn generation_event_stream(
                 match item {
                     CoreEvent::Delta(out) => {
                         timings[i].observe_first_output();
-                        accs[i].fold(&out);
+                        accumulated[i].append_delta(&out);
                         if incremental {
-                            yield stream_frame_string(out, &accs[i], true, &rid_strs[i], idx(i));
+                            yield json_string(&stream_frame(out, &accumulated[i], true, &rid_strs[i], idx(i), None));
                         } else {
                             coalesced = true;
                         }
@@ -396,7 +404,7 @@ fn generation_event_stream(
                     CoreEvent::Finished(out) => {
                         timings[i].observe_first_output();
                         timings[i].finish();
-                        accs[i].fold(&out);
+                        accumulated[i].append_delta(&out);
                         terminal = Some(out);
                     }
                     CoreEvent::Failed(error) => {
@@ -407,22 +415,22 @@ fn generation_event_stream(
             }
 
             if let Some(error) = failed {
-                let status = error.http_status();
-                yield tag_value(error_value(status.as_u16(), &error.to_string()), idx(i));
+                yield json_string(&error.stream_error(idx(i)));
             } else if let Some(out) = terminal {
                 // The final frame carries the full cumulative state, so any
                 // coalesced non-terminal frames are moot.
-                yield terminal_stream_frame_string(
+                let e2e_latency = Some(e2e_latency(&timings[i]));
+                yield json_string(&stream_frame(
                     out,
-                    &accs[i],
+                    &accumulated[i],
                     incremental,
                     &rid_strs[i],
                     idx(i),
-                    &timings[i],
-                );
+                    e2e_latency,
+                ));
             } else {
                 if coalesced {
-                    yield cumulative_frame_string(&accs[i], &rid_strs[i], idx(i));
+                    yield json_string(&accumulated[i].frame(&rid_strs[i], idx(i), None));
                 }
                 futs.push(recv_indexed(i, call)); // keep this item flowing
             }
@@ -433,30 +441,39 @@ fn generation_event_stream(
 
 /// Python's `e2e_latency` is `finished_time - created_time`, in seconds, and is
 /// attached only when the request finishes. The Rust native API owns the same
-/// lifecycle boundary, so it adds the value while handling the terminal egress
+/// lifecycle boundary, so it sets the value while handling the terminal egress
 /// item rather than putting API-only timing onto every shared core output.
-fn add_e2e_latency(value: &mut serde_json::Value, timing: &RequestTiming) {
+fn e2e_latency(timing: &RequestTiming) -> f64 {
     let (time_to_first_token, e2e_latency) = timing
         .terminal_latencies()
         .expect("a successful terminal output has complete request timing");
     debug_assert!(time_to_first_token <= e2e_latency);
-    value["meta_info"]["e2e_latency"] = serde_json::json!(e2e_latency.as_secs_f64());
+    e2e_latency.as_secs_f64()
 }
 
-/// Render a terminal streaming frame. Intermediate cumulative frames keep the
-/// memoized fast path; the one terminal frame uses the Value path so it can carry
-/// the request-local `e2e_latency`, exactly as Python does.
-fn terminal_stream_frame_string(
-    out: CoreOutput,
-    acc: &OutputAccumulator,
+/// One streaming frame: the cumulative view (default), or this step's delta
+/// with the cumulative token count in `meta_info` (matching Python). Only the
+/// terminal frame carries `e2e_latency`.
+fn stream_frame(
+    delta: CoreOutput,
+    accumulated: &CoreOutput,
     incremental: bool,
     rid_str: &str,
-    index: Option<usize>,
-    timing: &RequestTiming,
-) -> String {
-    let mut value = super::frame::stream_frame_value(out, acc, incremental, rid_str);
-    add_e2e_latency(&mut value, timing);
-    tag_value(value, index)
+    index: Option<u32>,
+    e2e_latency: Option<f64>,
+) -> api::GenerateResponse {
+    if incremental {
+        let mut d = delta;
+        d.completion_tokens = accumulated.completion_tokens;
+        d.frame(rid_str, index, e2e_latency)
+    } else {
+        accumulated.frame(rid_str, index, e2e_latency)
+    }
+}
+
+/// The SSE `data` text of one `api.v1` item (a frame or an error).
+fn json_string<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).expect("api.v1 types serialize to JSON")
 }
 
 #[cfg(test)]
@@ -678,7 +695,8 @@ mod tests {
             time_to_first_token: None,
             e2e_latency: None,
         };
-        let (status, value) = drain_unary(&mut call, "client-rid", timing).await;
+        let (status, item) = drain_unary(&mut call, "client-rid", timing).await;
+        let value = serde_json::to_value(&item).unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(value["meta_info"]["id"], "client-rid");
         assert_eq!(value["meta_info"]["prompt_tokens"], 5);

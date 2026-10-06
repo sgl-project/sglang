@@ -21,7 +21,6 @@ mod tools;
 pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
 
 use super::app::AppState;
-use super::frame::OutputAccumulator;
 use crate::api_server::core::{CoreCall, CoreError, CoreEvent, CoreOutput};
 use crate::message::config::ServerArgs;
 use crate::message::request::GenerateRequest;
@@ -117,13 +116,13 @@ pub(super) fn openai_error(code: StatusCode, message: impl Into<String>, stream:
 /// semantic failures / truncation to `(status, message)` for the OpenAI error
 /// shape. The call owns cancellation and disarms itself.
 async fn collect_output(mut call: CoreCall) -> Result<CoreOutput, (StatusCode, String)> {
-    let mut accumulator = OutputAccumulator::default();
+    let mut accumulated = CoreOutput::default();
     let output = loop {
         match call.recv().await {
-            Some(CoreEvent::Delta(output)) => accumulator.fold(&output),
+            Some(CoreEvent::Delta(output)) => accumulated.append_delta(&output),
             Some(CoreEvent::Finished(output)) => {
-                accumulator.fold(&output);
-                break accumulator.into_output();
+                accumulated.append_delta(&output);
+                break accumulated;
             }
             Some(CoreEvent::Failed(error)) => {
                 let status = error.http_status();
