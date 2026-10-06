@@ -31,14 +31,15 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Container, Iterable, Sequence
+from typing import Optional
 
-# ~524K entries; at ~150-250 B/entry this is <= ~125 MiB and covers roughly
-# 32M tokens at page size 64 across all pools.
-HICACHE_EXISTENCE_CACHE_MAX_ENTRIES = 512 * 1024
+from sglang.srt.environ import envs
 
 
 class StorageExistenceCache:
-    def __init__(self, max_entries: int = HICACHE_EXISTENCE_CACHE_MAX_ENTRIES):
+    def __init__(self, max_entries: Optional[int] = None):
+        if max_entries is None:
+            max_entries = envs.SGLANG_HICACHE_EXISTENCE_CACHE_MAX_ENTRIES.get()
         self.max_entries = max_entries
         self._entries: OrderedDict[tuple[str, str], None] = OrderedDict()
 
