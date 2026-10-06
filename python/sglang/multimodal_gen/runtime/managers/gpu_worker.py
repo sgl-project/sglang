@@ -1435,6 +1435,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             output=result.output,
             audio=getattr(result, "audio", None),
             audio_sample_rate=getattr(result, "audio_sample_rate", None),
+            fps=getattr(result, "fps", None),
             metrics=result.metrics,
             usage=getattr(result, "usage", None),
             trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
@@ -1450,6 +1451,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> OutputBatch:
         """Merge per-output batches produced by grouped execution."""
         merged = OutputBatch()
+        merged.fps = output_batches[0].fps
         parts = _ExpandedOutputParts()
 
         for output_batch in output_batches:
