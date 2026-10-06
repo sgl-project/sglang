@@ -4062,6 +4062,15 @@ class TestDcpCommBackendDefault(CustomTestCase):
                         self._resolved(dcp_size=4, dcp_comm_backend="fi_a2a", **fields)
 
     @override_platform(is_cuda=True, is_hip=False)
+    def test_pp_without_the_deepgemm_warmup_keeps_fi_a2a(self):
+        """Only the PP DeepGEMM warmup's third stream blocks fi_a2a; PP alone
+        must not."""
+        host, mla = self._fused_reduce()
+        warmup = envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.override(False)
+        with host, mla, warmup:
+            self.assertEqual(self._resolved(dcp_size=4, pp_size=2), "fi_a2a")
+
+    @override_platform(is_cuda=True, is_hip=False)
     def test_explicit_fi_a2a_names_the_blocker(self):
         host, mla = self._fused_reduce(platform_blocker=self._NO_FUSED_OP)
         with host, mla:

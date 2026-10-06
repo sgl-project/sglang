@@ -385,7 +385,7 @@ def correct_attn_out(
 
 
 # A2A DCP reduce: LSE-weighted combine of N partial attention outputs
-# (used by the a2a / fi_a2a communication backends, see comm.py).
+# (used by the a2a communication backend, see comm.py).
 
 
 def _lse_pack_dim(output_dtype: torch.dtype) -> int:

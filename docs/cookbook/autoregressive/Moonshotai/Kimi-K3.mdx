@@ -205,7 +205,7 @@ Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request â
 **Blackwell DCP notes** â€” the DCP cells are Balanced and High-Throughput on every Blackwell platform, in both the `Unified` and `Decode` roles:
 
 - DCP is the only axis that shards the TP-replicated MLA KV; Low-Latency skips it.
-- Leave `--dcp-comm-backend` unset: it resolves to `fi_a2a` (FlashInfer's fused all-to-all + LSE merge) where the DCP group shares one NVLink domain, GB200/GB300 fabric or one node, and `a2a` otherwise.
+- Leave `--dcp-comm-backend` unset: it resolves to `fi_a2a` (FlashInfer's fused all-to-all + LSE merge) where the DCP group shares one NVLink domain, GB200/GB300 fabric or one node, and the installed `flashinfer-python` provides `decode_cp_a2a_lse_reduce`; otherwise to `a2a` (the startup log names the missing requirement).
 - No `--enable-symm-mem` under DCP (force-disabled for decode-graph correctness).
 - Explicit `tokenspeed_mla` force-rewrites `--kv-cache-dtype` to fp8; the default `cutedsl_mla` serves either dtype.
 - Calculator ratios run well above 1 here (`r > 1` is legal): `bfloat16` state buys admission, `fp8` KV buys context.

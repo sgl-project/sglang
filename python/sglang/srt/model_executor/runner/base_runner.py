@@ -67,8 +67,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# fi_a2a workspace capacity in tokens when no decode graph is captured;
-# arbitrary, since wider eager batches are reduced in chunks of this size.
+# fi_a2a workspace capacity in tokens when no decode CUDA graph batch sizes are
+# configured; arbitrary, since wider eager batches are reduced in chunks of this size.
 _FI_A2A_EAGER_ONLY_MAX_TOKENS = 256
 
 

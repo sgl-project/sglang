@@ -476,21 +476,10 @@ def init_fi_a2a_workspace(
 def _fi_a2a_peer_views(
     cp_attn_out: torch.Tensor, cp_attn_lse: torch.Tensor, cp_size: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """View [B, H, D] partials and their [B, H] LSE as the fused reduce's
-    [B, H/cp, cp, D] and [B, H/cp, cp]; head h goes to peer h // (H/cp)."""
+    """View contiguous [B, H, D] partials and their [B, H] LSE as the fused
+    reduce's [B, H/cp, cp, D] and [B, H/cp, cp]; head h goes to peer h // (H/cp)."""
     batch, heads, _ = cp_attn_out.shape
     local_heads = heads // cp_size
-    itemsize = cp_attn_out.element_size()
-    # The kernel reads every row in 8-byte words along a unit-stride last dim.
-    if cp_attn_out.stride(-1) != 1 or any(
-        n % 8
-        for n in (
-            cp_attn_out.data_ptr(),
-            cp_attn_out.stride(0) * itemsize,
-            cp_attn_out.stride(1) * itemsize,
-        )
-    ):
-        cp_attn_out = cp_attn_out.clone(memory_format=torch.contiguous_format)
     partial_o = cp_attn_out.unflatten(1, (cp_size, local_heads)).transpose(1, 2)
     partial_lse = (
         cp_attn_lse.reshape(batch, heads)
@@ -562,9 +551,11 @@ def dcp_a2a_lse_reduce(
     cuda_graph_buffers: Optional[dict] = None,
     comm_backend: str = "a2a",
 ) -> torch.Tensor:
-    """A2A DCP reduce: all-to-all exchange of head partials, then local Triton
-    combine. Output + fp32 LSE are packed into ONE all_to_all (LSE reinterpreted
-    as output-dtype columns along D) -> 1 NCCL call/layer instead of 2.
+    """A2A DCP reduce: exchange head partials + LSE across DCP ranks and merge
+    them. fi_a2a does both in one FlashInfer kernel (fi_a2a_lse_reduce). a2a
+    packs output + fp32 LSE into ONE all_to_all (LSE reinterpreted as
+    output-dtype columns along D) -> 1 NCCL call/layer instead of 2, then merges
+    with the local Triton combine.
     is_lse_base_on_e: True=base-e (FlashAttention), False=base-2 (FlashInfer-MLA).
     """
     if cp_group.world_size == 1:
