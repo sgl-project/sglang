@@ -3927,6 +3927,11 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            prefill_chunk_alignment=getattr(
+                self.token_to_kv_pool_allocator.get_kvcache(),
+                "prefill_chunk_alignment",
+                1,
+            ),
         )
 
         if self.chunked_req is not None:

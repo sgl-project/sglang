@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 """Request scheduler policy"""
 
+import math
 import os
 import random
 from collections import Counter
@@ -647,8 +648,10 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        prefill_chunk_alignment: int = 1,
     ):
         self.page_size = page_size
+        self.prefill_chunk_alignment = prefill_chunk_alignment
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -1123,6 +1126,25 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
+    def _align_prefill_chunk(
+        self, prefix_len: int, extend_len: int, truncation_align_size: Optional[int] = None
+    ) -> int:
+        """Align an unfinished chunk's absolute end to the cache requirement.
+
+        Exact fill is a compute optimization; it must not split compression
+        groups. Call only for unfinished chunks, since a final chunk may end
+        at any token. Backends without a requirement retain existing behavior.
+        """
+        if self.prefill_chunk_alignment <= 1:
+            return extend_len
+        alignment = math.lcm(
+            self.prefill_chunk_alignment,
+            truncation_align_size or 1,
+            self.kv_shard_granule or 1,
+        )
+        end = (prefix_len + extend_len) // alignment * alignment
+        return max(0, end - prefix_len)
+
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens(req)
@@ -1168,6 +1190,10 @@ class PrefillAdder:
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        if truncated:
+            new_len = self._align_prefill_chunk(len(req.prefix_indices), new_len)
+            if new_len <= 0:
+                return req
         # The continuing chunk must fit. Keep reservation outside assert for -O.
         reserved = self._kv_shard_reserve_scratch(
             prefix_len=len(req.prefix_indices), extend_len=new_len
@@ -1331,7 +1357,11 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            trunc_len = self._align_prefill_chunk(
+                len(req.prefix_indices), self.rem_chunk_tokens
+            )
+            if trunc_len <= 0:
+                return AddReqResult.OTHER
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1570,11 +1600,11 @@ class PrefillAdder:
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER
             if self.exact_chunk_fill:
-                # Take the remainder verbatim so the batch hits exactly
-                # chunked_prefill_size. `chunk_fit_tokens > chunk_tokens_limit`
-                # here, so this never runs past the end of the prompt. Uses the
-                # limit rather than rem_chunk_tokens so an SWA-capped chunk stays
-                # capped.
+                # Take the remainder, subject to the cache alignment below,
+                # so the batch approaches chunked_prefill_size. The limit is
+                # below chunk_fit_tokens, so this cannot run past the prompt.
+                # Use the limit rather than rem_chunk_tokens so an SWA-capped
+                # chunk stays capped.
                 extend_len = chunk_tokens_limit
                 if truncation_align_size is not None:
                     extend_len = (
@@ -1588,6 +1618,9 @@ class PrefillAdder:
                     )
                 end = (prefix_len + extend_len) // self.page_size * self.page_size
                 extend_len = end - prefix_len
+            extend_len = self._align_prefill_chunk(
+                prefix_len, extend_len, truncation_align_size
+            )
             if extend_len <= 0:
                 return AddReqResult.OTHER
             is_chunked = True

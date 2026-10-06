@@ -1532,6 +1532,89 @@ class TestPrefillAdder(CustomTestCase):
         )
         return req
 
+    def test_exact_fill_respects_cache_alignment_for_new_chunks(self):
+        # A short completion leaves a non-page-aligned budget for the next req.
+        # Check both normal admission and the no-prefix-cache ignore-EOS path.
+        for ignore_eos in (False, True):
+            for tail in (101, 102, 103):
+                with self.subTest(ignore_eos=ignore_eos, tail=tail):
+                    adder = self._create_delayer_adder(
+                        available_tokens=1_000_000,
+                        delayer=None,
+                        page_size=64,
+                        rem_input_tokens=16384,
+                        rem_chunk_tokens=16384,
+                        prefill_chunk_alignment=64,
+                    )
+                    adder.exact_chunk_fill = True
+                    self.mock_tree_cache.disable = ignore_eos
+                    first = self._create_delayer_req(tail)
+                    second = self._create_delayer_req(32769)
+                    for req in (first, second):
+                        req.sampling_params.ignore_eos = ignore_eos
+                        req.origin_input_ids = req.full_untruncated_fill_ids
+                        adder.add_one_req(req, False, None)
+                    self.assertEqual(first.extend_range.length, tail)
+                    self.assertEqual(second.extend_range.length, 16256)
+                    self.assertIs(adder.new_chunked_req, second)
+                    self.assertEqual(adder.rem_chunk_tokens, 128 - tail)
+                    # KV is still billed in pages, independently of compute.
+                    self.assertEqual(adder.memory_budget.current_offset, 16512)
+
+    def test_cache_alignment_continuation_and_final_chunk(self):
+        # An arbitrary continuation budget must preserve the absolute boundary.
+        # Final chunks may be shorter than alignment; defer if an unfinished
+        # chunk cannot reach even the next boundary.
+        for budget, remaining, expected in ((101, 200, 64), (63, 200, 0), (63, 3, 3)):
+            with self.subTest(budget=budget, remaining=remaining):
+                adder = self._create_delayer_adder(
+                    available_tokens=1_000_000,
+                    delayer=None,
+                    page_size=64,
+                    rem_chunk_tokens=budget,
+                    prefill_chunk_alignment=64,
+                )
+                adder.exact_chunk_fill = True
+                req = self._create_delayer_req(128 + remaining)
+                req.prefix_indices = list(range(128))
+                result = adder.add_chunked_req(req)
+                if expected:
+                    req.set_extend_range.assert_called_once_with(128, 128 + expected)
+                    self.assertEqual(adder.rem_chunk_tokens, budget - expected)
+                else:
+                    req.set_extend_range.assert_not_called()
+                    self.assertEqual(adder.can_run_list, [])
+                    self.assertEqual(adder.rem_chunk_tokens, budget)
+                self.assertIs(result, None if expected == remaining else req)
+
+    def test_cache_alignment_absolute_boundary_and_other_alignment(self):
+        # Use admission itself: combining 64-token cache pages and 96-token
+        # truncation tiles requires an absolute boundary at 192, not 256.
+        adder = self._create_delayer_adder(
+            available_tokens=1_000_000,
+            delayer=None,
+            page_size=64,
+            rem_chunk_tokens=250,
+            prefill_chunk_alignment=64,
+        )
+        adder.exact_chunk_fill = True
+        req = self._create_delayer_req(1000)
+        req.prefix_indices = list(range(64))
+        adder.add_one_req(req, False, 96)
+        req.set_extend_range.assert_called_once_with(64, 192)
+
+    def test_exact_fill_without_cache_requirement_keeps_remainder(self):
+        adder = self._create_delayer_adder(
+            available_tokens=1_000_000,
+            delayer=None,
+            page_size=64,
+            rem_chunk_tokens=16283,
+        )
+        adder.exact_chunk_fill = True
+        req = self._create_delayer_req(32769)
+        adder.add_one_req(req, False, None)
+        self.assertEqual(req.extend_range.length, 16283)
+
     def test_add_chunked_req_non_hybrid_no_swa_reservation(self):
         # Non-hybrid path: the SWA-pool reservation must NOT apply, otherwise
         # the fix would regress non-SWA models.
