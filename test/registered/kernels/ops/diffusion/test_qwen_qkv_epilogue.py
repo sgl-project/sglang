@@ -152,23 +152,18 @@ def test_qwen_qkv_epilogue_is_bit_exact(img_tokens, txt_tokens, heads):
         )
 
 
-def test_qwen_qkv_epilogue_rejects_compile():
-    tensor = torch.empty(1, 1, 1, 128, device="cuda", dtype=torch.bfloat16)
-    row = torch.empty(128, device="cuda", dtype=torch.bfloat16)
-    cache = torch.empty(1, 128, device="cuda", dtype=torch.float32)
-    with patch("torch.compiler.is_compiling", return_value=True):
+@pytest.mark.parametrize(
+    "head_dim,compiling", [(128, True), (64, False)], ids=["compile", "head-dim"]
+)
+def test_qwen_qkv_epilogue_rejects_unsupported_execution(head_dim, compiling):
+    tensor = torch.empty(1, 1, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+    row = torch.empty(head_dim, device="cuda", dtype=torch.bfloat16)
+    cache = torch.empty(1, head_dim, device="cuda", dtype=torch.float32)
+    with patch("torch.compiler.is_compiling", return_value=compiling):
         assert (
             try_fused_qwen_qkv_epilogue(
-                tensor,
-                tensor,
-                tensor,
-                tensor,
-                tensor,
-                tensor,
-                row,
-                row,
-                row,
-                row,
+                *([tensor] * 6),
+                *([row] * 4),
                 cache,
                 cache,
                 1e-6,
@@ -176,31 +171,6 @@ def test_qwen_qkv_epilogue_rejects_compile():
             )
             is None
         )
-
-
-def test_qwen_qkv_epilogue_rejects_unsupported_head_dim():
-    tensor = torch.empty(1, 1, 1, 64, device="cuda", dtype=torch.bfloat16)
-    row = torch.empty(64, device="cuda", dtype=torch.bfloat16)
-    cache = torch.empty(1, 64, device="cuda", dtype=torch.float32)
-    assert (
-        try_fused_qwen_qkv_epilogue(
-            tensor,
-            tensor,
-            tensor,
-            tensor,
-            tensor,
-            tensor,
-            row,
-            row,
-            row,
-            row,
-            cache,
-            cache,
-            1e-6,
-            1e-6,
-        )
-        is None
-    )
 
 
 @pytest.mark.parametrize("mode", ["dense", "attention_mask", "text_mask", "sharded"])

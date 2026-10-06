@@ -249,8 +249,8 @@ class TestKDAFlashInferEnvelopeStateContract(unittest.TestCase):
     def _build_kda_views(heads_per_rank: int = 12):
         """Real K3 KDA envelope views on CPU for one attn-TP shard; 2 slots
         suffice, the per-slot geometry is slot-count independent."""
-        from sglang.srt.mem_cache.layout.page_major import (
-            build_page_major_mamba_views,
+        from sglang.srt.mem_cache.layout.token_major import (
+            build_mamba_entry_views,
             mamba_entry_bytes,
         )
 
@@ -258,9 +258,7 @@ class TestKDAFlashInferEnvelopeStateContract(unittest.TestCase):
         entry_bytes = mamba_entry_bytes(**geom)
         max_slots = 2
         raw = torch.empty(max_slots * entry_bytes, dtype=torch.uint8, device="cpu")
-        _, temporal_view = build_page_major_mamba_views(
-            raw, max_slots=max_slots, **geom
-        )
+        _, temporal_view = build_mamba_entry_views(raw, max_slots=max_slots, **geom)
         return geom, entry_bytes, temporal_view
 
     def test_k3_tp8_envelope_view_matches_recurrent_kda_contract(self):

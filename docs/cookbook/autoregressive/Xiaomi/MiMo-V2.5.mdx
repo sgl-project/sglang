@@ -76,12 +76,12 @@ import { MiMoV25Deployment } from '/src/snippets/autoregressive/mimo-v25-deploym
 - EAGLE speculative decoding (3 steps, topk=1) typically yields a 2–3× decode speedup. Requires `--enable-multi-layer-eagle` (both Hopper and Blackwell). See §5.4 for acceptance-rate behavior on natural text vs random prompts.
 
 **MiMo-V2.5 (310B):**
-- The checkpoint has a TP=4-interleaved fused `qkv_proj`; attention-TP per DP group **must** be 4. Use `--dp = TP / 4`; for TP > 4 this also requires DP-attention. Total GPUs must be a multiple of 4. A bare `--tp 8` without `--dp 2` will fail to load with `MiMoV2 fused qkv_proj checkpoint is TP=4-interleaved; got attention tp_size=8`.
-- Single-node deployments: H100/H200 8× GPUs (`--tp 8 --dp 2`), B200 4× GPUs (`--tp 4`, dp=1, no DP-attn flag needed), GB300 4× GPUs (`--tp 4`, single NVL4 node). FP8 quantization.
+- The checkpoint has a TP=4-interleaved fused `qkv_proj`; attention-TP per DP group **must** be 4. Use `--attn-dp-size = TP / 4`; for TP > 4 this means DP-attention is on. Total GPUs must be a multiple of 4. A bare `--tp 8` without `--attn-dp-size 2` will fail to load with `MiMoV2 fused qkv_proj checkpoint is TP=4-interleaved; got attention tp_size=8`.
+- Single-node deployments: H100/H200 8× GPUs (`--tp 8 --attn-dp-size 2`), B200 4× GPUs (`--tp 4`, attention DP size 1, no DP-attn flag needed), GB300 4× GPUs (`--tp 4`, single NVL4 node). FP8 quantization.
 - On Blackwell, pass `--attention-backend fa4`: MiMoV2's asymmetric KV (`head_dim` 192 / `v_head_dim` 128) fails on the SM100 default `trtllm_mha`, which requires equal K/V widths.
 - On Blackwell, pass `--mm-attention-backend fa4` for the V2.5 vision encoder. The checkpoint config requests FlashAttention-3 internally, but SGLang rejects FA3 on Blackwell and expects FA4 for multimodal attention.
 - On Blackwell, pass `--moe-runner-backend flashinfer_trtllm`; the default `auto` falls through to the triton fused-MoE runner, ~12% slower at bs=1 decode.
-- `--enable-dp-lm-head` and `--mm-enable-dp-encoder` are required whenever `--enable-dp-attention` is on, to keep LM head and encoder sharding consistent.
+- `--enable-dp-lm-head` and `--mm-enable-dp-encoder` are required whenever `--attn-dp-size` is greater than 1, to keep LM head and encoder sharding consistent.
 - EAGLE MTP uses the checkpoint's MTP weights. Enable with `--speculative-algorithm EAGLE` and `--enable-multi-layer-eagle` (both Hopper and Blackwell).
 - **Multimodal**: Supports image, video, and audio understanding; see Section 4.3 for invocation examples.
 
@@ -365,15 +365,16 @@ Standard 5-shot, `temperature=0`, `max_tokens=4096`, model defaults to thinking-
 **Benchmark Command:**
 
 ```shell Command
-python3 -m sglang.test.run_eval \
-  --base-url http://127.0.0.1:30000 \
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
   --model XiaomiMiMo/MiMo-V2.5 \
-  --eval-name gsm8k \
   --num-examples 200 \
   --num-threads 8 \
   --max-tokens 4096 \
   --temperature 0.0
 ```
+
+The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
 
 > `run_eval.py` automatically appends `/v1` to `--base-url`; pass the bare `host:port` URL (without trailing `/v1`), otherwise requests resolve to `/v1/v1/chat/completions` and 404.
 
@@ -546,7 +547,7 @@ Max ITL (ms):                            1600.00
 
 - Hardware: NVIDIA H200 GPU (8×)
 - Model: `XiaomiMiMo/MiMo-V2.5` (FP8)
-- Tensor Parallelism: 8 (DP-attention with `--dp 2`)
+- Tensor Parallelism: 8 (DP-attention with `--attn-dp-size 2`)
 - Recipe: Balanced (DP-attn + EAGLE MTP)
 - sglang version: `0.0.0.dev1+g7d99af439` (`lmsysorg/sglang:dev-mimo-v2.5`)
 
@@ -748,13 +749,14 @@ Pro's 3-layer MTP behaves very differently on natural text vs uniform-random tok
 **Benchmark Command:**
 
 ```shell Command
-python3 -m sglang.test.run_eval \
-  --base-url http://127.0.0.1:30000 \
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
   --model XiaomiMiMo/MiMo-V2.5-Pro \
-  --eval-name gsm8k \
   --num-examples 200 \
   --num-threads 4
 ```
+
+The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
 
 The `accept_rate` and `accept_length` rows below are not part of `run_eval`'s own output — they were aggregated from the server-side `Decode batch ... accept rate: X accept len: Y` log lines emitted during the GSM8K run (307 batches total).
 
@@ -775,7 +777,7 @@ Reference numbers from the [day0 enablement PR](https://github.com/sgl-project/s
 
 - Hardware: NVIDIA Hopper GPU (2 nodes × 8 GPUs, GPU SKU intentionally not disclosed)
 - Model: `XiaomiMiMo/MiMo-V2.5-Pro` (FP8)
-- Parallelism: `--tp 16 --dp 2 --ep 16 --moe-dense-tp-size 1 --enable-dp-attention`
+- Parallelism: `--tp 16 --attn-dp-size 2 --ep 16 --moe-dense-tp-size 1`
 - Recipe: Hopper EP16 (DeepEP + EAGLE multi-layer MTP)
 
 #### 5.5.1 Long-Context Prefill Throughput
