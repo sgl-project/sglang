@@ -65,34 +65,30 @@ class InklingOutputParser:
         self._content_kind_ids = frozenset(
             tokenizer.encode_special(name) for name in _CONTENT_KIND_NAMES
         )
+        self._text_opener_ids = (
+            tokenizer.encode_special("message_model"),
+            tokenizer.encode_special("content_text"),
+        )
+        self._end_message_id = tokenizer.encode_special("end_message")
         self._message_ids: list[int] = []
         self._streamed = ""
         self._held_reasoning = ""
         self._model_authored = True
+        self._at_message_boundary = True
+        self._in_unframed_text = False
         self._num_tool_calls = 0
         self.num_consumed_tokens = 0
         if continues_text_block:
             # The prompt ended inside an open model text block, so the sampled
             # tokens carry no header; replay the opener so they parse as text.
-            self._message_ids = [
-                tokenizer.encode_special("message_model"),
-                tokenizer.encode_special("content_text"),
-            ]
-            for token_id in self._message_ids:
-                self._parser.parse_token(token_id)
+            for token_id in self._text_opener_ids:
+                self._parse(token_id, _DeltaBuilder())
 
     def feed(self, token_ids: Sequence[int]) -> InklingOutputDelta:
         delta = _DeltaBuilder()
         for token_id in token_ids:
             self.num_consumed_tokens += 1
-            self._message_ids.append(token_id)
-            try:
-                updates = self._parser.parse_token(token_id)
-            except self._tml.v0.ParseError as exc:
-                self._recover_message(delta, exc)
-                continue
-            for update in updates:
-                self._apply(update.update, delta)
+            self._feed_token(token_id, delta)
         return delta.build()
 
     def finish(
@@ -128,6 +124,33 @@ class InklingOutputParser:
         self._release_held_reasoning(delta)
         return delta.build()
 
+    def _feed_token(self, token_id: int, delta: _DeltaBuilder) -> None:
+        is_special = self._tml.tokenizer.is_special_token(token_id)
+        if self._in_unframed_text and is_special:
+            # Inside a real text block TML reads most specials as text; the
+            # sampler never emitted an opener here, so a special is framing.
+            self._in_unframed_text = False
+            if token_id != self._end_message_id:
+                self._parse(self._end_message_id, delta)
+        elif self._at_message_boundary and not is_special:
+            # Constrained decoding (e.g. response_format) samples a bare payload
+            # where a message header belongs; parse it as model text.
+            for opener_id in self._text_opener_ids:
+                self._parse(opener_id, delta)
+            self._in_unframed_text = True
+        self._parse(token_id, delta)
+
+    def _parse(self, token_id: int, delta: _DeltaBuilder) -> None:
+        self._at_message_boundary = False
+        self._message_ids.append(token_id)
+        try:
+            updates = self._parser.parse_token(token_id)
+        except self._tml.v0.ParseError as exc:
+            self._recover_message(delta, exc)
+            return
+        for update in updates:
+            self._apply(update.update, delta)
+
     def _apply(self, update: Any, delta: _DeltaBuilder) -> None:
         chat = self._tml.chat
         if isinstance(update, chat.StreamingMessageHeader):
@@ -141,6 +164,7 @@ class InklingOutputParser:
             self._complete_message(update, delta)
             self._message_ids = []
             self._streamed = ""
+            self._at_message_boundary = True
 
     def _complete_message(self, message: Any, delta: _DeltaBuilder) -> None:
         chat = self._tml.chat
@@ -198,6 +222,8 @@ class InklingOutputParser:
         self._message_ids = []
         self._streamed = ""
         self._model_authored = True
+        self._at_message_boundary = True
+        self._in_unframed_text = False
 
     def _payload_text(self) -> str:
         ids = self._message_ids

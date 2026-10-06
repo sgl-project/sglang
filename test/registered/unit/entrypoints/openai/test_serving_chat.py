@@ -5128,6 +5128,37 @@ class InklingTokenOutputTest(CustomTestCase):
                 with self.subTest(case=name, mode=mode):
                     self.assertEqual(result, expected)
 
+    def test_constrained_output_without_header_is_content(self):
+        """Bug regression: response_format grammars sample bare JSON where a
+        message header belongs (after the reasoning terminator, or from the
+        first token), and the parser dropped that unframed text."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        encode = tokenizer.encode_ordinary
+        special = tokenizer.encode_special
+        payload = '{"marker": "<|end_message|>", "ok": true}'
+        thinking = [
+            special("message_model"),
+            special("content_thinking"),
+            *encode("plan"),
+            special("end_message"),
+        ]
+        eos = special("content_model_end_sampling")
+        cases = [
+            ("after thinking", thinking, ("plan", payload)),
+            ("from first token", [], ("", payload)),
+        ]
+        for name, prefix, expected in cases:
+            results = self._reasoning_and_content(
+                self.request,
+                [*prefix, *encode(payload), eos],
+                {"type": "stop", "matched": eos},
+            )
+            for mode, result in results.items():
+                with self.subTest(case=name, mode=mode):
+                    self.assertEqual(result, expected)
+
 
 class TestRequestChatTemplateTrustGate(CustomTestCase):
     def setUp(self):
