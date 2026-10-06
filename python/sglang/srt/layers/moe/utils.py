@@ -23,9 +23,10 @@ from sglang.srt.runtime_context import (
     get_server_args,
     get_spec,
 )
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import is_cuda, is_npu, is_xpu
 
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 
 from sglang.srt.utils.common import log_info_on_rank0
 
@@ -383,8 +384,8 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     ):
         return DispatcherOutputDtype.BF16
 
-    # 6. Default on NPU → BF16
-    if _is_npu:
+    # 6. Default on NPU / XPU → BF16
+    if _is_npu or _is_xpu:
         return DispatcherOutputDtype.BF16
 
     # 7. Default → FP8
