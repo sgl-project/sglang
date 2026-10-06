@@ -205,6 +205,25 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                     self.apply_policy(make_runner(self, **runner_args), **hardware)
                 )
 
+    def test_selects_flashinfer_for_a_page_major_pool(self):
+        """The unified pool runs page-major. Its strided state reaches every
+        prefill kernel as contiguous per-sequence copies, so FlashInfer prefill
+        qualifies there exactly as on the contiguous pool."""
+        cases = (
+            ("sm100", {}, {}),
+            (
+                "sm90",
+                {"state_dtype": torch.float32},
+                {"capability": (9, 0), "cuda_version": "12.9"},
+            ),
+        )
+        for name, runner_args, hardware in cases:
+            with self.subTest(name=name):
+                runner = make_runner(
+                    self, enable_page_major_kv_layout=True, **runner_args
+                )
+                self.assertEqual(self.apply_policy(runner, **hardware), "flashinfer")
+
     def test_rejects_gdn_config_without_qwen_head_dims(self):
         runner = make_runner(self)
         runner.hybrid_gdn_config = SimpleNamespace()
@@ -213,7 +232,6 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
     def test_rejects_unvalidated_runtime_modes(self):
         cases = (
             ("non_triton_base", {"linear_attn_backend": "cutedsl"}),
-            ("page_major_kv", {"enable_page_major_kv_layout": True}),
             ("dynamic_chunk", {"enable_dynamic_chunking": True}),
             ("unchunked", {"chunked_prefill_size": -1}),
             ("unknown_chunk", {"chunked_prefill_size": None}),
