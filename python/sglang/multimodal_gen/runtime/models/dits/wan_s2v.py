@@ -31,10 +31,11 @@ from sglang.multimodal_gen.runtime.layers.attention.layer import (
     UlyssesAttention,
     USPAttention,
 )
-from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
+from sglang.multimodal_gen.runtime.layers.elementwise import GatedResidual2Seg, MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
     LayerNormScaleShift,
+    LayerNormScaleShift2Seg,
     RMSNorm,
     tensor_parallel_rms_norm,
 )
@@ -761,6 +762,11 @@ class WanS2VAttentionBlock(WanAttentionBlock):
             eps,
             supported_attention_backends=supported_attention_backends,
         )
+        # The video tokens and the t=0 suffix are modulated with different rows of e.
+        self.norm1 = LayerNormScaleShift2Seg(dim, eps=eps, dtype=torch.float32)
+        self.norm2 = LayerNormScaleShift2Seg(dim, eps=eps, dtype=torch.float32)
+        self.self_attn_residual = GatedResidual2Seg()
+        self.mlp_residual = GatedResidual2Seg()
 
     def forward(
         self,
@@ -774,58 +780,21 @@ class WanS2VAttentionBlock(WanAttentionBlock):
         num_replicated_suffix=0,
     ):
         seg_idx = min(max(0, e[1].item()), x.size(1))
-        seg_idx = [0, seg_idx, x.size(1)]
         e = e[0]
         e = (self.modulation.float().unsqueeze(2) + e.float()).chunk(6, dim=1)
         e = [element.squeeze(1) for element in e]
-        norm_x = torch.cat(
-            [
-                self.norm1(
-                    x[:, seg_idx[i] : seg_idx[i + 1]],
-                    e[0][:, i : i + 1],
-                    e[1][:, i : i + 1],
-                )
-                for i in range(2)
-            ],
-            dim=1,
-        )
         y = self.self_attn(
-            norm_x,
+            self.norm1(x, e[0], e[1], seg_idx),
             seq_lens,
             grid_sizes,
             freqs,
             num_replicated_suffix=num_replicated_suffix,
         )
-        y = torch.cat(
-            [
-                y[:, seg_idx[i] : seg_idx[i + 1]].float() * e[2][:, i : i + 1]
-                for i in range(2)
-            ],
-            dim=1,
-        )
-        x = x + y.to(dtype=x.dtype)
+        x = self.self_attn_residual(x, y, e[2], seg_idx)
         cross = self.cross_attn(self.norm3(x), context, context_lens)
         x = x + cross
-        norm2_x = torch.cat(
-            [
-                self.norm2(
-                    x[:, seg_idx[i] : seg_idx[i + 1]],
-                    e[3][:, i : i + 1],
-                    e[4][:, i : i + 1],
-                )
-                for i in range(2)
-            ],
-            dim=1,
-        )
-        y = self.ffn(norm2_x)
-        y = torch.cat(
-            [
-                y[:, seg_idx[i] : seg_idx[i + 1]].float() * e[5][:, i : i + 1]
-                for i in range(2)
-            ],
-            dim=1,
-        )
-        x = x + y.to(dtype=x.dtype)
+        y = self.ffn(self.norm2(x, e[3], e[4], seg_idx))
+        x = self.mlp_residual(x, y, e[5], seg_idx)
         return x
 
 
