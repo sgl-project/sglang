@@ -4355,6 +4355,24 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
 
+    def test_fallback_llama_nemotron_never_forces_by_default(self):
+        """Llama-Nemotron picks thinking through a "detailed thinking on" system
+        prompt, so an unannotated request must not force reasoning; nemotron_3's
+        default-on toggle made a "thinking off" answer come back as
+        reasoning_content with content empty."""
+        self._setup_fallback("llama_nemotron")
+        req_default = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        self.assertFalse(self.chat._get_reasoning_from_request(req_default))
+
+        req_enabled = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
+
     def test_fallback_ling3_default_on(self):
         """Ling3 public checkpoints default `thinking_option='on'` in the chat
         template when `enable_thinking` is omitted, and the template detector

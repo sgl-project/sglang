@@ -1119,6 +1119,20 @@ class Nemotron3Detector(BaseReasoningFormatDetector):
         )
 
 
+class _LlamaNemotronDetector(Nemotron3Detector):
+    """Llama-Nemotron (nvidia/Llama-3_3-Nemotron-Super-49B-v1,
+    Llama-3_1-Nemotron-Ultra-253B-v1) reuses the Nemotron <think> tokens, but
+    thinking is selected by a "detailed thinking on"/"off" system prompt rather
+    than enable_thinking. Reasoning must never be forced from the default: the
+    model opens <think> itself when it thinks, and forcing it would file a
+    non-thinking answer as reasoning_content and return empty content.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.reasoning_default = "explicit_enable_thinking"
+
+
 class GraniteThinkingDetector(BaseReasoningFormatDetector):
     """Detector for Granite 4.2 thinking models (ibm-granite/granite-4.2-*).
 
@@ -2282,6 +2296,7 @@ class ReasoningParser:
         "step3p5": DeepSeekR1Detector,
         "mistral": MistralDetector,
         "nemotron_3": Nemotron3Detector,
+        "llama_nemotron": _LlamaNemotronDetector,
         "granite_thinking_parser": GraniteThinkingDetector,
         "interns1": Qwen3Detector,
         "gemma4": Gemma4Detector,
