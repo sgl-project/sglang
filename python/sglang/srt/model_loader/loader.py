@@ -12,6 +12,7 @@ import fnmatch
 import gc
 import glob
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -1074,7 +1075,6 @@ class DefaultModelLoader(BaseModelLoader):
     @staticmethod
     def postprocess_weights(model, target_device):
         if QuantizedRLModelLoader.is_reload_scenario(model):
-            QuantizedRLModelLoader.end_weight_update(model)
             return
         for module, quant_method in _modules_with_quant_method(model):
             # When quant methods need to process weights after loading
@@ -1089,7 +1089,6 @@ class DefaultModelLoader(BaseModelLoader):
     def restore_weights_before_loading(model, target_device):
         """Undo in-place quant packing so fresh weights can be loaded."""
         if QuantizedRLModelLoader.is_reload_scenario(model):
-            QuantizedRLModelLoader.begin_weight_update(model)
             return
         for module, quant_method in _modules_with_quant_method(model):
             # AMX packing and the MXFP4 backend wrappers are duck-typed and cannot restore
@@ -1312,28 +1311,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         return name, None, None
 
     @staticmethod
-    def begin_weight_update(model):
-        if hasattr(model, "_quantized_rl_pending"):
-            raise ValueError("A quantized weight-update session is already open")
-        model._quantized_rl_pending = {}
-
-    @staticmethod
-    def validate_weight_update(model):
-        pending = getattr(model, "_quantized_rl_pending", {})
-        if pending:
-            raise ValueError(
-                "Incomplete per-tensor FP8 updates: "
-                + ", ".join(sorted(pending))
-                + ". Supply all destination rows before ending the update session."
-            )
-
-    @staticmethod
-    def end_weight_update(model):
-        QuantizedRLModelLoader.validate_weight_update(model)
-        if hasattr(model, "_quantized_rl_pending"):
-            del model._quantized_rl_pending
-
-    @staticmethod
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
         """Shard new BF16 weights natively, then quantize into their original buffers."""
         from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -1356,7 +1333,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             if shard_id is None:
                 complete_params.add(name)
 
-        pending = getattr(model, "_quantized_rl_pending", None)
         row_masks = {}
         # Check coverage before modifying any model parameter. Per-tensor
         # quantization needs the original BF16 values for every destination row.
@@ -1385,20 +1361,17 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     marker, torch.ones((weight.shape[0], 1), device="cpu"), *args
                 )
             rows = marker.data[:, 0].bool()
-            if pending is not None and name in pending:
-                rows |= pending[name][1]
-            if not per_channel and not rows.all() and pending is None:
+            if not per_channel and not rows.all():
                 raise ValueError(
                     f"Partial per-tensor FP8 update for {name}: supply all destination "
-                    "rows together, or use begin_weight_update()/end_weight_update() "
-                    "to send a complete matrix in multiple chunks."
+                    "rows in the same update call, including inside a weight-update session."
                 )
             row_masks[name] = (rows, per_channel)
 
         def load_destinations():
             for name, sources in grouped.items():
                 if name not in row_masks:
-                    yield from sources
+                    yield sources
                     continue
                 param = params[name]
                 data = param.data
@@ -1406,17 +1379,12 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 layer = model.get_submodule(name.rpartition(".")[0])
                 rows, per_channel = row_masks[name]
                 complete = rows is None or bool(rows.all())
-                if pending is not None and name in pending and rows is not None:
-                    staging = pending[name][0]
-                else:
-                    # Incomplete per-tensor matrices retain only new BF16 data
-                    # on the host until a session supplies all their rows.
-                    staging = torch.empty_strided(
-                        rebuild["shape"],
-                        rebuild["stride"],
-                        dtype=rebuild["dtype"],
-                        device=data.device if per_channel or complete else "cpu",
-                    )
+                staging = torch.empty_strided(
+                    rebuild["shape"],
+                    rebuild["stride"],
+                    dtype=rebuild["dtype"],
+                    device=data.device,
+                )
                 param.data = staging
                 for key, loaders in model.recorded_loader.items():
                     if name in loaders and not hasattr(param, key):
@@ -1429,14 +1397,8 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                             else loader,
                         )
                 try:
-                    # The model consumes each source with its native loader
-                    # before the iterator resumes to finalize this destination.
-                    yield from sources
-                    if not per_channel and not complete:
-                        pending[name] = (staging, rows)
-                        continue
-                    if staging.device != data.device:
-                        staging = staging.to(data.device)
+                    # The caller completes this group before requesting the next.
+                    yield sources
                     local_weight = torch.as_strided(
                         data, rebuild["shape"], rebuild["stride"]
                     )
@@ -1465,18 +1427,22 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                             staging, dtype=data.dtype, out=local_weight
                         )
                         layer.weight_scale.data.copy_(scale)
-                        if pending is not None:
-                            pending.pop(name, None)
                 finally:
                     param.data = data
                     # Release this destination before allocating the next one.
                     del staging
 
-        native_weights = load_destinations()
+        destinations = load_destinations()
         try:
-            first_time_load_weights(native_weights)
+            if getattr(first_time_load_weights, "_streams_weight_loading", False):
+                first_time_load_weights(itertools.chain.from_iterable(destinations))
+            else:
+                # Generic loaders may eagerly materialize or reorder weights.
+                # Keep BF16 staging active until their native call returns.
+                for sources in destinations:
+                    first_time_load_weights(sources)
         finally:
-            native_weights.close()
+            destinations.close()
 
         if is_last_update:
             gc.collect()

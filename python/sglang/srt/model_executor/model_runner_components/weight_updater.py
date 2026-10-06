@@ -10,7 +10,6 @@ import torch
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
-    QuantizedRLModelLoader,
     get_model_loader,
     post_load_weights,
 )
@@ -314,9 +313,6 @@ class WeightUpdater:
         DefaultModelLoader.restore_weights_before_loading(
             self.get_model(), torch.device(self.device)
         )
-
-    def validate_weight_update(self: WeightUpdater) -> None:
-        QuantizedRLModelLoader.validate_weight_update(self.get_model())
 
     def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> None:
         if run_post_load:

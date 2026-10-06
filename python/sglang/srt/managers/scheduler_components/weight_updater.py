@@ -312,22 +312,7 @@ class SchedulerWeightUpdaterManager:
                 message="no weight-update session is open; call begin_weight_update() first",
             )
         run_post_load = not self._session.loaded_weights
-        runners = self._select_runners(self._session.selector)
-        error = None
-        try:
-            for _, runner in runners:
-                runner.weight_updater.validate_weight_update()
-        except ValueError as e:
-            error = str(e)
-        # Reject on every TP rank before finalizing any runner. Keep the
-        # session open so the caller can supply the missing checkpoint rows.
-        errors = [None] * torch.distributed.get_world_size(group=self.tp_cpu_group)
-        torch.distributed.all_gather_object(errors, error, group=self.tp_cpu_group)
-        if any(errors):
-            return EndWeightUpdateReqOutput(
-                success=False, message="; ".join(dict.fromkeys(e for e in errors if e))
-            )
-        for _, runner in runners:
+        for _, runner in self._select_runners(self._session.selector):
             runner.weight_updater.end_weight_update(run_post_load=run_post_load)
         self._session = None
         torch.distributed.barrier(group=self.tp_cpu_group)

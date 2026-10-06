@@ -1474,6 +1474,16 @@ def gguf_quant_weights_iterator(
             yield name, param
 
 
+def streaming_weight_loader(func: Callable) -> Callable:
+    """Declare that each input tensor is loaded before advancing the iterator.
+
+    Quantized reloads can then finalize one destination before staging the next.
+    Methods that buffer or reorder their inputs must not use this declaration.
+    """
+    func._streams_weight_loading = True
+    return func
+
+
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     if param.numel() == 1 and loaded_weight.numel() == 1:
