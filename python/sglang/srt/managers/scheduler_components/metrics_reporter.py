@@ -219,6 +219,13 @@ class SchedulerMetricsReporter:
         self.enable_kv_cache_events = (
             self.metrics_collector_context.enable_kv_cache_events
         )
+        parallel = get_parallel()
+        # The max/mean token ratio is engine-wide; one scheduler reports it.
+        self.reports_dp_token_imbalance_ratio = (
+            parallel.attn_dp_rank == 0
+            and parallel.attn_tp_rank == 0
+            and parallel.attn_cp_rank == 0
+        )
         self._init_metrics()
         self._install_device_timer_on_runners()
         # Keep log history after the existing async result copy so reporting does
@@ -1114,6 +1121,16 @@ class SchedulerMetricsReporter:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if (
+            self.current_scheduler_metrics_enabled
+            and (dp_balance_stats := batch.dp_balance_stats) is not None
+        ):
+            self.metrics_collector.observe_dp_balance(dp_balance_stats)
+            if self.reports_dp_token_imbalance_ratio:
+                self.metrics_collector.observe_dp_token_imbalance_ratio(
+                    dp_balance_stats
+                )
+
         if not isinstance(result, GenerationBatchResult):
             return
 
