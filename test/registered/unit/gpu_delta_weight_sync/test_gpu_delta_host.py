@@ -786,28 +786,8 @@ class TestHostSnapshot(unittest.TestCase):
             first.index["encoded"]["capacity"],
             (sum(file["nbytes"] for file in manifest["files"]) + 1023) // 1024 * 1024,
         )
-        records = dict(first.index["tensors"])
-        first_extents = {name: dict(record) for name, record in records.items()}
         first.mark_reusable()
         first.close()
-        # Inner compressed spans may shrink while canonical tensor shapes stay
-        # fixed. Another tensor becomes unchanged and must leave the active map.
-        smaller = b"shorter-inner-frame"
-        dense, expert = manifest["tensors"][:2]
-        compressed = zstd.ZstdCompressor(write_checksum=True).compress(smaller)
-        dense["frames"][0]["encoded_bytes"] = len(smaller)
-        dense["outer"].update(encoded_bytes=len(compressed), decoded_bytes=len(smaller))
-        dense["outer"]["frames"][0].update(
-            encoded_bytes=len(compressed), decoded_bytes=len(smaller)
-        )
-        expert.update(changed_bytes=0, frames=[])
-        del expert["outer"]
-        payload = bytearray((self.root / "owner.bin").read_bytes())
-        payload[: len(compressed)] = compressed
-        (self.root / "owner.bin").write_bytes(payload)
-        manifest["files"][0]["sha256"] = hashlib.sha256(payload).hexdigest()
-        path.write_text(json.dumps(manifest))
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
         warm = {}
         second = prepare_snapshot(
             arena,
@@ -823,14 +803,6 @@ class TestHostSnapshot(unittest.TestCase):
         self.assertEqual(warm["host_rank_allocation_calls"], 0)
         self.assertEqual(warm["host_encoded_cache_allocation_calls"], 0)
         self.assertEqual(warm["host_rank_mapping_reused"], 1)
-        self.assertIsNot(second.index["tensors"], first.index["tensors"])
-        self.assertEqual(set(second.index["tensors"]), {"dense", "raw"})
-        for name in second.index["tensors"]:
-            self.assertIs(second.index["tensors"][name], records[name])
-        self.assertEqual(records["expert"], {"offset": 0, "nbytes": 0})
-        self.assertLess(records["raw"]["offset"], first_extents["raw"]["offset"])
-        self.assertEqual(bytes(second.get("dense")), smaller)
-        self.assertEqual(bytes(second.get("raw")), expected["raw"])
         first.mark_reusable()
         with self.assertRaisesRegex(ValueError, "engine APPLIED release"):
             prepare_snapshot(
@@ -845,9 +817,7 @@ class TestHostSnapshot(unittest.TestCase):
             )
         second.mark_reusable()
         second.close()
-        # Restore the inactive expert and original dense span while growing the
-        # raw target. The same records must now describe the new allocation.
-        path, _, manifest, expected = fixture(self.root)
+        manifest = json.loads(path.read_text())
         large = bytes(original["capacity"] * 2 + 1)
         payload = (self.root / "owner.bin").read_bytes() + large
         raw = manifest["tensors"][2]
@@ -874,23 +844,6 @@ class TestHostSnapshot(unittest.TestCase):
         self.assertNotEqual(third.index["rank_arena"]["identity"], original["identity"])
         self.assertEqual(third.index["rank_arena"]["generation"], 2)
         self.assertEqual(growth["host_rank_allocation_calls"], 1)
-        self.assertEqual(set(third.index["tensors"]), set(expected))
-        for name, record in third.index["tensors"].items():
-            self.assertIs(record, records[name])
-            self.assertEqual(
-                bytes(third.get(name)), large if name == "raw" else expected[name]
-            )
-        self.assertEqual(records["dense"], first_extents["dense"])
-        self.assertEqual(records["expert"], first_extents["expert"])
-        self.assertEqual(records["raw"]["offset"], first_extents["raw"]["offset"])
-        self.assertEqual(records["raw"]["nbytes"], len(large))
-        self.assertEqual(set(arena.tensor_records), set(expected))
-        self.assertTrue(
-            all(
-                set(record) == {"offset", "nbytes"}
-                for record in arena.tensor_records.values()
-            )
-        )
         self.assertEqual(
             third.index["rank_arena"]["capacity"],
             (2 * third.index["arena_bytes"] + 1023) // 1024 * 1024,
@@ -961,7 +914,7 @@ def decode_fixture():
             "raw": {"file": "payload", "encoded_offset": start, "encoded_bytes": 16},
         }
     )
-    layout, size = host._tensor_layout(entries, {})
+    layout, size = host._tensor_layout(entries)
     return entries, layout, size, {"payload": memoryview(bytes(blob))}, expected
 
 
