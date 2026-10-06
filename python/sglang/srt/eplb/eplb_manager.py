@@ -9,6 +9,7 @@ import torch.distributed as dist
 from torch import nn
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.elastic_ep.errors import ElasticLayoutFatal
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import (
@@ -27,13 +28,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class ExpertLayoutDivergence(RuntimeError):
+class ExpertLayoutDivergence(ElasticLayoutFatal):
     """A reshuffle stopped with the cohort's expert layouts possibly disagreeing.
 
-    Separate from a clean abort, which returns False having installed nothing: once a
+    Separate from a clean abort, which returns False having installed nothing. Once a
     chunk is in, a rank that falls back holds a different map than its peers and routes
-    tokens to the wrong expert, returning plausible garbage instead of failing. Callers
-    must treat this as fatal, like the orphan reload in _load_missing_expert_weights.
+    tokens to the wrong expert, returning plausible garbage instead of failing. Fatal,
+    like the orphan reload in _load_missing_expert_weights, and for the same reason.
     """
 
 
@@ -302,7 +303,6 @@ class EPLBManager:
         if not self._cohort_accepts(new_metadata is not None, cohort_size, "metadata"):
             return False
 
-        installed_any = False
         for chunk_layer_ids in self._compute_update_layer_ids_chunks():
             failed = False
             try:
@@ -333,15 +333,16 @@ class EPLBManager:
             # out. Still a rendezvous for ranks with no moves in this chunk, which
             # have to install it too (see rebalance()).
             if not self._cohort_accepts(not failed, cohort_size, "chunk"):
-                if not installed_any:
-                    # Nothing landed anywhere, so every rank still holds the map it
-                    # came in with: a clean abort the caller can retry.
-                    return False
+                # The first chunk is no cleaner than the rest. update() installs the
+                # chunk's metadata after the p2p copy and before the weights reload, so
+                # by the time a vote fails the ranks that passed already hold it, and
+                # the one that failed holds either the old map or the new map over slots
+                # it could not reload. Either way the cohort has stopped agreeing. Only
+                # the two votes above this loop leave every rank on the map it came in
+                # with, and those are the only clean aborts.
                 raise ExpertLayoutDivergence(
-                    "scale reshuffle stopped after installing "
-                    "at least one chunk; layout may diverge"
+                    "scale reshuffle stopped on a failed chunk vote; layout may diverge"
                 )
-            installed_any = True
         return True
 
     @staticmethod
