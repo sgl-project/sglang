@@ -34,6 +34,7 @@ class _StubReq:
         self.extra_key = None
         self.cache_salt = None
         self.prefix_indices = None
+        self.prefix_len = 0
         self.last_node = None
         self.last_host_node = None
         self.best_match_node = None
@@ -42,6 +43,7 @@ class _StubReq:
         self.swa_branching_seqlen = None
         self.kv = SimpleNamespace(cache_protected_len=None)
 
+    set_prefix_indices = Req.set_prefix_indices
     match_prefix = Req.match_prefix
 
     def _compute_max_prefix_len(self, input_len):

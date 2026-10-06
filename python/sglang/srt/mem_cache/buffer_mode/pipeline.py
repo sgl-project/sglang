@@ -1043,7 +1043,7 @@ class BufferModePipeline:
             if not (req.host_hit_is_storage and req.host_loaded_length > 0):
                 self._clear_storage_hit(req)
             return True
-        joint_len = len(req.prefix_indices)
+        joint_len = req.prefix_len
         if joint_len >= f.matched_len + f.num_tokens:
             # The joint match already covers the staged span; a shorter FULL-only
             # prefix would strand the slots recomputed below cache_protected_len.
@@ -1072,7 +1072,7 @@ class BufferModePipeline:
             node_id, root_id
         )[:matched_len]
         assert len(full_indices) == matched_len
-        req.prefix_indices = full_indices
+        req.set_prefix_indices(full_indices)
         req.last_node = node_id
         req.kv.cache_protected_len = matched_len
         full_tokens = max(0, f.matched_len + f.num_tokens - matched_len)
@@ -1252,7 +1252,7 @@ class BufferModePipeline:
             req.staged_prefetch_plan = None
 
         splice_base = plan.device_prefix_len
-        assert len(req.prefix_indices) == splice_base
+        assert req.prefix_len == splice_base
         trim_tokens = splice_base - f.matched_len
         assert trim_tokens % cache.page_size == 0, (
             f"staged splice trim not page-aligned req={req.rid}: "

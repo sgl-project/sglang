@@ -424,7 +424,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
         )
         req.full_untruncated_fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
-        req.set_extend_range(len(req.prefix_indices), len(req.origin_input_ids))
+        req.set_extend_range(req.prefix_len, len(req.origin_input_ids))
         reqs.append(req)
 
     return input_ids, reqs
@@ -438,13 +438,13 @@ def prepare_extend_inputs_for_correctness_test(
         req.full_untruncated_fill_ids.extend(input_ids[i][bench_args.cut_len :])
         if model_runner is not None:
             # Use req.kv.req_pool_idx instead of i to handle slot 0 padding correctly
-            req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, : bench_args.cut_len
-            ].to(req.prefix_indices.dtype)
+            req.set_prefix_indices(
+                model_runner.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, : bench_args.cut_len
+                ].to(torch.int64)
+            )
             req.logprob_start_len = -1
-        req.set_extend_range(
-            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-        )
+        req.set_extend_range(req.prefix_len, len(req.full_untruncated_fill_ids))
     return reqs
 
 
@@ -471,7 +471,7 @@ def prepare_synthetic_inputs_for_latency_test(
         )
         req.full_untruncated_fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
-        req.set_extend_range(len(req.prefix_indices), len(req.origin_input_ids))
+        req.set_extend_range(req.prefix_len, len(req.origin_input_ids))
         reqs.append(req)
 
     return reqs

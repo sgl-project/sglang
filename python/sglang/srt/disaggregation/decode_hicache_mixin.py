@@ -315,8 +315,10 @@ class DecodeHiCacheTransferMixin:
             ),
             decode_req.hicache_restored_kv_indices,
         )
-        req.prefix_indices = torch.cat(
-            [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
+        req.set_prefix_indices(
+            torch.cat(
+                [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
+            )
         )
         req.last_node = restore_lock.node
         req.lock = restore_lock

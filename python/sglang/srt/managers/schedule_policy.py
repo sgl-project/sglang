@@ -334,7 +334,7 @@ class SchedulePolicy:
             # We prefer to set IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD > 0 because too small
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
-            if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
+            if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 match_result = self.waiting_queue_radix_tree.match_prefix(
                     MatchPrefixParams(
                         key=RadixKey(
@@ -397,9 +397,7 @@ class SchedulePolicy:
             or budget < 2 * page_size
         ):
             return None
-        remaining = len(chunked_req.full_untruncated_fill_ids) - len(
-            chunked_req.prefix_indices
-        )
+        remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
         reserved = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
@@ -1007,16 +1005,14 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         # Truncate input length to available tokens and update request metadata
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
-        )
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         if (
             self.dllm_config.requires_separate_context_encoding
             and req.is_dllm_prefill()
         ):
             cand_extend_input_len = min(
                 cand_extend_input_len,
-                req.dllm_block_offset - len(req.prefix_indices),
+                req.dllm_block_offset - req.prefix_len,
             )
         if (
             req.dllm_incomplete_ids
@@ -1028,7 +1024,7 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
-        req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+        req.set_extend_range(req.prefix_len, req.prefix_len + new_len)
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
@@ -1064,7 +1060,7 @@ class PrefillAdder:
             if self.kv_shard_granule:
                 # Align the absolute boundary to keep pages within one scratch region.
                 # If no budget remains, use a full chunk to make progress.
-                prefix_len = len(req.prefix_indices)
+                prefix_len = req.prefix_len
                 floored = (
                     prefix_len + _rem_tokens
                 ) // self.kv_shard_granule * self.kv_shard_granule - prefix_len
@@ -1085,9 +1081,7 @@ class PrefillAdder:
             assert self.chunked_req_limit > 0
             _rem_tokens = min(_rem_tokens, self.chunked_req_limit)
 
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
-        )
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         _rem_tokens = self.memory_budget.fit_chunk(
             extend_input_len=cand_extend_input_len,
             max_new_tokens=self._swa_new_tokens(req),
@@ -1099,11 +1093,11 @@ class PrefillAdder:
         new_len = min(cand_extend_input_len, _rem_tokens)
         # The continuing chunk must fit. Keep reservation outside assert for -O.
         reserved = self._kv_shard_reserve_scratch(
-            prefix_len=len(req.prefix_indices), extend_len=new_len
+            prefix_len=req.prefix_len, extend_len=new_len
         )
         if not reserved:
             raise RuntimeError("chunked request exceeds the sharded assembly scratch")
-        req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+        req.set_extend_range(req.prefix_len, req.prefix_len + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
@@ -1140,9 +1134,7 @@ class PrefillAdder:
                 self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)
 
     def add_one_req_ignore_eos(self, req: Req):
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
-        )
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         paged_input = (
             self.ceil_paged_tokens(cand_extend_input_len) + self.per_req_token_overhead
         )
@@ -1237,13 +1229,11 @@ class PrefillAdder:
 
             # Non-chunked prefill — the whole sequence is committed this iter.
             if not self._kv_shard_reserve_scratch(
-                prefix_len=len(req.prefix_indices),
+                prefix_len=req.prefix_len,
                 extend_len=cand_extend_input_len,
             ):
                 return AddReqResult.OTHER
-            req.set_extend_range(
-                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-            )
+            req.set_extend_range(req.prefix_len, len(req.full_untruncated_fill_ids))
             self.can_run_list.append(req)
             self._update_prefill_budget(
                 0,
@@ -1269,10 +1259,8 @@ class PrefillAdder:
             if not self._kv_shard_reserve_scratch(prefix_len=0, extend_len=trunc_len):
                 return AddReqResult.OTHER
 
-            assert len(req.prefix_indices) == 0
-            req.set_extend_range(
-                len(req.prefix_indices), len(req.prefix_indices) + trunc_len
-            )
+            assert req.prefix_len == 0
+            req.set_extend_range(req.prefix_len, req.prefix_len + trunc_len)
             self.can_run_list.append(req)
             self.new_chunked_req = req
             self._update_prefill_budget(
@@ -1302,9 +1290,7 @@ class PrefillAdder:
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
-        )
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
@@ -1402,7 +1388,7 @@ class PrefillAdder:
                 if req.host_loaded_length > promised_host_hit:
                     # A load can expose resident FULL behind host-only aux state; its
                     # H2D is queued, so keep the approved budget and shrink the work.
-                    prefix_len = len(req.prefix_indices) + req.host_loaded_length
+                    prefix_len = req.prefix_len + req.host_loaded_length
                     extend_len = admission.extend_len
                     if self.dllm_config is None:
                         extend_len = min(
@@ -1431,8 +1417,8 @@ class PrefillAdder:
                     )
                     if isinstance(admission, AddReqResult):
                         return admission
-                req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.kv.cache_protected_len = len(req.prefix_indices)
+                req.set_prefix_indices(torch.cat([req.prefix_indices, new_indices]))
+                req.kv.cache_protected_len = req.prefix_len
 
             # Sharded pools cannot load host KV; reserve scratch after all other gates.
             if not self._kv_shard_reserve_scratch(
@@ -1456,7 +1442,7 @@ class PrefillAdder:
         has_chunked_req: bool = False,
     ) -> _PrefillAdmission | AddReqResult:
         """Select a prefill shape without allocating or publishing cached KV."""
-        prefix_len = len(req.prefix_indices) + host_hit_length
+        prefix_len = req.prefix_len + host_hit_length
         extend_len = len(req.full_untruncated_fill_ids) - prefix_len
         input_tokens = self.ceil_paged_tokens(extend_len)
         # Whether the request fits whole. Against the raw length under
@@ -1531,7 +1517,7 @@ class PrefillAdder:
     def _commit_prefill_admission(
         self, req: Req, admission: _PrefillAdmission, mamba_gap_reserve: int
     ) -> None:
-        assert len(req.prefix_indices) == admission.prefix_len
+        assert req.prefix_len == admission.prefix_len
         req.set_extend_range(
             admission.prefix_len, admission.prefix_len + admission.extend_len
         )
@@ -1581,7 +1567,7 @@ class PrefillAdder:
         preemptible_reqs = []
         min_tokens_to_remove = (
             len(req.full_untruncated_fill_ids)
-            - len(req.prefix_indices)
+            - req.prefix_len
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
             - self.rem_total_tokens
         )
