@@ -203,13 +203,17 @@ class Model(msgspec.Struct):
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
+                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. "
+                '"mxfp4" selects the native OCP MXFP4 DSA KV cache '
+                "(block-size-32 E2M1 with one E8M0 scale per 32 values, "
+                "BF16 RoPE tails) via FlashMLA on SM100+."
             ),
             choices=[
                 "auto",
                 "fp8_e5m2",
                 "fp8_e4m3",
                 "mxfp8",
+                "mxfp4",
                 "bf16",
                 "bfloat16",
                 "nvfp4",

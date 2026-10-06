@@ -60,6 +60,11 @@ def configure_kv_cache_dtype(
             kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype == "mxfp8":
         kv_cache_dtype = torch.float8_e4m3fn
+    elif server_args_kv_cache_dtype == "mxfp4":
+        # Native OCP MXFP4: block-size-32 E2M1 with one E8M0 scale per 32 values.
+        # Stored as packed uint8 (two E2M1 elements per byte) plus a separate
+        # E8M0 scale buffer, so the pool dtype is a plain byte tensor here.
+        kv_cache_dtype = torch.uint8
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
     elif server_args_kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):

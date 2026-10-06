@@ -63,6 +63,20 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         self.assertEqual(resolve_kv_cache_quant("fp4_mx_block16"), "fp4_mx_block16")
         self.assertIsNone(resolve_kv_cache_quant("fp8_e4m3"))
 
+    def test_native_mxfp4_uses_byte_storage(self):
+        from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+
+        resolved, dtype = configure_kv_cache_dtype(
+            server_args_kv_cache_dtype="mxfp4",
+            model=None,
+            model_dtype=torch.bfloat16,
+            is_draft_worker=False,
+            is_dflash=False,
+            speculative_draft_attention_backend=None,
+        )
+        self.assertIsNone(resolved)
+        self.assertEqual(dtype, torch.uint8)
+
     def test_resolve_mxfp4_name_raises(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             resolve_kv_cache_quant,
