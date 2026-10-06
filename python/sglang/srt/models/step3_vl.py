@@ -25,9 +25,9 @@ from sglang.srt.layers.dp_attention import (
     reject_attn_tp_shard_with_tp_reduce,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -334,9 +334,6 @@ class Step3TextDecoderLayer(nn.Module):
 
         self.layer_id = layer_id
         self.is_layer_sparse = True if layer_id in moe_layers_idx else False
-        self.is_previous_layer_sparse = (
-            True if layer_id - 1 in moe_layers_idx else False
-        )
         self.is_next_layer_sparse = True if layer_id + 1 in moe_layers_idx else False
 
         if not self.is_layer_sparse:
@@ -373,7 +370,7 @@ class Step3TextDecoderLayer(nn.Module):
                     prefix=add_prefix("mlp", prefix),
                 )
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -382,13 +379,6 @@ class Step3TextDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=self.is_previous_layer_sparse,
-                next_layer_sparse=self.is_layer_sparse,
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def moe_mlp_forward(self, hidden_states):
