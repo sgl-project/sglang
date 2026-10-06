@@ -8,7 +8,11 @@ import torch
 from diffusers.models.embeddings import Timesteps
 from torch import nn
 
-from sglang.kernels.ops.diffusion import modulate_scale_shift
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    modulate_scale_shift,
+    tensors_equal,
+)
 from sglang.multimodal_gen.configs.models.dits.anima import AnimaDiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
@@ -29,6 +33,55 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+
+_ANIMA_ROPE = BitExactFusionGate("Anima FP32 RoPE", per_signature=True)
+
+
+def _anima_rope_eager(q, k, cos, sin):
+    cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+    q1, q2 = q.chunk(2, dim=-1)
+    k1, k2 = k.chunk(2, dim=-1)
+    return (
+        (q.float() * cos + torch.cat((-q2, q1), -1).float() * sin).to(q.dtype),
+        (k.float() * cos + torch.cat((-k2, k1), -1).float() * sin).to(k.dtype),
+    )
+
+
+def _anima_rope(q, k, cos, sin):
+    if (
+        not torch.compiler.is_compiling()
+        and q.is_cuda
+        and torch.version.hip is None
+        and not _ANIMA_ROPE.disabled
+    ):
+        from sglang.kernels.ops.diffusion import (
+            can_use_fused_rope_rotate_half_fp32,
+            fused_rope_rotate_half_fp32,
+        )
+
+        if can_use_fused_rope_rotate_half_fp32(q, k, cos, sin):
+            sig = (q.device, q.dtype, q.shape)
+            verified = _ANIMA_ROPE.is_verified(sig)
+            if verified or not torch.cuda.is_current_stream_capturing():
+                try:
+                    out = fused_rope_rotate_half_fp32(q, k, cos, sin)
+                except Exception as exc:
+                    _ANIMA_ROPE.on_exception(exc, logger=logger)
+                else:
+                    if verified:
+                        return out
+                    return _ANIMA_ROPE.accept_or_fallback(
+                        out,
+                        _anima_rope_eager(q, k, cos, sin),
+                        sig=sig,
+                        equal=tensors_equal,
+                        logger=logger,
+                    )
+    return _anima_rope_eager(q, k, cos, sin)
 
 
 def _is_anima_block(name, module):
@@ -187,12 +240,7 @@ class AnimaAttention(nn.Module):
         v = self.to_v(context)[0].unflatten(-1, (self.heads, self.head_dim))
         q, k = self.norm_q(q), self.norm_k(k)
         if rope is not None:
-            cos, sin = (r[None, :, None, :] for r in rope)
-            # Cosmos uses split-half RoPE in fp32, then rounds once
-            q1, q2 = q.chunk(2, dim=-1)
-            k1, k2 = k.chunk(2, dim=-1)
-            q = (q.float() * cos + torch.cat((-q2, q1), -1).float() * sin).to(q.dtype)
-            k = (k.float() * cos + torch.cat((-k2, k1), -1).float() * sin).to(k.dtype)
+            q, k = _anima_rope(q, k, *rope)
         out = self.attn(q, k, v, attn_mask_meta=attn_mask_meta).flatten(2)
         return self.to_out[0](out)[0]
 
