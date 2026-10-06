@@ -311,6 +311,11 @@ is_sm100_or_sm110_supported = lru_cache(maxsize=1)(
         cuda_version=(12, 8),
     )
 )
+is_sm110_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version, device_capability_majors=[11], cuda_version=(12, 8)
+    )
+)
 is_sm80_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
