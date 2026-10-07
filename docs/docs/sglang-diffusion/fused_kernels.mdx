@@ -14,7 +14,9 @@ Multi-step denoising amplifies a per-step rounding difference into visible quali
 
 **Bit-exact — mounted unconditionally.** The kernel reproduces every rounding boundary of the eager chain, so `torch.equal` holds against the reference. Some go quite far to get there: the fused LayerNorm+modulate kernel replicates PyTorch's `vectorized_layer_norm_kernel` down to its Welford update order, guarded reciprocal, and warp-fold tree; the fused RMSNorm+scale/shift kernel replicates FlashInfer's CuTe-DSL `RMSNormKernel` fragment order and `shfl.bfly` fold. Because the dispatch they replicate can change underneath them, each one still verifies itself against the live eager chain on first sight and falls back permanently on any mismatch.
 
-**Not bit-exact — request-gated.** These differ from eager only at half-precision rounding-order level, but that is enough to matter, so they are mounted only for `quality="extra-high"` and `quality="high"` requests, at batch boundaries, all-or-nothing per transformer. The default `quality="lossless"` runs the unmodified reference chain.
+**Same math, different rounding — request-gated at `lossless`.** These keep the reference function and the precision of every operand and accumulator; only the place or the order of the rounding moves, so the result is within rounding error of the reference rather than equal to it. They are mounted for `quality="lossless"` (the default) and `quality="high"` requests, at batch boundaries, all-or-nothing per transformer. `quality="exact"` runs the unmodified reference chain instead.
+
+**Approximate — request-gated at `high`.** A fusion that quantizes, lowers an operand or accumulator precision, or sits upstream of a quantizer or threshold is no longer a rounding difference, so it needs model-level quality evaluation and is mounted only for `quality="high"`. Today that is the FLUX.2 NVFP4 FC1+SwiGLU+quant path (it quantizes FC2's input before the reference BF16 intermediate exists), Ideogram's BF16-native gate RMSNorm (the reference keeps the norm statistics in fp32), and SANA-Video's BF16-input linear attention (the reference promotes those inputs to FP32).
 
 **Model/checkpoint-native.** Generic close-contract kernels, sparse operators, and FP8/NVFP4 producers can be part of a model implementation or a separately selected deployment path. They are documented in the inventory, but `quality` does not select or undo those choices.
 
@@ -28,11 +30,18 @@ The quality levels are cumulative:
 
 | `quality` | Included optimization set |
 | --- | --- |
-| `lossless` | The selected deployment's reference path plus every unconditional bit-exact replacement |
-| `extra-high` | Everything in `lossless`, plus request-gated DiT and VAE kernel fusions; this level does not itself enable sparse, caching, or another approximate path |
-| `high` | Everything in `extra-high`, plus any model-owned high-only optimization, such as an audited Cache-DiT policy or lower-precision VAE decode |
+| `exact` | The selected deployment's reference path plus every unconditional bit-exact replacement |
+| `lossless` | Everything in `exact`, plus request-gated DiT and VAE fusions that keep the reference math and every operand's precision; this level does not itself enable quantization, sparsity, caching, or another approximate path |
+| `high` | Everything in `lossless`, plus any model-owned approximate optimization, such as an audited Cache-DiT policy, lower-precision VAE decode, or the approximate fusions listed above |
 
-If a model has no eligible request-gated fusion, `extra-high` can execute the same path as `lossless`. Likewise, `high` adds only the model-specific high-only paths that the active pipeline implements.
+A fusion claiming `lossless` has to pass the admission checks in
+`sglang/multimodal_gen/test/quality_tier_admission.py`: scored against an fp64
+evaluation of the same math, its RMS and max error may not exceed 1.5x the
+path the model runs today, its rounding may not be biased, and NaN, Inf and
+non-contiguous inputs have to behave as before. Lowering an accumulation below
+fp32, or quantizing, makes it `high` by construction — no measurement admits it.
+
+If a model has no eligible request-gated fusion, `lossless` can execute the same path as `exact`. Likewise, `high` adds only the model-specific high-only paths that the active pipeline implements.
 
 <Note>
 `quality` is not a master precision switch. A quantized checkpoint, an explicitly selected approximate attention backend, or an independently enabled cache remains active at every quality tier.
@@ -41,15 +50,15 @@ If a model has no eligible request-gated fusion, `extra-high` can execute the sa
 ## Enabling the request-gated set
 
 ```bash
-sglang generate --model-path MODEL_PATH --prompt "..." --quality extra-high
+sglang generate --model-path MODEL_PATH --prompt "..." --quality lossless
 ```
 
-The server default stays `lossless`; the OpenAI-compatible endpoints carry it per request. Images:
+The server default is `lossless`, so this is the set a request gets unless it asks otherwise; the OpenAI-compatible endpoints carry the level per request. Images:
 
 ```bash
 curl -X POST http://${HOST}:${PORT}/v1/images/generations \
   -H 'Content-Type: application/json' \
-  -d '{"model": "MODEL_PATH", "prompt": "...", "quality": "extra-high"}'
+  -d '{"model": "MODEL_PATH", "prompt": "...", "quality": "lossless"}'
 ```
 
 Video, same field:
@@ -57,7 +66,7 @@ Video, same field:
 ```bash
 curl -X POST http://${HOST}:${PORT}/v1/videos \
   -H 'Content-Type: application/json' \
-  -d '{"model": "MODEL_PATH", "prompt": "...", "quality": "extra-high"}'
+  -d '{"model": "MODEL_PATH", "prompt": "...", "quality": "lossless"}'
 ```
 
 <Warning>
@@ -68,14 +77,14 @@ The `quality` field in a **video response** body is unrelated. It is Sora-compat
 
 <Warning>
 Do not combine request-gated DiT fusions with `--enable-breakable-cuda-graph`.
-BCG warmup captures the lossless module branches before an `extra-high` or
+BCG warmup captures the lossless module branches before an `lossless` or
 `high` request mounts its DiT fusions, so replay would bypass the requested
 kernels. SGLang rejects this combination for models with eligible DiT quality
 sites. Models whose request-gated path changes only VAE decode remain allowed
 because BCG captures the DiT only.
 </Warning>
 
-These fusion families mount under both `quality="extra-high"` and
+These fusion families mount under both `quality="lossless"` and
 `quality="high"`:
 
 | Fusion | What it folds |
@@ -237,11 +246,11 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | LTX-2 | QK-norm + split RoPE, ada-values split, RMSNorm+modulate, modulate, residual-gate add, linear+GELU |
 | LTX-2.5 decoder | paired 3D RoPE with shared axis-table cache |
 | HunyuanVideo / Helios | QKV+RoPE pack, strided QK RMSNorm, linear+GELU; Helios also has paired in-place Q/K RoPE |
-| LingBot Video MoE | Default-on group-limited top-k expert selection; fused RMSNorm, per-token gated residual, and fused RMSNorm+modulate at `quality=extra-high` or `quality=high` |
+| LingBot Video MoE | Default-on group-limited top-k expert selection; fused RMSNorm, per-token gated residual, and fused RMSNorm+modulate at `quality=lossless` or `quality=high` |
 | Sana | LN+modulate, GLUMB bias+SiLU / bias+GLU, residual-gate add |
-| SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; GLUMB bias+SiLU / bias+GLU in eager and BCG; LN+modulate and residual-gate add during BCG; BF16-input linear attention at `quality=extra-high` or `quality=high` |
+| SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; GLUMB bias+SiLU / bias+GLU in eager and BCG; LN+modulate and residual-gate add during BCG; BF16-input linear attention at `quality=lossless` or `quality=high` |
 | Sana-WM | bidirectional gated delta-net, fused QK inverse-RMS |
-| Wan / LongLive 2 VAE | temb table slices (Wan); VAE cat+pad and DupUp3D add; lossless FP32 normalization post-ops; full `channels_last_3d` RMSNorm+SiLU at `quality=extra-high` or `quality=high` |
+| Wan / LongLive 2 VAE | temb table slices (Wan); VAE cat+pad and DupUp3D add; lossless FP32 normalization post-ops; full `channels_last_3d` RMSNorm+SiLU at `quality=lossless` or `quality=high` |
 | Cosmos3 | QK-norm + RoPE + KV packing; rounded T2I fusion also supports Hopper TP2/SP1 Super-Text2Image with the 5120-wide SwiGLU architecture |
 | Krea2 / MiniMax-H3 | QK-norm + RoPE (Krea2 also CuTe-DSL norm+scale/shift; MiniMax-H3 also indexed modulation) |
 | FLUX.2 VAE / HunyuanVAE / latent upsampler | GroupNorm + SiLU (channels-last two-pass for FLUX.2) |

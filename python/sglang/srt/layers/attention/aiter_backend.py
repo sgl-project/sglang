@@ -2034,7 +2034,10 @@ class AiterAttnBackend(AttentionBackend):
             swa_out_cache_loc = self.swa_kv_pool.translate_loc_from_full_to_swa(
                 forward_batch.out_cache_loc
             )
-        max_kv_len = forward_batch.seq_lens_cpu.max().item()
+        # Absent under the sync-free path (needs_cpu_seq_lens=False); unified
+        # verify sizes from its page table instead.
+        if forward_batch.seq_lens_cpu is not None:
+            max_kv_len = forward_batch.seq_lens_cpu.max().item()
 
         # dcp metadata
         local_kv_lens = None
@@ -2941,9 +2944,13 @@ class AiterAttnBackend(AttentionBackend):
         use_asm_cprr_verify = False
 
         swa_page_table = None
+        # Unified verify never reads this host max (replay sizes from
+        # max_context_len); torch.max(seq_lens).item() would sync every replay.
         max_kv_len = (
             seq_lens_cpu.max().item()
             if seq_lens_cpu is not None
+            else None
+            if forward_mode.is_target_verify() and self._use_unified_verify
             else torch.max(seq_lens).item()
         )
 

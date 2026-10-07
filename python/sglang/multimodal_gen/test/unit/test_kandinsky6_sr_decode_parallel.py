@@ -37,12 +37,12 @@ from sglang.multimodal_gen.runtime.models.vaes.kandinsky6_sr_vae import (
     _SpatialChunkedConv3d,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.decode_stage import (
-    Kandinsky6SRDecodeStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.run_spec import (
     SR_DENOISED_KEY,
     SR_TILES_KEY,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.stages import (
+    Kandinsky6SRDecodeStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiled import (
     decode_chunks,
