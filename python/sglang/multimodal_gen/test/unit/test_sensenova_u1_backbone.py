@@ -67,13 +67,17 @@ def test_sensenova_backbone_prefix_cache_and_generation(moe, dtype):
         inputs_embeds=image,
         indexes=indexes,
         past_key_values=cache,
-        use_cache=False,
+        attention_mask={"full_attention": None},
+        use_cache=True,
         update_cache=False,
         image_gen_indicators=torch.ones(1, 4, dtype=torch.bool, device=device),
     )
-    first = model.model(**kwargs).last_hidden_state
-    second = model.model(**kwargs).last_hidden_state
-    torch.testing.assert_close(first, second, rtol=0, atol=0)
+    first = model.model(**kwargs)
+    second = model.model(**kwargs)
+    assert first.past_key_values is second.past_key_values is cache
+    torch.testing.assert_close(
+        first.last_hidden_state, second.last_hidden_state, rtol=0, atol=0
+    )
     for layer, expected in zip(cache.layers, snapshots):
         torch.testing.assert_close((layer.keys, layer.values), expected, rtol=0, atol=0)
     kwargs["image_gen_indicators"][0, 0] = False
