@@ -113,7 +113,10 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
-from sglang.srt.utils.mem_forensics import stop_memory_history
+from sglang.srt.utils.mem_forensics import (
+    start_memory_history,
+    stop_memory_history,
+)
 from sglang.srt.utils.profile_utils import (
     export_cuda_graph_capture_trace,
     graph_capture_profile_dir,
@@ -881,12 +884,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 record_shapes=True,
             )
-        torch.cuda.memory._record_memory_history()
+        # Keeps memory forensics' recorder configuration when it owns it.
+        start_memory_history()
         return profile_context
 
     def _post_process_after_profile(self, prof_context):
         torch.cuda.memory._dump_snapshot("cuda_graph_runner_memory_usage.pickle")
-        # Keeps recording (and its history) when memory forensics owns it.
+        # Leaves recording (and its history) on when memory forensics owns it.
         stop_memory_history()
         log_message = (
             "Sorted by CUDA Time:\n"
