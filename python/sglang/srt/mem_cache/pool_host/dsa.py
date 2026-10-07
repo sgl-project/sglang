@@ -146,6 +146,10 @@ class DSAIndexerPoolHost(HostKVCache):
         device_pool = decl.device_pool
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
+        # Under DCP transfer indices stay widened while index pages hold this
+        # rank's rows, so one index page spans logical_page_size of them.
+        self.dcp_size = anchor_host.dcp_size
+        self.dcp_rank = anchor_host.dcp_rank
         self.layout = anchor_host.layout
         self.pin_memory = pin_memory
         self.device = device
@@ -321,16 +325,13 @@ class DSAIndexerPoolHost(HostKVCache):
     def _get_indexer_page_indices(self, host_indices, device_indices):
         if host_indices.numel() == 0:
             return host_indices, device_indices
-        if host_indices.numel() % self.page_size != 0:
+        span = self.logical_page_size
+        if host_indices.numel() % span != 0:
             raise ValueError(
                 "Index buffer transfer expects page-aligned indices for DSA."
             )
-        host_page_indices = (
-            host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
-        )
-        device_page_indices = (
-            device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
-        )
+        host_page_indices = host_indices.reshape(-1, span)[:, 0] // span
+        device_page_indices = device_indices.reshape(-1, span)[:, 0] // span
         return host_page_indices, device_page_indices
 
     def load_to_device_per_layer(

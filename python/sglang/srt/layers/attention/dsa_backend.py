@@ -2120,8 +2120,11 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        if forward_batch.dcp_owned_prefill:
+        if forward_batch.dcp_owned_prefill or (
+            get_parallel().dcp_enabled and phase == "decode"
+        ):
             # Q arrives all-gathered; attend owned slots, the caller LSE-merges.
+            # Verify / draft-extend rows are one query per draft token.
             if q_rope is not None:
                 q = torch.cat(
                     [
@@ -2141,11 +2144,15 @@ class DeepseekSparseAttnBackend(
                 extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                 page_size=1,
                 output_num_tokens=q.shape[0],
-                page_table_is_expanded=False,
+                page_table_is_expanded=phase == "decode",
                 cu_seqlens_q=metadata.cu_seqlens_q,
             )
             return self._forward_decode_dcp(
-                q, kv_cache, slots, layer, persistent_workspace=False
+                q,
+                kv_cache,
+                slots,
+                layer,
+                persistent_workspace=not forward_batch.dcp_owned_prefill,
             )
         prefill_page_table_1 = metadata.page_table_1
         if (

@@ -1361,8 +1361,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
             return torch.cat(logits_chunks, dim=0)
 
-        if get_parallel().dcp_enabled and forward_batch.forward_mode.is_decode():
+        if get_parallel().dcp_enabled and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
             # DCP: score this rank's index-K shard, then exchange top-k candidates.
+            # Verify / draft-extend rows are already one query per draft token.
             assert self.num_init_tokens == 0 and self.num_local_tokens == 0
             local_lens = get_dcp_lens(
                 seqlens_32, get_parallel().attn_dcp_size, get_parallel().attn_dcp_rank

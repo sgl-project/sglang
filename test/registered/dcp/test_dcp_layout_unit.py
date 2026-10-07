@@ -30,6 +30,7 @@ from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -540,6 +541,22 @@ class TestGetDcpLens(CustomTestCase):
 
         self.assertEqual(pool.get_kv_buffer_shape(), expected)
         pool.full_kv_pool.get_kv_buffer_shape.assert_called_once_with()
+
+    def test_dsa_indexer_host_pages_follow_the_widened_page(self):
+        dcp_size, page = 4, 64
+        host = object.__new__(DSAIndexerPoolHost)
+        host.page_size = page
+        host.dcp_size = dcp_size
+        span = page * dcp_size
+        host_idx = torch.cat([torch.arange(span) + span * p for p in (5, 2)])
+        dev_idx = torch.cat([torch.arange(span) + span * p for p in (40, 7)])
+
+        host_pages, dev_pages = host._get_indexer_page_indices(host_idx, dev_idx)
+        # Widened page p holds local rows [p * page, (p + 1) * page) on each rank.
+        self.assertEqual(host_pages.tolist(), [5, 2])
+        self.assertEqual(dev_pages.tolist(), [40, 7])
+        for slot, local_page in zip(dev_idx.tolist(), [40] * span + [7] * span):
+            self.assertEqual((slot // dcp_size) // page, local_page)
 
 
 if __name__ == "__main__":
