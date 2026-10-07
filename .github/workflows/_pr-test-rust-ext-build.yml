@@ -46,7 +46,7 @@ on:
       cache_key_prefix:
         description: 'Cache key prefix. Callers share it on purpose to reuse each other''s build; it encodes the arch and the interpreter ABI set, since the modules are portable across neither.'
         type: string
-        default: rust-ext-x86_64-cp310-cp312
+        default: rust-ext-x86_64-cp312
       max_glibc:
         description: >
           Highest GLIBC symbol version the built .so files may require. A ceiling set
@@ -168,16 +168,13 @@ jobs:
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 60
     name: Build Rust Ext
-    # No crate sets abi3, so the pools' interpreters (h100 ships 3.10, h20 ships
-    # 3.12) each need their own module set, and each its own target dir, since
-    # PyO3's fingerprint tracks the interpreter. The two passes therefore share
-    # nothing, which is why they run as parallel jobs rather than back to back.
+    # No crate sets abi3, so each interpreter the stages run (SGLANG_CI_PYTHON in
+    # ci_install_dependency.sh) needs its own module set, and each its own target
+    # dir, since PyO3's fingerprint tracks the interpreter.
     strategy:
-      # Both legs run to completion, so a failure in one still leaves the other's
-      # log to compare against.
       fail-fast: false
       matrix:
-        python-version: ['3.10', '3.12']
+        python-version: ['3.12']
     steps:
       - uses: actions/checkout@v4
         with:

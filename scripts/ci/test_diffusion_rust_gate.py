@@ -98,6 +98,7 @@ printf 'RESULT=%s:%s\n' "$SGLANG_BUILD_RUST_EXTS" "$SGLANG_RUST_BUILD_MODE"
                     os.environ,
                     GITHUB_ENV=f"{tmp}/env",
                     USE_VENV="0",
+                    SGLANG_CI_PYTHON="",
                     SGLANG_BUILD_RUST_EXTS="none",
                     SGLANG_RUST_BUILD_MODE="never",
                 )
