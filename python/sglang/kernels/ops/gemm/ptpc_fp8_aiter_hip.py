@@ -7,10 +7,16 @@ the weight to FP8 per output channel and the activation per token halves the
 bytes the GEMM has to stream, which is the only lever that helps once the
 kernel is already bandwidth-saturated.
 
-The GEMM is hipBLASLt ``torch._scaled_mm`` (the ``kernel_gemm_0`` ATOM uses
-for dense PTPC). CK ``gemm_a8w8_bpreshuffle`` is slower on the same shapes
-and rejects N that is not a multiple of 64. hipBLASLt needs N % 16 == 0, so
-short weights are zero-padded and the padding columns are dropped.
+The GEMM is aiter ``gemm_a8w8_bpreshuffle``. On the tuned gfx950 shapes that
+is the ``kernel_gemm_0`` ATOM uses for dense PTPC (about 6 us on the latent
+``[3584, 7168]`` projection). hipBLASLt ``torch._scaled_mm`` picks the F8BS
+solution instead, which measured 13-17 us on the same shape, so it is only
+the fallback for shapes the preshuffle kernel rejects.
+
+``gemm_a8w8_bpreshuffle`` needs N % 64 == 0 and a (16, 16) shuffled weight,
+which also needs K % 32 == 0. Short weights are zero-padded and the padding
+columns are dropped. A shape the kernel still rejects is packed for
+``torch._scaled_mm`` (column-major B, N padded to 16).
 
 Activation quant is aiter ``per_token_quant_hip``
 (``dynamic_per_token_scaled_quant``), the same kernel ATOM launches.
@@ -25,8 +31,9 @@ import torch
 
 from sglang.srt.utils import is_hip
 
-# hipBLASLt rejects N that is not a multiple of 16.
-_N_ALIGN = 16
+# gemm_a8w8_bpreshuffle tiles N by 64. The (16, 16) shuffle also needs K % 32.
+_N_ALIGN = 64
+_K_ALIGN = 32
 
 
 def _ops():
@@ -42,34 +49,71 @@ def available() -> bool:
     return is_hip() and _ops() is not None
 
 
-def _pad_rows(weight: torch.Tensor) -> tuple[torch.Tensor, int, int]:
-    # Contiguous [N, K] so the transpose below is column-major. hipBLASLt
-    # accepts only row-major A times column-major B; calling contiguous() on
-    # the transpose turns B row-major and _scaled_mm raises.
+def _pad(weight: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Zero-pad [N, K] so N % 64 == 0 and K % 32 == 0."""
     weight = weight.contiguous()
     out_features, in_features = weight.shape
-    padded = out_features + (-out_features) % _N_ALIGN
-    if padded != out_features:
-        weight = torch.cat(
-            [
-                weight,
-                weight.new_zeros((padded - out_features, in_features)),
-            ]
-        )
-    return weight, out_features, padded
+    pad_n = (-out_features) % _N_ALIGN
+    pad_k = (-in_features) % _K_ALIGN
+    if pad_n or pad_k:
+        weight = torch.nn.functional.pad(weight, (0, pad_k, 0, pad_n))
+    return weight, out_features
 
 
 def _as_scaled_mm_weight(weight_nk: torch.Tensor) -> torch.Tensor:
-    """[N, K] contiguous FP8 -> [K, N] column-major, unshuffled."""
+    """[N, K] contiguous FP8 -> [K, N] column-major, unshuffled.
+
+    hipBLASLt accepts only row-major A times column-major B. contiguous() on
+    this transpose would make B row-major and ``_scaled_mm`` would raise.
+    """
     return weight_nk.t()
 
 
+def _bpreshuffle_weight(
+    weight_nk: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor | None:
+    """(16, 16)-shuffled [N, K], or None when the kernel rejects the shape."""
+    n, k = weight_nk.shape
+    if n % _N_ALIGN or k % _K_ALIGN:
+        return None
+    try:
+        from aiter import gemm_a8w8_bpreshuffle
+        from aiter.ops.shuffle import shuffle_weight
+    except (ImportError, ModuleNotFoundError):
+        return None
+    shuffled = shuffle_weight(weight_nk, layout=(16, 16))
+    probe_x = torch.zeros((1, k), device=weight_nk.device, dtype=weight_nk.dtype)
+    probe_xs = torch.ones((1, 1), device=weight_nk.device, dtype=torch.float32)
+    probe_ws = scale.reshape(n, 1).contiguous().float()
+    try:
+        gemm_a8w8_bpreshuffle(
+            probe_x, shuffled, probe_xs, probe_ws, dtype=torch.bfloat16
+        )
+    except RuntimeError:
+        return None
+    return shuffled
+
+
+def _finish(
+    quantized: torch.Tensor, scale: torch.Tensor, out_features: int
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    shuffled = _bpreshuffle_weight(quantized, scale)
+    if shuffled is not None:
+        # Contiguous [N, K] is the preshuffle layout. run() tells the two
+        # layouts apart by contiguity: the scaled_mm fallback is a transpose.
+        return shuffled, scale.reshape(-1, 1).contiguous().float(), out_features
+    return (
+        _as_scaled_mm_weight(quantized),
+        scale.reshape(1, -1).contiguous().float(),
+        out_features,
+    )
+
+
 def pack(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Quantize [out, in] BF16 -> ([K, N] FP8 weight, [1, N] scales, out).
+    """Quantize [out, in] BF16 and pack it for the PTPC GEMM.
 
     Returns the logical `out` alongside the padded tensors so `run` can slice
-    the padding away. The returned ``[K, N]`` weight is column-major:
-    hipBLASLt rejects a row-major B.
+    the padding away.
     """
     ops = _ops()
     if ops is None:
@@ -77,13 +121,9 @@ def pack(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
     fp8, per_token_quant = ops
     if weight.ndim != 2 or not weight.is_cuda:
         raise ValueError(f"expected a 2D CUDA weight, got {tuple(weight.shape)}")
-    weight, out_features, padded = _pad_rows(weight)
-    quantized, scale = per_token_quant(weight.contiguous(), quant_dtype=fp8)
-    return (
-        _as_scaled_mm_weight(quantized),
-        scale.reshape(1, padded).contiguous().float(),
-        out_features,
-    )
+    weight, out_features = _pad(weight)
+    quantized, scale = per_token_quant(weight, quant_dtype=fp8)
+    return _finish(quantized, scale, out_features)
 
 
 def pack_prequantized(
@@ -106,16 +146,13 @@ def pack_prequantized(
     out_features, _in_features = weight.shape
     if scale.numel() != out_features:
         raise ValueError(f"expected {out_features} channel scales, got {scale.numel()}")
-    weight, out_features, padded = _pad_rows(weight)
-    if padded != out_features:
+    weight, out_features = _pad(weight)
+    padded_n = weight.shape[0]
+    if padded_n != out_features:
         scale = torch.cat(
-            [scale.reshape(-1), scale.reshape(-1).new_ones(padded - out_features)]
+            [scale.reshape(-1), scale.reshape(-1).new_ones(padded_n - out_features)]
         )
-    return (
-        _as_scaled_mm_weight(weight),
-        scale.reshape(1, padded).contiguous().float(),
-        out_features,
-    )
+    return _finish(weight, scale, out_features)
 
 
 def covered(x: torch.Tensor, weight: torch.Tensor | None) -> bool:
@@ -146,6 +183,16 @@ def covered_prequant(
     )
 
 
+def _match_k(x: torch.Tensor, packed_k: int) -> torch.Tensor:
+    if x.shape[-1] == packed_k:
+        return x
+    if x.shape[-1] > packed_k:
+        raise ValueError(
+            f"activation K {x.shape[-1]} is wider than the packed weight K {packed_k}"
+        )
+    return torch.nn.functional.pad(x, (0, packed_k - x.shape[-1]))
+
+
 def run(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -156,32 +203,50 @@ def run(
 ) -> torch.Tensor:
     """out[:, :out_features] = (x @ weight) with per-token / per-channel FP8.
 
-    ``weight`` is the packed ``[K, N]`` tensor from ``pack``.
+    A contiguous ``weight`` is the shuffled ``[N, K]`` preshuffle pack. A
+    non-contiguous one is the column-major ``[K, N]`` hipBLASLt fallback.
     """
     ops = _ops()
     if ops is None:
         raise RuntimeError("aiter PTPC FP8 GEMM is unavailable")
     fp8, per_token_quant = ops
+    preshuffle = weight.is_contiguous()
+    if preshuffle:
+        _packed_n, packed_k = weight.shape
+    else:
+        packed_k, _packed_n = weight.shape
     if x_scale is None:
-        xq, xs = per_token_quant(x, quant_dtype=fp8)
+        xq, xs = per_token_quant(_match_k(x, packed_k), quant_dtype=fp8)
         out_dtype = x.dtype
     else:
-        xq, xs = x, x_scale
+        xq, xs = _match_k(x, packed_k), x_scale
         out_dtype = torch.bfloat16
-    padded_n = weight.shape[1]
-    if out is not None and padded_n != out_features:
-        raise ValueError(
-            "out= is unavailable when the packed weight has padded columns"
+    if preshuffle:
+        from aiter import gemm_a8w8_bpreshuffle
+
+        result = gemm_a8w8_bpreshuffle(
+            xq,
+            weight,
+            xs.reshape(xq.shape[0], 1).contiguous().float(),
+            scale.reshape(weight.shape[0], 1),
+            dtype=out_dtype,
         )
-    result = torch._scaled_mm(
-        xq,
-        weight,
-        scale_a=xs.reshape(xq.shape[0], 1),
-        scale_b=scale.reshape(1, padded_n),
-        out_dtype=out_dtype,
-        out=out,
-    )
-    return result if result.shape[1] == out_features else result[:, :out_features]
+    else:
+        padded_n = weight.shape[1]
+        result = torch._scaled_mm(
+            xq,
+            weight,
+            scale_a=xs.reshape(xq.shape[0], 1),
+            scale_b=scale.reshape(1, padded_n),
+            out_dtype=out_dtype,
+            out=out if padded_n == out_features else None,
+        )
+    if result.shape[1] != out_features:
+        result = result[:, :out_features]
+    if out is not None and result.data_ptr() != out.data_ptr():
+        out.copy_(result)
+        return out
+    return result
 
 
 def warmup(

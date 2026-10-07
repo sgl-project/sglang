@@ -2148,11 +2148,14 @@ def _apply_fallback_scaled_mm(
 
 
 def _k3_ptpc_scaled_mm() -> bool:
-    """K3 dense PTPC follows ATOM: hipBLASLt ``torch._scaled_mm``.
+    """Use aiter's per-token quant for K3 dense PTPC.
 
-    ``SGLANG_ROCM_K3_PTPC_SCALED_MM=0`` keeps the CK ``b_preshuffle`` path.
-    Unset, the switch follows the K3 FP8 flags so the load-time layout and
-    the GEMM stay agreed. Other models are unchanged when those flags are off.
+    The GEMM stays on ``gemm_a8w8_bpreshuffle`` (``kernel_gemm_0`` on the
+    tuned shapes). hipBLASLt ``torch._scaled_mm`` measured as the slower F8BS
+    solution on those same shapes, so this flag no longer changes the GEMM.
+    ``SGLANG_ROCM_K3_PTPC_SCALED_MM=0`` keeps the group quant kernel. Unset,
+    the switch follows the K3 FP8 flags. Other models are unchanged when
+    those flags are off.
     """
     import os
 
@@ -2179,8 +2182,6 @@ def use_aiter_bpreshuffle_gemm(output_size: int) -> bool:
     # 14us against 90us for the cktile instance that does accept it.
     # A shuffled weight through scaled_mm (or an unshuffled one through CK)
     # silently returns garbage, so this predicate is also the load-time shuffle.
-    if _k3_ptpc_scaled_mm():
-        return False
     return _use_aiter and output_size % 64 == 0
 
 

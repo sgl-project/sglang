@@ -13,8 +13,8 @@ pytestmark = pytest.mark.skipif(
 
 HIDDEN = 7168
 LATENT = 3584
-# hipBLASLt needs N % 16 == 0. Both shapes already are, so they take the
-# unpadded torch._scaled_mm path. 100 exercises the zero-padded columns.
+# gemm_a8w8_bpreshuffle needs N % 64 == 0. 6288 is padded up to that tile.
+# 100 is rejected by the preshuffle kernel and takes the scaled_mm fallback.
 KDA_ROWS = 6288
 
 

@@ -276,7 +276,7 @@ def k3_run_front_down_fp8(
 
 
 def k3_prepare_shared_expert_ptpc(mlp: nn.Module) -> None:
-    """Pack shared gate_up and down as hipBLASLt PTPC copies.
+    """Pack shared gate_up and down as preshuffle PTPC copies.
 
     The BF16 parameters stay in place so ``_merge_front_weights`` and
     ``_eligible_for_fused_front`` keep working. The router rows of the merged
