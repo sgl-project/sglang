@@ -66,11 +66,15 @@ class ChunkCache(BasePrefixCache):
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         return MatchResult(
-            device_indices=torch.empty((0,), dtype=torch.int64),
+            device_prefix_len=0,
             last_device_node=None,
             last_host_node=None,
             best_match_node=None,
         )
+
+    def path_device_indices(self, node: Any) -> torch.Tensor:
+        # The tree owns no KV.
+        return torch.empty((0,), dtype=torch.int64)
 
     def insert(self, params: InsertParams) -> InsertResult:
         # ChunkCache does not support prefix caching, so insert is a no-op

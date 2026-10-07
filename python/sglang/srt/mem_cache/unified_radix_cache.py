@@ -1201,8 +1201,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # page-aligned boundary, so the normal match remains safe to repoint.
         # The tree's own walk: a session slot must not answer for the insert.
         match_result = self._match_tree(MatchPrefixParams(key=radix_key, req=req))
-        new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
+        new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
             f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
@@ -3472,7 +3472,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 if new_indices.numel() == 0:
                     return (
-                        self.tree_core.empty_match_result.device_indices,
+                        self.tree_core.empty_device_indices,
                         last_best_match_device_node_id,
                     )
 
@@ -3484,7 +3484,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 return new_indices, best_match_node_id
 
         return (
-            self.tree_core.empty_match_result.device_indices,
+            self.tree_core.empty_device_indices,
             last_best_match_device_node_id,
         )
 
@@ -3801,11 +3801,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Internal callers (and the session sentinel / None) pass a non-int through.
         return node_handle
 
-    def prefix_device_indices(self, req: Req) -> torch.Tensor:
-        root = self.root_node_handle(req.extra_key)
-        path = self.tree_core.collect_full_device_indices(req.last_node, root)
-        assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
-        return path[: req.prefix_len]
+    def path_device_indices(self, node: NodeId) -> torch.Tensor:
+        return self.tree_core.collect_full_device_indices(node, self.root_node_handle())
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
