@@ -19,7 +19,9 @@ use dynamo_protocols::types::{
     CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
 use futures::StreamExt;
+use serde::Deserialize;
 
+use super::routing::PDRoutingFields;
 use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
     openai_error, submit_generation, unix_seconds_u32,
@@ -34,6 +36,14 @@ use crate::message::types::{OneOrMany, TokenIds};
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/completions", post(completions))
+}
+
+#[derive(Deserialize)]
+struct CompletionRequest {
+    #[serde(flatten)]
+    request: CreateCompletionRequest,
+    #[serde(flatten)]
+    routing: PDRoutingFields,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -58,9 +68,9 @@ pub(super) struct ChoiceExtensions {
 
 async fn completions(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<CreateCompletionRequest>, JsonRejection>,
+    body: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Response {
-    let request = match body {
+    let CompletionRequest { request, routing } = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
@@ -138,6 +148,10 @@ async fn completions(
             );
         }
     };
+    let routing = match routing.into_routing(prompts.len(), n) {
+        Ok(routing) => routing,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
+    };
     let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
     let created = unix_seconds_u32();
     let mut submitted = Vec::with_capacity(choice_count);
@@ -162,7 +176,7 @@ async fn completions(
                     Err(response) => return response,
                 };
             }
-            let native = GenerateRequest {
+            let mut native = GenerateRequest {
                 rid: rid.clone(),
                 text: text.clone(),
                 input_ids: input_ids.clone(),
@@ -178,6 +192,7 @@ async fn completions(
                 return_text_in_logprobs: request.logprobs.map(|_| true),
                 ..Default::default()
             };
+            routing.apply(&mut native, prompt_index);
             let call = match submit_generation(&state, native, stream).await {
                 Ok(call) => call,
                 Err(response) => return response,

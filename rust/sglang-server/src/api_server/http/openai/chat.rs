@@ -28,6 +28,7 @@ use serde::Deserialize;
 
 use super::completions::completion_usage;
 use super::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
+use super::routing::PDRoutingFields;
 use super::tools::{
     apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name, dynamo_tool_choice,
     parse_chat_tool_calls,
@@ -53,6 +54,8 @@ struct ChatRequest {
     #[serde(flatten)]
     request: CreateChatCompletionRequest,
     chat_template_kwargs: Option<ChatTemplateKwargs>,
+    #[serde(flatten)]
+    routing: PDRoutingFields,
 }
 
 async fn chat_completions(
@@ -62,6 +65,7 @@ async fn chat_completions(
     let ChatRequest {
         request,
         chat_template_kwargs,
+        routing,
     } = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
@@ -174,6 +178,10 @@ async fn chat_completions(
 
     let stream = request.stream.unwrap_or(false);
     let n = request.n.unwrap_or(1) as usize;
+    let routing = match routing.into_routing(1, n) {
+        Ok(routing) => routing,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
+    };
     let want_logprobs = request.logprobs.unwrap_or(false);
     let parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
     let stream_tool_choice = request.tool_choice.clone();
@@ -204,7 +212,7 @@ async fn chat_completions(
                 .expect("chat prompt exists until the last choice")
                 .clone()
         };
-        let native = GenerateRequest {
+        let mut native = GenerateRequest {
             rid: rid.clone(),
             text: Some(choice_prompt),
             // Rendered templates own their special tokens — the pool must not
@@ -218,6 +226,7 @@ async fn chat_completions(
             return_text_in_logprobs: want_logprobs.then_some(true),
             ..Default::default()
         };
+        routing.apply(&mut native, 0);
         let call = match submit_generation(&state, native, stream).await {
             Ok(call) => call,
             Err(response) => return response,
