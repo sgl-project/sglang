@@ -346,6 +346,10 @@ class LogitsMetadata:
     # rows (see EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
 
+    # Explicit last real token rows when exported prefill inserts padding
+    # between requests. Ordinary contiguous batches derive these from lengths.
+    extend_last_token_indices: Optional[torch.Tensor] = None
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         # MLP-sync may turn an idle rank into a dummy EXTEND for DP prefill
@@ -681,7 +685,9 @@ class LogitsProcessor(nn.Module):
             and not logits_metadata.extend_return_logprob
         ):
             # Prefill without input logprobs.
-            last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+            last_index = logits_metadata.extend_last_token_indices
+            if last_index is None:
+                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
             pruned_states = hidden_states[last_index]
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = hidden_states_before_norm[last_index]

@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -178,7 +179,11 @@ class RadixAttention(nn.Module):
         context = get_tc_piecewise_forward_context()
         if (
             self.use_prefill_attention_wrapper
-            and forward_batch.forward_mode.is_extend()
+            and (
+                forward_batch.forward_mode.is_extend()
+                or torch.compiler.is_exporting()
+                or envs.SGLANG_DEBUG_MLX_EXPORT_VALIDATE.get()
+            )
             and context is not None
             # ``_force_eager_attn`` is only set inside Inkling's eager
             # norm+attn+sconv region, never during tc-piecewise capture. Reading
@@ -276,6 +281,25 @@ class RadixAttention(nn.Module):
                     if return_lse
                     else unified_attention_with_output
                 )
+            export_state = {}
+            if (
+                torch.compiler.is_exporting()
+                or envs.SGLANG_DEBUG_MLX_EXPORT_VALIDATE.get()
+            ):
+                attn_backend = get_attn_backend()
+                k_cache, v_cache = attn_backend.token_to_kv_pool.get_kv_buffer(
+                    self.layer_id
+                )
+                export_state = {
+                    "k_cache": k_cache,
+                    "v_cache": v_cache,
+                    "req_to_token": attn_backend.req_to_token_pool.req_to_token,
+                    "req_pool_indices": forward_batch.req_pool_indices,
+                    "seq_lens": forward_batch.seq_lens,
+                    "out_cache_loc": forward_batch.out_cache_loc,
+                    "extend_prefix_lens": forward_batch.extend_prefix_lens,
+                    "extend_seq_lens": forward_batch.extend_seq_lens,
+                }
             lse = op(
                 q,
                 k,
@@ -285,6 +309,7 @@ class RadixAttention(nn.Module):
                 self.layer_id,
                 use_mha_companion=use_mha_companion,
                 key_value_num_tokens=key_value_num_tokens,
+                **export_state,
                 **kwargs,
             )
             if return_lse:
@@ -430,7 +455,8 @@ def _unified_attention_with_output_impl(
     return lse
 
 
-@register_custom_op(mutates_args=["output"])
+# Export must retain KV writes performed by the eager attention implementation.
+@register_custom_op(mutates_args=["output", "k_cache", "v_cache"])
 @register_split_op()
 def unified_attention_with_output(
     query: torch.Tensor,
@@ -450,6 +476,14 @@ def unified_attention_with_output(
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    k_cache: Optional[torch.Tensor] = None,
+    v_cache: Optional[torch.Tensor] = None,
+    req_to_token: Optional[torch.Tensor] = None,
+    req_pool_indices: Optional[torch.Tensor] = None,
+    seq_lens: Optional[torch.Tensor] = None,
+    out_cache_loc: Optional[torch.Tensor] = None,
+    extend_prefix_lens: Optional[torch.Tensor] = None,
+    extend_seq_lens: Optional[torch.Tensor] = None,
 ) -> None:
     _unified_attention_with_output_impl(
         query,
