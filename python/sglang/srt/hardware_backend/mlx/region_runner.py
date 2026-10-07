@@ -14,8 +14,10 @@ lengths -- from its tensor arguments). Both ladders come from
 ``cuda_graph_config`` -- the same --cuda-graph-bs-{decode,prefill} /
 --cuda-graph-max-bs-{decode,prefill} flags the CUDA runners honour, with
 MPS-sized defaults -- and are exported at startup, so no shape is exported in
-the request path. A shape whose export fails is blacklisted and served by the
-eager Torch path instead.
+the request path. Packed prefill requires an explicit
+``cuda_graph_config[prefill].full_prefill_max_req``; unset retains the original
+single-request captures. A shape whose export fails is blacklisted and served
+by the eager Torch path instead.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -74,6 +77,21 @@ def _configured_prefill_token_buckets() -> tuple[int, ...]:
         "cuda_graph_config[prefill].bs",
         get_exec().graph.cuda_graph_config.prefill.bs,
     )
+
+
+def _configured_prefill_batch_sizes(model_runner: Any) -> tuple[int, ...]:
+    """Packed prefill is opt-in through the shared request-cap setting."""
+    max_requests = get_exec().graph.cuda_graph_config.prefill.full_prefill_max_req
+    if max_requests is None:
+        return (1,)
+    if type(max_requests) is not int or max_requests <= 0:
+        raise ValueError(
+            "cuda_graph_config[prefill].full_prefill_max_req must be a positive integer"
+        )
+    buckets = list(_configured_decode_batch_sizes(model_runner))
+    if buckets[-1] > max_requests:
+        buckets.append(max_requests)
+    return tuple(sorted({size for size in buckets if size <= max_requests}))
 
 
 def _validated_buckets(
@@ -230,10 +248,22 @@ class MlxRegionRunner(BaseRunner):
         # Request cardinalities share the configured decode ladder even when
         # decode is disabled; prefill-only serving needs its own captures.
         self._prefill_batch_sizes = (
-            _configured_decode_batch_sizes(model_runner)
+            _configured_prefill_batch_sizes(model_runner)
             if self._prefill_token_buckets
             else ()
         )
+        self._max_prefill_padding_ratio = 1.0
+        if any(size > 1 for size in self._prefill_batch_sizes):
+            self._max_prefill_padding_ratio = (
+                envs.SGLANG_MLX_REGION_MAX_PREFILL_PADDING_RATIO.get()
+            )
+            if (
+                not math.isfinite(self._max_prefill_padding_ratio)
+                or self._max_prefill_padding_ratio < 1
+            ):
+                raise ValueError(
+                    "SGLANG_MLX_REGION_MAX_PREFILL_PADDING_RATIO must be finite and >= 1"
+                )
         self._executors: dict[tuple, Any] = {}
         self._failed_batch_sizes: set[tuple] = set()
         self._state_token: Optional[tuple] = None
@@ -347,8 +377,7 @@ class MlxRegionRunner(BaseRunner):
                     self._failed_batch_sizes.add(key)
                     continue
             exported += 1
-            # Each export leaves transient buffers in the MLX cache; release
-            # them so the ladder's peak footprint stays that of one shape.
+            # Release transient buffers; compiled executors remain retained.
             _clear_mlx_cache()
         self.startup_export_seconds = time.perf_counter() - started
         logger.info(
@@ -478,9 +507,8 @@ class MlxRegionRunner(BaseRunner):
                 for key in self._packed_prefill_keys()
                 if key[1] >= forward_batch.batch_size
                 and key[2] >= lengths[0]
-                # Extra matrix work can erase the region's dispatch savings.
-                # Cap padding at 50% of real tokens; small batches stay eager.
-                and 2 * key[1] * key[2] <= 3 * sum(lengths)
+                # A performance policy, not a numerical acceptance gate.
+                and key[1] * key[2] <= self._max_prefill_padding_ratio * sum(lengths)
             ]
             return min(
                 candidates, key=lambda key: (key[1] * key[2], key[1]), default=None

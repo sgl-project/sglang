@@ -33,6 +33,7 @@ from sglang.srt.hardware_backend.mlx.region_runner import (
     _PAD_SINK_SLOT,
     MlxRegionRunner,
     _configured_decode_batch_sizes,
+    _configured_prefill_batch_sizes,
     _configured_prefill_token_buckets,
     _kernel_contract_reject_reason,
     _nontrivial_logits_reason,
@@ -87,6 +88,7 @@ def _make_runner(*, lora_enabled: bool = False) -> MlxRegionRunner:
         mlx_region_prefill_token_buckets(DEFAULT_MAX_PREFILL_TOKENS)
     )
     runner._prefill_batch_sizes = runner._decode_batch_sizes
+    runner._max_prefill_padding_ratio = 1.5
     runner._executors = {}
     runner._failed_batch_sizes = set()
     runner._state_token = None
@@ -980,6 +982,63 @@ class TestPackedPrefillBucketing(CustomTestCase):
         )
         self.assertIsNone(runner._executor_key(self._batch(runner, (8, 8))))
         self.assertIsNone(runner._executor_key(self._batch(runner, (5,) * 5)))
+
+    def test_padding_limit_controls_fallback_without_changing_batch_semantics(self):
+        runner = self._runner()
+        batch = self._batch(runner, (5, 5))
+        runner._max_prefill_padding_ratio = 1.0
+        self.assertIsNone(runner._executor_key(batch))
+        self.assertEqual(
+            runner._executor_key(self._batch(runner, (7, 7))), ("extend_batch", 2, 7)
+        )
+        runner._max_prefill_padding_ratio = 1.4
+        self.assertEqual(runner._executor_key(batch), ("extend_batch", 2, 7))
+        runner._max_prefill_padding_ratio = 2.0
+        self.assertEqual(
+            runner._executor_key(self._batch(runner, (5, 5, 5))),
+            ("extend_batch", 4, 7),
+        )
+        self.assertIsNone(runner._executor_key(self._batch(runner, (3, 5))))
+        self.assertIsNone(runner._executor_key(self._batch(runner, prefixes=(0, 1, 0))))
+
+    def test_packed_capture_cap_is_explicit_and_clamped_to_the_request_pool(self):
+        model_runner = SimpleNamespace(req_to_token_pool=SimpleNamespace(size=8))
+        for cap, expected in [
+            (None, (1,)),
+            (1, (1,)),
+            (3, (1, 2, 3)),
+            (16, (1, 2, 4, 8)),
+        ]:
+            config = CudaGraphConfig(
+                prefill=PhaseConfig(full_prefill_max_req=cap),
+                decode=PhaseConfig(bs=[1, 2, 4, 8, 16]),
+            )
+            with (
+                self.subTest(cap=cap),
+                get_context().override_server_args(cuda_graph_config=config),
+            ):
+                self.assertEqual(
+                    _configured_prefill_batch_sizes(model_runner), expected
+                )
+                runner = self._runner()
+                runner._prefill_batch_sizes = expected
+                if cap in (None, 1):
+                    self.assertEqual(runner._packed_prefill_keys(), [])
+                for key in runner._packed_prefill_keys():
+                    self.assertLessEqual(
+                        key[1], min(cap, model_runner.req_to_token_pool.size)
+                    )
+
+    def test_invalid_request_caps_fail_instead_of_exporting_unintended_shapes(self):
+        runner = SimpleNamespace(req_to_token_pool=SimpleNamespace(size=8))
+        for cap in (0, -1, 1.5, "4", True):
+            config = CudaGraphConfig(prefill=PhaseConfig(full_prefill_max_req=cap))
+            with (
+                self.subTest(cap=cap),
+                get_context().override_server_args(cuda_graph_config=config),
+            ):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    _configured_prefill_batch_sizes(runner)
 
     def test_unsupported_metadata_and_semantics_keep_the_fallback(self):
         runner = self._runner()

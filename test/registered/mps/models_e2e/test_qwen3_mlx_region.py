@@ -63,6 +63,8 @@ class TestQwen3MlxRegion(CustomTestCase):
                     "--cuda-graph-bs-prefill",
                     "128",
                     "512",
+                    "--cuda-graph-config",
+                    '{"prefill":{"full_prefill_max_req":4}}',
                 ],
             )
             try:

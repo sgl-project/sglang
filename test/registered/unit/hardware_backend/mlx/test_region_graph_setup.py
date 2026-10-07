@@ -96,7 +96,9 @@ def test_region_is_shared_only_by_enabled_phases(prefill_enabled, decode_enabled
 def test_disabled_phases_do_not_export_unused_buckets(prefill_enabled, decode_enabled):
     config = CudaGraphConfig(
         prefill=PhaseConfig(
-            backend=Backend.FULL if prefill_enabled else Backend.DISABLED, bs=[128]
+            backend=Backend.FULL if prefill_enabled else Backend.DISABLED,
+            bs=[128],
+            full_prefill_max_req=2,
         ),
         decode=PhaseConfig(
             backend=Backend.FULL if decode_enabled else Backend.DISABLED, bs=[1, 2]
@@ -124,3 +126,28 @@ def test_disabled_phases_do_not_export_unused_buckets(prefill_enabled, decode_en
     assert region._decode_batch_sizes == ((1, 2) if decode_enabled else ())
     assert region._prefill_token_buckets == ((128,) if prefill_enabled else ())
     assert region._prefill_batch_sizes == ((1, 2) if prefill_enabled else ())
+
+
+@pytest.mark.parametrize("ratio", [0.5, float("nan"), float("inf")])
+def test_invalid_packed_padding_policy_fails_before_capture(ratio):
+    from sglang.srt.environ import envs
+
+    with (
+        envs.SGLANG_MLX_REGION_MAX_PREFILL_PADDING_RATIO.override(ratio),
+        get_context().override_server_args(
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(
+                    backend=Backend.FULL, bs=[128, 256], full_prefill_max_req=2
+                ),
+                decode=PhaseConfig(backend=Backend.FULL, bs=[1, 2]),
+            )
+        ),
+        mock.patch("sglang.srt.hardware_backend.mlx.region_runner.BaseRunner.__init__"),
+        mock.patch(
+            "sglang.srt.hardware_backend.mlx.region_runtime.validate_mlx_region_runtime"
+        ),
+        mock.patch.object(MlxRegionRunner, "_export_at_startup") as capture,
+    ):
+        with pytest.raises(ValueError, match="must be finite and >= 1"):
+            MlxRegionRunner(SimpleNamespace(req_to_token_pool=SimpleNamespace(size=8)))
+    capture.assert_not_called()
