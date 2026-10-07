@@ -279,7 +279,7 @@ def _visible_start(excludes: list[str]) -> dict[str, Any]:
 
 
 def _class_escape(char: str) -> str:
-    return "\\" + char if char in "\\]^-[" else char
+    return _BLANKS.get(char, "\\" + char if char in "\\]^-[" else char)
 
 
 def message_start_anchors(template: ResponseTemplate) -> list[str]:
