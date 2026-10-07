@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -479,6 +479,25 @@ class Fp8Config(QuantizationConfig):
             )
 
 
+def _refill_in_place(
+    old: Optional[torch.Tensor], new: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
+    """`new`'s values in `old`'s storage when shape, dtype and device match, so
+    CUDA graphs captured before a weight reload keep valid pointers."""
+    if new is None:
+        return None
+    if (
+        old is not None
+        and old.shape == new.shape
+        and old.dtype == new.dtype
+        and old.device == new.device
+        and old.is_contiguous()
+    ):
+        old.copy_(new)
+        return old
+    return new
+
+
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
 
@@ -943,30 +962,47 @@ class Fp8LinearMethod(LinearMethodBase):
         """On SM120, decode-sized rows of a tuned shape run a small-M MXFP8 GEMM
         that reads the 32x32 block scales directly. Reached only when the layer
         is served as MXFP8, which on SM120 needs --fp8-gemm-backend
-        flashinfer_cutlass or flashinfer_cutedsl (auto resolves to cutlass)."""
-        layer.mxfp8_skinny_scale = None
-        layer.mxfp8_skinny_counters = None
+        flashinfer_cutlass or flashinfer_cutedsl (auto resolves to cutlass).
+
+        A weight reload reruns this without recapturing CUDA graphs, so buffers
+        from an earlier call are refilled in place: captured launches keep valid
+        pointers, see the new scales, and start from zeroed counters."""
+        scale, counters = self._mxfp8_skinny_buffers(layer)
+        layer.mxfp8_skinny_scale = _refill_in_place(
+            getattr(layer, "mxfp8_skinny_scale", None), scale
+        )
+        layer.mxfp8_skinny_counters = _refill_in_place(
+            getattr(layer, "mxfp8_skinny_counters", None), counters
+        )
+
+    def _mxfp8_skinny_buffers(
+        self, layer: Module
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """(FP32 block scales, zeroed split-K counters or None), or (None, None)
+        when the layer does not use the kernel."""
         if not (is_sm120() and envs.SGLANG_ENABLE_SM120_MXFP8_SKINNY_GEMM.get()):
-            return
+            return None, None
         if list(self.weight_block_size) != [32, 32] or not layer.weight.is_contiguous():
-            return
+            return None, None
         from sglang.kernels.ops.gemm.sm120_mxfp8_skinny_gemm import tuned_config
         from sglang.srt.runtime_context import get_exec
 
         n, k = layer.weight.shape
         config = tuned_config(n, k)
         if config is None:
-            return
+            return None, None
         if get_exec().deterministic.enable_deterministic_inference:
             # The two kernels reduce in different orders, so a row's result
             # would depend on which side of MAX_M its batch falls.
-            return
-        layer.mxfp8_skinny_scale = layer.weight_scale_inv.data.float().contiguous()
+            return None, None
+        scale = layer.weight_scale_inv.data.float().contiguous()
         bn, split, _ = config
+        counters = None
         if split > 1:
-            layer.mxfp8_skinny_counters = torch.zeros(
+            counters = torch.zeros(
                 (n + bn - 1) // bn, dtype=torch.int32, device=layer.weight.device
             )
+        return scale, counters
 
     @staticmethod
     def _apply_mxfp8_skinny(layer: Module, x) -> Optional[torch.Tensor]:
