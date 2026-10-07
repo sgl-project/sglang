@@ -1115,6 +1115,7 @@ class KVCacheConfigurator:
             return None
         placement = decision.placement
         region = placement.region
+        kv_dtype = region.resolved_kv_dtype()
         logger.info(
             "[unified-memory-pool] fused draft region in 'full': %d lane(s) x %d "
             "kv head(s) x %d/%d k/v head_dim @ %s = %d B/token; runner lanes %s",
@@ -1122,7 +1123,11 @@ class KVCacheConfigurator:
             region.head_num,
             region.head_dim,
             region.resolved_v_head_dim(),
-            region.store_dtype,
+            (
+                kv_dtype
+                if kv_dtype == region.store_dtype
+                else f"{kv_dtype} (stored as {region.store_dtype})"
+            ),
             region.entry_bytes(),
             [
                 tuple(placement.lanes_for(r))
