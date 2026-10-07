@@ -288,9 +288,12 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     rules = [
         (
             "KDA hybrid linear attention",
-            # GLM-5.3 Flash supports explicit BCG opt-in, but stays off by
-            # default like other KDA models. Explicit backends skip these rules.
-            lambda: uses_kda_attention(model_config_of(server_args).hf_config),
+            # GLM-5.3 Flash is BCG-validated; other KDA models stay off by default.
+            lambda: (
+                uses_kda_attention(model_config_of(server_args).hf_config)
+                and "Glm5NextForConditionalGeneration"
+                not in model_config_of(server_args).hf_config.architectures
+            ),
         ),
         # DSV4 is BCG-compatible but introduces heavy memory pressure: the
         # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
@@ -410,7 +413,7 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
 
 
 def apply_glm5_prefill_cuda_graph_policy(server_args: Any):
-    """Set capture sizes for explicitly enabled GLM breakable prefill graphs."""
+    """Set capture sizes for GLM-5.3 Flash breakable prefill graphs."""
     cfg = resolving_view(server_args)
     if (
         cfg.cuda_graph_config.prefill.backend != Backend.BREAKABLE
