@@ -6476,3 +6476,38 @@ fn swa_lock_walk_splits_a_long_live_ancestor_to_one_window() {
     assert_eq!(tc.arena.device_lock_ref(ancestor, SWA), 0);
     assert_eq!(tc.swa_protected_size(), 0);
 }
+
+/// `SGLANG_SWA_LOCK_WINDOW_ONLY` parses like Python `EnvBool.parse`:
+/// `true/1/yes/y` / `false/0/no/n` (case-insensitive), everything else
+/// invalid. `no`/`n` must switch the split off; `off` is not a Python
+/// literal, so it keeps the default instead of disabling it. Unique var name
+/// per case: tests in this binary run concurrently and share the process
+/// environment, and the real flag must stay unset for the tests above.
+#[test]
+fn swa_lock_window_only_matches_python_env_bool() {
+    for (raw, want) in [
+        ("true", true),
+        ("1", true),
+        ("YES", true),
+        ("y", true),
+        ("false", false),
+        ("0", false),
+        ("No", false),
+        ("n", false),
+    ] {
+        let name = format!("SGLANG_TEST_ENV_BOOL_SWA_{raw}");
+        unsafe { std::env::set_var(&name, raw) };
+        assert_eq!(env_bool(&name, true), want, "value {raw:?}");
+        assert_eq!(env_bool(&name, false), want, "value {raw:?}");
+    }
+    // Unparsable stays on the default, like `EnvField.get` (warn-and-default).
+    for (i, raw) in ["off", "2", "", "yes."].into_iter().enumerate() {
+        let name = format!("SGLANG_TEST_ENV_BOOL_SWA_INVALID_{i}");
+        unsafe { std::env::set_var(&name, raw) };
+        assert!(env_bool(&name, true), "value {raw:?} keeps default true");
+        assert!(!env_bool(&name, false), "value {raw:?} keeps default false");
+    }
+    // Unset is the default, i.e. the split is on unless explicitly turned off.
+    assert!(env_bool("SGLANG_TEST_ENV_BOOL_SWA_UNSET", true));
+    assert!(!env_bool("SGLANG_TEST_ENV_BOOL_SWA_UNSET", false));
+}

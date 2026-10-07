@@ -18,6 +18,23 @@ use crate::unified_tree_core::{
     PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore,
 };
 
+/// Boolean env var with Python `EnvBool` semantics: `true/1/yes/y` → true,
+/// `false/0/no/n` → false (case-insensitive); anything else is invalid and
+/// keeps `default`, mirroring `EnvField.get`'s warn-and-default. The literal
+/// sets are the ones `sglang-server`'s `utils::environ::env_bool` mirrors;
+/// this crate is excluded from the root workspace and cannot depend on it, so
+/// the parse is kept in sync by hand and pinned by a unit test.
+fn env_bool(name: &str, default: bool) -> bool {
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    match raw.to_lowercase().as_str() {
+        "true" | "1" | "yes" | "y" => true,
+        "false" | "0" | "no" | "n" => false,
+        _ => default,
+    }
+}
+
 /// SWA component driver; owns the SWA device/host value slots.
 pub struct SwaComponent {
     /// Sliding window size in tokens.
@@ -130,9 +147,7 @@ impl SwaComponent {
     /// The window-only lock split is on by default, matching Python
     /// `SGLANG_SWA_LOCK_WINDOW_ONLY` (an EnvBool defaulting to True).
     fn swa_lock_window_only() -> bool {
-        std::env::var("SGLANG_SWA_LOCK_WINDOW_ONLY")
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
-            .unwrap_or(true)
+        env_bool("SGLANG_SWA_LOCK_WINDOW_ONLY", true)
     }
 
     // Tier-selected SWA slot reads for the lock walks; `host` picks the host slot.
@@ -1225,6 +1240,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         let sliding_window_size = self.sliding_window_size;
         let mut covered = 0;
         let mut swa_uuid = None;
+        // Read once per walk, like Python (`window_only = not lock_host and
+        // envs.SGLANG_SWA_LOCK_WINDOW_ONLY.get()`, above its loop).
+        let window_only = !lock_host && Self::swa_lock_window_only();
 
         let mut cur = node_id;
         loop {
@@ -1236,7 +1254,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             // trailing window (device tier). Split before locking: the guard
             // requires the node to be unlocked. `cur` keeps its id as the
             // in-window tail, so the walk continues into the split-off parent.
-            if !lock_host && Self::swa_lock_window_only() {
+            if window_only {
                 self.maybe_split_for_window_lock_(tree_core, cur, sliding_window_size - covered);
             }
             let node = tree_core.arena.node_mut(cur);
