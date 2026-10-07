@@ -371,22 +371,19 @@ class FlowMatchEulerDiscreteScheduler(
         # 4. If required, convert sigmas to one of karras, exponential, or beta sigma schedules
         if self.config.use_karras_sigmas:
             sigmas_tensor = torch.from_numpy(sigmas_array).to(dtype=torch.float32)
-            sigmas_tensor = self._convert_to_karras(
+            sigmas_array = self._convert_to_karras(
                 in_sigmas=sigmas_tensor, num_inference_steps=num_inference_steps
             )
-            sigmas_array = sigmas_tensor.numpy()
         elif self.config.use_exponential_sigmas:
             sigmas_tensor = torch.from_numpy(sigmas_array).to(dtype=torch.float32)
-            sigmas_tensor = self._convert_to_exponential(
+            sigmas_array = self._convert_to_exponential(
                 in_sigmas=sigmas_tensor, num_inference_steps=num_inference_steps
             )
-            sigmas_array = sigmas_tensor.numpy()
         elif self.config.use_beta_sigmas:
             sigmas_tensor = torch.from_numpy(sigmas_array).to(dtype=torch.float32)
-            sigmas_tensor = self._convert_to_beta(
+            sigmas_array = self._convert_to_beta(
                 in_sigmas=sigmas_tensor, num_inference_steps=num_inference_steps
             )
-            sigmas_array = sigmas_tensor.numpy()
 
         # 5. Convert sigmas and timesteps to tensors and move to specified device
         sigmas_tensor = torch.from_numpy(sigmas_array).to(
