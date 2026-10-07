@@ -32,7 +32,6 @@ import numpy as np
 import orjson
 
 from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation
-from sglang.srt.weight_sync.gpu_delta.payload import validate_payload_ranges
 
 
 def _cache_base():
@@ -159,23 +158,11 @@ def _read_verify_payload(source, destination, expected, skip_payload_hash):
 
 
 def _read_verify_payloads(
-    publication, files, definitions, manifest, pool, metrics, skip_payload_hash
+    publication, files, definitions, pool, metrics, skip_payload_hash
 ):
-    def validate_frames():
-        started = time.perf_counter()
-        validate_payload_ranges(
-            manifest["tensors"],
-            {name: record["nbytes"] for name, record in definitions.items()},
-            manifest["frame_bytes"],
-            manifest["codec"],
-        )
-        return time.perf_counter() - started
-
     started = time.perf_counter()
-    futures, validation, error = [], None, None
+    futures, error = [], None
     try:
-        # Independent CPU work; neither worker waits for another pool task.
-        validation = pool.executor.submit(validate_frames)
         for name, record in definitions.items():
             source = (publication.parent / name).resolve(strict=True)
             if source.parent != publication.parent:
@@ -200,13 +187,6 @@ def _read_verify_payloads(
             if error is None:
                 error = exc
     metrics["host_encoded_cache_read_hash_s"] = time.perf_counter() - started
-    if validation is not None:
-        try:
-            metrics["host_encoded_cache_frames_validate_s"] = validation.result()
-            metrics["host_encoded_cache_frames_validations"] = 1
-        except BaseException as exc:  # noqa: BLE001 - both branches drain before READY
-            if error is None:
-                error = exc
     if error is not None:
         raise error
 
@@ -460,8 +440,6 @@ class HostArena:
                 "host_encoded_cache_hash_files",
                 "host_encoded_cache_created",
                 "host_encoded_cache_reused",
-                "host_encoded_cache_frames_validate_s",
-                "host_encoded_cache_frames_validations",
                 "host_encoded_cache_allocation_s",
                 "host_encoded_cache_allocation_calls",
                 "host_encoded_cache_allocation_bytes",
@@ -543,7 +521,6 @@ class HostArena:
                     publication,
                     files,
                     definitions,
-                    manifest,
                     pool,
                     metrics,
                     self.skip_payload_hash,

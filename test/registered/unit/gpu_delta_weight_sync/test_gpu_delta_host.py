@@ -237,16 +237,11 @@ class TestHostSnapshot(unittest.TestCase):
         entered, release, finished = [threading.Event() for _ in range(3)]
         snapshots, errors = [], []
         peer_finished = threading.Event()
-        validating, validated = threading.Event(), threading.Event()
         original_read = host._read_verify_payload
-        original_validate = host.validate_payload_ranges
-
-        def delayed_validation(*args):
-            original_validate(*args)
-            validating.set()
-            assert validated.wait(5)
 
         def delayed_read(source, destination, expected, skip_payload_hash):
+            if source.name == "foreign.bin":
+                assert entered.wait(5)
             result = original_read(source, destination, expected, skip_payload_hash)
             if source.name == "owner.bin":
                 entered.set()
@@ -277,31 +272,22 @@ class TestHostSnapshot(unittest.TestCase):
         with (
             patch.object(host, "_read_verify_payload", side_effect=delayed_read),
             patch.object(
-                host, "validate_payload_ranges", side_effect=delayed_validation
-            ),
-            patch.object(
                 self.pool, "decode_zstd", wraps=self.pool.decode_zstd
             ) as decode,
         ):
             builder = threading.Thread(target=build)
             builder.start()
             try:
-                self.assertTrue(validating.wait(5))
                 self.assertTrue(entered.wait(5))
+                self.assertTrue(peer_finished.wait(5))
                 self.assertFalse(finished.is_set())
                 decode.assert_not_called()
                 self.assertIsNone(arena.allocation)
                 state = json.loads(next(self.cache.glob("*/*/state.json")).read_text())
                 self.assertEqual(state["state"], "BUILDING")
                 (self.root / "owner.bin").write_bytes(b"changed after retained read")
-                release.set()
-                self.assertTrue(peer_finished.wait(5))
-                self.assertFalse(finished.is_set())
-                decode.assert_not_called()
-                self.assertIsNone(arena.allocation)
             finally:
                 release.set()
-                validated.set()
                 builder.join(5)
         self.assertFalse(builder.is_alive())
         self.assertEqual(errors, [])
@@ -389,7 +375,6 @@ class TestHostSnapshot(unittest.TestCase):
             self.assertTrue(snapshot.index["publication"]["skip_payload_hash"])
             self.assertEqual(metrics["host_encoded_cache_skip_payload_hash"], 1)
             self.assertEqual(metrics["host_encoded_cache_created"], created)
-            self.assertEqual(metrics["host_encoded_cache_frames_validations"], created)
             for field in ("hash_files", "hash_bytes", "sha256_worker_sum_s"):
                 self.assertEqual(metrics["host_encoded_cache_" + field], 0)
             snapshot.close()
@@ -469,7 +454,7 @@ class TestHostSnapshot(unittest.TestCase):
                 metadata(),
             )
         # A different engine's authenticated bytes can still have invalid Zstd.
-        # Encoded READY proves hash/metadata only; local failure cannot release it.
+        # Encoded READY proves file verification only; local failure cannot release it.
         manifest["files"][0]["sha256"] = hashlib.sha256(
             (self.root / "owner.bin").read_bytes()
         ).hexdigest()
@@ -525,7 +510,7 @@ class TestHostSnapshot(unittest.TestCase):
             self.assertEqual(child.exitcode, 0)
         self.assertEqual(len({row[0] for row in records}), 1)
         self.assertNotEqual(records[0][3], records[1][3])
-        for field in ("created", "hash_files", "frames_validations"):
+        for field in ("created", "hash_files"):
             self.assertEqual(
                 sum(row[1]["host_encoded_cache_" + field] for row in records),
                 2 if field == "hash_files" else 1,
@@ -549,87 +534,6 @@ class TestHostSnapshot(unittest.TestCase):
                 self.pool,
                 {},
                 metadata(2),
-            )
-
-    def test_invalid_foreign_metadata_drains_reads_before_rank_allocation_or_decode(
-        self,
-    ):
-        path, _, manifest, expected = fixture(self.root)
-        manifest["tensors"][-1]["outer"]["frames"][0]["decoded_bytes"] = 11
-        content = json.dumps(manifest).encode()
-        path.write_bytes(content)
-        digest = hashlib.sha256(content).hexdigest()
-        with patch.dict(os.environ, {"GPU_DELTA_SKIP_PAYLOAD_HASH": "1"}):
-            arena = self.arena()
-            follower = self.arena()
-        errors = []
-        entered, release, finished = [threading.Event() for _ in range(3)]
-        original_read = host._read_verify_payload
-
-        def delayed_read(source, destination, record, skip_payload_hash):
-            result = original_read(source, destination, record, skip_payload_hash)
-            if source.name == "owner.bin":
-                entered.set()
-                assert release.wait(5)
-            return result
-
-        def build():
-            try:
-                prepare_snapshot(
-                    arena,
-                    path,
-                    digest,
-                    manifest,
-                    local_entries(manifest, expected),
-                    self.pool,
-                    {},
-                    metadata(),
-                )
-            except ValueError as error:
-                errors.append(str(error))
-            finally:
-                finished.set()
-
-        with (
-            patch.object(
-                host, "_reserve_encoded_cache", wraps=host._reserve_encoded_cache
-            ) as allocate,
-            patch.object(
-                host, "_read_verify_payload", side_effect=delayed_read
-            ) as read,
-            patch.object(
-                self.pool, "decode_zstd", wraps=self.pool.decode_zstd
-            ) as decode,
-        ):
-            builder = threading.Thread(target=build)
-            builder.start()
-            try:
-                self.assertTrue(entered.wait(5))
-                self.assertFalse(finished.is_set())
-                self.assertIsNone(arena.allocation)
-                decode.assert_not_called()
-                state = json.loads(next(self.cache.glob("*/*/state.json")).read_text())
-                self.assertEqual(state["state"], "BUILDING")
-            finally:
-                release.set()
-                builder.join(5)
-        self.assertFalse(builder.is_alive())
-        self.assertEqual(len(errors), 1)
-        self.assertIn("outer Zstd chunk range", errors[0])
-        allocate.assert_called_once()
-        self.assertEqual(read.call_count, len(manifest["files"]))
-        decode.assert_not_called()
-        self.assertIsNone(arena.allocation)
-        with self.assertRaisesRegex(ValueError, "failed or already released"):
-            prepare_snapshot(
-                follower,
-                path,
-                digest,
-                manifest,
-                local_entries(manifest, expected),
-                self.pool,
-                {},
-                metadata(),
             )
 
     def test_payload_reader_handles_short_reads_and_failure(self):

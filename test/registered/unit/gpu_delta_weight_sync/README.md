@@ -71,7 +71,7 @@ suite. The registered `test_gpu_delta_layout_cuda.py` compares layouts and deriv
 scale buffers with the existing SGLang/FlashInfer loader helpers and checks MLA
 source views, failure gating and destination addresses across CUDA graph replay.
 
-Preparation reads, validates and hashes encoded publication files once per engine-host.
+Preparation reads and hashes encoded publication files once per engine-host.
 `GPU_DELTA_SKIP_PAYLOAD_HASH=1` skips payload SHA256 on both Miles and SGLang;
 the default is `0`. Set it in the Ray job environment so trainers and rollout
 workers inherit the same policy. Miles publishes `payload_checksum_format="none"`
@@ -81,9 +81,11 @@ verification of a hashed publication. Each rank caches this setting when its
 HostArena is created. The encoded
 cache index and READY token bind the policy, and all ranks in the original cohort
 must agree. Skipping trusts payload contents without SHA authentication; manifest
-SHA, file identity/size, path, frame-range and decode checks remain in force.
-After encoded-cache READY admission drains global validation, the caller keeps
-only its rank's entries and releases the global manifest before local arena
+SHA, file identity/size, path, exact Zstd output and native decode checks remain in force.
+Miles constructs per-tensor offsets and frame coverage; the receiver does not
+rescan those descriptors in a separate executor task. After encoded-cache READY
+admission drains all file reads and hashes, the caller keeps only its rank's
+entries and releases the global manifest before local arena
 planning and payload preparation. Encoded file views remain owned until all jobs drain;
 failed preparation never authorizes cache reuse.
 Each rank prepares only its local tensors directly in its own retained, original
@@ -283,9 +285,8 @@ and omitted-byte ranges in one pass. Frames and payloads remain
 publication-specific. Private arena index/state records use `orjson`; atomic
 replacement and canonical namespace/publication digests are unchanged.
 
-One creator per engine-host validates all publication frame metadata, including
-foreign experts, then reads and SHA-256 checks owner files in parallel using its
-existing CPU pool. Each task copies into its disjoint retained tmpfs slice and
+One creator per engine-host reads and SHA-256 checks owner files in parallel
+using its existing CPU pool. Each task copies into its disjoint retained tmpfs slice and
 checks source identity/extent across the read; all tasks drain before READY or failure. The
 namespace and build/release mutex bind the original engine participants and delta
 stream; publication metadata binds the manifest path, digest, session and versions.
@@ -328,10 +329,10 @@ packed path rather than being split into layer batches.
 `host_raw_pack_s` is preparation CPU packing; raw H2D also occurs in preparation.
 
 Preparation reports manifest loading/parsing (`host_manifest_read_parse_s`), plan
-validation (`host_plan_validate_s`), frame validation (`host_encoded_cache_frames_validate_s`),
-local tensor planning (`host_tensor_prepare_s`) and full preparation
-(`host_prepare_s`). Local planning releases the global manifest and foreign
-entries after host verification/decode; that release is included in both spans.
+validation (`host_plan_validate_s`), local tensor planning (`host_tensor_prepare_s`)
+and full preparation (`host_prepare_s`). Local planning releases the global manifest
+and foreign entries after file verification and before local payload preparation;
+that release is included in both spans.
 `host_metadata_prepare_s` covers small GPU input setup and
 status-callback preparation, including its own stream waits (`host_metadata_wait_s`).
 `paused_setup_host_s` includes decoded-slot allocation, output-pointer binding and
@@ -356,19 +357,17 @@ call, so host enqueue durations can contain GPU backpressure.
 
 `host_encoded_cache_created`/`host_encoded_cache_reused` identify the creator
 and followers. Creator-only `host_encoded_cache_read_hash_s` measures submission
-through file verification joins, before waiting for global frame validation.
-Frame validation runs in the same pool and can overlap this span; both are nested
-inside cache build and must not be added to obtain elapsed time.
+through all file verification joins. It is nested inside cache build.
 `host_encoded_cache_read_worker_sum_s` and `host_encoded_cache_sha256_worker_sum_s`
 sum file-read and SHA intervals. Each file is read directly into its final retained
 mapping, then hashed there. Different files can run concurrently; neither worker
 sum is additive with the enclosing wall span, which also includes scheduling and joins.
-`host_encoded_cache_hash_files`, `hash_bytes` and `frames_validations` (with the
-same prefix) count shared work once. `host_encoded_cache_skip_payload_hash` reports
+`host_encoded_cache_hash_files` and `host_encoded_cache_hash_bytes` count shared
+work once. `host_encoded_cache_skip_payload_hash` reports
 the cached policy on every rank; skipped SHA worker time, hash bytes and hash files
-are zero, including on the creator. All reads and frame validation drain before
-READY or failure returns; rank allocation and local payload preparation start only after both
-pass. `host_encoded_cache_wait_s` isolates the
+are zero, including on the creator. All file tasks drain before READY or failure
+returns; rank allocation and local payload preparation start only after file
+verification passes. `host_encoded_cache_wait_s` isolates the
 cache mutex wait. `host_encoded_cache_build_s` repeats the cached build duration
 on followers and must not be summed across ranks. `host_rank_prepare_s` includes
 cache access, global-metadata release, rank allocation and local payload preparation,
@@ -385,9 +384,9 @@ release and timing bookkeeping.
 
 `host_plan_cache_reused` reports whether the canonical plan was already admitted.
 Every publication authenticates its manifest and retains the admitted plan digest;
-Miles owns the unchanged static definitions. Changing payload/frame extents are
-bounded before host allocation and native decoding. No old manifest or payload
-is retained in the plan cache.
+Miles owns the unchanged static definitions and each publication's payload offsets
+and frame coverage. Native frame geometry and decode status checks remain in force.
+No old manifest or payload is retained in the plan cache.
 
 Each rank reports `host_rank_outer_zstd_decode_s` for CPU task submission/join
 wall time, including raw copies. `host_rank_outer_zstd_worker_decode_sum_s`
