@@ -88,7 +88,6 @@ diffusion_common = [
   "addict",
   "cloudpickle",
   "diffusers==0.37.0",
-  "fast-simplification",
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",
