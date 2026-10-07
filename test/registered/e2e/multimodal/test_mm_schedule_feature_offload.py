@@ -31,7 +31,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=5, suite="base-b-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 # The weakref assertions only mean something with a real device allocation.
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
