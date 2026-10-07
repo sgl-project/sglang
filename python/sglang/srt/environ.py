@@ -1264,6 +1264,8 @@ class Envs:
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
 
+    # Per-file overrides for packaged MoE LoRA plans, tiles, and base GEMM configs.
+    SGLANG_LORA_MOE_CONFIG_DIR = EnvStr(None)
     # Per-file overrides for dense LoRA plan tables.
     SGLANG_LORA_DENSE_CONFIG_DIR = EnvStr(None)
 
