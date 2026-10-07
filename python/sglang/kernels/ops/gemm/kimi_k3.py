@@ -9,8 +9,10 @@ if TYPE_CHECKING:
 
 _is_npu = is_npu()
 
-# (n, k) -> the largest num_tokens where the tiny GEMM still beats cuBLAS.
-# Doubles as the compile-time max_m: one kernel is built per m up to it.
+# (n, k) -> the largest num_tokens where the tiny GEMM still beats a general
+# GEMM. Doubles as the compile-time max_m: one kernel is built per m up to it.
+# f_b is (1536, 128). At M=32 the K-variant measured 6 us against hipBLASLt
+# MT32x16x64 at 5 us, so the cutoff stays at 12.
 _K3_TINY_GEMM_MAX_TOKENS = {
     (144, 7168): 16,
     (896, 7168): 8,

@@ -160,6 +160,12 @@ _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+# Module-level linears already reach aiter tgemm. The fused-front helper
+# calls F.linear, which on this decode shape (router N=896, K=7168, M=32)
+# lands on hipBLASLt's MT16x16x1024 tile.
+_use_aiter_tgemm = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+if _use_aiter_tgemm:
+    from aiter.tuned_gemm import tgemm
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -230,6 +236,10 @@ def _k3_bf16_gemm(
                 if out is None:
                     return cutedsl_bf16_gemm(x, weight)
                 return cutedsl_bf16_gemm_out(x, weight, out)
+    if out is None and _use_aiter_tgemm:
+        if not weight.is_contiguous():
+            weight = weight.contiguous()
+        return tgemm.mm(x, weight, None, otype=x.dtype)
     if out is None:
         return torch.nn.functional.linear(x, weight)
     if out.dtype != x.dtype:
