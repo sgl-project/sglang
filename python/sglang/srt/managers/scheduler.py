@@ -2487,6 +2487,11 @@ class Scheduler(
 
     def register_deferred_output_source(self, source: DeferredOutputSource) -> None:
         """Let ``source`` hold finished requests' responses; see deferred_output."""
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            # PD finishes and streams prefill requests from its transfer queues.
+            raise ValueError(
+                "deferred output sources are not supported with PD disaggregation"
+            )
         self.deferred_output_sources = (*self.deferred_output_sources, source)
         self.output_streamer.defer_outputs = True
 
@@ -5044,8 +5049,13 @@ class Scheduler(
             self.load_inquirer.get_loads, force=True, snapshot=snapshot
         )
 
-        # sleep until next event
-        self.maybe_sleep_on_idle()
+        if deferred_output_sources and self.has_pending_deferred_outputs():
+            # Held responses are released by polling, not by a socket event:
+            # keep polling, and yield the GIL to the sources' workers.
+            time.sleep(0)
+        else:
+            # sleep until next event
+            self.maybe_sleep_on_idle()
         self.metrics_reporter.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
@@ -5086,9 +5096,6 @@ class Scheduler(
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
-            # Held responses are not on the GPU, but their requests are not done.
-            if getattr(self, "deferred_output_sources", ()):
-                idle &= not self.has_pending_deferred_outputs()
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
