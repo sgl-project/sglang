@@ -87,6 +87,46 @@ class TestTailMetadata(CustomTestCase):
 
 
 class TestBoundedPrefillReaders(CustomTestCase):
+    def test_prompt_logprobs_rejected_before_dispatch(self):
+        from sglang.srt.managers.io_struct import GenerateReqInput
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
+        from sglang.srt.runtime_context import get_context
+
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.context_len = 1024
+        manager.num_reserved_tokens = 0
+        manager.allow_auto_truncate = False
+        manager.validate_total_tokens = False
+        manager.is_generation = True
+        for encoder, decoder, embedded in (
+            (False, False, False),
+            (True, False, False),
+            (False, True, False),
+            (False, True, True),
+        ):
+            for start in (0, 511, 512, -1, None):
+                request = GenerateReqInput(
+                    input_ids=None if embedded else [42] * 512,
+                    input_embeds=[[0.0]] * 512 if embedded else None,
+                    sampling_params={"max_new_tokens": 1},
+                    return_logprob=True,
+                    logprob_start_len=start,
+                )
+                with (
+                    self.subTest(
+                        encoder=encoder, decoder=decoder, embedded=embedded, start=start
+                    ),
+                    get_context().override_server_args(
+                        enable_encoder_swa_bounded_replay=encoder,
+                        enable_decoder_swa_bounded_replay=decoder,
+                    ),
+                ):
+                    if (encoder or decoder) and start in (0, 511):
+                        with self.assertRaisesRegex(ValueError, "prompt logprobs"):
+                            manager._validate_one_request(request, request.input_ids)
+                    else:
+                        manager._validate_one_request(request, request.input_ids)
+
     def test_graph_replay_rejects_uncomputed_prompt_rows(self):
         from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
