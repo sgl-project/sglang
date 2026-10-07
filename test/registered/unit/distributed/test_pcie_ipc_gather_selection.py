@@ -74,12 +74,17 @@ class _FakeWorkspace:
 
 @contextlib.contextmanager
 def _fake_flashinfer(
-    workspace_cls=_FakeWorkspace, free_bytes=1 << 40, one_rank=True, missing=()
+    workspace_cls=_FakeWorkspace,
+    free_bytes=1 << 40,
+    one_rank=True,
+    missing=(),
+    hosts=(0, 0, 0, 0),
 ):
     """FlashInfer, free GPU memory and (with ``one_rank``) the cross-rank
     agreement, stubbed for a CPU process. ``free_bytes`` may be an exception
     for ``torch.cuda.mem_get_info`` to raise; ``missing`` names API symbols
-    this FlashInfer lacks."""
+    this FlashInfer lacks; ``hosts`` is each rank's host, as
+    ``in_the_same_node_as`` reports it (left to the real check when None)."""
     module = types.ModuleType("flashinfer.comm")
     module.PcieIpcAllGatherWorkspace = workspace_cls
     module.PcieIpcAllGatherLaunchConfig = lambda *a: ("config",) + a
@@ -97,6 +102,13 @@ def _fake_flashinfer(
             patch.dict(sys.modules, {"flashinfer": package, "flashinfer.comm": module})
         )
         stack.enter_context(patch.object(torch.cuda, "mem_get_info", **mem_get_info))
+        if hosts is not None:
+            stack.enter_context(
+                patch(
+                    "sglang.srt.distributed.parallel_state.in_the_same_node_as",
+                    return_value=[h == hosts[0] for h in hosts],
+                )
+            )
         if one_rank:
             stack.enter_context(
                 patch.object(
@@ -200,6 +212,20 @@ class TestMakeVocabGather(CustomTestCase):
                 self.assertIsInstance(gather, NcclVocabGather)
                 group.pcie_ipc_comm.adopt.assert_not_called()
 
+    def test_group_across_hosts_never_starts_the_build(self):
+        """FlashInfer does not reject a TP4 group spanning hosts, and its failed
+        IPC handle exchange there leaves the buffers allocated."""
+        group = _group()
+        with _fake_flashinfer(hosts=(0, 0, 1, 1)):
+            with patch.object(vocab_gather, "PcieIpcVocabGather") as build:
+                with patch.object(vocab_gather, "_can_build_pcie_ipc_gather") as probe:
+                    gather = make_vocab_gather(
+                        group, local_width=WIDTH, prefer_pcie_ipc=True, symm_rows=16
+                    )
+        self.assertIsInstance(gather, NcclVocabGather)
+        build.assert_not_called()
+        probe.assert_not_called()
+
     def test_nvlink_multicast_wins_over_pcie_ipc(self):
         with patch.object(vocab_gather, "_nvlink_ca_comm", return_value=MagicMock()):
             with patch.object(vocab_gather, "NVLinkVocabGather") as nvlink:
@@ -233,7 +259,8 @@ class TestMakeVocabGather(CustomTestCase):
 
 def _agreement_rank(rank: int, init_file: str, failing: str) -> None:
     """One of four gloo ranks; rank 1 fails at ``failing``, the others succeed
-    (with ``build_all``, every rank fails the build)."""
+    (with ``build_all``, every rank fails the build; with ``multi_host``, ranks
+    2 and 3 are on another host). The one-host check is the real one."""
     dist.init_process_group(
         backend="gloo", init_method=Path(init_file).as_uri(), rank=rank, world_size=4
     )
@@ -260,7 +287,10 @@ def _agreement_rank(rank: int, init_file: str, failing: str) -> None:
             free_bytes = 0
         if rank == 1 and failing == "probe":
             free_bytes = RuntimeError("CUDA error")
-        with _fake_flashinfer(workspace, free_bytes=free_bytes, one_rank=False):
+        hosts = (0, 0, 1, 1) if failing == "multi_host" else None
+        with _fake_flashinfer(
+            workspace, free_bytes=free_bytes, one_rank=False, hosts=hosts
+        ):
             try:
                 gather = make_vocab_gather(
                     group, local_width=WIDTH, prefer_pcie_ipc=True, symm_rows=16
@@ -278,7 +308,7 @@ def _agreement_rank(rank: int, init_file: str, failing: str) -> None:
             assert isinstance(gather, NcclVocabGather), (rank, type(gather))
         if group.pcie_ipc_comm is not None:
             group.pcie_ipc_comm.adopt.assert_not_called()
-        if failing in ("memory", "no_comm", "probe"):
+        if failing in ("memory", "no_comm", "probe", "multi_host"):
             # no rank may start the collective build
             assert not built, rank
     finally:
@@ -306,6 +336,9 @@ class TestRanksAgree(CustomTestCase):
 
     def test_one_rank_probe_exception_keeps_every_rank_off_the_build(self):
         self._spawn("probe")
+
+    def test_group_across_hosts_keeps_every_rank_off_the_build(self):
+        self._spawn("multi_host")
 
     def test_build_failing_on_every_rank_takes_every_rank_to_nccl(self):
         self._spawn("build_all")
