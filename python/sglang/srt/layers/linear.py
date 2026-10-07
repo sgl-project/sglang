@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import itertools
 import logging
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
 
+import msgspec
 import torch
 from torch import nn
 from torch.nn.parameter import Parameter, UninitializedParameter
@@ -57,13 +57,8 @@ _disable_hip_linear_quant = _is_hip and get_bool_env_var(
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class ReplicatedParallelGroup:
-    """Share each weight partition across consecutive ranks of a base group.
-
-    This selects weight placement; the layer's execution policy still owns
-    its collectives.
-    """
+class ReplicatedParallelGroup(msgspec.Struct, frozen=True):
+    """Share weight partitions across consecutive ranks; collectives stay separate."""
 
     group: Literal["tp", "attn_tp"]
     replica_size: int
