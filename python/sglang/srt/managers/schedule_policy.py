@@ -855,7 +855,7 @@ class PrefillAdder:
         radix COW headroom or locked-but-evictable bytes — that residual is
         backstopped by the fail-loud RuntimeError in `alloc_req_slots`. FIXME: if
         over-admission crashes under pressure, make this more conservative (e.g.
-        multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`)."""
+        also account for missing tracking buffers)."""
         if self._mamba_slot_cost and not req.kv.holds_mamba:
             return self._mamba_slot_cost
         return 0
@@ -1038,10 +1038,6 @@ class PrefillAdder:
         )
         self._account_prefill_cache_admission(req, prefix_len)
 
-    def _req_inc_lock_ref(self, req: Req):
-        # Persist the release receipt.
-        req.lock_receipt = self.tree_cache.inc_lock_ref(req.last_node).to_dec_params()
-
     def _kv_shard_reserve_scratch(self, prefix_len: int, extend_len: int) -> bool:
         """Reserve scratch or return False to defer; no-op when sharding is off.
 
@@ -1205,13 +1201,11 @@ class PrefillAdder:
             else None
         )
         try:
-            # Replay the acquire's receipt (SWA boundary uuid, mamba flag) so the
-            # release takes back exactly what this temporary lock took.
-            dec_lock_params = self.tree_cache.inc_lock_ref(last_node).to_dec_params()
+            lock = self.tree_cache.lock(last_node)
             try:
                 yield None
             finally:
-                self.tree_cache.dec_lock_ref(last_node, dec_lock_params)
+                self.tree_cache.unlock(lock)
         finally:
             if host_lock_params is not None:
                 self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)
@@ -1612,7 +1606,7 @@ class PrefillAdder:
         req.set_extend_range(
             admission.prefix_len, admission.prefix_len + admission.extend_len
         )
-        self._req_inc_lock_ref(req)
+        req.lock = self.tree_cache.lock(req.last_node)
         self.can_run_list.append(req)
         if admission.is_chunked:
             self.new_chunked_req = req
