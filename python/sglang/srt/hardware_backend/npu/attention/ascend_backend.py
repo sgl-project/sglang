@@ -1150,7 +1150,6 @@ class AscendAttnBackend(AttentionBackend):
         )
 
         attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
-        attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
         if pad_rows:
             attn_out = torch.cat(
                 [attn_out, attn_out.new_zeros(pad_rows, *attn_out.shape[1:])], dim=0
