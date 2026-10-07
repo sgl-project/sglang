@@ -3,6 +3,7 @@ import os
 import pathlib
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -49,8 +50,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     get_layerwise_offload_component_names_for_pipeline,
     is_layerwise_offloaded_module,
     is_resident_layerwise_module,
+    iter_materialized_weights,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    RESIDENCY_LIFETIME_FORWARD,
+    RESIDENCY_LIFETIME_PERMANENT,
     RESIDENCY_POLICY_LEADING,
     RESIDENCY_POLICY_STRIDED,
 )
@@ -224,9 +228,11 @@ def _server_args(**kwargs):
         dit_offload_prefetch_size=1,
         dit_layerwise_resident_layers=0.0,
         dit_layerwise_residency_policy=RESIDENCY_POLICY_LEADING,
+        dit_layerwise_residency_lifetime=RESIDENCY_LIFETIME_FORWARD,
         layerwise_prefetch_size={},
         layerwise_resident_layers={},
         layerwise_residency_policy={},
+        layerwise_residency_lifetime={},
         pin_cpu_memory=False,
         # the pin budget ranks candidates by bytes x steps, and reads the step
         # count off the pipeline's sampling defaults
@@ -515,6 +521,65 @@ def test_snapshot_and_layerwise_share_the_residency_managers_pin_budget():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("explicit", [None, "canonical", "legacy"])
+@pytest.mark.parametrize("keep_after_warmup", [False, True])
+def test_explicit_layerwise_offload_disables_request_end_preload(
+    monkeypatch, explicit, keep_after_warmup
+):
+    args = _server_args(
+        component_residency=(
+            {"text_encoder": "layerwise-offload"} if explicit == "canonical" else None
+        ),
+        layerwise_offload_components=["text_encoder"],
+        _explicit_arg_names=(
+            {"layerwise_offload_components"} if explicit == "legacy" else set()
+        ),
+        enable_layerwise_nvtx_marker=False,
+        pipeline_config=SimpleNamespace(supports_auto_residency=False),
+    )
+    module = _NestedDummyModel()
+    use = ComponentUse(
+        "encode",
+        "text_encoder",
+        preferred_ready_after_request=True,
+        keep_ready_after_warmup=keep_after_warmup,
+    )
+    stage = SimpleNamespace(component_uses=lambda *_: [use])
+    pipeline = SimpleNamespace(
+        modules={"text_encoder": module},
+        _stage_name_mapping={"encode": stage},
+        component_residency_strategies={},
+    )
+    configure_layerwise_offload_modules(pipeline.modules, args)
+    manager = ComponentResidencyManager(pipeline, args)
+    manager.refresh_pipeline(pipeline)
+    strategy = manager.strategy_for("text_encoder", module)
+    assert isinstance(strategy, LayerwiseOffloadStrategy)
+    prepare = Mock(wraps=strategy.prepare_for_use)
+    monkeypatch.setattr(strategy, "prepare_for_use", prepare)
+    release = Mock(wraps=module.layerwise_offload_managers[0].release_after_use)
+    monkeypatch.setattr(
+        module.layerwise_offload_managers[0], "release_after_use", release
+    )
+
+    for is_warmup in (True, False, False):
+        batch = SimpleNamespace(is_warmup=is_warmup)
+        manager.begin_request([stage], batch, args)
+        manager.before_stage(stage, 0, batch, args)
+        manager.begin_stage()
+        prepare.reset_mock()
+        release.reset_mock()
+        manager.end_stage()
+        manager.finish_request()
+        if explicit is not None:
+            prepare.assert_not_called()
+            release.assert_called()
+        elif not (is_warmup and keep_after_warmup):
+            prepare.assert_called_once()
+    module.disable_offload()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_layerwise_pin_lease_includes_alignment_and_survives_host_aliases():
     budget = host_memory_budget.HostPinBudget(
         available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + 76
@@ -611,6 +676,150 @@ def test_failed_layerwise_allocation_refunds_only_unallocated_allowance(monkeypa
     gc.collect()
     assert budget.committed_bytes == 64 + 76
     del manager, model
+    gc.collect()
+    assert budget.committed_bytes == 64
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("source_device", ["cpu", "cuda"])
+@pytest.mark.parametrize("fallback", [None, "register", "shared_storage"])
+def test_consolidated_host_copy_order_and_fallback(
+    monkeypatch, source_device, fallback
+):
+    numel = layerwise_offload_mod._REGISTER_MIN_BYTES // 4
+    expected = torch.arange(numel, dtype=torch.float32)
+    model = torch.nn.Module()
+    block = torch.nn.Module()
+    block.weight = torch.nn.Parameter(expected.to(source_device).clone())
+    model.blocks = torch.nn.ModuleList([block])
+    budget = host_memory_budget.HostPinBudget(
+        available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + numel * 4
+    )
+    register = layerwise_offload_mod._pin_in_place
+    registrations = []
+
+    def observe_registration(tensor):
+        if (
+            source_device == "cpu"
+            and fallback != "shared_storage"
+            and not registrations
+        ):
+            torch.testing.assert_close(tensor, expected, rtol=0, atol=0)
+        registrations.append(tensor.data_ptr())
+        return False if fallback == "register" else register(tensor)
+
+    monkeypatch.setattr(layerwise_offload_mod, "_pin_in_place", observe_registration)
+    if fallback == "shared_storage":
+        monkeypatch.setattr(layerwise_offload_mod, "_shared_storage", lambda _: None)
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=True,
+        pin_budget=budget,
+    )
+    assert registrations
+    host_alias = manager._consolidated_cpu_weights[0][torch.float32].detach()
+    assert host_alias.is_pinned()
+    assert host_alias.untyped_storage().nbytes() == numel * 4
+    torch.testing.assert_close(host_alias, expected, rtol=0, atol=0)
+    assert budget.committed_bytes == numel * 4
+    manager.load_all_layers()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(block.weight.cpu(), expected, rtol=0, atol=0)
+    manager.remove_forward_hooks()
+    manager.enabled = False
+    manager.release_host_stores()
+    assert budget.committed_bytes == numel * 4
+    del host_alias, manager, model, block
+    gc.collect()
+    assert budget.committed_bytes == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cpu_copy_failure_returns_unregistered_pin_allowance(monkeypatch):
+    numel = layerwise_offload_mod._REGISTER_MIN_BYTES // 4
+    model = torch.nn.Module()
+    block = torch.nn.Module()
+    block.weight = torch.nn.Parameter(torch.ones(numel))
+    model.blocks = torch.nn.ModuleList([block])
+    budget = host_memory_budget.HostPinBudget(
+        available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + numel * 4 + 64
+    )
+    assert budget.request(component_name="other", weight_bytes=64)
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        initialize=False,
+        pin_cpu_memory=True,
+        pin_budget=budget,
+    )
+    original_copy = torch.Tensor.copy_
+
+    def fail_copy(target, source, *args, **kwargs):
+        if target.device.type == "cpu" and source.numel() == numel:
+            raise RuntimeError("CPU weight copy failed")
+        return original_copy(target, source, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", fail_copy)
+    with pytest.raises(RuntimeError, match="CPU weight copy failed"):
+        manager.initialize()
+    gc.collect()
+    assert budget.committed_bytes == 64
+    assert block.weight.numel() == numel
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "source_device,numel,registration_failure",
+    [
+        ("cpu", 4, False),
+        ("cuda", layerwise_offload_mod._REGISTER_MIN_BYTES // 4, False),
+        ("cpu", layerwise_offload_mod._REGISTER_MIN_BYTES // 4, True),
+    ],
+)
+def test_pinned_copy_failure_retains_lease_for_live_alias(
+    monkeypatch, source_device, numel, registration_failure
+):
+    model = torch.nn.Module()
+    block = torch.nn.Module()
+    block.weight = torch.nn.Parameter(torch.ones(numel, device=source_device))
+    model.blocks = torch.nn.ModuleList([block])
+    budget = host_memory_budget.HostPinBudget(
+        available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + numel * 4 + 64
+    )
+    assert budget.request(component_name="other", weight_bytes=64)
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        initialize=False,
+        pin_cpu_memory=True,
+        pin_budget=budget,
+    )
+    if registration_failure:
+        monkeypatch.setattr(layerwise_offload_mod, "_pin_in_place", lambda _: False)
+    original_copy = torch.Tensor.copy_
+    aliases = []
+
+    def fail_pinned_copy(target, source, *args, **kwargs):
+        if target.device.type == "cpu" and target.is_pinned():
+            aliases.append(target.detach())
+            raise RuntimeError("pinned weight copy failed")
+        return original_copy(target, source, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", fail_pinned_copy)
+    with pytest.raises(RuntimeError, match="pinned weight copy failed"):
+        manager.initialize()
+    assert len(aliases) == 1
+    assert aliases[0].is_pinned()
+    assert budget.committed_bytes == 64 + numel * 4
+    assert block.weight.numel() == numel
+    aliases.clear()
     gc.collect()
     assert budget.committed_bytes == 64
 
@@ -986,6 +1195,7 @@ def _resident_manager(
     prefetch_size=1,
     resident_layers=0,
     residency_policy=RESIDENCY_POLICY_LEADING,
+    residency_lifetime=RESIDENCY_LIFETIME_FORWARD,
 ):
     return LayerwiseOffloadManager(
         model=model,
@@ -996,6 +1206,7 @@ def _resident_manager(
         prefetch_size=prefetch_size,
         resident_layers=resident_layers,
         residency_policy=residency_policy,
+        residency_lifetime=residency_lifetime,
     )
 
 
@@ -1242,11 +1453,11 @@ def test_configure_logs_component_start_and_completion(monkeypatch):
         "Configuring layerwise offload for transformer (_ResidentComponent): "
         "blocks (8 layers)"
     )
-    # "(per request)" is the point of this line: the set is re-established every
-    # request, not pinned for the server's lifetime.
+    # The lifetime in parentheses is the point of this line: `forward` says the
+    # set is re-established every request, not pinned for the server's lifetime.
     assert logs[-1] == (
         "Layerwise offload ready for transformer (_ResidentComponent) in 2.35s: "
-        "groups=1, layers=8, prefetch/group=2, resident=3/8 (per request), policy=leading"
+        "groups=1, layers=8, prefetch/group=2, resident=3/8 (forward), policy=leading"
     )
 
 
@@ -2052,11 +2263,13 @@ def test_layerwise_tuning_defaults_match_the_group():
         3.0,
         20.0,
         RESIDENCY_POLICY_STRIDED,
+        RESIDENCY_LIFETIME_FORWARD,
     )
     assert args.layerwise_tuning_for("text_encoder", dit_group=False) == (
         0.0,
         0.0,
         RESIDENCY_POLICY_LEADING,
+        RESIDENCY_LIFETIME_FORWARD,
     )
 
 
@@ -2073,12 +2286,14 @@ def test_layerwise_tuning_per_component_entry_wins():
         2.0,
         4.0,
         RESIDENCY_POLICY_STRIDED,
+        RESIDENCY_LIFETIME_FORWARD,
     )
     # an entry for one component leaves every other component alone
     assert args.layerwise_tuning_for("vae", dit_group=False) == (
         0.0,
         0.0,
         RESIDENCY_POLICY_LEADING,
+        RESIDENCY_LIFETIME_FORWARD,
     )
     assert args.layerwise_tuning_for("transformer", dit_group=True)[:2] == (3.0, 20.0)
 
@@ -2582,3 +2797,330 @@ def test_small_pinned_stores_keep_using_the_pool(monkeypatch):
     tensor = layerwise_offload_mod._pinned_empty(1024, dtype=torch.float32)
     assert tensor.is_pinned()
     assert len(pooled) == 1
+
+
+# --- permanent residency lifetime -------------------------------------------
+
+
+def _permanent_manager(model, *, num_layers, resident_layers, prefetch_size=1):
+    return _resident_manager(
+        model,
+        num_layers=num_layers,
+        prefetch_size=prefetch_size,
+        resident_layers=resident_layers,
+        residency_lifetime=RESIDENCY_LIFETIME_PERMANENT,
+    )
+
+
+def test_permanent_residents_are_placed_at_load_without_a_host_store(monkeypatch):
+    """`permanent` puts the resident set on the device in the constructor.
+
+    Not on the first forward, not during warmup: at load. And it keeps no host
+    copy of those layers -- there is nothing to reload them from because
+    nothing ever releases them.
+    """
+    _patch_fake_device(monkeypatch)
+    model = _MultiBlockModel(6)
+    originals = [model.blocks[i].weight.detach().clone() for i in range(6)]
+    manager = _permanent_manager(model, num_layers=6, resident_layers=3)
+
+    assert manager._permanent_set == frozenset({0, 1, 2})
+    # Armed from load: the forward-lifetime set waits for the first forward.
+    assert manager._residency_active is True
+    assert manager._retained_layers == 3
+    assert {0, 1, 2} <= manager._gpu_layers
+    for i in range(3):
+        assert i not in manager._weight_metadata
+        assert not manager._consolidated_cpu_weights.get(i)
+        assert torch.equal(model.blocks[i].weight, originals[i])
+        # a strided view keeps its layout, as the strided host store would have
+        assert model.blocks[i].weight.stride() == originals[i].stride()
+    # Streamed layers take the ordinary path: a host store, and a placeholder
+    # until prefetched. The head of the stream is now layer 3, not layer 0.
+    assert 3 in manager._gpu_layers
+    for i in (4, 5):
+        assert i in manager._weight_metadata
+        assert tuple(model.blocks[i].weight.shape) == (1,)
+
+
+def test_permanent_residents_survive_every_release_path(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    manager = _permanent_manager(_MultiBlockModel(6), num_layers=6, resident_layers=3)
+    manager.prefetch_layer(4, non_blocking=False)
+    assert {0, 1, 2, 3, 4} <= manager._gpu_layers
+
+    manager.release_layer(0, force=True)
+    assert 0 in manager._gpu_layers
+    manager.release_all()
+    assert manager._gpu_layers == {0, 1, 2}
+    # Nothing to write back and nothing to write it to; must be a no-op.
+    manager.sync_all_layers_to_cpu()
+    assert manager._gpu_layers == {0, 1, 2}
+
+
+def test_prepare_does_not_touch_permanent_residents(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    model = _MultiBlockModel(6)
+    manager = _permanent_manager(model, num_layers=6, resident_layers=3)
+    manager.release_all()
+    before = [model.blocks[i].weight.data_ptr() for i in range(3)]
+
+    log = _record_prepare(manager, monkeypatch)
+    manager.prepare_for_next_req(non_blocking=False)
+
+    prefetched = [entry[1] for entry in log if entry[0] == "prefetch"]
+    assert not set(prefetched) & {0, 1, 2}
+    assert 3 in prefetched
+    assert [model.blocks[i].weight.data_ptr() for i in range(3)] == before
+
+
+def test_permanent_residents_survive_disable_and_enable_offload(monkeypatch):
+    """The compile-warmup and LoRA paths toggle offload off and on again.
+
+    Off loads every layer; on syncs the loaded layers back to their host
+    stores and releases them. Permanent layers have no host store and must
+    come out of that round trip untouched, with the streamed layer released
+    as before.
+    """
+    _patch_fake_device(monkeypatch)
+    model = _MixinModel()
+    model.configure_layerwise_offload(
+        _server_args(
+            dit_layerwise_offload=True,
+            dit_layerwise_resident_layers=2,
+            dit_layerwise_residency_lifetime=RESIDENCY_LIFETIME_PERMANENT,
+        )
+    )
+    (manager,) = model.layerwise_offload_managers
+    assert manager._permanent_set == frozenset({0, 1})
+    expected = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+
+    model.disable_offload()
+    assert not is_layerwise_offloaded_module(model)
+    model.enable_offload()
+    assert is_layerwise_offloaded_module(model)
+
+    assert {0, 1} <= manager._gpu_layers
+    for i in (0, 1):
+        assert torch.equal(model.blocks[i].weight, expected)
+    assert tuple(model.blocks[2].weight.shape) == (1,)
+
+
+def test_iter_materialized_weights_reads_permanent_residents_from_the_module(
+    monkeypatch,
+):
+    _patch_fake_device(monkeypatch)
+    model = _MixinModel()
+    model.configure_layerwise_offload(
+        _server_args(
+            dit_layerwise_offload=True,
+            dit_layerwise_resident_layers=2,
+            dit_layerwise_residency_lifetime=RESIDENCY_LIFETIME_PERMANENT,
+        )
+    )
+    expected = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+
+    materialized = dict(iter_materialized_weights(model))
+    assert sorted(materialized) == sorted(name for name, _ in model.named_parameters())
+    # permanent: the module's own tensor; streamed: rebuilt from the host store
+    assert torch.equal(materialized["blocks.0.weight"], expected)
+    assert torch.equal(materialized["blocks.2.weight"], expected)
+
+
+def test_permanent_residents_stay_out_of_the_host_pin_plan(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    planned = {}
+    original = LayerwiseOffloadManager._plan_layer_hosting
+
+    def spy(self, layer_groups):
+        planned["layers"] = sorted(layer_groups)
+        return original(self, layer_groups)
+
+    monkeypatch.setattr(LayerwiseOffloadManager, "_plan_layer_hosting", spy)
+    _permanent_manager(_MultiBlockModel(6), num_layers=6, resident_layers=3)
+    assert planned["layers"] == [3, 4, 5]
+
+
+def test_permanent_lifetime_with_no_resident_layers_warns_and_streams(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    warnings = []
+    monkeypatch.setattr(
+        layerwise_offload_mod.logger,
+        "warning",
+        lambda message, *args: warnings.append(message % args),
+    )
+    manager = _permanent_manager(_MultiBlockModel(4), num_layers=4, resident_layers=0)
+    assert manager._permanent_set == frozenset()
+    assert manager._residency_active is False
+    assert any("permanent residency with no resident layers" in w for w in warnings)
+
+
+def test_unknown_residency_lifetime_is_rejected(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    with pytest.raises(ValueError, match="unknown residency lifetime"):
+        _resident_manager(
+            _MultiBlockModel(4),
+            num_layers=4,
+            resident_layers=2,
+            residency_lifetime="sometimes",
+        )
+
+
+def test_forward_lifetime_is_the_default_and_unchanged(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(4), num_layers=4, prefetch_size=1, resident_layers=2
+    )
+    assert manager.residency_lifetime == RESIDENCY_LIFETIME_FORWARD
+    assert manager._permanent_set == frozenset()
+    assert manager._residency_active is False
+    for i in range(4):
+        assert i in manager._weight_metadata
+
+
+def test_layerwise_tuning_returns_the_lifetime():
+    args = _server_args(
+        dit_layerwise_resident_layers=20,
+        dit_layerwise_residency_lifetime=RESIDENCY_LIFETIME_PERMANENT,
+        layerwise_residency_lifetime="video_vae=forward",
+    )
+    assert (
+        args.layerwise_tuning_for("transformer", dit_group=True)[3]
+        == RESIDENCY_LIFETIME_PERMANENT
+    )
+    assert (
+        args.layerwise_tuning_for("video_vae", dit_group=False)[3]
+        == RESIDENCY_LIFETIME_FORWARD
+    )
+    # the DiT-group default is not the auxiliary default
+    assert (
+        args.layerwise_tuning_for("text_encoder", dit_group=False)[3]
+        == RESIDENCY_LIFETIME_FORWARD
+    )
+
+
+def test_layerwise_tuning_rejects_unknown_lifetime():
+    args = _server_args(layerwise_residency_lifetime="vae=sometimes")
+    with pytest.raises(ValueError, match="unknown residency lifetime"):
+        args.layerwise_tuning_for("vae", dit_group=False)
+
+
+def test_configure_logs_a_permanent_lifetime(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    logs = []
+    monkeypatch.setattr(
+        layerwise_offload_mod.logger,
+        "info",
+        lambda message, *args: logs.append(message % args),
+    )
+    comp = _ResidentComponent(8)
+    comp.configure_layerwise_offload(
+        _server_args(
+            dit_offload_prefetch_size=2,
+            dit_layerwise_resident_layers=3,
+            dit_layerwise_residency_lifetime=RESIDENCY_LIFETIME_PERMANENT,
+        ),
+        component_name="transformer",
+    )
+    assert any("placed 3 permanent resident layers" in line for line in logs)
+    assert logs[-1].endswith("resident=3/8 (permanent), policy=leading")
+
+
+class _LoRAWrap(torch.nn.Module):
+    """Mimic BaseLayerWithLoRA: live Parameter name becomes *.base_layer.weight."""
+
+    def __init__(self, base: torch.nn.Module) -> None:
+        super().__init__()
+        self.base_layer = base
+
+    @property
+    def weight(self):
+        return self.base_layer.weight
+
+
+def test_offload_param_name_aliases_cover_lora_wrap():
+    from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+        offload_param_name_aliases,
+    )
+
+    aliases = offload_param_name_aliases("blocks.0.weight")
+    assert "blocks.0.weight" in aliases
+    assert "blocks.0.base_layer.weight" in aliases
+    assert "blocks.0.weight" in offload_param_name_aliases("blocks.0.base_layer.weight")
+
+
+def test_parking_does_not_steal_lora_wrapped_layer_weights(monkeypatch):
+    """After wrap, live names are *.base_layer.weight; park must still skip them."""
+    _patch_fake_device(monkeypatch)
+    model = _MixinModel()
+    model.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 0)
+
+    for i, block in enumerate(list(model.blocks)):
+        model.blocks[i] = _LoRAWrap(block)
+
+    from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+        refresh_layerwise_targets,
+    )
+
+    refresh_layerwise_targets(model)
+    live_names = {n for n, _ in model.named_parameters() if n.endswith(".weight")}
+    assert any("base_layer.weight" in n for n in live_names)
+
+    managed = model._managed_layer_parameter_names()
+    assert live_names <= managed
+
+    model.park_non_layer_weights()
+    parked = set(model._parked_non_layer_weights)
+    assert not (parked & live_names), parked
+
+
+def test_iter_materialized_weights_skips_wrapped_placeholders(monkeypatch):
+    from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+        iter_materialized_weights,
+        refresh_layerwise_targets,
+    )
+
+    model = _configure_mixin_model(monkeypatch)
+    before = dict(iter_materialized_weights(model))
+    assert "blocks.0.weight" in before
+    assert before["blocks.0.weight"].numel() > 1
+
+    for i, block in enumerate(list(model.blocks)):
+        model.blocks[i] = _LoRAWrap(block)
+    refresh_layerwise_targets(model)
+
+    after = dict(iter_materialized_weights(model))
+    assert "blocks.0.weight" in after
+    assert after["blocks.0.weight"].numel() > 1
+    assert "blocks.0.base_layer.weight" not in after
+
+
+def test_write_dense_weight_keeps_manager_parameter(monkeypatch):
+    from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+        write_dense_weight,
+    )
+
+    model = _configure_mixin_model(monkeypatch)
+    layer = model.blocks[0]
+    manager = model.layerwise_offload_managers[0]
+    original = manager.get_target_with_name("blocks.0.weight")
+    layer._offload_root = model
+    layer._offload_param_prefix = "blocks.0"
+
+    merged = torch.arange(9, dtype=torch.float32).reshape(3, 3) + 7
+    with torch.no_grad():
+        write_dense_weight(layer, merged)
+
+    assert manager.get_target_with_name("blocks.0.weight") is original
+    got = manager.get_cpu_weight("blocks.0.weight")
+    assert got is not None
+    torch.testing.assert_close(got, merged)
+
+
+def test_finish_offload_writeback_is_noop_when_idle():
+    from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+        finish_offload_writeback,
+    )
+
+    finish_offload_writeback()

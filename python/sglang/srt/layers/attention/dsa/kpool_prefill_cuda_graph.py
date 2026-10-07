@@ -37,11 +37,21 @@ def _kpool_indexer_prefill_with_output(
     )
     if not return_indices:
         return
-    if result is None or result.shape != (n, output.shape[1]):
-        raise ValueError("Pooled-indexer prefill returned an unexpected top-k shape")
+    num_logical = sum(forward_batch.extend_seq_lens_cpu)
+    if (
+        result is None
+        or result.ndim != 2
+        or not num_logical <= result.shape[0] <= n
+        or result.shape[1] != output.shape[1]
+    ):
+        raise ValueError(
+            "Pooled-indexer prefill returned an unexpected top-k shape: got "
+            f"{None if result is None else tuple(result.shape)}, expected "
+            f"between {num_logical} and {n} rows of width {output.shape[1]}"
+        )
     # The following captured attention segment reads this stable padded buffer.
-    output[:n].copy_(result)
-    output[n:].fill_(-1)
+    output[:num_logical].copy_(result[:num_logical])
+    output[num_logical:].fill_(-1)
 
 
 def _kpool_indexer_prefill_capture_stub(

@@ -49,6 +49,7 @@ class ToleranceConfig:
     load_peak_vram: float = 0.01
     runtime_peak_vram: float = 0.02
     host_anon: float = 0.02
+    load: float | None = None
 
     @classmethod
     def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
@@ -102,6 +103,7 @@ class ToleranceConfig:
                 )
             ),
             host_anon=float(tol_data.get("host_anon", 0.02)),
+            load=float(tol_data["load"]) if "load" in tol_data else None,
         )
 
 
@@ -359,6 +361,27 @@ class DiffusionTestCase:
         ):
             raise ValueError(f"{self.id}: request warmup requires non-realtime metrics")
 
+        # A consistency golden records one path, and these were recorded on the
+        # reference one, so the case asks for it by name instead of inheriting
+        # whichever level is the server default. Without this the check would
+        # answer two questions at once -- "did the code regress" and "how far
+        # is the default level from the goldens" -- and spend its whole budget
+        # on the second: the default's own drift already sits at SSIM 0.91
+        # against goldens whose threshold is 0.92. A case that names a level
+        # keeps it; refreshing the goldens onto the default level is what
+        # removes the pin.
+        # Replaces rather than mutates: several cases share one module-level
+        # sampling-params instance.
+        if self.run_consistency_check and "quality" not in self.sampling_params.extras:
+            object.__setattr__(
+                self,
+                "sampling_params",
+                replace(
+                    self.sampling_params,
+                    extras={**self.sampling_params.extras, "quality": "exact"},
+                ),
+            )
+
         has_startup_lora = self.server_args.lora_path is not None
         has_dynamic_lora = self.server_args.dynamic_lora_path is not None
         has_second_lora = self.server_args.second_lora_path is not None
@@ -447,6 +470,28 @@ PI05_ACTION_CI_sampling_params = DiffusionSamplingParams(
         "enable_cuda_graph": True,
         "action_max_abs_diff_threshold": 0.05,
         "action_mean_abs_diff_threshold": 0.005,
+    },
+)
+
+
+# DROID policy: three fixed-name 360x640 cameras, 8-dim state and actions,
+# the package recipe (4 steps, CFG on video). Noise comes from the seed.
+FLUX3_ACTION_CI_sampling_params = DiffusionSamplingParams(
+    prompt="put the marker in the cup",
+    extras={
+        "action_horizon": 32,
+        "action_dim": 8,
+        "state_dim": 8,
+        "image_height": 360,
+        "image_width": 640,
+        "camera_order": ("wrist", "left", "right"),
+        "num_inference_steps": 4,
+        "seed": 0,
+        "enable_prefix_cache": False,
+        # Same path is bit-exact across runs and GPUs. Kernel swaps move actions
+        # by up to max 0.064 / mean 0.020 (eager QK-norm+RoPE in every block).
+        "action_max_abs_diff_threshold": 0.2,
+        "action_mean_abs_diff_threshold": 0.05,
     },
 )
 

@@ -2,6 +2,8 @@ import inspect
 import re
 from typing import Dict, List, Optional, Tuple, Type
 
+from transformers import PreTrainedTokenizerBase
+
 from sglang.srt.entrypoints.openai.encoding_dsv4 import dsml_token as dsv4_dsml_token
 from sglang.srt.entrypoints.openai.encoding_dsv4 import eos_token as dsv4_eos_token
 from sglang.srt.entrypoints.openai.encoding_dsv4 import (
@@ -43,6 +45,7 @@ from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_THINKING,
     END_MESSAGE,
     INKLING_CONTROL_TOKENS,
+    INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
 
@@ -110,6 +113,9 @@ class BaseReasoningFormatDetector:
             self._in_reasoning = True
         if self.think_end_token in self.previous_content:
             self._in_reasoning = False
+
+    def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
+        return tokenizer.encode(self.think_end_token, add_special_tokens=False)
 
     def _maybe_apply_force_nonempty_content(
         self, ret: StreamingParseResult
@@ -388,6 +394,38 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             force_nonempty_content=force_nonempty_content,
         )
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
+
+
+class IQuestQ1ReasoningDetector(BaseReasoningFormatDetector):
+    @staticmethod
+    def thinking_enabled(chat_kwargs):
+        thinking = chat_kwargs.get("thinking")
+        enable_thinking = chat_kwargs.get("enable_thinking")
+        return (
+            True
+            if thinking is None and enable_thinking is None
+            else bool(thinking or enable_thinking)
+        )
+
+    def __init__(
+        self,
+        stream_reasoning=True,
+        force_reasoning=True,
+        continue_final_message=False,
+        previous_content="",
+        force_nonempty_content=False,
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+            thinks_internally=True,
+            reasoning_default="enable_thinking",
+        )
 
 
 class Qwen3Detector(BaseReasoningFormatDetector):
@@ -1333,6 +1371,11 @@ class InklingDetector(BaseReasoningFormatDetector):
         self._pending_header = ""
         self._pending_reasoning = ""
 
+    def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
+        del tokenizer
+        # Native framing IDs differ from encoding their printed names as plain text.
+        return [INKLING_SPECIAL_TOKEN_IDS[self.think_end_token]]
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         self._buffer = ""
         self._kind = None
@@ -2244,6 +2287,7 @@ class ReasoningParser:
         "gemma4": Gemma4Detector,
         "gigachat35": DeepSeekR1Detector,
         "inkling": InklingDetector,
+        "iquest_q1": IQuestQ1ReasoningDetector,
         "cohere_command4": CohereCommand4Detector,
     }
 
@@ -2264,6 +2308,13 @@ class ReasoningParser:
             raise ValueError(f"Unsupported model type: {model_type}")
 
         chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+
+        if model_type.lower() == "iquest_q1" and (
+            request is not None or force_reasoning is None
+        ):
+            force_reasoning = IQuestQ1ReasoningDetector.thinking_enabled(
+                chat_template_kwargs
+            )
 
         # Special cases where we override force_reasoning
         if model_type.lower() in {
