@@ -354,13 +354,16 @@ def sgl_build_tree_kernel_triton(
     )
 
 
-def _get_spec_sampling_verify_fn(use_rejection_sampling: bool):
+def _get_spec_sampling_verify_fn(
+    use_rejection_sampling: bool,
+    use_block_verification: bool = False,
+):
     if use_rejection_sampling:
         from sglang.kernels.ops.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
         )
 
-        if get_spec().speculative_use_block_verification:
+        if use_block_verification:
             return partial(chain_speculative_sampling_triton, block_verification=True)
         return chain_speculative_sampling_triton
     if _is_hip:
@@ -915,7 +918,10 @@ def eagle_sample(
             tp_group.broadcast(accept_index, src=0)
             tp_group.broadcast(num_correct_drafts, src=0)
     else:
-        sampling_fn = _get_spec_sampling_verify_fn(use_rejection_sampling)
+        sampling_fn = _get_spec_sampling_verify_fn(
+            use_rejection_sampling,
+            get_spec().speculative_use_block_verification,
+        )
 
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0

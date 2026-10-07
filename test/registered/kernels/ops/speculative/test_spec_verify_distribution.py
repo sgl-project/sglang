@@ -138,16 +138,16 @@ class TestSpecVerifyDistribution(CustomTestCase):
             predicts, accept_index, accept_token_num = _empty_outputs(self.device)
 
             if verifier == "greedy":
-                from sgl_kernel import verify_tree_greedy
+                from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 
-                verify_tree_greedy(
+                verify_tree_greedy_func(
                     predicts=predicts,
                     accept_index=accept_index,
                     accept_token_num=accept_token_num,
                     candidates=candidates.long(),
-                    retrive_index=retrive_index.long(),
-                    retrive_next_token=retrive_next_token.long(),
-                    retrive_next_sibling=retrive_next_sibling.long(),
+                    retrieve_index=retrive_index.long(),
+                    retrieve_next_token=retrive_next_token.long(),
+                    retrieve_next_sibling=retrive_next_sibling.long(),
                     target_predict=target_probs.argmax(dim=-1),
                 )
             else:
