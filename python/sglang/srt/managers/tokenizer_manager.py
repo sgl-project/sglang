@@ -108,7 +108,7 @@ from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.output_store import (
     OUTPUT_STORE_REF_KEY,
-    OutputStore,
+    OutputStoreWriter,
     TokenReplayStash,
     maybe_create_output_store,
 )
@@ -474,7 +474,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     _server_stop_hook: Optional[Callable[[], None]] = None
     _engine_state_changed_callback: Optional[Callable[[], None]] = None
     # Set by maybe_init_output_store; None without --output-store-backend.
-    output_store: Optional[OutputStore] = None
+    output_store: Optional[OutputStoreWriter] = None
 
     def set_server_stop_hook(self, hook: Callable[[], None]) -> None:
         self._server_stop_hook = hook

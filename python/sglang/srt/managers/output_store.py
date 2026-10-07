@@ -72,15 +72,14 @@ class OutputStoreConfig(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class OutputStoreStash(Protocol):
-    """The outputs of one response that OutputStore writes as one bundle."""
+    """The outputs of one response that an OutputStoreWriter stores together."""
 
     def is_empty(self) -> bool:
         """Nothing to write; checked on the event loop before the put."""
         ...
 
     def to_bundle_fields(self) -> Dict[str, torch.Tensor]:
-        """One CPU tensor per bundle field, any dtype; runs on a store worker thread,
-        so it may copy."""
+        """One tensor per field, any dtype; runs on a writer thread, so it may copy."""
         ...
 
 
@@ -134,17 +133,37 @@ class TokenReplayStash(msgspec.Struct):
         return fields
 
 
-class OutputStore:
-    """Writes one bundle per response from the tokenizer process.
+class OutputStoreWriter(Protocol):
+    """Stores one response's stash and resolves to its ``output_store_ref``.
 
-    The bundle stages every field through host memory, so stashes hold CPU tensors.
-    GPU-resident, batch-granular outputs, such as SpecForge's hidden-state capture,
-    need a second writer instead: on the attention-TP rank 0 scheduler, one
-    ``batch_put_from`` per scheduler batch from registered device memory, holding
-    the batch's responses until the put lands. That writer should keep
-    ``submit_put``/``cleanup_after`` and the ``{"handle", "fields"}`` ref so readers
-    parse one ref format; extract that pair into a Protocol when it is added.
+    The ref is ``{"handle": ..., "fields": {name: {"dtype", "shape"}}}``: ``handle``
+    is the writer's JSON-safe locator, and ``fields`` gives each tensor's dtype
+    without the ``torch.`` prefix (``int32``, ``bfloat16``) and its shape, so readers
+    parse one format whatever wrote it. The reader removes the object after reading
+    it; ``cleanup_after`` covers a ref that is never delivered.
+
+    ``MooncakeBundleWriter`` serves ``--output-store-backend mooncake`` from the
+    tokenizer process. GPU-resident outputs, such as SpecForge's hidden-state
+    capture, need another writer on the attention-TP rank 0 scheduler: it may
+    coalesce a scheduler batch's stashes into one ``batch_put_from`` from registered
+    device memory, as long as each future resolves to its own stash's ref, and the
+    scheduler holds those responses until their futures resolve.
     """
+
+    def submit_put(
+        self, stash: OutputStoreStash
+    ) -> concurrent.futures.Future[Dict[str, Any]]:
+        """Store the stash off the caller's thread; resolves to its output_store_ref."""
+        ...
+
+    def cleanup_after(self, future: concurrent.futures.Future[Dict[str, Any]]) -> None:
+        """Remove the stored object once a put whose ref is never delivered succeeds."""
+        ...
+
+
+class MooncakeBundleWriter:
+    """Writes each stash as one hard-pinned Mooncake bundle; staged through host
+    memory, so stashes must hold CPU tensors."""
 
     def __init__(self, config: OutputStoreConfig) -> None:
         import mooncake.structured_object_store as structured_object_store
@@ -241,14 +260,14 @@ class OutputStore:
 
 def maybe_create_output_store(
     *, backend: str, extra_config: Optional[str], disaggregation_mode: str
-) -> Optional[OutputStore]:
+) -> Optional[OutputStoreWriter]:
     if backend == "none":
         return None
     if disaggregation_mode != "null":
         raise ValueError(
             "--output-store-backend is not supported with PD disaggregation yet"
         )
-    return OutputStore(OutputStoreConfig.from_extra_config(extra_config))
+    return MooncakeBundleWriter(OutputStoreConfig.from_extra_config(extra_config))
 
 
 def _parse_size(value: Any) -> int:

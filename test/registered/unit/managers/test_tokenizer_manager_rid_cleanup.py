@@ -15,7 +15,6 @@ Covers:
 
 import asyncio
 import concurrent.futures
-import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -412,7 +411,7 @@ class TestAbortOutputPayload(CustomTestCase):
 
 
 class _FakeOutputStore:
-    """OutputStore boundary: records what would be written to or removed from Mooncake."""
+    """OutputStoreWriter boundary: records what would be written or removed."""
 
     def __init__(self):
         self.future = concurrent.futures.Future()

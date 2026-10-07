@@ -23,7 +23,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager  # noqa: E402
 from sglang.srt.managers.io_struct import BatchTokenIDOutput  # noqa: E402
 from sglang.srt.managers.output_store import (  # noqa: E402
-    OutputStore,
+    MooncakeBundleWriter,
     OutputStoreConfig,
     TokenReplayStash,
     maybe_create_output_store,
@@ -155,7 +155,7 @@ def _fake_mooncake(setup_error=0):
     }
 
 
-class TestOutputStore(CustomTestCase):
+class TestMooncakeBundleWriter(CustomTestCase):
     def _store(self, setup_error=0, **overrides):
         modules = _fake_mooncake(setup_error)
         config = msgspec.convert(
@@ -170,7 +170,7 @@ class TestOutputStore(CustomTestCase):
             type=OutputStoreConfig,
         )
         with patch.dict(sys.modules, modules):
-            store = OutputStore(config)
+            store = MooncakeBundleWriter(config)
         self.addCleanup(store._executor.shutdown, wait=True)
         return store, modules["mooncake.store"].setup_configs
 
