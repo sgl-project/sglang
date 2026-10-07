@@ -26,7 +26,6 @@ import torch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
-    kv_indices_num_token_blocks,
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
@@ -46,6 +45,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.speculative.eagle_info import spec_kv_index_token_blocks
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -65,11 +65,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
-
-# Token-block parallel KV-index building pays only on long-context servers;
-# below this the draft decode path keeps the historical one-program-per-step grid.
-_KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
-
 
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
@@ -2396,12 +2391,22 @@ class FlashInferMultiStepDraftBackend:
             seq_lens_sum=seq_lens_sum,
         )
 
-        num_token_blocks = (
-            kv_indices_num_token_blocks(
-                self.pool_len, self.speculative_num_steps * num_seqs * self.topk
-            )
-            if self.max_context_len >= _KV_INDEX_BLOCKS_MIN_CONTEXT
-            else 1
+        # Token blocks from the batch's mean live length (seq_lens_sum is a
+        # host int here), capped by the draft window when one is set: the
+        # table width would fan a few short requests out into idle programs.
+        # This launch runs outside the captured draft graph, so the grid may
+        # change from step to step; any block count is correct (the kernel
+        # strides its blocks over the row), it only changes the parallelism.
+        num_token_blocks = spec_kv_index_token_blocks(
+            table_width=self.max_context_len,
+            kv_lens_sum=seq_lens_sum,
+            batch_size=num_seqs,
+            base_programs=self.speculative_num_steps * num_seqs * self.topk,
+            length_cap=(
+                self.draft_window_size + self.draft_sink_size
+                if self.draft_window_size > 0
+                else None
+            ),
         )
         self.generate_draft_decode_kv_indices[
             (self.speculative_num_steps * num_token_blocks, num_seqs, self.topk)
