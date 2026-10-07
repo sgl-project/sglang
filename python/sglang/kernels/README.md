@@ -33,9 +33,10 @@ Place model-specific implementations and tuning data inside the corresponding
 logical operator group, rather than creating a model-specific top-level group
 under `ops/`.
 
-`lora` is its own group because it has a distinct responsibility: the adapter
-kernels that only the LoRA runtime in `srt/lora` calls (`dense/` SGMV GEMMs and
-their tuning data, `moe/` fused MoE-LoRA). It also keeps the experimental
+`lora` owns adapter kernels called by `srt/lora`: `common/` holds shared
+route primitives and routed A/B GEMMs, `dense/` holds the legacy dense backends'
+SGMV GEMMs and the embedding kernels, and `moe/` holds MoE stages and CuTeDSL implementations. Plans, provider binding
+and workspace ownership stay in `srt/lora`. The group also keeps the experimental
 TRT-LLM LoRA path whole as `dense/trtllm_lora_temp/` and
 `moe/trtllm_lora_temp/`; the latter includes the FlashInfer overlay and the
 flag-gated routing kernels that `srt/layers/moe/topk.py` reaches.

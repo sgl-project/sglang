@@ -2337,7 +2337,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and is_cuda():
+        self._lora_marlin = moe_runner_backend.is_lora_marlin()
+        if moe_runner_backend.is_lora() and not self._lora_marlin:
+            raise ValueError(
+                "NVFP4 MoE LoRA requires --moe-runner-backend lora_marlin."
+            )
+        if (moe_runner_backend.is_auto() or moe_runner_backend.is_lora()) and is_cuda():
             capability = get_device_capability()
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
@@ -2421,6 +2426,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        if self._lora_marlin and not layer.moe_runner_config.is_gated:
+            raise ValueError(
+                "NVFP4 MoE LoRA requires gated experts with two W13 slices."
+            )
         # TODO(ch-wan): check if this is needed
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.params_dtype = params_dtype
@@ -2655,6 +2664,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
+        if moe_runner_backend.is_lora_marlin():
+            moe_runner_backend = MoeRunnerBackend.MARLIN
         use_nvfp4_dispatch = _use_nvfp4_dispatch()
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
@@ -3033,6 +3044,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if get_moe_a2a_backend().is_megamoe():
             # FusedMoE.forward is never reached under megamoe.
             self.runner = None
+            return
+
+        if moe_runner_backend.is_lora():
             return
 
         if moe_runner_backend.is_flashinfer_cutedsl():
