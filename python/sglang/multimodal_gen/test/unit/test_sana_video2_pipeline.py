@@ -1,6 +1,8 @@
+from contextlib import nullcontext
 from itertools import pairwise
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.sana_video2 import (
@@ -8,6 +10,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.sana_video2 import (
 )
 from sglang.multimodal_gen.configs.sample.sana_video2 import SanaVideo2SamplingParams
 from sglang.multimodal_gen.registry import get_model_info
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
+    sana_video2,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_video2 import (
     sample_flow_dpm,
     sample_ltx_euler,
@@ -76,6 +82,43 @@ def test_ti2v_euler_preserves_condition_and_uses_frame_timestep():
     assert all(time.shape == (1, 1, 3, 1, 1) for time in seen)
     assert all(torch.count_nonzero(time[:, :, 0]) == 0 for time in seen)
     assert all(torch.all(time[:, :, 1:] > 0) for time in seen)
+
+
+@pytest.mark.parametrize("conditioned", [False, True])
+@pytest.mark.parametrize("flow_shift, expected", [(None, 12.0), (3.0, 3.0)])
+def test_denoising_uses_request_flow_shift(
+    monkeypatch, conditioned, flow_shift, expected
+):
+    shifts = []
+
+    def sample(predict, latents, steps, shift, callback):
+        shifts.append(shift)
+        return latents
+
+    monkeypatch.setattr(
+        sana_video2, "sample_ltx_euler" if conditioned else "sample_flow_dpm", sample
+    )
+    stage = object.__new__(sana_video2.SanaVideo2DenoisingStage)
+    stage.transformer = None
+    stage.begin_declared_component_use = lambda **_: None
+    stage.progress_bar = lambda **_: nullcontext()
+    batch = SimpleNamespace(
+        do_classifier_free_guidance=False,
+        prompt_embeds=[torch.zeros(1, 300, 4)],
+        prompt_attention_mask=[torch.ones(1, 300)],
+        condition_image=object() if conditioned else None,
+        latents=torch.zeros(1, 2, 3, 1, 1),
+        num_inference_steps=2,
+        is_warmup=False,
+        flow_shift=flow_shift,
+    )
+    stage.forward(batch, SimpleNamespace(pipeline_config=SanaVideo2PipelineConfig()))
+    assert shifts == [expected]
+
+
+def test_denoising_stage_role():
+    stage = object.__new__(sana_video2.SanaVideo2DenoisingStage)
+    assert stage.role_affinity is RoleType.DENOISER
 
 
 def test_vae_statistics_are_inverted_for_decode():

@@ -8,6 +8,7 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -213,6 +214,10 @@ class SanaVideo2DenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
 
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DENOISER
+
     def component_uses(self, server_args, stage_name=None):
         return [ComponentUse(self._component_stage_name(stage_name), "transformer")]
 
@@ -259,12 +264,17 @@ class SanaVideo2DenoisingStage(PipelineStage):
             else batch.num_inference_steps
         )
         sampler = sample_ltx_euler if is_ti2v else sample_flow_dpm
+        flow_shift = (
+            batch.flow_shift
+            if batch.flow_shift is not None
+            else server_args.pipeline_config.flow_shift
+        )
         with self.progress_bar(total=steps, batch=batch) as progress:
             batch.latents = sampler(
                 predict,
                 batch.latents,
                 steps,
-                server_args.pipeline_config.flow_shift,
+                flow_shift,
                 callback=lambda *_: progress.update(),
             )
         return batch
