@@ -80,7 +80,7 @@ def torch_build_configuration(
     environment["LIBTORCH_LIB"] = os.fspath(torch_root)
     environment["LIBTORCH_CXX11_ABI"] = "1" if cxx11_abi else "0"
     # tch 0.24 targets Torch 2.11. The compatibility header below covers the
-    # API removals in the supported 2.12 through 2.14 builds, after this gate.
+    # API removals in the supported 2.12-2.14 builds, after this explicit gate.
     environment["LIBTORCH_BYPASS_VERSION_CHECK"] = "1"
     environment["PYO3_PYTHON"] = sys.executable
     environment["PATH"] = os.pathsep.join(
@@ -90,13 +90,16 @@ def torch_build_configuration(
         filter(None, (os.fspath(torch_lib), environment.get("LD_LIBRARY_PATH")))
     )
 
-    cxxflags = environment.get("CXXFLAGS", "")
-    # PT 2.14's TensorBase.h uses C++20 `requires` clauses; appended -std=c++20
-    # overrides the -std=c++17 that tch 0.24's cc-rs pins.
-    std_flag = "-std=c++20" if major_minor >= (2, 14) else ""
-    environment["CXXFLAGS"] = (
-        f"{cxxflags} -include {shlex.quote(os.fspath(compat_header.resolve()))} {std_flag}"
-    ).strip()
+    # cc-rs splits *FLAGS on whitespace unless told they are shell words,
+    # which the quoted header path below needs to survive a space.
+    environment["CC_SHELL_ESCAPED_FLAGS"] = "1"
+    cxxflags = [environment.get("CXXFLAGS", "")]
+    # torch-sys 0.24 hardcodes -std=c++17, but libtorch declares C++20 from 2.12 on;
+    # cc-rs appends CXXFLAGS after a build script's own flags, so this one wins.
+    if major_minor >= (2, 12):
+        cxxflags.append("-std=c++20")
+    cxxflags.append(f"-include {shlex.quote(os.fspath(compat_header.resolve()))}")
+    environment["CXXFLAGS"] = " ".join(filter(None, cxxflags)).strip()
 
     package_depth = len(python_module.split(".")) - 1
     bundled_torch_lib = "$ORIGIN/" + "../" * package_depth + "torch/lib"
@@ -106,14 +109,6 @@ def torch_build_configuration(
         rpath_flags.append(f"-C link-arg=-Wl,-rpath,{torch_lib}")
     environment["RUSTFLAGS"] = " ".join(filter(None, (rustflags, *rpath_flags)))
 
-    # Hash the entry compat header plus any siblings it chain-includes
-    # (torch_2_14_compat.h today) so edits to either invalidate the build cache.
-    compat_sources = sorted(compat_header.parent.glob("torch_*_compat.h"))
-    compat_headers_sha256 = {
-        p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-        for p in compat_sources
-        if p.is_file()
-    }
     fingerprint = {
         "torch_version": version,
         "torch_root": os.fspath(torch_root),
@@ -121,6 +116,10 @@ def torch_build_configuration(
         "torch_cuda": getattr(torch_module.version, "cuda", None),
         "torch_hip": getattr(torch_module.version, "hip", None),
         "include_absolute_rpath": include_absolute_rpath,
-        "compat_headers_sha256": compat_headers_sha256,
+        "compat_header_sha256": (
+            hashlib.sha256(compat_header.read_bytes()).hexdigest()
+            if compat_header.is_file()
+            else None
+        ),
     }
     return TorchBuildConfiguration(environment=environment, fingerprint=fingerprint)

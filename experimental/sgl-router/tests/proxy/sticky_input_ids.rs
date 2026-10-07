@@ -58,7 +58,10 @@ fn config() -> Config {
             tokenizer: Default::default(),
             policy: PolicyKind::Sticky,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
+            reorg_buckets: None,
+            reorg_admission: Default::default(),
             circuit_breaker: None,
             cache_aware: None,
             // Push eviction far out so the background sweeper never fires
@@ -101,7 +104,7 @@ fn build_ctx(worker_urls: &[String]) -> Arc<AppContext> {
             url: url.clone(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId(MODEL.into())],
-            bootstrap_port: None,
+            ..Default::default()
         });
     }
     // Sticky needs no cache-aware deps, so the defaults registry is fine — the
