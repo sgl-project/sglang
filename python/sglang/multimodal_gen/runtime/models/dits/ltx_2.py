@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_fused_rmsnorm_scale_shift,
+    can_use_fused_rmsnorm_modulation,
     can_use_linear_gelu,
     can_use_ltx2_qknorm_split_rope_cuda,
     can_use_modulate_scale_shift_cuda,
@@ -204,14 +204,12 @@ def _ltx2_rms_norm_modulate(
 
     Folds the weightless RMSNorm and the modulate into one kernel when the
     request-gated fusion is mounted on ``block`` and the per-call guard
-    passes; otherwise the verbatim eager reference chain (the ``lossless``
+    passes; otherwise the verbatim eager reference chain (the ``exact``
     default). The fused kernel is not bit-exact (<=1 bf16 ULP) so it is gated
     on the request-scoped mount rather than a runtime self-check.
     """
-    if (
-        ltx2_rms_norm_modulate_active(block)
-        and x.is_cuda
-        and can_use_fused_rmsnorm_scale_shift(x.dtype, x.shape[-1])
+    if ltx2_rms_norm_modulate_active(block) and can_use_fused_rmsnorm_modulation(
+        x, scale, shift
     ):
         return fused_ltx2_rms_norm_modulate(x, scale, shift, eps)
     normed = rms_norm(x, eps)

@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    TreeLock,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.evict_policy import TLRUStrategy
@@ -4938,7 +4939,7 @@ def test_recover_with_locked_full_applies_through_the_python_allocator():
     # The decode advanced past the window: the SWA lock releases early, then
     # window eviction tombstones the SWA slot under the FULL lock (the state a
     # locked-full overlap recovers from); its frees return to the allocator.
-    cache.dec_swa_lock_only(node, lock.to_dec_params())
+    cache.release_swa(TreeLock(node, lock.to_dec_params()))
     tracker = {ComponentType.FULL: 0, ComponentType.SWA: 0}
     device_frees: dict = {}
     host_frees: dict = {}
