@@ -429,16 +429,16 @@ class _GenerationStreamAccumulator:
                     req.sampling_params.stream_interval or self.default_stream_interval
                 )
 
-                # Send the first token at once, then whenever at least
-                # stream_interval tokens are unsent. A step can append several
+                # Send every step at the default interval of 1. Otherwise send
+                # the first token at once, then whenever at least
+                # stream_interval tokens are unsent: a step can append several
                 # tokens (speculative decoding, dLLM), so it can pass a multiple
                 # of the interval without landing on it.
                 num_unsent = len(req.output_ids) - req.send_token_offset
                 should_output = (
-                    num_unsent >= stream_interval
+                    stream_interval == 1
+                    or num_unsent >= stream_interval
                     or (req.send_token_offset == 0 and num_unsent > 0)
-                    if stream_interval > 1
-                    else len(req.output_ids) % stream_interval == 0
                 )
 
                 if should_output:
