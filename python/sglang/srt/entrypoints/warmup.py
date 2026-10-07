@@ -488,6 +488,49 @@ def _serving_coverage_phases(
 
     phases.append(("sampling", _per_rank(_sampling)))
 
+    async def _decode_batch_limits():
+        """Running-request limit of each DP rank, as ``{rank: limit}``.
+
+        Read from each scheduler's internal state; when that does not report
+        one limit per rank, every rank uses the smallest reported limit, or
+        the configured ``max_running_requests`` if none is reported.
+        """
+        key = "effective_max_running_requests_per_dp"
+        states = await tokenizer_manager.get_internal_state()
+        reported = [state.get(key) for state in states]
+        if len(reported) == len(ranks) and all(reported):
+            return {rank: int(n) for rank, n in zip(ranks, reported)}
+        known = [int(n) for n in reported if n]
+        limit = min(known) if known else int(schedule.max_running_requests or 0)
+        return {rank: limit or max_running for rank in ranks}
+
+    async def _decode_batches():
+        # Concurrent decodes at every power-of-two batch size up to the
+        # rank's running-request limit, plus the limit itself, alternating
+        # greedy and sampled requests. Kernels launched outside the CUDA
+        # graphs (allocation, speculative verify, sampling) are specialized
+        # on the batch size and otherwise load at the first batch of that
+        # size while serving. Not capped at the cohort size: a rank runs at
+        # most ceil(log2(limit)) + 1 waves and fewer than 3 * limit requests.
+        limits = await _decode_batch_limits()
+
+        def _decode_request(rank, i):
+            req = _request(
+                rank, input_ids=_ids(np.random.randint(16, 257)), max_new_tokens=16
+            )
+            req.sampling_params["temperature"] = 0.0 if i % 2 == 0 else 1.0
+            return req
+
+        async def body(rank):
+            limit = max(1, limits[rank])
+            sizes = sorted({min(1 << i, limit) for i in range(limit.bit_length() + 1)})
+            for bs in sizes:
+                await _gather(_decode_request(rank, i) for i in range(bs))
+
+        await _per_rank(body)()
+
+    phases.append(("decode-batches", _decode_batches))
+
     mm_tokens = getattr(
         getattr(tokenizer_manager, "mm_processor", None), "mm_tokens", None
     )
@@ -545,6 +588,8 @@ async def serving_coverage(
       in ways random token ids never do),
     * non-greedy sampling variants (the sampling kernels are otherwise built
       on the first sampled request); a variant the server rejects is skipped,
+    * concurrent decodes at every power-of-two batch size up to each DP
+      rank's running-request limit, half greedy and half sampled,
     * one image request when the model is multimodal.
 
     Prompt and decode lengths are clamped to the engine's input limit; phases
