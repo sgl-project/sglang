@@ -80,39 +80,40 @@ python -m sglang.launch_server \
 
 * **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
-#### Optional B300 throughput tuning for the 4B model
+#### B300 BF16 mixed chunking for the 4B model
 
-For text-only traffic on one NVIDIA B300 (TP1), you can opt in to TRTLLM attention
-with an FP8 E4M3 KV cache and 16384-token prefill chunks. Model weights remain
-BF16, but the attention backend also converts queries to FP8. This recipe is
-separate from the default deployment selector because it changes attention
-precision. Validate accuracy on your own workload before adopting it; image and
-video accuracy were not evaluated in this experiment.
+For text-only traffic on one NVIDIA B300 (TP1), you can enable mixed chunking
+with TRTLLM attention to reduce median time to first token (TTFT). Model weights,
+KV cache, and attention queries all remain BF16. The recipe uses page size 32,
+16384-token prefill chunks, and the default NHD KV-cache layout.
 
-The results below were measured with the BF16 GEMM tuning in
-[PR #42913](https://github.com/sgl-project/sglang/pull/42913), at SGLang source
-commit `cd4657fd5b`, using Torch `2.14.1+cu130`, FlashInfer `0.7.0.post1`, and
-Transformers `5.17.0` on Linux with CUDA 13.0. Use a source build containing that
-change to reproduce the small-batch results; they are not measurements of a
-published release.
+Use a source build containing the BF16 mixed-batch attention and fused QK
+normalization/mRoPE changes in
+[PR #42913](https://github.com/sgl-project/sglang/pull/42913).
+These measurements used those changes with Torch `2.14.1+cu130`, FlashInfer
+`0.7.0.post1`, and Transformers `5.17.0` on Linux with CUDA 13.0; they are not
+measurements of a published release. The pinned source and reproduction scripts
+are in the [experiment record](https://github.com/zcnrex/sglang/tree/f907431182d8097b1317d3029f006fb55b8e23df/benchmark/qwen3_vl).
 
-<Accordion title="Launch the optional B300 4B configuration">
+<Accordion title="Launch the B300 BF16 mixed-chunk configuration">
 
 ```bash Command
 CUDA_VISIBLE_DEVICES=0 sglang serve \
   --model-path Qwen/Qwen3-VL-4B-Instruct \
+  --dtype bfloat16 \
+  --kv-cache-dtype auto \
   --attention-backend trtllm_mha \
   --page-size 32 \
-  --kv-cache-dtype fp8_e4m3 \
   --chunked-prefill-size 16384 \
+  --enable-mixed-chunk \
+  --cuda-graph-backend-prefill disabled \
   --enforce-disable-flashinfer-allreduce-fusion \
   --host 127.0.0.1 \
   --port 30000
 ```
 
-Leave mixed chunking disabled for this throughput-oriented recipe. In the
-8192-input/1024-output workload, enabling it reduced throughput even though it
-improved time to first token (TTFT).
+With `--dtype bfloat16`, `--kv-cache-dtype auto` also selects BF16. To reproduce
+the comparison with mixed chunking disabled, remove only `--enable-mixed-chunk`.
 
 </Accordion>
 
@@ -121,34 +122,39 @@ improved time to first token (TTFT).
 The workload used text-only random prompts of exactly 8192 input tokens and
 1024 output tokens, with concurrency 1/4/8/16/32/64/128 and respectively
 30/40/80/80/160/320/640 measured requests. Each point used
-`max(64, concurrency)` warmup requests followed by a cache flush. Throughput
-below counts **output tokens only** on one GPU; TTFT and time per output token
-(TPOT) are medians.
+`max(64, concurrency)` warmup requests followed by a cache flush. Both sweeps
+used the same source build and configuration, changing only mixed chunking.
+Each completed all 1350 measured requests and the expected token counts.
+
+Throughput below counts **output tokens only** on one GPU. TTFT and time per
+output token (TPOT) are medians; “off” and “on” refer to mixed chunking.
 
 <table>
-  <thead><tr><th>Concurrency</th><th>Output tokens/s</th><th>TTFT (ms)</th><th>TPOT (ms)</th></tr></thead>
+  <thead><tr><th>Concurrency</th><th>Output tokens/s (off)</th><th>Output tokens/s (on)</th><th>TTFT ms (off)</th><th>TTFT ms (on)</th><th>TPOT ms (off)</th><th>TPOT ms (on)</th></tr></thead>
   <tbody>
-    <tr><td>1</td><td>378.19</td><td>71.09</td><td>2.57</td></tr>
-    <tr><td>4</td><td>1323.28</td><td>172.63</td><td>2.85</td></tr>
-    <tr><td>8</td><td>2193.91</td><td>352.90</td><td>3.30</td></tr>
-    <tr><td>16</td><td>3229.05</td><td>524.67</td><td>4.44</td></tr>
-    <tr><td>32</td><td>4216.96</td><td>997.65</td><td>6.60</td></tr>
-    <tr><td>64</td><td>5046.35</td><td>2011.10</td><td>10.72</td></tr>
-    <tr><td>128</td><td>5600.03</td><td>3821.71</td><td>19.12</td></tr>
+    <tr><td>1</td><td>383.49</td><td>383.81</td><td>75.08</td><td>75.50</td><td>2.54</td><td>2.53</td></tr>
+    <tr><td>4</td><td>1229.77</td><td>1234.49</td><td>187.29</td><td>158.94</td><td>3.06</td><td>3.08</td></tr>
+    <tr><td>8</td><td>1886.31</td><td>1888.61</td><td>384.52</td><td>262.65</td><td>3.87</td><td>3.96</td></tr>
+    <tr><td>16</td><td>2547.93</td><td>2558.44</td><td>566.15</td><td>383.80</td><td>5.72</td><td>5.87</td></tr>
+    <tr><td>32</td><td>3118.62</td><td>3136.65</td><td>1080.92</td><td>522.48</td><td>9.19</td><td>9.73</td></tr>
+    <tr><td>64</td><td>3488.07</td><td>3518.27</td><td>2158.99</td><td>543.47</td><td>16.24</td><td>17.60</td></tr>
+    <tr><td>128</td><td>3763.54</td><td>3801.87</td><td>4120.29</td><td>577.62</td><td>29.97</td><td>32.95</td></tr>
   </tbody>
 </table>
 
-This configuration prioritizes output throughput. Median TTFT increased from
-71.09 ms at concurrency 1 to 3821.71 ms at concurrency 128. Evaluate this
-throughput/latency tradeoff against your workload requirements.
+At concurrency 128, enabling mixed chunking reduced median TTFT from 4120 ms
+to 578 ms (86.0%) while output throughput changed from 3764 to 3802 tokens/s
+(+1.0%). Median TPOT increased from 29.97 to 32.95 ms (+10.0%). Use this recipe
+when faster first-token delivery matters, and evaluate the inter-token latency
+tradeoff for your traffic.
 
-Text GSM8K scored 1218/1314 (92.69%) versus 1215/1314 (92.47%) for the BF16
-reference. The evaluation used the first five dataset rows as few-shot examples,
-then all 1314 remaining rows, temperature 0, a 2048-token output limit, and
-concurrency 32. This single-run result does not establish equivalent accuracy on
-other workloads. The reference and candidate configurations, raw benchmark
-results, pinned benchmark client, and reproduction scripts are available in the
-[experiment record](https://github.com/zcnrex/sglang/tree/b13cd3464903c21ddf9a424e141c7def2f4d7295/benchmark/qwen3_vl).
+Text GSM8K scored 1216/1314 (92.54%) for the combined BF16 configuration and
+1215/1314 (92.47%) for the BF16 reference. The evaluation used the first five
+dataset rows as few-shot examples, then all 1314 remaining rows, temperature 0,
+a 2048-token output limit, and concurrency 32. This single-run check does not
+establish equivalent accuracy on other workloads. A one-image smoke test produced the same 32 generated tokens as the reference;
+broad image and video accuracy were not evaluated. The experiment record includes the raw results, pinned
+benchmark client, source hashes, and evaluation protocol.
 
 </Accordion>
 
