@@ -25,10 +25,15 @@ class ResponseToolAdapter:
         flat_tools, names = flatten_response_tools(request.tools)
         adapter = cls(flat_tools, request.tool_choice)
         flat_tools = adapter.flat_tools
-        choice = response_tool_choice(adapter.choice(), flat_tools, names)
+        adapted_choice = adapter.choice()
+        choice = response_tool_choice(adapted_choice, flat_tools, names)
         state = ResponseToolState(
             public_tools=request.tools,
-            public_choice=request.effective_tool_choice(),
+            public_choice=(
+                request.tool_choice
+                if adapted_choice != request.tool_choice
+                else request.effective_tool_choice()
+            ),
             names=names,
             custom_names={t["name"] for t in flat_tools if t["type"] == "custom"},
         )

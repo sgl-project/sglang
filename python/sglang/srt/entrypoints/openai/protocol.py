@@ -2038,10 +2038,6 @@ class ResponsesRequest(PDRoutingFields):
         tool_choice = self.tool_choice
         if not isinstance(tool_choice, dict):
             return tool_choice
-        if tool_choice == {"type": "shell"} and any(
-            tool.type == "shell" for tool in self.tools
-        ):
-            return tool_choice
         name = tool_choice.get("name") or (tool_choice.get("function") or {}).get(
             "name"
         )
