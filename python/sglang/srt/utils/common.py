@@ -101,13 +101,16 @@ from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    describe_kv_events_publisher,
     get_exec,
     get_flags,
     get_model,
     get_parallel,
     get_platform,
+    get_serving,
     get_spec,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
@@ -309,6 +312,11 @@ is_sm100_or_sm110_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version,
         device_capability_majors=[10, 11],
         cuda_version=(12, 8),
+    )
+)
+is_sm110_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version, device_capability_majors=[11], cuda_version=(12, 8)
     )
 )
 is_sm80_supported = lru_cache(maxsize=1)(
@@ -3669,6 +3677,41 @@ def _configure_uvicorn_access_log_filter(
             loggers_cfg["uvicorn.access"]["filters"] = filters_list
         if filter_name not in filters_list:
             filters_list.append(filter_name)
+
+
+def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Build server metadata shared by HTTP and native gRPC.
+
+    Callers add transport-specific fields and serialize the result.
+    """
+    result = server_args.resolved_dict()
+    result["launch_command"] = server_args.launch_command
+    result.update(scheduler_info)
+    result["kv_events"] = describe_kv_events_publisher(server_args)
+    return result
+
+
+def start_follower_grpc_server(server_args, scheduler_info: Dict[str, Any]):
+    """Expose GetServerInfo only, without constructing a TokenizerManager.
+
+    The snapshot is taken after scheduler readiness. This does not launch a
+    sidecar or enable inference/control RPCs.
+    """
+    serving = get_serving()
+    if serving.grpc_port is None or serving.smg_grpc_mode or serving.grpc_mode:
+        return None
+
+    from sglang.srt.rust_extensions import load_rust_extension
+
+    grpc_native = load_rust_extension("sglang.srt.rust_extensions._grpc")
+    return grpc_native.start_metadata_server(
+        host=serving.host,
+        port=serving.grpc_port,
+        server_info_json=json.dumps(
+            msgspec_to_builtins(build_server_info(server_args, scheduler_info)),
+            default=str,
+        ),
+    )
 
 
 def launch_dummy_health_check_server(host, port, enable_metrics):

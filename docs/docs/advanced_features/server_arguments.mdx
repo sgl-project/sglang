@@ -1649,6 +1649,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>none</code>, <code>deepep</code>, <code>mooncake</code>, <code>nixl</code>, <code>mori</code>, <code>ascend_fuseep</code>, <code>flashinfer</code>, <code>megamoe</code>, <code>pplx</code></td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-enable-w4a4-mxfp4-megamoe`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Whether the draft model's MXFP4 MegaMoE layers use the W4A4 `mxf4xmxf4` MMA type. Pass `--no-speculative-enable-w4a4-mxfp4-megamoe` to keep the draft on `fp8xfp4` (W4A8) while the target runs W4A4. Same as `--enable-w4a4-mxfp4-megamoe` if unset. A draft that runs MXFP4 MegaMoE with a different MMA type from the target may allocate an additional MegaMoE symmetric buffer after the KV pool is sized; lower `--mem-fraction-static` if CUDA-graph capture runs out of memory.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: bool</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-draft-model-quantization`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The quantization method for speculative model.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
