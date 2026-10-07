@@ -219,7 +219,10 @@ def run_case(case, settings, model, engine_url, defaults, sampling_defaults):
 
 def load_model(path):
     config = json.loads(Path(path, "config.json").read_text())
-    generation = json.loads(Path(path, "generation_config.json").read_text())
+    generation_file = Path(path, "generation_config.json")
+    generation = (
+        json.loads(generation_file.read_text()) if generation_file.exists() else {}
+    )
     keys = ("repetition_penalty", "temperature", "top_k", "top_p", "min_p")
     return SimpleNamespace(
         path=path,
