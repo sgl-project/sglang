@@ -107,6 +107,12 @@ class Memory(msgspec.Struct):
         Optional[float],
         "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0 in cache mode, 1.2 in buffer_only mode, or 0.2 for backup-only host-pool decode retraction.",
     ] = None
+    hicache_swa_ratio: A[
+        Optional[float],
+        "DeepSeek V4 only: host SWA pages per device SWA page. Overrides "
+        "--hicache-ratio for the SWA host pool only; requires an explicit "
+        "--hicache-ratio. Unset uses --hicache-ratio for both pools.",
+    ] = None
     hicache_size: A[
         int,
         "The size of host KV cache memory pool in gigabytes. Overrides --hicache-ratio in either host memory mode.",

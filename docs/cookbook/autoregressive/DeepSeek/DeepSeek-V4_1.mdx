@@ -198,6 +198,7 @@ PD and speculative decoding cannot be combined.
 HiCache extends RadixAttention with a hierarchy of KV cache tiers, significantly expanding effective context capacity for long-context and multi-turn scenarios.
 
 To enable HiCache, open the **HiCache** card in the [Playground above](#playground) and flip **Enable**: the Playground emits `--enable-hierarchical-cache` on top of the recipe's flags, and cold KV pages spill to CPU pinned memory (L2, GPU + CPU) instead of being dropped from the GPU pool. The host pool is sized by ratio (`--hicache-ratio 2`), not by a fixed `--hicache-size`.
+If SWA host windows are evicted while full KV remains on host, add `--hicache-swa-ratio` to increase only the SWA host pool (for example, `--hicache-ratio 2 --hicache-swa-ratio 4`). The extra host memory is allocated per rank; check startup allocation lines against available RAM.
 
 The Write policy knob controls the GPU → CPU write and defaults to `write_through` (the upstream default): every page is mirrored to the CPU tier as it is written. `write_through_selective` backs up only hot data and `write_back` defers the copy to eviction, trading cache freshness for host-side I/O.
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
@@ -93,6 +94,18 @@ def handle_hicache_ratio_default(server_args: Any):
     resolves --hicache-host-memory-fraction to None (auto-sizing off).
     """
     cfg = resolving_view(server_args)
+    if cfg.hicache_swa_ratio is not None:
+        if not math.isfinite(cfg.hicache_swa_ratio) or cfg.hicache_swa_ratio <= 0:
+            raise ValueError("--hicache-swa-ratio must be a positive finite number.")
+        if not cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "--hicache-swa-ratio requires --enable-hierarchical-cache."
+            )
+        if cfg.hicache_ratio is None:
+            raise ValueError(
+                "--hicache-swa-ratio requires an explicit --hicache-ratio "
+                "because automatic host-memory sizing uses one shared ratio."
+            )
     fraction = cfg.hicache_host_memory_fraction
     if fraction is not None and not 0 < fraction <= 1:
         raise ValueError("--hicache-host-memory-fraction must be in (0, 1].")

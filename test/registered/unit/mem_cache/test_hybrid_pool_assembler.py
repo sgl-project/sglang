@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     StackBuildResult,
     _check_declared_pools_present,
+    _deepseek_v4_num_host_pages,
     _DsaStrategy,
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
@@ -63,6 +64,63 @@ class TestDeepSeekV4SWAPageLayout(CustomTestCase):
             physical_page_size=256,
             consumer="test consumer",
         )
+
+    def test_independent_swa_host_ratio_does_not_grow_full_host_pool(self):
+        params = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(size_full=1024)
+        )
+        kvcache = SimpleNamespace(size=1024, swa_size=256)
+        for swa_ratio, expected_swa_pages in ((None, 4), (4.0, 8)):
+            with (
+                self.subTest(swa_ratio=swa_ratio),
+                patch.object(
+                    hybrid_pool_assembler,
+                    "get_memory",
+                    return_value=SimpleNamespace(
+                        hicache_size=0, hicache_ratio=2.0, hicache_swa_ratio=swa_ratio
+                    ),
+                ),
+            ):
+                self.assertEqual(
+                    _deepseek_v4_num_host_pages(
+                        params=params,
+                        kvcache=kvcache,
+                        page_size=256,
+                        swa_page_size=128,
+                    ),
+                    (8, expected_swa_pages, 8),
+                )
+
+        with (
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(
+                    hicache_size=0, hicache_ratio=2.0, hicache_swa_ratio=0.01
+                ),
+            ),
+            self.assertRaisesRegex(ValueError, "one SWA host page"),
+        ):
+            _deepseek_v4_num_host_pages(
+                params=params, kvcache=kvcache, page_size=256, swa_page_size=128
+            )
+
+    def test_swa_ratio_rejects_layout_without_host_swa_pool(self):
+        with (
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(hicache_swa_ratio=4.0),
+            ),
+            self.assertRaisesRegex(ValueError, "paged DeepSeek V4 SWA host pool"),
+        ):
+            hybrid_pool_assembler.build_deepseek_v4_hicache_stack(
+                params=SimpleNamespace(page_size=256),
+                kvcache=SimpleNamespace(_unified_kv=True, swa_kv_pool=None),
+                load_cache_event=None,
+                storage_backend=None,
+                layer_mappings=SimpleNamespace(transfer_layer_id_max=1, full={}),
+            )
 
 
 class _Pool:

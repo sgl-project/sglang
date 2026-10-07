@@ -767,6 +767,7 @@ python3 -m sglang.launch_server \
 ```
 
 DSv4 HiCache sizes the host tier with `--hicache-ratio` (host/device token ratio), not `--hicache-size`.
+For long-lived prefixes, the smaller SWA host pool may fill before the full-KV host pool. Set `--hicache-swa-ratio` alongside an explicit `--hicache-ratio` to grow only the SWA host pool; for example, `--hicache-ratio 2 --hicache-swa-ratio 4`. Check the startup host-pool allocation lines and available host RAM on every rank before increasing it.
 
 **DEP8 (DP Attention), concurrency 64–160:**
 ```bash Command
