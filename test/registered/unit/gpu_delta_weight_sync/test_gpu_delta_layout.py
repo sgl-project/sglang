@@ -357,8 +357,18 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             def aliases(a, b):
                 return False
 
-        with patch.dict(
-            models._MODEL_MAPPINGS, IndependentTestModel=IndependentMapping
+        with (
+            patch.dict(models._MODEL_MAPPINGS, IndependentTestModel=IndependentMapping),
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.runtime_context": SimpleNamespace(
+                        get_exec=lambda: self.fail(
+                            "dense mapping accessed MoE topology"
+                        )
+                    )
+                },
+            ),
         ):
             plan = layout.GpuDeltaLayout(
                 root, {"canonical.vector": {"dtype": "F32", "shape": [6]}}
@@ -618,10 +628,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         fake_model = SimpleNamespace(
             parameters=lambda: iter([SimpleNamespace(device=torch.device("cuda", 0))])
         )
-        runtime = SimpleNamespace(get_exec=lambda: SimpleNamespace(moe=object()))
         with (
-            patch.dict(sys.modules, {"sglang.srt.runtime_context": runtime}),
-            patch.object(layout, "_require_fixed_moe_topology"),
             patch.object(layout, "GpuDeltaLayout", return_value=fake_plan),
             patch("sglang.srt.weight_sync.gpu_delta.host.HostArena"),
             patch(
@@ -728,7 +735,31 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             "dtype": "F32",
             "shape": [],
         }
-        plan = layout.GpuDeltaLayout(root, inventory)
+        moe = SimpleNamespace(
+            enable_eplb=False,
+            elastic_ep_backend=None,
+            init_expert_location="trivial",
+            ep_num_redundant_experts=0,
+            moe_a2a_backend="none",
+            moe_runner_backend="flashinfer_cutedsl",
+        )
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.runtime_context": SimpleNamespace(
+                        get_exec=lambda: SimpleNamespace(moe=moe)
+                    )
+                },
+            ),
+            patch.object(
+                layout,
+                "_require_fixed_moe_topology",
+                wraps=layout._require_fixed_moe_topology,
+            ) as require_topology,
+        ):
+            plan = layout.GpuDeltaLayout(root, inventory)
+        require_topology.assert_called_once_with(moe)
         self.assertEqual(len(plan.excluded), 2)
         for binding in plan.bindings:
             relative = binding.name.removeprefix(prefix)

@@ -52,6 +52,10 @@ class GpuDeltaLayout:
             if binding is not None:
                 self.bindings.append(binding)
         self.bindings.sort(key=lambda b: _natural_key(b.name))
+        if mapping.parameters.moe_layers:
+            from sglang.srt.runtime_context import get_exec
+
+            _require_fixed_moe_topology(get_exec().moe)
         self.derived = []
         self._consumers = []
         for prefix, layer in mapping.parameters.moe_layers.items():
@@ -142,7 +146,6 @@ class GpuDeltaBackend:
     """Scheduler-owned plan; large decoded masks exist only during apply."""
 
     def __init__(self, model_runner, identity):
-        from sglang.srt.runtime_context import get_exec
         from sglang.srt.weight_sync.gpu_delta.checkpoint import (
             read_canonical_checkpoint_inventory,
         )
@@ -154,7 +157,6 @@ class GpuDeltaBackend:
         self.decode_stages = int(os.environ.get("GPU_DELTA_DECODE_STAGES", "2"))
         if self.decode_stages not in (2, 3, 4):
             raise ValueError("GPU_DELTA_DECODE_STAGES must be 2, 3 or 4")
-        _require_fixed_moe_topology(get_exec().moe)
         self.identity = dict(identity)
         self._canonical_plan_digest = None
         self.batch_plan = None

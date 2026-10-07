@@ -14,8 +14,8 @@ from safetensors import safe_open
 def read_canonical_checkpoint_inventory(model_runner):
     """Read source names, shapes and dtypes without materializing any tensors.
 
-    Only the standard local, serialized NVFP4 source contract is supported. Runtime
-    layout admission separately checks the physical buffers and model mappings.
+    The source inventory is independent of quantization. Runtime layout admission
+    checks the physical buffers and model mappings separately.
     """
     from sglang.srt.model_loader.loader import DefaultModelLoader, ModelOptModelLoader
     from sglang.srt.model_loader.weight_utils import (
@@ -44,9 +44,6 @@ def read_canonical_checkpoint_inventory(model_runner):
         raise ValueError("GPU delta does not support secondary or remapped sources")
     if config.decryption_key_file is not None:
         raise ValueError("GPU delta does not support encrypted checkpoint sources")
-    quant_config = model.quant_config
-    if not getattr(quant_config, "is_checkpoint_nvfp4_serialized", False):
-        raise ValueError("GPU delta requires a serialized NVFP4 checkpoint")
 
     folder = Path(model_config.model_path)
     if not folder.is_dir():

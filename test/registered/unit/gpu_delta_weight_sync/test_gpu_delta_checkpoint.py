@@ -76,11 +76,7 @@ class TestCanonicalCheckpointHeaders(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.folder = Path(self.temp.name)
         self.runner = types.SimpleNamespace(
-            model=types.SimpleNamespace(
-                quant_config=types.SimpleNamespace(
-                    is_checkpoint_nvfp4_serialized=True, is_nvfp4_online=False
-                )
-            ),
+            model=types.SimpleNamespace(),
             model_config=types.SimpleNamespace(
                 model_path=str(self.folder),
                 hf_config=types.SimpleNamespace(architectures=["Glm4MoeForCausalLM"]),
@@ -181,7 +177,7 @@ class TestCanonicalCheckpointHeaders(unittest.TestCase):
             inventory["model.layers.0.mlp.experts.0.gate_proj.weight_scale"]["dtype"],
             "F8_E4M3",
         )
-        self.assertEqual(vars(self.runner.model).keys(), {"quant_config"})
+        self.assertEqual(vars(self.runner.model), {})
 
     def test_index_selects_shards_and_excludes_duplicate_consolidated_file(self):
         self.save("shard.safetensors", {"weight": torch.zeros(2, 3)})
@@ -259,20 +255,6 @@ class TestCanonicalCheckpointHeaders(unittest.TestCase):
                 "allow_patterns_overrides",
                 ["subdir/*.safetensors"],
                 "secondary or remapped",
-            ),
-            (
-                self.runner.model.quant_config,
-                "is_checkpoint_nvfp4_serialized",
-                False,
-                "serialized NVFP4",
-            ),
-            (
-                self.runner.model,
-                "quant_config",
-                types.SimpleNamespace(
-                    is_checkpoint_nvfp4_serialized=False, is_nvfp4_online=True
-                ),
-                "serialized NVFP4",
             ),
             (
                 self.runner.model_config,

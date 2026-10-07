@@ -14,6 +14,11 @@ standard checkpoint loader and its selected target/bundled-MTP files; custom,
 secondary or transformed sources are outside this contract. It does not wrap
 model methods or change ordinary checkpoint loading. Packed live parameters alone
 cannot recover the canonical source inventory.
+Source-header discovery does not require a quantization marker or NVFP4
+checkpoint. Model mappings and backend bindings determine the supported physical
+layouts; the current GPU qualification remains NVFP4 W4A16.
+Fixed MoE topology is required only when the model mapping binds routed experts;
+dense-only mappings do not need a CuTe MoE configuration.
 
 Model mapping is selected once during admission in `gpu_delta/models.py`. The
 implemented DeepSeek MLA/DSA family covers GLM's shared runtime implementation:
