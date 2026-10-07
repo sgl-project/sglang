@@ -1100,6 +1100,39 @@ def test_concat_qkv_attention_skips_grouped_weight_loader() -> None:
     assert grouped_weight.rank_local_weight_transform is not None
 
 
+@pytest.mark.parametrize("layout", [None, "native", "interleaved"])
+@pytest.mark.parametrize("grouped", [True, False])
+@pytest.mark.parametrize("diffusers", [True, False])
+def test_explicit_checkpoint_qkv_layout_overrides_inferred_layout(
+    layout, grouped, diffusers
+):
+    _ensure_single_process_parallel_runtime()
+    arch = MiniMaxH3DiTArchConfig(
+        hidden_size=32,
+        num_attention_heads=2,
+        attention_head_dim=16,
+        checkpoint_qkv_layout=layout,
+        qkv_checkpoint_grouped=grouped,
+        checkpoint_uses_diffusers_layout=diffusers,
+    )
+    attention = MiniMaxH3Attention(arch, None, prefix="blocks.0.attn")
+    weight = attention.qkv_proj.weight
+    loaded = torch.arange(weight.numel(), dtype=torch.float32).reshape(weight.shape)
+    weight.weight_loader(weight, loaded)
+
+    reorder = (
+        layout == "interleaved" if layout is not None else grouped and not diffusers
+    )
+    expected = (
+        _reorder_grouped_qkv_to_qkv(
+            loaded, num_query_groups=2, heads_per_group=1, head_dim=16
+        )
+        if reorder
+        else loaded
+    )
+    torch.testing.assert_close(weight, expected.to(weight))
+
+
 @pytest.mark.parametrize("backend,out_features", [("comfy_kitchen", 12), ("jit", 16)])
 def test_integrated_h3_int8_loader_preserves_quantized_weights(
     tmp_path, monkeypatch, backend, out_features

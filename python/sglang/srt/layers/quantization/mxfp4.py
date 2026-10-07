@@ -700,7 +700,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     check_mega_moe_shapes,
                 )
 
-                mma_type = _mega_moe_mma_type()
+                mma_type = _mega_moe_mma_type(layer)
                 check_mega_moe_shapes(
                     hidden=layer.w13_weight.shape[2] * 2,
                     intermediate=layer.w13_weight.shape[1] // 2,
