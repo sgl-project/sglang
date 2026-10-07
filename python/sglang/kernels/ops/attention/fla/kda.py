@@ -11,6 +11,7 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from sglang.kernels.ops.attention.fla.chunk_intra import chunk_kda_fwd_intra
@@ -1030,9 +1031,11 @@ def kda_gate_chunk_cumsum_vector_kernel(
                 mask=offsets_t < T,
                 other=0.0,
             ).to(tl.float32)
+            # Not tl.sigmoid: tl.exp and Triton's / are approximate on CUDA. This
+            # matches the unfused path's beta.float().sigmoid() bit for bit.
             tl.store(
                 beta_out + (bos + offsets_t) * H + i_h,
-                tl.sigmoid(b_beta),
+                tl.div_rn(1.0, 1.0 + libdevice.exp(-b_beta)),
                 mask=offsets_t < T,
             )
 
