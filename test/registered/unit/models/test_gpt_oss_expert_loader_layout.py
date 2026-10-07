@@ -23,7 +23,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
 
 EXPERT_PATTERN = re.compile(
     r"^(.*\.mlp\.experts)\.(\d+)\.(gate_up_proj|down_proj)\."
