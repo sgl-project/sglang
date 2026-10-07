@@ -76,6 +76,7 @@ class Glm4vRMSNorm(RMSNorm):
         return x
 
 
+# TODO: fold into parallel_group selection ("attn_tp" under DP attention).
 def glm4v_vision_reduces_over_attn_tp(use_data_parallel: bool) -> bool:
     return is_dp_attention_enabled() and not use_data_parallel
 
