@@ -23,7 +23,10 @@ import torch
 from transformers.video_utils import VideoMetadata
 
 from sglang.srt.models.embedding_gemma2 import EmbeddingGemma2Model
-from sglang.srt.multimodal.processors.base_processor import Modality
+from sglang.srt.multimodal.processors.base_processor import (
+    Modality,
+    MultimodalSpecialTokens,
+)
 from sglang.srt.multimodal.processors.gemma4 import Gemma4SGLangProcessor
 from sglang.srt.utils.common import load_audio
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
@@ -129,24 +132,25 @@ class EmbeddingGemma2SGLangProcessor(Gemma4SGLangProcessor):
             discard_alpha_channel=discard_alpha_channel,
         )
 
-    async def process_mm_data_async(  # type: ignore[override]
+    async def load_mm_data(  # type: ignore[override]
         self,
+        prompt: Any,
+        multimodal_tokens: MultimodalSpecialTokens,
         image_data: list[Any] | None = None,
+        video_data: list[Any] | None = None,
         audio_data: list[Any] | None = None,
-        input_text: Any = "",
-        request_obj: Any = None,
-        *args: Any,
         **kwargs: Any,
     ):
-        video_data = request_obj.video_data if request_obj is not None else None
-        input_text = self._resolve_prompt(
-            input_text,
+        # Resolve the prompt here rather than overriding process_mm_data_async, so
+        # requests keep Gemma4's route through the preprocessing worker pool.
+        prompt = self._resolve_prompt(
+            prompt,
             n_image=len(image_data) if image_data else 0,
             n_video=len(video_data) if video_data else 0,
             n_audio=len(audio_data) if audio_data else 0,
         )
-        return await super().process_mm_data_async(
-            image_data, audio_data, input_text, request_obj, *args, **kwargs
+        return await super().load_mm_data(
+            prompt, multimodal_tokens, image_data, video_data, audio_data, **kwargs
         )
 
     def _resolve_prompt(

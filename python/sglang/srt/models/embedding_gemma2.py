@@ -60,7 +60,7 @@ from sglang.srt.models.gemma4_mm import (
     Gemma4MultimodalEmbedder,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -567,8 +567,7 @@ class EmbeddingGemma2Model(nn.Module):
         self.text_config = text_config
 
         try:
-            server_args = get_server_args()
-            limit_mm = getattr(server_args, "limit_mm_data_per_request", {}) or {}
+            limit_mm = get_mm().limit_mm_data_per_request or {}
         except Exception:  # noqa: BLE001
             limit_mm = {}
 
