@@ -841,8 +841,9 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
     expose owner-local storage; ``index_key_cache.get_local_buffer`` always
     exposes that storage.
 
-    This is a pool-level implementation. DSA backend metadata, fused indexer
-    stores, and model-runner selection still require separate integration.
+    The DSA backend keeps separate raw-reader scratch tables and logical
+    batched-indexer tables. Indexer writers use the pool's owner-filtered API;
+    direct fused writers cannot write logical rows into an owner-local pool.
     """
 
     def __init__(

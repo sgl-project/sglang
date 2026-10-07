@@ -302,6 +302,9 @@ class DSAMetadata:
     pooled_paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     kpool_extend_plan: Optional[KPoolExtendPlan] = None
     kpool_write_plan: Optional[KPoolWritePlan] = None
+    # Batched IndexKeyCache reads accept logical pages and translate inside the
+    # pool. Raw paged kernels instead use real_page_table (scratch addresses).
+    logical_indexer_page_table: Optional[torch.Tensor] = None
 
 
 @torch.compile
@@ -466,6 +469,11 @@ class DeepseekSparseAttnBackend(
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
+
+        self.kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
+        if self.kv_shard_pool is not None:
+            self.needs_cpu_seq_lens = True
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -968,6 +976,15 @@ class DeepseekSparseAttnBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        sharded_extend = False
+        if self.kv_shard_pool is not None:
+            from sglang.srt.layers.attention.kv_shard_hooks import (
+                prepare_kv_shard_forward,
+            )
+
+            sharded_extend = prepare_kv_shard_forward(
+                self.kv_shard_pool, self.req_to_token, forward_batch
+            )
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
@@ -991,6 +1008,12 @@ class DeepseekSparseAttnBackend(
         page_table = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
         ]
+        logical_indexer_page_table = None
+        if sharded_extend:
+            logical_indexer_page_table = self._transform_table_1_to_real(page_table)
+            page_table = self.kv_shard_pool.translate_loc_to_scratch(page_table).to(
+                page_table.dtype
+            )
 
         page_table_1_flattened = None
         topk_indices_offset = None
@@ -1149,6 +1172,8 @@ class DeepseekSparseAttnBackend(
                     else 0
                 )
                 page_table = page_table[bs_idx, :max_seqlen_k]
+                if logical_indexer_page_table is not None:
+                    logical_indexer_page_table = logical_indexer_page_table[bs_idx]
 
             if any(forward_batch.extend_prefix_lens_cpu) or bs_idx_cpu is not None:
                 max_seqlen_q = (
@@ -1186,7 +1211,9 @@ class DeepseekSparseAttnBackend(
                 # Validate indices when logical tokens exceed physical capacity
                 # This is likely to be triggered by PP with high kv reuse & parallelism
                 kv_cache_capacity = (
-                    self.token_to_kv_pool.size + self.token_to_kv_pool.page_size
+                    self.kv_shard_pool.shard_spec.scratch_rows
+                    if sharded_extend
+                    else self.token_to_kv_pool.size + self.token_to_kv_pool.page_size
                 )
                 if forward_batch.seq_lens_sum > kv_cache_capacity:
                     max_idx = page_table_1_flattened.max().item()
@@ -1271,6 +1298,7 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+            logical_indexer_page_table=logical_indexer_page_table,
         )
         metadata = self._init_kpool_metadata(
             metadata,

@@ -14,7 +14,11 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     use_mla_backend,
 )
-from sglang.srt.configs.model_config import is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    get_dsa_index_kpool,
+    get_dsa_index_kpool_compress,
+    is_deepseek_dsa,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.utils.common import get_device_memory_capacity
@@ -25,6 +29,30 @@ logger = logging.getLogger(__name__)
 def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> None:
     cfg = cfg or resolving_view(server_args)
     prefill_backend, _ = attention_backends_of(resolved_view(server_args))
+    if prefill_backend == "dsa":
+        if not (
+            cfg.device == "cuda"
+            and cfg.enable_prefill_cp
+            and cfg.attn_cp_size > 1
+            and cfg.pp_size == 1
+            and cfg.cp_strategy == "interleave"
+            and cfg.dsa_prefill_backend == "trtllm"
+            and cfg.dsa_decode_backend == "trtllm"
+            and cfg.kv_cache_dtype == "fp8_e4m3"
+            and cfg.page_size == 64
+            and cfg.disaggregation_transfer_backend == "mooncake"
+            and not cfg.enable_dsa_cache_layer_split
+            and get_dsa_index_kpool(model_config_of(server_args).hf_config) == 1
+            and not get_dsa_index_kpool_compress(model_config_of(server_args).hf_config)
+        ):
+            raise ValueError(
+                "DSA KV sharding requires CUDA interleave prefill CP > 1, "
+                "TRTLLM prefill/decode, pp_size=1, fp8_e4m3 KV, page size 64, index_kpool=1 "
+                "and Mooncake; DSA cache layer splitting must be disabled."
+            )
+        return
+    if is_deepseek_dsa(model_config_of(server_args).hf_config):
+        raise ValueError("DSA KV sharding requires the dsa attention backend.")
     if prefill_backend == "fa3":
         return
     if prefill_backend != "trtllm_mla":
@@ -63,9 +91,20 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "page, which is incompatible with local decode."
         )
     if cfg.speculative_algorithm is not None:
-        raise ValueError(
-            "--enable-kv-cache-sharding does not support speculative decoding."
-        )
+        model_config = model_config_of(server_args)
+        if not (
+            cfg.speculative_algorithm == "EAGLE"
+            and "GlmMoeDsaForCausalLM"
+            in getattr(model_config.hf_config, "architectures", [])
+            and (model_config.num_nextn_predict_layers or 0) == 1
+            and cfg.speculative_eagle_topk == 1
+            and not cfg.enable_multi_layer_eagle
+            and cfg.pp_size == 1
+        ):
+            raise ValueError(
+                "KV sharding supports speculative decoding only for GLM DSA "
+                "single-layer NextN MTP with EAGLE, topk=1 and pp_size=1."
+            )
     if cfg.dllm_algorithm is not None:
         raise ValueError(
             "--enable-kv-cache-sharding does not support diffusion language "
@@ -183,11 +222,6 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
         )
 
     if use_mla_backend(server_args):
-        if is_deepseek_dsa(model_config.hf_config):
-            raise ValueError(
-                "--enable-kv-cache-sharding does not support DSA models yet "
-                "(indexer buffers are not striped)."
-            )
         if cfg.attn_cp_size <= 1:
             if cfg.enable_dp_attention:
                 raise ValueError(
@@ -263,15 +297,20 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             page_size,
         )
 
-    if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
+    graph_config = cfg.cuda_graph_config
+    if graph_config.prefill.backend != Backend.DISABLED:
         logger.warning(
             "Prefill CUDA graph (%s) is incompatible with "
             "--enable-kv-cache-sharding; disabling it.",
             cfg.cuda_graph_config.prefill.backend,
         )
-        declarations["cuda_graph_config"] = with_phase(
-            cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-        )
+        graph_config = with_phase(graph_config, Phase.PREFILL, backend=Backend.DISABLED)
+    if cfg.speculative_algorithm is not None:
+        # The P-side MTP runner performs only draft-extend. Capturing its
+        # ordinary decode/verify graphs would read logical IDs as local rows.
+        graph_config = with_phase(graph_config, Phase.DECODE, backend=Backend.DISABLED)
+    if graph_config != cfg.cuda_graph_config:
+        declarations["cuda_graph_config"] = graph_config
 
     if declarations:
         declare_resolution(
