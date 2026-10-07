@@ -438,21 +438,25 @@ def minimax_h3_decode_reference_video_frames(
     )
 
 
+def _try_create_reference_video_memfd(name: str) -> int:
+    """Return an anonymous output fd, or -1 when memfd is unavailable."""
+    if not sys.platform.startswith("linux") or not hasattr(os, "memfd_create"):
+        return -1
+    try:
+        return os.memfd_create(name, flags=os.MFD_CLOEXEC)
+    except OSError:
+        # The Python API can exist while the syscall is unavailable or blocked
+        # by the container's seccomp policy.
+        return -1
+
+
 def _decode_reference_video_local(command: list[str]) -> tuple[Any, int]:
     """Write one worker's RGB stream without a large stdout aggregation."""
 
     # Linux workers can let ffmpeg write the exact RGB24 stream into an
     # anonymous file descriptor. Mapping that output avoids communicate()'s
     # chunk list and final bytes join for a several-hundred-MiB reference.
-    output_fd = -1
-    if sys.platform.startswith("linux"):
-        try:
-            output_fd = os.memfd_create(
-                "sglang-h3-reference-video",
-                flags=os.MFD_CLOEXEC,
-            )
-        except OSError:
-            output_fd = -1
+    output_fd = _try_create_reference_video_memfd("sglang-h3-reference-video")
 
     payload: Any = b""
     payload_size = 0
@@ -531,15 +535,12 @@ def _decode_reference_video_shared(command: list[str]) -> tuple[Any, int]:
     leader_state = None
     if is_leader:
         try:
-            try:
-                leader_fd = os.memfd_create(
-                    "sglang-h3-reference-video-shared",
-                    flags=os.MFD_CLOEXEC,
-                )
-            except OSError:
-                # Anonymous file descriptors can be disabled by a container's
-                # seccomp policy. Tell every host to use the unchanged local
-                # decode path instead of failing a valid request.
+            leader_fd = _try_create_reference_video_memfd(
+                "sglang-h3-reference-video-shared"
+            )
+            if leader_fd < 0:
+                # All ranks must learn about missing API/syscall support through
+                # the collective before falling back to local decoding.
                 leader_state = (None, 0, None)
             else:
                 payload_size = _write_reference_video_to_fd(command, leader_fd)
