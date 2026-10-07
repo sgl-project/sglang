@@ -619,11 +619,27 @@ class TestDataParallelCoverage(_PublishedConfig):
 class TestDecodeBatchesPerRank(_PublishedConfig):
     dp_size = 2
 
-    async def test_each_dp_rank_is_filled_to_its_own_limit(self):
-        tm = DecodeWaveManager(limits=[4, 2])
+    async def test_equal_limits_fill_every_rank(self):
+        tm = DecodeWaveManager(limits=[4, 4])
         await _phases(tm)["decode-batches"]()
         self.assertEqual([len(w) for w in tm.waves[0]], [1, 2, 4])
-        self.assertEqual([len(w) for w in tm.waves[1]], [1, 2])
+        self.assertEqual([len(w) for w in tm.waves[1]], [1, 2, 4])
+
+    async def test_replies_in_any_order_never_overfill_a_rank(self):
+        # Replies arrive in completion order and carry no DP rank, so rank 1
+        # may answer first; neither rank may be sent more than the smallest.
+        for limits in ([2, 4], [4, 2]):
+            with self.subTest(limits=limits):
+                tm = DecodeWaveManager(limits=limits)
+                await _phases(tm)["decode-batches"]()
+                self.assertEqual([len(w) for w in tm.waves[0]], [1, 2])
+                self.assertEqual([len(w) for w in tm.waves[1]], [1, 2])
+
+    async def test_differing_limits_use_the_smallest_for_every_rank(self):
+        tm = DecodeWaveManager(limits=[8, 3])
+        await _phases(tm)["decode-batches"]()
+        self.assertEqual([len(w) for w in tm.waves[0]], [1, 2, 3])
+        self.assertEqual([len(w) for w in tm.waves[1]], [1, 2, 3])
 
     async def test_without_one_limit_per_rank_every_rank_uses_the_smallest(self):
         tm = DecodeWaveManager(limits=[4])
