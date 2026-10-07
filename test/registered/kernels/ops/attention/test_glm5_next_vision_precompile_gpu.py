@@ -5,11 +5,12 @@ Runs ``precompile_kernels_after_loading`` against the real Triton
 vision tower's own: several variable-length image sequences, ``q``/``k``
 contiguous (as ``_apply_qk_norm_head_size`` and RoPE leave them) and ``v`` a
 strided view of the fused qkv projection buffer (``pass_strided_qkv``). The
-test asserts through Triton's per-device kernel cache on ``_fwd_kernel``
-(``JITFunction.device_caches[device] -> (kernel_cache, ...)``, Triton 3.7)
-and through ``triton.knobs.runtime.kernel_load_start_hook`` that the
-representative call neither compiles nor device-loads a new specialization,
-and checks its output against an SDPA reference.
+test clears Triton's per-device kernel cache on ``_fwd_kernel``
+(``JITFunction.device_caches[device] -> (kernel_cache, ...)``, Triton 3.7),
+asserts that the hook adds and device-loads one specialization, and asserts
+through that cache and ``triton.knobs.runtime.kernel_load_start_hook`` that
+the representative call neither compiles nor device-loads another one. It
+also checks the call's output against an SDPA reference.
 """
 
 import unittest
@@ -127,18 +128,23 @@ class TestGlm5NextVisionPrecompileGpu(CustomTestCase):
         self._loads.append(name)
 
     def test_hook_loads_the_kernel_the_vision_call_reuses(self):
+        # CustomTestCase retries the test method in CI without rerunning
+        # setUp, so start every attempt from an empty in-memory kernel cache
+        # and load log; otherwise a retry would reuse the specialization a
+        # failed attempt loaded for the vision call. Triton's on-disk cache
+        # still spares a real recompile.
         cache = _kernel_cache()
-        entries_before = len(cache)
+        cache.clear()
+        self._loads.clear()
 
         with patch.object(glm5_next, "VisionAttention", _FakeVisionAttention):
             _make_model().precompile_kernels_after_loading()
         torch.cuda.synchronize()
 
         entries_after_hook = len(cache)
-        self.assertGreaterEqual(entries_after_hook, 1)
-        # Another test in this process may already have compiled it.
-        self.assertIn(entries_after_hook - entries_before, (0, 1))
+        self.assertEqual(entries_after_hook, 1)
         loads_after_hook = len(self._loads)
+        self.assertGreaterEqual(loads_after_hook, 1)
 
         q, k, v, cu_seqlens, seq_lens, max_seqlen = _vision_qkv()
         out = torch.empty_like(q)
