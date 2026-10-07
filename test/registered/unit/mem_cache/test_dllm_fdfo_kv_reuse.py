@@ -57,6 +57,9 @@ class _FakeTreeCache:
     def supports_prefix_sharing(self):
         return False
 
+    def maybe_hand_to_session(self, req):
+        pass
+
 
 def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
     return SimpleNamespace(
