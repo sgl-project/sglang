@@ -22,6 +22,7 @@ GPU and no real buffers are needed.
 
 import types
 import unittest
+from unittest.mock import Mock
 
 import torch
 
@@ -291,6 +292,35 @@ class TestHybridLinearMLARouting(unittest.TestCase):
 
         self.assertEqual(len(pool.full_kv_pool.mla_set_calls), 1)
         self.assertIs(pool.full_kv_pool.mla_set_calls[0], loc)
+
+    def test_nvfp4_maps_storage_layer_without_mutating_model_layer(self):
+        from sglang.srt.mem_cache.memory_pool import (
+            DSANVFP4TokenToKVPool,
+            HybridLinearKVPool,
+            KVWriteLoc,
+        )
+
+        full_pool = Mock(spec=DSANVFP4TokenToKVPool)
+        pool = object.__new__(HybridLinearKVPool)
+        pool.full_kv_pool = full_pool
+        pool.use_mla = True
+        pool.full_attention_layer_id_mapping = {7: 0}
+
+        layer = types.SimpleNamespace(layer_id=7)
+        loc_info = KVWriteLoc(torch.tensor([3, 4]), physical=True)
+        cache_k_nope = torch.zeros(2, 1, 6)
+        cache_k_rope = torch.zeros(2, 1, 2)
+
+        pool.set_mla_kv_buffer(layer, loc_info, cache_k_nope, cache_k_rope)
+
+        self.assertEqual(layer.layer_id, 7)
+        full_pool.set_mla_kv_buffer.assert_called_once_with(
+            layer,
+            loc_info,
+            cache_k_nope,
+            cache_k_rope,
+            layer_id_override=0,
+        )
 
 
 class TestMlaWriteDoorsUnderDcp(unittest.TestCase):

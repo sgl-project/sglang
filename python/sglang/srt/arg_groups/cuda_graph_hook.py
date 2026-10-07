@@ -120,6 +120,41 @@ def apply_cuda_graph_compatibility(server_args: Any):
     """
 
     cfg = resolving_view(server_args)
+
+    # NVFP4 DSA generation is graph-safe, but ordinary context gathering still
+    # deduplicates with dynamic torch.unique output. Keep prefill eager until
+    # the static TensorRT-LLM context gather is ported. An explicit request is
+    # rejected rather than silently ignored.
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    is_nvfp4_dsa = cfg.kv_cache_dtype == "nvfp4" and is_deepseek_dsa(
+        model_config_of(server_args).hf_config
+    )
+    if is_nvfp4_dsa:
+        prefill_backend = cfg.cuda_graph_config.prefill.backend
+        if (
+            (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked
+            and prefill_backend != Backend.DISABLED
+        ):
+            raise ValueError(
+                "NVFP4 DSA does not yet support prefill CUDA Graphs; set "
+                "--cuda-graph-backend-prefill disabled. Decode CUDA Graphs "
+                "remain supported."
+            )
+        if prefill_backend != Backend.DISABLED:
+            logger.info(
+                "Disabling prefill CUDA Graphs for NVFP4 DSA; decode CUDA "
+                "Graphs remain enabled."
+            )
+            declare_resolution(
+                server_args,
+                "_apply_cuda_graph_compatibility_nvfp4_dsa",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
+        return
+
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
         return
 

@@ -21,6 +21,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
     get_dsa_index_kpool_compress,
+    get_dsa_index_topk,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
@@ -64,6 +65,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
+    DSANVFP4TokenToKVPool,
     DSATokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -153,6 +155,43 @@ def _should_enable_lazy_compaction() -> bool:
     Centralized here so both unified-memory-pool factory call sites stay in sync.
     """
     return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
+
+
+def dsa_nvfp4_graph_scratch_reservation_gb(
+    *, model_config: ModelConfig, kv_cache_dtype: torch.dtype
+) -> float:
+    """Reserve the persistent compact-FP8 decode-graph gather workspace."""
+    if not (
+        is_float4_e2m1fn_x2(kv_cache_dtype) and is_deepseek_dsa(model_config.hf_config)
+    ):
+        return 0.0
+
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    decode_config = get_exec().graph.cuda_graph_config.decode
+    if decode_config.backend == Backend.DISABLED:
+        return 0.0
+    capture_batch_sizes = list(decode_config.bs or ())
+    max_bs = max(capture_batch_sizes, default=int(decode_config.max_bs or 0))
+    configured_max_requests = get_schedule().max_running_requests
+    if configured_max_requests is not None:
+        max_bs = min(max_bs, int(configured_max_requests))
+    if max_bs <= 0:
+        return 0.0
+
+    # Target verification contributes one independent Top-K row per draft
+    # token. The +1 is conservative for speculative implementations that also
+    # retain the current-token row in their graph width.
+    draft_tokens = int(max_speculative_num_draft_tokens() or 0)
+    rows_per_request = max(1, draft_tokens + (1 if draft_tokens else 0))
+    num_pairs = max_bs * rows_per_request * get_dsa_index_topk(model_config.hf_config)
+    page_size = 64
+    padded_pairs = ((num_pairs + page_size - 1) // page_size) * page_size
+    # One 576-byte compact E4M3 row and one int32 remapped index per pair.
+    workspace_bytes = padded_pairs * (576 + 4)
+    if get_exec().overlap.enable_two_batch_overlap:
+        workspace_bytes *= 2
+    return workspace_bytes / (1 << 30)
 
 
 def mm_runtime_reservation_gb(
@@ -345,10 +384,34 @@ class KVCacheConfigurator:
         quant_method.load_scales_from_model(self.model)
         return quant_method
 
+    def _build_dsa_fp4_quant_method(self, *, num_layers: int):
+        if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            return None
+        quant_name = resolve_kv_cache_quant(self.kv_cache_dtype_str)
+        if quant_name is None:
+            return None
+        quant_method = get_kv_cache_quant_method(
+            quant_name,
+            num_layers=num_layers,
+            device=self.device,
+        )
+        # DSA uses its fixed MLA amax recipe, independent of checkpoint FP8-KV
+        # scales. This also keeps embedded NextN draft models model-agnostic.
+        quant_method.configure_dsa_mla_scales()
+        return quant_method
+
     def _build_mha_quant_method(self, *, num_layers: int):
         if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
             return get_kv_cache_quant_method("cpu_fp8_e4m3")
         return self._build_fp4_quant_method(num_layers=num_layers)
+
+    def _build_hybrid_quant_method(self, *, num_layers: int, use_dsa: bool):
+        builder = (
+            self._build_dsa_fp4_quant_method
+            if use_dsa
+            else self._build_mha_quant_method
+        )
+        return builder(num_layers=num_layers)
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
@@ -1641,6 +1704,14 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
+        is_nvfp4 = is_float4_e2m1fn_x2(self.kv_cache_dtype)
+        if is_nvfp4 and (
+            get_memory().enable_hisparse or dsa_cp_layer_shard_rank is not None
+        ):
+            raise ValueError(
+                "The basic NVFP4 DSA cache path does not yet support HiSparse "
+                "or DSA cache layer splitting."
+            )
         if get_memory().enable_hisparse:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
@@ -1658,7 +1729,11 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
-            PoolCls = DSATokenToKVPool
+            PoolCls = DSANVFP4TokenToKVPool if is_nvfp4 else DSATokenToKVPool
+        if is_nvfp4:
+            pool_kwargs["quant_method"] = self._build_dsa_fp4_quant_method(
+                num_layers=self.layer_info.num_effective_layers
+            )
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
@@ -1889,12 +1964,14 @@ class KVCacheConfigurator:
             ]
         )
         extra_args = {}
+        use_dsa = False
         if self.use_mla_backend:
             extra_args = {
                 "kv_lora_rank": self.model_config.kv_lora_rank,
                 "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
             }
             if is_deepseek_dsa(self.model_config.hf_config):
+                use_dsa = True
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(
                     use_dsa=True,
@@ -1921,8 +1998,8 @@ class KVCacheConfigurator:
                         tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
                         max_running_requests=(req_to_token_pool.req_to_token.shape[0]),
                     )
-        quant_method = self._build_mha_quant_method(
-            num_layers=len(full_attention_layer_ids)
+        quant_method = self._build_hybrid_quant_method(
+            num_layers=len(full_attention_layer_ids), use_dsa=use_dsa
         )
         # MXFP8 KV cache needs the block-scaled pool (data + UE8M0 scale
         # buffers) for the full-attention layers, same as the SWA branch.
@@ -2233,7 +2310,22 @@ class KVCacheConfigurator:
             is_multimodal=self.model_config.is_multimodal,
             mm_feature_transport=get_mm().mm_feature_transport,
         )
-        rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        nvfp4_scratch_reservation_gb = dsa_nvfp4_graph_scratch_reservation_gb(
+            model_config=self.model_config,
+            kv_cache_dtype=self.kv_cache_dtype,
+        )
+        if nvfp4_scratch_reservation_gb > 0:
+            logger.info(
+                "Reserving %.2f GB of the KV budget for NVFP4 DSA CUDA Graph "
+                "gather scratch.",
+                nvfp4_scratch_reservation_gb,
+            )
+        rest_memory = (
+            available_gpu_memory
+            - slack_gb
+            - mm_reservation_gb
+            - nvfp4_scratch_reservation_gb
+        )
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
