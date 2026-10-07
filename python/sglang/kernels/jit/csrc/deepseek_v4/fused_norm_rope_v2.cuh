@@ -416,8 +416,8 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   using Paged = deepseek_v4::PagedKV<kLayout, kPageBits>;
   // kFp8TwoPool: 512 B row holding the 448 fp8 nope + its UE8M0 scales, with rope
   // split off into a second [num_slots, kRopeDim] bf16 pool at the same row
-  // kUniformFp8Store: write the whole head_dim (rope tail included) as plain
-  // e4m3 at per-tensor scale 1.0 into the uniform 512-byte-per-token pool.
+  // kUniformFp8Store: the whole head_dim, rope tail included, as plain e4m3 (scale 1.0)
+  // into the uniform 512-byte-per-token pool.
   static_assert(!(kBf16Store && kFp8TwoPool));
   static_assert(!(kFp8TwoPool && kUniformFp8Store));
   static_assert(!(kFp8TwoPool && kLayout != deepseek_v4::KVLayout::V4), "the fp8 two-pool store is a V4 cache");
@@ -529,8 +529,8 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
 
   PDLTriggerSecondary<kUsePDL>();
 
-  // part 2: rope on the rope warp (each lane owns one (real, imag) pair of
-  // the rope tail), then the layout-specific store.
+  // part 2: rope on the rope warp, one (real, imag) pair per lane;
+  // then the layout-specific store.
   if (warp_id == kRopeWarp) {
     const auto x_real = data[0];
     const auto x_imag = data[1];
@@ -541,8 +541,7 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   }
 
   if constexpr (kUniformFp8Store) {
-    // BF16 round-trip to match the unfused path (Triton norm+rope emits
-    // bf16, then the pool store casts bf16 -> e4m3 at scale 1.0).
+    // BF16 round-trip to match the unfused path, which stores bf16 and then casts to e4m3.
     const auto x = cast<float>(cast<bf16_t>(data[0]));
     const auto y = cast<float>(cast<bf16_t>(data[1]));
     reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = pack_fp8(x, y);

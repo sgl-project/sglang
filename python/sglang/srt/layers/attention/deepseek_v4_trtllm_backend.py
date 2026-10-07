@@ -143,10 +143,10 @@ def _refresh_indexed_tail(
     extra_indices: Optional[torch.Tensor],
     table: torch.Tensor,
     lens: torch.Tensor,
-    rows: int,
 ) -> None:
     """Write this layer's top-k into the shared indexed table and its lens."""
     assert extra_indices is not None
+    rows = table.shape[0]
     extra_indices = extra_indices[:rows]
     width = extra_indices.shape[-1]
     assert table.shape == (rows, SWA_WINDOW + width), f"{table.shape=} {width=}"
@@ -158,7 +158,7 @@ def _refresh_indexed_tail(
         extra_indices,
         core.sparse_topk_lengths(compress_ratio)[:rows],
         table,
-        lens[:rows],
+        lens,
     )
 
 
@@ -255,7 +255,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         self.trtllm_eager_output_buffer: torch.Tensor | None = None
         # (buffer, rows, real rows) whose pad tail is already zero (kernel writes [:real]).
         self._padded_output_zeroed: Optional[tuple[int, int, int]] = None
-        # Indexer top-k writes into the table tail only when strided topk_v2 is the writer.
+        # topk_v2 writes the c4 tail in place only when no ratio-1/2 layer shares the table.
         self.trtllm_topk_writes_table = (
             self.dsa_topk_backend.should_use_topk_v2()
             and not get_exec().features.enable_return_indexer_topk
@@ -269,8 +269,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         )
         max_prefill_rows = _trtllm_query_row_capacity(model_runner)
         w4 = ceil_align(self.index_topk, PAGE_INDEX_ALIGNED_SIZE)
-        # c128 pages of the longest representable sequence, plus the producer's
-        # own alignment block.
+        # Longest sequence's c128 pages plus the producer's alignment block.
         w128 = (
             ceil_align(
                 ceil_div(self.MAX_SEQ_LEN_FOR_CAPTURE, 128), PAGE_INDEX_ALIGNED_SIZE
@@ -430,9 +429,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         attn_sink: torch.Tensor,
         extra_indices: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Sparse MLA decode. Uniform multi-token metadata (verify /
-        draft-extend) switches the call to varlen mode with per-request
-        ``seq_lens``; plain decode stays one row per request."""
+        """Sparse MLA decode; uniform multi-token metadata runs VarSeq."""
 
         bs, num_heads, head_dim = q.shape
         assert head_dim == 512
@@ -453,7 +450,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             extra_indices = extra_indices[:bs]
 
         # Only indexed tails and lens vary by layer; other table data is prebuilt.
-        swa_width = core_attn_metadata.swa_page_indices.shape[1]
         if compress_ratio == 0:
             # swa_page_indices is itself a valid all-SWA combined table.
             sparse_indices = core_attn_metadata.swa_page_indices
@@ -483,7 +479,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
                 extra_indices,
                 sparse_indices,
                 sparse_topk_lens,
-                bs,
             )
 
         swa_kv_cache, compressed_kv_cache = self._trtllm_kv_cache_views(
@@ -499,18 +494,18 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         if seq_lens.shape[0] != bs:
             assert seq_lens.shape[0] > bs, f"{seq_lens.shape=} {bs=}"
             seq_lens = seq_lens[:bs]
+        # Uniform verify/draft-extend metadata uses VarSeq; ragged verify uses dense per-token.
         seq_lens_req = core_attn_metadata.trtllm_seq_lens_req
-        if swa_width > SWA_WINDOW:
-            # DSpark attends noncausally to its window plus the whole draft block:
+        if core_attn_metadata.swa_page_indices.shape[1] > SWA_WINDOW:
+            # DSpark attends noncausally to its window plus the whole draft block;
             # dense rows bounded by the block's visible length, all from SWA storage.
+            assert seq_lens_req is None, "DSpark draft blocks use dense rows"
             compressed_kv_cache = swa_kv_cache
             seq_lens = core_attn_metadata.swa_topk_lengths[:bs]
-            seq_lens_req = None
         assert attn_sink.dtype == torch.float32
         assert self.trtllm_workspace_buffer is not None
         _check_trtllm_query_rows(bs)
 
-        # Uniform verify/draft-extend metadata uses VarSeq; ragged verify uses dense per-token.
         cum_seq_lens_q = core_attn_metadata.trtllm_cum_seq_lens_q
         common = dict(
             swa_kv_cache=swa_kv_cache,
@@ -566,9 +561,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         attn_sink: torch.Tensor,
         extra_indices: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Sparse MLA prefill in the dense one-query-token-per-entry shape
-        (``(sum_q, 1)``, per-token causal ``seq_lens``): faster than VarSeq on
-        ragged chunks."""
+        """Sparse MLA prefill, one query token per entry with per-token causal seq_lens."""
 
         assert q.ndim == 3, f"{q.shape=}"
         num_qo_padded, num_heads, head_dim = q.shape
@@ -608,7 +601,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
                 extra_indices,
                 sparse_indices,
                 sparse_topk_lens,
-                sum_q,
             )
 
         assert sparse_topk_lens is not None

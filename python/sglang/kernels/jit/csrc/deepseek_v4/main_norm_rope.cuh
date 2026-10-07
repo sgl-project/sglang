@@ -215,8 +215,7 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
     };
   }
   if constexpr (kFp8Out) {
-    // DType round-trip first so the stored bits match the unfused
-    // DType-store -> .to(e4m3) sequence exactly.
+    // DType round-trip first, so the bits match a DType store followed by .to(e4m3).
     const auto [bx, by] = cast<fp32x2_t>(cast<DType2>(rotated));
     tile::Memory<fp8x2_e4m3_t>{lane_id, kWarpThreads}.store(output_ptr + (kHeadDim - kRopeDim), pack_fp8(bx, by));
   } else {

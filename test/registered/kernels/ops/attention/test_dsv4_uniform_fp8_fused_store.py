@@ -1,16 +1,5 @@
-"""Correctness of the uniform-FP8 fused store (CUDA FusedNormRopeKernel).
-
-The kernel fuses RMSNorm + RoPE + plain e4m3 cast (per-tensor scale 1.0) +
-paged scatter into the 512-byte-per-token uniform pool, reading positions,
-destinations, decode window boundaries and prefill-row validity from the
-compress plan. Reference is the unfused pipeline it replaces
-(fused_norm_rope_inplace_triton, then an e4m3 cast + index_put) with the
-plan semantics emulated in Python.
-
-The CUDA block reduction sums the RMSNorm squares in a different order than
-the Triton reference, so a ~1e-6 fraction of elements can land one e4m3 ulp
-apart; the assertions allow exactly that and nothing more.
-"""
+"""Uniform-FP8 fused compress store must match Triton norm+rope, e4m3 cast and index_put;
+the RMSNorm reduction order allows rare one-ulp mismatches."""
 
 import sys
 
