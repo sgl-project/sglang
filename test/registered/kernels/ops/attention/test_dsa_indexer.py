@@ -278,7 +278,6 @@ class TestDSAIndexer(CustomTestCase):
     def setUpClass(cls):
         """Set up global server args for testing."""
         server_args = ServerArgs(model_path="dummy")
-        server_args.enable_dp_attention = False
         server_args.dsa_prefill_backend = "flashmla_sparse"
         server_args.dsa_decode_backend = "flashmla_sparse"
         set_global_server_args_for_scheduler(server_args)
@@ -1236,7 +1235,7 @@ class TestDSAIndexer(CustomTestCase):
             with self.subTest(topk_backend=topk_backend.value):
                 backend = object.__new__(DeepseekSparseAttnBackend)
                 backend.device = self.device
-                backend.real_page_size = 64
+                backend.physical_page_size = 64
                 backend.hisparse_coordinator = None
                 backend.speculative_num_draft_tokens = 0
                 backend.use_fused_topk = True

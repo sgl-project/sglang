@@ -1,0 +1,26 @@
+[package]
+name = "sglang-grpc-types"
+description = "Generated Rust bindings for the SGLang runtime.v1 API"
+version = "0.1.0"
+edition.workspace = true
+rust-version = "1.92"
+license.workspace = true
+repository = "https://github.com/sgl-project/sglang"
+readme = "README.md"
+workspace = "../rust"
+include = [
+    "build.rs",
+    "README.md",
+    "src/**",
+    "sglang/**/*.proto",
+]
+
+[dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+tonic = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }
+tonic-build = { workspace = true }
