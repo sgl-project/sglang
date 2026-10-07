@@ -1,10 +1,8 @@
 """MRotaryEmbedding, YaRNScalingMRotaryEmbedding, NDRotaryEmbedding, OneDRotaryEmbedding."""
 
 import functools
-from typing import List
 
 import torch
-from torch import nn
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -505,9 +503,11 @@ class NDRotaryEmbedding(torch.nn.Module):
         return cos.float(), sin.float()
 
 
-class FluxPosEmbed(nn.Module):
+class FluxPosEmbed(torch.nn.Module):
+    """uncached FLUX-family RoPE with contiguous float32 outputs"""
+
     # modified from https://github.com/black-forest-labs/flux/blob/c00d7c60b085fce8058b9df845e036090873f2ce/src/flux/modules/layers.py#L11
-    def __init__(self, theta: int, axes_dim: List[int]):
+    def __init__(self, theta: int, axes_dim: list[int]):
         super().__init__()
         self.rope = NDRotaryEmbedding(
             rope_dim_list=axes_dim,
@@ -523,7 +523,5 @@ class FluxPosEmbed(nn.Module):
 
     def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         pos = ids.float()
-        # TODO: potential error: flux use n_axes = ids.shape[-1]
-        # see: https://github.com/huggingface/diffusers/blob/17c0e79dbdf53fb6705e9c09cc1a854b84c39249/src/diffusers/models/transformers/transformer_flux.py#L509
         freqs_cos, freqs_sin = self.rope.forward_uncached(pos=pos)
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
