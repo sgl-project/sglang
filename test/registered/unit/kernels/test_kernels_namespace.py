@@ -341,7 +341,18 @@ def test_deep_select_spec_matches_wrapper_architectures():
     )
 
 
-_LORA_ENGINE_APIS = (("common.routing", "build_route", "build_route"),)
+_LORA_ENGINE_APIS = (
+    ("common.routing", "build_route", "build_route"),
+    ("common.lora_a", "grouped_lora_a", "grouped_lora_a"),
+    ("common.lora_a", "per_row_lora_a", "per_row_lora_a"),
+    ("common.lora_b", "grouped_lora_b", "grouped_lora_b"),
+    ("common.lora_b", "per_row_lora_b", "per_row_lora_b"),
+    (
+        "dense.embedding_lora_a",
+        "embedding_lora_a_tokens_fwd",
+        "embedding_lora_a_tokens_fwd",
+    ),
+)
 
 
 @pytest.mark.parametrize("module, function, op", _LORA_ENGINE_APIS)
