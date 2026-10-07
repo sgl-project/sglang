@@ -41,7 +41,7 @@ from sglang.srt.speculative.pp_draft_embedding import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=18, stage="nightly", runner_config="1-gpu-large")
 
 
 def build_source(kind, *, tied=True, vocab=512):
