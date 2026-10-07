@@ -62,7 +62,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 
@@ -382,10 +382,14 @@ class BeamDecoderLayer(nn.Module):
             local_tokens=local_hidden_states,
             forward_batch=forward_batch,
         )
-        global_output = self.mlp(hidden_states)
+        use_reduce_scatterv = (
+            isinstance(self.mlp, BeamMoE) and should_use_dp_reduce_scatterv()
+        )
+        with get_forward().scoped(mlp_reduce_scatter=use_reduce_scatterv):
+            global_output = self.mlp(hidden_states)
         output = get_local_dp_buffer(get_tp_group())
         # BeamMoE skips its all-reduces in this layout; reduce-scatter instead.
-        if isinstance(self.mlp, BeamMoE) and should_use_dp_reduce_scatterv():
+        if use_reduce_scatterv:
             get_tp_group().reduce_scatterv(
                 global_output, output=output, sizes=get_dp_global_num_tokens()
             )
