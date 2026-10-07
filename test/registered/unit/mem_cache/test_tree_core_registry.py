@@ -17,12 +17,15 @@ from sglang.srt.mem_cache.rust_tree_core import component_registry as rust_compo
 from sglang.srt.mem_cache.unified_cache import tree_core_registry
 from sglang.srt.mem_cache.unified_cache.component_factory import (
     DEFAULT_COMPONENT_FACTORY_KEYS,
-    TreeComponentArgument,
     resolve_component_factory_keys,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components import registry as python_components
-from sglang.srt.mem_cache.unified_cache.components.base import EvictLayer, TreeComponent
+from sglang.srt.mem_cache.unified_cache.components.base import (
+    EvictLayer,
+    PythonTreeComponentArgument,
+    TreeComponent,
+)
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     _TREE_CORE_REGISTRY,
     create_tree_components,
@@ -171,7 +174,7 @@ class NamedComponentRegistryTest(CustomTestCase):
             with self.subTest(register=register), self.assertRaises(TypeError):
                 register("invalid", 42)
 
-    def test_python_callable_receives_common_arguments(self):
+    def test_python_callable_receives_python_arguments(self):
         calls = []
 
         def factory(args):
@@ -186,12 +189,13 @@ class NamedComponentRegistryTest(CustomTestCase):
         components = create_tree_components(cache, params)
         self.assertIsInstance(components[ComponentType.FULL], _StubFullComponent)
         self.assertEqual(len(calls), 1)
-        self.assertIsInstance(calls[0], TreeComponentArgument)
+        self.assertIsInstance(calls[0], PythonTreeComponentArgument)
         self.assertIs(calls[0].cache, cache)
         self.assertIs(calls[0].params, params)
         self.assertEqual(calls[0].component_type, ComponentType.FULL)
-        self.assertIsNone(calls[0].native_init_params)
-        self.assertIsNone(calls[0].native_bindings)
+        self.assertFalse(hasattr(calls[0], "native_init_params"))
+        self.assertFalse(hasattr(calls[0], "native_bindings"))
+        self.assertFalse(hasattr(calls[0], "is_bigram"))
 
     def test_factory_type_error_propagates_without_retry(self):
         factory = mock.Mock(side_effect=TypeError("factory failed"))

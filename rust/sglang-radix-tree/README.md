@@ -87,24 +87,30 @@ Supported component sets are `[Full]`, `[Full, SWA]`, `[Full, Mamba]`, and `[Ful
 Three separate registries connect backend selection and component construction:
 
 - `register_tree_core_backend(name, factory)` selects a tree-core implementation.
-- `register_python_tree_component(name, factory)` registers a callable that receives `TreeComponentArgument` and returns a Python `TreeComponent`; existing component classes with `(cache, params)` constructors are also accepted.
-- `register_rust_tree_component(name, factory)` registers a callable that receives the same argument object and returns a native `TreeComponentBinding` handle.
+- `register_python_tree_component(name, factory)` registers a callable that receives `PythonTreeComponentArgument` and returns a Python `TreeComponent`; existing component classes with `(cache, params)` constructors are also accepted.
+- `register_rust_tree_component(name, factory)` registers a callable that receives `TreeComponentArgument` and returns a native `TreeComponentBinding` handle.
 
-The common arguments contain `component_type`, `params`, and optional `cache`. Native factories also receive `native_init_params`, `native_bindings`, and `is_bigram`. Factories run during construction; Rust retains the native component and performs tree operations without Python node callbacks. Factories should construct a fresh component for each cache. Both backends validate the returned component kind; Rust also validates its key mode. New native behavior requires a constructor compiled into the extension; a Python factory cannot turn a Python `TreeComponent` subclass into a native implementation.
+Python's `PythonTreeComponentArgument`, defined in `unified_cache/components/base.py`, requires `component_type`, `params`, and `cache`. The independent `TreeComponentArgument`, defined in `rust_tree_core/component_registry.py`, requires `component_type`, `params`, `native_init_params`, `native_bindings`, and `is_bigram`.
+
+Factories run during construction; Rust retains the native component and performs tree operations without Python node callbacks. Factories should construct a fresh component for each cache. Both backends validate the returned component kind; Rust also validates its key mode. New native behavior requires a constructor compiled into the extension; a Python factory cannot turn a Python `TreeComponent` subclass into a native implementation.
 
 For example, these factories select the existing Full implementations under a shared name:
 
 ```python
-from sglang.srt.mem_cache.rust_tree_core.component_registry import register_rust_tree_component
+from sglang.srt.mem_cache.rust_tree_core.component_registry import (
+    TreeComponentArgument,
+    register_rust_tree_component,
+)
+from sglang.srt.mem_cache.unified_cache.components.base import PythonTreeComponentArgument
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.registry import register_python_tree_component
 
 
-def python_full(args):
+def python_full(args: PythonTreeComponentArgument):
     return FullComponent(args.cache, args.params)
 
 
-def native_full(args):
+def native_full(args: TreeComponentArgument):
     return args.native_bindings.TreeComponentBinding.full(
         args.native_init_params, args.is_bigram
     )

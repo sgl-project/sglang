@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from typing import Callable
 
-from sglang.srt.mem_cache.unified_cache.component_factory import TreeComponentArgument
-from sglang.srt.mem_cache.unified_cache.components.base import TreeComponent
+from sglang.srt.mem_cache.unified_cache.components.base import (
+    PythonTreeComponentArgument,
+    TreeComponent,
+)
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 
 PythonTreeComponentFactory = (
-    type[TreeComponent] | Callable[[TreeComponentArgument], TreeComponent]
+    type[TreeComponent] | Callable[[PythonTreeComponentArgument], TreeComponent]
 )
 _PYTHON_TREE_COMPONENT_REGISTRY: dict[str, PythonTreeComponentFactory] = {}
 
@@ -39,7 +41,7 @@ def registered_python_tree_components() -> dict[str, PythonTreeComponentFactory]
 
 
 def create_python_tree_component(
-    factory: PythonTreeComponentFactory, args: TreeComponentArgument
+    factory: PythonTreeComponentFactory, args: PythonTreeComponentArgument
 ) -> TreeComponent:
     """Construct and validate a Python component from a class or factory."""
     if isinstance(factory, type) and issubclass(factory, TreeComponent):

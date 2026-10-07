@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from types import ModuleType
 from typing import TYPE_CHECKING, Callable
 
 from sglang.srt.mem_cache.unified_cache.component_factory import (
-    TreeComponentArgument,
     resolve_component_factory_keys,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -18,6 +19,18 @@ from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+
+
+@dataclass(frozen=True)
+class TreeComponentArgument:
+    """Arguments supplied to native component factories."""
+
+    component_type: ComponentType
+    params: CacheInitParams
+    native_init_params: object
+    native_bindings: ModuleType
+    is_bigram: bool
+
 
 RustTreeComponentFactory = Callable[[TreeComponentArgument], object]
 _RUST_TREE_COMPONENT_REGISTRY: dict[str, RustTreeComponentFactory] = {}

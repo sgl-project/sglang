@@ -1,9 +1,7 @@
-"""Construction arguments and selectors shared by component factories."""
+"""Factory keys and selectors shared by component registries."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from types import ModuleType
 from typing import TYPE_CHECKING
 
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -11,23 +9,12 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.unified_cache.components.base import TreeComponent
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 DEFAULT_COMPONENT_FACTORY_KEYS: dict[ComponentType, str] = {
     ComponentType.FULL: "full",
     ComponentType.SWA: "swa",
     ComponentType.MAMBA: "mamba",
 }
-
-
-@dataclass(frozen=True)
-class TreeComponentArgument:
-    component_type: ComponentType
-    params: CacheInitParams
-    cache: UnifiedRadixCache | None = None
-    native_init_params: object | None = None
-    native_bindings: ModuleType | None = None
-    is_bigram: bool = False
 
 
 def resolve_component_factory_keys(

@@ -20,10 +20,12 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.unified_cache.component_factory import (
-    TreeComponentArgument,
     resolve_component_factory_keys,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import (
+    PythonTreeComponentArgument,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -182,7 +184,7 @@ def create_tree_components(
         factories[component_type] = factory
     return {
         component_type: create_python_tree_component(
-            factory, TreeComponentArgument(component_type, params, cache=cache)
+            factory, PythonTreeComponentArgument(component_type, params, cache=cache)
         )
         for component_type, factory in factories.items()
     }

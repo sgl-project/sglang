@@ -63,6 +63,15 @@ _COMPONENT_UUID_COUNTERS = {
 }
 
 
+@dataclasses.dataclass(frozen=True)
+class PythonTreeComponentArgument:
+    """Arguments supplied to Python component factories."""
+
+    component_type: ComponentType
+    params: CacheInitParams
+    cache: UnifiedRadixCache
+
+
 @dataclasses.dataclass
 class ComponentData:
     value: Optional[torch.Tensor] = None

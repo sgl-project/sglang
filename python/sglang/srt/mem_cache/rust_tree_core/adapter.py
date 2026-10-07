@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.component_registry import (
+    TreeComponentArgument,
     create_rust_tree_component,
     resolve_rust_component_factories,
 )
@@ -44,9 +45,6 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     RecoverSWAWithLockedFull,
     ReplaceWriteThroughOnNodeSplit,
     SWARebuild,
-)
-from sglang.srt.mem_cache.unified_cache.component_factory import (
-    TreeComponentArgument,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase

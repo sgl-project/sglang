@@ -40,9 +40,13 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.rust_tree_core import component_registry as rust_components
 from sglang.srt.mem_cache.rust_tree_core.adapter import (
     RustUnifiedTreeCore,
     _tlru_float_config,
+)
+from sglang.srt.mem_cache.rust_tree_core.component_registry import (
+    TreeComponentArgument,
 )
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings as mem_cache
 from sglang.srt.mem_cache.rust_tree_core.extension import load_tree_core_extension
@@ -56,6 +60,9 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components import registry as python_components
+from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str, hash_str_to_int64
 from sglang.srt.runtime_context import get_context
 
@@ -133,13 +140,6 @@ def test_match_on_the_empty_tree_returns_no_indices():
 
 @pytest.fixture
 def component_factories(monkeypatch):
-    from sglang.srt.mem_cache.rust_tree_core import (
-        component_registry as rust_components,
-    )
-    from sglang.srt.mem_cache.unified_cache.components import (
-        registry as python_components,
-    )
-
     for module, attribute in (
         (python_components, "_PYTHON_TREE_COMPONENT_REGISTRY"),
         (rust_components, "_RUST_TREE_COMPONENT_REGISTRY"),
@@ -154,9 +154,6 @@ def component_factories(monkeypatch):
 def test_builtin_component_factory_constructs_native_cache_and_matches(
     is_eagle, selector
 ):
-    from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-
     cache = UnifiedRadixCache(
         CacheInitParams(
             disable=False,
@@ -182,12 +179,6 @@ def test_builtin_component_factory_constructs_native_cache_and_matches(
 def test_native_callable_constructs_components_for_each_cache(
     component_factories, is_eagle
 ):
-    from sglang.srt.mem_cache.unified_cache.component_factory import (
-        TreeComponentArgument,
-    )
-    from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-
     python_components, rust_components = component_factories
     calls = []
     handles = []
@@ -221,6 +212,7 @@ def test_native_callable_constructs_components_for_each_cache(
     assert handles[0] is not handles[1]
     for args, handle, cache in zip(calls, handles, caches):
         assert isinstance(args, TreeComponentArgument)
+        assert not hasattr(args, "cache")
         assert args.component_type == ComponentType.FULL
         assert args.params.is_eagle is is_eagle
         assert args.is_bigram is is_eagle
@@ -264,7 +256,8 @@ def test_direct_native_core_factory_does_not_require_python_registration(
         component_registry_override={ComponentType.FULL: "test_native_only"}
     )
     assert len(calls) == 1
-    assert calls[0].cache is None
+    assert isinstance(calls[0], TreeComponentArgument)
+    assert not hasattr(calls[0], "cache")
     _insert(core, [1, 2], [10, 11])
     assert core.match_prefix(
         MatchPrefixParams(key=_key([1, 2]))
