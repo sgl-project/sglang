@@ -247,7 +247,10 @@ class GenerateReqInput:
     # Return prompt top logprobs as flat arrays plus shape metadata instead of
     # the nested per-position [logprob, token_id, text] lists.
     return_flat_raw_top_logprobs: bool = False
-    # Base64-encode the flat arrays. Requires return_flat_raw_top_logprobs.
+    # Return output top logprobs the same way, on the finished response only,
+    # which also skips detokenizing every candidate. Not supported with stream.
+    return_flat_raw_output_top_logprobs: bool = False
+    # Base64-encode the flat arrays. Requires one of the two flags above.
     return_flat_raw_top_logprobs_b64: bool = False
     # Whether to stream output.
     stream: bool = False
@@ -458,12 +461,18 @@ class GenerateReqInput:
                 "scoring: delimiter-sparse top logprob rows have no contiguous "
                 "position mapping."
             )
-        if (
-            self.return_flat_raw_top_logprobs_b64
-            and not self.return_flat_raw_top_logprobs
+        if self.return_flat_raw_output_top_logprobs and self.stream:
+            raise ValueError(
+                "return_flat_raw_output_top_logprobs is only set on the finished "
+                "response and does not support stream=True."
+            )
+        if self.return_flat_raw_top_logprobs_b64 and not (
+            self.return_flat_raw_top_logprobs
+            or self.return_flat_raw_output_top_logprobs
         ):
             raise ValueError(
-                "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs."
+                "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs "
+                "or return_flat_raw_output_top_logprobs."
             )
 
     def _determine_batch_size(self):
@@ -967,6 +976,7 @@ class GenerateReqInput:
             sampling_logprobs_mode=self.sampling_logprobs_mode[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
+            return_flat_raw_output_top_logprobs=self.return_flat_raw_output_top_logprobs,
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,

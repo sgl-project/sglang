@@ -761,6 +761,41 @@ class ServingChatTestCase(CustomTestCase):
             "return_sampling_mask requires return_meta_info=true.",
         )
 
+    def test_validate_request_rejects_flat_output_top_logprobs_without_meta_info(
+        self,
+    ):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            logprobs=True,
+            top_logprobs=2,
+            return_flat_raw_output_top_logprobs=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_flat_raw_output_top_logprobs requires return_meta_info=true.",
+        )
+
+    def test_convert_to_internal_request_passes_flat_output_top_logprobs(self):
+        self.tm.tokenizer = None
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            input_ids=[101, 102, 103],
+            logprobs=True,
+            top_logprobs=2,
+            return_meta_info=True,
+            return_flat_raw_output_top_logprobs=True,
+            return_flat_raw_top_logprobs_b64=True,
+        )
+
+        adapted, _ = self.chat._convert_to_internal_request(req, self.fastapi_request)
+
+        self.assertEqual(adapted.top_logprobs_num, 2)
+        self.assertTrue(adapted.return_flat_raw_output_top_logprobs)
+        self.assertTrue(adapted.return_flat_raw_top_logprobs_b64)
+
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
             model="x",

@@ -126,6 +126,24 @@ class TestFlatRawTopLogprobsValidation(CustomTestCase):
         for i in range(2):
             self.assertTrue(req[i].return_flat_raw_top_logprobs_b64)
 
+    def test_output_flag_enables_b64_and_propagates_to_batch_items(self):
+        req = GenerateReqInput(
+            text=["a", "b"],
+            return_flat_raw_output_top_logprobs=True,
+            return_flat_raw_top_logprobs_b64=True,
+        )
+        req.normalize_batch_and_arguments()
+        for i in range(2):
+            self.assertTrue(req[i].return_flat_raw_output_top_logprobs)
+            self.assertTrue(req[i].return_flat_raw_top_logprobs_b64)
+
+    def test_output_flag_rejects_stream(self):
+        req = GenerateReqInput(
+            text="hello", stream=True, return_flat_raw_output_top_logprobs=True
+        )
+        with self.assertRaisesRegex(ValueError, "stream"):
+            req.normalize_batch_and_arguments()
+
 
 class TestFlatAssembly(CustomTestCase):
     def test_flat_matches_nested_rows(self):
@@ -314,6 +332,114 @@ class TestB64MetaInfo(CustomTestCase):
             again["input_top_logprobs_val_flat_b64"],
             meta_info["input_top_logprobs_val_flat_b64"],
         )
+
+
+class TestFlatOutputTopLogprobs(CustomTestCase):
+    def _state(self, val_rows=None, **obj_kwargs) -> ReqState:
+        state = _make_state(
+            return_logprob=True,
+            top_logprobs_num=2,
+            return_flat_raw_output_top_logprobs=True,
+            **obj_kwargs,
+        )
+        state.output_top_logprobs_val.extend(val_rows or _EXACT_VAL_ROWS[1:])
+        state.output_top_logprobs_idx.extend(_IDX_ROWS[1:])
+        return state
+
+    def _meta_info(self, state: ReqState, finished: bool) -> dict:
+        meta_info = {}
+        _TokenizerManagerStub().add_logprob_to_meta_info(
+            meta_info,
+            state,
+            top_logprobs_num=2,
+            token_ids_logprob=None,
+            return_text_in_logprobs=False,
+            finished=finished,
+        )
+        return meta_info
+
+    def test_unfinished_output_carries_no_top_logprobs(self):
+        state = self._state()
+
+        meta_info = self._meta_info(state, finished=False)
+
+        self.assertFalse(any(k.startswith("output_top_logprobs") for k in meta_info))
+        self.assertEqual(state.output_top_logprobs, [])
+
+    def test_finished_output_replaces_nested(self):
+        meta_info = self._meta_info(self._state(), finished=True)
+
+        self.assertNotIn("output_top_logprobs", meta_info)
+        self.assertEqual(meta_info["output_top_logprobs_shape"], [3, 2])
+        self.assertEqual(meta_info["output_top_logprobs_null_prefix"], 0)
+        self.assertEqual(
+            meta_info["output_top_logprobs_val_flat"],
+            [v for row in _EXACT_VAL_ROWS[1:] for v in row],
+        )
+        self.assertEqual(
+            meta_info["output_top_logprobs_idx_flat"],
+            [i for row in _IDX_ROWS[1:] for i in row],
+        )
+        # The prompt side keeps its own format.
+        self.assertIn("input_top_logprobs", meta_info)
+
+    def test_b64_roundtrip_keeps_non_finite_logprobs(self):
+        val_rows = [[-0.5, float("-inf")], [-0.25, -1.5], [-0.125, -4.0]]
+        state = self._state(val_rows, return_flat_raw_top_logprobs_b64=True)
+
+        meta_info = self._meta_info(state, finished=True)
+
+        self.assertNotIn("output_top_logprobs_val_flat", meta_info)
+        shape = meta_info["output_top_logprobs_shape"]
+        val = np.frombuffer(
+            base64.b64decode(meta_info["output_top_logprobs_val_flat_b64"]),
+            dtype=meta_info["output_top_logprobs_val_flat_b64_dtype"],
+        ).reshape(shape)
+        idx = np.frombuffer(
+            base64.b64decode(meta_info["output_top_logprobs_idx_flat_b64"]),
+            dtype=meta_info["output_top_logprobs_idx_flat_b64_dtype"],
+        ).reshape(shape)
+        np.testing.assert_array_equal(val, np.asarray(val_rows, dtype=np.float32))
+        np.testing.assert_array_equal(idx, np.asarray(_IDX_ROWS[1:], dtype=np.int32))
+
+    def test_unrepresentable_rows_fall_back_to_nested(self):
+        state = self._state([[-0.5, -2.5], [-0.25], [-0.125, -4.0]])
+
+        meta_info = self._meta_info(state, finished=True)
+
+        self.assertNotIn("output_top_logprobs_shape", meta_info)
+        self.assertEqual(len(meta_info["output_top_logprobs"]), 3)
+
+    def test_convert_logprob_style_forwards_finished(self):
+        state = _make_state(
+            return_logprob=True,
+            top_logprobs_num=2,
+            return_flat_raw_output_top_logprobs=True,
+        )
+        recv_obj = SimpleNamespace(
+            input_token_logprobs_val=None,
+            output_token_logprobs_val=[[-0.5]],
+            output_token_logprobs_idx=[[11]],
+            input_top_logprobs_val=None,
+            input_top_logprobs_val_flat=None,
+            output_top_logprobs_val=[[[-0.5, -2.5]]],
+            output_top_logprobs_idx=[[[11, 22]]],
+        )
+        meta_info = {}
+
+        _TokenizerManagerStub().convert_logprob_style(
+            meta_info,
+            state,
+            top_logprobs_num=2,
+            token_ids_logprob=None,
+            return_text_in_logprobs=False,
+            recv_obj=recv_obj,
+            recv_obj_index=0,
+            finished=True,
+        )
+
+        self.assertEqual(meta_info["output_top_logprobs_shape"], [1, 2])
+        self.assertEqual(meta_info["output_top_logprobs_idx_flat"], [11, 22])
 
 
 def _make_logprob_processor() -> SchedulerLogprobResultProcessor:
