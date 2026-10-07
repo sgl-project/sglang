@@ -140,7 +140,7 @@ export const config = {
               "--hicache-write-policy write_through"]
             : ["--enable-hierarchical-cache", "--hicache-size 32"],
           hints: (s) => s.hw === "mi355x"
-            ? ["180 GB host tier per GPU (about 720 GB for four GPUs), write-through; the measured MI355X agentic recipe."]
+            ? ["About 750 GB of host memory per node; the measured MI355X agentic recipe."]
             : ["32 GB host tier; the default ratio can demand more host RAM than the node has free."],
         },
         {
