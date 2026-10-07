@@ -170,7 +170,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                                 {},
                             )
 
-    def test_glm5_next_cp_requires_text_only_serving(self):
+    def test_glm5_next_cp_allows_multimodal_serving(self):
         from sglang.srt.arg_groups.parallel_hook import _boundary_parallelism_overrides
 
         for prefill_cp in (False, True):
@@ -192,18 +192,68 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                             language_only=language_only,
                             language_model_only=language_model_only,
                         )
-                        if (
-                            prefill_cp
-                            and cp_size > 1
-                            and not (language_only or language_model_only)
-                        ):
-                            with self.assertRaisesRegex(ValueError, "--language-only"):
-                                _boundary_parallelism_overrides(cfg, "glm5_next_text")
-                        else:
-                            self.assertEqual(
-                                _boundary_parallelism_overrides(cfg, "glm5_next_text"),
-                                {},
-                            )
+                        self.assertEqual(
+                            _boundary_parallelism_overrides(cfg, "glm5_next_text"),
+                            {},
+                        )
+
+
+class TestCpTpGroupSharing(CustomTestCase):
+    def resolve(self, architecture="Glm5NextForConditionalGeneration", heads=32, **kw):
+        from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
+            resolve_cp_tp_group_sharing,
+        )
+        from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
+        from sglang.srt.server_args import ServerArgs
+
+        options = dict(
+            tp_size=4,
+            attn_cp_size=4,
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            cuda_graph_config=CudaGraphConfig(),
+        )
+        options.update(kw)
+        args = ServerArgs(model_path="dummy", **options)
+        model = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture]),
+            hf_text_config=SimpleNamespace(linear_attn_config={"num_heads": heads}),
+        )
+        resolve_cp_tp_group_sharing(args, model)
+        return args
+
+    def test_sharing_is_model_resolved_and_keeps_raw_args_pristine(self):
+        for options, expected in (
+            ({}, True),
+            ({"enable_prefill_cp": False}, False),
+            ({"attn_cp_size": 1}, False),
+            (
+                {
+                    "architecture": "DeepseekV32ForCausalLM",
+                    "tp_size": 8,
+                    "attn_cp_size": 2,
+                    "attn_dp_size": 2,
+                },
+                False,
+            ),
+        ):
+            with self.subTest(options=options):
+                args = self.resolve(**options)
+                self.assertEqual(
+                    resolution_result(args, "cp_tp_group_sharing"), expected
+                )
+                self.assertFalse(args.cp_tp_group_sharing)
+
+    def test_sharing_rejects_noncollocated_topologies_and_indivisible_heads(self):
+        for options, error in (
+            ({"attn_cp_size": 2}, "tp-size.*attn-cp-size"),
+            ({"attn_dp_size": 2}, "attention DP"),
+            ({"heads": 30}, "num_heads.*divisible"),
+            ({"cp_strategy": "zigzag"}, "interleave"),
+        ):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(ValueError, error):
+                    self.resolve(**options)
 
 
 class TestModelOverridableWhitelist(CustomTestCase):
@@ -246,6 +296,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "attn_cp_size",
                     "dcp_comm_backend",
                     "dcp_replicate_q_proj",
+                    "cp_tp_group_sharing",
                     "disable_overlap_schedule",
                     "disable_radix_cache",
                     "uses_mamba_radix_cache",

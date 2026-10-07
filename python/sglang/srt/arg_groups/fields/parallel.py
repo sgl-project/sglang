@@ -161,6 +161,14 @@ class Parallel(msgspec.Struct):
             choices=("zigzag", "interleave"),
         ),
     ] = None
+    cp_tp_group_sharing: A[
+        bool,
+        Arg(
+            help="(Derived) prefill CP shares the TP group while linear attention keeps TP head partitions.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
     # Split DSA GPU KV/indexer cache layers across CP ranks.
     enable_dsa_cache_layer_split: A[
         bool,

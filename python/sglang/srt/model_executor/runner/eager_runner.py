@@ -370,7 +370,9 @@ class EagerRunner(BaseRunner):
                         forward_batch,
                         **kwargs,
                     )
-            elif cp_active:
+            elif cp_active and not getattr(
+                model_runner.model, "supports_full_sequence_cp", False
+            ):
                 ret = self._execute_extend_cp(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(

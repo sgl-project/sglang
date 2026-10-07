@@ -462,7 +462,9 @@ class TestAttentionCpBoundary(CustomTestCase):
                                     declare_attn(
                                         read=residual.attn_readout,
                                         update=residual.attn_update,
-                                        tensor_parallel_over_cp=tensor_parallel,
+                                        tp_group=comm.SumGroup.TP
+                                        if tensor_parallel
+                                        else comm.SumGroup.ATTN_TP,
                                     ),
                                     None,
                                 ),

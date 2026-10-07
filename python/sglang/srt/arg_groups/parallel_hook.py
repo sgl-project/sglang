@@ -7,6 +7,7 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.cp_tp_group_sharing_hook import resolve_cp_tp_group_sharing
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
     _dcp_comm_backend_default,
@@ -80,11 +81,6 @@ def _boundary_parallelism_overrides(cfg, model_type: str) -> dict:
                 "GLM-5.3-Flash prefill CP does not support PD disaggregation: "
                 "KDA state transfer does not yet support CP head partitions."
             )
-        if not (cfg.language_only or cfg.language_model_only):
-            raise ValueError(
-                "GLM-5.3-Flash prefill CP currently supports text-only serving; "
-                "add --language-only."
-            )
     if (nemotron or longcat) and cfg.enable_attn_tp_input_scattered:
         # Neither model enters the input-scattered attention scope. Preserve
         # their existing ordinary execution and make the effective flag explicit.
@@ -116,6 +112,7 @@ def handle_context_parallelism(server_args: Any):
                 cfg, model_config.hf_text_config.model_type
             ),
         )
+        resolve_cp_tp_group_sharing(server_args, model_config)
         if (
             cfg.enable_prefill_cp
             and get_platform().is_hip
