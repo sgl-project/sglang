@@ -3,10 +3,11 @@
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
-from sglang.srt.dllm.mixin.scheduler import DllmManager
+from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -222,6 +223,39 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         )
         self.assertEqual(manager.waiting_queue, [keep])
         self.assertEqual(manager.staging_queue, [])
+
+
+class TestDllmFdfoResolvedBlockKeepsRow(unittest.TestCase):
+    def test_resolved_block_keeps_row_until_next_block(self):
+        """A resolved FDFO block used to hand its row back to the pool while the
+        request kept running. An abort before the next block then skipped
+        release_kv_cache (it only runs for row holders), leaking the request's
+        tree lock and any KV the tree does not own."""
+        pool = ReqToTokenPool(
+            size=4, max_context_len=16, device="cpu", enable_memory_saver=False
+        )
+        req = SimpleNamespace(
+            dllm_incomplete_ids=array("q"),
+            is_dllm_prefill=lambda: False,
+            kv=ReqKvInfo(kv_allocated_len=8, kv_committed_len=8),
+        )
+        pool.alloc([req])
+        row = req.kv.req_pool_idx
+        scheduler = SimpleNamespace(
+            dllm_config=SimpleNamespace(
+                first_done_first_out_mode=True,
+                requires_separate_context_encoding=False,
+            ),
+            req_to_token_pool=pool,
+            stash_chunked_request=Mock(),
+        )
+
+        SchedulerDllmMixin.finish_dllm_forward(scheduler, req)
+
+        scheduler.stash_chunked_request.assert_called_once_with(req)
+        self.assertTrue(req.kv.holds_kv)
+        self.assertEqual(req.kv.req_pool_idx, row)
+        self.assertNotIn(row, pool.free_slots)
 
 
 if __name__ == "__main__":
