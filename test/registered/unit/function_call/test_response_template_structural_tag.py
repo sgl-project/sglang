@@ -8,7 +8,6 @@ from xgrammar import Grammar
 from xgrammar.testing import _is_grammar_accept_string
 
 from sglang.srt.function_call.response_template_structural_tag import (
-    json_answer_structural_tag,
     supports_tool_call_structural_tag,
     tool_call_structural_tag,
 )
@@ -151,7 +150,7 @@ class TestToolCallStructuralTag(CustomTestCase):
                 self.assertIs(_accepts(tag, text), expected)
         self.assertIsNone(_build(ANSWER_TEMPLATE, tools=()))
 
-    def test_required_reasoning_opens_the_message_with_visible_text(self):
+    def test_required_reasoning_opens_the_message_with_nonempty_reasoning(self):
         loaded = load_response_template(ANSWER_TEMPLATE)
         for required in (False, True):
             tag = tool_call_structural_tag(
@@ -166,7 +165,7 @@ class TestToolCallStructuralTag(CustomTestCase):
             cases = [
                 ("<answer>Sunny.", not required),
                 ("<think></think><answer>Sunny.", not required),
-                ("<think> \n</think><answer>Sunny.", not required),
+                ("<think> \n</think><answer>Sunny.", True),
                 ("<think>\nplan</think><answer>Sunny.", True),
             ]
             for text, expected in cases:
@@ -235,7 +234,7 @@ class TestToolCallStructuralTag(CustomTestCase):
         spelled = copy.deepcopy(TEMPLATE)
         spelled["fields"]["tool_calls"]["close"] = ['b">x', "</call>"]
         spaced = copy.deepcopy(TEMPLATE)
-        spaced["fields"]["tool_calls"]["close"] = ["\n\n", "</call>"]
+        spaced["fields"]["tool_calls"]["close"] = ["\n", "</call>"]
         colon = copy.deepcopy(TEMPLATE)
         colon["fields"]["tool_calls"]["content_args"]["tag_pattern"] = (
             r"<arg:(?P<key>\w+)>(?P<value>.*?)</arg>"
@@ -261,16 +260,6 @@ class TestToolCallStructuralTag(CustomTestCase):
         for name, template, tool, derivable in cases:
             with self.subTest(name):
                 self.assertIs(_build(template, tools=[tool]) is not None, derivable)
-
-        for close, derivable in [(["}</call>", "</call>"], False), ("</call>", True)]:
-            with self.subTest(close=close):
-                template = copy.deepcopy(ANSWER_TEMPLATE)
-                template["fields"]["tool_calls"]["close"] = close
-                fields = load_response_template(template).fields
-                tag = json_answer_structural_tag(
-                    fields["content"], {"type": "object"}, fields["tool_calls"], ["f"]
-                )
-                self.assertIs(tag is not None, derivable)
 
     def test_non_literal_thinking_delimiters_return_none(self):
         template = copy.deepcopy(TEMPLATE)

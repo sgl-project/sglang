@@ -2,7 +2,15 @@
 
 from typing import Any
 
-from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
+from sglang.srt.function_call.response_template_structural_tag import (
+    answer_rest_structural_tag,
+    tool_call_structural_tag,
+)
+from sglang.srt.parser.chat_parsing.response_parser import ResponseParser
+from sglang.srt.parser.response_template import (
+    _CONTENT_FIELD,
+    ResponseTemplateReasoningDetector,
+)
 
 BEAM_RESPONSE_TEMPLATE: dict[str, Any] = {
     "defaults": {"role": "assistant"},
@@ -58,4 +66,35 @@ BEAM_RESPONSE_TEMPLATE: dict[str, Any] = {
 class BeamReasoningDetector(ResponseTemplateReasoningDetector):
     response_template = BEAM_RESPONSE_TEMPLATE
     reasoning_default = "always"
-    grammar_requires_reasoning = True
+
+    def answer_rest_structural_tag(self, prefix: str) -> dict[str, Any] | None:
+        parser = ResponseParser(self.response_template, prefix=prefix)
+        regions = [
+            (event.get("field"), event["type"])
+            for event in parser.initial_events
+            if event["type"] != "region_chunk"
+        ]
+        if regions[-1:] != [(_CONTENT_FIELD, "region_open")]:
+            return None
+        return answer_rest_structural_tag(self._content_field)
+
+    def json_answer_structural_tag(
+        self,
+        json_schema: Any,
+        *,
+        tools: list[dict[str, Any]],
+        parallel_tool_calls: bool = True,
+        message_start: bool = False,
+    ) -> dict[str, Any] | None:
+        if not self.think_end_token or self._content_field is None:
+            return None
+        return tool_call_structural_tag(
+            self._tool_field,
+            tools,
+            parallel_tool_calls=parallel_tool_calls,
+            thinking=self._thinking_field if message_start else None,
+            answer=self._content_field,
+            answer_format={"type": "json_schema", "json_schema": json_schema},
+            message_start=self._message_start if message_start else None,
+            grammar_requires_reasoning=True,
+        )

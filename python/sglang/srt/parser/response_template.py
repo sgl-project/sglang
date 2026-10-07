@@ -21,7 +21,7 @@ import logging
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -32,12 +32,8 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.response_template_structural_tag import (
-    answer_rest_structural_tag,
-    json_answer_structural_tag,
     message_start_anchors,
     message_start_openers,
-    supports_tool_call_structural_tag,
-    tool_call_structural_tag,
     typed_parameters,
 )
 from sglang.srt.parser.chat_parsing.content_parsers import _apply_transform
@@ -414,7 +410,6 @@ class ResponseTemplateReasoningDetector:
     _default_think_end = ""
     thinks_internally = False
     reasoning_default = "explicit_enable_thinking"
-    grammar_requires_reasoning = False
 
     def __init__(
         self,
@@ -497,38 +492,21 @@ class ResponseTemplateReasoningDetector:
 
     def answer_rest_structural_tag(self, prefix: str) -> dict[str, Any] | None:
         """A structural tag for the rest of an answer that `prefix` leaves open,
-        or `None` if it leaves none open."""
-        parser = ResponseParser(self.response_template, prefix=prefix)
-        regions = [
-            (event.get("field"), event["type"])
-            for event in parser.initial_events
-            if event["type"] != "region_chunk"
-        ]
-        if regions[-1:] != [(_CONTENT_FIELD, "region_open")]:
-            return None
-        return answer_rest_structural_tag(self._content_field)
+        or `None` if none applies."""
+        return None
 
     def json_answer_structural_tag(
         self,
         json_schema: Any,
         *,
-        tool_names: list[str],
+        tools: list[dict[str, Any]],
+        parallel_tool_calls: bool = True,
         message_start: bool = False,
     ) -> dict[str, Any] | None:
         """A structural tag for JSON framed as the answer, after the reasoning
         or, at the `message_start`, from the first token, or `None` to apply the
         JSON schema directly. Calls to `tool_names` may come first."""
-        if not self.think_end_token or self._content_field is None:
-            return None
-        return json_answer_structural_tag(
-            self._content_field,
-            json_schema,
-            self._tool_field,
-            tool_names,
-            thinking=self._thinking_field,
-            message_start=self._message_start if message_start else None,
-            grammar_requires_reasoning=self.grammar_requires_reasoning,
-        )
+        return None
 
     def json_output_started(self, text: str) -> bool:
         """Whether generated `text` reaches the start of JSON-schema output."""
@@ -585,7 +563,6 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
 
     response_template: dict | None = None
     constrains_every_turn = False
-    grammar_requires_reasoning = False
 
     def __init__(
         self,
@@ -775,10 +752,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         return ToolStreamingParseResult(normal_text=normal_text, calls=pending_calls)
 
     def supports_structural_tag(self) -> bool:
-        # Forced calls then keep the native format, which this detector parses
-        # instead of the JSON array used without a template-derived tag.
-        tools = [tool.model_dump() for tool in self._tools or ()]
-        return supports_tool_call_structural_tag(self._tool_field, tools)
+        return False
 
     def open_call_closer(self, text: str) -> str | None:
         """The closer for a call that `text` leaves open at its end."""
@@ -801,36 +775,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         parallel_tool_calls: bool = True,
         message_start: bool = False,
     ):
-        tool_dicts = [tool.model_dump() for tool in tools or ()]
-        if tool_choice == "none":
-            tool_dicts, tool_choice = [], "auto"
-        named = isinstance(tool_choice, ToolChoice)
-        # Named calls still fall back if another tool cannot use this format.
-        if named and not supports_tool_call_structural_tag(
-            self._tool_field, tool_dicts
-        ):
-            return None
-        if named:
-            tool_dicts = [
-                tool
-                for tool in tool_dicts
-                if tool["function"]["name"] == tool_choice.function.name
-            ]
-        tag = tool_call_structural_tag(
-            self._tool_field,
-            tool_dicts,
-            parallel_tool_calls=parallel_tool_calls and not named,
-            thinking=self._thinking_field if thinking_mode else None,
-            answer=self._content_field if tool_choice == "auto" else None,
-            # The tag then covers the output from its first token.
-            message_start=self._message_start if message_start else None,
-            grammar_requires_reasoning=self.grammar_requires_reasoning,
-        )
-        if tag is None:
-            return None
-        from xgrammar import StructuralTag
-
-        return StructuralTag.model_validate(tag)
+        return None
 
     def validate_structure_constraint_request(
         self,
@@ -840,22 +785,16 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         strict_requested: bool,
     ) -> bool:
         """Whether to constrain automatic tool choice."""
-        if tool_choice == "auto" and parallel_tool_calls and not strict_requested:
-            return False
-        # Raises for unencodable names before the caller would log and drop
-        # the error, leaving the request unconstrained.
-        tag = self.get_structural_tag(tools=tools, tool_choice=tool_choice)
-        if tool_choice != "auto":
-            return False
-        if tag is None:
-            requested = (
-                "strict tools" if strict_requested else "parallel_tool_calls=False"
-            )
+        if tool_choice == "auto" and not parallel_tool_calls:
             raise ValueError(
-                f"{type(self).__name__} cannot enforce {requested} with "
-                "automatic tool choice for this response template"
+                f"{type(self).__name__} cannot enforce "
+                "parallel_tool_calls=False with automatic tool choice"
             )
-        return True
+        if tool_choice == "auto" and strict_requested:
+            raise ValueError(
+                f"{type(self).__name__} does not support strict tool constraints"
+            )
+        return False
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError(
