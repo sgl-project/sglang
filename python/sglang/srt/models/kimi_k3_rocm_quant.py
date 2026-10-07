@@ -19,11 +19,13 @@ point behind ``_is_hip`` and keeps the checkpoint's own layout otherwise.
 """
 
 from types import SimpleNamespace
+from typing import Optional
 
 import torch
 from torch import nn
 
 from sglang.srt.environ import envs
+from sglang.srt.models.kimi_k3_rocm_fusion import _k3_log_once
 
 
 def _k3_channel_fp8_to_bf16(module: nn.Module, weight: torch.Tensor) -> torch.Tensor:
@@ -146,3 +148,108 @@ def _k3_densify_quark_shared_experts(mlp: nn.Module) -> None:
         scheme = getattr(linear, "scheme", None)
         if isinstance(scheme, quark_w4a4_mxfp4.QuarkW4A4MXFP4):
             scheme.process_weights_after_loading(linear)
+
+
+def _k3_qkvgbfa_inproj(self_attn: nn.Module, hidden_states) -> Optional[torch.Tensor]:
+    """Run the merged [q,k,v,g | f_a | b] projection, or None if uncovered."""
+    if self_attn._use_qkvgbfa_ptpc_fp8(hidden_states):
+        from sglang.kernels.ops.gemm import ptpc_fp8_aiter_hip
+
+        if isinstance(hidden_states, tuple):
+            return ptpc_fp8_aiter_hip.run(
+                hidden_states[0],
+                self_attn._qkvgbfa_fp8_w,
+                self_attn._qkvgbfa_fp8_s,
+                self_attn._qkvgbfa_fp8_n,
+                x_scale=hidden_states[1],
+            )
+        return ptpc_fp8_aiter_hip.run(
+            hidden_states,
+            self_attn._qkvgbfa_fp8_w,
+            self_attn._qkvgbfa_fp8_s,
+            self_attn._qkvgbfa_fp8_n,
+        )
+    # A prequantized merge has no dense carrier to hand the linear method.
+    if self_attn._qkvgbfa_layer is None:
+        return None
+    return self_attn.fused_qkvg_proj.quant_method.apply(
+        self_attn._qkvgbfa_layer, hidden_states, None
+    )
+
+
+
+def k3_prepare_front_down_fp8(mlp: nn.Module) -> None:
+    """Pack the fused front's latent down-projection for the PTPC FP8 path.
+
+    Mirrors ``_prepare_moe_latent_mxfp4``'s split of the merged front weight --
+    ``[gate_up | router | latent_down]`` -- keeping the router head BF16 (FP8
+    logits move the top-k pick) and quantizing only the ``[3584, 7168]`` tail.
+
+    The head view is shared with the MXFP4 path when both are packed; it is a
+    slice of ``_front_w``, so this costs one FP8 copy of the down-projection and
+    nothing else.
+    """
+    if not envs.SGLANG_ROCM_K3_MOE_LATENT_FP8.get() or not mlp.use_latent_moe:
+        return
+    if not (mlp._eligible_for_fused_front or mlp._eligible_for_partial_fused_front):
+        return
+    if mlp._front_sizes is None or len(mlp._front_sizes) not in (2, 3):
+        return
+
+    from sglang.kernels.ops.gemm import ptpc_fp8_aiter_hip
+
+    if not ptpc_fp8_aiter_hip.available():
+        return
+    head_rows = sum(mlp._front_sizes[:-1])
+    down = mlp._front_w[head_rows:]
+    if tuple(down.shape) != (3584, 7168) or down.dtype != torch.bfloat16:
+        return
+
+    if mlp._front_head is None:
+        mlp._front_head = mlp._front_w[:head_rows]
+    # Resolved once here rather than per forward: k3_use_front_down_fp8 runs on
+    # every layer of every step, and this pack already happens after load.
+    mlp._front_down_fp8_min_tokens = envs.SGLANG_ROCM_K3_MOE_LATENT_FP8_MIN_TOKENS.get()
+    (
+        mlp._front_down_fp8_w,
+        mlp._front_down_fp8_s,
+        mlp._front_down_fp8_n,
+    ) = ptpc_fp8_aiter_hip.pack(down.contiguous())
+    # Kernel selection must happen outside cuda-graph capture.
+    ptpc_fp8_aiter_hip.warmup(
+        mlp._front_down_fp8_w,
+        mlp._front_down_fp8_s,
+        mlp._front_down_fp8_n,
+        down.shape[1],
+    )
+    _k3_log_once(
+        "k3_front_down_fp8",
+        "K3 ROCm: latent front down-projection packed as PTPC FP8 "
+        "(decode batches >= %d)",
+        mlp._front_down_fp8_min_tokens,
+    )
+
+
+
+def k3_use_front_down_fp8(mlp: nn.Module, num_tokens: int) -> bool:
+    return (
+        getattr(mlp, "_front_down_fp8_w", None) is not None
+        and num_tokens >= mlp._front_down_fp8_min_tokens
+    )
+
+
+
+def k3_run_front_down_fp8(
+    mlp: nn.Module, hidden_states: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """``hidden_states @ latent_down.T`` in PTPC FP8, or None if uncovered."""
+    from sglang.kernels.ops.gemm import ptpc_fp8_aiter_hip
+
+    if not ptpc_fp8_aiter_hip.covered(hidden_states, mlp._front_down_fp8_w):
+        return None
+    return ptpc_fp8_aiter_hip.run(
+        hidden_states,
+        mlp._front_down_fp8_w,
+        mlp._front_down_fp8_s,
+        mlp._front_down_fp8_n,
+    )

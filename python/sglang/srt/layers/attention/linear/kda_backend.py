@@ -401,6 +401,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # force-flush path.
     needs_cpu_seq_lens: bool = False
 
+    # One-shot log guard for the HIP fused-KDA rejection diagnostic.
+    _hip_fused_reject_logged: bool = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         # Needed by the extra_buffer track path: _init_track_conv_indices reads

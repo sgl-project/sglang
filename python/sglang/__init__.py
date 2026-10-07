@@ -7,11 +7,48 @@ import sys as _sys
 # (hf_transformers_patches, lang.api, ...), which pull in torch and
 # FlashInfer: those claim these cache dirs early, and the first value set is
 # the one that sticks. Safe here -- environ has no heavy dependency (no torch).
+from sglang.srt.environ import envs as _envs
 from sglang.srt.environ import (
     redirect_third_party_caches as _redirect_third_party_caches,
 )
 
 _redirect_third_party_caches()
+
+# Kimi-K3 may opt into an SGLang-owned AITER tuning profile. Configure it
+# before any downstream import can initialize AITER_CONFIGS.
+import importlib.util as _importlib_util
+import os as _os
+from pathlib import Path as _Path
+
+import torch as _torch
+
+if (
+    _torch.version.hip is not None
+    and _envs.SGLANG_ROCM_K3_AITER_M16384_PROFILE.get()
+    and "AITER_CONFIG_GEMM_BF16" not in _os.environ
+):
+    _aiter_spec = _importlib_util.find_spec("aiter")
+    if _aiter_spec is not None and _aiter_spec.origin is not None:
+        _aiter_root = _Path(_aiter_spec.origin).resolve().parent
+        _base = _aiter_root / "configs" / "bf16_tuned_gemm.csv"
+        _model_configs = sorted(
+            (_aiter_root / "configs" / "model_configs").glob("*bf16_tuned_gemm*.csv")
+        )
+        _profile = (
+            _Path(__file__).resolve().parent
+            / "kernels"
+            / "ops"
+            / "gemm"
+            / "configs"
+            / "kimik3_m16384_profile.csv"
+        )
+        _paths = [_base, *_model_configs, _profile]
+        if all(_path.is_file() for _path in _paths):
+            _os.environ["AITER_CONFIG_GEMM_BF16"] = _os.pathsep.join(map(str, _paths))
+del _importlib_util
+del _os
+del _Path
+del _torch
 
 if _sys.platform == "darwin" and _platform.machine() == "arm64":
     from sglang._platform_stubs import install_platform_stubs as _install_platform_stubs

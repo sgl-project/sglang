@@ -85,7 +85,7 @@ class TestNightlyKimiK3PerformanceMI35x(unittest.TestCase):
             # is read by AITER itself rather than sglang.
             "env_vars": {
                 "SGLANG_USE_AITER": "1",
-                "SGLANG_AITER_K3_OPT": "1",
+                "SGLANG_ROCM_K3_AITER_OPT": "1",
                 "AITER_FLYDSL_FORCE": "1",
                 "AITER_SITUV2_A8W4": "1",
             },
