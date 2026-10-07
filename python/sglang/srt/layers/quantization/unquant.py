@@ -36,6 +36,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_platform,
+    get_spec,
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -134,6 +135,7 @@ _direct_default_tactic = None
 _prefer_direct = None
 _run_direct_dense = None
 _enable_bf16_splitk_gemm = False
+_enable_m1_bf16_direct = False
 
 # GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
 # Unlisted shapes, including M=64, retain the existing TGV/cuBLAS path.
@@ -238,6 +240,10 @@ def precompile_splitk_tactics() -> bool:
         weight = torch.zeros(n, k, dtype=torch.bfloat16, device=device)
         out = torch.empty(m, n, dtype=torch.bfloat16, device=device)
         _bf16_splitk_gemm_out(x, weight, None, out)
+    if _enable_m1_bf16_direct:
+        x = torch.zeros(1, 2560, dtype=torch.bfloat16, device=device)
+        weight = torch.zeros(19456, 2560, dtype=torch.bfloat16, device=device)
+        _try_m1_bf16_direct(x, weight, None)
     torch.cuda.synchronize()
     return True
 
@@ -255,8 +261,9 @@ def initialize_bf16_gemm_config() -> None:
     global _direct_default_tactic
     global _prefer_direct
     global _run_direct_dense
-    global _enable_bf16_splitk_gemm
+    global _enable_bf16_splitk_gemm, _enable_m1_bf16_direct
 
+    _enable_m1_bf16_direct = False
     backend_str = get_exec().kernel.bf16_gemm_backend
     if backend_str == "auto" and get_platform().is_sm100:
         backend_str = (
@@ -316,6 +323,7 @@ def initialize_bf16_gemm_config() -> None:
         _prefer_direct = prefer_direct_bf16_gemm_sm100
         _run_direct_dense = run_direct_dense
         _enable_bf16_splitk_gemm = True
+        _enable_m1_bf16_direct = torch.cuda.get_device_capability() == (10, 3)
 
     _CUBLASLT_BF16_READY.clear()
     _BF16_GEMM_BACKEND = backend
@@ -361,6 +369,56 @@ def _bf16_splitk_gemm(
 
 _CUBLASLT_BF16_SHAPES = frozenset({(19456, 2560), (2560, 9728)})
 _CUBLASLT_BF16_READY: set[tuple[int, int, int]] = set()
+
+
+def _try_m1_bf16_direct(x, weight, bias, addend=None, out=None):
+    if (
+        not _enable_m1_bf16_direct
+        or x.ndim < 2
+        or x.shape[-1] != 2560
+        or x.numel() != 2560
+        or tuple(weight.shape) != (19456, 2560)
+    ):
+        return None
+    if (
+        bias is not None
+        or addend is not None
+        or not x.is_cuda
+        or x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or x.device != weight.device
+        or x.requires_grad
+        or weight.requires_grad
+        or not x.is_contiguous()
+        or not weight.is_contiguous()
+        or x.data_ptr() % 32
+        or weight.data_ptr() % 32
+        or not get_bf16_gemm_backend().is_cutedsl()
+        or not envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.get()
+        or get_exec().kernel.disable_flashinfer_autotune
+        or get_exec().deterministic.enable_deterministic_inference
+        or get_spec().speculative_algorithm is not None
+    ):
+        return None
+    if out is not None and (
+        x.ndim != 2
+        or out.requires_grad
+        or out.dtype != torch.bfloat16
+        or out.device != x.device
+        or not out.is_contiguous()
+        or tuple(out.shape) != (1, 19456)
+        or out.data_ptr() % 32
+    ):
+        return None
+    if out is None:
+        out = torch.empty(1, 19456, dtype=x.dtype, device=x.device)
+        result = out.view(*x.shape[:-1], 19456)
+    else:
+        result = out
+    _run_direct_dense(
+        x.view(1, 2560), weight.T, out, False, _direct_default_tactic(1, 19456, 2560)
+    )
+    return result
 
 
 def _try_tuned_bf16_cublaslt(x, weight, bias, addend=None, out=None):
@@ -414,6 +472,9 @@ def _bf16_gemm_dispatch_impl(
     tuned = _try_tuned_bf16_cublaslt(x, weight, bias, addend)
     if tuned is not None:
         return tuned
+    direct = _try_m1_bf16_direct(x, weight, bias, addend)
+    if direct is not None:
+        return direct
     m = x.numel() // x.shape[-1]
     if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
         m, weight.shape[0], weight.shape[1]
@@ -627,6 +688,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         tuned = _try_tuned_bf16_cublaslt(x, layer.weight, bias, out=output)
         if tuned is not None:
             return tuned
+        direct = _try_m1_bf16_direct(x, layer.weight, bias, out=output)
+        if direct is not None:
+            return direct
         if (
             _enable_bf16_splitk_gemm
             and bias is None
