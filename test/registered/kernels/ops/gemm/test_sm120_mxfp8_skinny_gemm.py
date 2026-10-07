@@ -1,6 +1,6 @@
 """SM120 small-M MXFP8 GEMM: FP64 reference, bit-identity with FlashInfer's
-activation quantization, determinism, batch invariance, CUDA-graph replay, and
-dispatch through Fp8LinearMethod.apply."""
+activation quantization, determinism, batch invariance, CUDA-graph replay,
+split-K counter validation, and dispatch through Fp8LinearMethod.apply."""
 
 from types import SimpleNamespace
 
@@ -84,10 +84,55 @@ def test_matches_reference(n, k, m):
         assert not counters.any(), "split-K counters must return to zero"
 
 
+@pytest.mark.parametrize("n,k", [(1792, 5120), (5120, 2048)])  # split-K, BK 256
+@pytest.mark.parametrize("m", [1, MAX_M])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_input_dtypes(n, k, m, dtype):
+    torch.manual_seed(m * 7 + n)
+    w, s = _weight(n, k)
+    x = torch.randn(m, k, device="cuda", dtype=dtype)
+    out = mxfp8_skinny_gemm(x, w, s, _counters(n, k), out_dtype=dtype)
+    assert out.dtype == dtype
+    ref = _reference(x, w, s)
+    err = (out.double() - ref).abs().max() / ref.abs().max()
+    assert err < 8e-3, err
+
+
+@pytest.mark.parametrize(
+    "case", ["missing", "strided view", "int64", "too few", "on CPU"]
+)
+def test_split_k_counters_validated(case):
+    n, k = 1792, 5120
+    bn, split, _ = tuned_config(n, k)
+    assert split > 1
+    tiles = (n + bn - 1) // bn
+    counters = {
+        "missing": lambda: None,
+        "strided view": lambda: torch.zeros(
+            2 * tiles, dtype=torch.int32, device="cuda"
+        )[::2],
+        "int64": lambda: torch.zeros(tiles, dtype=torch.int64, device="cuda"),
+        "too few": lambda: torch.zeros(tiles - 1, dtype=torch.int32, device="cuda"),
+        "on CPU": lambda: torch.zeros(tiles, dtype=torch.int32),
+    }[case]()
+    w, s = _weight(n, k)
+    x = torch.randn(6, k, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="counters"):
+        mxfp8_skinny_gemm(x, w, s, counters)
+
+
+def _cute_dsl_available():
+    from flashinfer.cute_dsl import is_cute_dsl_available
+
+    return is_cute_dsl_available()
+
+
 @pytest.mark.parametrize("backend", ["cute-dsl", "cuda"])
 @pytest.mark.parametrize("m", [1, 6, 16, 48, 128])
 def test_fused_quant_matches_flashinfer(m, backend):
     flashinfer = pytest.importorskip("flashinfer")
+    if backend == "cute-dsl" and not _cute_dsl_available():
+        pytest.skip("FlashInfer CuTe-DSL is not installed")
     n, k = 8192, 1280
     # FlashInfer's CUDA backend flushes BF16 subnormal inputs to zero; the
     # CuTe-DSL backend (the one SGLang calls) and this kernel keep them.
@@ -98,11 +143,8 @@ def test_fused_quant_matches_flashinfer(m, backend):
     x[0, 0:32] = 0
     x[0, 32:64] = 3.5  # amax / 448 is exactly 2^-7
     x[0, 64:96] = 448.0 * 2.0**-127  # amax / 448 at the smallest UE8M0 scale
-    try:
-        q, sf = flashinfer.mxfp8_quantize(x, True, 32, backend=backend)
-        q_lin, sf_lin = flashinfer.mxfp8_quantize(x, False, 32, backend=backend)
-    except RuntimeError as e:
-        pytest.skip(f"FlashInfer {backend} quantize unavailable: {e}")
+    q, sf = flashinfer.mxfp8_quantize(x, True, 32, backend=backend)
+    q_lin, sf_lin = flashinfer.mxfp8_quantize(x, False, 32, backend=backend)
     # Selector weight (row j picks activation j) with block scale 2^64:
     # out[:, :K] is the activation as the GEMM saw it, exact in FP32 for every
     # BF16 input, so this compares operands.
@@ -152,12 +194,12 @@ def test_cuda_graph_replay():
 def build_linear(monkeypatch):
     """A real block-FP8 (32x32, UE8M0) ColumnParallelLinear served as MXFP8."""
     from sglang.srt import runtime_context
+    from sglang.srt.layers.linear import ColumnParallelLinear
     from sglang.srt.layers.quantization import fp8_utils
     from sglang.srt.layers.quantization.fp8 import Fp8Config
     from sglang.test.layer_ut_utils import (
         init_single_process_dist,
         load_linear_weights,
-        make_tp1_column_parallel_linear,
     )
 
     init_single_process_dist()
@@ -167,7 +209,7 @@ def build_linear(monkeypatch):
         fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTLASS,
     )
 
-    def build(n, k, deterministic=False, block_n=32):
+    def build(n, k, deterministic=False, block_n=32, bias=False):
         cfg = SimpleNamespace(
             deterministic=SimpleNamespace(enable_deterministic_inference=deterministic)
         )
@@ -178,9 +220,17 @@ def build_linear(monkeypatch):
             weight_block_size=[block_n, 32],
             scale_fmt="ue8m0",
         )
-        layer = make_tp1_column_parallel_linear(
-            quant_config, n, k, skip_block_quant_check=True
-        )
+        layer = ColumnParallelLinear(
+            input_size=k,
+            output_size=n,
+            bias=bias,
+            params_dtype=torch.bfloat16,
+            quant_config=quant_config,
+            prefix="model.layers.0.mlp.up_proj",
+            tp_rank=0,
+            tp_size=1,
+            skip_block_quant_check=True,
+        ).cuda()
         w, s = _weight(n, k)
         s = s[:: block_n // 32].contiguous()
         load_linear_weights(
@@ -209,31 +259,56 @@ def skinny_rows(monkeypatch):
 
 
 @pytest.mark.parametrize("n,k", [(1792, 5120), (8192, 1280)])
-def test_linear_apply(build_linear, skinny_rows, n, k):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_linear_apply(build_linear, skinny_rows, n, k, dtype):
     flashinfer = pytest.importorskip("flashinfer")
     from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 
     layer, s = build_linear(n, k)
     split = tuned_config(n, k)[1]
     assert (layer.mxfp8_skinny_counters is not None) == (split > 1)
-    x = torch.randn(MAX_M + 1, k, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(MAX_M + 1, k, device="cuda", dtype=dtype)
     cutlass = layer(x)[0]  # above MAX_M: the existing CUTLASS path
     assert skinny_rows == []
     for m in (1, 6, MAX_M):
         out = layer(x[:m])[0]
-        assert torch.equal(
-            out, mxfp8_skinny_gemm(x[:m], layer.weight, s.float(), _counters(n, k))
+        assert out.dtype == dtype
+        direct = mxfp8_skinny_gemm(
+            x[:m], layer.weight, s.float(), _counters(n, k), out_dtype=dtype
         )
+        assert torch.equal(out, direct)
         err = (
             out.float() - cutlass[:m].float()
         ).abs().max() / cutlass.float().abs().max()
         assert err < 1e-2, (m, err)
+    out_3d = layer(x[:6].view(2, 3, k))[0]
+    assert torch.equal(out_3d.view(6, n), layer(x[:6])[0])
+    if dtype != torch.bfloat16:
+        assert skinny_rows == [1, 6, MAX_M, 6, 6]
+        return
     q, sf = flashinfer.mxfp8_quantize(x[:6], True, 32)
     out_q = layer.quant_method.apply(layer, Mxfp8SwizzledInput(q, sf))
     assert torch.equal(out_q, layer(x[:6])[0])
-    out_3d = layer(x[:6].view(2, 3, k))[0]
-    assert torch.equal(out_3d.view(6, n), layer(x[:6])[0])
     assert skinny_rows == [1, 6, MAX_M, 6, 6, 6, 6]
+
+
+def test_linear_bias_and_fp32_keep_existing_path(build_linear, skinny_rows):
+    n, k = 5120, 2048
+    layer, s = build_linear(n, k, bias=True)
+    assert layer.mxfp8_skinny_scale is not None
+    x = torch.randn(6, k, device="cuda", dtype=torch.bfloat16)
+    no_bias = mxfp8_skinny_gemm(x, layer.weight, s.float()).float()
+    bias = torch.randn(n, device="cuda") * no_bias.abs().max()
+    layer.bias.data.copy_(bias)
+    out = layer(x)[0]
+    assert skinny_rows == []
+    ref = no_bias + layer.bias.float()
+    err = (out.float() - ref).abs().max() / ref.abs().max()
+    assert err < 1e-2, err
+    # FP32 activations stay off the kernel, as FlashInfer's MXFP8 path takes
+    # only BF16 and FP16.
+    assert layer.quant_method._apply_mxfp8_skinny(layer, x.float()) is None
+    assert skinny_rows == []
 
 
 def test_linear_gates(build_linear, skinny_rows):
