@@ -7,11 +7,13 @@ Use real auto-loaders with local config/tokenizer/processor files. No model
 weights, Hub downloads, server, GPU, or mocked Transformers APIs are needed.
 """
 
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
+import sentencepiece as spm
 import torch
 from PIL import Image
 from tokenizers import Tokenizer
@@ -31,6 +33,26 @@ from sglang.srt.utils.patch_tokenizer import unpatch_tokenizer
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+# Minimal stand-in for InternLM2TokenizerFast: a remote-code fast class with its own
+# __init__, shipped with tokenizer.model only (no tokenizer.json).
+_SPM_ONLY_FAST_TOKENIZER_CODE = """
+from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
+
+
+class SpmOnlyTokenizerFast(PreTrainedTokenizerFast):
+    vocab_files_names = {"vocab_file": "tokenizer.model"}
+
+    def __init__(self, vocab_file=None, **kwargs):
+        super().__init__(vocab_file=vocab_file, **kwargs)
+        self.vocab_file = vocab_file
+"""
+_SPM_CORPUS = [
+    "the quick brown fox jumps over the lazy dog",
+    "hello world from a tiny tokenizer",
+    "numbers like 12 and 345 appear here",
+    "spaces  and\ttabs and new\nlines",
+] * 50
 
 
 class TestHFTransformersLoading(unittest.TestCase):
@@ -94,6 +116,68 @@ class TestHFTransformersLoading(unittest.TestCase):
             chat_template="{% for message in messages %}{{ message['content'] }}{{ eos_token }}{% endfor %}",
         )
 
+    def write_spm_only_remote_code_tokenizer(self):
+        model = io.BytesIO()
+        # Placeholder pieces that tokenizer_config.json renames to chat tokens,
+        # with InternLM2's normalizer and trainer spec.
+        spm.SentencePieceTrainer.train(
+            sentence_iterator=iter(_SPM_CORPUS),
+            model_writer=model,
+            model_type="bpe",
+            vocab_size=400,
+            user_defined_symbols=["[UNUSED_0]", "[UNUSED_1]"],
+            character_coverage=1.0,
+            unk_id=0,
+            bos_id=1,
+            eos_id=2,
+            normalization_rule_name="identity",
+            add_dummy_prefix=False,
+            remove_extra_whitespaces=False,
+            byte_fallback=True,
+            split_digits=True,
+        )
+        Path(self.model_path, "tokenizer.model").write_bytes(model.getvalue())
+        Path(self.model_path, "tokenization_spm_only.py").write_text(
+            _SPM_ONLY_FAST_TOKENIZER_CODE
+        )
+        sp = spm.SentencePieceProcessor(model_proto=model.getvalue())
+        declared = {
+            "<unk>": 0,
+            "<s>": 1,
+            "</s>": 2,
+            "<|im_start|>": sp.piece_to_id("[UNUSED_0]"),
+            "<|im_end|>": sp.piece_to_id("[UNUSED_1]"),
+        }
+        added_tokens_decoder = {
+            str(token_id): {
+                "content": content,
+                "special": True,
+                "lstrip": False,
+                "rstrip": False,
+                "normalized": False,
+                "single_word": False,
+            }
+            for content, token_id in declared.items()
+        }
+        Path(self.model_path, "tokenizer_config.json").write_text(
+            json.dumps(
+                {
+                    "auto_map": {
+                        "AutoTokenizer": [
+                            None,
+                            "tokenization_spm_only.SpmOnlyTokenizerFast",
+                        ]
+                    },
+                    "tokenizer_class": "SpmOnlyTokenizerFast",
+                    "unk_token": "<unk>",
+                    "bos_token": "<s>",
+                    "eos_token": "</s>",
+                    "added_tokens_decoder": added_tokens_decoder,
+                }
+            )
+        )
+        return sp, declared
+
     def test_text_config_loads_with_context_length_and_rope(self):
         self.write_config(self.text_config())
 
@@ -154,6 +238,27 @@ class TestHFTransformersLoading(unittest.TestCase):
             ),
             [5, 2],
         )
+
+    def test_spm_only_remote_code_tokenizer_matches_sentencepiece(self):
+        """A tokenizer.model-only remote-code fast tokenizer must tokenize like its
+        SentencePiece model and keep chat tokens at their declared, in-vocab ids."""
+        self.write_config(self.text_config())
+        sp, declared = self.write_spm_only_remote_code_tokenizer()
+
+        tokenizer = get_tokenizer(
+            self.model_path, trust_remote_code=True, local_files_only=True
+        )
+        self.addCleanup(unpatch_tokenizer, tokenizer)
+
+        for token in ("<|im_start|>", "<|im_end|>"):
+            self.assertEqual(tokenizer.convert_tokens_to_ids(token), declared[token])
+        chat = "<|im_start|>user\nhello world<|im_end|>\n<|im_start|>assistant\n"
+        self.assertLess(max(tokenizer.encode(chat)), sp.get_piece_size())
+        text = "hello world  the lazy fox 12345\tok"
+        self.assertEqual(
+            tokenizer.encode(text, add_special_tokens=False), sp.encode(text)
+        )
+        self.assertEqual(tokenizer.decode(sp.encode(text)), text)
 
     def test_processor_loading_preserves_image_tokens_and_backend(self):
         self.write_multimodal_config()
