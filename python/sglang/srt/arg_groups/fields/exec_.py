@@ -98,6 +98,12 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "DeepSeek-V4.1 decoder SWA bounded replay: after the last kv_source layer, run the remaining layers over only the last window_size tokens of a prefill. Main and indexer KV stay exact; nothing is replayed. Deterministic for a fixed prompt and chunk size.",
     ] = False
+    enable_swa_recompute: A[
+        bool,
+        "DeepSeek-V4 SWA recompute: when a cached prefix kept its full KV but lost "
+        "its sliding-window state, replay only the trailing dependency window "
+        "instead of prefilling the prefix again. Experimental; CUDA.",
+    ] = False
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "

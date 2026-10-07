@@ -1188,6 +1188,12 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
+        # Device FULL tokens past prefix_indices that an SWA replay makes
+        # reusable, and the key they were matched with.
+        self.swa_recompute_hit_length = 0
+        self.swa_recompute_key: Optional[RadixKey] = None
+        # Replay owed by this request's next forward (SWARecompute), or None.
+        self.swa_recompute = None
         # The branching point seqlen to track mamba state. If set, given by prefix
         # match, it will be the tracked seqlen in the ping pong buffer for the
         # right prefill pass.
@@ -1651,17 +1657,14 @@ class Req(ReqDllmMixin):
             if reprefill_tail:
                 capped = max(0, input_len - reprefill_tail)
                 key_limit = capped if key_limit is None else min(key_limit, capped)
+            key = RadixKey(
+                token_ids=token_ids_to_match,
+                extra_key=self.extra_key,
+                limit=key_limit,
+                cache_salt=self.cache_salt,
+            )
             match_result = tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(
-                        token_ids=token_ids_to_match,
-                        extra_key=self.extra_key,
-                        limit=key_limit,
-                        cache_salt=self.cache_salt,
-                    ),
-                    req=self,
-                    cow_mamba=cow_mamba,
-                )
+                MatchPrefixParams(key=key, req=self, cow_mamba=cow_mamba)
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
                 match_result = zero_match_result(
@@ -1692,6 +1695,8 @@ class Req(ReqDllmMixin):
                 self.kv.cache_protected_len = match_result.cache_protected_len
             else:
                 self.kv.cache_protected_len = len(self.prefix_indices)
+            self.swa_recompute_hit_length = match_result.swa_recompute_hit_length
+            self.swa_recompute_key = key if self.swa_recompute_hit_length else None
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1985,6 +1990,8 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.lock = None
         self.swa_branching_seqlen = None
+        self.swa_recompute_hit_length = 0
+        self.swa_recompute_key = None
         self.extend_range = None
         self.dllm_initialized = False
         self.is_retracted = True
@@ -2444,6 +2451,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # of each request's first extend token (NgramEmbeddingManager).
     engram_history: Optional[torch.Tensor] = None
     encoder_swa_reset: Optional[List[bool]] = None
+    # Per request: first prefix position whose SWA rows the worker rebuilds
+    # before this extend, or None.
+    swa_recompute_starts: Optional[List[Optional[int]]] = None
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
@@ -2815,6 +2825,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     )
             self.encoder_swa_reset = [
                 r.kv.req_pool_idx is None or r.is_retracted for r in reqs
+            ]
+        if any(r.swa_recompute is not None for r in reqs):
+            self.swa_recompute_starts = [
+                None if r.swa_recompute is None else r.swa_recompute.take_start()
+                for r in reqs
             ]
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(

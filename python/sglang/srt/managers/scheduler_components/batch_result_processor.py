@@ -266,6 +266,9 @@ class SchedulerBatchResultProcessor:
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            for req in batch.reqs:
+                if req.swa_recompute is not None:
+                    self.tree_cache.release_swa_recompute_workspace(req)
             auxiliary_output_starts = self.snapshot_auxiliary_output_starts(
                 batch, result
             )

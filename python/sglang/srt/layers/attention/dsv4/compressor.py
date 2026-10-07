@@ -164,7 +164,7 @@ class CompressorBackendMixin:
         layer_id: int,
         compressor: Compressor,
     ) -> None:
-        if forward_batch.forward_mode.is_idle():
+        if forward_batch.forward_mode.is_idle() or forward_batch.swa_recompute:
             return
         token_to_kv_pool = self.token_to_kv_pool
         if TYPE_CHECKING:
@@ -194,6 +194,8 @@ class CompressorBackendMixin:
         compressor: Compressor,
     ) -> None:
         assert is_overlap_compress(compressor.ratio)
+        if forward_batch.swa_recompute:
+            return
         token_to_kv_pool = self.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)

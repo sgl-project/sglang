@@ -659,6 +659,29 @@ class DSparkWorkerV2(BaseSpecWorker):
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
 
+        self._inject_prefill_target_hidden(
+            batch, logits_output, next_token_ids.device, target_hidden_is_projected
+        )
+        for replay in batch_output.swa_recompute_outputs or ():
+            self._inject_prefill_target_hidden(
+                replay.batch,
+                replay.logits_output,
+                next_token_ids.device,
+                target_hidden_is_projected,
+            )
+        batch_output.next_draft_input = make_next_draft_input(
+            bonus_tokens=next_token_ids,
+            new_seq_lens=new_seq_lens,
+        )
+        return batch_output
+
+    def _inject_prefill_target_hidden(
+        self,
+        batch: ScheduleBatch,
+        logits_output,
+        device,
+        target_hidden_is_projected: bool,
+    ) -> None:
         if logits_output.hidden_states is None:
             raise RuntimeError(
                 "DSpark requires target aux hidden capture for prefill, but got None. "
@@ -673,7 +696,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         # Must inject before prefill returns: the scheduler may update radix
         # afterward, invalidating out_cache_loc.
-        device = next_token_ids.device
         pin_memory = is_pin_memory_available(device)
         ctx_lens = torch.tensor(
             batch.extend_lens, dtype=torch.int32, pin_memory=pin_memory
@@ -724,12 +746,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
         logits_output.hidden_states_token_indices = None
-
-        batch_output.next_draft_input = make_next_draft_input(
-            bonus_tokens=next_token_ids,
-            new_seq_lens=new_seq_lens,
-        )
-        return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:

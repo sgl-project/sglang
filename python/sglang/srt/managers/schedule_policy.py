@@ -1387,11 +1387,16 @@ class PrefillAdder:
         # The temporary pin excludes this prefix from the evictable budget.
         # Selection itself neither allocates slots nor materializes host hits.
         with self._lock_node(req.last_node):
+            # A replay reuses resident FULL like a host hit and needs SWA rows
+            # for the whole replayed span.
+            swa_recompute_len = (
+                self.tree_cache.swa_recompute_len if req.swa_recompute_hit_length else 0
+            )
             admission = self._select_prefill_admission(
                 req,
                 total_tokens=total_tokens,
-                host_hit_length=req.host_hit_length,
-                swa_host_hit_length=req.swa_host_hit_length,
+                host_hit_length=req.host_hit_length + req.swa_recompute_hit_length,
+                swa_host_hit_length=req.swa_host_hit_length + swa_recompute_len,
                 truncation_align_size=truncation_align_size,
                 has_chunked_req=has_chunked_req,
             )
@@ -1504,6 +1509,28 @@ class PrefillAdder:
                         return admission
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.kv.cache_protected_len = len(req.prefix_indices)
+
+            if req.swa_recompute_hit_length:
+                recomputed = self.tree_cache.init_swa_recompute(
+                    req, req.swa_recompute_key
+                )
+                req.swa_recompute_hit_length = 0
+                req.swa_recompute_key = None
+                if recomputed is None:
+                    admission = self._select_prefill_admission(
+                        req,
+                        total_tokens=total_tokens,
+                        host_hit_length=0,
+                        swa_host_hit_length=0,
+                        truncation_align_size=truncation_align_size,
+                        has_chunked_req=has_chunked_req,
+                    )
+                    if isinstance(admission, AddReqResult):
+                        return admission
+                else:
+                    new_indices, req.last_node, req.swa_recompute = recomputed
+                    req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                    req.kv.cache_protected_len = len(req.prefix_indices)
 
             # Sharded pools cannot load host KV; reserve scratch after all other gates.
             if not self._kv_shard_reserve_scratch(

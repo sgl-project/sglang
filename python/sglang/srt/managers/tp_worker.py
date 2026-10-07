@@ -618,6 +618,14 @@ class TpModelWorker(BaseTpWorker):
                 # Replay reads restored main/indexer KV before the normal extend.
                 run_encoder_swa_replay(self, batch)
 
+            swa_recompute_outputs = []
+            if batch.swa_recompute_starts is not None:
+                from sglang.srt.model_executor.swa_recompute import run_swa_recompute
+
+                swa_recompute_outputs = run_swa_recompute(
+                    self, batch, capture_hidden_mode
+                )
+
             forward_batch = ForwardBatch.init_new(
                 batch,
                 self.model_runner,
@@ -627,6 +635,7 @@ class TpModelWorker(BaseTpWorker):
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
+            swa_recompute_outputs = []
             assert capture_hidden_mode is None, (
                 "capture_hidden_mode override requires a ScheduleBatch input"
             )
@@ -649,6 +658,7 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                swa_recompute_outputs=swa_recompute_outputs,
             )
 
             capture_pre_sample_logits(batch, forward_batch, logits_output)

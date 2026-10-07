@@ -201,6 +201,48 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     )
 
 
+def validate_deepseek_v4_swa_recompute(server_args: ServerArgs) -> None:
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        is_unified_kv_triton,
+    )
+
+    cfg = resolving_view(server_args)
+    if not cfg.enable_swa_recompute:
+        return
+    if model_config_of(server_args).hf_config.model_type == "deepseek_v41":
+        raise ValueError(
+            "--enable-swa-recompute does not support DeepSeek-V4.1; use "
+            "--enable-encoder-swa-bounded-replay"
+        )
+    incompatible = (
+        ("hardware other than CUDA", not get_platform().is_cuda),
+        ("SM120", get_platform().is_sm120),
+        (
+            "speculative decoding other than DSpark",
+            cfg.speculative_algorithm is not None
+            and str(cfg.speculative_algorithm).upper() != "DSPARK",
+        ),
+        ("DP attention", attn_dp_enabled_of(cfg)),
+        ("context parallelism", cfg.attn_cp_size > 1),
+        ("decode context parallelism", cfg.dcp_size > 1),
+        ("pipeline parallelism", cfg.pp_size > 1),
+        ("PD disaggregation", cfg.disaggregation_mode != "null"),
+        ("the TRT-LLM attention backend", cfg.dsv4_attn_backend == "trtllm"),
+        ("the unified KV layout", is_unified_kv_triton()),
+        ("unified memory", cfg.enable_unified_memory),
+        ("online C128 compression", envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()),
+        ("two-batch overlap", cfg.enable_two_batch_overlap),
+        ("mixed prefill/decode", cfg.enable_mixed_chunk),
+        ("HiSparse", cfg.enable_hisparse),
+        ("LoRA", cfg.enable_lora),
+        ("radix sessions", cfg.enable_session_radix_cache),
+        ("external cache linker", cfg.enable_unified_cache_external_linker),
+    )
+    for feature, enabled in incompatible:
+        if enabled:
+            raise ValueError(f"--enable-swa-recompute does not support {feature} yet")
+
+
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
