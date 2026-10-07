@@ -412,7 +412,7 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
     )
 
 
-def apply_glm5_prefill_cuda_graph_policy(server_args: Any):
+def apply_glm5_next_prefill_cuda_graph_policy(server_args: Any):
     """Set capture sizes for GLM-5.3 Flash breakable prefill graphs."""
     cfg = resolving_view(server_args)
     if (
@@ -428,7 +428,7 @@ def apply_glm5_prefill_cuda_graph_policy(server_args: Any):
     # ceiling and its buckets together.
     declare_resolution(
         server_args,
-        "_apply_glm5_prefill_cuda_graph_policy",
+        "_apply_glm5_next_prefill_cuda_graph_policy",
         cuda_graph_config=with_phase(
             cfg.cuda_graph_config,
             Phase.PREFILL,

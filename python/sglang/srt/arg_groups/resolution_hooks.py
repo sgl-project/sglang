@@ -56,7 +56,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_mamba_backend",
         "handle_int8_mamba_checkpoint",
         "handle_linear_attn_backend",
-        "apply_glm5_prefill_cuda_graph_policy",
+        "apply_glm5_next_prefill_cuda_graph_policy",
         "handle_kv4_compatibility",
         "handle_mxfp8_kv_cache_compatibility",
         "handle_amd_specifics",
