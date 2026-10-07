@@ -250,6 +250,7 @@ def _dcp_topk_pack_kernel(
     logits_ptr,
     idx_ptr,
     len_ptr,
+    row_start_ptr,
     send_ptr,
     send_int_ptr,
     logits_stride,
@@ -259,20 +260,24 @@ def _dcp_topk_pack_kernel(
     BLOCK: tl.constexpr,
     DCP_SIZE: tl.constexpr,
     DCP_RANK: tl.constexpr,
+    HAS_ROW_START: tl.constexpr,
 ):
     b = tl.program_id(0)
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     in_range = offs < topk
     idx = tl.load(idx_ptr + b * idx_stride + offs, mask=in_range, other=-1)
     valid = (idx >= 0) & (idx < tl.load(len_ptr + b))
+    col = idx
+    if HAS_ROW_START:
+        col = idx + tl.load(row_start_ptr + b)
     score = tl.load(
-        logits_ptr + b * logits_stride + idx,
+        logits_ptr + b.to(tl.int64) * logits_stride + col,
         mask=in_range & valid,
         other=float("-inf"),
     )
     gid = tl.where(valid, idx * DCP_SIZE + DCP_RANK, -1)
-    tl.store(send_ptr + b * topk + offs, score, mask=in_range)
-    tl.store(send_int_ptr + (rows + b) * topk + offs, gid, mask=in_range)
+    tl.store(send_ptr + b.to(tl.int64) * topk + offs, score, mask=in_range)
+    tl.store(send_int_ptr + (rows + b).to(tl.int64) * topk + offs, gid, mask=in_range)
 
 
 def dcp_topk_pack(
@@ -281,10 +286,12 @@ def dcp_topk_pack(
     local_lens: torch.Tensor,
     dcp_size: int,
     dcp_rank: int,
+    row_starts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Local top-k -> [2, rows, topk] fp32 send plane: (score, global pos as int32 bits).
 
     Invalid picks get score -inf and position -1; global pos = local * W + rank.
+    ``local_idx`` is relative to ``row_starts`` (packed prefill logits) when given.
     """
     rows, topk = local_idx.shape
     send = torch.empty((2, rows, topk), dtype=torch.float32, device=logits.device)
@@ -294,6 +301,7 @@ def dcp_topk_pack(
             logits,
             local_idx,
             local_lens,
+            row_starts if row_starts is not None else local_lens,
             send,
             send.view(torch.int32),
             logits.stride(0),
@@ -303,6 +311,7 @@ def dcp_topk_pack(
             BLOCK=block,
             DCP_SIZE=dcp_size,
             DCP_RANK=dcp_rank,
+            HAS_ROW_START=row_starts is not None,
         )
     return send
 
@@ -320,8 +329,11 @@ def _dcp_topk_gather_scores_kernel(
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     in_range = col < DCP_SIZE * topk
     src = col // topk
-    score = tl.load(recv_ptr + (src * 2 * rows + b) * topk + col % topk, mask=in_range)
-    tl.store(scores_ptr + b * DCP_SIZE * topk + col, score, mask=in_range)
+    score = tl.load(
+        recv_ptr + (src * 2 * rows + b).to(tl.int64) * topk + col % topk,
+        mask=in_range,
+    )
+    tl.store(scores_ptr + b.to(tl.int64) * DCP_SIZE * topk + col, score, mask=in_range)
 
 
 @triton.jit
@@ -338,14 +350,16 @@ def _dcp_topk_finalize_kernel(
     b = tl.program_id(0)
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     in_range = offs < topk
-    pick = tl.load(pick_ptr + b * pick_stride + offs, mask=in_range, other=-1)
+    pick = tl.load(
+        pick_ptr + b.to(tl.int64) * pick_stride + offs, mask=in_range, other=-1
+    )
     ok = in_range & (pick >= 0)
     pick = tl.where(ok, pick, 0)
-    base = ((pick // topk) * 2 * rows + b) * topk + pick % topk
+    base = ((pick // topk) * 2 * rows + b).to(tl.int64) * topk + pick % topk
     score = tl.load(recv_ptr + base, mask=ok, other=float("-inf"))
     gid = tl.load(recv_int_ptr + base + rows * topk, mask=ok, other=-1)
     tl.store(
-        out_ptr + b * topk + offs,
+        out_ptr + b.to(tl.int64) * topk + offs,
         tl.where(ok & (score > float("-inf")), gid, -1),
         mask=in_range,
     )

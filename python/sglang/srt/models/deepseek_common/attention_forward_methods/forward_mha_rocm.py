@@ -203,6 +203,8 @@ class DeepseekMHARocmForwardMixin:
                     not get_exec().kernel.dsa_decode_backend == "trtllm"
                     or not get_exec().kernel.dsa_prefill_backend == "trtllm"
                 )
+                # DCP shards the prefix: the all-gather below dequantizes too.
+                and not get_parallel().dcp_enabled
             ):
                 # FP8 path: dequantize DSA-specific FP8 format to BF16
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_dsa(forward_batch)

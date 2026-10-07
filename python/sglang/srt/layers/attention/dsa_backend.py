@@ -84,7 +84,12 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
-from sglang.srt.layers.dcp.dsa import dcp_compact_read_table, dcp_prefill_page_table
+from sglang.srt.layers.dcp.dsa import (
+    dcp_compact_read_table,
+    dcp_prefill_page_table,
+    dcp_use_owned_prefill,
+    dcp_use_split_indexer,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     is_cuda,
@@ -2115,6 +2120,33 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if forward_batch.dcp_owned_prefill:
+            # Q arrives all-gathered; attend owned slots, the caller LSE-merges.
+            if q_rope is not None:
+                q = torch.cat(
+                    [
+                        q.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        q_rope.view(
+                            -1,
+                            layer.tp_q_head_num,
+                            layer.head_dim - layer.v_head_dim,
+                        ),
+                    ],
+                    dim=-1,
+                )
+            assert metadata.dsa_extend_seq_lens_list is not None
+            slots = transform_index_page_table_prefill(
+                page_table=metadata.page_table_1,
+                topk_indices=self._pad_topk_indices(topk_indices, q.shape[0]),
+                extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
+                page_size=1,
+                output_num_tokens=q.shape[0],
+                page_table_is_expanded=False,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+            )
+            return self._forward_decode_dcp(
+                q, kv_cache, slots, layer, persistent_workspace=False
+            )
         prefill_page_table_1 = metadata.page_table_1
         if (
             get_parallel().dcp_enabled
@@ -3225,12 +3257,15 @@ class DeepseekSparseAttnBackend(
         kv_cache: torch.Tensor,
         page_table_1: torch.Tensor,
         layer: RadixAttention,
+        persistent_workspace: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Attend this rank's share of the global top-k -> (out, natural-log lse).
 
         Owned slots are packed to the front so the split-K kernel only walks
         about topk / W of them. A row this rank owns nothing of comes back with
         zero output and a large negative LSE, so it drops out of the merge.
+        Prefill-sized calls take a transient workspace: the persistent one is
+        grow-only (captured graphs hold its pointers).
         """
         from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
             triton_sparse_mla_decode_splitk,
@@ -3239,8 +3274,11 @@ class DeepseekSparseAttnBackend(
         assert self.dsa_index_kpool <= 1, "DSA + DCP does not support index kpool"
         q_all = q_all.view(-1, layer.tp_q_head_num, layer.head_dim)
         local_table, local_lens = dcp_compact_read_table(page_table_1)
-        stream_id = int(torch.cuda.current_stream(q_all.device).cuda_stream)
-        workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
+        if persistent_workspace:
+            stream_id = int(torch.cuda.current_stream(q_all.device).cuda_stream)
+            workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
+        else:
+            workspace = []
         out, lse = triton_sparse_mla_decode_splitk(
             q_nope=q_all[:, :, : layer.v_head_dim],
             q_rope=q_all[:, :, layer.v_head_dim :],
@@ -3831,8 +3869,26 @@ class DeepseekSparseAttnBackend(
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_dsa_enable_prefill_cp())  # CP not enabled
                 and (self.hisparse_coordinator is None)
-                and (not get_parallel().dcp_enabled)  # MHA path reads the local shard
             )
+            if get_parallel().dcp_enabled:
+                forward_batch.dcp_owned_prefill = (
+                    not self.use_mha
+                    and forward_batch.extend_num_tokens is not None
+                    and dcp_use_owned_prefill(
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.extend_num_tokens,
+                        self.num_q_heads * get_parallel().attn_dcp_size,
+                    )
+                )
+                forward_batch.dcp_split_indexer = (
+                    not self.use_mha
+                    and not forward_batch.dcp_owned_prefill
+                    and forward_batch.extend_seq_lens_cpu is not None
+                    and dcp_use_split_indexer(
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.extend_seq_lens_cpu,
+                    )
+                )
         else:
             self.use_mha = False  # Decode/verify always use MLA
 

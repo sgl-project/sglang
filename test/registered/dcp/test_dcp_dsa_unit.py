@@ -196,7 +196,7 @@ class _FakeIndexPool:
         return k, s
 
 
-class TestDcpGatherIndexKPrefill(CustomTestCase):
+class TestDcpLocalIndexKPrefill(CustomTestCase):
     def _check(self, w, page_size, seq_lens):
         g = torch.Generator().manual_seed(0)
         span = page_size * w
@@ -213,19 +213,36 @@ class TestDcpGatherIndexKPrefill(CustomTestCase):
             torch.uint8
         )
         global_s = torch.randn((total_slots, 1), generator=g)
+        lens = torch.tensor(seq_lens, dtype=torch.int32)
+        pad = [(n + w - 1) // w for n in seq_lens]
 
-        def rank_fn(r):
+        for r in range(w):
             # Rank r's local store holds the slots it owns, at row slot // W.
             owned = torch.arange(r, total_slots, w)
             pool = _FakeIndexPool(global_k[owned], global_s[owned], page_size)
-            lens = torch.tensor(seq_lens, dtype=torch.int32)
+            with patch.object(dcp_dsa, "get_parallel", return_value=_parallel(w, r)):
+                out = dcp_dsa.dcp_local_index_k_prefill(pool, 0, lens, lens, table)
+            self.assertEqual(out.pad_sum, sum(pad))
+            self.assertEqual(
+                out.req_starts.tolist(), [sum(pad[:b]) for b in range(len(pad))]
+            )
+            for b, n in enumerate(seq_lens):
+                # Local row j is position j * W + r; rows past the rank's length pad.
+                pos = torch.arange(r, max(r, n), w)
+                rows = out.req_starts[b] + torch.arange(pos.numel())
+                self.assertTrue(torch.equal(out.k_fp8[rows], global_k[table[b, pos]]))
+                self.assertTrue(torch.equal(out.k_scale[rows], global_s[table[b, pos]]))
+
+        def rank_fn(r):
+            owned = torch.arange(r, total_slots, w)
+            pool = _FakeIndexPool(global_k[owned], global_s[owned], page_size)
             return dcp_dsa.dcp_gather_index_k_prefill(pool, 0, lens, lens, table)
 
-        outs = _run_collective(w, rank_fn)
-        ref_slots = torch.cat([table[b, :n] for b, n in enumerate(seq_lens)])
-        for k, s in outs:
-            self.assertTrue(torch.equal(k, global_k[ref_slots]))
-            self.assertTrue(torch.equal(s, global_s[ref_slots]))
+        # The gathered index K is the full sequence, flat in request order.
+        ref = torch.cat([table[b, :n] for b, n in enumerate(seq_lens)])
+        for k, s in _run_collective(w, rank_fn):
+            self.assertTrue(torch.equal(k, global_k[ref]))
+            self.assertTrue(torch.equal(s, global_s[ref]))
 
     def test_page1(self):
         self._check(w=4, page_size=1, seq_lens=[13, 4, 1, 9])
@@ -235,6 +252,105 @@ class TestDcpGatherIndexKPrefill(CustomTestCase):
 
     def test_dcp8_uneven(self):
         self._check(w=8, page_size=4, seq_lens=[3, 33, 64, 65])
+
+
+class TestDcpExchangeTopkPrefill(CustomTestCase):
+    """Prefill rows: packed per-request local logits, causal per-token lengths."""
+
+    def _check(self, w, seq_lens, extend_lens, seed=0):
+        topk = 2048
+        g = torch.Generator().manual_seed(seed)
+        # Token i of request b sits at position seq_len - extend + i, attends <= it.
+        req = torch.cat(
+            [torch.full((e,), b, dtype=torch.int32) for b, e in enumerate(extend_lens)]
+        )
+        causal = torch.cat(
+            [torch.arange(n - e + 1, n + 1) for n, e in zip(seq_lens, extend_lens)]
+        ).int()
+        rows = req.numel()
+        global_logits = torch.randn((rows, max(seq_lens)), generator=g)
+        pad = [(n + w - 1) // w for n in seq_lens]
+        starts = torch.tensor(
+            [sum(pad[:b]) for b in range(len(pad))], dtype=torch.int32
+        )
+
+        def rank_fn(r):
+            # Garbage outside each row's window must never be picked.
+            local = torch.full((rows, sum(pad)), 1e30)
+            local_lens = torch.clamp((causal - r + w - 1) // w, min=0).int()
+            for t in range(rows):
+                n = int(local_lens[t])
+                s = int(starts[req[t]])
+                local[t, s : s + n] = global_logits[t, torch.arange(n) * w + r]
+            return dcp_dsa.dcp_exchange_topk_prefill(
+                local.cuda(),
+                starts[req.long()].cuda(),
+                local_lens.cuda(),
+                topk,
+                DSATopKBackend.SGL_KERNEL.topk_func,
+            ).cpu()
+
+        outs = [o.sort(dim=1).values for o in _run_collective(w, rank_fn)]
+        for out in outs[1:]:
+            self.assertTrue(torch.equal(out, outs[0]))
+        out = outs[0]
+        self.assertEqual(out.shape, (rows, topk))
+        for t in range(rows):
+            n = int(causal[t])
+            k = min(topk, n)
+            ref = torch.topk(global_logits[t, :n], k).indices.sort().values
+            got = out[t][out[t] >= 0].sort().values
+            self.assertTrue(torch.equal(got.long(), ref), f"t={t}")
+            self.assertEqual(int((out[t] < 0).sum()), topk - k)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "Triton kernels need a GPU")
+    def test_global_positions(self):
+        self._check(w=4, seq_lens=[9000, 300, 2100], extend_lens=[40, 300, 7])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "Triton kernels need a GPU")
+    def test_dcp8(self):
+        self._check(w=8, seq_lens=[40000, 2049], extend_lens=[16, 2049], seed=1)
+
+
+class TestDcpOwnedPrefillChoice(CustomTestCase):
+    def test_ratio(self):
+        ratio = dcp_dsa.envs.SGLANG_DCP_DSA_OWNED_PREFILL_RATIO
+        with ratio.override(3.0):
+            self.assertFalse(dcp_dsa.dcp_use_owned_prefill([0], 4096, 64))
+            self.assertFalse(dcp_dsa.dcp_use_owned_prefill([100_000, 0], 1024, 64))
+            self.assertTrue(dcp_dsa.dcp_use_owned_prefill([300_000], 1024, 64))
+        with ratio.override(0.0):
+            self.assertTrue(dcp_dsa.dcp_use_owned_prefill([0], 4096, 64))
+        with ratio.override(-1.0):
+            self.assertFalse(dcp_dsa.dcp_use_owned_prefill([10**9], 1, 64))
+
+    def test_split_indexer(self):
+        min_kv = dcp_dsa.envs.SGLANG_DCP_DSA_SPLIT_INDEXER_MIN_KV
+        with min_kv.override(8192):
+            # A fresh 8K prompt averages ~4K keys per query token.
+            self.assertFalse(dcp_dsa.dcp_use_split_indexer([0], [8192]))
+            self.assertTrue(dcp_dsa.dcp_use_split_indexer([0], [32768]))
+            self.assertTrue(dcp_dsa.dcp_use_split_indexer([65536, 0], [1024, 64]))
+            self.assertFalse(dcp_dsa.dcp_use_split_indexer([], []))
+        with min_kv.override(0):
+            self.assertTrue(dcp_dsa.dcp_use_split_indexer([0], [1]))
+
+
+class TestDcpSplitRows(CustomTestCase):
+    def test_round_trip(self):
+        for w, rows in ((4, 10), (4, 3), (8, 64), (4, 0)):
+            full = torch.arange(rows * 3, dtype=torch.int32).view(rows, 3)
+            spans = []
+
+            def rank_fn(r):
+                lo, hi, per = dcp_dsa.dcp_split_rows(rows)
+                spans.append((lo, hi))
+                return dcp_dsa.dcp_all_gather_rows(full[lo:hi], rows, per)
+
+            for out in _run_collective(w, rank_fn):
+                self.assertTrue(torch.equal(out, full), f"w={w} rows={rows}")
+            covered = sorted(i for lo, hi in spans[w:] for i in range(lo, hi))
+            self.assertEqual(covered, list(range(rows)))
 
 
 class TestDcpPrefillPageTable(CustomTestCase):

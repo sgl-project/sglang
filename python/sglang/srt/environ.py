@@ -936,6 +936,19 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    # DSA + DCP prefill attends this rank's share of the top-k and LSE-merges
+    # (Q all-gather + head-partial merge, ~3 * heads * extend tokens of traffic
+    # per cached prefix token) when the cached prefix exceeds
+    # ratio * gathered heads * extend tokens; below that it all-gathers the
+    # prefix KV instead. 0 always takes the owned path; negative never does.
+    SGLANG_DCP_DSA_OWNED_PREFILL_RATIO = EnvFloat(3.0)
+    # Fixed per-chunk logits budget for the owned DCP DSA prefill indexer. It
+    # must be identical on every DCP rank: each chunk runs a top-k all-gather.
+    SGLANG_DCP_DSA_PREFILL_LOGITS_BUDGET_MB = EnvInt(1024)
+    # DCP DSA prefill (gathered KV): each rank scores 1/W of the query rows and
+    # all-gathers their top-k once the mean key length per query token reaches
+    # this; shorter batches score every row on every rank (no exchange).
+    SGLANG_DCP_DSA_SPLIT_INDEXER_MIN_KV = EnvInt(8192)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
