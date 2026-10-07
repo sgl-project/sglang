@@ -2545,6 +2545,24 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertIsInstance(params["dry_run"], bool)
         self.assertEqual(params["dry_run"], True)
 
+    def test_string_null_and_invalid_boolean_stay_literal(self):
+        """A string 'null' and a non-boolean token stay as written."""
+        text = """<tool_call>
+<function=sql_interpreter>
+<parameter=query>
+null
+</parameter>
+<parameter=dry_run>
+yes
+</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "null")
+        self.assertEqual(params["dry_run"], "yes")
+
     def test_complex_array_parameter(self):
         """
         Test parsing of complex array parameters.
