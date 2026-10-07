@@ -74,8 +74,6 @@ def test_bf16_projection_accepts_fp32_conditioning(modulation):
 @pytest.mark.parametrize("lengths", [(7, None), (129, None), (193, 65), (17, 129)])
 @torch.no_grad()
 def test_attention_backend_dispatch_and_repeated_forward(monkeypatch, backend, lengths):
-    if backend == "FA" and torch.cuda.get_device_capability()[0] == 12:
-        pytest.skip("the platform currently resolves FA to SDPA on SM12.x")
     if backend == "SAGE_ATTN_3":
         if importlib.util.find_spec("sageattn3") is None:
             pytest.skip("requires the optional SageAttention3 extension")
