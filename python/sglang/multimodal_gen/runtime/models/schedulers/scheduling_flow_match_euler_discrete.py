@@ -25,13 +25,15 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-import scipy.stats
 import torch
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from diffusers.utils import BaseOutput
 
 from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
+from sglang.multimodal_gen.runtime.models.schedulers.sigma_schedule import (
+    SigmaScheduleMixin,
+)
 from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
     SchedulerRLMixin,
 )
@@ -55,7 +57,7 @@ class FlowMatchEulerDiscreteSchedulerOutput(BaseOutput):
 
 
 class FlowMatchEulerDiscreteScheduler(
-    SchedulerMixin, ConfigMixin, BaseScheduler, SchedulerRLMixin
+    SchedulerMixin, ConfigMixin, BaseScheduler, SchedulerRLMixin, SigmaScheduleMixin
 ):
     """
     Euler scheduler.
@@ -554,96 +556,6 @@ class FlowMatchEulerDiscreteScheduler(
             return (prev_sample,)
 
         return FlowMatchEulerDiscreteSchedulerOutput(prev_sample=prev_sample)
-
-    # Copied from diffusers.schedulers.scheduling_euler_discrete.EulerDiscreteScheduler._convert_to_karras
-    def _convert_to_karras(
-        self, in_sigmas: torch.Tensor, num_inference_steps: int
-    ) -> torch.Tensor:
-        """Constructs the noise schedule of Karras et al. (2022)."""
-
-        # Hack to make sure that other schedulers which copy this function don't break
-        # TODO: Add this logic to the other schedulers
-        if hasattr(self.config, "sigma_min"):
-            sigma_min = self.config.sigma_min
-        else:
-            sigma_min = None
-
-        if hasattr(self.config, "sigma_max"):
-            sigma_max = self.config.sigma_max
-        else:
-            sigma_max = None
-
-        sigma_min = sigma_min if sigma_min is not None else in_sigmas[-1].item()
-        sigma_max = sigma_max if sigma_max is not None else in_sigmas[0].item()
-
-        rho = 7.0  # 7.0 is the value used in the paper
-        ramp = np.linspace(0, 1, num_inference_steps)
-        min_inv_rho = sigma_min ** (1 / rho)
-        max_inv_rho = sigma_max ** (1 / rho)
-        sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
-        return sigmas
-
-    # Copied from diffusers.schedulers.scheduling_euler_discrete.EulerDiscreteScheduler._convert_to_exponential
-    def _convert_to_exponential(
-        self, in_sigmas: torch.Tensor, num_inference_steps: int
-    ) -> torch.Tensor:
-        """Constructs an exponential noise schedule."""
-
-        # Hack to make sure that other schedulers which copy this function don't break
-        # TODO: Add this logic to the other schedulers
-        if hasattr(self.config, "sigma_min"):
-            sigma_min = self.config.sigma_min
-        else:
-            sigma_min = None
-
-        if hasattr(self.config, "sigma_max"):
-            sigma_max = self.config.sigma_max
-        else:
-            sigma_max = None
-
-        sigma_min = sigma_min if sigma_min is not None else in_sigmas[-1].item()
-        sigma_max = sigma_max if sigma_max is not None else in_sigmas[0].item()
-
-        sigmas = np.exp(
-            np.linspace(math.log(sigma_max), math.log(sigma_min), num_inference_steps)
-        )
-        return sigmas
-
-    # Copied from diffusers.schedulers.scheduling_euler_discrete.EulerDiscreteScheduler._convert_to_beta
-    def _convert_to_beta(
-        self,
-        in_sigmas: torch.Tensor,
-        num_inference_steps: int,
-        alpha: float = 0.6,
-        beta: float = 0.6,
-    ) -> torch.Tensor:
-        """From "Beta Sampling is All You Need" [arXiv:2407.12173] (Lee et. al, 2024)"""
-
-        # Hack to make sure that other schedulers which copy this function don't break
-        # TODO: Add this logic to the other schedulers
-        if hasattr(self.config, "sigma_min"):
-            sigma_min = self.config.sigma_min
-        else:
-            sigma_min = None
-
-        if hasattr(self.config, "sigma_max"):
-            sigma_max = self.config.sigma_max
-        else:
-            sigma_max = None
-
-        sigma_min = sigma_min if sigma_min is not None else in_sigmas[-1].item()
-        sigma_max = sigma_max if sigma_max is not None else in_sigmas[0].item()
-
-        sigmas = np.array(
-            [
-                sigma_min + (ppf * (sigma_max - sigma_min))
-                for ppf in [
-                    scipy.stats.beta.ppf(timestep, alpha, beta)
-                    for timestep in 1 - np.linspace(0, 1, num_inference_steps)
-                ]
-            ]
-        )
-        return sigmas
 
     def _time_shift_exponential(
         self, mu: float, sigma: float, t: torch.Tensor | np.ndarray
