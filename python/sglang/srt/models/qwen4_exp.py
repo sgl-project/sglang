@@ -1408,7 +1408,11 @@ class Qwen4ExpPLELayer(nn.Module):
         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
         gated_value = gated_value.flatten(-2)
         gated_value_normed = gated_value_normed.flatten(-2)
-        if self.ple_embedding.enable_ple_fusion and batch.mode.is_target_verify():
+        if (
+            not _is_npu
+            and self.ple_embedding.enable_ple_fusion
+            and batch.mode.is_target_verify()
+        ):
             from sglang.kernels.ops.mamba.qwen4_short_conv import (
                 can_fuse_qwen4_verify_conv,
                 fused_qwen4_verify_conv,
