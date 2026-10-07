@@ -57,8 +57,11 @@ def _bf16_skinny_kernel(
 
 
 def bf16_skinny_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """1 <= M <= 16 BF16 rows on one CUDA (not ROCm) device, K % 128 == 0, unit
+    stride along K and arbitrary row strides."""
     return (
         x.is_cuda
+        and torch.version.hip is None
         and weight.device == x.device
         and x.dim() == 2
         and 0 < x.shape[0] <= MAX_M
@@ -83,20 +86,22 @@ def bf16_skinny_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     m, k = x.shape
     n = weight.shape[0]
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
-    _bf16_skinny_kernel[(triton.cdiv(n, _BLOCK_N),)](
-        x,
-        weight,
-        out,
-        m,
-        n,
-        k,
-        x.stride(0),
-        weight.stride(0),
-        out.stride(0),
-        BM=MAX_M,
-        BN=_BLOCK_N,
-        BK=_BLOCK_K,
-        num_warps=4,
-        num_stages=4,
-    )
+    # Triton launches on the current device; the operands may be on another.
+    with torch.cuda.device(x.device):
+        _bf16_skinny_kernel[(triton.cdiv(n, _BLOCK_N),)](
+            x,
+            weight,
+            out,
+            m,
+            n,
+            k,
+            x.stride(0),
+            weight.stride(0),
+            out.stride(0),
+            BM=MAX_M,
+            BN=_BLOCK_N,
+            BK=_BLOCK_K,
+            num_warps=4,
+            num_stages=4,
+        )
     return out
