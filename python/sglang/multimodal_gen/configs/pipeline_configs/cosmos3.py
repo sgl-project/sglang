@@ -11,6 +11,7 @@ in the stages from ``num_frames`` and ``image_path``; T2I overrides
 import functools
 import os
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
@@ -24,6 +25,20 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 )
 
 COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
+COSMOS3_NANO_ARCH_SIGNATURE = (4096, 36, 32)
+COSMOS3_NANO_KEEP_RESIDENT_MIN_AVAILABLE_GB = 90
+COSMOS3_DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB = 120
+
+
+@functools.lru_cache(maxsize=None)
+def _transformer_config(model_path: str) -> dict:
+    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+        get_diffusers_component_config,
+    )
+
+    return get_diffusers_component_config(
+        component_path=os.path.join(model_path, "transformer")
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -34,17 +49,23 @@ def is_edge_checkpoint(model_path: str) -> bool:
     is available before the weights are on device (e.g. when resolving sampling
     defaults in the client process).
     """
-    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-        get_diffusers_component_config,
-    )
-
-    config = get_diffusers_component_config(
-        component_path=os.path.join(model_path, "transformer")
-    )
+    config = _transformer_config(model_path)
     return (
         config.get("backbone_type") == COSMOS3_EDGE_BACKBONE_TYPE
         or config.get("hidden_act") == "relu2"
     )
+
+
+@functools.lru_cache(maxsize=None)
+def is_nano_checkpoint(model_path: str) -> bool:
+    """Whether the checkpoint uses the Nano transformer architecture."""
+    config = _transformer_config(model_path)
+    signature = (
+        config.get("hidden_size"),
+        config.get("num_hidden_layers"),
+        config.get("num_attention_heads"),
+    )
+    return signature == COSMOS3_NANO_ARCH_SIGNATURE
 
 
 @functools.lru_cache(maxsize=None)
@@ -70,11 +91,6 @@ def _distilled_sampler_config(model_path: str) -> dict | None:
     return sampler
 
 
-def is_distilled_checkpoint(model_path: str) -> bool:
-    """Whether the checkpoint is a few-step distilled variant."""
-    return _distilled_sampler_config(model_path) is not None
-
-
 def get_distilled_sigmas(model_path: str) -> list[float] | None:
     """The explicit fixed-step sigma schedule for a distilled checkpoint."""
     sampler = _distilled_sampler_config(model_path)
@@ -94,6 +110,11 @@ class Cosmos3Config(PipelineConfig):
     # TI2V (text + image → video) so the request validator accepts ``image_path``
     # without requiring it. T2V ignores it; I2V uses it; T2I disregards it.
     task_type: ModelTaskType = ModelTaskType.TI2V
+    supported_task_types: ClassVar[tuple[ModelTaskType, ...]] = (
+        ModelTaskType.TI2V,
+        ModelTaskType.T2I,
+        ModelTaskType.V2V,
+    )
 
     dit_config: DiTConfig = field(default_factory=Cosmos3VideoConfig)
 
@@ -113,7 +134,7 @@ class Cosmos3Config(PipelineConfig):
     vae_precision: str = "bf16"
 
     # Pipeline-level (not sampling) knobs.
-    max_sequence_length: int = 512
+    max_sequence_length: int = 4096
     use_duration_template: bool = True
     use_system_prompt: bool = False
 
@@ -125,6 +146,7 @@ class Cosmos3Config(PipelineConfig):
     # Pre-computed once in update_config_from_dict from the resolved model_path.
     # None until that point (e.g. in unit-test mocks that never call update_config_from_dict).
     is_edge: bool | None = None
+    is_nano: bool | None = None
     distilled_sigmas: list[float] | None = None
 
     def __post_init__(self):
@@ -145,10 +167,11 @@ class Cosmos3Config(PipelineConfig):
         if self.model_path:
             self.distilled_sigmas = get_distilled_sigmas(self.model_path)
             self.is_edge = is_edge_checkpoint(self.model_path)
+            self.is_nano = is_nano_checkpoint(self.model_path)
             if self.distilled_sigmas is not None:
                 self.scheduler_class_override = None
 
-    def adjust_num_frames(self, num_frames: int) -> int:
+    def adjust_num_frames(self, num_frames: int, *, log_adjustment: bool = True) -> int:
         """Round ``num_frames`` so ``(n - 1) % 4 == 0`` for the VAE.
 
         Skips rounding when ``num_frames == 1`` (T2I path) so the single
@@ -171,7 +194,38 @@ class Cosmos3Config(PipelineConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         # Keep the DiT and VAE resident when the GPUs have the headroom.
+        is_nano = self.is_nano
+        if is_nano is None:
+            # Directly constructed configs in callers/tests have not resolved
+            # checkpoint metadata yet; registered model IDs remain unambiguous.
+            is_nano = "cosmos3-nano" in (self.model_path or "").lower()
+        threshold_gb = (
+            COSMOS3_NANO_KEEP_RESIDENT_MIN_AVAILABLE_GB
+            if is_nano
+            else COSMOS3_DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB
+        )
         return ModelDeploymentConfig(
-            keep_resident_min_available_gb=120,
+            keep_resident_min_available_gb=threshold_gb,
             keep_resident_components=("dit", "vae"),
         )
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.cosmos3 import (
+        Cosmos3SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=Cosmos3SamplingParams,
+        pipeline_config_cls=Cosmos3Config,
+        hf_model_paths=[
+            "nvidia/Cosmos3-Nano",
+            "nvidia/Cosmos3-Nano-Policy-DROID",
+            "nvidia/Cosmos3-Super",
+            "nvidia/Cosmos3-Super-Text2Image",
+            "nvidia/Cosmos3-Super-Image2Video",
+            "nvidia/Cosmos3-Edge",
+        ],
+        model_detectors=[lambda hf_id: "cosmos3omni" in hf_id.lower()],
+    )

@@ -36,7 +36,6 @@ def _srt_clip_param_name(name: str) -> str:
 
 
 class CLIPTextTransformer(nn.Module):
-
     def __init__(
         self,
         config: CLIPTextConfig,
@@ -145,7 +144,6 @@ class CLIPTextTransformer(nn.Module):
 
 
 class CLIPTextModel(TextEncoder):
-
     def __init__(
         self,
         config: CLIPTextConfig,
@@ -185,6 +183,9 @@ class CLIPTextModel(TextEncoder):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+            # standalone CLIP text-transformer checkpoints omit the model wrapper
+            if name.startswith(("embeddings.", "encoder.", "final_layer_norm.")):
+                name = f"text_model.{name}"
             name = _srt_clip_param_name(name)
             # Handle q_proj, k_proj, v_proj -> qkv_proj mapping
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -254,7 +255,6 @@ class CLIPTextModelWithProjection(CLIPTextModel):
 
 
 class CLIPVisionTransformer(nn.Module):
-
     def __init__(
         self,
         config: CLIPVisionConfig,

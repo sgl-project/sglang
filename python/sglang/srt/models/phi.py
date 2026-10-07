@@ -7,7 +7,6 @@ import torch
 from torch import nn
 from transformers import PhiConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -29,7 +28,6 @@ from sglang.srt.utils import add_prefix, make_layers
 
 
 class PhiAttention(nn.Module):
-
     def __init__(
         self,
         config: PhiConfig,
@@ -99,7 +97,6 @@ class PhiAttention(nn.Module):
 
 
 class PhiMLP(nn.Module):
-
     def __init__(
         self, config: PhiConfig, quant_config: Optional[QuantizationConfig] = None
     ):
@@ -128,7 +125,6 @@ class PhiMLP(nn.Module):
 
 
 class PhiLayer(nn.Module):
-
     def __init__(
         self,
         config: PhiConfig,
@@ -167,7 +163,6 @@ class PhiLayer(nn.Module):
 
 
 class PhiModel(nn.Module):
-
     def __init__(
         self,
         config: PhiConfig,
@@ -180,7 +175,7 @@ class PhiModel(nn.Module):
             config.vocab_size, config.hidden_size
         )
 
-        pp_group = get_pp_group()
+        pp_group = get_parallel().pp_group
         pp_size = pp_group.world_size
         pp_rank = pp_group.rank
 

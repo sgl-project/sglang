@@ -72,9 +72,9 @@ def rpd_to_chrome_trace(
         raise Exception("Trace file is empty.")
 
     print("Timestamps:")
-    print(f"\t    first: \t{min_time/1000} us")
-    print(f"\t     last: \t{max_time/1000} us")
-    print(f"\t duration: \t{(max_time-min_time) / 1000000000} seconds")
+    print(f"\t    first: \t{min_time / 1000} us")
+    print(f"\t     last: \t{max_time / 1000} us")
+    print(f"\t duration: \t{(max_time - min_time) / 1000000000} seconds")
 
     start_time = min_time / 1000
     end_time = max_time / 1000
@@ -114,7 +114,7 @@ def rpd_to_chrome_trace(
         )
 
     print("\nFilter: %s" % (rangeStringApi))
-    print(f"Output duration: {(end_time-start_time)/1000000} seconds")
+    print(f"Output duration: {(end_time - start_time) / 1000000} seconds")
 
     # Output Ops
 

@@ -9,9 +9,19 @@ class LongCatImageSamplingParams(SamplingParams):
     guidance_scale: float = 4.5
     height: int = 1024
     width: int = 1024
-    # Override base class defaults to enable LongCat-specific features by default
     enable_cfg_renorm: bool = True
+    cfg_renorm_min: float = 0.0
     enable_prompt_rewrite: bool = True
+
+    @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset(
+            {
+                "cfg_renorm_min",
+                "enable_cfg_renorm",
+                "enable_prompt_rewrite",
+            }
+        )
 
 
 @dataclass
@@ -29,6 +39,23 @@ class LongCatImageEditSamplingParams(SamplingParams):
     negative_prompt: str = ""
     enable_cfg_renorm: bool = False
     enable_prompt_rewrite: bool = False
+
+    def prepare_synthetic_warmup_request_for_queue(self, req, server_args) -> None:
+        if server_args.warmup_resolutions is None:
+            return
+        # Editing derives both the output grid and VL prefix from the input
+        # image. A square placeholder discards an explicit non-square warmup
+        # resolution and captures a graph that the real request cannot replay.
+        import base64
+        import io
+
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (req.width, req.height)).save(buffer, format="PNG")
+        req.image_path = [
+            "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+        ]
 
 
 @dataclass

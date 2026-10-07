@@ -14,11 +14,16 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.separate_buffer_allocator_double import (
+    separate_buffer_allocator_double,
+)
+from sglang.test.test_utils import CustomTestCase, enter_override
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _make_model_runner(**attrs):
@@ -28,6 +33,7 @@ def _make_model_runner(**attrs):
     raise AttributeError on the internal `self.effective_max_total_num_tokens`
     read inside `max_token_pool_size`."""
     instance = object.__new__(ModelRunner)
+    instance.kv_cache_configurator = object.__new__(KVCacheConfigurator)
     for name, value in attrs.items():
         setattr(instance, name, value)
     return instance
@@ -85,8 +91,9 @@ class TestMaxTokenPoolSize(CustomTestCase):
             full_max_total_num_tokens=3000,
             swa_max_total_num_tokens=500,
         )
-        self.assertEqual(instance.max_token_pool_size, 3000)
-        self.assertEqual(instance.effective_max_total_num_tokens, 3000)
+        with get_context().override_server_args(enable_unified_memory=False):
+            self.assertEqual(instance.max_token_pool_size, 3000)
+            self.assertEqual(instance.effective_max_total_num_tokens, 3000)
 
 
 def _make_prealloc_queue(
@@ -98,7 +105,10 @@ def _make_prealloc_queue(
     """Build a minimal DecodePreallocQueue for _check_if_req_exceed_kv_capacity."""
     queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
     queue.max_total_num_tokens = max_total_num_tokens
-    queue.token_to_kv_pool_allocator = SimpleNamespace(size_swa=10**9)
+    queue.num_reserved_decode_tokens = 0
+    queue.token_to_kv_pool_allocator = separate_buffer_allocator_double(
+        page_size=1, size_swa=10**9
+    )
     # Disable the SWA-tail branch; this test only exercises the pool-length gate.
     queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
 
@@ -124,6 +134,10 @@ def _make_req(rid: str, prompt_len: int):
 
 
 class TestCheckIfReqExceedKvCapacity(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        enter_override(self, get_context().override_server_args())
+
     def test_hisparse_admits_beyond_device_pool_up_to_host_backed_size(self):
         """Core regression: request longer than device-only
         `max_total_num_tokens` but within HiSparse host-backed

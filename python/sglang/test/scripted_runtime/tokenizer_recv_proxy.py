@@ -23,7 +23,6 @@ _WORK_REQ_TYPES = (
 
 
 class ScriptedTokenizerRecvProxy:
-
     def __init__(self, *, underlying: zmq.Socket) -> None:
         self._underlying = underlying
         self._buffer: deque = deque()

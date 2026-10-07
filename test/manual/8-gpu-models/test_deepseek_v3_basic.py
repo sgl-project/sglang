@@ -2,8 +2,8 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -47,18 +47,16 @@ class TestDeepseekV3Basic(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=1400,
             num_threads=1400,
-            num_shots=8,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v3)\n" f'{metrics["score"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v3)\n{metrics["score"]=:.3f}\n'
             )
             self.assertGreater(metrics["score"], 0.935)
 
@@ -70,7 +68,7 @@ class TestDeepseekV3Basic(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v3)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-v3)\n{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(speed, 12)

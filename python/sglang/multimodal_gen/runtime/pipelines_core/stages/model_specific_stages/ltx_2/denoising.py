@@ -1,4 +1,5 @@
 import math
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -12,11 +13,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_world_size,
 )
-from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
-    dispatch_branches,
-)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
-    cfg_model_parallel_all_gather,
     cfg_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -38,6 +35,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
+)
+from sglang.multimodal_gen.runtime.platforms import (
+    current_platform,
 )
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
@@ -180,6 +180,10 @@ class LTX2DenoisingStage(DenoisingStage):
         self.sampler_name = sampler_name
         # set per request by _prepare_denoising_loop before the cache-dit hook
         self._disable_cache_dit_for_request = False
+        self._ltx2_coords_cache: OrderedDict[
+            tuple, tuple[torch.Tensor | None, torch.Tensor | None]
+        ] = OrderedDict()
+        self._ltx2_coords_cache_max_entries = 4
 
     def _scheduler_step_kwargs(self, batch: Req, scheduler) -> dict:
         return self.prepare_extra_func_kwargs(
@@ -252,144 +256,6 @@ class LTX2DenoisingStage(DenoisingStage):
             cfg_model_parallel_all_reduce(video_partial),
             cfg_model_parallel_all_reduce(audio_partial),
         )
-
-    def _run_legacy_one_stage_multi_branch_cfg_parallel(
-        self,
-        *,
-        base_model_kwargs: dict[str, object],
-        ctx: "LTX2DenoisingContext",
-        step: "DenoisingStepState",
-        encoder_hidden_states: torch.Tensor,
-        audio_encoder_hidden_states: torch.Tensor,
-        encoder_attention_mask: torch.Tensor | None,
-        negative_encoder_hidden_states: torch.Tensor,
-        negative_audio_encoder_hidden_states: torch.Tensor,
-        negative_encoder_attention_mask: torch.Tensor | None,
-        need_perturbed: bool,
-        need_modality: bool,
-        stage1_guider_params: dict[str, object],
-    ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-        """Multi-branch CFG parallel for the legacy LTX-2.3 one-stage path.
-
-        Distributes up to 4 forward passes (cond, neg, perturbed, modality)
-        across CFG ranks via round-robin.  Each rank runs only its assigned
-        passes, then an all-gather collects every output so all ranks can
-        compute the guidance combination locally.
-        """
-        cfg_rank = get_classifier_free_guidance_rank()
-        cfg_world_size = get_classifier_free_guidance_world_size()
-
-        # Build kwargs for every pass in canonical order.
-        all_passes: list[tuple[str, dict[str, object]]] = [
-            (
-                "cond",
-                self._build_ltx2_model_kwargs(
-                    ctx,
-                    base_model_kwargs,
-                    encoder_hidden_states=encoder_hidden_states,
-                    audio_encoder_hidden_states=audio_encoder_hidden_states,
-                    encoder_attention_mask=encoder_attention_mask,
-                ),
-            ),
-            (
-                "neg",
-                self._build_ltx2_model_kwargs(
-                    ctx,
-                    base_model_kwargs,
-                    encoder_hidden_states=negative_encoder_hidden_states,
-                    audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
-                    encoder_attention_mask=negative_encoder_attention_mask,
-                ),
-            ),
-        ]
-        if need_perturbed:
-            all_passes.append(
-                (
-                    "perturbed",
-                    self._build_ltx2_model_kwargs(
-                        ctx,
-                        base_model_kwargs,
-                        encoder_hidden_states=encoder_hidden_states,
-                        audio_encoder_hidden_states=audio_encoder_hidden_states,
-                        encoder_attention_mask=encoder_attention_mask,
-                        skip_video_self_attn_blocks=tuple(
-                            stage1_guider_params["video_stg_blocks"]
-                        ),
-                        skip_audio_self_attn_blocks=tuple(
-                            stage1_guider_params["audio_stg_blocks"]
-                        ),
-                    ),
-                )
-            )
-        if need_modality:
-            all_passes.append(
-                (
-                    "modality",
-                    self._build_ltx2_model_kwargs(
-                        ctx,
-                        base_model_kwargs,
-                        encoder_hidden_states=encoder_hidden_states,
-                        audio_encoder_hidden_states=audio_encoder_hidden_states,
-                        encoder_attention_mask=encoder_attention_mask,
-                        disable_a2v_cross_attn=True,
-                        disable_v2a_cross_attn=True,
-                    ),
-                )
-            )
-
-        pass_names = [name for name, _ in all_passes]
-        n_passes = len(pass_names)
-        assignments = dispatch_branches(n_passes, cfg_world_size)
-        my_indices = assignments[cfg_rank]
-        max_local = max(len(a) for a in assignments)
-
-        local_videos: list[torch.Tensor] = []
-        local_audios: list[torch.Tensor] = []
-
-        indices_to_run = my_indices if my_indices else [0]
-        with set_forward_context(
-            current_timestep=step.step_index, attn_metadata=step.attn_metadata
-        ):
-            for idx in indices_to_run:
-                _, kwargs = all_passes[idx]
-                v, a = step.current_model(**kwargs)
-                local_videos.append(v.float())
-                local_audios.append(a.float())
-
-        if not my_indices:
-            # This rank has no real branch, but it still needs tensor shapes for all-gather.
-            # The dummy branch above provides the shapes; zeros keep this rank from contributing.
-            local_videos = [torch.zeros_like(local_videos[0])]
-            local_audios = [torch.zeros_like(local_audios[0])]
-
-        # Pad to max_local for unbalanced cases (n_passes not divisible by n_ranks).
-        while len(local_videos) < max_local:
-            local_videos.append(torch.zeros_like(local_videos[0]))
-            local_audios.append(torch.zeros_like(local_audios[0]))
-
-        # Stack -> [max_local, B, ...], flatten to [max_local*B, ...] for all-gather.
-        local_v = torch.stack(local_videos, dim=0)
-        local_a = torch.stack(local_audios, dim=0)
-        B = local_v.shape[1]
-        local_v_flat = local_v.reshape(max_local * B, *local_v.shape[2:])
-        local_a_flat = local_a.reshape(max_local * B, *local_a.shape[2:])
-
-        # All-gather along batch dim -> [cfg_world_size * max_local * B, ...].
-        all_v_flat = cfg_model_parallel_all_gather(local_v_flat, dim=0)
-        all_a_flat = cfg_model_parallel_all_gather(local_a_flat, dim=0)
-
-        # Reshape to [cfg_world_size, max_local, B, ...].
-        all_v = all_v_flat.reshape(cfg_world_size, max_local, B, *all_v_flat.shape[1:])
-        all_a = all_a_flat.reshape(cfg_world_size, max_local, B, *all_a_flat.shape[1:])
-
-        # Branch i was run by rank (i % cfg_world_size) at slot (i // cfg_world_size).
-        return {
-            name: (
-                all_v[i % cfg_world_size, i // cfg_world_size],
-                all_a[i % cfg_world_size, i // cfg_world_size],
-            )
-            for i, name in enumerate(pass_names)
-        }
 
     @staticmethod
     def _get_video_latent_num_frames_for_model(
@@ -563,7 +429,11 @@ class LTX2DenoisingStage(DenoisingStage):
         noise = torch.randn(
             reference_tensor.shape,
             generator=generator,
-            dtype=torch.float64,
+            dtype=(
+                torch.float32
+                if not current_platform.is_float64_supported()
+                else torch.float64
+            ),
             device=reference_tensor.device,
         )
         noise = (noise - noise.mean()) / noise.std()
@@ -1180,19 +1050,45 @@ class LTX2DenoisingStage(DenoisingStage):
             f"{audio_latent_model_input.ndim}, shape={tuple(audio_latent_model_input.shape)}"
         )
 
-    def _prepare_ltx2_model_inputs(
+    def _get_ltx2_rope_coords(
         self,
         ctx: LTX2DenoisingContext,
         step: DenoisingStepState,
         batch: Req,
         server_args: ServerArgs,
-        sigma: torch.Tensor,
-    ) -> LTX2ModelInputs:
-        latent_model_input = ctx.latents.to(ctx.target_dtype)
-        audio_latent_model_input = ctx.audio_latents.to(ctx.target_dtype)
-        audio_num_frames_latent = self._get_audio_num_frames_latent(
-            audio_latent_model_input
+        latent_model_input: torch.Tensor,
+        audio_latent_model_input: torch.Tensor,
+        audio_num_frames_latent: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        video_sp_start = (
+            int(batch.sp_video_start_frame) if batch.did_sp_shard_latents else None
         )
+        audio_sp_start = (
+            int(batch.sp_audio_start_frame)
+            if batch.did_sp_shard_audio_latents
+            else None
+        )
+        key = (
+            id(step.current_model),
+            id(server_args.pipeline_config),
+            latent_model_input.device,
+            audio_latent_model_input.device,
+            tuple(latent_model_input.shape),
+            tuple(audio_latent_model_input.shape),
+            ctx.latent_num_frames_for_model,
+            ctx.latent_height,
+            ctx.latent_width,
+            float(batch.fps),
+            audio_num_frames_latent,
+            ctx.use_ltx23_legacy_one_stage,
+            server_args.enable_breakable_cuda_graph,
+            video_sp_start,
+            audio_sp_start,
+        )
+        cached = self._ltx2_coords_cache.get(key)
+        if cached is not None:
+            self._ltx2_coords_cache.move_to_end(key)
+            return cached
 
         video_coords = None
         audio_coords = None
@@ -1211,7 +1107,7 @@ class LTX2DenoisingStage(DenoisingStage):
                 audio_latent_model_input,
                 num_frames=audio_num_frames_latent,
             )
-        video_coords, audio_coords = _prepare_ltx2_rope_coords_for_bcg(
+        coords = _prepare_ltx2_rope_coords_for_bcg(
             enabled=server_args.enable_breakable_cuda_graph,
             current_model=step.current_model,
             latent_model_input=latent_model_input,
@@ -1223,6 +1119,34 @@ class LTX2DenoisingStage(DenoisingStage):
             width=ctx.latent_width,
             audio_num_frames=audio_num_frames_latent,
             fps=batch.fps,
+        )
+        self._ltx2_coords_cache[key] = coords
+        if len(self._ltx2_coords_cache) > self._ltx2_coords_cache_max_entries:
+            self._ltx2_coords_cache.popitem(last=False)
+        return coords
+
+    def _prepare_ltx2_model_inputs(
+        self,
+        ctx: LTX2DenoisingContext,
+        step: DenoisingStepState,
+        batch: Req,
+        server_args: ServerArgs,
+        sigma: torch.Tensor,
+    ) -> LTX2ModelInputs:
+        latent_model_input = ctx.latents.to(ctx.target_dtype)
+        audio_latent_model_input = ctx.audio_latents.to(ctx.target_dtype)
+        audio_num_frames_latent = self._get_audio_num_frames_latent(
+            audio_latent_model_input
+        )
+
+        video_coords, audio_coords = self._get_ltx2_rope_coords(
+            ctx,
+            step,
+            batch,
+            server_args,
+            latent_model_input=latent_model_input,
+            audio_latent_model_input=audio_latent_model_input,
+            audio_num_frames_latent=audio_num_frames_latent,
         )
 
         batch_size = int(latent_model_input.shape[0])
@@ -2719,8 +2643,8 @@ class LTX2DenoisingStage(DenoisingStage):
 
     def _get_negative_prompt_embeds_validator(self, batch: Req):
         """Allow either tensor or list negative prompt embeddings for LTX-2 CFG."""
-        return (
-            lambda x: (not batch.do_classifier_free_guidance)
+        return lambda x: (
+            (not batch.do_classifier_free_guidance)
             or V.is_tensor(x)
             or V.list_not_empty(x)
         )
