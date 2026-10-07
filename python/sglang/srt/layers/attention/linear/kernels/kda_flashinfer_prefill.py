@@ -12,8 +12,6 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 )
 
 if TYPE_CHECKING:
-    from flashinfer.kda import RecurrentKDAPrefillWrapper
-
     from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -70,7 +68,7 @@ def build_flashinfer_kda_checkpoint_plan(
 
 
 class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
-    """Execute planned KDA prefill; FlashInfer validates the tensor contract."""
+    """Execute KDA prefill; FlashInfer validates the tensor contract."""
 
     uses_state_checkpoints = True
     supports_track_state_snapshot = True
@@ -79,17 +77,12 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
     def __init__(self):
         if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
             raise ValueError("FlashInfer KDA prefill requires SM100 or SM103")
-        from flashinfer.kda import RecurrentKDAPrefillWrapper
+        from flashinfer.kda import recurrent_kda
 
-        self._wrapper_cls = RecurrentKDAPrefillWrapper
+        self._recurrent_kda = recurrent_kda
 
     def decode(self, *args, **kwargs):
         raise NotImplementedError("FlashInferKDAPrefillKernel is prefill-only")
-
-    def plan(self, query_start_loc: torch.Tensor) -> RecurrentKDAPrefillWrapper:
-        wrapper = self._wrapper_cls(query_start_loc.device)
-        wrapper.plan(query_start_loc)
-        return wrapper
 
     def extend(
         self,
@@ -105,7 +98,6 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         lower_bound: float,
-        prefill_wrapper: RecurrentKDAPrefillWrapper,
         return_intermediate_states: bool = False,
         state_checkpoint_cu_starts: Optional[torch.Tensor] = None,
         num_state_checkpoints: int = 0,
@@ -114,9 +106,6 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         track_ssm_h_batch_src: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        assert prefill_wrapper is not None, (
-            "FlashInfer KDA prefill batch was not planned"
-        )
         needs_checkpoint = (
             return_intermediate_states and kwargs.get("track_state") is not None
         )
@@ -125,7 +114,7 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             if needs_checkpoint
             else None
         )
-        result = prefill_wrapper.run(
+        result = self._recurrent_kda(
             q=q.contiguous(),
             k=k.contiguous(),
             v=v.contiguous(),
@@ -141,6 +130,7 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
             lower_bound=lower_bound,
+            cu_seqlens=query_start_loc,
             ssm_state_indices=cache_indices.to(torch.int32),
             beta_is_logit=True,
             state_checkpoints=checkpoints,
@@ -153,6 +143,7 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             checkpoint_every_n_tokens=(
                 state_checkpoint_every_n_tokens if needs_checkpoint else 0
             ),
+            backend="cute-dsl",
         )
         if needs_checkpoint:
             kwargs["track_state"][track_ssm_h_batch_src] = checkpoints.float()

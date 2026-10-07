@@ -567,11 +567,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
-        if (
-            self.kernel_dispatcher.prefill_backend.is_flashinfer()
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            self._init_flashinfer_prefill_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
             if self.forward_metadata.mamba_track_mask_indices is None:
                 self.forward_metadata.mamba_track_mask_indices = (
@@ -582,31 +577,25 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+            if (
+                self.kernel_dispatcher.extend_kernel.uses_state_checkpoints
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and self.forward_metadata.track_ssm_h_src is not None
+                and self.forward_metadata.track_ssm_h_src.numel() > 0
+            ):
+                from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
+                    build_flashinfer_kda_checkpoint_plan,
+                )
 
-    def _init_flashinfer_prefill_metadata(self, forward_batch: ForwardBatch):
-        """Plan sequence order and checkpoints once for all KDA layers."""
-        metadata = self.forward_metadata
-        if metadata.logical_num_tokens <= 1:
-            return
-
-        if (
-            metadata.track_ssm_h_src is not None
-            and metadata.track_ssm_h_src.numel() > 0
-        ):
-            from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
-                build_flashinfer_kda_checkpoint_plan,
-            )
-
-            assert self._has_cpu_prefill_track_metadata(forward_batch), (
-                "FlashInfer KDA checkpoints require host prefill tracking metadata"
-            )
-            build_flashinfer_kda_checkpoint_plan(
-                forward_batch, metadata, self.device, self.mamba_chunk_size
-            )
-
-        metadata.flashinfer_kda_prefill_wrapper = (
-            self.kernel_dispatcher.extend_kernel.plan(metadata.query_start_loc)
-        )
+                assert self._has_cpu_prefill_track_metadata(forward_batch), (
+                    "FlashInfer KDA checkpoints require host prefill tracking metadata"
+                )
+                build_flashinfer_kda_checkpoint_plan(
+                    forward_batch,
+                    self.forward_metadata,
+                    self.device,
+                    self.mamba_chunk_size,
+                )
 
     def forward_decode(
         self,
@@ -1003,7 +992,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ),
             state_checkpoint_indices=self.forward_metadata.state_checkpoint_indices,
             track_ssm_h_batch_src=self.forward_metadata.track_ssm_h_batch_src,
-            prefill_wrapper=self.forward_metadata.flashinfer_kda_prefill_wrapper,
         )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary

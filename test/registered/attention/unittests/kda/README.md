@@ -36,24 +36,25 @@ Columns are runner modes; rows are the linear-attention kernel backend. Cells us
 FlashInfer prefill execution requires SM100/SM103,
 BF16 model activations, BF16 or FP32 SSM state, equal Q/K/V head counts with
 128-D heads, and a finite negative safe-gate lower bound.
-FlashInfer validates this tensor contract when the wrapper runs, including
+FlashInfer validates this tensor contract when the kernel runs, including
 during server warmup. Radix-cache checkpoints require a positive mamba chunk
 size divisible by 32. Incompatible intervals are rejected at backend
 initialization; FlashInfer rejects unbounded gates during warmup, so original
 Kimi Linear should use Triton prefill.
 
-The backend plans sequence order and radix-cache checkpoints once per batch,
+The backend maps radix-cache checkpoint destinations once per tracked batch,
 before layer execution. The adapter consumes raw gate/beta projections and
-normalizes projection strides before calling FlashInfer. Packed batches may
-include single-token sequences and zero-length padding rows; only the total
-packed token count must exceed one.
+normalizes projection strides before calling `recurrent_kda(backend="cute-dsl")`
+directly. FlashInfer owns execution scheduling and workspace allocation; its
+direct API may read packed sequence offsets on the host to size that workspace.
+Packed batches may include single-token sequences and zero-length padding rows;
+only the total packed token count must exceed one.
 
 KDA models pass raw beta logits in every phase; activation belongs to the
 kernel adapters. A packed batch with only one token uses Triton with the same
 raw beta format. Invalid checkpoint metadata raises an assertion instead of changing
 kernels. TBO and full prefill CUDA graphs are rejected at initialization; BCG
 keeps linear attention eager. Verify uses its separately resolved backend.
-Untracked prefill needs no host sequence lengths.
 
 ## Production-Unsupported
 

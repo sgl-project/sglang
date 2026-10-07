@@ -2,7 +2,6 @@
 
 from itertools import accumulate
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -150,10 +149,8 @@ def test_kda_prefill_checkpoints(state_dtype, layout, prefix_len):
                 track_state=snapshots,
                 track_chunk_idx=tensor(host_plan.chunk_indices),
             )
-        if kernel is fi:
-            kwargs["prefill_wrapper"] = fi.plan(offsets)
-            if track:
-                kwargs.update(vars(metadata))
+        if kernel is fi and track:
+            kwargs.update(vars(metadata))
         output = kernel.extend(
             *inputs,
             ssm_states=state,
@@ -165,11 +162,7 @@ def test_kda_prefill_checkpoints(state_dtype, layout, prefix_len):
         assert torch.isfinite(state).all()
         return state, snapshots
 
-    with patch(
-        "flashinfer.kda_kernels.kda_chunked_bt16._cu_seqlens_contents",
-        side_effect=AssertionError("cu_seqlens copied to host"),
-    ):
-        fi_state, fi_track = run(fi, track=True)
+    fi_state, fi_track = run(fi, track=True)
     assert torch.isfinite(fi_track[0]).all() and torch.isnan(fi_track[1:]).all()
     if layout == "padded_row":
         torch.testing.assert_close(fi_state[0], initial[0], atol=0, rtol=0)
@@ -244,16 +237,7 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(extend_lens):
         dispatcher = flashinfer_dispatcher()
         backend = fixture.backend.linear_attn_backend
         backend.kernel_dispatcher = dispatcher
-        kernel = dispatcher.extend_kernel
-        with (
-            patch.object(kernel, "plan", wraps=kernel.plan) as plan,
-            patch(
-                "flashinfer.kda_kernels.kda_chunked_bt16._cu_seqlens_contents",
-                side_effect=AssertionError("cu_seqlens copied to host"),
-            ),
-        ):
-            flashinfer_output = run_kda_fixture_eager(fixture)
-        assert plan.call_count == int(sum(extend_lens) > 1)
+        flashinfer_output = run_kda_fixture_eager(fixture)
 
         torch.testing.assert_close(
             flashinfer_output.float(), triton_output.float(), atol=3e-2, rtol=3e-2
