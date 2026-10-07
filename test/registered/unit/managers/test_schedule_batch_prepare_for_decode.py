@@ -201,7 +201,7 @@ class TestPrepareForDecodePenaltyHistory(unittest.TestCase):
         running.req_pool_indices_cpu = running.req_pool_indices.clone()
         self._prepare_for_decode(running)
         for req in running.reqs:
-            req._refresh_fill_ids = lambda: None
+            req.refresh_fill_ids = lambda: None
             req.set_extend_range = lambda start, end: None
         prefill = _make_penalized_prefill_batch()
 
