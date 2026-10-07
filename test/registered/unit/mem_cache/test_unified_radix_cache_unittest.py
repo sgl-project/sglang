@@ -62,6 +62,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.pool_host import PoolEntry
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -77,11 +78,13 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
+    BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     _TREE_CORE_REGISTRY,
@@ -236,6 +239,46 @@ class _FakeFullComponent(TreeComponent):
 
     def _recede_session_coverage(self, session_id, leaf, fallback) -> None:
         pass
+
+
+class _ExtraPoolFullComponent(FullComponent):
+    """FULL component that also stores every page under a pool of its own,
+    staged through the anchor's host pool."""
+
+    EXTRA_POOL = PoolName.DRAFT
+
+    def buffer_mode_host_pool_entries(self, host_pool_group):
+        anchor = host_pool_group.anchor_entry
+        return [
+            PoolEntry(
+                name=self.EXTRA_POOL,
+                host_pool=anchor.host_pool,
+                device_pool=anchor.device_pool,
+                layer_mapper=anchor.layer_mapper,
+            )
+        ]
+
+    def buffer_backup_keys(self, node, hash_values):
+        return {self.EXTRA_POOL: list(hash_values)}
+
+    def build_hicache_transfers(self, node, phase, **kwargs):
+        if phase == CacheTransferPhase.BACKUP_HOST:
+            # Two transfers of the pool, each keyed by its own pages: the
+            # storage write must keep the keys per transfer.
+            value = node.component_data[BASE_COMPONENT_TYPE].value
+            keys = list(node.hash_value)
+            split = len(keys) // 2
+            page_size = self.tree_core.page_size
+            halves = [
+                (value[: split * page_size], keys[:split]),
+                (value[split * page_size :], keys[split:]),
+            ]
+            return [
+                PoolTransfer(name=self.EXTRA_POOL, device_indices=rows, keys=part)
+                for rows, part in halves
+                if part
+            ]
+        return super().build_hicache_transfers(node, phase, **kwargs)
 
 
 def _drop_hicache_atexit_pin(cache):
@@ -468,6 +511,9 @@ def build_fixture(
     enable_session_radix_cache: bool = False,
     tree_page_size: Optional[int] = None,
     mamba_cache_chunk_size: Optional[int] = None,
+    component_registry_override: Optional[
+        dict[ComponentType, type[TreeComponent]]
+    ] = None,
     tree_core_backend: Optional[str] = None,
 ):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
@@ -602,6 +648,7 @@ def build_fixture(
         enable_session_radix_cache=enable_session_radix_cache,
         eviction_policy=cfg.eviction_policy,
         is_eagle=cfg.is_eagle,
+        component_registry_override=component_registry_override,
     )
     requested_backend = tree_core_backend or _selected_tree_core_test_backend()
     selected_backend = resolve_tree_core_backend(requested_backend, cache_init_params)
@@ -1135,13 +1182,18 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         # every in-flight backup.
         lock_params = cache.inc_lock_ref(leaf_id).to_dec_params()
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
+        keys = list(snapshot.hash_values)
+        # Entries are keyed by the write's ack id, not by the node.
         pipeline.ongoing_write_through = {
-            leaf_id: _UnifiedBufferBackupEntry(
-                intent=_UnifiedBackupIntent(snapshot=snapshot),
+            -1: _UnifiedBufferBackupEntry(
+                intent=_UnifiedBackupIntent(
+                    snapshot=snapshot, pool=PoolName.KV, keys=keys
+                ),
                 host_indices=torch.empty(0, dtype=torch.int64),
                 aux_xfers=[],
                 lock_params=lock_params,
                 occupied_units=0,
+                keys_by_pool={PoolName.KV: keys},
             )
         }
         cache.buffer_pipeline = pipeline
@@ -4031,8 +4083,14 @@ class UnifiedRadixCacheSuite:
         pipeline = cache.buffer_pipeline
         controller = cache.cache_controller
         _write_backup(cache, leaf)
-        node_ids = [intent.snapshot.node_id for intent in pipeline.pending_write_queue]
+        # One intent per pool of every node on the path.
+        intents = list(pipeline.pending_write_queue)
+        node_ids = sorted({intent.snapshot.node_id for intent in intents})
         self.assertGreaterEqual(len(node_ids), 2)
+        self.assertEqual(
+            pipeline.inflight_backup_pools[leaf],
+            {intent.pool for intent in intents if intent.snapshot.node_id == leaf},
+        )
 
         device_allocators = [allocator]
         if self.cfg.has_swa:
@@ -4064,9 +4122,19 @@ class UnifiedRadixCacheSuite:
         self.assertFalse(pipeline.pending_write_queue)
         self.assertFalse(controller.write_queue)
         self.assertEqual(len(controller.ack_write_queue), 1)
+        # Every intent is a write of its own, acked under its own id.
         ack = controller.ack_write_queue[0]
-        self.assertEqual(ack.node_ids, node_ids)
-        self.assertEqual(set(pipeline.ongoing_write_through), set(node_ids))
+        self.assertEqual(len(ack.node_ids), len(intents))
+        self.assertEqual(list(ack.node_ids), list(pipeline.ongoing_write_through))
+        self.assertEqual(
+            sorted(
+                {
+                    entry.intent.snapshot.node_id
+                    for entry in pipeline.ongoing_write_through.values()
+                }
+            ),
+            node_ids,
+        )
         staged_avail = self._host_avail_sizes(cache)
         self.assertNotEqual(staged_avail, avail0)
 
@@ -4076,7 +4144,7 @@ class UnifiedRadixCacheSuite:
             self.assertGreater(_device_lock_ref(cache, node_id, ComponentType.FULL), 0)
         cache.writing_check(finish_count=1)
         self.assertFalse(pipeline.ongoing_write_through)
-        self.assertEqual(len(pipeline.ongoing_backup), len(node_ids))
+        self.assertEqual(len(pipeline.ongoing_backup), len(intents))
         for node_id in node_ids:
             self.assertEqual(_device_lock_ref(cache, node_id, ComponentType.FULL), 0)
         # Each storage write still owns its staging until its separate ACK.
@@ -4103,13 +4171,259 @@ class UnifiedRadixCacheSuite:
         )
         for n in chain:
             self.assertTrue(
-                cache.storage_existence_cache.contains_all(
-                    PoolName.KV, cache.tree_core.get_hash_values(n)
+                cache.storage_existence_cache.pool(PoolName.KV).contains_all(
+                    cache.tree_core.get_hash_values(n)
                 )
             )
-        # Re-hit absorbed by the (FULL-focused) belief skip.
+            for transfer in _aux_storage_key_transfers(cache, n) or ():
+                self.assertTrue(
+                    cache.storage_existence_cache.pool(transfer.name).contains_all(
+                        transfer.keys
+                    )
+                )
+        # Re-hit absorbed when every pool is believed present.
         _write_backup(cache, leaf)
         self.assertNotIn(leaf, cache.buffer_pipeline.inflight_backup_node_ids)
+
+        if self.cfg.has_swa:
+            # Only the SWA window dropped: the next insert queues the SWA pool
+            # alone. A private SWA arena's write proceeds even with FULL staging
+            # at the live cap (shared or anchor-aliased layouts keep the gate).
+            swa_transfer = _aux_storage_key_transfers(cache, leaf)[0]
+            cache.storage_existence_cache.pool(PoolName.SWA).invalidate_beyond(
+                swa_transfer.keys, keep_pages=0
+            )
+            host_group = controller.mem_pool_host
+            private_swa = (
+                pipeline._shared_host_domain() is None
+                and host_group.entry_map[PoolName.SWA].host_pool
+                is not host_group.anchor_entry.host_pool
+            )
+            staged_before = pipeline.write_staged_tokens_
+            if private_swa:
+                pipeline.write_staged_tokens_ = host_group.size
+            with (
+                mock.patch.object(controller, "write", wraps=controller.write) as stage,
+                mock.patch.object(
+                    controller, "write_storage", wraps=controller.write_storage
+                ) as write_storage,
+                mock.patch.object(
+                    controller, "page_set_func", wraps=controller.page_set_func
+                ) as write_full,
+                mock.patch.object(
+                    pipeline, "_write_intents", wraps=pipeline._write_intents
+                ) as admissions,
+            ):
+                # The fixture parks the stock trigger; arm it here.
+                cache.write_through_threshold = 1
+                self._insert(cache, allocator, req_to_token_pool, seq_ab)
+                self.assertEqual(
+                    [
+                        (i.snapshot.node_id, i.pool)
+                        for i in pipeline.pending_write_queue
+                    ],
+                    [(leaf, PoolName.SWA)],
+                )
+                # One admission per node per walk.
+                self.assertEqual(admissions.call_count, len(node_ids))
+                self.assertTrue(cache.buffer_backup_pending(leaf))
+                self._pump_hicache_until(
+                    cache,
+                    lambda: (
+                        not pipeline.inflight_backup_node_ids
+                        and not pipeline.ongoing_backup
+                    ),
+                    "selective buffer backup did not drain",
+                )
+            self.assertFalse(cache.buffer_backup_pending(leaf))
+            if private_swa:
+                pipeline.write_staged_tokens_ -= host_group.size - staged_before
+            self.assertTrue(stage.called)
+            self.assertTrue(
+                all(call.args[0].numel() == 0 for call in stage.call_args_list)
+            )
+            # SWA writes carry no KV page; the window's keys ride the transfer.
+            self.assertTrue(write_storage.called)
+            snapshot = cache.tree_core.snapshot_buffer_backup(
+                leaf, cache.hicache_storage_pass_prefix_keys
+            )
+            for call in write_storage.call_args_list:
+                host_indices, _, hash_value, prefix_keys = call.args[:4]
+                self.assertEqual(host_indices.numel(), 0)
+                self.assertEqual(hash_value, [])
+                transfers = call.kwargs["extra_pools"]
+                self.assertEqual(
+                    [t.name for t in transfers if t.indices_from_pool is None],
+                    [PoolName.SWA],
+                )
+                self.assertEqual(prefix_keys, snapshot.prefix_keys)
+            write_full.assert_not_called()
+            self.assertTrue(
+                cache.storage_existence_cache.pool(PoolName.SWA).contains_all(
+                    swa_transfer.keys
+                )
+            )
+            self.assertEqual(self._host_avail_sizes(cache), avail0)
+        cache.sanity_check()
+
+    @staticmethod
+    def _writes_by_pool(write_storage, extra):
+        """Key tuples of the KV writes and of the ``extra`` pool's writes
+        among the storage writes recorded by ``write_storage``."""
+        kv_writes, extra_writes = set(), set()
+        for call in write_storage.call_args_list:
+            host_indices, _, hash_value = call.args[:3]
+            transfers = call.kwargs.get("extra_pools") or []
+            names = [transfer.name for transfer in transfers]
+            if hash_value:
+                assert extra not in names
+                kv_writes.add(tuple(hash_value))
+            elif extra in names:
+                # The pool's transfers reach storage as one contiguous span.
+                assert host_indices.numel() == 0 and names == [extra]
+                extra_writes.add(tuple(transfers[0].keys))
+        return kv_writes, extra_writes
+
+    def test_buffer_only_writes_component_pools_independently(self):
+        """A component's own pool (aliased host entry, per-pool keys,
+        BACKUP_HOST transfers) is written, believed and re-written
+        independently of the KV pool."""
+        self._skip_unsupported_hicache_test()
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        # Component buffer-mode hooks are Python-core only.
+        cache, allocator, req_to_token_pool = build_fixture(
+            self.cfg,
+            component_registry_override={ComponentType.FULL: _ExtraPoolFullComponent},
+            tree_core_backend="python",
+        )
+        self._init_buffer_hicache(cache, storage_dir)
+        extra = _ExtraPoolFullComponent.EXTRA_POOL
+        controller = cache.cache_controller
+        self.assertIn(extra, controller.mem_pool_host.entry_map)
+        avail0 = self._host_avail_sizes(cache)
+
+        seq = self._buffer_swa_seq()
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        chain = self._path_chain(cache, leaf)
+        pipeline = cache.buffer_pipeline
+        expected_intents = []
+        expected_backlog = 0
+        for node_id in chain:
+            snapshot = cache.tree_core.snapshot_buffer_backup(
+                node_id, cache.hicache_storage_pass_prefix_keys
+            )
+            expected_backlog += len(snapshot.key)
+            expected_intents.extend(
+                (node_id, pool) for pool, _ in pipeline._write_intents(snapshot)
+            )
+        pipeline.write_backlog_cap = expected_backlog
+        if self.cfg.has_swa:
+            self.assertEqual(
+                {pool for node_id, pool in expected_intents if node_id == leaf},
+                {PoolName.KV, PoolName.DRAFT, PoolName.SWA},
+            )
+        self.assertFalse(cache.buffer_backup_pending(leaf))
+        with mock.patch.object(
+            controller, "write_storage", wraps=controller.write_storage
+        ) as write_storage:
+            _write_backup(cache, leaf)
+            self.assertEqual(
+                [
+                    (intent.snapshot.node_id, intent.pool)
+                    for intent in pipeline.pending_write_queue
+                ],
+                expected_intents,
+            )
+            self.assertEqual(pipeline.write_backlog_tokens_, expected_backlog)
+            self.assertEqual(pipeline._backlog_cap_hits, 0)
+            self.assertTrue(cache.buffer_backup_pending(leaf))
+            self._pump_hicache_until(
+                cache,
+                lambda: (
+                    not cache.buffer_pipeline.inflight_backup_node_ids
+                    and not cache.buffer_pipeline.ongoing_backup
+                ),
+                "buffer backup pipeline did not drain",
+            )
+        self.assertFalse(cache.buffer_backup_pending(leaf))
+        # Each pool of each node is a write of its own: the KV chain with its
+        # pages, the component's pool with no KV rows and its transfers
+        # keyed by their own pages.
+        expected = {tuple(cache.tree_core.get_hash_values(n)) for n in chain}
+        kv_writes, extra_writes = self._writes_by_pool(write_storage, extra)
+        self.assertEqual(kv_writes, expected)
+        self.assertEqual(extra_writes, expected)
+
+        page_hashes = self._all_page_hashes(cache, leaf)
+        self.assertEqual(
+            self._storage_exists_count(
+                cache, page_hashes, [PoolTransfer(name=extra, keys=page_hashes)]
+            ),
+            len(page_hashes),
+        )
+        for n in chain:
+            keys = cache.tree_core.get_hash_values(n)
+            self.assertTrue(
+                cache.storage_existence_cache.pool(PoolName.KV).contains_all(keys)
+            )
+            self.assertTrue(
+                cache.storage_existence_cache.pool(extra).contains_all(keys)
+            )
+        self.assertEqual(self._host_avail_sizes(cache), avail0)
+
+        # Only the component's pool dropped from the beliefs: its requested
+        # backup writes that pool alone, staged through the anchor's host
+        # pool with no KV rows.
+        for n in chain:
+            cache.storage_existence_cache.pool(extra).invalidate_beyond(
+                cache.tree_core.get_hash_values(n), keep_pages=0
+            )
+        with (
+            mock.patch.object(controller, "write", wraps=controller.write) as stage,
+            mock.patch.object(
+                controller, "write_storage", wraps=controller.write_storage
+            ) as write_storage,
+            mock.patch.object(
+                controller, "page_set_func", wraps=controller.page_set_func
+            ) as write_full,
+        ):
+            cache.request_buffer_backup(leaf)
+            intents = list(pipeline.pending_write_queue)
+            self.assertEqual(
+                [(intent.snapshot.node_id, intent.pool) for intent in intents],
+                [(n, extra) for n in chain],
+            )
+            self._pump_hicache_until(
+                cache,
+                lambda: (
+                    not pipeline.inflight_backup_node_ids
+                    and not pipeline.ongoing_backup
+                ),
+                "component-pool backup did not drain",
+            )
+        self.assertTrue(stage.called)
+        self.assertTrue(all(call.args[0].numel() == 0 for call in stage.call_args_list))
+        self.assertEqual(len(write_storage.call_args_list), len(chain))
+        kv_writes, extra_writes = self._writes_by_pool(write_storage, extra)
+        self.assertEqual(kv_writes, set())
+        self.assertEqual(extra_writes, expected)
+        write_full.assert_not_called()
+        for n in chain:
+            self.assertTrue(
+                cache.storage_existence_cache.pool(extra).contains_all(
+                    cache.tree_core.get_hash_values(n)
+                )
+            )
+        self.assertEqual(self._host_avail_sizes(cache), avail0)
+
+        # Everything believed stored: a requested backup is absorbed.
+        cache.request_buffer_backup(leaf)
+        self.assertNotIn(leaf, pipeline.inflight_backup_node_ids)
         cache.sanity_check()
 
     def test_buffer_only_read_path_roundtrip(self):
@@ -4228,10 +4542,18 @@ class UnifiedRadixCacheSuite:
             for component_type in cons.tree_components:
                 self.assertIsNone(_host_value(cons, cur, component_type))
         self.assertTrue(
-            cons.storage_existence_cache.contains_all(
-                PoolName.KV, self._all_page_hashes(cons, leaf)
+            cons.storage_existence_cache.pool(PoolName.KV).contains_all(
+                self._all_page_hashes(cons, leaf)
             )
         )
+        # The fetch is evidence for every pool it delivered, so the
+        # consumer's own re-write of the span is skipped pool by pool.
+        for transfer in _aux_storage_key_transfers(cons, leaf) or ():
+            self.assertTrue(
+                cons.storage_existence_cache.pool(transfer.name).contains_all(
+                    transfer.keys
+                )
+            )
         loaded_k, loaded_v = self._snapshot_full_kv(cons_alloc, mc.device_indices)
         self.assertTrue(torch.equal(loaded_k, expected_k))
         self.assertTrue(torch.equal(loaded_v, expected_v))
