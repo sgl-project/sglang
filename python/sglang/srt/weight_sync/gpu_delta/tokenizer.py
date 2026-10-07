@@ -41,7 +41,7 @@ class GpuDeltaTokenizerControl:
         ):
             try:
                 if isinstance(obj, UpdateWeightsFromGpuDeltaReqInput):
-                    return await self._load(obj)
+                    return await self._update(obj)
                 return await self._clear()
             except Exception as exc:
                 return {"success": False, "message": str(exc), "participants": []}
@@ -77,7 +77,7 @@ class GpuDeltaTokenizerControl:
                 self.manager.mm_processor.clear_preprocess_cache()
             return result, was_paused
 
-    async def _load(self, obj):
+    async def _update(self, obj):
         path = Path(obj.manifest_path).resolve(strict=True)
         content = await asyncio.to_thread(path.read_bytes)
         manifest = orjson.loads(content)

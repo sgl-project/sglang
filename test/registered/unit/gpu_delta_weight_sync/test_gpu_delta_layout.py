@@ -38,6 +38,14 @@ def _bytes(tensor):
     return tensor.detach().contiguous().reshape(-1).view(torch.uint8)
 
 
+def _apply_binding(binding, mask):
+    if binding.destinations:
+        for destination in binding.destinations:
+            destination.bitwise_xor_(mask.reshape(destination.shape))
+    else:
+        binding.xor(mask)
+
+
 class TestCanonicalPlanCache(unittest.TestCase):
     def publication(self):
         entries = [
@@ -168,8 +176,10 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 )
                 batch = layout._PreparedBatch(
                     decoder,
-                    None,
-                    [(binding.xor, payload)],
+                    lambda: _apply_binding(
+                        binding, torch.where(prepared.error == 0, payload, 0)
+                    ),
+                    [],
                     [],
                     lambda: prepared.error.bitwise_or_(
                         (decoder.statuses != 0).any().to(torch.int32)
@@ -245,12 +255,12 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     self.assertEqual(len(binding.storage), 2 if independent_mma else 1)
                     before = [image.clone() for image in binding.storage]
                     pointers = [image.data_ptr() for image in binding.storage]
-                    binding.xor(mask)
+                    _apply_binding(binding, mask)
                     for image, original in zip(binding.storage, before):
                         torch.testing.assert_close(image, original ^ transformed)
                     # Alias duplication would cancel the first XOR. A second
                     # update also proves cached destinations stay live.
-                    binding.xor(mask)
+                    _apply_binding(binding, mask)
                     for image, original, pointer in zip(
                         binding.storage, before, pointers
                     ):
@@ -309,7 +319,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         for binding in plan.bindings:
             key = binding.name.split(".")[-2].removesuffix("_proj")
             mask = _bytes(before[key]) ^ _bytes(after[key])
-            binding.xor(binding.selected_bytes(mask))
+            _apply_binding(binding, binding.selected_bytes(mask))
         plan.check_identity()
         torch.testing.assert_close(
             _bytes(shared.gate_up_proj.weight),

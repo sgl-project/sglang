@@ -149,22 +149,15 @@ def _direct_binding(name, meta, target, slices=None):
             f"live={_dtype_name(target.dtype)}{tuple(target.shape)}"
         )
     direct = len(meta["shape"]) <= 1
-    xor = None
-    if not direct:
-        byte_target = _byte_view(target)
-
-        def xor(mask):
-            byte_target.bitwise_xor_(mask.reshape(byte_target.shape))
-
     return TensorBinding(
         name,
         meta["dtype"],
         tuple(meta["shape"]),
         slices,
-        xor,
+        None,
         (target,),
         encoding="raw_bytes" if direct else "xor_bytes",
-        destinations=() if direct else (byte_target,),
+        destinations=() if direct else (_byte_view(target),),
     )
 
 
@@ -236,6 +229,7 @@ def _moe_binding(name, meta, layer, expert, projection, suffix):
 
     group = 128 if projection == "down" else 64
     destinations = []
+    xor = None
     if (
         rows % group == 0
         and cols % 4 == 0
@@ -249,13 +243,6 @@ def _moe_binding(name, meta, layer, expert, projection, suffix):
                 start = 2 if projection == "gate" else 0  # CuTe DSL is up-first.
                 view = view[:, :, :, start : start + 2, :]
             destinations.append(view.permute(0, 3, 2, 1, 4))
-        mask_shape = destinations[0].shape
-
-        def xor(mask):
-            mask = mask.reshape(mask_shape)
-            for destination in destinations:
-                destination.bitwise_xor_(mask)
-
     else:
 
         def xor(mask):

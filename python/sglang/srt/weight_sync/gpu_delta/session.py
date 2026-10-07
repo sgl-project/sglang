@@ -444,12 +444,11 @@ class GpuDeltaSchedulerControl:
                 participant=receipt,
             )
         except Exception as exc:
-            receipt = {
-                "identity": self.session.identity if self.session else None,
-                "state": "REJECTED",
-            }
-            if self.session is not None and self.session._session is not None:
-                receipt = self.session.status()
+            receipt = (
+                self.session.status()
+                if self.session is not None
+                else {"identity": None, "state": "REJECTED"}
+            )
             receipt["generation_paused"] = self.scheduler._engine_paused
             return delta_io.GpuDeltaReqOutput(
                 rid=request.rid, success=False, message=str(exc), participant=receipt

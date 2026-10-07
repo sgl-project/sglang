@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from sglang.srt.weight_sync.gpu_delta import io as delta_io
 from sglang.srt.weight_sync.gpu_delta import session as delta_runtime
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -407,8 +408,17 @@ def test_clear_drains_release_before_private_close_and_shared_unlink(
     assert not directory.exists() and source.read_bytes() == b"retained"
     assert session.clear()["version"] == 7
     session.release_cache(owner=True)
-    with pytest.raises(ValueError, match="base version"):
-        session.prepare(request([session.identity]))
+    scheduler = SimpleNamespace(_engine_paused=False)
+    control = GpuDeltaSchedulerControl(scheduler)
+    control.session = session
+    rejected = control.handle(
+        delta_io.PrepareGpuDeltaReqInput(**request([session.identity]))
+    )
+    assert not rejected.success and "base version" in rejected.message
+    assert rejected.participant["state"] == "CLEARED"
+    assert rejected.participant["version"] == 7
+    assert rejected.participant["identity"] == session.identity
+    assert not rejected.participant["generation_paused"]
 
 
 @pytest.mark.parametrize(

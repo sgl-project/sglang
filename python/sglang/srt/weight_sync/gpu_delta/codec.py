@@ -136,7 +136,6 @@ class NvcompDecoder:
         version = tuple(int(v) for v in distribution.version.split(".")[:2])
         if not (5, 3) <= version < (6, 0) or ctypes.sizeof(ctypes.c_size_t) != 8:
             raise RuntimeError("Direct GPU deltas require the 64-bit nvCOMP 5.3+ ABI")
-        self.version = distribution.version
         self.backend = "hardware"
         self._options = options_type()
         # Explicit backend selection: DEFAULT can silently select software.
