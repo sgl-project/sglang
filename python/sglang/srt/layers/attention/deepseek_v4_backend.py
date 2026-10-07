@@ -1600,7 +1600,14 @@ class DeepseekV4AttnBackend(
 
     @property
     def low_ratio_prefill_graph(self) -> bool:
-        return bool(self.low_ratios) and has_dense_fp4_indexer() and is_sm100_or_newer()
+        # Under decoder bounded replay the indexer runs at a graph break instead,
+        # where it filters by candidates and so serves any context length.
+        return (
+            bool(self.low_ratios)
+            and has_dense_fp4_indexer()
+            and is_sm100_or_newer()
+            and not self.enable_decoder_swa_bounded_replay
+        )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
         max_seq_len = _prefill_graph_max_seq_len()
@@ -1617,9 +1624,6 @@ class DeepseekV4AttnBackend(
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             return True
-        # The captured tail reads the indexer the graph captured with it.
-        if not self.low_ratio_prefill_graph:
-            return False
         tail_rows = sum(min(SWA_WINDOW, n) for n in forward_batch.extend_seq_lens_cpu)
         return tail_rows <= _PREFILL_GRAPH_TAIL_WINDOWS * SWA_WINDOW
 
@@ -1700,9 +1704,12 @@ class DeepseekV4AttnBackend(
         )
         metadata.core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
         if metadata.low_ratio_req_indices is None:
-            metadata.low_ratio_req_indices = torch.repeat_interleave(
+            req_indices = torch.repeat_interleave(
                 forward_batch.req_pool_indices.to(torch.int64),
                 tail_lens.to(torch.int64),
+            )
+            metadata.low_ratio_req_indices = _pad_tensor_to_size(
+                req_indices, positions.shape[0]
             )
             metadata.low_ratio_pos_i64 = positions.to(torch.int64)
         if cp_tail is None:
@@ -2888,16 +2895,17 @@ class DeepseekV4AttnBackend(
         meta = self.forward_metadata
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
         hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
+        num_rows = positions.shape[0]
         if (
             hoisted_req is not None
             and hoisted_pos is not None
-            and hoisted_pos.shape[0] == positions.shape[0]
+            and hoisted_pos.shape[0] >= num_rows
         ):
-            # Bucket-sized under the prefill graph; an eager break sees the
-            # live rows only and falls through.
-            req, pos = hoisted_req, hoisted_pos
+            # Bucket-sized under the prefill graph; an eager break sees only the
+            # live rows, which lead the bucket.
+            req, pos = hoisted_req[:num_rows], hoisted_pos[:num_rows]
         else:
-            req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
+            req = token_req_indices(forward_batch, num_tokens=num_rows)
             pos = positions
         if (
             forward_batch.forward_mode.is_extend()
@@ -3073,6 +3081,8 @@ class DeepseekV4AttnBackend(
 
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
+        # A prefill graph break passes the live rows of bucket-sized metadata.
+        num_rows = x.shape[0]
         compressor = layer.compressor
         layer_id = layer.layer_id
         # Contiguous complex64 freqs_cis gives a real/imag-interleaved view without copying.
@@ -3093,14 +3103,14 @@ class DeepseekV4AttnBackend(
                 compressor.wkv(x),
                 compressor.norm.weight.data,
                 pos,
-                core.raw_out_loc,
+                core.raw_out_loc[:num_rows],
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
                 page_size=page_size,
                 layout=kv_layout,
             )
-            out_loc = core.c1_out_loc
+            out_loc = core.c1_out_loc[:num_rows]
         else:
             # CompressStatePool stores each request's pending pairs in a position ring.
             # KVAndScore rows use | kv | score |, addressed as req * ring_size + pos % ring_size.
@@ -3111,7 +3121,7 @@ class DeepseekV4AttnBackend(
                 compressor.norm.weight.data,
                 pos,
                 req,
-                core.raw_out_loc,
+                core.raw_out_loc[:num_rows],
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
@@ -3132,7 +3142,7 @@ class DeepseekV4AttnBackend(
                     ring_size=state.ring_size,
                     layout=kv_layout,
                 )
-            out_loc = core.c2_out_loc
+            out_loc = core.c2_out_loc[:num_rows]
 
         indexer = layer.indexer
         if indexer is not None and indexer.owns_k:
@@ -3397,6 +3407,7 @@ class DeepseekV4AttnBackend(
     ) -> PrefillInputs:
         core = self.forward_metadata.core_metadata
         tail = self.forward_metadata.late_layer_tail
+        num_rows = x.shape[0]
         if rows_per_request is not None:
             rows_per_request_device = async_h2d(
                 rows_per_request, dtype=torch.int32, device=x.device
@@ -3417,13 +3428,13 @@ class DeepseekV4AttnBackend(
             positions=pos,
             req_rows=req,
             req_pool_indices=forward_batch.req_pool_indices,
-            kv_page_table=core.page_table,
+            kv_page_table=core.page_table[:num_rows],
             seq_lens_cpu=_as_int_list(forward_batch.seq_lens_cpu),
             rows_per_request=rows_per_request,
             rows_per_request_device=rows_per_request_device,
-            out_raw_indices=core.sparse_raw_indices(layer.compress_ratio),
+            out_raw_indices=core.sparse_raw_indices(layer.compress_ratio)[:num_rows],
             out_page_indices=(
-                core.sparse_page_indices(layer.compress_ratio)
+                core.sparse_page_indices(layer.compress_ratio)[:num_rows]
                 if self._low_ratio_prefill_reads_page_indices(forward_batch)
                 else None
             ),

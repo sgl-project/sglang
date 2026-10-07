@@ -160,10 +160,7 @@ class TestDecoderBoundedReplayPrefillGraph(CustomTestCase):
             enable_prefill_cp=False,
             enable_decoder_swa_bounded_replay=True,
             cuda_graph_config=with_phase(
-                default_cuda_graph_config(),
-                Phase.PREFILL,
-                backend=backend,
-                max_seq_len=16384,
+                default_cuda_graph_config(), Phase.PREFILL, backend=backend
             ),
             **overrides,
         )
@@ -175,7 +172,10 @@ class TestDecoderBoundedReplayPrefillGraph(CustomTestCase):
         replay; any other captured prefill would run the late layers on stale rows."""
         for backend in (Backend.DISABLED, Backend.BREAKABLE):
             with self.subTest(backend=backend):
-                validate_deepseek_v41_features(self._args(backend))
+                args = self._args(backend)
+                validate_deepseek_v41_features(args)
+                # The indexer runs at a graph break here, so no context cap applies.
+                self.assertIsNone(args.cuda_graph_config.prefill.max_seq_len)
         for backend in (Backend.FULL, Backend.TC_PIECEWISE):
             with (
                 self.subTest(backend=backend),

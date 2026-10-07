@@ -309,7 +309,12 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             )
 
     prefill_graph = cfg.cuda_graph_config.prefill
-    if prefill_graph.backend != Backend.DISABLED and prefill_graph.max_seq_len is None:
+    if (
+        prefill_graph.backend != Backend.DISABLED
+        and prefill_graph.max_seq_len is None
+        # Decoder bounded replay runs the indexer at a graph break, not captured.
+        and not cfg.enable_decoder_swa_bounded_replay
+    ):
         # The captured low-ratio indexer scores a static context width; 16k
         # keeps it inside the candidate window at under 1 ms per layer.
         declare_resolution(
