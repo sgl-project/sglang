@@ -33,6 +33,13 @@ from sglang.srt.distributed import (
     moe_tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.dp_attention import (
+    dp_gather_replicate,
+    dp_scatter,
+    get_dp_global_num_tokens,
+    get_global_dp_buffer,
+    get_local_dp_buffer,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -46,6 +53,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
     should_skip_post_experts_all_reduce,
+    should_use_dp_reduce_scatterv,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -65,7 +73,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import add_prefix, is_cuda, make_layers, set_weight_attrs
 
 _is_cuda = is_cuda()
@@ -484,6 +492,40 @@ class BeamDecoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # The MLP is sharded over the full TP group, so attention-DP ranks
+        # gather their tokens around it; norms and residuals stay DP-local.
+        self.gather_mlp_tokens = get_parallel().attn_dp_size > 1
+
+    def _forward_mlp(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        if not self.gather_mlp_tokens:
+            return self.mlp(hidden_states)
+        local_hidden_states = hidden_states
+        hidden_states = get_global_dp_buffer(get_parallel().tp_group)
+        dp_gather_replicate(
+            global_tokens=hidden_states,
+            local_tokens=local_hidden_states,
+            forward_batch=forward_batch,
+        )
+        use_reduce_scatterv = (
+            isinstance(self.mlp, BeamMoE) and should_use_dp_reduce_scatterv()
+        )
+        with get_forward().scoped(mlp_reduce_scatter=use_reduce_scatterv):
+            global_output = self.mlp(hidden_states)
+        output = get_local_dp_buffer(get_parallel().tp_group)
+        # BeamMoE skips its all-reduces in this layout; reduce-scatter instead.
+        if use_reduce_scatterv:
+            get_parallel().tp_group.reduce_scatterv(
+                global_output, output=output, sizes=get_dp_global_num_tokens()
+            )
+        else:
+            dp_scatter(
+                local_tokens=output,
+                global_tokens=global_output,
+                forward_batch=forward_batch,
+            )
+        return output
 
     def forward(
         self,
@@ -503,7 +545,10 @@ class BeamDecoderLayer(nn.Module):
             self.attn_residual_scales,
         )
         residual = hidden_states
-        hidden_states = self.mlp(self.pre_feedforward_layernorm(hidden_states))
+        hidden_states = self._forward_mlp(
+            hidden_states=self.pre_feedforward_layernorm(hidden_states),
+            forward_batch=forward_batch,
+        )
         return depth_scaled_residual(
             self.post_feedforward_layernorm(hidden_states),
             residual,
@@ -535,7 +580,7 @@ class BeamDecoderLayer(nn.Module):
             self.rms_norm_eps,
             self.attn_residual_scales,
         )
-        mlp = self.mlp(normed)
+        mlp = self._forward_mlp(normed, forward_batch)
         return self.sandwich_residual_norm(
             mlp,
             residual,
@@ -560,6 +605,7 @@ class BeamModel(nn.Module):
             VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
+                use_attn_tp_group=get_parallel().enable_dp_attention,
                 prefix=add_prefix("embed_tokens", prefix),
             )
             if self.pp_group.is_first_rank
@@ -752,10 +798,10 @@ class BeamForCausalLM(nn.Module):
                 "weights and dynamic per-token activations), or serialized W4A4 "
                 "NVFP4 from compressed-tensors or ModelOpt"
             )
-        if get_parallel().enable_dp_attention or get_parallel().enable_dp_lm_head:
+        if get_parallel().moe_dense_tp_size == 1:
             raise NotImplementedError(
-                "Beam does not yet support attention data parallelism or a "
-                "data-parallel LM head"
+                "Beam shards dense MLP layers over the full TP group; "
+                "moe_dense_tp_size=1 is not supported"
             )
         if (
             get_exec().moe.enable_eplb
@@ -775,6 +821,7 @@ class BeamForCausalLM(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 params_dtype=torch.bfloat16,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
