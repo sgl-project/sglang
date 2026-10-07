@@ -79,7 +79,10 @@ class TestDSV4DequantKCachePaged(CustomTestCase):
         # freshly allocated destination.
         num_tokens, page_size = 777, 256
         workspace = torch.full(
-            (num_tokens + 512, 1, 512), float("nan"), dtype=torch.bfloat16, device="cuda"
+            (num_tokens + 512, 1, 512),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device="cuda",
         )
         self._check(num_tokens, page_size, out=workspace[:num_tokens])
         # Rows past the slice stay untouched.

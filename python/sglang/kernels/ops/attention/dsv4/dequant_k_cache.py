@@ -325,10 +325,9 @@ def _dequantize_k_cache_paged_kernel(
     # load. The one-token-per-program shape issued 64-element loads and left
     # the pass at ~12% of HBM peak; the dequant itself is elementwise, so the
     # grid shape does not change any output bit.
-    token_ids = (
-        tl.program_id(0).to(tl.int64) * TOKENS_PER_PROG
-        + tl.arange(0, TOKENS_PER_PROG).to(tl.int64)
-    )
+    token_ids = tl.program_id(0).to(tl.int64) * TOKENS_PER_PROG + tl.arange(
+        0, TOKENS_PER_PROG
+    ).to(tl.int64)
     tmask = token_ids < num_tokens
     loc = tl.load(page_table_ptr + token_ids, mask=tmask, other=0).to(tl.int64)
     page_idx = loc // PAGE_SIZE
