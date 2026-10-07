@@ -77,6 +77,10 @@ class TestEnableMetrics(CustomTestCase):
                     "sglang:dp_cooperation_realtime_tokens_total",
                     {"mode": "decode"},
                 ),
+                ("sglang:dp_attention_tokens_total", {"kind": "scheduled"}),
+                ("sglang:dp_attention_steps_total", {"rank_state": "active"}),
+                ("sglang:dp_attention_token_imbalance_ratio_count", {}),
+                ("sglang:dp_attention_sync_wait_seconds_count", {}),
             ]
             _check_metrics_positive(self, metrics, metrics_to_check)
 

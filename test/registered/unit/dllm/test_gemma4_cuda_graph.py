@@ -35,6 +35,7 @@ class _ReadStream:
         out,
         kv_start_idx=None,
         sliding_window=False,
+        token_mapping=None,
     ):
         for i, (req, length) in enumerate(zip(req_pool_indices, seq_lens)):
             start = 0 if kv_start_idx is None else int(kv_start_idx[i])
