@@ -6,6 +6,8 @@ on:
       - '.github/workflows/mlu-ci-reliability-report.yml'
       - 'scripts/ci/utils/mlu_ci_reliability_report.py'
       - 'scripts/ci/utils/test_mlu_ci_reliability_report.py'
+      - 'scripts/ci/utils/resolve_mlu_ci_ref.sh'
+      - 'scripts/ci/utils/test_resolve_mlu_ci_ref.py'
   schedule:
     - cron: '17 0 * * 1' # Every Monday at 00:17 UTC
   workflow_dispatch:
@@ -41,6 +43,9 @@ jobs:
 
       - name: Test MLU CI reliability reporter
         run: python -m unittest discover -s scripts/ci/utils -p 'test_mlu_ci_reliability_report.py'
+
+      - name: Test MLU CI ref resolver
+        run: python -m unittest discover -s scripts/ci/utils -p 'test_resolve_mlu_ci_ref.py'
 
   report:
     needs: test
