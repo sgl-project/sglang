@@ -150,6 +150,25 @@ def test_greedy_matches_int8_replay(case):
         assert bool((corrected == SENTINEL).all()), (kind, bs)
 
 
+def test_walk_beyond_16_steps():
+    """The exchange state is sized by gamma, not by a fixed step count: at
+    gamma = 40, three consecutive rounds of every kernel (both round-parity sets)
+    replay the int8 arithmetic exactly."""
+    w1, w2 = _synthetic_weights(_vocab_for(18))
+    walker = mw.MarkovWalker(w1, w2, gamma=40, device=torch.device(DEV), seed=1234)
+    walker.warmup()
+    ref = Reference(w1, w2)
+    for bs in (1, 3, 64):
+        for rnd in range(3):
+            base, anchor = _batch(walker, bs, seed=1000 * bs + rnd)
+            tokens = torch.empty(bs * walker.gamma, dtype=torch.int64, device=DEV)
+            out = walker.walk(base, anchor, None, tokens)
+            kind = walker.kernel_for(bs)
+            assert torch.equal(out, ref.greedy(kind, base, anchor)), (kind, bs, rnd)
+    del walker
+    torch.cuda.empty_cache()
+
+
 def test_greedy_near_fp64_dequant_reference(case):
     """On the kernel's own path, a greedy token may differ from the fp64 argmax of
     base + W2 W1[prev] on the dequantized weights only at a near-tie (bf16 rounding
@@ -436,6 +455,11 @@ def test_host_rejects_bad_arguments(case):
         dict(tokens_out=tokens[:-1]),
         dict(temps=temps[:-1]),
         dict(state=walker.states["wgmma"][1:]),
+        dict(
+            state=torch.zeros(
+                mw.state_words("wgmma", walker.gamma - 1), dtype=torch.int64, device=DEV
+            )
+        ),
         dict(w2_res=w.w2_res[:-1]),
         dict(
             corrected_out=torch.zeros(

@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 MARKOV_RANK = 256  # hard-wired in every kernel: 528-B W1 rows, 8 k32 chunks
-MAX_STEPS = 16  # kMaxSteps
+MAX_STEPS = 256  # kMaxSteps: the Philox counters pack the step into 8 bits
 MAX_BS = 64  # kMaxB of small_batch / wgmma
 SMALL_BATCH_MAX_BS = (
     4  # serving dispatch; the small_batch launcher itself takes up to 8
@@ -52,10 +52,6 @@ WGMMA_TILES = ROWS_CTA // WGMMA_TILE_ROWS
 WGMMA_MAX_TILES = 32  # the stream mask is a 32-bit word
 # Measured on H100 SXM (132 SMs): the 18-tile layout streams these tiles.
 WGMMA_MASK = sum(1 << t for t in (1, 2, 4, 7, 9, 11, 14))
-# int64 words of the kernels' kStateU64: round | pad | two sets of {key, count}
-# pairs (16-B pairs for single, 128-B for small_batch / wgmma).
-STATE_SINGLE_WORDS = 2 + 4 * MAX_STEPS
-STATE_BATCHED_WORDS = 16 + 2 * MAX_STEPS * MAX_BS * 16
 
 # wgmma: in every 64-row tile, wgmma column n = 8 i + 2 tig + e holds tile row
 # rho(n), so a thread's 16 columns are the 8-row runs 8 tig.. and 32 + 8 tig..
@@ -127,8 +123,9 @@ def markov_walk_single(
 
     base_logits bf16 [1, kb >= num_steps, V]; anchor int64 [1]; temps fp32 [1]
     (<= 0 or NaN: greedy); tokens_out int64 [num_steps]; corrected_out None or
-    bf16 shaped like base_logits, written for T > 0 only. The weights and the
-    state are those of MarkovWalkWeights / MarkovWalker.states.
+    bf16 shaped like base_logits, written for T > 0 only. The weights are those
+    of MarkovWalkWeights; state is int64 [state_words(kind, S)] for S >= num_steps
+    (MarkovWalker.states holds one per kind, S = gamma rounded up to 16).
     """
     _jit_single_module().walk(
         frag,
@@ -432,6 +429,15 @@ def _kernel_for(bs: int, *, big_vocab: bool) -> str:
     return "single" if bs == 1 else "small_batch"
 
 
+def state_words(kind: str, num_steps: int) -> int:
+    """int64 words of a kernel's state for up to num_steps steps: round | pad | two
+    sets (round parity) of {key, count} pairs, one 16-B pair per step for single,
+    one 128-B pair per (step, request) for small_batch / wgmma."""
+    if kind == "single":
+        return 2 + 4 * num_steps
+    return 16 + 2 * num_steps * MAX_BS * 16
+
+
 def _aligned_zeros(n: int, *, device: torch.device) -> torch.Tensor:
     t = torch.zeros(n, dtype=torch.int64, device=device)
     assert t.data_ptr() % 128 == 0, "state buffer not 128-B aligned"
@@ -510,10 +516,11 @@ class MarkovWalker:
         kinds = (
             ("wgmma",) if self.weights.big_vocab else ("single", "small_batch", "wgmma")
         )
-        words = {"single": STATE_SINGLE_WORDS, "small_batch": STATE_BATCHED_WORDS}
+        # Capacity in whole 16-step units: on H100 a 7-step set stride made wgmma
+        # 1.2-1.7% slower at bs 5-16 than the 16-step one, with identical code.
+        steps = -(-self.gamma // 16) * 16
         self.states = {
-            k: _aligned_zeros(words.get(k, STATE_BATCHED_WORDS), device=self.device)
-            for k in kinds
+            k: _aligned_zeros(state_words(k, steps), device=self.device) for k in kinds
         }
         self.anchor_buf = torch.zeros(MAX_BS, dtype=torch.int64, device=self.device)
         # temps_buf is caller-writable: stage temperatures into it in-graph.

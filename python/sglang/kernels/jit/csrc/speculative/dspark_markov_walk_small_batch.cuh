@@ -17,7 +17,8 @@
 // Logits: the fp32 op sequence before the bf16 rounding is pinned (__fmul_rn / __fmaf_rn / __fadd_rn), so an exact
 // reference replays it bit for bit; argmax and Gumbel-max read the rounded values (ties -> smallest row) and
 // corrected receives exactly those bits.
-// State: int64 [kStateU64] = round | pad to 128 B | two sets of [16 steps][64 requests] pairs, one 128-B line each
+// State: int64 [16 + 2 S kStepU64] = round | pad to 128 B | two sets of [S >= num_steps steps][64 requests] pairs,
+// one 128-B line each
 // (atomics to one line serialize in its L2 slice).  Round r uses set r & 1; CTA 0 clears the other set at the start
 // and stores round + 1 after the last step.  Nothing is reset between launches.
 #pragma once
@@ -36,12 +37,11 @@
 
 namespace sglang::dspark_markov_walk::small_batch {
 
-constexpr int kMaxB = 64;                              // state / SMEM array sizing
-constexpr int kPairMaxB = 8;                           // launcher limit (two mma passes)
-constexpr int kGrp = 4;                                // requests per mma pass (column pairs)
-constexpr int kPairU64 = 16;                           // one {key, count} pair per 128-B line
-constexpr int kSetU64 = kMaxSteps * kMaxB * kPairU64;  // one set of pairs
-constexpr int kStateU64 = 16 + 2 * kSetU64;            // round | pad to 128 B | two sets (round parity)
+constexpr int kMaxB = 64;                   // state / SMEM array sizing
+constexpr int kPairMaxB = 8;                // launcher limit (two mma passes)
+constexpr int kGrp = 4;                     // requests per mma pass (column pairs)
+constexpr int kPairU64 = 16;                // one {key, count} pair per 128-B line
+constexpr int kStepU64 = kMaxB * kPairU64;  // one step's pairs in a set
 // W2 slice per CTA: TS SMEM tiles + NG register tiles per warp, 72 16-row tiles = 1152 rows
 constexpr int NG = 6, TS = 3;
 constexpr int kTilesSmem = TS * kWarps, kTilesPerCta = kTilesSmem + NG * kWarps, kRowsCta = kTilesPerCta * 16;
@@ -69,6 +69,7 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
     const float* __restrict__ temps,
     int nb,
     int num_steps,
+    int state_steps,
     int kb,
     int ld,
     int valid_rows,
@@ -101,11 +102,12 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
 
   const u64 round = ld_relaxed(state);
   const int set = static_cast<int>(round & 1);
-  u64* pairs = state + 16 + set * kSetU64;  // pair (k, b) at pairs + kPairU64 * (k * kMaxB + b)
+  const int set_u64 = state_steps * kStepU64;
+  u64* pairs = state + 16 + set * set_u64;  // pair (k, b) at pairs + kPairU64 * (k * kMaxB + b)
   auto pair = [&](int k, int b) { return pairs + kPairU64 * (k * kMaxB + b); };
-  if (blockIdx.x == 0)  // clear the set round r+1 uses (it may differ in B, K)
-    for (int i = threadIdx.x; i < kMaxSteps * kMaxB * 2; i += kThreads)
-      st_relaxed(state + 16 + (set ^ 1) * kSetU64 + (i >> 1) * kPairU64 + (i & 1), 0);
+  if (blockIdx.x == 0)  // clear the set round r+1 uses (it may differ in B, and in K <= state_steps)
+    for (int i = threadIdx.x; i < state_steps * kMaxB * 2; i += kThreads)
+      st_relaxed(state + 16 + (set ^ 1) * set_u64 + (i >> 1) * kPairU64 + (i & 1), 0);
   const uint2 seed2 = make_uint2(static_cast<unsigned>(seed), static_cast<unsigned>(seed >> 32));
   const int npass = (nb + kGrp - 1) / kGrp;
   const int n_items = num_steps * npass;  // (step, pass) in walk order
@@ -386,7 +388,9 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
  * \param tokens     int64 [B * num_steps], row-major b * num_steps + k.
  * \param corrected  None, or bf16 shaped like base: the bf16 logits the walk used, rows k < num_steps, vocabulary rows
  *                   < valid_rows, written for requests with temps > 0 only -- zero-initialise it once.
- * \param state      int64 [kStateU64], 128-B aligned, zeroed once and never reset between calls.
+ * \param state      int64 [16 + 2 S kStepU64] for S >= num_steps steps: round | pad to 128 B | two sets (round
+ *                   parity) of 128-B {key, count} pairs per (step, request); 128-B aligned, zeroed once and
+ *                   never reset between calls; serves any num_steps <= S.
  * \param temps      fp32 [B]: <= 0 or NaN: greedy for that request; T > 0 is clamped to [1e-5, 1e4].
  * \param valid_rows The vocabulary size: % 8 == 0, <= min(ld, rows_pad, V).
  * \param seed       Philox key; the round counter in state advances every launch.
@@ -425,7 +429,13 @@ inline void walk(
   TensorMatcher({nb}).with_dtype<int64_t>().with_device(device).ensure_alignment(8).verify(anchor);
   TensorMatcher({nb}).with_dtype<float>().with_device(device).ensure_alignment(4).verify(temps);
   TensorMatcher({nb.unwrap() * num_steps}).with_dtype<int64_t>().with_device(device).ensure_alignment(8).verify(tokens);
-  TensorMatcher({kStateU64}).with_dtype<int64_t>().with_device(device).ensure_alignment(128).verify(state);
+  auto state_words = SymbolicSize{"state_words"};
+  TensorMatcher({state_words}).with_dtype<int64_t>().with_device(device).ensure_alignment(128).verify(state);
+  const int64_t state_steps = (state_words.unwrap() - 16) / (2 * kStepU64);
+  CHECK_HOST(
+      state_words.unwrap() == 16 + 2 * kStepU64 * state_steps && state_steps >= num_steps && state_steps <= kMaxSteps)
+      << "state must be int64 [16 + " << 2 * kStepU64 << " S] with num_steps <= S <= " << kMaxSteps << "; got "
+      << state_words.unwrap() << " words for num_steps " << num_steps;
   const int64_t nb_v = nb.unwrap(), kb_v = kb.unwrap(), ld_v = ld.unwrap();
   CHECK_HOST(nb_v >= 1 && nb_v <= kPairMaxB) << "batch must be in [1, " << kPairMaxB << "], got " << nb_v;
   CHECK_HOST(kb_v >= num_steps) << "base has " << kb_v << " steps < num_steps " << num_steps;
@@ -455,6 +465,7 @@ inline void walk(
       static_cast<const float*>(temps.data_ptr()),
       static_cast<int>(nb_v),
       static_cast<int>(num_steps),
+      static_cast<int>(state_steps),
       static_cast<int>(kb_v),
       static_cast<int>(ld_v),
       static_cast<int>(valid_rows),

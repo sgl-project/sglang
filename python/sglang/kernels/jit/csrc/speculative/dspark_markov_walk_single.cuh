@@ -24,9 +24,9 @@
 //   3. (144 threads, 8 adjacent rows each) logits, bf16 rounding, corrected (sampling rounds), key, block argmax
 //   4. (thread 224) the cross-CTA exchange of the common header on step k's {key, count} pair, after prefetching
 //      W1q[local winner] into L2; meanwhile warps 0..6 compute step k + 1's Gumbel noise.
-// State: int64 [kStateU64] = round | pad | two sets of 16 {key, count} pairs.  Round r uses set r & 1; CTA 0 clears
-// the other set at the start and stores round + 1 after the last step (every CTA has polled every final count by then,
-// and the next launch starts after this one ends).  Nothing is reset between launches.
+// State: int64 [2 + 4 S] = round | pad | two sets of S {key, count} pairs, S >= num_steps.  Round r uses set r & 1; CTA
+// 0 clears the other set at the start and stores round + 1 after the last step (every CTA has polled every final count
+// by then, and the next launch starts after this one ends).  Nothing is reset between launches.
 #pragma once
 
 #include <sgl_kernel/tensor.h>
@@ -47,7 +47,6 @@ constexpr int kUSmemBytes = 544;  // SMEM slot of the gathered W1q row (kURowByt
 // W2 slice per CTA: TS SMEM tiles + NG register tiles per warp, 72 16-row tiles = 1152 rows
 constexpr int NG = 6, TS = 3;
 constexpr int kTilesSmem = TS * kWarps, kTilesPerCta = kTilesSmem + NG * kWarps, kRowsCta = kTilesPerCta * 16;
-constexpr int kStateU64 = 2 + 4 * kMaxSteps;  // round | pad | two sets of 16-B {key, count} pairs per step
 
 // Owner lanes hold rows l0 + g and + 8 of a tile: c0/c2 = <q_w, q_hi>, c1/c3 = <q_w, q_lo> (B columns 0, 1) -> fp32
 // bias into bias_s (local row index)
@@ -83,6 +82,7 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_single_kernel(
     u64* __restrict__ state,
     const float* __restrict__ temps,
     int num_steps,
+    int state_steps,
     int ld,
     int valid_rows,
     u64 seed) {
@@ -115,9 +115,10 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_single_kernel(
   const u64 round = ld_relaxed(state);
   const int set = static_cast<int>(round & 1);
   // {key, arrivals} pairs, 16-B aligned (state + 2), one pair per step; set r&1, CTA 0 clears the other set
-  u64* pairs = state + 2 + set * 2 * kMaxSteps;
-  if (blockIdx.x == 0 && threadIdx.x < 2 * kMaxSteps)
-    st_relaxed(state + 2 + (set ^ 1) * 2 * kMaxSteps + threadIdx.x, 0);
+  u64* pairs = state + 2 + set * 2 * state_steps;
+  if (blockIdx.x == 0)
+    for (int i = threadIdx.x; i < 2 * state_steps; i += kThreads)
+      st_relaxed(state + 2 + (set ^ 1) * 2 * state_steps + i, 0);
   const float inv_t = inv_temperature(temperature);
   const bool sampling = inv_t > 0.f;
   // corrected logits only feed the verifier's q = softmax(corrected / T): sampling rounds only
@@ -370,7 +371,8 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_single_kernel(
  * \param tokens     int64 [num_steps], tokens[k] = step k.
  * \param corrected  None, or bf16 shaped like base: the bf16 logits the walk used, written ONLY in sampling rounds,
  *                   rows k < num_steps, vocabulary rows < valid_rows -- zero-initialise it once.
- * \param state      int64 [kStateU64], 16-B aligned, zeroed once and kept across calls (round counter + exchange).
+ * \param state      int64 [2 + 4 S] for S >= num_steps steps: round | pad | two sets of 16-B {key, count} pairs per
+ *                   step; 16-B aligned, zeroed once and kept across calls; serves any num_steps <= S.
  * \param temps      fp32 [1]: <= 0 or NaN: greedy; T > 0 is clamped to [1e-5, 1e4]; read in-kernel (one graph for
  *                   every temperature).
  * \param valid_rows The vocabulary size: % 8 == 0, <= min(ld, rows_pad, V).
@@ -409,7 +411,12 @@ inline void walk(
   TensorMatcher({1}).with_dtype<int64_t>().with_device(device).ensure_alignment(8).verify(anchor);
   TensorMatcher({1}).with_dtype<float>().with_device(device).ensure_alignment(4).verify(temps);
   TensorMatcher({num_steps}).with_dtype<int64_t>().with_device(device).ensure_alignment(8).verify(tokens);
-  TensorMatcher({kStateU64}).with_dtype<int64_t>().with_device(device).ensure_alignment(16).verify(state);
+  auto state_words = SymbolicSize{"state_words"};
+  TensorMatcher({state_words}).with_dtype<int64_t>().with_device(device).ensure_alignment(16).verify(state);
+  const int64_t state_steps = (state_words.unwrap() - 2) / 4;
+  CHECK_HOST(state_words.unwrap() == 2 + 4 * state_steps && state_steps >= num_steps && state_steps <= kMaxSteps)
+      << "state must be int64 [2 + 4 S] with num_steps <= S <= " << kMaxSteps << "; got " << state_words.unwrap()
+      << " words for num_steps " << num_steps;
   const int64_t ld_v = ld.unwrap();
   CHECK_HOST(kb.unwrap() >= num_steps) << "base has " << kb.unwrap() << " steps < num_steps " << num_steps;
   CHECK_HOST(
@@ -436,6 +443,7 @@ inline void walk(
       static_cast<u64*>(state.data_ptr()),
       static_cast<const float*>(temps.data_ptr()),
       static_cast<int>(num_steps),
+      static_cast<int>(state_steps),
       static_cast<int>(ld_v),
       static_cast<int>(valid_rows),
       static_cast<u64>(seed));

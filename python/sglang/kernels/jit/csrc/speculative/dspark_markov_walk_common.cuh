@@ -20,7 +20,8 @@ namespace sglang::dspark_markov_walk {
 
 using u64 = unsigned long long;
 
-inline constexpr int kMaxSteps = 16;  // K <= 16 draft steps per launch
+// Draft steps per launch; the Philox counters pack the step into 8 bits (step | request << 8).
+inline constexpr int kMaxSteps = 256;
 // single / small_batch CTA and W2 layout: 256 threads; a 16-row W2 tile = 8 k32-chunks x 32 lanes of 16-B mma A
 // fragments
 inline constexpr int kThreads = 256;
