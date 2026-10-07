@@ -768,7 +768,7 @@ mod tests {
     fn chat_finish_reason_maps_scheduler_kinds() {
         let output = |finish: serde_json::Value| FrontendOutput {
             text: "x".into(),
-            token_ids: vec![1],
+            token_ids: vec![1].into(),
             prompt_tokens: 1,
             completion_tokens: 1,
             finish_reason: Some(serde_json::from_value(finish).unwrap()),

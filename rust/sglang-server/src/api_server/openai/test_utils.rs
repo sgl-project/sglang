@@ -42,7 +42,7 @@ pub(super) fn chunk(rid: &str, text: &str, done: bool) -> ResponseItem {
     let output = ChunkEvent {
         rid: rid.into(),
         text: text.into(),
-        token_ids: vec![1],
+        token_ids: vec![1].into(),
         prompt_tokens: 5,
         completion_tokens: 1,
         finish_reason: done.then(|| {
