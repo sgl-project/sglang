@@ -232,31 +232,25 @@ export const agentx = {
      "donorHardware": "gb300"
     }
    },
+   "prov": {
+    "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
+    "run": "36997573694",
+    "pr": "3659",
+    "comment": "5987483060",
+    "status": "verified-pr"
+   },
    "points": [
     {
      "concs": [1],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/e79239bab1e1cb487dc74e27d693110f03384d41/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/gb300-fp4/agentx/agg-tp8-c1-mtp.yaml",
-     "status": "verified-pr",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36997573694",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659",
-     "pr": "3659",
-     "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
      "goldenAL": "3.61",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060",
-     "kv": "hicache"
+     "kv": "hicache",
+     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/gb300-fp4/agentx/agg-tp8-c1-mtp.yaml"
     },
     {
      "concs": [2],
      "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/e79239bab1e1cb487dc74e27d693110f03384d41/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/gb300-fp4/agentx/agg-tp8-c2-mtp.yaml",
-     "status": "verified-pr",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36997573694",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659",
-     "pr": "3659",
-     "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
      "goldenAL": "3.61",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060",
      "kv": "hicache",
      "patch": {
       "dynamo": [
@@ -280,19 +274,13 @@ export const agentx = {
        },
        null
       ]
-     }
+     },
+     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/gb300-fp4/agentx/agg-tp8-c2-mtp.yaml"
     },
     {
      "concs": [4],
      "item": 2,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/e79239bab1e1cb487dc74e27d693110f03384d41/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/gb300-fp4/agentx/agg-tp8-c4-mtp.yaml",
-     "status": "verified-pr",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36997573694",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659",
-     "pr": "3659",
-     "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
      "goldenAL": "3.61",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060",
      "kv": "hicache",
      "patch": {
       "dynamo": [
@@ -316,7 +304,8 @@ export const agentx = {
        },
        null
       ]
-     }
+     },
+     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/gb300-fp4/agentx/agg-tp8-c4-mtp.yaml"
     }
    ],
    "routers": {
@@ -483,18 +472,19 @@ export const agentx = {
      "donorHardware": "gb300"
     }
    },
+   "prov": {
+    "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
+    "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/gb300-fp4/agentx/disagg-1p4d-p-dep4-d-tp4-c45-mtp.yaml",
+    "run": "36997573694",
+    "pr": "3659",
+    "comment": "5987483060",
+    "status": "verified-pr"
+   },
    "points": [
     {
      "concs": [45],
      "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/e79239bab1e1cb487dc74e27d693110f03384d41/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/gb300-fp4/agentx/disagg-1p4d-p-dep4-d-tp4-c45-mtp.yaml",
-     "status": "verified-pr",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36997573694",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659",
-     "pr": "3659",
-     "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
      "goldenAL": "2.5",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060",
      "kv": "hicache"
     }
    ],
@@ -749,18 +739,19 @@ export const agentx = {
      "donorHardware": "gb300"
     }
    },
+   "prov": {
+    "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
+    "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/gb300-fp4/agentx/disagg-1p6d-p-dep4-d-tp4-c45-mtp.yaml",
+    "run": "36997573694",
+    "pr": "3659",
+    "comment": "5987483060",
+    "status": "verified-pr"
+   },
    "points": [
     {
      "concs": [45],
      "item": 2,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/e79239bab1e1cb487dc74e27d693110f03384d41/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/gb300-fp4/agentx/disagg-1p6d-p-dep4-d-tp4-c45-mtp.yaml",
-     "status": "verified-pr",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36997573694",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659",
-     "pr": "3659",
-     "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
      "goldenAL": "2.5",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060",
      "kv": "hicache"
     }
    ],
@@ -905,18 +896,19 @@ export const agentx = {
      "donorHardware": "gb300"
     }
    },
+   "prov": {
+    "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
+    "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/gb300-fp4/agentx/disagg-1p2d-p-dep4-d-tp4-c48-mtp.yaml",
+    "run": "36997573694",
+    "pr": "3659",
+    "comment": "5987483060",
+    "status": "verified-pr"
+   },
    "points": [
     {
      "concs": [48],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/e79239bab1e1cb487dc74e27d693110f03384d41/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/gb300-fp4/agentx/disagg-1p2d-p-dep4-d-tp4-c48-mtp.yaml",
-     "status": "verified-pr",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36997573694",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659",
-     "pr": "3659",
-     "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
      "goldenAL": "2.5",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060",
      "kv": "hicache"
     }
    ],
@@ -1057,18 +1049,19 @@ export const agentx = {
      "donorHardware": "gb300"
     }
    },
+   "prov": {
+    "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
+    "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/gb300-fp4/agentx/disagg-2p1d-p-dep8-d-dep16-c192-mtp.yaml",
+    "run": "36997573694",
+    "pr": "3659",
+    "comment": "5987483060",
+    "status": "verified-pr"
+   },
    "points": [
     {
      "concs": [192],
      "item": 3,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/e79239bab1e1cb487dc74e27d693110f03384d41/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/gb300-fp4/agentx/disagg-2p1d-p-dep8-d-dep16-c192-mtp.yaml",
-     "status": "verified-pr",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36997573694",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659",
-     "pr": "3659",
-     "sha": "e79239bab1e1cb487dc74e27d693110f03384d41",
      "goldenAL": "2.5",
-     "useComment": "https://github.com/SemiAnalysisAI/InferenceX/pull/3659#issuecomment-5987483060",
      "kv": "hicache"
     }
    ],
@@ -1263,17 +1256,18 @@ export const agentx = {
      "donorHardware": "gb200"
     }
    },
+   "prov": {
+    "sha": "5921b0f0451ea6352875935cd3f7e7aae1a20e40",
+    "recipe": "benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/gb200-fp4/agentic/glm5.2-agentx-agg.yaml",
+    "run": "31958517356/attempts/1",
+    "pr": "2620",
+    "status": "verified",
+    "date": "2026-08-16"
+   },
    "points": [
     {
      "concs": [1, 2, 4, 8, 12, 16],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/5921b0f0451ea6352875935cd3f7e7aae1a20e40/benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/gb200-fp4/agentic/glm5.2-agentx-agg.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/31958517356/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2620",
-     "pr": "2620",
-     "date": "2026-08-16",
-     "sha": "5921b0f0451ea6352875935cd3f7e7aae1a20e40",
      "goldenAL": "2.99",
      "kv": "hicache"
     }
@@ -1465,45 +1459,34 @@ export const agentx = {
      "donorHardware": "gb200"
     }
    },
+   "prov": {
+    "sha": "6130a8b5b671be6fc9695e8d159197f2cd275482",
+    "run": "32207758126/attempts/2",
+    "pr": "2642",
+    "status": "verified",
+    "date": "2026-08-19"
+   },
    "points": [
     {
      "concs": [2],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/6130a8b5b671be6fc9695e8d159197f2cd275482/benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/gb200-fp4/agentic/agg-gb200-tp8-c2-mtp.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/32207758126/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2642",
-     "pr": "2642",
-     "date": "2026-08-19",
-     "sha": "6130a8b5b671be6fc9695e8d159197f2cd275482",
      "goldenAL": "3.33",
-     "kv": "hicache"
+     "kv": "hicache",
+     "recipe": "benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/gb200-fp4/agentic/agg-gb200-tp8-c2-mtp.yaml"
     },
     {
      "concs": [4],
      "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/6130a8b5b671be6fc9695e8d159197f2cd275482/benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/gb200-fp4/agentic/agg-gb200-tp8-c4-mtp.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/32207758126/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2642",
-     "pr": "2642",
-     "date": "2026-08-19",
-     "sha": "6130a8b5b671be6fc9695e8d159197f2cd275482",
      "goldenAL": "3.33",
-     "kv": "hicache"
+     "kv": "hicache",
+     "recipe": "benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/gb200-fp4/agentic/agg-gb200-tp8-c4-mtp.yaml"
     },
     {
      "concs": [8],
      "item": 2,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/6130a8b5b671be6fc9695e8d159197f2cd275482/benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/gb200-fp4/agentic/agg-gb200-tp8-c8-mtp.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/32207758126/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2642",
-     "pr": "2642",
-     "date": "2026-08-19",
-     "sha": "6130a8b5b671be6fc9695e8d159197f2cd275482",
      "goldenAL": "3.33",
-     "kv": "hicache"
+     "kv": "hicache",
+     "recipe": "benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/gb200-fp4/agentic/agg-gb200-tp8-c8-mtp.yaml"
     }
    ],
    "routers": {
@@ -1643,17 +1626,18 @@ export const agentx = {
      "donorHardware": "gb200"
     }
    },
+   "prov": {
+    "sha": "5921b0f0451ea6352875935cd3f7e7aae1a20e40",
+    "recipe": "benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/gb200-fp4/agentic/glm5.2-agentx.yaml",
+    "run": "31958517356/attempts/1",
+    "pr": "2620",
+    "status": "verified",
+    "date": "2026-08-16"
+   },
    "points": [
     {
      "concs": [10, 12],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/5921b0f0451ea6352875935cd3f7e7aae1a20e40/benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/gb200-fp4/agentic/glm5.2-agentx.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/31958517356/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2620",
-     "pr": "2620",
-     "date": "2026-08-16",
-     "sha": "5921b0f0451ea6352875935cd3f7e7aae1a20e40",
      "override": "zip_override_mtp_agentx_frontier[0]",
      "goldenAL": "2.99",
      "kv": "hicache"
@@ -1946,17 +1930,18 @@ export const agentx = {
      "donorHardware": "gb200"
     }
    },
+   "prov": {
+    "sha": "6130a8b5b671be6fc9695e8d159197f2cd275482",
+    "recipe": "benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/gb200-fp4/agentic/disagg-gb200-1p6d-dep8-tp4-c45-mtp.yaml",
+    "run": "32207758126/attempts/2",
+    "pr": "2642",
+    "status": "verified",
+    "date": "2026-08-19"
+   },
    "points": [
     {
      "concs": [45],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/6130a8b5b671be6fc9695e8d159197f2cd275482/benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/gb200-fp4/agentic/disagg-gb200-1p6d-dep8-tp4-c45-mtp.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/32207758126/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2642",
-     "pr": "2642",
-     "date": "2026-08-19",
-     "sha": "6130a8b5b671be6fc9695e8d159197f2cd275482",
      "goldenAL": "2.5",
      "kv": "hicache"
     }
@@ -2161,17 +2146,18 @@ export const agentx = {
      "donorHardware": "gb200"
     }
    },
+   "prov": {
+    "sha": "6130a8b5b671be6fc9695e8d159197f2cd275482",
+    "recipe": "benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/gb200-fp4/agentic/disagg-gb200-1p4d-dep8-tp4-c48-mtp.yaml",
+    "run": "32207758126/attempts/2",
+    "pr": "2642",
+    "status": "verified",
+    "date": "2026-08-19"
+   },
    "points": [
     {
      "concs": [48],
      "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/6130a8b5b671be6fc9695e8d159197f2cd275482/benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/gb200-fp4/agentic/disagg-gb200-1p4d-dep8-tp4-c48-mtp.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/32207758126/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2642",
-     "pr": "2642",
-     "date": "2026-08-19",
-     "sha": "6130a8b5b671be6fc9695e8d159197f2cd275482",
      "goldenAL": "2.5",
      "kv": "hicache"
     }
@@ -2323,17 +2309,18 @@ export const agentx = {
      "donorHardware": "gb200"
     }
    },
+   "prov": {
+    "sha": "6130a8b5b671be6fc9695e8d159197f2cd275482",
+    "recipe": "benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/gb200-fp4/agentic/disagg-gb200-2p1d-dep8-dep16-c128-mtp.yaml",
+    "run": "32207758126/attempts/2",
+    "pr": "2642",
+    "status": "verified",
+    "date": "2026-08-19"
+   },
    "points": [
     {
      "concs": [128],
      "item": 2,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/6130a8b5b671be6fc9695e8d159197f2cd275482/benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/gb200-fp4/agentic/disagg-gb200-2p1d-dep8-dep16-c128-mtp.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/32207758126/attempts/2",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2642",
-     "pr": "2642",
-     "date": "2026-08-19",
-     "sha": "6130a8b5b671be6fc9695e8d159197f2cd275482",
      "goldenAL": "2.5",
      "kv": "hicache"
     }
@@ -2510,32 +2497,25 @@ export const agentx = {
      "donorHardware": "b300"
     }
    },
+   "prov": {
+    "sha": "674946f358232388205c9e398d0cc06b14ba2969",
+    "recipe": "benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
+    "run": "34528653758/attempts/1",
+    "pr": "2994",
+    "status": "verified",
+    "date": "2026-09-11"
+   },
    "points": [
     {
      "concs": [1],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375964",
      "goldenAL": "2.99",
-     "kv": "hicache"
+     "kv": "hicache",
+     "job": "34528653758/job/103044375964"
     },
     {
      "concs": [4],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375774",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -2557,19 +2537,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "34528653758/job/103044375774"
     },
     {
      "concs": [8],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375813",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -2591,19 +2564,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "34528653758/job/103044375813"
     },
     {
      "concs": [12],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375382",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -2625,19 +2591,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "34528653758/job/103044375382"
     },
     {
      "concs": [16],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375184",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -2659,19 +2618,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "34528653758/job/103044375184"
     },
     {
      "concs": [20],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044376125",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -2693,19 +2645,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "34528653758/job/103044376125"
     },
     {
      "concs": [24],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375368",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -2727,19 +2672,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "34528653758/job/103044375368"
     },
     {
      "concs": [28],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044374971",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -2761,19 +2699,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "34528653758/job/103044374971"
     },
     {
      "concs": [32],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375267",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -2795,19 +2726,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "34528653758/job/103044375267"
     },
     {
      "concs": [40],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375118",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -2829,19 +2753,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "34528653758/job/103044375118"
     },
     {
      "concs": [48],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/674946f358232388205c9e398d0cc06b14ba2969/benchmarks/single_node/agentic/glm5.2_fp4_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2994",
-     "pr": "2994",
-     "date": "2026-09-11",
-     "sha": "674946f358232388205c9e398d0cc06b14ba2969",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34528653758/job/103044375877",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -2863,7 +2780,8 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "34528653758/job/103044375877"
     }
    ],
    "routers": {
@@ -2987,32 +2905,25 @@ export const agentx = {
      "donorHardware": "b300"
     }
    },
+   "prov": {
+    "sha": "de588b628068061130059bf4ecd4c08877c74250",
+    "recipe": "benchmarks/single_node/agentic/glm5.2_fp8_b300_sglang_mtp.sh",
+    "run": "35015325736/attempts/1",
+    "pr": "3146",
+    "status": "verified",
+    "date": "2026-09-16"
+   },
    "points": [
     {
      "concs": [1],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/de588b628068061130059bf4ecd4c08877c74250/benchmarks/single_node/agentic/glm5.2_fp8_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3146",
-     "pr": "3146",
-     "date": "2026-09-16",
-     "sha": "de588b628068061130059bf4ecd4c08877c74250",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340182",
      "goldenAL": "2.99",
-     "kv": "hicache"
+     "kv": "hicache",
+     "job": "35015325736/job/104538340182"
     },
     {
      "concs": [4],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/de588b628068061130059bf4ecd4c08877c74250/benchmarks/single_node/agentic/glm5.2_fp8_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3146",
-     "pr": "3146",
-     "date": "2026-09-16",
-     "sha": "de588b628068061130059bf4ecd4c08877c74250",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340169",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -3034,19 +2945,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "35015325736/job/104538340169"
     },
     {
      "concs": [8],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/de588b628068061130059bf4ecd4c08877c74250/benchmarks/single_node/agentic/glm5.2_fp8_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3146",
-     "pr": "3146",
-     "date": "2026-09-16",
-     "sha": "de588b628068061130059bf4ecd4c08877c74250",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340279",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -3068,19 +2972,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "35015325736/job/104538340279"
     },
     {
      "concs": [12],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/de588b628068061130059bf4ecd4c08877c74250/benchmarks/single_node/agentic/glm5.2_fp8_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3146",
-     "pr": "3146",
-     "date": "2026-09-16",
-     "sha": "de588b628068061130059bf4ecd4c08877c74250",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340368",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -3102,19 +2999,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "35015325736/job/104538340368"
     },
     {
      "concs": [16],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/de588b628068061130059bf4ecd4c08877c74250/benchmarks/single_node/agentic/glm5.2_fp8_b300_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3146",
-     "pr": "3146",
-     "date": "2026-09-16",
-     "sha": "de588b628068061130059bf4ecd4c08877c74250",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35015325736/job/104538340285",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -3136,7 +3026,8 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "35015325736/job/104538340285"
     }
    ],
    "routers": {
@@ -3259,17 +3150,18 @@ export const agentx = {
      "donorHardware": "b200"
     }
    },
+   "prov": {
+    "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
+    "recipe": "benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/agg-variants.yaml",
+    "run": "36304573738/attempts/4",
+    "pr": "3400",
+    "status": "verified",
+    "date": "2026-10-02"
+   },
    "points": [
     {
      "concs": [1],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/53483461cd7aace0c8712c2d5cf7ec4a2b3e819a/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/agg-variants.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36304573738/attempts/4",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3400",
-     "pr": "3400",
-     "date": "2026-10-02",
-     "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
      "override": "override_c1",
      "goldenAL": "2.99",
      "kv": "hicache"
@@ -3277,13 +3169,6 @@ export const agentx = {
     {
      "concs": [4],
      "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/53483461cd7aace0c8712c2d5cf7ec4a2b3e819a/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/agg-variants.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36304573738/attempts/4",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3400",
-     "pr": "3400",
-     "date": "2026-10-02",
-     "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
      "override": "override_c4",
      "goldenAL": "2.99",
      "kv": "hicache",
@@ -3314,13 +3199,6 @@ export const agentx = {
     {
      "concs": [8],
      "item": 2,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/53483461cd7aace0c8712c2d5cf7ec4a2b3e819a/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/agg-variants.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36304573738/attempts/4",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3400",
-     "pr": "3400",
-     "date": "2026-10-02",
-     "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
      "override": "override_c8",
      "goldenAL": "2.99",
      "kv": "hicache",
@@ -3518,32 +3396,25 @@ export const agentx = {
      "donorHardware": "b200"
     }
    },
+   "prov": {
+    "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
+    "recipe": "benchmarks/single_node/agentic/glm5.2_fp4_b200_sglang_mtp.sh",
+    "run": "33683520699/attempts/1",
+    "pr": "2808",
+    "status": "verified",
+    "date": "2026-09-02"
+   },
    "points": [
     {
      "concs": [1],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d79d82b51c52f18137374897f53860e7cea529b4/benchmarks/single_node/agentic/glm5.2_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2808",
-     "pr": "2808",
-     "date": "2026-09-02",
-     "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089398",
      "goldenAL": "2.99",
-     "kv": "hicache"
+     "kv": "hicache",
+     "job": "33683520699/job/100426089398"
     },
     {
      "concs": [4],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d79d82b51c52f18137374897f53860e7cea529b4/benchmarks/single_node/agentic/glm5.2_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2808",
-     "pr": "2808",
-     "date": "2026-09-02",
-     "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089293",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -3565,19 +3436,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "33683520699/job/100426089293"
     },
     {
      "concs": [8],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d79d82b51c52f18137374897f53860e7cea529b4/benchmarks/single_node/agentic/glm5.2_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2808",
-     "pr": "2808",
-     "date": "2026-09-02",
-     "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089238",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -3599,19 +3463,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "33683520699/job/100426089238"
     },
     {
      "concs": [12],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d79d82b51c52f18137374897f53860e7cea529b4/benchmarks/single_node/agentic/glm5.2_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2808",
-     "pr": "2808",
-     "date": "2026-09-02",
-     "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089321",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -3637,19 +3494,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "33683520699/job/100426089321"
     },
     {
      "concs": [16],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/d79d82b51c52f18137374897f53860e7cea529b4/benchmarks/single_node/agentic/glm5.2_fp4_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2808",
-     "pr": "2808",
-     "date": "2026-09-02",
-     "sha": "d79d82b51c52f18137374897f53860e7cea529b4",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33683520699/job/100426089397",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -3675,7 +3525,8 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "33683520699/job/100426089397"
     }
    ],
    "routers": {
@@ -3798,17 +3649,18 @@ export const agentx = {
      "donorHardware": "b200"
     }
    },
+   "prov": {
+    "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
+    "recipe": "benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/disagg-variants.yaml",
+    "run": "36304573738/attempts/4",
+    "pr": "3400",
+    "status": "verified",
+    "date": "2026-10-02"
+   },
    "points": [
     {
      "concs": [48],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/53483461cd7aace0c8712c2d5cf7ec4a2b3e819a/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/disagg-variants.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36304573738/attempts/4",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3400",
-     "pr": "3400",
-     "date": "2026-10-02",
-     "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
      "override": "override_1p4d_tp4_c48",
      "goldenAL": "2.5",
      "kv": "hicache"
@@ -4079,17 +3931,18 @@ export const agentx = {
      "donorHardware": "b200"
     }
    },
+   "prov": {
+    "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
+    "recipe": "benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/disagg-variants.yaml",
+    "run": "36304573738/attempts/4",
+    "pr": "3400",
+    "status": "verified",
+    "date": "2026-10-02"
+   },
    "points": [
     {
      "concs": [64],
      "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/53483461cd7aace0c8712c2d5cf7ec4a2b3e819a/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/b200-fp4/agentx/disagg-variants.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36304573738/attempts/4",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3400",
-     "pr": "3400",
-     "date": "2026-10-02",
-     "sha": "53483461cd7aace0c8712c2d5cf7ec4a2b3e819a",
      "override": "override_1p1d_c64",
      "goldenAL": "2.5",
      "kv": "hicache"
@@ -4264,32 +4117,25 @@ export const agentx = {
      "donorHardware": "b200"
     }
    },
+   "prov": {
+    "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
+    "recipe": "benchmarks/single_node/agentic/glm5.2_fp8_b200_sglang_mtp.sh",
+    "run": "35013710860/attempts/1",
+    "pr": "2863",
+    "status": "verified",
+    "date": "2026-09-17"
+   },
    "points": [
     {
      "concs": [1],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/a30c9cb26d6d2a218ef87aadcaf854123ffcf71e/benchmarks/single_node/agentic/glm5.2_fp8_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2863",
-     "pr": "2863",
-     "date": "2026-09-17",
-     "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588543",
      "goldenAL": "2.99",
-     "kv": "hicache"
+     "kv": "hicache",
+     "job": "35013710860/job/104532588543"
     },
     {
      "concs": [4],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/a30c9cb26d6d2a218ef87aadcaf854123ffcf71e/benchmarks/single_node/agentic/glm5.2_fp8_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2863",
-     "pr": "2863",
-     "date": "2026-09-17",
-     "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588624",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -4311,19 +4157,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "35013710860/job/104532588624"
     },
     {
      "concs": [8],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/a30c9cb26d6d2a218ef87aadcaf854123ffcf71e/benchmarks/single_node/agentic/glm5.2_fp8_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2863",
-     "pr": "2863",
-     "date": "2026-09-17",
-     "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588912",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -4345,19 +4184,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "35013710860/job/104532588912"
     },
     {
      "concs": [12],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/a30c9cb26d6d2a218ef87aadcaf854123ffcf71e/benchmarks/single_node/agentic/glm5.2_fp8_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2863",
-     "pr": "2863",
-     "date": "2026-09-17",
-     "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588733",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -4383,19 +4215,12 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "35013710860/job/104532588733"
     },
     {
      "concs": [16],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/a30c9cb26d6d2a218ef87aadcaf854123ffcf71e/benchmarks/single_node/agentic/glm5.2_fp8_b200_sglang_mtp.sh",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2863",
-     "pr": "2863",
-     "date": "2026-09-17",
-     "sha": "a30c9cb26d6d2a218ef87aadcaf854123ffcf71e",
-     "jobUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35013710860/job/104532588655",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -4421,7 +4246,8 @@ export const agentx = {
         }
        }
       ]
-     }
+     },
+     "job": "35013710860/job/104532588655"
     }
    ],
    "routers": {
@@ -4544,30 +4370,24 @@ export const agentx = {
      "donorHardware": "h200"
     }
    },
+   "prov": {
+    "sha": "f8fbcc22342bc842c05181205f87080b9c6136c4",
+    "run": "35177419428/attempts/1",
+    "pr": "3112",
+    "status": "verified",
+    "date": "2026-09-18"
+   },
    "points": [
     {
      "concs": [2],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f8fbcc22342bc842c05181205f87080b9c6136c4/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/h200-fp8/agentx/agg-h200-tp8-mtp-c2.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35177419428/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3112",
-     "pr": "3112",
-     "date": "2026-09-18",
-     "sha": "f8fbcc22342bc842c05181205f87080b9c6136c4",
      "goldenAL": "2.99",
-     "kv": "hicache"
+     "kv": "hicache",
+     "recipe": "benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/h200-fp8/agentx/agg-h200-tp8-mtp-c2.yaml"
     },
     {
      "concs": [4],
      "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f8fbcc22342bc842c05181205f87080b9c6136c4/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/h200-fp8/agentx/agg-h200-tp8-mtp-c4.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35177419428/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3112",
-     "pr": "3112",
-     "date": "2026-09-18",
-     "sha": "f8fbcc22342bc842c05181205f87080b9c6136c4",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -4592,18 +4412,12 @@ export const agentx = {
        },
        null
       ]
-     }
+     },
+     "recipe": "benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/h200-fp8/agentx/agg-h200-tp8-mtp-c4.yaml"
     },
     {
      "concs": [8],
      "item": 2,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f8fbcc22342bc842c05181205f87080b9c6136c4/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/h200-fp8/agentx/agg-h200-tp8-mtp-c8.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35177419428/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3112",
-     "pr": "3112",
-     "date": "2026-09-18",
-     "sha": "f8fbcc22342bc842c05181205f87080b9c6136c4",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -4628,18 +4442,12 @@ export const agentx = {
        },
        null
       ]
-     }
+     },
+     "recipe": "benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/h200-fp8/agentx/agg-h200-tp8-mtp-c8.yaml"
     },
     {
      "concs": [12],
      "item": 3,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f8fbcc22342bc842c05181205f87080b9c6136c4/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/h200-fp8/agentx/agg-h200-tp8-mtp-c12.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35177419428/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3112",
-     "pr": "3112",
-     "date": "2026-09-18",
-     "sha": "f8fbcc22342bc842c05181205f87080b9c6136c4",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -4664,18 +4472,12 @@ export const agentx = {
        },
        null
       ]
-     }
+     },
+     "recipe": "benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/h200-fp8/agentx/agg-h200-tp8-mtp-c12.yaml"
     },
     {
      "concs": [16],
      "item": 4,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/f8fbcc22342bc842c05181205f87080b9c6136c4/benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/h200-fp8/agentx/agg-h200-tp8-mtp-c16.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/35177419428/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3112",
-     "pr": "3112",
-     "date": "2026-09-18",
-     "sha": "f8fbcc22342bc842c05181205f87080b9c6136c4",
      "goldenAL": "2.99",
      "kv": "hicache",
      "patch": {
@@ -4700,7 +4502,8 @@ export const agentx = {
        },
        null
       ]
-     }
+     },
+     "recipe": "benchmarks/multi_node/srt-slurm-recipes/glm5.2/sglang/h200-fp8/agentx/agg-h200-tp8-mtp-c16.yaml"
     }
    ],
    "routers": {
@@ -4866,43 +4669,30 @@ export const agentx = {
      "donorHardware": "h200"
     }
    },
+   "prov": {
+    "sha": "e2404449f9255a3b40c02394c09e91ce5f0f5101",
+    "recipe": "benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/agentic/disagg-h200-1p1d-pcp8-tp8-dp8-mtp6-hicache.yaml",
+    "run": "34643185284/attempts/1",
+    "pr": "3021",
+    "status": "verified",
+    "date": "2026-09-15"
+   },
    "points": [
     {
      "concs": [8],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/e2404449f9255a3b40c02394c09e91ce5f0f5101/benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/agentic/disagg-h200-1p1d-pcp8-tp8-dp8-mtp6-hicache.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34643185284/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3021",
-     "pr": "3021",
-     "date": "2026-09-15",
-     "sha": "e2404449f9255a3b40c02394c09e91ce5f0f5101",
      "goldenAL": "3.78",
      "kv": "hicache"
     },
     {
      "concs": [12],
      "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/e2404449f9255a3b40c02394c09e91ce5f0f5101/benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/agentic/disagg-h200-1p1d-pcp8-tp8-dp8-mtp6-hicache.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34643185284/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3021",
-     "pr": "3021",
-     "date": "2026-09-15",
-     "sha": "e2404449f9255a3b40c02394c09e91ce5f0f5101",
      "goldenAL": "3.78",
      "kv": "hicache"
     },
     {
      "concs": [16],
      "item": 2,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/e2404449f9255a3b40c02394c09e91ce5f0f5101/benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/agentic/disagg-h200-1p1d-pcp8-tp8-dp8-mtp6-hicache.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34643185284/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/3021",
-     "pr": "3021",
-     "date": "2026-09-15",
-     "sha": "e2404449f9255a3b40c02394c09e91ce5f0f5101",
      "goldenAL": "3.78",
      "kv": "hicache"
     }
@@ -5117,43 +4907,30 @@ export const agentx = {
      "donorHardware": "h200"
     }
    },
+   "prov": {
+    "sha": "76ff8a6f83cfe190a98d28d4884507edf6cc8040",
+    "recipe": "benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/agentic/disagg-h200-2p2d-pcp8-tp8-dp8-mtp.yaml",
+    "run": "32793067438/attempts/1",
+    "pr": "2684",
+    "status": "verified",
+    "date": "2026-08-25"
+   },
    "points": [
     {
      "concs": [8],
      "item": 0,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/76ff8a6f83cfe190a98d28d4884507edf6cc8040/benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/agentic/disagg-h200-2p2d-pcp8-tp8-dp8-mtp.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/32793067438/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2684",
-     "pr": "2684",
-     "date": "2026-08-25",
-     "sha": "76ff8a6f83cfe190a98d28d4884507edf6cc8040",
      "goldenAL": "2.99",
      "kv": "none"
     },
     {
      "concs": [12],
      "item": 1,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/76ff8a6f83cfe190a98d28d4884507edf6cc8040/benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/agentic/disagg-h200-2p2d-pcp8-tp8-dp8-mtp.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/32793067438/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2684",
-     "pr": "2684",
-     "date": "2026-08-25",
-     "sha": "76ff8a6f83cfe190a98d28d4884507edf6cc8040",
      "goldenAL": "2.99",
      "kv": "none"
     },
     {
      "concs": [16],
      "item": 2,
-     "recipeUrl": "https://github.com/SemiAnalysisAI/InferenceX/blob/76ff8a6f83cfe190a98d28d4884507edf6cc8040/benchmarks/multi_node/srt-slurm-recipes/sglang/glm5.2/agentic/disagg-h200-2p2d-pcp8-tp8-dp8-mtp.yaml",
-     "status": "verified",
-     "runUrl": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/32793067438/attempts/1",
-     "prUrl": "https://github.com/SemiAnalysisAI/InferenceX/pull/2684",
-     "pr": "2684",
-     "date": "2026-08-25",
-     "sha": "76ff8a6f83cfe190a98d28d4884507edf6cc8040",
      "goldenAL": "2.99",
      "kv": "none"
     }

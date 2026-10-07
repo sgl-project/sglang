@@ -260,6 +260,21 @@ export const AgentX = ({ data }) => {
     : t.block.kind === "worker" ? (t.block.role === "agg" ? "worker" : t.block.role)
     : { "dynamo-frontend": "frontend", "sglang-router": "router" }[t.block.kind] || t.block.kind);
 
+  // Provenance: values shared by every point of a deployment live once in cell.prov, and GitHub
+  // URLs are stored as ids (mirrors expand_point() in emit.py, which checks the round trip).
+  const pointInfo = (c, p) => {
+    const q = { ...(c.prov || {}), ...p };
+    const R = data.source.repo;
+    return {
+      ...q,
+      recipeUrl: q.recipe ? `${R}/blob/${q.sha}/${q.recipe}` : undefined,
+      runUrl: q.run ? `${R}/actions/runs/${q.run}` : undefined,
+      jobUrl: q.job ? `${R}/actions/runs/${q.job}` : undefined,
+      prUrl: q.pr ? `${R}/pull/${q.pr}` : undefined,
+      useComment: q.comment ? `${R}/pull/${q.pr}#issuecomment-${q.comment}` : undefined,
+    };
+  };
+
   // ==== 4. State ====
   const [isDark, setIsDark] = useState(false);
   useEffect(() => {
@@ -328,7 +343,7 @@ export const AgentX = ({ data }) => {
 
   const cell = data.cells[cellIdx];
   const pi = Math.min(pointIdx, cell.points.length - 1);
-  const point = cell.points[pi];
+  const point = pointInfo(cell, cell.points[pi]);
   const kv = kvChoice && cell.kv.available.includes(kvChoice) ? kvChoice : point.kv;
   const routerData = cell.routers[router];
   const blocks = blocksFor(cellIdx, pi, router, kv);
