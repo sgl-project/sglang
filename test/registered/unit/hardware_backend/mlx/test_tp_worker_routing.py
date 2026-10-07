@@ -482,7 +482,7 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
         module = "sglang.srt.managers.scheduler_components.batch_result_processor"
         with (
             patch(f"{module}.release_kv_cache", side_effect=release) as released,
-            patch(f"{module}.maybe_cache_unfinished_req"),
+            patch(f"{module}.checkpoint_kv_cache"),
         ):
             processor.process_batch_result_prefill(batch, result)
         return released
@@ -499,7 +499,7 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
 
             self.assertTrue(req.finished())
             self.assertEqual(req.finished_len, 0)
-            released.assert_called_once_with(req, None, is_insert=True)
+            released.assert_called_once_with(req, None, checkpoint=True)
             self.assertEqual(worker._mlx_finished_rids, {rid})
             # Reclamation remains deferred, preserving overlap safety.
             self.assertEqual(worker._mlx_runner._known, {rid})
@@ -672,7 +672,7 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
                 disable_radix_cache=False, disable_overlap_schedule=False
             ),
             patch(f"{module}.release_kv_cache", side_effect=release),
-            patch(f"{module}.maybe_cache_unfinished_req"),
+            patch(f"{module}.checkpoint_kv_cache"),
             patch(
                 "sglang.srt.hardware_backend.mlx.scheduler_mixin.resolve_forward_inputs"
             ),
@@ -723,7 +723,7 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
         req = self._req("a")
         released = self._process_prefill(SimpleNamespace(), [req])
         self.assertTrue(req.finished())
-        released.assert_called_once_with(req, None, is_insert=True)
+        released.assert_called_once_with(req, None, checkpoint=True)
 
 
 if __name__ == "__main__":
