@@ -22,15 +22,13 @@ from concurrent.futures import ThreadPoolExecutor
 def validate_codec(manifest):
     """Admit the authenticated publication codec before examining any tensor payload."""
     if (
-        type(manifest.get("protocol_version")) is not int
-        or manifest["protocol_version"] != 4
-        or manifest.get("codec") not in {"snappy-zstd", "lz4-zstd", "lz4"}
-        or "codec_profile" in manifest
+        manifest.get("codec") not in {"snappy-zstd", "lz4-zstd", "lz4"}
         or type(manifest.get("frame_bytes")) is not int
         or not 0 < manifest["frame_bytes"] <= 4 << 20
     ):
         raise ValueError(
-            "GPU delta requires protocol 4 with a snappy-zstd, lz4-zstd or lz4 codec"
+            "GPU delta requires a snappy-zstd, lz4-zstd or lz4 codec "
+            "and an integer frame size in (0, 4 MiB]"
         )
 
 

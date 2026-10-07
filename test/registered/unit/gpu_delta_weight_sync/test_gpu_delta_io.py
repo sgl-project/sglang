@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-def test_describe_binds_published_scheduler_ranks_without_legacy_ps(monkeypatch):
+def test_describe_binds_published_scheduler_ranks(monkeypatch):
     rank = 7
     from sglang.srt.disaggregation.utils import DisaggregationMode
     from sglang.srt.managers.scheduler import Scheduler
@@ -21,8 +21,7 @@ def test_describe_binds_published_scheduler_ranks_without_legacy_ps(monkeypatch)
 
     reset_context()
     try:
-        # Use the current launch-time configuration/rank derivation, rather than
-        # adding the removed `ps` field to a fake scheduler.
+        # Derive the serving identity from the published launch-time ranks.
         publish(
             ServerArgs(
                 model_path="dummy",
@@ -45,7 +44,6 @@ def test_describe_binds_published_scheduler_ranks_without_legacy_ps(monkeypatch)
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.rust_server = None
         scheduler.tp_worker = SimpleNamespace(model_runner=runner)
-        assert not hasattr(scheduler, "ps")
 
         plan = {"tensors": []}
         backends = []

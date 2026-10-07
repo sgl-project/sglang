@@ -552,7 +552,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         backend.identity = {"host_cache_id": "host"}
         backend.payload_pool = object()
         manifest.update(
-            protocol_version=4,
             codec="lz4-zstd",
             frame_bytes=1 << 20,
             base_version=0,

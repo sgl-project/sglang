@@ -25,11 +25,10 @@ layouts, alpha/scale refresh views, and generic consumer identity snapshots.
 family supplies startup bindings and derived views through the same small mapping
 interface; no GDN/KDA mapping or additional serving backend is implemented here.
 
-Descriptions identify the admitted dense and MoE storage contracts in `layouts`,
-rather than a model-named adapter. Canonical tensor/view metadata and publication
-wire fields are unchanged. The rank layout digest changes with this description,
-so existing streams require fresh admission. The artificial independent mapping
-in the CPU suite tests the extension boundary, not a newly qualified model.
+Descriptions identify the admitted dense and MoE storage contracts in `layouts`.
+The rank layout digest binds these contracts and the canonical tensor views.
+The artificial independent mapping in the CPU suite tests the extension boundary,
+not a newly qualified model.
 
 One Miles coordinator exclusively owns these engines' model updates, pause/resume,
 memory residency and topology for the stream's lifetime. Mixing another weight
@@ -222,7 +221,7 @@ Defaults remain Snappy for ordinary updates and LZ4-Zstd for initial sync in Mil
 Three-codec native and full-model receiver matrices are qualified on B300; the
 learned-update E2E is a separate, earlier source scope.
 
-Protocol 4 carries the selected `codec` and explicit positive integer `frame_bytes`
+The manifest carries the selected `codec` and explicit positive integer `frame_bytes`
 up to 4 MiB (default 1 MiB). Actual encoded/decoded sizes and pointer alignment
 must satisfy the hardware decoder's limits. Matrix frames contain only
 input/output offsets and lengths, without
@@ -237,7 +236,8 @@ The decoder caches the device's hardware operation limit and rejects a frame if
 its actual compressed or decoded length exceeds that limit. A 4 MiB frame whose
 compressed representation expands beyond a 4 MiB device limit is rejected;
 there is no frame splitting or software fallback. Outer Zstd stays at 1 MiB.
-There is no GPU outer decoder, legacy protocol or automatic fallback.
+Each publication selects its codec and frame size. There is no GPU outer decoder
+or automatic fallback.
 
 `GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS=0` (default) or `1` selects nvCOMP
 hardware chunk sorting once when the decoder is constructed, for either inner algorithm.

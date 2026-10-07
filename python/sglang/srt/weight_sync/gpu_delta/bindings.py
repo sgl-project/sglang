@@ -20,8 +20,8 @@ from typing import Callable
 import torch
 
 BACKEND_LAYOUTS = {
-    "dense": "unquantized-tp-v1",
-    "moe": "flashinfer-cutedsl-nvfp4-w4a16-v1",
+    "dense": "unquantized-tp",
+    "moe": "flashinfer-cutedsl-nvfp4-w4a16",
 }
 
 
@@ -408,7 +408,7 @@ class ConsumerSnapshot:
 
 
 def gate_up_target(target, module, shard, slices):
-    dim = getattr(target, "output_dim", 0)
+    dim = target.output_dim
     half = target.shape[dim] // 2
     target = target.narrow(dim, shard * half, half)
     slices[dim] = [module.tp_rank * half, (module.tp_rank + 1) * half]

@@ -54,7 +54,7 @@ def entry(payload, name="weight", size=36):
 
 class TestOuterZstd(unittest.TestCase):
     def test_manifest_codec_and_frame_geometry_admission(self):
-        admitted = dict(protocol_version=4, codec="snappy-zstd", frame_bytes=1 << 20)
+        admitted = dict(codec="snappy-zstd", frame_bytes=1 << 20)
         for codec in ("snappy-zstd", "lz4-zstd", "lz4"):
             for size in (1 << 16, 192 << 10, 1 << 19, 1 << 20, 2 << 20, 4 << 20):
                 validate_codec(admitted | {"codec": codec, "frame_bytes": size})
@@ -81,12 +81,8 @@ class TestOuterZstd(unittest.TestCase):
                             [record], {"owner.bin": 50}, size, "lz4-zstd"
                         )
         for patch_value in (
-            {"protocol_version": 2},
-            {"protocol_version": 3},
-            {"protocol_version": 4.0},
             {"codec": "zstd"},
             {"codec": None},
-            {"codec_profile": "snappy-independent-1mib-gpu-zstd-v1"},
             {"frame_bytes": 0},
             {"frame_bytes": -1},
             {"frame_bytes": (4 << 20) + 1},
