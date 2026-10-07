@@ -1888,6 +1888,9 @@ class Envs:
         "/tmp/sglang_weight_cache_{device_uuid}.ready"
     )
 
+    # Feature-owned ROCm controls.
+    SGLANG_ROCM_K3_RADIX4_FUSE_SORT = EnvBool(True)
+
 
 envs = Envs()
 EnvField._allow_set_name = False
