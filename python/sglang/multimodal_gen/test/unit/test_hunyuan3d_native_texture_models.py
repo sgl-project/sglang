@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan3d.shape import (
     Hunyuan3DShapeSaveStage,
 )
+from sglang.multimodal_gen.runtime.utils.mesh3d_utils import mesh_simplify
 
 
 def _unet_config() -> dict:
@@ -256,6 +257,25 @@ class TestHunyuan3DPaintRemesh(unittest.TestCase):
 
     def test_remesh_disabled_keeps_all_faces(self):
         self.assertEqual(len(self._unwrap(use_remesh=False).faces), 81920)
+
+    def test_decimation_keeps_shape_and_topology(self):
+        sphere = trimesh.creation.icosphere(subdivisions=6, radius=1.0)
+        mesh = mesh_simplify(sphere, target_faces=5000)
+        self.assertLessEqual(len(mesh.faces), 5000)
+        self.assertGreater(len(mesh.faces), 4500)
+        self.assertTrue(mesh.is_watertight)
+        radius = np.linalg.norm(mesh.vertices, axis=1)
+        self.assertLess(np.abs(radius - 1.0).max(), 0.02)
+
+    def test_decimation_keeps_open_boundary(self):
+        sphere = trimesh.creation.icosphere(subdivisions=5)
+        half = trimesh.Trimesh(
+            sphere.vertices, sphere.faces[sphere.triangles_center[:, 2] > 0]
+        )
+        mesh = mesh_simplify(half, target_faces=2000)
+        self.assertLessEqual(len(mesh.faces), 2000)
+        boundary = lambda m: (np.bincount(m.edges_unique_inverse) == 1).sum()
+        self.assertEqual(boundary(mesh), boundary(half))
 
 
 if __name__ == "__main__":
