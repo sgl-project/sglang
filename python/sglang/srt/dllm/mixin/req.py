@@ -22,6 +22,8 @@ class ReqDllmMixin:
         self.dllm_phase: Optional[DllmReqPhase] = None
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
+        self.dllm_block_id = 0
+        self.dllm_block_done = False
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
 
@@ -72,6 +74,8 @@ class ReqDllmMixin:
             # non-incomplete path which also defers it to the adder.
             return
 
+        self.dllm_block_id += 1
+        self.dllm_block_done = False
         self.dllm_block_offset = (
             0
             if not self.dllm_initialized

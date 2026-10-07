@@ -570,24 +570,21 @@ class TpModelWorker(BaseTpWorker):
         forward_batch: ForwardBatch,
         batch: Optional[ScheduleBatch] = None,
     ) -> GenerationBatchResult:
+        block_ids = (
+            tuple(req.dllm_block_id for req in batch.reqs) if batch is not None else None
+        )
         algo_states = None
         if self.dllm_algorithm.fdfo and batch is not None:
             algo_states = [req.dllm_algo_state for req in batch.reqs]
 
-        (
-            logits_output,
-            next_token_ids,
-            accept_length_per_req_cpu,
-            dllm_algo_state,
-            can_run_cuda_graph,
-        ) = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
-
+        out = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
         return GenerationBatchResult(
-            logits_output=logits_output,
-            next_token_ids=next_token_ids,
-            accept_length_per_req_cpu=accept_length_per_req_cpu,
-            dllm_algo_state=dllm_algo_state,
-            can_run_cuda_graph=can_run_cuda_graph,
+            logits_output=out.logits_output,
+            next_token_ids=out.block_tokens,
+            dllm_block_ids=block_ids,
+            dllm_block_done=out.block_done,
+            dllm_algo_state=out.algo_states,
+            can_run_cuda_graph=out.can_run_cuda_graph,
         )
 
     def forward_batch_generation(

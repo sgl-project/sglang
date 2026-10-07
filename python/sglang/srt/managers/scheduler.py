@@ -3598,6 +3598,13 @@ class Scheduler(
             if self.enable_hicache_storage:
                 self._process_storage_prefetch_retries()
 
+    def _clear_dllm_future(self, req):
+        buf = self.future_map.dllm_block_tokens_buf
+        slot = req.kv.req_pool_idx
+        if buf is not None and slot is not None:
+            with self.forward_stream_ctx:
+                buf[slot] = -1
+
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
@@ -3617,7 +3624,8 @@ class Scheduler(
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
             for req in self.dllm_manager.staging_queue:
                 if self.dllm_config.first_done_first_out_mode:
-                    if not req.dllm_incomplete_ids:
+                    if req.dllm_block_done:
+                        self._clear_dllm_future(req)
                         self.stash_chunked_request(req)
                         self.req_to_token_pool.free(req)
                     # Otherwise, keep req slot/KV for reuse.
@@ -4384,9 +4392,15 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            self._relay_forward_payload(
-                                batch, future_indices, batch_result
-                            )
+                            if batch.is_dllm():
+                                if self.dllm_config.first_done_first_out_mode:
+                                    self.future_map.stash_dllm_block_tokens(
+                                        future_indices, batch_result.next_token_ids
+                                    )
+                            else:
+                                self._relay_forward_payload(
+                                    batch, future_indices, batch_result
+                                )
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
@@ -4458,7 +4472,17 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
-                if batch_result.has_sampled_token_ids:
+                if batch.is_dllm():
+                    if self.dllm_config.first_done_first_out_mode:
+                        self.future_map.stash_dllm_block_tokens(
+                            batch.req_pool_indices, batch_result.next_token_ids
+                        )
+                    batch_result.copy_done = self.device_module.Event()
+                    batch_result.copy_to_cpu(
+                        return_logprob=batch.return_logprob,
+                        return_hidden_states=batch.return_hidden_states,
+                    )
+                elif batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(
                         batch, batch.req_pool_indices, batch_result

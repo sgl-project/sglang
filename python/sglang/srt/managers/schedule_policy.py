@@ -915,11 +915,19 @@ class PrefillAdder:
         if _rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
 
-        # Truncate input length to available tokens and update request metadata
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
+        reuse_block = (
+            self.dllm_config.first_done_first_out_mode
+            and req.kv.holds_kv
+            and not req.dllm_block_done
         )
-        if req.dllm_incomplete_ids and cand_extend_input_len > _rem_tokens:
+        cand_extend_input_len = (
+            req.extend_range.length
+            if reuse_block
+            else len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+        )
+        if (
+            reuse_block or req.dllm_incomplete_ids
+        ) and cand_extend_input_len > _rem_tokens:
             return AddReqResult.NO_TOKEN
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)

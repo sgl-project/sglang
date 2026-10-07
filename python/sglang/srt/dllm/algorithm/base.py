@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, NamedTuple, Optional, Union
 
 import torch
 
@@ -14,13 +14,13 @@ from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
-DllmRunOutput = Tuple[
-    Union[LogitsProcessorOutput, torch.Tensor],
-    List,
-    Optional[List[int]],
-    Optional[List[Any]],
-    bool,
-]
+
+class DllmRunOutput(NamedTuple):
+    logits_output: Union[LogitsProcessorOutput, torch.Tensor]
+    block_tokens: torch.Tensor  # [batch_size, block_size]
+    block_done: Optional[torch.Tensor] # [batch_size] bool; FDFO only, true means block KV is ready to commit.
+    algo_states: Optional[List[Any]]
+    can_run_cuda_graph: bool
 
 
 class DllmAlgorithm:
@@ -49,7 +49,7 @@ class DllmAlgorithm:
         forward_batch: ForwardBatch,
         full_logits: torch.Tensor,
         states: List[Any],
-    ) -> List[bool]:
+    ) -> torch.Tensor:
         """One denoise step, advancing ``forward_batch.input_ids``/``states`` in
         place. Returns, per block, whether it was already complete *on entry* --
         i.e. this forward persisted its final KV cache and it can be emitted.
@@ -66,22 +66,17 @@ class DllmAlgorithm:
             return self._run_fdfo(model_runner, forward_batch, algo_states)
         return self._run_sync(model_runner, forward_batch)
 
-    def _block_start_list(self, forward_batch: ForwardBatch) -> List[int]:
-        batch_size = forward_batch.batch_size
-        input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
-        return (input_ids != self.mask_id).sum(dim=1).tolist()
-
     def _run_sync(
         self, model_runner: ModelRunner, forward_batch: ForwardBatch
     ) -> DllmRunOutput:
         batch_size = forward_batch.batch_size
-        start_list = self._block_start_list(forward_batch)
+        block_tokens = forward_batch.input_ids.view(batch_size, self.block_size)
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-        # No mask to denoise: return empty so process_batch_result_dllm skips the
-        # stream branch (matches the pre-refactor behavior).
-        if all(start == self.block_size for start in start_list):
-            return out.logits_output, [], None, None, out.can_run_graph
+        if not bool((block_tokens == self.mask_id).any()):
+            return DllmRunOutput(
+                out.logits_output, block_tokens.clone(), None, None, out.can_run_graph
+            )
 
         states = self.init_step_state(forward_batch)
         # NPU: attention metadata is stable across a block's denoise steps (the
@@ -91,15 +86,13 @@ class DllmAlgorithm:
             forward_batch.mark_forward_metadata_ready()
         for _ in range(self.max_steps(self.block_size)):
             done = self.step(forward_batch, out.logits_output.full_logits, states)
-            if all(done):
+            if bool(done.all()):
                 break
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
 
-        next_token_ids = forward_batch.input_ids.view(batch_size, self.block_size)
-        next_token_ids_list = [
-            next_token_ids[i, start_list[i] :] for i in range(batch_size)
-        ]
-        return out.logits_output, next_token_ids_list, None, None, out.can_run_graph
+        return DllmRunOutput(
+            out.logits_output, block_tokens.clone(), None, None, out.can_run_graph
+        )
 
     def _run_fdfo(
         self,
@@ -123,17 +116,9 @@ class DllmAlgorithm:
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         done = self.step(forward_batch, out.logits_output.full_logits, states)
+        # Clone so a later in-place step cannot race the async D2H of this result.
+        block_tokens = forward_batch.input_ids.view(batch_size, self.block_size).clone()
 
-        accept_length_per_req_cpu = [self.block_size if d else 0 for d in done]
-        next_token_ids_list = forward_batch.input_ids.view(
-            batch_size, self.block_size
-        ).tolist()
-        states_out = [None if done[i] else states[i] for i in range(batch_size)]
-
-        return (
-            out.logits_output,
-            next_token_ids_list,
-            accept_length_per_req_cpu,
-            states_out,
-            out.can_run_graph,
+        return DllmRunOutput(
+            out.logits_output, block_tokens, done, states, out.can_run_graph
         )

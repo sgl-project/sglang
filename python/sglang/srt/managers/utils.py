@@ -4,7 +4,7 @@ import dataclasses
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
 import torch
@@ -48,16 +48,14 @@ def _async_d2h(t: torch.Tensor) -> torch.Tensor:
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
-    next_token_ids: Optional[
-        Union[torch.Tensor, List[torch.Tensor], List[List[int]]]
-    ] = None
+    next_token_ids: Optional[torch.Tensor] = None
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
     num_block_accept_tokens: int = 0
     num_cap_tokens: int = 0
-    # FDFO dLLM batching: per-request accepted block length and carried algo state.
-    accept_length_per_req_cpu: Optional[List[int]] = None
+    dllm_block_ids: Optional[tuple[int, ...]] = None
     dllm_algo_state: Optional[List[Any]] = None
+    dllm_block_done: Optional[torch.Tensor] = None # FDFO only
     can_run_cuda_graph: bool = False
 
     # PP skip output comm: True when output send/recv was skipped and
@@ -164,6 +162,9 @@ class GenerationBatchResult:
                 self.logits_output.hidden_states
             )
         self.next_token_ids = _async_d2h(self.next_token_ids)
+
+        if self.dllm_block_done is not None:
+            self.dllm_block_done = _async_d2h(self.dllm_block_done)
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
