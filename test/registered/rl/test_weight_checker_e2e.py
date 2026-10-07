@@ -25,8 +25,13 @@ from typing import List, Tuple
 import requests
 import torch
 
-from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    get_device,
+    kill_process_tree,
+)
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -35,6 +40,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=60, stage="nightly", runner_config="1-gpu-large")
+register_xpu_ci(est_time=60, suite="nightly-xpu-1-gpu", nightly=True)
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 # We address the up half via the HF-style unfused name "up_proj.weight". sglang's
@@ -54,6 +60,7 @@ class TestWeightCheckerE2E(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        monkey_patch_torch_reductions()
         cls.url = DEFAULT_URL_FOR_TEST
         # --mem-fraction-static 0.7 leaves enough free GPU for _check_tensors's
         # CPU->GPU round trip: snapshot lives on CPU, then _compare moves each
@@ -115,7 +122,7 @@ class TestWeightCheckerE2E(CustomTestCase):
         # The unfused HF name "up_proj" is what update_weights_from_tensor accepts;
         # sglang's loader rewrites it onto the fused gate_up_proj tensor.
         upload_name = "model.layers.5.mlp.up_proj.weight"
-        new_tensor = torch.full(_UP_PROJ_SHAPE, 1.5, device="cuda")
+        new_tensor = torch.full(_UP_PROJ_SHAPE, 1.5, device=get_device())
         update_resp = self._update_weights([(upload_name, new_tensor)])
         self.assertEqual(update_resp.status_code, 200)
         self.assertTrue(update_resp.json()["success"])
@@ -131,7 +138,7 @@ class TestWeightCheckerE2E(CustomTestCase):
     def test_d_update_with_same_tensor_keeps_compare_passing(self):
         """Prime a param, snapshot, push the same bytes again, compare must pass."""
         param_name = "model.layers.6.mlp.up_proj.weight"
-        same_tensor = torch.full(_UP_PROJ_SHAPE, 0.25, device="cuda")
+        same_tensor = torch.full(_UP_PROJ_SHAPE, 0.25, device=get_device())
 
         # Step 1: prime the param to a known value.
         self.assertTrue(
@@ -201,7 +208,7 @@ class TestWeightCheckerE2E(CustomTestCase):
         before_hash = before.get(fused_name)
         self.assertIsNotNone(before_hash, f"missing {fused_name!r} in checksum keys")
 
-        new_tensor = torch.full(_UP_PROJ_SHAPE, 0.5, device="cuda")
+        new_tensor = torch.full(_UP_PROJ_SHAPE, 0.5, device=get_device())
         self.assertTrue(
             self._update_weights([(param_name, new_tensor)]).json()["success"]
         )
