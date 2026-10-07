@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import is_gfx95_supported, is_gfx942_supported
@@ -38,25 +39,27 @@ _REQUIRED_HEAD_DIM = 128
 
 _DEFAULT_FORMAT = "fp8"
 
-# Imported at module load so torch.compile sees stable symbols. If the installed
-# aiter lacks mha_v4, the names resolve to None and construction raises a clear
-# error.
-try:
-    from aiter.ops.mha_v4 import AttentionFormat as _AiterAttentionFormat
-    from aiter.ops.mha_v4 import AttentionScaleMode as _AiterAttentionScaleMode
-    from aiter.ops.mha_v4 import mha_v4 as _aiter_mha_v4
-    from aiter.ops.mha_v4 import native_fp8_format as _aiter_native_fp8_format
+# Defined unconditionally (as None) so the names stay patchable and so that
+# referencing one yields the construction-time message rather than a NameError.
+_AiterAttentionFormat = None
+_AiterAttentionScaleMode = None
+_aiter_mha_v4 = None
+_aiter_native_fp8_format = None
+_AITER_MHA_V4_AVAILABLE = False
 
-    _AITER_MHA_V4_AVAILABLE = True
-except ImportError:
-    # Keep the names defined (as None) so they remain patchable and referencing
-    # them yields a clear message via the construction-time availability check.
-    _AiterAttentionFormat = None
-    _AiterAttentionScaleMode = None
-    _aiter_mha_v4 = None
-    _aiter_native_fp8_format = None
+# Imported at module load so torch.compile sees stable symbols, and gated on
+# USE_AITER because importing aiter without it is not guaranteed to fail with an
+# ImportError on a machine that lacks the package or the ROCm runtime.
+if USE_AITER:
+    try:
+        from aiter.ops.mha_v4 import AttentionFormat as _AiterAttentionFormat
+        from aiter.ops.mha_v4 import AttentionScaleMode as _AiterAttentionScaleMode
+        from aiter.ops.mha_v4 import mha_v4 as _aiter_mha_v4
+        from aiter.ops.mha_v4 import native_fp8_format as _aiter_native_fp8_format
 
-    _AITER_MHA_V4_AVAILABLE = False
+        _AITER_MHA_V4_AVAILABLE = True
+    except ImportError:
+        pass
 
 
 class _Fmt(enum.Enum):
@@ -209,8 +212,8 @@ class AITERQuantImpl(AttentionImpl):
     ) -> None:
         if not _AITER_MHA_V4_AVAILABLE:
             raise RuntimeError(
-                "AITER quant backend requires aiter.ops.mha_v4, which is not "
-                "available in the installed aiter build."
+                "AITER quant backend requires aiter.ops.mha_v4. Set "
+                "SGLANG_USE_AITER=1 on a ROCm build whose aiter ships it."
             )
         if head_size != _REQUIRED_HEAD_DIM:
             raise NotImplementedError(
