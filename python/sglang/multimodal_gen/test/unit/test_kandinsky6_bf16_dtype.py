@@ -301,7 +301,8 @@ def test_bcg_joint_cfg_output_lifetime_and_text_shape_fallback(monkeypatch, use_
     batch.is_warmup = True
     stage._predict_joint_velocity(cfg_policy=policies[0], **inputs)
     batch.is_warmup = False
-    runner = stage._bcg_runners[id(dit)]
+    runner = stage._maybe_get_bcg_runner(dit)
+    assert runner is not None
     replay = runner.replay
     replay_calls = 0
 
