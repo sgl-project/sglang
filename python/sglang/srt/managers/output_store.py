@@ -13,6 +13,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Protocol
 
 import msgspec
@@ -133,7 +134,7 @@ class TokenReplayStash(msgspec.Struct):
         return fields
 
 
-class OutputStoreWriter(Protocol):
+class OutputStoreWriter(ABC):
     """Stores one response's stash and resolves to its ``output_store_ref``.
 
     The ref is ``{"handle": ..., "fields": {name: {"dtype", "shape"}}}``: ``handle``
@@ -150,18 +151,20 @@ class OutputStoreWriter(Protocol):
     scheduler holds those responses until their futures resolve.
     """
 
+    @abstractmethod
     def submit_put(
         self, stash: OutputStoreStash
     ) -> concurrent.futures.Future[Dict[str, Any]]:
         """Store the stash off the caller's thread; resolves to its output_store_ref."""
         ...
 
+    @abstractmethod
     def cleanup_after(self, future: concurrent.futures.Future[Dict[str, Any]]) -> None:
         """Remove the stored object once a put whose ref is never delivered succeeds."""
         ...
 
 
-class MooncakeBundleWriter:
+class MooncakeBundleWriter(OutputStoreWriter):
     """Writes each stash as one hard-pinned Mooncake bundle; staged through host
     memory, so stashes must hold CPU tensors."""
 
