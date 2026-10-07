@@ -1107,6 +1107,29 @@ class TestNixlStaging(CustomTestCase):
         mgr.server_args = SimpleNamespace(chunked_prefill_size=4)
         return mgr
 
+    def test_set_kv_buffer_tensors_accepts_slot_layer_ids(self):
+        # prefill.py/decode.py pass slot_layer_ids= unconditionally under
+        # SGLANG_DISAGG_STAGING_BUFFER on non-MLA models; the setter must
+        # accept it or kv_manager init dies with TypeError (#42684).
+        mgr = self._make_manager()
+        mgr.set_kv_buffer_tensors(
+            ["k0", "k1"], ["v0", "v1"], 2, slot_layer_ids=[0, 1, 0, 1]
+        )
+        self.assertEqual(
+            mgr.kv_buffer_tensors,
+            {
+                "k_buffers": ["k0", "k1"],
+                "v_buffers": ["v0", "v1"],
+                "page_size": 2,
+                "slot_layer_ids": [0, 1, 0, 1],
+            },
+        )
+
+    def test_set_kv_buffer_tensors_slot_layer_ids_default_empty(self):
+        mgr = self._make_manager()
+        mgr.set_kv_buffer_tensors(["k0"], ["v0"], 1)
+        self.assertEqual(mgr.kv_buffer_tensors["slot_layer_ids"], [])
+
     def test_register_buffer_to_engine_groups_kv_memory_kinds_in_one_pass(self):
         agent = StagingFakeAgent(register_result=["desc"])
         mgr = self._make_manager(agent)
