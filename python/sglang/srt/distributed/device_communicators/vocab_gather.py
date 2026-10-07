@@ -274,8 +274,12 @@ def make_pcie_ipc_gather(
     # FlashInfer allocates and maps the IPC buffer without telling the other
     # ranks when that fails on one of them, which leaves them waiting. So the
     # ranks first agree that each can build it, and then check that each did.
+    # FlashInfer does not reject a TP4 group spanning hosts, and its failed
+    # handle exchange there leaves the buffers allocated, so a group that is not
+    # on one host never starts the build.
+    on_one_host = _on_one_host(group)
     workspace_bytes = 2 * group.world_size * max_rows * local_width * dtype.itemsize
-    ready = _can_build_pcie_ipc_gather(group, workspace_bytes)
+    ready = on_one_host and _can_build_pcie_ipc_gather(group, workspace_bytes)
     if _count_ranks(group, ready) < group.world_size:
         return None
     gather = None
@@ -310,6 +314,17 @@ def make_pcie_ipc_gather(
         dtype,
     )
     return gather
+
+
+def _on_one_host(group) -> bool:
+    """Whether every rank of ``group`` shares this host's shared memory, as the
+    custom all-reduce checks it. Collective over ``group.cpu_group``."""
+    from sglang.srt.distributed.parallel_state import in_the_same_node_as
+
+    on_one_host = all(in_the_same_node_as(group.cpu_group, source_rank=0))
+    if not on_one_host:
+        logger.warning("PCIe-IPC vocab gather needs one host; using NCCL")
+    return on_one_host
 
 
 def _can_build_pcie_ipc_gather(group, workspace_bytes: int) -> bool:
