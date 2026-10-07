@@ -24,6 +24,7 @@ from torch import nn
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -48,6 +49,7 @@ from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
@@ -65,6 +67,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -101,9 +104,11 @@ def load_mimo_v2_qkv_proj_weight(
     loaded_weight,
     expected_fused_tp_size: Optional[int] = None,
     deferred_scale_inv: Optional[Dict[str, torch.Tensor]] = None,
+    *,
+    qkv_proj: QKVParallelLinear,
 ):
-    tp_size = get_parallel().attn_tp_size
-    tp_rank = get_parallel().attn_tp_rank
+    qkv_proj = unwrap_lora_layer(qkv_proj)
+    tp_rank, tp_size = get_group_rank_size(qkv_proj.tp_group)
     ckpt_tp = expected_fused_tp_size if expected_fused_tp_size is not None else tp_size
 
     if ckpt_tp == tp_size and loaded_weight.shape == param.shape:
@@ -194,11 +199,10 @@ def _resolve_deferred_qkv_scale_inv(
     expected_fused_tp_size: int,
     block_size: int = 128,
     config=None,
+    *,
+    model: nn.Module,
 ):
-    tp_size = get_parallel().attn_tp_size
-    tp_rank = get_parallel().attn_tp_rank
     ckpt_tp = expected_fused_tp_size
-    shards_per_rank = ckpt_tp // tp_size
 
     for scale_name, ckpt_scale in deferred_scale_inv.items():
         weight_name = scale_name.replace(".weight_scale_inv", ".weight")
@@ -208,6 +212,9 @@ def _resolve_deferred_qkv_scale_inv(
                 f"weight {weight_name} not found"
             )
 
+        qkv_proj = unwrap_lora_layer(model.get_submodule(weight_name.rsplit(".", 1)[0]))
+        tp_rank, tp_size = get_group_rank_size(qkv_proj.tp_group)
+        shards_per_rank = ckpt_tp // tp_size
         weight_param = params_dict[weight_name]
         scale_param = params_dict[scale_name]
         weight_data = weight_param.data
@@ -955,6 +962,7 @@ class MiMoV2Model(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.pp_group = get_parallel().pp_group
+        self._kv_cache_parallel_layout = resolve_linear_parallel_group("attn_tp")
         self.layers_to_capture = []
 
         if self.pp_group.is_first_rank:
@@ -1078,8 +1086,7 @@ class MiMoV2Model(nn.Module):
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        attn_tp_rank = get_parallel().attn_tp_rank
-        attn_tp_size = get_parallel().attn_tp_size
+        attn_tp_rank, attn_tp_size = self._kv_cache_parallel_layout
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             attn_tp_rank,
@@ -1546,6 +1553,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                         loaded_weight,
                         expected_fused_tp_size,
                         deferred_scale_inv=deferred_qkv_scale_inv,
+                        qkv_proj=self.get_submodule(name.rsplit(".", 1)[0]),
                     )
                 continue
 
@@ -1598,7 +1606,13 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     if name in params_dict.keys():
                         param = params_dict[name]
                         if "attention_sink_bias" in name:
-                            start = get_parallel().attn_tp_rank * param.numel()
+                            projection = unwrap_lora_layer(
+                                self.get_submodule(name.rsplit(".", 1)[0]).qkv_proj
+                            )
+                            start = (
+                                get_group_rank_size(projection.tp_group)[0]
+                                * param.numel()
+                            )
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )
@@ -1617,6 +1631,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 deferred_qkv_scale_inv,
                 expected_fused_tp_size,
                 config=self.config,
+                model=self,
             )
 
     def get_embed_and_head(self):

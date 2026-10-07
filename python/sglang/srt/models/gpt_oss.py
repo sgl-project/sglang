@@ -27,6 +27,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -62,6 +63,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
@@ -1274,8 +1276,11 @@ class GptOssForCausalLM(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                         if "sinks" in name:
-                            start = get_parallel().attn_tp_rank * param.numel()
-                            tp_size = get_parallel().tp_size
+                            projection = unwrap_lora_layer(
+                                self.get_submodule(name.rsplit(".", 1)[0]).qkv_proj
+                            )
+                            tp_rank, tp_size = get_group_rank_size(projection.tp_group)
+                            start = tp_rank * param.numel()
                             full_shard_size = param.numel() * tp_size
                             # This handles TP padding: if the checkpoint dim is not divisible by tp_size,
                             # the last TP shard extends beyond `loaded_weight`, pad with zeros before slicing.
