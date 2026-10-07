@@ -12,73 +12,24 @@
 //!   finished response. Streaming responses use Dynamo's
 //!   `apply_tool_calling_jail` directly in `chat.rs`.
 //!
-//! [`dynamo_parser_name`] canonicalizes the SGLang CLI parser names onto the
-//! dynamo-parsers registry keys, [`chat_delta`] builds the stream deltas these
-//! paths emit, and [`chat_finish_reason`] maps the scheduler's finish reason
-//! onto the OpenAI wire values.
-//!
-//! # Test coverage
-//!
-//! The tests cover parser-name canonicalization, every `tool_choice` branch of
-//! [`apply_tool_constraint`], Dynamo's streaming jail integration, unary
-//! parsing, and finish-reason mapping.
+//! [`chat_delta`] builds the stream deltas these paths emit, and
+//! [`chat_finish_reason`] maps the scheduler's finish reason onto the OpenAI
+//! wire values.
 
-use dynamo_parsers::parsers::get_tool_parser_map;
 use dynamo_parsers::{
-    StructuralTagBuilder, StructuralTagSchemaMode, ToolCallFormatBuildContext,
-    ToolChoice as DynamoToolChoice, ToolDefinition, TriggeredTagsConfig,
-    try_tool_call_parse_aggregate_finalize,
+    ToolChoice as DynamoToolChoice, ToolDefinition, try_tool_call_parse_aggregate_finalize,
 };
 use dynamo_protocols::types::{
     ChatCompletionMessageContent, ChatCompletionMessageToolCall,
     ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta,
-    ChatCompletionToolChoiceOption, FinishReason as OpenAIFinishReason, FunctionCall, FunctionType,
-    Role,
+    FinishReason as OpenAIFinishReason, FunctionCall, FunctionType, Role,
 };
+use sglang_processor::{ToolConstraint, dynamo_tool_parser_name, tool_constraint};
 
 use crate::api_server::core::CoreOutput;
 use crate::message::sampling::SamplingParams;
 
-/// Canonicalize a tool-call parser name onto the dynamo-parsers registry keys.
-///
-/// SGLang canonicalizes these legacy CLI names in the opposite direction from
-/// the current Dynamo parser registry.
-pub(super) fn dynamo_parser_name(parser: &str) -> &str {
-    match parser {
-        "llama3" => "llama3_json",
-        "qwen" => "qwen25",
-        "glm" | "glm45" => "glm47",
-        other => other,
-    }
-}
-
-/// Map the OpenAI wire `tool_choice` onto the Dynamo choice. A missing/auto
-/// choice reads as `Auto`.
-pub(super) fn dynamo_tool_choice(
-    choice: &Option<ChatCompletionToolChoiceOption>,
-) -> DynamoToolChoice {
-    match choice {
-        Some(ChatCompletionToolChoiceOption::None) => DynamoToolChoice::None,
-        Some(ChatCompletionToolChoiceOption::Required) => DynamoToolChoice::Required,
-        Some(ChatCompletionToolChoiceOption::Named(choice)) => {
-            DynamoToolChoice::Named(choice.function.name.clone())
-        }
-        Some(ChatCompletionToolChoiceOption::Auto) | None => DynamoToolChoice::Auto,
-    }
-}
-
-/// Validate `tool_choice` against `tools`, then — when a tool-call `parser`
-/// is configured — turn it into a sampling constraint, mirroring Python's
-/// `serving_chat` logic. Validation runs even without a parser, so an invalid
-/// choice (required/named with nothing to select) is rejected before
-/// submission in every mode.
-///
-/// Prefers a structural-tag constraint: the parser's own registered builder,
-/// or — for llama3 with strict tools under `auto` — a triggered-tag builder
-/// so the model emits calls in the exact `<|python_tag|>` format. Otherwise
-/// `required`/`named` choices fall back to a JSON-schema array constraining
-/// the output to `{"name", "parameters"}` objects (`maxItems: 1` when
-/// `parallel_tool_calls` is false).
+/// Set the `tool_choice` constraint `sglang_processor::tool_constraint` builds.
 pub(super) fn apply_tool_constraint(
     sampling: &mut SamplingParams,
     parser: Option<&str>,
@@ -86,96 +37,10 @@ pub(super) fn apply_tool_constraint(
     tools: &[ToolDefinition],
     parallel_tool_calls: Option<bool>,
 ) -> Result<(), String> {
-    if *tool_choice == DynamoToolChoice::None {
-        return Ok(());
-    }
-    if *tool_choice == DynamoToolChoice::Required && tools.is_empty() {
-        return Err("tool_choice is \"required\" but tools is empty".into());
-    }
-    if let DynamoToolChoice::Named(name) = tool_choice
-        && !tools.iter().any(|tool| &tool.name == name)
-    {
-        return Err(format!(
-            "tool named \"{name}\" in tool_choice is not present in tools"
-        ));
-    }
-
-    let Some(parser) = parser else {
-        return Ok(()); // validation only
-    };
-    let parser = dynamo_parser_name(parser);
-    let config = get_tool_parser_map()
-        .get(parser)
-        .ok_or_else(|| format!("tool-call parser `{parser}` is not supported by Dynamo"))?;
-    let builder = config.structural_tag_builder.clone().or_else(|| {
-        (parser == "llama3_json"
-            && *tool_choice == DynamoToolChoice::Auto
-            && tools.iter().any(|tool| tool.strict.unwrap_or(false)))
-        .then(|| {
-            StructuralTagBuilder::TriggeredTags(TriggeredTagsConfig {
-                begin_template: r#"<|python_tag|>{"name":"{name}", "arguments":"#.to_string(),
-                end_template: "}".to_string(),
-                triggers: vec!["<|python_tag|>".to_string()],
-                content_style: Default::default(),
-                tool_call_ban_tokens: Vec::new(),
-                reasoning_end: None,
-            })
-        })
-    });
-    if let Some(builder) = builder
-        && let Some(tag) = builder
-            .build_tool_call_format(&ToolCallFormatBuildContext {
-                tool_choice,
-                tools,
-                parallel_tool_calls,
-                schema_mode: StructuralTagSchemaMode::Auto,
-                starts_in_reasoning: false,
-            })
-            .map_err(|error| error.to_string())?
-    {
-        sampling.structural_tag = Some(tag.to_string());
-        return Ok(());
-    }
-
-    if matches!(
-        tool_choice,
-        DynamoToolChoice::Required | DynamoToolChoice::Named(_)
-    ) {
-        let selected = match tool_choice {
-            DynamoToolChoice::Named(name) => tools
-                .iter()
-                .filter(|tool| tool.name == *name)
-                .collect::<Vec<_>>(),
-            _ => tools.iter().collect(),
-        };
-        let schemas = selected
-            .into_iter()
-            .map(|tool| {
-                serde_json::json!({
-                    "properties": {
-                        "name": {"type": "string", "enum": [tool.name]},
-                        "parameters": tool.parameters.clone().unwrap_or_else(|| {
-                            serde_json::json!({"type": "object", "properties": {}})
-                        }),
-                    },
-                    "required": ["name", "parameters"],
-                })
-            })
-            .collect::<Vec<_>>();
-        let items = if schemas.len() == 1 {
-            schemas.into_iter().next().expect("one schema")
-        } else {
-            serde_json::json!({"type": "object", "anyOf": schemas})
-        };
-        let mut schema = serde_json::json!({
-            "type": "array",
-            "minItems": 1,
-            "items": items,
-        });
-        if parallel_tool_calls == Some(false) {
-            schema["maxItems"] = serde_json::json!(1);
-        }
-        sampling.json_schema = Some(schema.to_string());
+    match tool_constraint(parser, tool_choice, tools, parallel_tool_calls)? {
+        Some(ToolConstraint::StructuralTag(tag)) => sampling.structural_tag = Some(tag),
+        Some(ToolConstraint::JsonSchema(schema)) => sampling.json_schema = Some(schema),
+        None => {}
     }
     Ok(())
 }
@@ -216,7 +81,7 @@ pub(super) async fn parse_chat_tool_calls(
     let Some(parser) = parser else {
         return (content, None);
     };
-    let parser = dynamo_parser_name(parser);
+    let parser = dynamo_tool_parser_name(parser);
     match try_tool_call_parse_aggregate_finalize(&content, Some(parser), tools).await {
         Ok((mut calls, normal)) if !calls.is_empty() => {
             if !parallel_tool_calls {
@@ -260,33 +125,16 @@ pub(super) fn chat_finish_reason(output: &CoreOutput) -> Option<OpenAIFinishReas
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name,
-        dynamo_tool_choice, parse_chat_tool_calls,
-    };
+    use super::{chat_delta, chat_finish_reason, parse_chat_tool_calls};
     use crate::api_server::core::CoreOutput;
-    use crate::message::sampling::SamplingParams;
     use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
-    use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
     use dynamo_protocols::types::CreateChatCompletionStreamResponse as StreamResponse;
     use dynamo_protocols::types::{
         ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCallChunk,
-        ChatCompletionNamedToolChoice, ChatCompletionToolChoiceOption, ChatCompletionToolType,
-        FinishReason as OpenAIFinishReason, FunctionCallStream, FunctionName, FunctionType, Role,
+        ChatCompletionToolChoiceOption, FinishReason as OpenAIFinishReason, FunctionCallStream,
+        FunctionType, Role,
     };
     use futures::{StreamExt, stream};
-
-    fn tool(name: &str, strict: bool) -> ToolDefinition {
-        ToolDefinition {
-            name: name.into(),
-            parameters: Some(serde_json::json!({
-                "type": "object",
-                "properties": {"city": {"type": "string"}},
-                "required": ["city"]
-            })),
-            strict: Some(strict),
-        }
-    }
 
     fn stream_item(text: &str, finish: Option<OpenAIFinishReason>) -> Annotated<StreamResponse> {
         Annotated {
@@ -362,224 +210,6 @@ mod tests {
         )
         .collect()
         .await
-    }
-
-    #[test]
-    fn dynamo_parser_name_canonicalizes_cli_names() {
-        assert_eq!(dynamo_parser_name("llama3"), "llama3_json");
-        assert_eq!(dynamo_parser_name("qwen"), "qwen25");
-        assert_eq!(dynamo_parser_name("glm"), "glm47");
-        assert_eq!(dynamo_parser_name("glm45"), "glm47");
-        assert_eq!(dynamo_parser_name("qwen25"), "qwen25");
-    }
-
-    #[test]
-    fn required_tool_choice_builds_python_compatible_constraint() {
-        let mut sampling = SamplingParams::default();
-        apply_tool_constraint(
-            &mut sampling,
-            Some("llama3"),
-            &DynamoToolChoice::Required,
-            &[tool("get_weather", true)],
-            Some(false),
-        )
-        .unwrap();
-        let schema: serde_json::Value =
-            serde_json::from_str(sampling.json_schema.as_deref().unwrap()).unwrap();
-        assert_eq!(schema["type"], "array");
-        assert_eq!(schema["minItems"], 1);
-        assert_eq!(schema["maxItems"], 1);
-        assert_eq!(
-            schema["items"]["properties"]["name"]["enum"][0],
-            "get_weather"
-        );
-    }
-
-    #[test]
-    fn required_choice_without_parallel_flag_has_no_max_items() {
-        let mut sampling = SamplingParams::default();
-        apply_tool_constraint(
-            &mut sampling,
-            Some("llama3"),
-            &DynamoToolChoice::Required,
-            &[tool("get_weather", false)],
-            None,
-        )
-        .unwrap();
-        let schema: serde_json::Value =
-            serde_json::from_str(sampling.json_schema.as_deref().unwrap()).unwrap();
-        assert_eq!(schema["type"], "array");
-        assert!(schema.get("maxItems").is_none());
-    }
-
-    #[test]
-    fn named_tool_choice_restricts_the_schema_enum() {
-        let tools = [tool("get_weather", false), tool("get_time", false)];
-        let mut sampling = SamplingParams::default();
-        apply_tool_constraint(
-            &mut sampling,
-            Some("llama3"),
-            &DynamoToolChoice::Named("get_time".into()),
-            &tools,
-            None,
-        )
-        .unwrap();
-        let schema: serde_json::Value =
-            serde_json::from_str(sampling.json_schema.as_deref().unwrap()).unwrap();
-        // One candidate → a single schema, not an anyOf.
-        assert_eq!(schema["items"]["properties"]["name"]["enum"][0], "get_time");
-        assert!(schema["items"].get("anyOf").is_none());
-    }
-
-    #[test]
-    fn strict_auto_llama_tool_uses_python_compatible_constraint() {
-        let mut sampling = SamplingParams::default();
-        apply_tool_constraint(
-            &mut sampling,
-            Some("llama3"),
-            &DynamoToolChoice::Auto,
-            &[tool("get_weather", true)],
-            None,
-        )
-        .unwrap();
-        let schema: serde_json::Value =
-            serde_json::from_str(sampling.structural_tag.as_deref().unwrap()).unwrap();
-        assert_eq!(schema["type"], "structural_tag");
-        assert_eq!(schema["format"]["type"], "triggered_tags");
-        assert_eq!(schema["format"]["at_least_one"], false);
-        assert_eq!(
-            schema["format"]["tags"][0]["content"]["json_schema"]["required"][0],
-            "city"
-        );
-    }
-
-    #[test]
-    fn auto_without_strict_tools_stays_unconstrained() {
-        let mut sampling = SamplingParams::default();
-        apply_tool_constraint(
-            &mut sampling,
-            Some("llama3"),
-            &DynamoToolChoice::Auto,
-            &[tool("get_weather", false)],
-            None,
-        )
-        .unwrap();
-        assert!(sampling.json_schema.is_none());
-        assert!(sampling.structural_tag.is_none());
-    }
-
-    #[test]
-    fn tool_choice_none_is_a_no_op() {
-        let mut sampling = SamplingParams::default();
-        apply_tool_constraint(
-            &mut sampling,
-            Some("llama3"),
-            &DynamoToolChoice::None,
-            &[],
-            None,
-        )
-        .unwrap();
-        assert!(sampling.json_schema.is_none());
-        assert!(sampling.structural_tag.is_none());
-    }
-
-    #[test]
-    fn invalid_tool_choices_are_rejected_before_submission() {
-        let mut sampling = SamplingParams::default();
-        let error = apply_tool_constraint(
-            &mut sampling,
-            Some("llama3"),
-            &DynamoToolChoice::Required,
-            &[],
-            None,
-        )
-        .unwrap_err();
-        assert!(error.contains("required"));
-
-        let error = apply_tool_constraint(
-            &mut sampling,
-            Some("llama3"),
-            &DynamoToolChoice::Named("missing".into()),
-            &[tool("get_weather", false)],
-            None,
-        )
-        .unwrap_err();
-        assert!(error.contains("missing"));
-    }
-
-    /// Validation runs even without a parser (the handler calls this in every
-    /// mode), so an invalid choice is rejected before submission there too.
-    #[test]
-    fn missing_parser_still_validates_the_tool_choice() {
-        let mut sampling = SamplingParams::default();
-        let error =
-            apply_tool_constraint(&mut sampling, None, &DynamoToolChoice::Required, &[], None)
-                .unwrap_err();
-        assert!(error.contains("required"));
-        let error = apply_tool_constraint(
-            &mut sampling,
-            None,
-            &DynamoToolChoice::Named("missing".into()),
-            &[tool("get_weather", false)],
-            None,
-        )
-        .unwrap_err();
-        assert!(error.contains("missing"));
-        // A valid choice with no parser stays unconstrained.
-        apply_tool_constraint(
-            &mut sampling,
-            None,
-            &DynamoToolChoice::Auto,
-            &[tool("get_weather", false)],
-            None,
-        )
-        .unwrap();
-        assert!(sampling.json_schema.is_none());
-        assert!(sampling.structural_tag.is_none());
-    }
-
-    #[test]
-    fn dynamo_tool_choice_maps_the_openai_wire_values() {
-        let named = |name: &str| {
-            Some(ChatCompletionToolChoiceOption::Named(
-                ChatCompletionNamedToolChoice {
-                    r#type: ChatCompletionToolType::Function,
-                    function: FunctionName { name: name.into() },
-                },
-            ))
-        };
-        assert!(matches!(dynamo_tool_choice(&None), DynamoToolChoice::Auto));
-        assert!(matches!(
-            dynamo_tool_choice(&Some(ChatCompletionToolChoiceOption::Auto)),
-            DynamoToolChoice::Auto
-        ));
-        assert!(matches!(
-            dynamo_tool_choice(&Some(ChatCompletionToolChoiceOption::Required)),
-            DynamoToolChoice::Required
-        ));
-        assert!(matches!(
-            dynamo_tool_choice(&Some(ChatCompletionToolChoiceOption::None)),
-            DynamoToolChoice::None
-        ));
-        assert!(matches!(
-            dynamo_tool_choice(&named("get_weather")),
-            DynamoToolChoice::Named(name) if name == "get_weather"
-        ));
-    }
-
-    #[test]
-    fn unsupported_parser_is_rejected() {
-        let mut sampling = SamplingParams::default();
-        let error = apply_tool_constraint(
-            &mut sampling,
-            Some("not-a-parser"),
-            &DynamoToolChoice::Auto,
-            &[tool("get_weather", false)],
-            None,
-        )
-        .unwrap_err();
-        assert!(error.contains("not supported"));
-        assert!(sampling.json_schema.is_none());
     }
 
     #[tokio::test]

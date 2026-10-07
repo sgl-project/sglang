@@ -11,7 +11,6 @@ use std::sync::Arc;
 mod chat;
 mod completions;
 mod models;
-mod reasoning;
 mod template;
 mod template_builtins;
 mod template_legacy;

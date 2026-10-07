@@ -25,13 +25,12 @@ use dynamo_protocols::types::{
 };
 use futures::StreamExt;
 use serde::Deserialize;
+use sglang_processor::{
+    ReasoningStreamSplitter, dynamo_tool_choice, dynamo_tool_parser_name, split_reasoning,
+};
 
 use super::completions::completion_usage;
-use super::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
-use super::tools::{
-    apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name, dynamo_tool_choice,
-    parse_chat_tool_calls,
-};
+use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
     indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
@@ -464,8 +463,11 @@ pub(super) async fn unary_chat(
         // Split reasoning markers out of the content first (Python splits
         // before tool-call parsing too), then parse tool calls on the clean
         // normal text.
-        let (reasoning_text, text) =
-            split_reasoning_unary(reasoning_parser.as_deref(), &output.text, &output.token_ids);
+        let (reasoning_text, text) = split_reasoning(
+            reasoning_parser.as_deref(),
+            &output.text,
+            &parser_token_ids(&output.token_ids),
+        );
         let (content, tool_calls) = parse_chat_tool_calls(
             text,
             parser.as_deref(),
@@ -541,7 +543,7 @@ pub(super) fn chat_event_stream(
         let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
             if reasoning_parser.is_some() {
                 (0..count)
-                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref(), starts_in_reasoning))
+                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref(), starts_in_reasoning.then_some(true)))
                     .collect()
             } else {
                 vec![]
@@ -599,7 +601,7 @@ pub(super) fn chat_event_stream(
             let mut emitted = Vec::with_capacity(2);
             if reasoning_enabled {
                 let (reasoning_text, normal_text) =
-                    reasoning_splitters[index].split(&output.text, &output.token_ids);
+                    reasoning_splitters[index].split(&output.text, &parser_token_ids(&output.token_ids));
                 let mut remaining_logprobs =
                     want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
                 if !reasoning_text.is_empty() {
@@ -714,7 +716,7 @@ pub(super) fn chat_event_stream(
         Box<dyn futures::Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
     > = if let Some(parser) = parser {
         Box::pin(apply_tool_calling_jail(
-            Some(dynamo_parser_name(&parser).to_owned()),
+            Some(dynamo_tool_parser_name(&parser).to_owned()),
             tool_choice,
             tools,
             uses_tool_call_structural_tag,
@@ -821,6 +823,12 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
         content: Some(content),
         refusal: None,
     }
+}
+
+fn parser_token_ids(ids: &[i64]) -> Vec<u32> {
+    ids.iter()
+        .filter_map(|&id| u32::try_from(id).ok())
+        .collect()
 }
 
 #[cfg(test)]
