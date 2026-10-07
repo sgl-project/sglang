@@ -3994,6 +3994,58 @@ class TestNoneMeansUnset(CustomTestCase):
         self.assertIsNotNone(server_args.mamba_full_memory_ratio)
 
 
+class TestDcpGroupGeometryValidation(CustomTestCase):
+    """A DCP group must be a whole number of ranks inside one attention-TP
+    group -- one DP replica at one CP rank.
+
+    Both group families are built as contiguous chunks of the same TP group:
+    DCP in chunks of dcp_size, attention-TP in chunks of attn_tp_size. So the
+    binding constraint is attn_tp_size % dcp_size, and tp_size % dcp_size does
+    not imply it.
+    """
+
+    @staticmethod
+    def _validate(**kwargs):
+        parallel_hook.handle_decode_context_parallelism(
+            ServerArgs(model_path="dummy", **kwargs)
+        )
+
+    def test_ragged_split_is_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            self._validate(tp_size=4, dcp_size=3)
+        self.assertIn("--dcp-size", str(caught.exception))
+        self.assertIn("tp_size=4", str(caught.exception))
+
+    def test_dcp_wider_than_the_attention_tp_group_is_rejected(self):
+        """The case tp_size % dcp_size misses: 4 % 4 == 0, but DP attention
+        halves the attention-TP width, so a 4-rank DCP group would straddle two
+        replicas decoding different batches."""
+        with self.assertRaises(ValueError) as caught:
+            self._validate(tp_size=4, attn_dp_size=2, dcp_size=4)
+        self.assertIn("attn_tp_size=2", str(caught.exception))
+
+    def test_dwdp_is_folded_in_before_it_forces_dp_attention(self):
+        """handle_dwdp runs after this handler and then sets attn_dp_size
+        itself, so dwdp_size has to be read directly or a
+        DWDP run slips past with attn_tp_size=1."""
+        with self.assertRaises(ValueError) as caught:
+            self._validate(tp_size=4, dwdp_size=4, dcp_size=2)
+        self.assertIn("attn_tp_size=1", str(caught.exception))
+
+    def test_dcp_nested_inside_each_dp_replica_is_accepted(self):
+        # Two 2-rank DCP groups, one per replica: [0,1] and [2,3].
+        self._validate(tp_size=4, attn_dp_size=2, dcp_size=2)
+
+    def test_dcp_spanning_the_whole_tp_group_is_accepted(self):
+        self._validate(tp_size=4, dcp_size=4)
+
+    def test_an_indivisible_attention_split_is_left_to_context_parallelism(self):
+        """tp_size not divisible by attn_dp_size * attn_cp_size is
+        handle_context_parallelism's error to raise. Reporting a truncated
+        attn_tp_size here would name the wrong flag."""
+        self._validate(tp_size=4, attn_dp_size=3, dcp_size=2)
+
+
 class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
     """The graph-captured TP LM-head all-to-all must not run with NCCL's
     graph buffer registration: registered graph-pool temporaries deadlock the
