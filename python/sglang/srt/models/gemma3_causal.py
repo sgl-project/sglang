@@ -28,20 +28,24 @@ from transformers import (
     PreTrainedModel,
 )
 
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
-    resolve_linear_parallel_group,
+    _resolve_linear_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb, get_rope
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -736,7 +740,7 @@ class Gemma3ForCausalLM(PreTrainedModel):
         super().__init__(config=config)
         self.config = config
         self.quant_config = quant_config
-        self._shared_vocab_parallel_layout = resolve_linear_parallel_group("tp")
+        self._shared_vocab_tp_group = _resolve_linear_group("tp")
         self.model = Gemma3TextModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -924,19 +928,14 @@ class Gemma3ForCausalLM(PreTrainedModel):
     def _shard_weight(
         self, weight: torch.Tensor, *, draft_embedding=None
     ) -> torch.Tensor:
-        """Shard a full embedding/lm_head using its export or recipient draft layout.
-
-        Gemma3 uses nn.Embedding (unsharded) but the Eagle3 draft model uses
-        VocabParallelEmbedding (sharded). This method extracts the correct
-        shard so the weights can be shared.
-        """
-        tp_rank, tp_size = self._shared_vocab_parallel_layout
+        group = self._shared_vocab_tp_group
         if draft_embedding is not None:
-            tp_size = draft_embedding.tp_size
-            indices = draft_embedding.shard_indices
-            tp_rank = (
-                indices.padded_org_vocab_start_index // indices.num_org_elements_padded
+            group = (
+                draft_embedding.tp_group
+                if isinstance(draft_embedding, VocabParallelEmbedding)
+                else None
             )
+        tp_rank, tp_size = get_group_rank_size(group)
         if tp_size <= 1:
             return weight
         shard_size = (weight.shape[0] + tp_size - 1) // tp_size
@@ -971,7 +970,7 @@ class EmbeddingGemmaModel(Gemma3ForCausalLM):
         PreTrainedModel.__init__(self, config=config)
         self.config = config
         self.quant_config = quant_config
-        self._shared_vocab_parallel_layout = resolve_linear_parallel_group("tp")
+        self._shared_vocab_tp_group = _resolve_linear_group("tp")
         self.model = Gemma3TextModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )

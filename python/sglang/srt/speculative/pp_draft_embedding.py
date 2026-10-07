@@ -84,11 +84,11 @@ def resolve_target_embed_and_head(
         if draft_model is not None and hasattr(
             target_model, "get_embed_and_head_for_draft"
         ):
-            found = _find_draft_embedding_module(draft_model)
+            found = _find_draft_embedding_module(draft_model, allow_replicated=True)
             if found is None:
                 raise ValueError(
                     f"Draft model {draft_model.__class__.__name__} has no single "
-                    "VocabParallelEmbedding for target embedding sharing."
+                    "input embedding for target embedding sharing."
                 )
             return target_model.get_embed_and_head_for_draft(found[1])
         return target_model.get_embed_and_head()
@@ -99,9 +99,9 @@ def resolve_target_embed_and_head(
 
 
 def _find_draft_embedding_module(
-    draft_model: nn.Module,
+    draft_model: nn.Module, *, allow_replicated: bool = False
 ) -> Optional[Tuple[str, nn.Module]]:
-    """The draft's own input embedding: its single ``VocabParallelEmbedding``."""
+    """Find a single vocab-parallel or named replicated input embedding."""
     from sglang.srt.layers.vocab_parallel_embedding import (
         ParallelLMHead,
         VocabParallelEmbedding,
@@ -110,7 +110,14 @@ def _find_draft_embedding_module(
     found = [
         (f"{name}.weight", module)
         for name, module in draft_model.named_modules()
-        if isinstance(module, VocabParallelEmbedding)
+        if (
+            isinstance(module, VocabParallelEmbedding)
+            or (
+                allow_replicated
+                and isinstance(module, nn.Embedding)
+                and name.rsplit(".", 1)[-1] in _EMBED_ATTR_NAMES
+            )
+        )
         and not isinstance(module, ParallelLMHead)
     ]
     return found[0] if len(found) == 1 else None

@@ -33,6 +33,7 @@ from sglang.kernels.ops.moe.gemma4_routing import (
     gemma4_fused_routing,
     gemma_routing_post_topk,
 )
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
     SumGroup,
@@ -48,7 +49,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
-    resolve_linear_parallel_group,
+    _resolve_linear_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -58,7 +59,10 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -1132,7 +1136,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
-        self._shared_vocab_parallel_layout = resolve_linear_parallel_group("tp")
+        self._shared_vocab_tp_group = _resolve_linear_group("tp")
 
         self.model = Gemma4TextModel(
             config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
@@ -1430,19 +1434,14 @@ class Gemma4ForCausalLM(PreTrainedModel):
     def _shard_weight(
         self, weight: torch.Tensor, *, draft_embedding=None
     ) -> torch.Tensor:
-        """Shard a full embedding/lm_head using its export or recipient draft layout.
-
-        Gemma4 uses nn.Embedding (unsharded) but the Eagle3 draft model uses
-        VocabParallelEmbedding (sharded). This method extracts the correct
-        shard so the weights can be shared.
-        """
-        tp_rank, tp_size = self._shared_vocab_parallel_layout
+        group = self._shared_vocab_tp_group
         if draft_embedding is not None:
-            tp_size = draft_embedding.tp_size
-            indices = draft_embedding.shard_indices
-            tp_rank = (
-                indices.padded_org_vocab_start_index // indices.num_org_elements_padded
+            group = (
+                draft_embedding.tp_group
+                if isinstance(draft_embedding, VocabParallelEmbedding)
+                else None
             )
+        tp_rank, tp_size = get_group_rank_size(group)
         if tp_size <= 1:
             return weight
         shard_size = (weight.shape[0] + tp_size - 1) // tp_size
