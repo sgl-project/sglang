@@ -26,14 +26,15 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
     MHCState,
+    append_stages,
     declare_attn,
     declare_ffn,
     get_attn_tp_context,
     is_dense_ffn_fully_dp,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -51,6 +52,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -96,6 +98,7 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Glm5NextMLP
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE as Glm5NextMoE
+from sglang.srt.models.glm4v import glm4v_vision_reduces_over_attn_tp
 from sglang.srt.models.glm_ocr import (
     GlmOcrRMSNorm,
     GlmOcrVisionBlock,
@@ -238,6 +241,9 @@ class Glm5NextVisionBlock(GlmOcrVisionBlock):
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.mlp = Glm5NextVisionMLP(
             dim,
@@ -723,7 +729,6 @@ class Glm5NextDecoderLayer(nn.Module):
             )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
-        is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
         if self.is_layer_sparse:
@@ -793,7 +798,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 ),
                 is_last_layer=terminal,
             ).residual_ops()
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(read=residual.attn_readout, update=residual.attn_update),
                 self.input_layernorm,
@@ -812,14 +817,6 @@ class Glm5NextDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse,
-                next_layer_sparse=self.is_layer_sparse,
-                update=residual.ffn_update,
-            )
-            if layer_id != 0
-            else None,
-            terminal=terminal,
         )
 
     def _hc_pre(
@@ -1465,6 +1462,36 @@ class Glm5NextForConditionalGeneration(nn.Module):
             f"Only 1 fused shared expert is supported for {type(self).__name__}"
         )
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+
+    def wants_prefill_autotune(self) -> bool:
+        backend = get_moe_runner_backend()
+        return (
+            (backend.is_flashinfer_trtllm() or backend.is_flashinfer_trtllm_routed())
+            and get_moe_a2a_backend().is_none()
+            and not is_dp_attention_enabled()
+        )
+
+    def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
+        seen = set()
+        for module in self.model.modules():
+            if not isinstance(module, Glm5NextMoE):
+                continue
+            experts = module.experts
+            key = (experts.w13_weight.shape, experts.w2_weight.shape)
+            if key in seen:
+                continue
+            seen.add(key)
+            hidden_states = torch.randn(
+                (num_tokens, module.gate.weight.shape[1]),
+                dtype=dtype,
+                device=experts.w13_weight.device,
+            )
+            router_logits = module.gate(hidden_states)
+            experts(hidden_states, module.topk(hidden_states, router_logits))
+            del hidden_states, router_logits
+        if envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
+            return 0
+        return len(seen)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if not self.pp_group.is_last_rank:

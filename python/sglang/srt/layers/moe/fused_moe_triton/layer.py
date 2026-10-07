@@ -87,6 +87,7 @@ from sglang.srt.utils import (
     is_npu,
     round_up,
 )
+from sglang.srt.utils.common import is_building_neighbour_layer
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
@@ -163,6 +164,8 @@ def create_moe_dispatcher(
     moe_runner_config: MoeRunnerConfig,
     quant_method: FusedMoEMethodBase,
 ) -> BaseDispatcher:
+    if is_building_neighbour_layer():
+        return StandardDispatcher(moe_runner_config)
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none() and is_npu():
         return AscendTPDispatcher(moe_runner_config)
@@ -400,6 +403,8 @@ class FusedMoE(torch.nn.Module):
         # Set by the quant method when it repacks experts for MegaMoE.
         self._mega_moe_weights_built = False
         self._mega_moe_nvfp4 = False
+        # Read at construction: draft_model_build_scope applies the draft's own value.
+        self._mega_moe_w4a4 = get_exec().moe.enable_w4a4_mxfp4_megamoe
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
