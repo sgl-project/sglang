@@ -11,7 +11,6 @@ import sys
 import time
 import traceback
 import urllib.request
-import warnings
 import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -162,14 +161,6 @@ def dump_state_text(filename: str, states: list, mode: str = "w"):
 def normalize_base_url(host: str, port: int) -> str:
     from sglang.srt.utils.network import NetworkAddress
 
-    if host.startswith("http://") or host.startswith("https://"):
-        warnings.warn(
-            f"Including the scheme in --host ('{host}') is deprecated. "
-            f"Pass just the hostname (e.g. '127.0.0.1') instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return f"{host}:{port}"
     return NetworkAddress(host, port).to_url()
 
 

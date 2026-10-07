@@ -12,17 +12,23 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
 )
+from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
+    DecLockRefParams,
     DecLockRefResult,
     IncLockRefResult,
+    TreeLock,
 )
+from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_spec
 from sglang.srt.mem_cache.prefill_budget import (
     PrefillBudget,
     SWAPrefillBudget,
     estimate_swa_kv_tokens,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -67,6 +73,13 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.disable = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
+        # Route lock/unlock through inc/dec_lock_ref so tests can hook those.
+        tree_cache.lock.side_effect = lambda node: TreeLock(
+            node, tree_cache.inc_lock_ref(node).to_dec_params()
+        )
+        tree_cache.unlock.side_effect = lambda lock: (
+            lock is not None and tree_cache.dec_lock_ref(lock.node, lock.receipt)
+        )
         tree_cache.buffer_pipeline = None
         return tree_cache
 
@@ -147,22 +160,22 @@ class TestPrefillAdder(CustomTestCase):
     def create_shared_adder(self, *, num_mixed_decode_tokens=0):
         self.mock_tree_cache.supports_mamba.return_value = False
         self.mock_tree_cache.sliding_window_size = 8
-        self.mock_tree_cache.is_tree_cache.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
         allocator = init_unified_swa_pools(
             device="cpu",
             kv_cache_dtype=torch.float16,
             head_num=1,
-            head_dim=4,
-            v_head_dim=4,
+            head_dim=8,
+            v_head_dim=8,
             swa_head_num=1,
-            swa_head_dim=4,
-            swa_v_head_dim=4,
+            swa_head_dim=8,
+            swa_v_head_dim=8,
             page_size=4,
             start_layer=0,
             end_layer=2,
             swa_attention_layer_ids=[1],
             full_attention_layer_ids=[0],
-            total_bytes=1024,
+            total_bytes=2048,
             enable_memory_saver=False,
             need_sort=False,
             lazy_compaction=True,
@@ -195,7 +208,7 @@ class TestPrefillAdder(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
         self.mock_tree_cache.supports_mamba.return_value = False
-        self.mock_tree_cache.is_tree_cache.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
         self.mock_token_allocator.available_size.return_value = 32768
         return self.create_adder(
             self.create_running_batch(), page_size=256, rem_chunk_tokens=chunk_tokens
@@ -279,6 +292,36 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(8192))
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(req.extend_range.length, 4096)
+
+    def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
+        # A Mamba checkpoint only lands on a page-aligned chunk end, so an
+        # off-grid chunk leaves the rest of the prompt uncacheable. Without
+        # prefix sharing nothing is cached, so the chunk stays exact.
+        self.mock_token_allocator.available_size.return_value = 32768
+        cases = ((False, True, 100), (True, True, 64), (True, False, 100))
+        for supports_mamba, supports_prefix_sharing, expected in cases:
+            with (
+                self.subTest(
+                    supports_mamba=supports_mamba,
+                    supports_prefix_sharing=supports_prefix_sharing,
+                ),
+                patch.object(
+                    schedule_policy, "_use_exact_chunk_fill", return_value=True
+                ),
+            ):
+                self.mock_tree_cache.supports_mamba.return_value = supports_mamba
+                self.mock_tree_cache.supports_prefix_sharing.return_value = (
+                    supports_prefix_sharing
+                )
+                adder = self.create_adder(
+                    self.create_running_batch(), page_size=64, rem_chunk_tokens=100
+                )
+                req = self.create_shared_req("chunked")
+                req.full_untruncated_fill_ids = list(range(300))
+                adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(req.extend_range.length, expected)
 
     def test_shared_admission_reserves_all_pending_requests(self):
         adder = self.create_shared_adder()
@@ -676,19 +719,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.budget_state(), AddReqResult.CONTINUE)
 
         # Add a prefill that exactly consumes the chunk budget
-        req1 = self.create_mock_req("req1", priority=0, max_new_tokens=64)
-        req1.host_hit_length = 0
-        req1.prefix_indices = []
-        req1.full_untruncated_fill_ids = list(range(56))
-        req1.last_node = MagicMock()
-        req1.sampling_params.ignore_eos = False
-        # add_one_req reads req.extend_range.length after set_extend_range;
-        # emulate the real Req writer (a spec=Req mock lacks the attribute).
-        req1.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req1, "extend_range", Range(start, end)
-            )
-        )
+        req1 = self._create_delayer_req(56, rid="req1", max_new_tokens=64)
 
         result1 = adder.add_one_req(
             req1, has_chunked_req=False, truncation_align_size=None
@@ -716,17 +747,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder2.budget_state(), AddReqResult.CONTINUE)
 
         # Same prefill no longer exhausts the chunk budget
-        req2 = self.create_mock_req("req2", priority=0, max_new_tokens=64)
-        req2.host_hit_length = 0
-        req2.prefix_indices = []
-        req2.full_untruncated_fill_ids = list(range(56))
-        req2.last_node = MagicMock()
-        req2.sampling_params.ignore_eos = False
-        req2.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req2, "extend_range", Range(start, end)
-            )
-        )
+        req2 = self._create_delayer_req(56, rid="req2", max_new_tokens=64)
 
         result2 = adder2.add_one_req(
             req2, has_chunked_req=False, truncation_align_size=None
@@ -737,17 +758,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(result2, AddReqResult.CONTINUE)
 
         # Fit last small prefill request
-        req3 = self.create_mock_req("req3", priority=0, max_new_tokens=16)
-        req3.host_hit_length = 0
-        req3.prefix_indices = []
-        req3.full_untruncated_fill_ids = list(range(3))
-        req3.last_node = MagicMock()
-        req3.sampling_params.ignore_eos = False
-        req3.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req3, "extend_range", Range(start, end)
-            )
-        )
+        req3 = self._create_delayer_req(3, rid="req3", max_new_tokens=16)
 
         result3 = adder2.add_one_req(
             req3, has_chunked_req=False, truncation_align_size=None
@@ -756,6 +767,251 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(len(adder2.can_run_list), 2)
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
+
+    @patch(
+        "sglang.srt.managers.schedule_policy.page_interleave_shard_size",
+        return_value=4,
+    )
+    def test_ignore_eos_reserves_all_shard_class_pages(self, _shard_size):
+        """Disabled-radix admission must charge one page per shard class."""
+        self.mock_tree_cache.disable = True
+        self.mock_token_allocator.page_size = 16
+        self.mock_token_allocator.shard_spec = SimpleNamespace(
+            max_prefix_tokens=1024, chunk_tokens=1024
+        )
+        self.mock_token_allocator.available_size.return_value = 64
+        adder = self.create_adder(self.create_running_batch(), page_size=16)
+
+        req = self.create_mock_req("ignore_eos", priority=0, max_new_tokens=1)
+        req.sampling_params.ignore_eos = True
+        req.origin_input_ids = list(range(16))
+        req.full_untruncated_fill_ids = list(range(16))
+        req.last_node = MagicMock()
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.can_run_list, [])
+        req.set_extend_range.assert_not_called()
+
+    def create_sharded_adder(
+        self,
+        *,
+        chunk_tokens=16,
+        max_prefix_tokens=16,
+        shard_spec=None,
+        allocator_size=1024,
+        **kwargs,
+    ):
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        if shard_spec is None:
+            shard_spec = PageShardSpec(
+                shard_rank=0,
+                shard_size=2,
+                page_size=4,
+                max_prefix_tokens=max_prefix_tokens,
+                chunk_tokens=chunk_tokens,
+            )
+        allocator = PageInterleavePoolAllocator(
+            size=allocator_size,
+            physical_page_size=shard_spec.page_size,
+            shard_size=shard_spec.shard_size,
+            dtype=torch.int64,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+            shard_spec=shard_spec,
+        )
+        return self.create_adder(
+            self.create_running_batch(),
+            page_size=shard_spec.page_size,
+            rem_chunk_tokens=shard_spec.chunk_tokens,
+            token_to_kv_pool_allocator=allocator,
+            **kwargs,
+        )
+
+    def create_sharded_req(self, rid, *, prefix_len=12, extend_len=4):
+        req = self.create_shared_req(rid, max_new_tokens=1)
+        req.prefix_indices = list(range(prefix_len))
+        req.full_untruncated_fill_ids = list(range(prefix_len + extend_len))
+        return req
+
+    def test_sharded_admission_defers_prefix_scratch_overflow(self):
+        adder = self.create_sharded_adder()
+        first = self.create_sharded_req("first")
+        second = self.create_sharded_req("second")
+        self.assertEqual(
+            adder.add_one_req(first, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.CONTINUE,
+        )
+        remaining = (adder.rem_total_tokens, adder.rem_chunk_tokens)
+
+        # Both requests fit KV capacity, but prefix scratch fits only one.
+        self.assertEqual(
+            adder.add_one_req(
+                second, has_chunked_req=False, truncation_align_size=None
+            ),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [first])
+        second.set_extend_range.assert_not_called()
+        self.assertEqual((adder.rem_total_tokens, adder.rem_chunk_tokens), remaining)
+        self.assertEqual(adder.kv_shard_block_bound_pages, 2)
+        self.assertEqual(adder.kv_shard_chunk_pages, 1)
+
+        # Rejection leaves the remaining chunk scratch usable.
+        third = self.create_sharded_req("no-prefix", prefix_len=0)
+        self.assertEqual(
+            adder.add_one_req(third, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.CONTINUE,
+        )
+        self.assertEqual(adder.can_run_list, [first, third])
+        self.assertEqual(adder.kv_shard_block_bound_pages, 2)
+        self.assertEqual(adder.kv_shard_chunk_pages, 2)
+
+    def test_eight_long_prefixes_fit_an_eight_k_chunk(self):
+        context_len = 16384
+        extend_len = 1024
+        prefix_len = context_len - extend_len
+        kvc = SimpleNamespace(
+            page_size=4,
+            model_config=SimpleNamespace(context_len=context_len),
+        )
+        for chunk_tokens in (8192, 16384):
+            with self.subTest(chunk_tokens=chunk_tokens):
+                with (
+                    patch(
+                        "sglang.srt.mem_cache.page_interleave.get_kv_shard_group_info",
+                        return_value=(0, 2),
+                    ),
+                    patch(
+                        "sglang.srt.mem_cache.page_interleave.get_schedule",
+                        return_value=SimpleNamespace(chunked_prefill_size=chunk_tokens),
+                    ),
+                ):
+                    spec = make_page_shard_spec(kvc)
+                self.assertEqual(spec.max_prefix_tokens, 8 * context_len)
+                adder = self.create_sharded_adder(
+                    shard_spec=spec,
+                    allocator_size=8 * context_len,
+                    rem_input_tokens=32768,
+                )
+                reqs = [
+                    self.create_sharded_req(
+                        str(i), prefix_len=prefix_len, extend_len=extend_len
+                    )
+                    for i in range(9)
+                ]
+                for i, req in enumerate(reqs[:8]):
+                    result = adder.add_one_req(
+                        req, has_chunked_req=False, truncation_align_size=None
+                    )
+                    # The eighth request commits even if it exhausts the budget.
+                    expected = (
+                        AddReqResult.OTHER
+                        if i == 7 and chunk_tokens == 8192
+                        else AddReqResult.CONTINUE
+                    )
+                    self.assertEqual(result, expected)
+                self.assertEqual(adder.can_run_list, reqs[:8])
+                self.assertEqual(adder.rem_chunk_tokens, chunk_tokens - 8192)
+                self.assertEqual(adder.kv_shard_chunk_pages * spec.page_size, 8192)
+                self.assertEqual(
+                    adder.kv_shard_block_bound_pages * spec.logical_page_size,
+                    8 * prefix_len,
+                )
+                remaining = (
+                    adder.rem_total_tokens,
+                    adder.rem_chunk_tokens,
+                    adder.kv_shard_block_bound_pages,
+                    adder.kv_shard_chunk_pages,
+                )
+                self.assertEqual(
+                    adder.add_one_req(
+                        reqs[8], has_chunked_req=False, truncation_align_size=None
+                    ),
+                    AddReqResult.OTHER,
+                )
+                self.assertEqual(adder.can_run_list, reqs[:8])
+                reqs[8].set_extend_range.assert_not_called()
+                self.assertEqual(
+                    (
+                        adder.rem_total_tokens,
+                        adder.rem_chunk_tokens,
+                        adder.kv_shard_block_bound_pages,
+                        adder.kv_shard_chunk_pages,
+                    ),
+                    remaining,
+                )
+                if chunk_tokens == 16384:
+                    # Prefix scratch is full; a request without a prefix still fits.
+                    no_prefix = self.create_sharded_req(
+                        "no-prefix", prefix_len=0, extend_len=extend_len
+                    )
+                    self.assertEqual(
+                        adder.add_one_req(
+                            no_prefix,
+                            has_chunked_req=False,
+                            truncation_align_size=None,
+                        ),
+                        AddReqResult.CONTINUE,
+                    )
+                    self.assertEqual(adder.can_run_list, reqs[:8] + [no_prefix])
+
+    def test_sharded_admission_reserves_only_selected_chunk(self):
+        # Use normal page rounding without a sharding alignment override.
+        for remaining, selected, verdict in (
+            (8, 8, AddReqResult.OTHER),
+            (7, 4, AddReqResult.CONTINUE),
+        ):
+            with self.subTest(remaining=remaining):
+                adder = self.create_sharded_adder(chunk_tokens=8)
+                adder.exact_chunk_fill = False
+                adder.rem_chunk_tokens = remaining
+                req = self.create_sharded_req("chunked", extend_len=28)
+
+                self.assertEqual(
+                    adder.add_one_req(
+                        req, has_chunked_req=False, truncation_align_size=None
+                    ),
+                    verdict,
+                )
+                self.assertEqual(adder.can_run_list, [req])
+                self.assertIs(adder.new_chunked_req, req)
+                self.assertEqual(req.extend_range, Range(12, 12 + selected))
+                self.assertEqual(adder.kv_shard_block_bound_pages, 2)
+                self.assertEqual(adder.kv_shard_chunk_pages, selected // 4)
+
+    def test_sharded_admission_reserves_nothing_when_delayed(self):
+        delayer = _RecordingDelayer(allow=False)
+        adder = self.create_sharded_adder(prefill_delayer_single_pass=delayer)
+        req = self.create_sharded_req("delayed")
+
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [])
+        req.set_extend_range.assert_not_called()
+        self.assertEqual(adder.kv_shard_block_bound_pages, 0)
+        self.assertEqual(adder.kv_shard_chunk_pages, 0)
+
+        delayer.allow = True
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.CONTINUE,
+        )
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual(adder.kv_shard_block_bound_pages, 2)
+        self.assertEqual(adder.kv_shard_chunk_pages, 1)
 
     def _build_hybrid_swa_chunked_req(
         self,
@@ -885,7 +1141,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_token_allocator.full_available_size.return_value = 100_000
         self.mock_token_allocator.available_size.return_value = 100_000
         self.mock_tree_cache.sliding_window_size = WINDOW
-        self.mock_tree_cache.is_tree_cache.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
         adder = self.create_adder(self.create_running_batch(), page_size=PAGE)
         adder.is_hybrid_swa = True
         adder.memory_budget = SWAPrefillBudget(
@@ -934,7 +1190,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_token_allocator.full_available_size.return_value = 100_000
         self.mock_token_allocator.available_size.return_value = 100_000
         self.mock_tree_cache.sliding_window_size = WINDOW
-        self.mock_tree_cache.is_tree_cache.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
 
         def run(delivered: int, remaining_after_load: int = 100_000):
             self.mock_token_allocator.full_available_size.return_value = 100_000
@@ -994,6 +1250,188 @@ class TestPrefillAdder(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "promised"):
             run(HOST_HIT // 2)
 
+    def _build_hicache_restore_admission(
+        self,
+        *,
+        restored_tokens=0,
+        restored_swa_tokens=0,
+        available_swa=4096,
+        chunk_tokens=16384,
+        size_swa=16384,
+        ring=False,
+    ):
+        self.mock_token_allocator = self.create_token_allocator(
+            full_available_size=100_000,
+            swa_available_size=available_swa,
+            size_swa=size_swa,
+        )
+        self.mock_token_allocator.mock_add_spec(SWATokenToKVPoolAllocator)
+        self.mock_token_allocator.swa_req_ring = ring
+        self.mock_token_allocator.swa_ring_cost_tokens = 4096
+        self.mock_token_allocator.create_prefill_budget.side_effect = (
+            lambda tree_cache, **kwargs: SWAPrefillBudget(
+                self.mock_token_allocator, tree_cache, **kwargs
+            )
+        )
+        self.mock_tree_cache = self.create_tree_cache()
+        self.mock_tree_cache.sliding_window_size = 1024
+        self.mock_tree_cache.supports_mamba.return_value = False
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=128, rem_chunk_tokens=chunk_tokens
+        )
+        req = self._create_host_hit_req(host_hit=6144, tail=2048)
+        req.sampling_params.max_new_tokens = 1024
+        req.swa_host_hit_length = 1024
+        req.best_match_node = MagicMock()
+        req.needs_host_load_back.return_value = True
+
+        def load_back(params):
+            self.assertIs(params.req, req)
+            self.mock_token_allocator.swa_available_size.return_value -= (
+                restored_swa_tokens
+            )
+            return torch.arange(restored_tokens), req.last_node
+
+        self.mock_tree_cache.init_load_back.side_effect = load_back
+        return adder, req
+
+    def test_swa_failed_host_restore_defers_before_committing_request(self):
+        for chunk_tokens, has_prior_req in (
+            (None, False),
+            (4096, False),
+            (16384, False),
+            (16384, True),
+        ):
+            with self.subTest(chunk_tokens=chunk_tokens, has_prior_req=has_prior_req):
+                adder, req = self._build_hicache_restore_admission(
+                    chunk_tokens=chunk_tokens
+                )
+                if has_prior_req:
+                    first = self._create_delayer_req(
+                        512, rid="first", max_new_tokens=16
+                    )
+                    first.swa_host_hit_length = 0
+                    adder.add_one_req(
+                        first, has_chunked_req=False, truncation_align_size=None
+                    )
+                admitted_before = [first] if has_prior_req else []
+                budget_before = (
+                    adder.memory_budget.remaining_swa,
+                    adder.rem_total_tokens,
+                    adder.rem_chunk_tokens,
+                )
+                original_node = req.last_node = 42
+                original_receipt = req.lock_receipt = DecLockRefParams(node_id=7)
+                acquired = IncLockRefResult(
+                    node_id=42, skipped_lock_components=(ComponentType.SWA,)
+                )
+                self.mock_tree_cache.inc_lock_ref.return_value = acquired
+                self.mock_tree_cache.reset_mock()
+
+                result = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+
+                self.assertIs(result, AddReqResult.NO_TOKEN)
+                self.assertEqual(adder.can_run_list, admitted_before)
+                self.assertIsNone(adder.new_chunked_req)
+                req.set_extend_range.assert_not_called()
+                self.assertEqual(
+                    (
+                        adder.memory_budget.remaining_swa,
+                        adder.rem_total_tokens,
+                        adder.rem_chunk_tokens,
+                    ),
+                    budget_before,
+                )
+                self.assertIs(req.lock_receipt, original_receipt)
+                self.mock_tree_cache.init_load_back.assert_called_once()
+                self.mock_tree_cache.inc_lock_ref.assert_called_once_with(original_node)
+                self.mock_tree_cache.dec_lock_ref.assert_called_once_with(
+                    original_node, acquired.to_dec_params()
+                )
+
+    def test_swa_failed_host_restore_retries_when_capacity_recovers(self):
+        adder, req = self._build_hicache_restore_admission()
+        self.assertIs(
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.NO_TOKEN,
+        )
+        self.assertEqual(adder.can_run_list, [])
+
+        self.mock_token_allocator.swa_available_size.return_value = 10_240
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertIs(result, AddReqResult.CONTINUE)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual(req.extend_range, Range(0, 8192))
+        self.assertGreaterEqual(adder.memory_budget.remaining_swa, 0)
+        self.assertEqual(self.mock_tree_cache.inc_lock_ref.call_count, 3)
+        self.assertEqual(self.mock_tree_cache.dec_lock_ref.call_count, 2)
+
+    def test_swa_host_restore_admitted(self):
+        for label, options, expected_range, remaining_swa, expected_result in (
+            (
+                "restored",
+                dict(
+                    restored_tokens=6144, restored_swa_tokens=1024, available_swa=3328
+                ),
+                Range(6144, 8192),
+                128,
+                AddReqResult.CONTINUE,
+            ),
+            (
+                "exact_fit_ring",
+                dict(ring=True),
+                Range(0, 8192),
+                0,
+                AddReqResult.NO_TOKEN,
+            ),
+            (
+                "fitting_chunk",
+                dict(chunk_tokens=2048),
+                Range(0, 2048),
+                1920,
+                AddReqResult.OTHER,
+            ),
+            (
+                "never_fits",
+                dict(size_swa=4096),
+                Range(0, 2944),
+                1024,
+                AddReqResult.CONTINUE,
+            ),
+        ):
+            with self.subTest(label=label):
+                adder, req = self._build_hicache_restore_admission(**options)
+
+                result = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+
+                self.assertIs(result, expected_result)
+                self.mock_tree_cache.init_load_back.assert_called_once()
+                self.assertEqual(adder.can_run_list, [req])
+                self.assertEqual(req.extend_range, expected_range)
+                self.assertEqual(req.host_loaded_length, expected_range.start)
+                self.assertIs(
+                    adder.new_chunked_req, req if expected_range.end < 8192 else None
+                )
+                self.assertEqual(adder.memory_budget.remaining_swa, remaining_swa)
+
+    def test_swa_partial_host_restore_fails_loudly_before_request_commit(self):
+        adder, req = self._build_hicache_restore_admission(
+            restored_tokens=3072, restored_swa_tokens=1024
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "HiCache load-back"):
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual(adder.can_run_list, [])
+        req.set_extend_range.assert_not_called()
+
     def _create_host_hit_req(self, *, prefix_len=0, host_hit=8192, tail=1024):
         req = self._create_delayer_req(prefix_len + host_hit + tail)
         req.prefix_indices = torch.arange(prefix_len)
@@ -1018,7 +1456,11 @@ class TestPrefillAdder(CustomTestCase):
                 0,
                 24,
                 None,
-                SimpleNamespace(block_size=4, max_running_requests=2),
+                SimpleNamespace(
+                    block_size=4,
+                    max_running_requests=2,
+                    requires_separate_context_encoding=False,
+                ),
                 4,
                 0,
             ),
@@ -1027,7 +1469,11 @@ class TestPrefillAdder(CustomTestCase):
                 0,
                 24,
                 None,
-                SimpleNamespace(block_size=4, max_running_requests=2),
+                SimpleNamespace(
+                    block_size=4,
+                    max_running_requests=2,
+                    requires_separate_context_encoding=False,
+                ),
                 4,
                 0,
             ),
@@ -1226,8 +1672,10 @@ class TestPrefillAdder(CustomTestCase):
             **kwargs,
         )
 
-    def _create_delayer_req(self, num_tokens: int):
-        req = self.create_mock_req("delayer_req", priority=0, max_new_tokens=8)
+    def _create_delayer_req(
+        self, num_tokens: int, *, rid="delayer_req", max_new_tokens=8
+    ):
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=max_new_tokens)
         req.full_untruncated_fill_ids = list(range(num_tokens))
         req.host_hit_length = 0
         req.last_node = MagicMock()

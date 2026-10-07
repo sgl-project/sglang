@@ -18,6 +18,7 @@
 """Inference-only GLM-4.1V model compatible with HuggingFace weights."""
 
 import logging
+from array import array
 from functools import lru_cache
 from typing import Iterable, List, Optional, Tuple
 
@@ -35,6 +36,7 @@ from sglang.srt.layers.attention.vision import (
     prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.conv import Conv3dLayer
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -74,6 +76,20 @@ class Glm4vRMSNorm(RMSNorm):
         return x
 
 
+# TODO: fold into parallel_group selection ("attn_tp" under DP attention).
+def glm4v_vision_reduces_over_attn_tp(use_data_parallel: bool) -> bool:
+    return is_dp_attention_enabled() and not use_data_parallel
+
+
+def _glm4v_vision_tp(use_data_parallel: bool) -> Tuple[int, int]:
+    if use_data_parallel:
+        return 1, 0
+    parallel = get_parallel()
+    if glm4v_vision_reduces_over_attn_tp(use_data_parallel):
+        return parallel.attn_tp_size, parallel.attn_tp_rank
+    return parallel.tp_size, parallel.tp_rank
+
+
 class Glm4vVisionMLP(nn.Module):
     def __init__(
         self,
@@ -85,8 +101,7 @@ class Glm4vVisionMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
-        self.tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
+        self.tp_size, self.tp_rank = _glm4v_vision_tp(use_data_parallel)
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=in_features,
             output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
@@ -104,6 +119,9 @@ class Glm4vVisionMLP(nn.Module):
             prefix=add_prefix("down_proj", prefix),
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.act_fn = SiluAndMul()
 
@@ -143,6 +161,9 @@ class Glm4vVisionBlock(nn.Module):
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.mlp = Glm4vVisionMLP(
             dim,
@@ -236,8 +257,7 @@ class Glm4vPatchMerger(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = d_model
-        tp_size = 1 if use_data_parallel else get_parallel().tp_size
-        tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
+        tp_size, tp_rank = _glm4v_vision_tp(use_data_parallel)
         self.proj = ReplicatedLinear(
             self.hidden_size,
             self.hidden_size,
@@ -263,6 +283,9 @@ class Glm4vPatchMerger(nn.Module):
             prefix=add_prefix("down_proj", prefix),
             tp_size=tp_size,
             tp_rank=tp_rank,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.extra_activation_func = nn.GELU()
 
@@ -594,7 +617,7 @@ class Glm4vForConditionalGeneration(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
