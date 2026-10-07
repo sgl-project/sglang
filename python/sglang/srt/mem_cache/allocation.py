@@ -20,9 +20,6 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
-    MAMBA_STATE_PER_REQ_NO_CACHE,
-    MAMBA_STATE_PER_REQ_PREFIX_CACHE,
-    MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
     available_and_evictable_str,
     evict_from_tree_cache,
 )
@@ -201,6 +198,8 @@ def alloc_paged_token_slots_extend(
         )
         extra_alloc_kwargs["rotation_bases"] = kv_shard_rotation_bases
     if is_dsv4:
+        c128_num_pages = allocator.c128_num_pages_needed(prefix_lens_cpu, seq_lens_cpu)
+        allocator.ensure_c128_capacity(tree_cache, c128_num_pages)
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
         # Per-call per-req table for the C128 KV last_loc lookup.
         if batch is not None:
@@ -253,7 +252,7 @@ def _kv_shard_rotation_bases(
     The owner class of position-page P is ``(b_i + P) % shard_size``. Rules:
 
     - Read through ``req.last_node`` at alloc time, never a value cached on
-      the request: ``cache_unfinished_req`` can rebind a chunked request onto
+      the request: a ``checkpoint`` can rebind a chunked request onto
       another chain's canonical locs between chunks, changing the base. The
       read goes through ``tree_cache.rotation_base_of`` because the node
       handle is tree-specific (a NodeId on the unified tree).
@@ -284,6 +283,35 @@ def _kv_shard_rotation_bases(
     return bases
 
 
+def ensure_mamba_capacity(
+    req_to_token_pool: ReqToTokenPool,
+    reqs: list[Req],
+    tree_cache: BasePrefixCache | None,
+) -> bool:
+    """Reclaim the Mamba slots needed before binding any request rows."""
+    if not isinstance(req_to_token_pool, HybridReqToTokenPool):
+        return True
+
+    # Count the slots HybridReqToTokenPool.alloc will allocate for each request.
+    needed = 0
+    for req in reqs:
+        if not req.kv.holds_mamba:
+            needed += 1
+
+        if req.kv.mamba_ping_pong_track_buffer is None:
+            needed += req_to_token_pool.mamba_initial_tracking_slots
+
+    # Byte-coordinated for the shared allocator; plain free slots otherwise.
+    allocator = req_to_token_pool.mamba_allocator
+    supports_mamba = tree_cache is not None and tree_cache.supports_mamba()
+    available = allocator.schedulable_available_size()
+    if available < needed and supports_mamba:
+        tree_cache.evict_for_alloc(
+            EvictParams(num_tokens=0, mamba_num=needed - available)
+        )
+    return allocator.schedulable_available_size() >= needed
+
+
 def alloc_req_slots(
     req_to_token_pool: ReqToTokenPool,
     reqs: list[Req],
@@ -296,28 +324,9 @@ def alloc_req_slots(
     and should surface rather than be masked.
     """
     num_reqs = len(reqs)
-    if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        # Byte-coordinated for the shared allocator (accounts for the peer full
-        # sub-pool's bytes); plain slot free count for the non-shared one.
-        mamba_available_size = (
-            req_to_token_pool.mamba_allocator.schedulable_available_size()
-        )
-        # Eviction headroom factor: 3x (or lazy variant) for radix COW, 1x for chunk.
-        if tree_cache.supports_mamba():
-            factor = (
-                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
-                if req_to_token_pool.enable_mamba_extra_buffer_lazy
-                else MAMBA_STATE_PER_REQ_PREFIX_CACHE
-            )
-        else:
-            factor = MAMBA_STATE_PER_REQ_NO_CACHE
-        mamba_state_needed = num_reqs * factor
-        if mamba_available_size < mamba_state_needed:
-            if tree_cache is not None and tree_cache.supports_mamba():
-                mamba_num = max(0, mamba_state_needed - mamba_available_size)
-                tree_cache.evict_for_alloc(
-                    EvictParams(num_tokens=0, mamba_num=mamba_num)
-                )
+    # Keep combined serving's existing behavior: try cache eviction, then let
+    # the pool allocate. A failed precheck need not mean allocation will fail.
+    ensure_mamba_capacity(req_to_token_pool, reqs, tree_cache)
     req_pool_indices = req_to_token_pool.alloc(reqs)
     if req_pool_indices is None:
         raise RuntimeError(
@@ -445,6 +454,7 @@ def alloc_for_extend(
     for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
         req.kv.kv_allocated_len = seq_len
         req.kv.kv_committed_len = seq_len
+        batch.tree_cache.maybe_hand_to_session(req)
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
@@ -549,6 +559,10 @@ def alloc_paged_token_slots_decode(
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
     extra_alloc_kwargs = {}
     if is_dsv4:
+        c128_num_pages = allocator.c128_num_pages_needed(
+            (seq_lens_cpu - 1).clamp(min=0), seq_lens_cpu
+        )
+        allocator.ensure_c128_capacity(tree_cache, c128_num_pages)
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
         # Per-call per-req C128 table for the last_loc lookup.
         if batch is not None:

@@ -13,9 +13,9 @@
 # ==============================================================================
 """Byte-budget buffer sizing for the unified 2-pool factories.
 
-With ``unified_total_bytes`` set the buffer is that many bytes exactly (the
-mamba pair adds the state pool's bytes on top -- the budget is captured AFTER
-the state carve-out); without it, sizing falls back to the token-count re-sum.
+The SWA factory's ``total_bytes`` sets the exact buffer size. The Mamba pair's
+``unified_total_bytes`` adds state bytes because its budget excludes that carve-out.
+Without an explicit budget, sizing falls back to the token-count re-sum.
 Sizing from the ratio-derived token counts instead would re-introduce the
 configurator's rounding, which floors by the cell size and then page-aligns
 EACH side, losing up to about a page of tokens per side.
@@ -91,7 +91,7 @@ class TestBudgetSizing(unittest.TestCase):
             (64 + 32) * e + (e - 2),  # almost one more entry
         ):
             with self.subTest(budget=budget):
-                bundle = _swa_factory(unified_total_bytes=budget)
+                bundle = _swa_factory(total_bytes=budget)
                 self.assertEqual(bundle.unified_memory_pool.total_bytes, budget)
 
     def test_fallback_is_the_token_count_resum(self):
@@ -166,7 +166,7 @@ class TestBs1FeasibilityFloor(unittest.TestCase):
         must fail loud instead of livelocking later."""
         with self.assertRaises(RuntimeError) as ctx:
             _swa_factory(
-                unified_total_bytes=8 * _entry_bytes(),
+                total_bytes=8 * _entry_bytes(),
                 model_context_len=4096,
                 sliding_window_size=4096,
             )
@@ -184,7 +184,7 @@ class TestBs1FeasibilityFloor(unittest.TestCase):
         ):
             with self.subTest(case=case):
                 bundle = _swa_factory(
-                    unified_total_bytes=200 * e,
+                    total_bytes=200 * e,
                     model_context_len=model_context_len,
                     sliding_window_size=sliding_window_size,
                 )

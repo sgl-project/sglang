@@ -393,12 +393,13 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             self.hf_config.vision_config, "tokens_per_second", None
         )
 
+        # Also match the legacy sglang <image> sentinel used by /generate,
+        # so the artifact fast path can normalize it before build_input_ids.
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
             image_token_id=hf_config.image_token_id,
-            # The regex that matches expanded image tokens.
             image_token_regex=re.compile(
-                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
+                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>|<image>"
             ),
             video_token_id=self.VIDEO_TOKEN_ID,
             audio_token_id=self.audio_token_id,
@@ -864,8 +865,12 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         self,
         input_text,
         artifacts: list[QwenVLImagePreprocessArtifact],
-    ) -> MultimodalProcessorOutput:
-        """Compose prompt tokens and request-owned items from cached images."""
+    ) -> Optional[MultimodalProcessorOutput]:
+        """Compose prompt tokens and request-owned items from cached images.
+
+        Returns None when the raw prompt cannot be aligned with the prepared
+        artifacts; the caller falls back to _process_mm_data_uncached.
+        """
         image_grids = []
         for artifact in artifacts:
             grid = self._as_grid_batch(
@@ -879,20 +884,35 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         grid_key = tuple(
             tuple(int(value) for value in row.tolist()) for row in image_grid_thw
         )
-        if isinstance(input_text, str):
-            (
-                input_ids_tuple,
-                offsets,
-                mrope_positions,
-                mrope_position_delta,
-            ) = self._cached_image_prompt_template(input_text, grid_key)
-        else:
-            (
-                input_ids_tuple,
-                offsets,
-                mrope_positions,
-                mrope_position_delta,
-            ) = self._build_image_prompt_template(input_text, grid_key)
+        normalized_text = self._normalize_prompt_for_fast_path(
+            input_text, expected_image_count=len(grid_key)
+        )
+        if normalized_text is None:
+            return None
+        try:
+            if isinstance(normalized_text, str):
+                (
+                    input_ids_tuple,
+                    offsets,
+                    mrope_positions,
+                    mrope_position_delta,
+                ) = self._cached_image_prompt_template(normalized_text, grid_key)
+            else:
+                (
+                    input_ids_tuple,
+                    offsets,
+                    mrope_positions,
+                    mrope_position_delta,
+                ) = self._build_image_prompt_template(normalized_text, grid_key)
+        except ValueError as exc:
+            if "prompt placeholders" not in str(exc):
+                raise
+            logger.debug(
+                "Qwen-VL fast path skipped after normalization (%s); "
+                "falling back to full preprocessing",
+                exc,
+            )
+            return None
         input_ids_list = list(input_ids_tuple)
 
         mm_items = []
@@ -923,6 +943,23 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             mrope_positions=mrope_positions.clone(),
             mrope_position_delta=mrope_position_delta.clone(),
         )
+
+    def _normalize_prompt_for_fast_path(self, input_text, expected_image_count: int):
+        # Non-string input (list of ints) is already in the pre-tokenized shape
+        # build_input_ids expects; only string prompts need placeholder rewriting.
+        if not isinstance(input_text, str):
+            return input_text
+        native = self.mm_tokens.image_token
+        normalized, count = self.mm_tokens.image_token_regex.subn(native, input_text)
+        if count != expected_image_count:
+            logger.debug(
+                "Qwen-VL fast path skipped: %d image placeholder(s) in prompt "
+                "vs %d prepared artifact(s); falling back to full preprocessing",
+                count,
+                expected_image_count,
+            )
+            return None
+        return normalized
 
     @lru_cache(maxsize=256)
     def _cached_image_prompt_template(self, input_text: str, grid_key: tuple):
@@ -1165,7 +1202,12 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         artifacts = await prepare_artifacts(
             image_data, content_hashes=getattr(request_obj, "mm_content_hashes", None)
         )
-        return self.compose_image_artifacts(input_text, artifacts)
+        composed = self.compose_image_artifacts(input_text, artifacts)
+        if composed is not None:
+            return composed
+        return await self._process_mm_data_uncached(
+            image_data, input_text, request_obj, *args, **kwargs
+        )
 
     def _mark_cuda_ipc_features_for_deferred_reconstruction(self, mm_items):
         supports_deferred_reconstruction = get_mm().mm_enable_dp_encoder or (

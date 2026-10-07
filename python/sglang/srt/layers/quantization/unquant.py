@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -67,10 +68,43 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_gfx95 = _is_hip and is_gfx95_supported()
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
+    from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as _aiter_triton_a16w16
     from aiter.tuned_gemm import tgemm
+
+# Route supported decode shapes that are absent from the tuned table.
+_A16W16_TRITON_MAX_K = 2048
+_A16W16_TRITON_MAX_M = 64
+_A16W16_TRITON_NARROW_K = 512
+_A16W16_TRITON_NARROW_K_MAX_M = 512
+
+
+def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Return whether the Triton BF16 path supports this decode shape."""
+    if x.dim() != 2 or weight.dim() != 2:
+        return False
+    k = weight.shape[1]
+    max_m = (
+        _A16W16_TRITON_NARROW_K_MAX_M
+        if k <= _A16W16_TRITON_NARROW_K
+        else _A16W16_TRITON_MAX_M
+    )
+    return (
+        x.is_cuda
+        and weight.is_cuda
+        and x.device == weight.device
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.shape[1] == k
+        and 0 < k <= _A16W16_TRITON_MAX_K
+        and 0 < x.shape[0] <= max_m
+        and weight.shape[0] > 0
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    )
 
 
 class Bf16GemmBackend(Enum):
@@ -478,6 +512,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return output
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+            if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
+                return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
@@ -760,6 +796,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         ):
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
+        if self.use_flashinfer_cutlass:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                materialize_swiglu_params_for_cutlass,
+            )
+
+            layer._cutlass_swiglu_params = materialize_swiglu_params_for_cutlass(
+                layer.moe_runner_config,
+                int(layer.num_local_experts),
+                layer.w13_weight.device,
+            )
+
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
             # The cached indices are GPU tensors. Colocated weight offloading
@@ -936,10 +983,32 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
         param.data = param.data.reshape(expected_shape)
 
-    def _aiter_ck_moe_supported(self, layer) -> bool:
+    def _aiter_ck_moe_unsupported_reason(self, layer) -> Optional[str]:
         # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
         # (GemmSpec=Default; otherwise CK raises "not support this GEMM problem").
-        return layer.intermediate_size_per_partition % 128 == 0
+        if layer.intermediate_size_per_partition % 128 != 0:
+            return (
+                "intermediate_size_per_partition="
+                f"{layer.intermediate_size_per_partition} is not 128-aligned"
+            )
+
+        if not is_gfx95_supported():
+            return None
+
+        cfg = layer.moe_runner_config
+        wants_swiglu_oai = (
+            cfg.gemm1_alpha is not None or cfg.gemm1_clamp_limit is not None
+        )
+        if wants_swiglu_oai:
+            return (
+                f"activation={cfg.activation} with gemm1_alpha={cfg.gemm1_alpha} / "
+                f"gemm1_clamp_limit={cfg.gemm1_clamp_limit} (SwiGLU-OAI) is not "
+                "implemented by the aiter CK bf16 fused-MoE kernels"
+            )
+        return None
+
+    def _aiter_ck_moe_supported(self, layer) -> bool:
+        return self._aiter_ck_moe_unsupported_reason(layer) is None
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -968,7 +1037,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             backend = MoeRunnerBackend.TRITON
         self.runner = MoeRunner(backend, moe_runner_config)
 
-        # aiter CK fused-MoE only supports 128-aligned shapes; otherwise use triton.
+        # aiter CK fused-MoE only supports some shapes / activations; else use triton.
         self._aiter_runner: Optional[MoeRunner] = None
         if (
             _use_aiter
@@ -978,20 +1047,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
             and get_moe_a2a_backend().supports_aiter()
         ):
-            if self._aiter_ck_moe_supported(layer):
+            reason = self._aiter_ck_moe_unsupported_reason(layer)
+            if reason is None:
                 self._aiter_runner = MoeRunner(
                     MoeRunnerBackend.AITER, moe_runner_config
                 )
             elif get_moe_runner_backend().is_aiter():
                 raise ValueError(
-                    "moe_runner_backend=aiter is not supported for "
-                    f"intermediate_size_per_partition={layer.intermediate_size_per_partition}; "
+                    f"moe_runner_backend=aiter is not supported: {reason}; "
                     "use --moe-runner-backend triton."
                 )
             else:
                 logger.warning_once(
-                    "aiter CK fused-MoE does not support "
-                    f"intermediate_size_per_partition={layer.intermediate_size_per_partition}; "
+                    f"aiter CK fused-MoE does not support this layer: {reason}; "
                     "using triton MoE runner."
                 )
 
@@ -1063,15 +1131,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 FlashInferCutlassMoeQuantInfo,
             )
 
+            swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="bf16",
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
                 output_dtype=x.dtype,
-                moe_ep_size=layer.moe_ep_size,
-                moe_ep_rank=layer.moe_ep_rank,
-                moe_tp_size=layer.moe_tp_size,
-                moe_tp_rank=layer.moe_tp_rank,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
                 apply_routed_scaling_factor=not layer.should_fuse_routed_scaling_factor_in_topk,
             )
             return self.runner.run(dispatch_output, quant_info)
@@ -1091,12 +1159,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             if self._aiter_runner is not None:
                 from sglang.srt.layers.moe.moe_runner.aiter import (
                     AiterMoeQuantInfo,
+                    aiter_swiglu_oai_limit,
                 )
 
                 quant_info = AiterMoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,
                     expert_mask=layer.dispatcher.expert_mask_gpu,
+                    swiglu_limit=aiter_swiglu_oai_limit(self.moe_runner_config) or 0.0,
                 )
                 return self._aiter_runner.run(dispatch_output, quant_info)
 

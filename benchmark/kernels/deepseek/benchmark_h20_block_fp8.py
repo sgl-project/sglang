@@ -17,7 +17,7 @@ from unittest.mock import patch
 import torch
 import triton
 
-from sglang.kernels.ops.quantization import fp8_kernel
+from sglang.kernels.ops.gemm import fp8_kernel
 
 SHAPES = [
     (1792, 5120),

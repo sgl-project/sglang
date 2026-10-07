@@ -124,7 +124,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 **gfx950 block-FP8 accuracy: fixed as of the pinned MI355X image (`v0.5.13.post1-rocm720-mi35x-20260618`).** Earlier SGLang ROCm images miscompiled AMD aiter's `gemm_a8w8_blockscale_bpreshuffle` GEMM on gfx950 (ROCm 7.2): the error was small per layer but compounded across all 78 layers and silently corrupted output — in-context reasoning broke (GSM8K ≈ 0) while short factual prompts still looked fine. The root cause was a gfx950/ROCm-7.2 miscompile of the CK kernel (a packed illegal-type FMA that relied on an LLVM coercion pass removed in ROCm 7.2; non-deterministic wrong rows near tile boundaries). This is resolved in the pinned image and newer: GLM-5.2-FP8 on MI350X/MI355X (gfx950) was re-validated at TP4 and TP8 — **GSM8K ≈ 0.96 (0% invalid)** and **15/15 needle-in-haystack retrieval to ~118K tokens**. **MI300X / MI325X (gfx942) were never affected.** If you must run an older image, treat gfx950 FP8 output as unverified. Background: [sgl-project/sglang#28685](https://github.com/sgl-project/sglang/issues/28685) (analysis) and the upstream CK fix [ROCm/rocm-libraries#8639](https://github.com/ROCm/rocm-libraries/pull/8639) (scalar FMA + accumulator anchor; restores correctness and determinism at -O3).
 </Note>
 
-- **MTP / EAGLE speculative decoding on AMD.** Five-step MTP is validated for `amd/GLM-5.2-MXFP4` on MI355X with `lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260910`. Choose **Low-Latency** for the GPU-resident TP8/EP1 topology, or **High-Throughput** for the TP4/EP4 topology. Both emit `--speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6` with the Triton DSA prefill and decode backends. The TP4/EP4 InferenceX benchmark adds HiCache DRAM offload, but those host-specific knobs are intentionally omitted from the portable cookbook command. MTP remains unvalidated for GLM-5.2 on MI300X/MI325X and for the other MI355X checkpoint precisions.
+- **MTP / EAGLE speculative decoding on AMD.** Five-step MTP is validated for `amd/GLM-5.2-MXFP4` on MI355X with `lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260930`. Choose **Low-Latency** for TP8/EP1, or **High-Throughput** for TP4/EP4 with HiCache (`--enable-hierarchical-cache --hicache-ratio 1.0`). HiCache uses the default `kernel`, `page_first`, and `write_through` settings. MTP remains unvalidated for GLM-5.2 on MI300X/MI325X and for the other MI355X checkpoint precisions.
 
 ## 3. Advanced Usage
 
@@ -255,7 +255,7 @@ For the full setup (streaming, tool-use, count_tokens, persisting env in `~/.cla
 ### 3.5 Context Parallelism
 
 <Warning>
-Zigzag prefill CP (`--cp-strategy zigzag`) is temporarily unavailable for GLM-5.2. For prefill CP on CUDA, use `interleave` with `--dp 1` as shown below.
+Zigzag prefill CP (`--cp-strategy zigzag`) is temporarily unavailable for GLM-5.2. For prefill CP on CUDA, use `interleave` as shown below. Attention DP is supported: each DP group uses `tp_size / attn_dp_size` CP ranks. Dense FFNs retain the configured TP width; use `--moe-dense-tp-size 1` for local dense computation.
 </Warning>
 
 Prefill context parallelism can help with reduction of TTFT under long context. To enable prefill context parallelism for GLM 5.2, please append the following arguments:
@@ -303,3 +303,74 @@ python3 -m sglang.launch_server \
 ```
 
 **B200 (TP8):** same command, with `--mem-fraction-static 0.83` and `--hicache-size 169`. Lower concurrency (c1/c4/c8) uses `--hicache-ratio 0.75` instead.
+
+**GB300 (TP4, single node):** one 4-GPU GB300 node serves the whole model. All three commands offload KV cache to host DRAM with `--hicache-size 135` (GB of host memory per rank, 540 GB per node). GLM-5.2 is a DSA model, so on Blackwell SGLang already defaults to an FP8 E4M3 KV cache and TRT-LLM DSA attention; the commands do not need to set them.
+
+Low-latency (TP4, MTP 5-1-6, up to 16 concurrent requests):
+```bash Command
+sglang serve \
+  --model-path nvidia/GLM-5.2-NVFP4 \
+  --trust-remote-code \
+  --tp 4 \
+  --quantization modelopt_fp4 \
+  --fp4-gemm-backend flashinfer_trtllm \
+  --max-running-requests 16 \
+  --cuda-graph-max-bs-decode 16 \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 8192 \
+  --mem-fraction-static 0.8 \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --enable-hierarchical-cache \
+  --hicache-size 135 \
+  --hicache-write-policy write_back \
+  --hicache-io-backend direct
+```
+
+Balanced (DP attention, MTP 2-1-3, up to 256 concurrent requests):
+```bash Command
+sglang serve \
+  --model-path nvidia/GLM-5.2-NVFP4 \
+  --trust-remote-code \
+  --tp 4 \
+  --attn-dp-size 4 \
+  --quantization modelopt_fp4 \
+  --max-running-requests 256 \
+  --chunked-prefill-size 8192 \
+  --mem-fraction-static 0.92 \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 2 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 3 \
+  --enable-hierarchical-cache \
+  --hicache-size 135 \
+  --hicache-write-policy write_back \
+  --hicache-io-backend direct
+```
+
+High-throughput (DP attention, no MTP, up to 512 concurrent requests):
+```bash Command
+sglang serve \
+  --model-path nvidia/GLM-5.2-NVFP4 \
+  --trust-remote-code \
+  --tp 4 \
+  --attn-dp-size 4 \
+  --quantization modelopt_fp4 \
+  --max-running-requests 512 \
+  --chunked-prefill-size 8192 \
+  --mem-fraction-static 0.92 \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --enable-hierarchical-cache \
+  --hicache-size 135 \
+  --hicache-write-policy write_back \
+  --hicache-io-backend direct
+```
+
+With `--attn-dp-size 4`, `--chunked-prefill-size` is a global budget divided across the attention DP ranks, so the balanced and high-throughput commands prefill 2048 tokens per rank per chunk.

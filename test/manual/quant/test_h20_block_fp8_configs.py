@@ -1,14 +1,14 @@
 """Validate H20-3e decode tables, including nearest-M interpolation.
 
 Run on an H20-3e with the proposed configuration files installed:
-    python -m unittest test.manual.quant.test_h20_block_fp8_configs -v
+    python test/manual/quant/test_h20_block_fp8_configs.py -v
 """
 
 import unittest
 
 import torch
 
-from sglang.kernels.ops.quantization.fp8_kernel import (
+from sglang.kernels.ops.gemm.fp8_kernel import (
     get_w8a8_block_fp8_configs,
     w8a8_block_fp8_matmul_triton,
 )
