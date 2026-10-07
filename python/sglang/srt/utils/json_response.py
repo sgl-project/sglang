@@ -32,14 +32,7 @@ def orjson_response(content: Any, status_code: int = 200) -> Response:
 
 
 def model_json_response(content: Any) -> Any:
-    """Render a pydantic endpoint result in one pass; pass anything else through.
-
-    Returning the model itself makes FastAPI run ``jsonable_encoder``: a
-    ``model_dump`` followed by a pure-Python walk over the dumped payload, which
-    dominates large responses such as top-k logprobs. The JSON values match
-    FastAPI's (aliases applied); non-finite floats become null, as in
-    ``dumps_json``.
-    """
+    """Serialize a pydantic result in one pass, skipping FastAPI's jsonable_encoder walk."""
     if not isinstance(content, BaseModel):
         return content
     return Response(

@@ -109,6 +109,11 @@ class TestModelJSONResponse(unittest.TestCase):
         self.assertEqual(rendered.status_code, 200)
         self.assertEqual(rendered.media_type, "application/json")
         self.assertEqual(orjson.loads(rendered.body), orjson.loads(expected))
+
+    def test_keeps_the_response_model_serializer(self):
+        """The response's wrap serializer must still drop an unset `sglext`."""
+        rendered = model_json_response(_chat_response_with_top_logprobs(-3.5))
+
         self.assertNotIn("sglext", orjson.loads(rendered.body))
 
     def test_applies_field_aliases_like_fastapi(self):
