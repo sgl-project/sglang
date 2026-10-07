@@ -135,8 +135,9 @@ def _per_token_group_quant_8bit(
 
     This function converts the tensor values into float8 values.
     """
-    # Map the program id to the row of X and Y it should compute.
-    g_id = tl.program_id(0)
+    # Map the program id to the row of X and Y it should compute. Row offsets
+    # pass int32 once numel > 2^31.
+    g_id = tl.program_id(0).to(tl.int64)
     y_ptr += g_id * y_stride
     y_q_ptr += g_id * y_stride
     y_s_ptr += g_id
@@ -811,8 +812,9 @@ def _static_quant_fp8(
 
     This function converts the tensor values into float8 values.
     """
-    # Map the program id to the row of X and Y it should compute.
-    g_id = tl.program_id(0)
+    # Map the program id to the row of X and Y it should compute. Row offsets
+    # pass int32 once numel > 2^31 (e.g. 85k tokens x 25600 features).
+    g_id = tl.program_id(0).to(tl.int64)
     y_ptr += g_id * y_stride
     y_q_ptr += g_id * y_stride
     if REPEAT_SCALE:
