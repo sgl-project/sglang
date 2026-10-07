@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
     InklingShortConvHybridAttnBackend,
 )
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
@@ -814,6 +815,15 @@ class TestInklingCheckpointIndices(CustomTestCase):
             spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
             device_timer=None,
             canary_manager=None,
+            # The KV side is not under test: a static pool's translator binds
+            # the captured batch to its own write ids.
+            kv_index_translator=KVIndexTranslator(
+                req_to_token=torch.zeros((1, 8), dtype=torch.int32, device="cuda"),
+                token_to_kv_pool_allocator=None,
+                token_to_kv_pool=object(),
+                page_size=1,
+                device="cuda",
+            ),
         )
         return runner, backend, allocator, pool, slots, buffers
 
