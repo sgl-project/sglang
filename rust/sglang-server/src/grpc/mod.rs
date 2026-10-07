@@ -1,9 +1,8 @@
 //! Tonic adapter for the canonical `sglang.runtime.v1` API.
 //!
-//! This module only translates protobuf requests and responses. The shared
-//! [`FrontendHandle`] owns preprocessing, admission, runtime communication, and
-//! request cancellation; listener construction and server lifecycle are added
-//! by the next stack layer.
+//! This module translates protobuf requests and responses and mounts that thin
+//! adapter on Tonic. The shared [`FrontendHandle`] owns preprocessing,
+//! admission, runtime communication, and request cancellation.
 //!
 //! The thin Tonic-service structure, streamed response approach, and test
 //! strategy build on Rain Jiang's multi-protocol prototype in
@@ -23,11 +22,13 @@ use crate::message::config::{PreferredSamplingParams, ServerArgs};
 
 mod convert;
 mod response;
+mod server;
+
+pub(crate) use server::serve;
 
 #[cfg(test)]
 mod tests;
 
-#[cfg_attr(test, allow(dead_code))]
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -43,18 +44,12 @@ struct AdapterConfig {
 }
 
 /// Tonic-facing implementation backed by the transport-neutral Rust frontend.
-///
-/// The listener follow-up constructs this service. The temporary dead-code
-/// allowance keeps this adapter-only stack layer warning-clean on its own.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct GrpcService {
     frontend: FrontendHandle,
     config: AdapterConfig,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl GrpcService {
-    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn new(frontend: FrontendHandle, server_args: &ServerArgs) -> Self {
         Self {
             frontend,
@@ -92,12 +87,10 @@ fn unimplemented_rpc(name: &'static str) -> Status {
 
 #[tonic::async_trait]
 impl SglangService for GrpcService {
-    type TextGenerateStream = ResponseStream<proto::TextGenerateResponse>;
-
     async fn text_generate(
         &self,
         request: Request<proto::TextGenerateRequest>,
-    ) -> Result<Response<Self::TextGenerateStream>, Status> {
+    ) -> Result<Response<ResponseStream<proto::TextGenerateResponse>>, Status> {
         let request = convert::text_generate(
             request.into_inner(),
             self.config.preferred_sampling_params.as_ref(),
@@ -115,12 +108,10 @@ impl SglangService for GrpcService {
         )))
     }
 
-    type GenerateStream = ResponseStream<proto::GenerateResponse>;
-
     async fn generate(
         &self,
         request: Request<proto::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<ResponseStream<proto::GenerateResponse>>, Status> {
         let request = convert::generate(
             request.into_inner(),
             self.config.preferred_sampling_params.as_ref(),
@@ -233,12 +224,10 @@ impl SglangService for GrpcService {
         Err(unimplemented_rpc("pause_generation"))
     }
 
-    type WatchEngineStateStream = ResponseStream<proto::EngineStateSnapshot>;
-
     async fn watch_engine_state(
         &self,
         _request: Request<proto::WatchEngineStateRequest>,
-    ) -> Result<Response<Self::WatchEngineStateStream>, Status> {
+    ) -> Result<Response<ResponseStream<proto::EngineStateSnapshot>>, Status> {
         Err(unimplemented_rpc("watch_engine_state"))
     }
 
@@ -249,21 +238,17 @@ impl SglangService for GrpcService {
         Err(unimplemented_rpc("continue_generation"))
     }
 
-    type ChatCompleteStream = ResponseStream<proto::OpenAiStreamChunk>;
-
     async fn chat_complete(
         &self,
         _request: Request<proto::OpenAiRequest>,
-    ) -> Result<Response<Self::ChatCompleteStream>, Status> {
+    ) -> Result<Response<ResponseStream<proto::OpenAiStreamChunk>>, Status> {
         Err(unimplemented_rpc("chat_complete"))
     }
-
-    type CompleteStream = ResponseStream<proto::OpenAiStreamChunk>;
 
     async fn complete(
         &self,
         _request: Request<proto::OpenAiRequest>,
-    ) -> Result<Response<Self::CompleteStream>, Status> {
+    ) -> Result<Response<ResponseStream<proto::OpenAiStreamChunk>>, Status> {
         Err(unimplemented_rpc("complete"))
     }
 

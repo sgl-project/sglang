@@ -206,7 +206,7 @@ CUDA_VISIBLE_DEVICES=0,1 sglang generate \
   --config joy_echo_h200.json --prompt "A curious raccoon" \
   --width 640 --height 384 --num-frames 33 --num-inference-steps 8 --seed 42 \
   --num-gpus 2 --ulysses-degree 2 \
-  --performance-mode manual --enable-torch-compile=false --quality lossless \
+  --performance-mode manual --enable-torch-compile=false --quality exact \
   --component-residency=all=resident --warmup-mode request \
   --save-output --perf-dump-path joy_echo_h200.json.perf
 ```
