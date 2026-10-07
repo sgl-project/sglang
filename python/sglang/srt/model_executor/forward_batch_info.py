@@ -532,12 +532,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
-    # The write loc before `rebind_write_loc` replaced it with kernel-facing
+    # The write loc before `rebind_write_loc` replaced it with physical
     # ids; a backend re-derives from it into its capture-stable buffer.
     out_cache_loc_virtual: Optional[torch.Tensor] = None
     # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
     # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
+    # Whether `out_cache_loc` holds physical ids: set by
+    # KVIndexTranslator.rebind_write_loc; capture-time batches declare it.
+    out_cache_loc_is_physical: bool = False
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
@@ -553,6 +556,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
+    dllm_input_preparation_state: Optional[torch.Tensor] = None
     # For token embedding overrides (sparse replacement at specific positions)
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
@@ -931,6 +935,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         return_hidden_states_before_norm: bool,
+        extend_position_info=None,
+        spec_mrope_positions: Optional[torch.Tensor] = None,
     ):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
@@ -1154,12 +1160,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_seq_lens = extend_seq_lens
                 ret.extend_prefix_lens = extend_prefix_lens
             ret.extend_num_tokens = batch.extend_num_tokens
-            positions, ret.extend_start_loc = compute_position(
-                model_runner.prefill_attention_backend_str,
-                ret.extend_prefix_lens,
-                ret.extend_seq_lens,
-                ret.extend_num_tokens,
-            )
+            if extend_position_info is None:
+                positions, ret.extend_start_loc = compute_position(
+                    model_runner.prefill_attention_backend_str,
+                    ret.extend_prefix_lens,
+                    ret.extend_seq_lens,
+                    ret.extend_num_tokens,
+                )
+            else:
+                positions, ret.extend_start_loc, _ = extend_position_info
             if ret.positions is None:
                 ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
@@ -1168,7 +1177,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret._init_ngram_embedding_info(batch, device)
 
         if model_runner.model_config.model_is_mrope:
-            if (
+            if spec_mrope_positions is not None:
+                ret.mrope_positions = spec_mrope_positions
+            elif (
+                extend_position_info is not None and extend_position_info[2] is not None
+            ):
+                ret.mrope_positions = extend_position_info[2]
+            elif (
                 ret.spec_info is not None
                 and getattr(ret.spec_info, "positions", None) is not None
             ):
@@ -1186,7 +1201,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Init lora information
         if (
             model_runner.lora_manager is not None
-            and not model_runner.lora_manager.enable_dp_attention
+            and not model_runner.lora_manager.attn_dp_enabled
         ):
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
@@ -1195,13 +1210,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        if (
-            model_runner.attn_dcp_size > 1
-            and ret.out_cache_loc is not None
-            and is_hip()
-        ):
+        parallel = get_parallel()
+        if parallel.attn_dcp_size > 1 and ret.out_cache_loc is not None and is_hip():
             ret.dcp_kv_mask = (
-                ret.positions % model_runner.attn_dcp_size == model_runner.attn_dcp_rank
+                ret.positions % parallel.attn_dcp_size == parallel.attn_dcp_rank
             )
 
         return ret
@@ -1291,6 +1303,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         input is a gathered buffer whose real rows are not a prefix of it."""
         from sglang.srt.layers.layer_boundary import batch_gathers_over_moe_cp
         from sglang.srt.layers.moe.utils import is_moe_input_scattered_across_dp_ranks
+
+        if (
+            is_moe_input_scattered_across_dp_ranks()
+            and self.attn_cp_metadata is not None
+            and self.forward_mode.is_context_parallel_extend()
+        ):
+            from sglang.srt.layers.cp.base import get_cp_strategy
+
+            strategy = get_cp_strategy()
+            if strategy is not None:
+                return strategy.moe_num_token_non_padded(self)
 
         if self.num_token_non_padded is None:
             return None
@@ -1400,9 +1423,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_positions = seq_positions.view(batch_size, -1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):
-            mrope_delta_tensor = torch.zeros(
-                (batch_size, 1), dtype=torch.int64, device=device
+            self.mrope_positions = (
+                seq_positions.to(torch.int64).flatten().unsqueeze(0).repeat(3, 1)
             )
+            return
         else:
             mrope_deltas = [
                 (
