@@ -2230,6 +2230,36 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # Capable build: untouched, keeping the default or explicit setting.
         _run(capable=True).assert_not_called()
 
+    def test_sm120_deep_gemm_probe_requires_sm120_kernels(self):
+        """Builds that export the SM120 APIs without SM120 kernels are rejected."""
+        import sys
+        import types
+
+        from sglang.srt.layers.deep_gemm_wrapper import configurer
+
+        def _probe(with_sm120_kernel):
+            with tempfile.TemporaryDirectory() as root:
+                package_dir = os.path.join(root, "deep_gemm")
+                impls_dir = os.path.join(package_dir, "include", "deep_gemm", "impls")
+                os.makedirs(impls_dir)
+                if with_sm120_kernel:
+                    open(
+                        os.path.join(impls_dir, "sm120_fp8_fp4_gemm_1d1d.cuh"), "w"
+                    ).close()
+                fake = types.ModuleType("deep_gemm")
+                fake.__file__ = os.path.join(package_dir, "__init__.py")
+                for name in (
+                    "fp8_einsum",
+                    "m_grouped_fp8_fp4_gemm_nt_contiguous",
+                    "transform_sf_into_required_layout",
+                ):
+                    setattr(fake, name, lambda *args, **kwargs: None)
+                with patch.dict(sys.modules, {"deep_gemm": fake}):
+                    return configurer._sm120_deep_gemm_apis_available()
+
+        self.assertFalse(_probe(with_sm120_kernel=False))
+        self.assertTrue(_probe(with_sm120_kernel=True))
+
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
             _nemotron_h_overrides,

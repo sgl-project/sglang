@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import re
 import time
 from array import array
 from contextlib import contextmanager, nullcontext
@@ -117,6 +118,7 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     can_fuse_all_reduce,
 )
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -266,13 +268,34 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _FP8_WO_A_UE8M0 = _FP8_WO_A_GEMM and DEEPGEMM_SCALE_UE8M0
 
 
+def _fp8_config_skips_wo_a(quant_config: Fp8Config) -> bool:
+    """Whether ``ignored_layers`` leaves any target or MTP ``wo_a`` unquantized."""
+    ignored = quant_config.ignored_layers
+    if not ignored:
+        return False
+    layer_ids = {"0"}
+    for entry in ignored:
+        layer_ids.update(re.findall(r"(?:^|\.)layers\.(\d+)(?=\.|$)", entry))
+    prefixes = [f"model.layers.{i}.self_attn.wo_a" for i in sorted(layer_ids)]
+    prefixes.append("model.decoder.self_attn.wo_a")
+    return any(
+        is_layer_skipped(
+            prefix, ignored, fused_mapping=quant_config.packed_modules_mapping
+        )
+        for prefix in prefixes
+    )
+
+
 def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
     """The fp8 wo_a absorb GEMM (DeepGEMM fp8_einsum, aiter mxscale) takes 128x128
-    block scales only; any other layout dequantizes wo_a to bf16 at load."""
+    block scales only; any other layout dequantizes wo_a to bf16 at load. The
+    choice is model-wide, so a wo_a excluded from quantization keeps every
+    layer on the bf16 path."""
     return (
         _FP8_WO_A_GEMM
         and isinstance(quant_config, Fp8Config)
         and quant_config.weight_block_size == [128, 128]
+        and not _fp8_config_skips_wo_a(quant_config)
     )
 
 

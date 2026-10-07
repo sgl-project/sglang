@@ -1,4 +1,5 @@
 import logging
+import os
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
@@ -19,12 +20,28 @@ def _sm120_deep_gemm_apis_available() -> bool:
         import deep_gemm
     except (ImportError, OSError, RuntimeError):
         return False
-    return all(
+    if not all(
         callable(getattr(deep_gemm, name, None))
         for name in (
             "fp8_einsum",
             "m_grouped_fp8_fp4_gemm_nt_contiguous",
             "transform_sf_into_required_layout",
+        )
+    ):
+        return False
+    # Builds without SM120 kernels export the same APIs and only reject SM120
+    # at call time. The JIT compiles from the packaged headers, so require the
+    # SM120 FP8 GEMM kernel source those APIs dispatch to.
+    package_file = getattr(deep_gemm, "__file__", None)
+    if not package_file:
+        return False
+    return os.path.isfile(
+        os.path.join(
+            os.path.dirname(package_file),
+            "include",
+            "deep_gemm",
+            "impls",
+            "sm120_fp8_fp4_gemm_1d1d.cuh",
         )
     )
 
@@ -39,8 +56,8 @@ def _compute_enable_deep_gemm():
     if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
         return False
     # SM120/SM121 support (mma.sync block-scale, no TMEM) landed in DeepGEMM#324;
-    # probe every API used by the SM120 DSV4 paths since installed builds may
-    # expose fp8_einsum but still predate the SM120 kernels.
+    # probe every API used by the SM120 DSV4 paths and the SM120 kernel source,
+    # since installed builds may expose these APIs but predate the SM120 kernels.
     if sm_version in (120, 121) and not _sm120_deep_gemm_apis_available():
         return False
 
