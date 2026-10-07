@@ -9,7 +9,6 @@ ARG MANYLINUX_IMAGE=pytorch/manylinuxaarch64-builder:cuda13.4
 ARG DEEPGEMM_REF=v0.2.1.post1
 ARG SGL_DEEP_GEMM_VERSION=0.2.1.post1
 ARG DEEPEP_SOURCE_REF=sgl-deepep
-ARG DEEPEP_PACKAGING_REF=sgl-deepep-packaging
 ARG SGL_DEEP_EP_VERSION=0.1.2.post1
 
 ARG CUDA_VERSION=13.4.1
@@ -312,7 +311,6 @@ RUN --mount=type=cache,id=cu134-wheels-pip,target=/root/.cache/pip \
 FROM cu134_wheel_base AS cu134_wheel_deepep
 
 ARG DEEPEP_SOURCE_REF
-ARG DEEPEP_PACKAGING_REF
 ARG SGL_DEEP_EP_VERSION
 ARG GDRCOPY_VERSION=2.5.1
 ARG MAX_JOBS=8
@@ -336,31 +334,14 @@ RUN --mount=type=cache,id=cu134-wheels-pip,target=/root/.cache/pip \
     ${PYTHON_ROOT_PATH}/bin/pip install "auditwheel>=6.0" build ninja packaging setuptools wheel
 
 RUN git clone --recursive --depth 1 --branch "${DEEPEP_SOURCE_REF}" \
-        https://${GITHUB_ARTIFACTORY}/sgl-project/DeepEP.git /deepep-source \
- && git clone --depth 1 --branch "${DEEPEP_PACKAGING_REF}" \
-        https://${GITHUB_ARTIFACTORY}/sgl-project/DeepEP.git /deepep-packaging
-
-RUN set -eux; \
-    printf '%s' "${SGL_DEEP_EP_VERSION}" > /deepep-packaging/sgl_deep_ep/VERSION; \
-    ${PYTHON_ROOT_PATH}/bin/python - <<'PY'
-import pathlib
-p = pathlib.Path("/deepep-packaging/sgl_deep_ep/build_sgl_deep_ep.sh")
-s = p.read_text()
-if "13.4|13.4.*" not in s:
-    old = '    *)\n        echo "Unsupported CUDA version: ${CUDA_VERSION}; expected 12.9 or 13.0"'
-    new = ('    13.4|13.4.*)\n        CUDA_MAJOR=13\n        CUDA_TAG=cu134\n        ;;\n'
-           '    *)\n        echo "Unsupported CUDA version: ${CUDA_VERSION}; expected 12.9, 13.0 or 13.4"')
-    assert old in s, "DeepEP packaging CUDA case changed shape; update this patch"
-    p.write_text(s.replace(old, new))
-    print("patched build_sgl_deep_ep.sh for CUDA 13.4")
-PY
+        https://${GITHUB_ARTIFACTORY}/sgl-project/DeepEP.git /deepep-source
 
 RUN --mount=type=cache,id=cu134-wheels-pip,target=/root/.cache/pip \
     set -eux; \
     arch="$(uname -m)"; \
     raw_dir="$(mktemp -d)"; \
-    MAX_JOBS="${MAX_JOBS}" bash /deepep-packaging/sgl_deep_ep/build_sgl_deep_ep.sh \
-        /deepep-source /deepep-packaging/sgl_deep_ep "${raw_dir}" 13.4 "${arch}"; \
+    SGL_DEEP_EP_VERSION="${SGL_DEEP_EP_VERSION}" MAX_JOBS="${MAX_JOBS}" \
+        bash /deepep-source/sgl_deep_ep/build_sgl_deep_ep.sh "${raw_dir}" 13.4 "${arch}"; \
     mkdir -p /wheels; \
     auditwheel repair \
         --plat "manylinux_2_28_${arch}" \
@@ -441,13 +422,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     ; \
     fi
 
-# Copy the dependency spec, Rust extension sources, and shared protocol crate.
+# Copy the dependency spec, Rust extension sources, and shared API types.
 # Split from the pip install so changes to these build inputs invalidate the
 # dependency layer, while unrelated Python source changes do not.
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
 COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
 COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
-COPY proto                 /tmp/sglang_deps/proto
+COPY rust/sglang-api-types /tmp/sglang_deps/rust/sglang-api-types
 
 # Install sglang dependencies (torch, transformers, etc.).
 # Generate constraints.txt to prevent reinstalling these deps in later stages.
