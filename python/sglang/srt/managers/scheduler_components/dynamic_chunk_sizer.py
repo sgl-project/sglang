@@ -169,9 +169,7 @@ class DynamicChunkSizer:
             # Walk the same match -> lock -> alloc lifecycle as a scheduled
             # request so release_kv_cache can release it symmetrically.
             req.init_next_round_input(self.tree_cache)
-            req.lock_receipt = self.tree_cache.inc_lock_ref(
-                req.last_node
-            ).to_dec_params()
+            req.lock = self.tree_cache.lock(req.last_node)
             req.set_extend_range(
                 len(req.prefix_indices), len(req.full_untruncated_fill_ids)
             )
@@ -259,7 +257,7 @@ class DynamicChunkSizer:
 
             # Release KV and Mamba cache
             if req.kv.holds_kv:
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+                release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         logger.info(
             f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
