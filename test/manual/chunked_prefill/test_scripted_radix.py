@@ -358,7 +358,7 @@ class TestRadixHitCountInvariant(ScriptedTestCase):
                 for node_id, base_count in baseline.items():
                     if node_id in cur:
                         assert cur[node_id] == base_count, (
-                            f"_inc_hit_count(chunked=True) inflated existing "
+                            f"re-inserting an earlier chunk inflated existing "
                             f"node id={node_id} hit_count: baseline={base_count}, "
                             f"now={cur[node_id]}"
                         )

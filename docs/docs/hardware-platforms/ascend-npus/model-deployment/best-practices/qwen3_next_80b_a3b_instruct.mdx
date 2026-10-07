@@ -228,8 +228,7 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 4 \
     --speculative-draft-model-quantization unquant \
     --speculative-draft-model-path $DRAFT_MODEL_PATH \
-    --dp-size 2 \
-    --enable-dp-attention \
+    --attn-dp-size 2 \
     --enable-dp-lm-head \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
@@ -337,8 +336,7 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 28672 \
     --context-length 81920 \
     --max-total-tokens 122304 \
-    --dp-size 2 \
-    --enable-dp-attention \
+    --attn-dp-size 2 \
     --enable-dp-lm-head \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
