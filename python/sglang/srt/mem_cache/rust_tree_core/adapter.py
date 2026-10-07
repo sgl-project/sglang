@@ -59,7 +59,11 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.mem_cache.utils import get_eviction_strategy
-from sglang.srt.runtime_context import get_exec, mamba_cache_chunk_size
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_schedule,
+    mamba_cache_chunk_size,
+)
 from sglang.srt.utils import assert_int64_array
 
 if TYPE_CHECKING:
@@ -125,9 +129,9 @@ def _cache_action_from_tagged(action: tuple) -> CacheAction:
         return FreeDeviceKVFullOnly(indices=list(action[1]))
     if tag == "backup_kv":
         return BackupKV(node_ids=list(action[1]))
-    if tag == "mamba_evict_excess_path_states":
+    if tag == "evict_excess_path_states":
         return EvictExcessPathStates(
-            tail_node_id=action[1], component_type=ComponentType.MAMBA
+            tail_node_id=action[1], component_type=ComponentType(action[2])
         )
     if tag == "replace_write_through_on_node_split":
         return ReplaceWriteThroughOnNodeSplit(
@@ -394,6 +398,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         mamba_max_states_per_path = (
             get_exec().mamba.mamba_max_states_per_path if has_mamba else -1
         )
+        swa_max_states_per_path = (
+            get_schedule().swa_max_states_per_path
+            if ComponentType.SWA in self.tree_components
+            else -1
+        )
 
         self._binding = self._binding_class()(
             self._bindings.TreeCoreInitParamsBinding(
@@ -418,6 +427,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                     mamba_max_states_per_path
                     if mamba_max_states_per_path >= 0
                     else None
+                ),
+                swa_max_states_per_path=(
+                    swa_max_states_per_path if swa_max_states_per_path >= 0 else None
                 ),
             ),
             [int(component) for component in self.tree_components],
@@ -758,10 +770,13 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,
+        component_type: ComponentType,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
-        binding_result = self._binding.evict_excess_path_states(tail_node_id)
+        binding_result = self._binding.evict_excess_path_states(
+            tail_node_id, int(component_type)
+        )
         for component, tensors in binding_result.new_device_frees.items():
             device_frees[ComponentType(component)].extend(tensors)
         for component, tensors in binding_result.new_host_frees.items():

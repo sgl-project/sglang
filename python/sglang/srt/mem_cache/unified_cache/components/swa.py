@@ -1512,11 +1512,10 @@ class SWAComponent(TreeComponent):
         if isinstance(action, EvictExcessPathStates):
             device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
             host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
+            # The walk runs behind the tree-core interface (Rust runs it natively).
             try:
-                self._evict_excess_path_states(
-                    self.tree_core.node_by_id(action.tail_node_id),
-                    device_frees,
-                    host_frees,
+                self.tree_core.evict_excess_path_states(
+                    action.tail_node_id, self.component_type, device_frees, host_frees
                 )
             finally:
                 self.cache._free_values(device_frees, host_frees)

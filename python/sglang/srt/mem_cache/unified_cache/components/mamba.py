@@ -900,7 +900,7 @@ class MambaComponent(TreeComponent):
             # the walk runs behind the tree-core interface (Rust runs it natively).
             try:
                 self.tree_core.evict_excess_path_states(
-                    action.tail_node_id, device_frees, host_frees
+                    action.tail_node_id, self.component_type, device_frees, host_frees
                 )
             finally:
                 self.cache._free_values(device_frees, host_frees)
