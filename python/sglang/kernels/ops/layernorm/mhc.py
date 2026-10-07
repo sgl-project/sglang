@@ -1178,14 +1178,17 @@ def mhc_pre(
     else:
         if num_tokens <= 2048:
             assert n_splits == 1
-            if hc_hidden_size == 16384:
-                hidden_block = 256
-            elif hc_hidden_size == 28672:
-                hidden_block = 128
+            split_size = hc_hidden_size // n_splits_pre
+            for hidden_block in (256, 128):
+                if (
+                    hc_hidden_size % hidden_block == 0
+                    and split_size % hidden_block == 0
+                ):
+                    break
             else:
                 raise NotImplementedError(
-                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
-                    f"got {hc_hidden_size}"
+                    f"mhc_pre splitk kernel needs a hidden_block in {{256, 128}} that divides "
+                    f"hc_hidden_size // split_k = {split_size}, got hc_hidden_size={hc_hidden_size}"
                 )
             kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
                 hc_mult3,
