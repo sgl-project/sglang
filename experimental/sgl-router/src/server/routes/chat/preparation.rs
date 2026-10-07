@@ -407,7 +407,7 @@ fn lower_openai(
     let tokenizer = ctx.tokenizers.openai();
     if path == COMPLETIONS_PATH {
         return lower_completion(body, &headers, &settings, tokenizer)
-            .map(|(body, responder)| (body, Responder::Completion(responder)))
+            .map(|(body, responder)| (body, Responder::Completion(Box::new(responder))))
             .map_err(|unsupported| unsupported.0);
     }
     // Only renderers verified against SGLang render every chat.
@@ -426,7 +426,7 @@ fn lower_openai(
     let render = |request: &Value| ctx.tokenizers.encode_chat(&model.0, request);
     let chat_model = ctx.tokenizers.chat_model();
     lower_chat(body, &headers, &settings, chat_model, render, tokenizer)
-        .map(|(body, responder)| (body, Responder::Chat(responder)))
+        .map(|(body, responder)| (body, Responder::Chat(Box::new(responder))))
         .map_err(|unsupported| unsupported.0)
 }
 

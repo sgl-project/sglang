@@ -12,3 +12,88 @@ pub(crate) fn think_config(reasoning_parser: &str) -> Option<ThinkConfig> {
         _ => None,
     }
 }
+
+/// The detector a `--tool-call-parser` name selects, over the request's tool names.
+pub(crate) fn tool_detector(
+    tool_parser: &str,
+    tool_names: Vec<String>,
+) -> Option<Box<dyn ToolDetector>> {
+    let detector = match tool_parser {
+        "deepseekv4" => deepseek_v4::DsmlDetector::new(deepseek_v4::DSML_TAGS, tool_names),
+        _ => return None,
+    };
+    Some(Box::new(detector))
+}
+
+/// One parsed call: `ToolCallItem`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ToolCallItem {
+    pub tool_index: i64,
+    pub name: String,
+    pub parameters: String,
+}
+
+/// `(normal_text, calls)`: `StreamingParseResult`.
+pub(crate) type Parsed = (String, Vec<ToolCallItem>);
+
+/// SGLang's `BaseFormatDetector`, as `FunctionCallParser` drives it.
+pub(crate) trait ToolDetector: Send + Sync {
+    fn has_tool_call(&self, text: &str) -> bool;
+    /// `FunctionCallParser.parse_non_stream`.
+    fn parse_non_stream(&self, text: &str) -> Parsed;
+    /// `parse_stream_chunk`, plus `parse_stream_end` when `flush`.
+    fn parse_stream(&mut self, text: &str, flush: bool) -> Parsed;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    /// `tests/fixtures/tool_parity/*.json`, from `tests/scripts/generate_tool_parity.py`.
+    #[test]
+    fn tool_fixtures_match_sglang() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tool_parity");
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let fixture: Value =
+                serde_json::from_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap())
+                    .unwrap();
+            let parser = fixture["parser"].as_str().unwrap();
+            let names: Vec<String> = fixture["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned())
+                .collect();
+            let detector = || tool_detector(parser, names.clone()).unwrap();
+            let calls = |calls: Vec<ToolCallItem>| -> Value {
+                calls
+                    .into_iter()
+                    .map(|c| json!([c.tool_index, c.name, c.parameters]))
+                    .collect()
+            };
+            for case in fixture["cases"].as_array().unwrap() {
+                let chunks: Vec<&str> = case["chunks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c.as_str().unwrap())
+                    .collect();
+                let mut streaming = detector();
+                let steps: Vec<Value> = chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, chunk)| {
+                        let (normal, found) = streaming.parse_stream(chunk, i + 1 == chunks.len());
+                        json!([normal, calls(found)])
+                    })
+                    .collect();
+                let (normal, found) = detector().parse_non_stream(&chunks.concat());
+                let got = json!({"steps": steps, "unary": [normal, calls(found)]});
+                let want = json!({"steps": case["steps"], "unary": case["unary"]});
+                assert_eq!(got, want, "{parser} {:?}", chunks);
+            }
+        }
+    }
+}

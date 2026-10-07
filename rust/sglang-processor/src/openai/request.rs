@@ -3,8 +3,8 @@
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use super::wire::{py_strip, python_json};
 use super::{OpenAiHeaders, OpenAiSettings, Unsupported};
+use crate::parser::py::{py_strip, python_json};
 
 pub(super) fn default_model() -> String {
     "default".into()
@@ -84,7 +84,7 @@ pub(super) fn format_json_schema(
                 .as_ref()
                 .and_then(|json_schema| json_schema.schema.clone())
                 .ok_or(Unsupported("invalid_request"))?;
-            Some(python_json(&Value::Object(schema)))
+            Some(python_json(&Value::Object(schema), true))
         }
         FormatKind::JsonObject => Some(r#"{"type": "object"}"#.into()),
         FormatKind::Text => None,
