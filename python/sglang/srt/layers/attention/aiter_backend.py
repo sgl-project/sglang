@@ -392,6 +392,9 @@ class AiterAttnBackend(AttentionBackend):
         self.kv_index_translator = model_runner.kv_index_translator
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        # Captured at init. The process-wide flag is flipped for the K3 MLA
+        # draft only; the target keeps the value it saw when it was built.
+        self.use_mla_ps_kernel = False
 
         self.dcp_world_size = get_parallel().attn_dcp_size
         self.mla_decode_backend = envs.SGLANG_AITER_MLA_DECODE_BACKEND.get().lower()
@@ -695,6 +698,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.max_split_per_batch = -1
 
             self.fix_max_split_per_batch = self.max_split_per_batch
+            self.use_mla_ps_kernel = bool(_use_mla_ps_kernel)
 
     def pad_heads(self, x: torch.Tensor, padded: int) -> torch.Tensor:
         num_head = x.shape[1]
@@ -752,7 +756,7 @@ class AiterAttnBackend(AttentionBackend):
         Matches main's ``_use_mla_ps_kernel and dcp_world_size <= 1`` when ASM
         is off. DCP ASM needs the same buffers with fast_mode scheduling.
         """
-        return (_use_mla_ps_kernel and self.dcp_world_size <= 1) or (
+        return (self.use_mla_ps_kernel and self.dcp_world_size <= 1) or (
             self.use_mla_dcp_asm and self.dcp_world_size > 1
         )
 
@@ -1427,7 +1431,7 @@ class AiterAttnBackend(AttentionBackend):
     def _asm_cprr_supports_verify_shape(self, q_len: Optional[int]) -> bool:
         """Whether this topology has an asm cp kernel for DCP target verify."""
         return (
-            _use_mla_ps_kernel
+            self.use_mla_ps_kernel
             and self.mla_verify_backend == "asm"
             and self.dcp_world_size > 1
             and self.kv_cache_dtype == fp8_dtype
@@ -1451,7 +1455,7 @@ class AiterAttnBackend(AttentionBackend):
         """
         num_head = layer.tp_q_head_num
         if (
-            _use_mla_ps_kernel
+            self.use_mla_ps_kernel
             and self.dcp_world_size <= 1
             and self._asm_ps_supports_qlen(kwargs.get("max_seqlen_q") or 1)
         ):
@@ -1564,7 +1568,7 @@ class AiterAttnBackend(AttentionBackend):
             num_head=getattr(self, "num_head", layer.tp_q_head_num),
             kv_cache_dtype=self.kv_cache_dtype,
         ) and not (
-            _use_mla_ps_kernel
+            self.use_mla_ps_kernel
             and self.mla_decode_backend == "asm"
             and self._asm_ps_supports_qlen(max_q_len)
         ):
@@ -2219,7 +2223,7 @@ class AiterAttnBackend(AttentionBackend):
                     TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
                 )
 
-                if _use_mla_ps_kernel:
+                if self.use_mla_ps_kernel:
                     max_seqlen_qo = num_draft_tokens
                     (
                         work_metadata,
@@ -2350,7 +2354,7 @@ class AiterAttnBackend(AttentionBackend):
                     ) = self._build_dcp_verify_ragged_indices(
                         verify_token_table, local_kv_lens, bs, draft_num
                     )
-                if _use_mla_ps_kernel and (
+                if self.use_mla_ps_kernel and (
                     self.dcp_world_size <= 1 or use_asm_cprr_verify
                 ):
                     max_seqlen_qo = draft_num
@@ -2840,7 +2844,7 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         # if self.use_mla and (_use_mla_ps_kernel or self.kv_cache_dtype == fp8_dtype):
-        if self.use_mla and (_use_mla_ps_kernel or self.use_mla_dcp_asm):
+        if self.use_mla and (self.use_mla_ps_kernel or self.use_mla_dcp_asm):
             # for persistent mla_decode_fwd
             max_seqlen_qo = (
                 1 if self.num_draft_tokens is None else self.num_draft_tokens
@@ -3206,7 +3210,7 @@ class AiterAttnBackend(AttentionBackend):
 
             if self.use_mla:
                 max_q_len = self.num_draft_tokens
-                if _use_mla_ps_kernel and (
+                if self.use_mla_ps_kernel and (
                     self.dcp_world_size <= 1 or use_asm_cprr_verify
                 ):
                     num_kv_splits = self.max_split_per_batch
@@ -3357,7 +3361,7 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
             max_q_len = num_tokens_per_req
 
-            if self.use_mla and _use_mla_ps_kernel:
+            if self.use_mla and self.use_mla_ps_kernel:
                 num_kv_splits = self.max_split_per_batch
 
                 self.make_mla_meta_data(
@@ -3986,7 +3990,7 @@ class AiterAttnBackend(AttentionBackend):
                     num_head=getattr(self, "num_head", layer.tp_q_head_num),
                     kv_cache_dtype=self.kv_cache_dtype,
                 ) and not (
-                    _use_mla_ps_kernel
+                    self.use_mla_ps_kernel
                     and self.mla_verify_backend == "asm"
                     and self._asm_ps_supports_qlen(self.forward_metadata.max_q_len or 1)
                 ):
