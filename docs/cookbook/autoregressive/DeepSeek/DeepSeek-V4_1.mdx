@@ -1,6 +1,6 @@
 ---
 title: DeepSeek-V4.1
-description: "Deploy DeepSeek-V4.1 Flash with SGLang — launch recipes, feature compatibility, and tuning notes for GB300, H200, B200, B300 and MI350X."
+description: "Deploy DeepSeek-V4.1 Flash with SGLang — launch recipes, feature compatibility, and tuning notes for GB300, H200, B200, B300 and MI355X."
 tag: NEW
 ---
 
@@ -39,10 +39,10 @@ docker run --gpus all \
     sglang serve <use args below>
 ```
 
-**AMD GPUs (ROCm)** — ROCm support for this model is likewise a preview build, `lmsysorg/sglang:dev-dsv41-mi35x`; the command panel picks it automatically for the MI350X cell.
+**AMD GPUs (ROCm)** — AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 7.2 version.
 
 ```bash Command
-docker pull lmsysorg/sglang:dev-dsv41-mi35x
+docker pull lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261006
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -52,7 +52,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang:dev-dsv41-mi35x \
+    lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261006 \
     sglang serve <use args below>
 ```
 
@@ -90,7 +90,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **Sparse retrieval.** KV source layers and index source layers are different lists — four of the former, eight of the latter. The four extra index layers produce no keys at all; they re-score layer 20's keys with their own query, so retrieval decisions are made twice as often as keys are stored. Each retrieving layer picks a top-512 candidate set.
 
-**Engram.** An additive n-gram hash memory at two layers. Token ids are normalized *before* hashing, so `" The"`, `"the"` and `"THE"` cannot fork into separate rows. Its two fp8 tables are the largest single block of weight in the checkpoint, and by default they load row-sharded across the TP group, which costs an all-reduce per engram layer. `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1` (**opt-in**) moves them to one shared host copy instead: both all-reduces disappear, the freed HBM goes to the KV pool, and output is bitwise unchanged — at the cost of host RAM, a longer load, and needing huge-page backing to keep the gather cheap.
+**Engram.** An additive n-gram hash memory at two layers. Token ids are normalized *before* hashing, so `" The"`, `"the"` and `"THE"` cannot fork into separate rows. Its two fp8 tables are the largest single block of weight in the checkpoint, and by default they load row-sharded across the TP group, which costs an all-reduce per engram layer. `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1` (**opt-in**) moves them to host memory instead: the freed HBM goes to the KV pool and output is bitwise unchanged — at the cost of host RAM, a longer load, and needing huge-page backing to keep the gather cheap. `SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT` trades the two all-reduces for page size: `shared` (the default) maps a single copy all ranks read and needs no reduce; `per_rank` splits that same table into one shard per rank and keeps the reduce, but is the only one the kernel reliably backs with 2 MiB pages.
 
 **SWA bounded replay.** Because the window store is per-layer and cheap to rebuild, it need not all be recomputed. `--enable-decoder-swa-bounded-replay` (**opt-in**) runs the early layers over the whole extend and the late layers over only each request's last 128 tokens, sharing late-layer KV from source layer 20. Prefill gets materially faster. It is validated on the decode path only, refuses prompt logprobs by design, is not numerically equivalent to full prefill, and is excluded at launch with the prefill CUDA graph and with DP attention.
 
@@ -104,7 +104,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ### Do not override the backends
 
-`--attention-backend`, `--moe-runner-backend` and `--fp8-gemm-backend` are selected automatically from the model, hardware, forward mode and shape. On GB300 they resolve to `dsv4` / `flashinfer_mxfp4` / `flashinfer_cutedsl`. Confirm them in the startup log rather than passing them.
+`--attention-backend`, `--moe-runner-backend` and `--fp8-gemm-backend` are selected automatically from the model, hardware, forward mode and shape. On GB300 they resolve to `dsv4` / `flashinfer_mxfp4` / `flashinfer_cutedsl`. Confirm them in the startup log rather than passing them. On gfx950 the MI355X recipes pin `--fp8-gemm-backend aiter` and leave the other two to resolve.
 
 Overriding them is the most common cause of a disappointing measurement: it leaves the 32-wide ue8m0 blocks on the Triton `_w8a8_block_fp8_matmul` fallback, which dominates the decode step and costs most of the model's bs=1 throughput. If your decode rate looks like a small fraction of what you expected, check the resolved backends first.
 
@@ -201,6 +201,59 @@ To enable HiCache, open the **HiCache** card in the [Playground above](#playgrou
 
 The Write policy knob controls the GPU → CPU write and defaults to `write_through` (the upstream default): every page is mirrored to the CPU tier as it is written. `write_through_selective` backs up only hot data and `write_back` defers the copy to eviction, trading cache freshness for host-side I/O.
 
-The card is not offered on MI350X: hierarchical cache has not been validated on ROCm for this model yet.
+The card is not offered on MI355X: hierarchical cache has not been validated on ROCm for this model yet.
 
 Only the L2 tier is exposed here. For the storage (L3) tier and the canonical flag set, see the [HiCache best-practices recipe](../../../docs/advanced_features/hicache_best_practices) and the [HiCache documentation](../../../docs/advanced_features/hicache).
+
+### 3.6 Agentic Long-Context on MI355X (FP4, DSpark)
+
+Agentic replay is a different workload: long-context prompts, multi-turn sessions that reuse their own prefix across turns, and subagent branches that fan out within one session. Concurrency below counts live sessions, not requests. Both topologies keep the engram tables on the host, and neither adds a HiCache tier. The sessions fit the device pool.
+
+TP2 sweeps concurrency 1 to 64 and raises `--mem-fraction-static` as it climbs; TP4 sweeps 1 to 16 and holds 0.70, with a quarter of the checkpoint per rank leaving room to spare.
+
+The braced values in the command follow concurrency:
+
+| Concurrency | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| `--max-running-requests` | 2 | 4 | 8 | 16 | 32 | 64 | 128 |
+| `--cuda-graph-max-bs-decode` | 64 | 64 | 64 | 64 | 64 | 64 | 128 |
+| `--swa-prefix-tails` | 128 | 128 | 256 | 512 | 1024 | 2048 | 4096 |
+| `--chunked-prefill-size` | 16384 | 16384 | 16384 | 16384 | 16384 | 16384 | 4096 |
+| `--prefill-decode-interval` | 16 | 16 | 16 | 16 | 16 | 4 | 4 |
+| `--mem-fraction-static`, TP2 | 0.70 | 0.70 | 0.70 | 0.70 | 0.80 | 0.80 | 0.85 |
+| `--mem-fraction-static`, TP4 | 0.70 | 0.70 | 0.70 | 0.70 | 0.70 | — | — |
+
+```bash Command
+SGLANG_DEFAULT_THINKING=1 \
+SGLANG_DSV41_REASONING_EFFORT=high \
+SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
+SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank \
+SGLANG_USE_AITER=1 \
+SGLANG_USE_ROCM700A=0 \
+TORCH_BLAS_PREFER_HIPBLASLT=1 \
+AITER_BF16_FP8_MOE_BOUND=0 \
+TRITON_HIP_USE_ASYNC_COPY=0 \
+ROCM_QUICK_REDUCE_QUANTIZATION=NONE \
+HSA_NO_SCRATCH_RECLAIM=0 \
+GPU_MAX_HW_QUEUES=2 \
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-V4.1-Flash \
+  --trust-remote-code \
+  --tp {2 or 4} \
+  --ep-size 1 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 5 \
+  --enforce-shared-experts-fusion \
+  --fp8-gemm-backend aiter \
+  --enable-decoder-swa-bounded-replay \
+  --cuda-graph-backend-prefill disabled \
+  --mem-fraction-static {mem-fraction-static} \
+  --chunked-prefill-size {chunked-prefill-size} \
+  --prefill-decode-interval {prefill-decode-interval} \
+  --swa-prefix-tails {swa-prefix-tails} \
+  --max-running-requests {max-running-requests} \
+  --cuda-graph-max-bs-decode {cuda-graph-max-bs-decode} \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
+  --watchdog-timeout 3600
+```

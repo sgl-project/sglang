@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
-    quality_allows_kernel_fusions,
+    quality_allows,
 )
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_world_size,
@@ -374,9 +374,11 @@ class DecodingStage(PipelineStage):
             assert vae is not None
             self.vae = vae
 
+            # The decoder fast paths re-associate the reference operators
+            # without lowering any precision, so they belong to "lossless".
             with use_vae_fast_path(
                 vae,
-                quality_allows_kernel_fusions(batch.sampling_params.quality),
+                quality_allows(batch.sampling_params.quality, "lossless"),
             ):
                 try:
                     if stream is None:

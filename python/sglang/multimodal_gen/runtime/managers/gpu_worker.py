@@ -102,6 +102,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.utils.numerics_policy import apply_numerics_policy
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
@@ -384,6 +385,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not current_platform.is_mps():
             current_platform.set_device(current_platform.get_device(self.local_rank))
         self._cap_device_memory_for_tests()
+        apply_numerics_policy(
+            allow_cudnn_tf32=self.server_args.allow_cudnn_tf32,
+            allow_bf16_reduced_precision_reduction=(
+                self.server_args.allow_bf16_reduced_precision_reduction
+            ),
+        )
         # num_gpus is the total world size across every node; the co-located,
         # CPU-contending worker count on THIS host is num_gpus // nnodes.
         local_num_gpus = self.server_args.num_gpus // self.server_args.nnodes
@@ -1435,6 +1442,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             output=result.output,
             audio=getattr(result, "audio", None),
             audio_sample_rate=getattr(result, "audio_sample_rate", None),
+            fps=getattr(result, "fps", None),
             metrics=result.metrics,
             usage=getattr(result, "usage", None),
             trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
@@ -1450,6 +1458,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> OutputBatch:
         """Merge per-output batches produced by grouped execution."""
         merged = OutputBatch()
+        merged.fps = output_batches[0].fps
         parts = _ExpandedOutputParts()
 
         for output_batch in output_batches:
