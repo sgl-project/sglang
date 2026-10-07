@@ -52,7 +52,7 @@ def _req():
 class TestMambaPoolExhaustion(CustomTestCase):
     def test_unfinished_checkpoint_skipped_when_pool_exhausted(self):
         comp, allocator = _component(slot=None)
-        params = InsertParams(prev_prefix_len=0, chunked=True, priority=0)
+        params = InsertParams(prev_prefix_len=0, priority=0)
         cache_len = comp.prepare_for_caching_req(
             req=_req(), insert_params=params, token_ids_len=4096, is_finished=False
         )
@@ -63,7 +63,7 @@ class TestMambaPoolExhaustion(CustomTestCase):
 
     def test_unfinished_checkpoint_donated_when_replacement_slot_available(self):
         comp, allocator = _component(slot=torch.tensor([7]))
-        params = InsertParams(prev_prefix_len=0, chunked=True, priority=0)
+        params = InsertParams(prev_prefix_len=0, priority=0)
         cache_len = comp.prepare_for_caching_req(
             req=_req(), insert_params=params, token_ids_len=4096, is_finished=False
         )
