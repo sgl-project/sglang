@@ -38,11 +38,11 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
     get_attn_tp_context,
     is_dense_ffn_fully_dp,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -50,7 +50,6 @@ from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLine
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    reduce_moe_output,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -80,9 +79,8 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
-    is_non_idle_and_non_empty,
     is_npu,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -339,7 +337,6 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states += shared_output
-        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states
 
     def forward_normal(
@@ -365,7 +362,6 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 final_hidden_states_out = torch.empty_like(final_hidden_states)
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
             final_hidden_states = final_hidden_states_out
-        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states
 
     def forward_deepep(
@@ -411,101 +407,6 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         else:
             return None
 
-    def op_gate(self, state):
-        if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
-        ):
-            # router_logits: (num_tokens, n_experts)
-            state.router_logits = self.gate(state.hidden_states_mlp_input)
-        else:
-            state.router_logits = None
-
-    def op_shared_experts(self, state):
-        hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
-        if (self.num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, hidden_states_mlp_input
-        ):
-            state.shared_output = self.shared_experts(hidden_states_mlp_input)
-        else:
-            state.shared_output = None
-
-    def op_select_experts(self, state):
-        router_logits = state.pop("router_logits")
-        hidden_states = state.hidden_states_mlp_input
-
-        if router_logits is not None:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
-                state.topk_output = self.topk(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
-                )
-        else:
-            state.topk_output = self.topk.empty_topk_output(hidden_states.device)
-
-    def op_dispatch_a(self, state):
-        if self.ep_size > 1:
-            self.experts.dispatcher.dispatch_a(
-                hidden_states=state.hidden_states_mlp_input,
-                topk_output=state.pop("topk_output"),
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-
-    def op_dispatch_b(self, state):
-        if self.ep_size > 1:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
-                state.dispatch_output = self.experts.dispatcher.dispatch_b(
-                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
-                )
-
-    def op_experts(self, state):
-        state.combine_input = self.experts.run_moe_core(
-            dispatch_output=state.dispatch_output,
-        )
-
-    def op_combine_a(self, state):
-        if self.ep_size > 1:
-            self.experts.dispatcher.combine_a(
-                combine_input=state.pop("combine_input"),
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-            state.pop("dispatch_output")
-
-    def op_combine_b(self, state):
-        if self.ep_size > 1:
-            state.hidden_states_after_combine = self.experts.dispatcher.combine_b(
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-
-    def op_output(self, state):
-        final_hidden_states = state.pop("hidden_states_after_combine")
-
-        if get_moe_a2a_backend().is_mori():
-            num_tokens = state.pop("num_tokens")
-            final_hidden_states = final_hidden_states[:num_tokens]
-
-        if (shared_output := state.pop("shared_output")) is not None:
-            x = shared_output
-            if _use_aiter:
-                x.add_(final_hidden_states)
-            else:
-                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-            final_hidden_states = x
-        elif _use_aiter:
-            # fused in aiter_biased_grouped_topk so we can skip here
-            pass
-        else:
-            final_hidden_states *= self.routed_scaling_factor
-
-        state.hidden_states_mlp_output = final_hidden_states
-
 
 class Glm4MoeLiteDecoderLayer(nn.Module):
     def __init__(
@@ -547,7 +448,6 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
-        is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
         if self.is_layer_sparse:
@@ -572,6 +472,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
+                reduce_results=False,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -581,7 +482,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(),
                 self.input_layernorm,
@@ -594,12 +495,6 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == (1 if is_nextn else config.num_hidden_layers) - 1,
         )
 
     def _detect_gfx95_quant_format(self) -> str:
@@ -654,65 +549,10 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlp(hidden_states, forward_batch)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
-
-    def op_comm_prepare_attn(
-        self,
-        state,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
-        tbo_subbatch_index: Optional[int] = None,
-    ):
-        state.hidden_states_after_comm_pre_attn = self.attn_boundary.prepare(
-            hidden_states, forward_batch
-        )
-        if get_moe_a2a_backend().is_mori():
-            state.num_tokens = hidden_states.shape[0]
-        state.update(
-            dict(
-                forward_batch=forward_batch,
-                positions=positions,
-                zero_allocator=zero_allocator,
-                tbo_subbatch_index=tbo_subbatch_index,
-            )
-        )
-
-    def op_comm_prepare_mlp(self, state):
-        hidden_states = self.attn_boundary.finish(
-            state.pop("hidden_states_after_attn"), state.forward_batch
-        )
-        state.hidden_states_mlp_input = self.ffn_boundary.prepare(
-            hidden_states, state.forward_batch
-        )
-
-    def op_comm_postprocess_layer(self, state):
-        hidden_states = self.ffn_boundary.finish_complete_output(
-            state.pop("hidden_states_mlp_output"), state.forward_batch
-        )
-
-        output = dict(
-            positions=state.positions,
-            hidden_states=hidden_states,
-            forward_batch=state.forward_batch,
-            zero_allocator=state.zero_allocator,
-            tbo_subbatch_index=state.tbo_subbatch_index,
-        )
-
-        state.clear(
-            expect_keys={
-                "positions",
-                "forward_batch",
-                "zero_allocator",
-                "tbo_subbatch_index",
-            }
-        )
-        return output
 
 
 class Glm4MoeLiteModel(nn.Module):
@@ -740,7 +580,7 @@ class Glm4MoeLiteModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         self.alt_stream = get_stream("alt") if _is_cuda else None
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Glm4MoeLiteDecoderLayer(
                 config=config,
@@ -749,8 +589,6 @@ class Glm4MoeLiteModel(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -850,7 +688,6 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         super().__init__()
         config.moe_layer_freq = 1
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
         self.determine_num_fused_shared_experts()

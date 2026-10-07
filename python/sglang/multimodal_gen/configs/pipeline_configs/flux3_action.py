@@ -267,6 +267,18 @@ class Flux3ActionPipelineConfig(PipelineConfig):
     text_output_layers: tuple[int, ...] = (4, 8, 12, 16, 20, 24, 28, 32)
     # Text contexts cached per caption, bounded by their total token count.
     caption_cache_max_tokens: int = 1 << 16
+    # CUDA graphs of the observation encoding and of each denoising step.
+    enable_cuda_graph: bool = True
+    # Per stage; one entry per (prompt length bucket, CFG) combination.
+    cuda_graph_max_entries: int = 4
+
+    def cuda_graph_enabled(self, server_args: Any, component: str) -> bool:
+        """Graphs need resident weights and no cross-rank collectives."""
+        return (
+            self.enable_cuda_graph
+            and server_args.num_gpus == 1
+            and not server_args.should_start_component_on_cpu(component)
+        )
 
     def validate_server_args(self, server_args: Any) -> None:
         super().validate_server_args(server_args)
