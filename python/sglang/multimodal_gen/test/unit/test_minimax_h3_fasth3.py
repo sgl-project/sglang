@@ -25,6 +25,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+    minimax_h3_time_shift_sigmas,
+)
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
@@ -53,10 +56,17 @@ def test_registry_resolves_fasth3_configs() -> None:
 
 def test_fasth3_sampling_defaults_and_task_rejection() -> None:
     params = FastH3SamplingParams(prompt="p")
-    assert params.num_inference_steps == 5
+    assert params.num_inference_steps == 4
     assert params.guidance_scale == 1.0
+    sigmas = minimax_h3_time_shift_sigmas(
+        num_steps=params.num_inference_steps, shift_scale=12.0
+    )
+    assert len(sigmas) == 5
+    torch.testing.assert_close(
+        torch.tensor(sigmas), torch.tensor([1.0, 36.0 / 37.0, 12.0 / 13.0, 0.8, 0.0])
+    )
 
-    with pytest.raises(ValueError, match="exactly five sigma grid points"):
+    with pytest.raises(ValueError, match="exactly four inference steps"):
         FastH3SamplingParams(prompt="p", num_inference_steps=50)
 
     with pytest.raises(ValueError, match="distilled for t2va only"):

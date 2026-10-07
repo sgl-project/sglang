@@ -842,7 +842,7 @@ Keep `pdd_config.json` beside `pdd_fused_heads.safetensors`, outside the
 a separate output directory, and `--model-variant ref2va`.
 
 Use the requests in [Generate video and audio](#4-generate-video-and-audio)
-with `num_inference_steps: 9`, `flow_shift: 12.0`, and `audio_flow_shift: 3.0`.
+with `num_inference_steps: 8`, `flow_shift: 12.0`, and `audio_flow_shift: 3.0`.
 The nine sigma grid points give eight denoiser evaluations. These settings
 must match the fused heads; the server rejects a different step count or
 shift. Use `quality: "lossless"` in requests.
@@ -873,7 +873,7 @@ sglang serve \
 Requests use the same asynchronous video endpoint as the base model, with
 `task: "t2va"`, `conditions: []`, and a target such as
 `{"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0}`. The
-request default is `num_inference_steps: 5`: five points on the standard
+request default is `num_inference_steps: 4`: five points on the standard
 shift-12/shift-3 sigma grid, i.e. the four distilled DiT evaluations. Any
 other step count is rejected.
 
@@ -955,7 +955,7 @@ Requests use the same video endpoint as the base model with `task: "t2va"`
 and `conditions: []`, or `task: "fl2va"` with the
 [keyframe conditions](#4-generate-video-and-audio), and a target such as
 `{"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 14.375}` (the
-345-frame paper workload). The default `num_inference_steps: 9` is the only
+345-frame paper workload). The default `num_inference_steps: 8` is the only
 accepted value: nine sigma grid points, eight DiT forwards. Each keyframe adds
 about 2,000 dense rows, so an `fl2va` forward costs a little more than `t2va`.
 
@@ -1344,7 +1344,7 @@ sglang serve \
   entry per denoise step, each in `(0, 1]`. A ratio of `1.0` keeps a step
   on H3's native dense attention path; smaller values select the FlexAttention
   sparse path and drop more blocks. The example above matches a request with
-  `num_inference_steps: 8`, whose endpoint-inclusive sigma schedule has seven
+  `num_inference_steps: 7`, whose endpoint-inclusive sigma schedule has seven
   denoise updates.
 
 Cube labeling is coordinate-driven. FL2VA keyframes share the target video's
@@ -1612,7 +1612,8 @@ python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
 
 The same 4× B300 host served [FastH3](#6-fasth3-4-step-distilled-preview)
 with the VSA-H3 recipe above (1344×768 at 24 fps with audio, `task: "t2va"`,
-`num_inference_steps: 5`, seed 1000, eager BF16, Ulysses4, `VSA_sparsity` 0.9).
+five sigma grid points (four DiT forwards), seed 1000, eager BF16, Ulysses4,
+`VSA_sparsity` 0.9).
 E2E is the client wall clock of a `/v1/videos` request including decode,
 muxing, and file output, median of three requests after one warm request;
 the stage columns are the server timings of the same request. H3 aligns the
@@ -1637,7 +1638,7 @@ peak memory.
 An 8× B200 (SM100, 183 GB) host served [VDN-H3](#7-vdn-h3-hybrid-attention-8-step-distill)
 on the paper workload: 1344×768 at 24 fps with audio for 14.375 s (345 frames,
 102 latent frames, about 104k packed rows), `task: "t2va"`,
-`num_inference_steps: 9` (8 DiT forwards), seed 1000, `hybrid_window_attn_h3`,
+nine sigma grid points (8 DiT forwards), seed 1000, `hybrid_window_attn_h3`,
 eager, and the warmup run at the served clip shape
 (`--warmup-num-frames 345 --warmup-resolutions 1344x768`), so every forward
 of the served request is steady state; without those flags the first forward

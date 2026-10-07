@@ -451,6 +451,21 @@ def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
             stage.forward(batch, server_args)
 
         batch.num_inference_steps = 9
+        with pytest.raises(ValueError, match="9 AdaLN plans.*slab holds 8"):
+            stage.forward(batch, server_args)
+
+        batch.num_inference_steps = 8
+        assert stage.forward(batch, server_args) is batch
+
+        batch.num_inference_steps = 1
+        assert stage.forward(batch, server_args) is batch
+
+        batch.num_inference_steps = 0
+        with pytest.raises(ValueError, match="num_inference_steps >= 1"):
+            stage.forward(batch, server_args)
+
+        server_args.minimax_h3_adaln_online = False
+        batch.num_inference_steps = 50
         assert stage.forward(batch, server_args) is batch
 
 
