@@ -52,6 +52,14 @@ NUM_SLOTS = NUM_PAGES * PAGE_SIZE
 TOPK = 2051
 SM_SCALE = D_LATENT**-0.5
 WORKSPACE_BYTES = 128 * 1024 * 1024
+# Unit-variance queries and KV give logits with unit standard deviation, so the
+# softmax is far from uniform and a wrong scale changes the output by tens of
+# percent, well beyond the kernel's FP8 rounding.
+KV_CLAMP = 4.0
+MAX_REL_ERROR = 0.04
+# Rows with a few candidates mix large KV values and are the most sensitive.
+MAX_ROW_REL_ERROR = 0.1
+MIN_WRONG_REL_ERROR = 0.15
 
 
 def _quantize_rows(kv: torch.Tensor, row_bytes: int) -> torch.Tensor:
@@ -87,11 +95,10 @@ def _dequantize_rows(rows: torch.Tensor) -> torch.Tensor:
 def _make_cache(row_bytes: int, seed: int):
     generator = torch.Generator(device="cuda").manual_seed(seed)
     kv = (
-        torch.randn(NUM_SLOTS, D_LATENT, device="cuda", generator=generator).to(
-            torch.bfloat16
-        )
-        / 10
-    ).clamp(-1, 1)
+        torch.randn(NUM_SLOTS, D_LATENT, device="cuda", generator=generator)
+        .clamp(-KV_CLAMP, KV_CLAMP)
+        .to(torch.bfloat16)
+    )
     rows = _quantize_rows(kv, row_bytes)
     reference = _dequantize_rows(rows)
     # Slot 0 is poisoned: masked candidates must not read it.
@@ -119,10 +126,32 @@ def _make_indices(tokens: int, seed: int) -> torch.Tensor:
     return indices
 
 
-def _reference(q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor):
+def _make_q(tokens: int, heads: int, seed: int) -> torch.Tensor:
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    return torch.randn(tokens, heads, D_LATENT, device="cuda", generator=generator).to(
+        torch.bfloat16
+    )
+
+
+def _lengths(indices: torch.Tensor) -> torch.Tensor:
+    """One past the last valid column of each row (0 for an empty row)."""
+    columns = torch.arange(1, indices.shape[-1] + 1, device=indices.device)
+    return torch.where(indices >= 0, columns, 0).amax(dim=-1)
+
+
+def _reference(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float = SM_SCALE,
+    lengths: torch.Tensor | None = None,
+):
     valid = indices >= 0
+    if lengths is not None:
+        columns = torch.arange(indices.shape[-1], device=indices.device)
+        valid &= columns[None, :] < lengths[:, None]
     gathered = kv[indices.clamp(min=0).long()]
-    logits = torch.einsum("thd,tkd->thk", q.float(), gathered) * SM_SCALE
+    logits = torch.einsum("thd,tkd->thk", q.float(), gathered) * sm_scale
     logits = logits.masked_fill(~valid[:, None, :], float("-inf"))
     weights = torch.softmax(logits, dim=-1).nan_to_num(0.0)
     return torch.einsum("thk,tkd->thd", weights, gathered)
@@ -161,21 +190,31 @@ def _forward(q, cache, indices, runner, lse, workspace):
     )
 
 
+def _rel_error(out: torch.Tensor, expected: torch.Tensor) -> float:
+    return ((out.float() - expected).norm() / expected.norm()).item()
+
+
 def _assert_matches(out, q, kv, indices):
     assert not out.isnan().any()
     expected = _reference(q, kv, indices)
-    torch.testing.assert_close(out.float(), expected, atol=5e-2, rtol=5e-2)
+    error = _rel_error(out, expected)
+    assert error < MAX_REL_ERROR, error
     empty = (indices < 0).all(dim=-1)
     assert torch.all(out[empty] == 0)
+    rows = (out[~empty].float() - expected[~empty]).norm(dim=-1)
+    rows /= expected[~empty].norm(dim=-1)
+    assert rows.max().item() < MAX_ROW_REL_ERROR, rows.max().item()
+    # The comparison must be able to tell a wrong softmax scale apart.
+    for factor in (0.0, 0.5, 2.0):
+        wrong = _rel_error(out, _reference(q, kv, indices, SM_SCALE * factor))
+        assert wrong > max(MIN_WRONG_REL_ERROR, 5 * error), (factor, wrong)
 
 
 @pytest.mark.parametrize("row_bytes", [528, 656])
 @pytest.mark.parametrize("tokens,heads", [(4, 8), (4, 64), (80, 8), (80, 64)])
 def test_native_glm_nope_matches_reference(row_bytes, tokens, heads):
     cache, kv = _make_cache(row_bytes, seed=0)
-    q = (
-        torch.randn(tokens, heads, D_LATENT, device="cuda").to(torch.bfloat16) / 10
-    ).clamp(-1, 1)
+    q = _make_q(tokens, heads, seed=1)
     indices = _make_indices(tokens, seed=1)
     runner, lse = _make_runner(heads, max_tokens=256)
     workspace = torch.zeros(WORKSPACE_BYTES, dtype=torch.uint8, device="cuda")
@@ -189,10 +228,11 @@ def test_native_glm_nope_matches_reference(row_bytes, tokens, heads):
 def test_graph_replay_uses_updated_candidates(heads):
     tokens = 4
     cache, kv = _make_cache(528, seed=2)
-    q = (
-        torch.randn(tokens, heads, D_LATENT, device="cuda").to(torch.bfloat16) / 10
-    ).clamp(-1, 1)
+    q = _make_q(tokens, heads, seed=3)
     indices = _make_indices(tokens, seed=3)
+    # Captured with a short row 0, a tail-only row 1 and an empty row 3.
+    indices[0, 50:] = -1
+    captured_lengths = _lengths(indices)
     runner, lse = _make_runner(heads, max_tokens=256)
     workspace = torch.zeros(WORKSPACE_BYTES, dtype=torch.uint8, device="cuda")
 
@@ -205,16 +245,23 @@ def test_graph_replay_uses_updated_candidates(heads):
     with torch.cuda.graph(graph):
         out = _forward(q, cache, indices, runner, lse, workspace)
 
-    # Change candidates and their valid lengths, then replay.
+    # Extend the short and empty rows, fill row 1's holes, leave only the
+    # tail in row 2, then replay. Lengths frozen at capture would drop the new
+    # candidates of rows 0 and 3.
     updated = _make_indices(tokens, seed=4)
-    updated[0, 50:] = -1
+    updated[0, 300:] = torch.arange(1, TOPK - 299, device="cuda")
+    updated[1, :2048] = torch.arange(1, 2049, device="cuda")
     updated[2, :2048] = -1
+    updated[3] = torch.arange(1, TOPK + 1, device="cuda")
+    assert torch.all(_lengths(updated)[[0, 3]] > captured_lengths[[0, 3]])
     indices.copy_(updated)
-    q.mul_(0.5)
+    q.copy_(_make_q(tokens, heads, seed=5))
     graph.replay()
     torch.cuda.synchronize()
 
     _assert_matches(out, q, kv, updated)
+    stale = _reference(q, kv, updated, lengths=captured_lengths)
+    assert _rel_error(out, stale) > MIN_WRONG_REL_ERROR
 
 
 def test_variable_eager_lengths_do_not_retain_lse():
