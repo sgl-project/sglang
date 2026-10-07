@@ -59,12 +59,10 @@ export const agentx = {
  ],
  "checkpoints": [
   {
-   "id": "deepseek-ai/DeepSeek-V4-Pro",
-   "precision": "fp4"
+   "id": "deepseek-ai/DeepSeek-V4-Pro"
   },
   {
-   "id": "deepseek-ai/DeepSeek-V4-Pro-0813",
-   "precision": "fp8"
+   "id": "deepseek-ai/DeepSeek-V4-Pro-0813"
   }
  ],
  "envs": [

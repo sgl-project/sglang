@@ -63,8 +63,7 @@ export const agentx = {
  ],
  "checkpoints": [
   {
-   "id": "deepseek-ai/DeepSeek-V4.1-Flash",
-   "precision": "fp4"
+   "id": "deepseek-ai/DeepSeek-V4.1-Flash"
   }
  ],
  "envs": [
@@ -217,7 +216,7 @@ export const agentx = {
       {
        "kind": "nats",
        "count_nodes": 1,
-       "cmd": "nats-server -c nats.conf",
+       "cmd": "nats-server -js -sd /tmp/nats",
        "env": {},
        "args": []
       },
@@ -677,7 +676,7 @@ export const agentx = {
       {
        "kind": "nats",
        "count_nodes": 1,
-       "cmd": "nats-server -c nats.conf",
+       "cmd": "nats-server -js -sd /tmp/nats",
        "env": {},
        "args": []
       },
@@ -1105,7 +1104,7 @@ export const agentx = {
       {
        "kind": "nats",
        "count_nodes": 1,
-       "cmd": "nats-server -c nats.conf",
+       "cmd": "nats-server -js -sd /tmp/nats",
        "env": {},
        "args": []
       },
@@ -1388,7 +1387,7 @@ export const agentx = {
       {
        "kind": "nats",
        "count_nodes": 1,
-       "cmd": "nats-server -c nats.conf",
+       "cmd": "nats-server -js -sd /tmp/nats",
        "env": {},
        "args": []
       },
@@ -1539,7 +1538,7 @@ export const agentx = {
       {
        "kind": "nats",
        "count_nodes": 1,
-       "cmd": "nats-server -c nats.conf",
+       "cmd": "nats-server -js -sd /tmp/nats",
        "env": {},
        "args": []
       },

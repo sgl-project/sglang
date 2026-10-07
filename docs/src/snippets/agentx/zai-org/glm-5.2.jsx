@@ -59,12 +59,10 @@ export const agentx = {
  ],
  "checkpoints": [
   {
-   "id": "nvidia/GLM-5.2-NVFP4",
-   "precision": "fp4"
+   "id": "nvidia/GLM-5.2-NVFP4"
   },
   {
-   "id": "zai-org/GLM-5.2-FP8",
-   "precision": "fp8"
+   "id": "zai-org/GLM-5.2-FP8"
   }
  ],
  "envs": [

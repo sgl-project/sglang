@@ -176,7 +176,9 @@ export const AgentX = ({ data }) => {
       return parts.join(" ") || `Run on the ${b.role} node.`;
     }
     if (b.kind === "etcd") return "Start once, before everything else, on $ETCD_IP.";
-    if (b.kind === "nats") return "Start once on $NATS_IP, with nats.conf (below) in the working directory.";
+    if (b.kind === "nats") return (b.cmd || "").includes("nats.conf")
+      ? "Start once on $NATS_IP, with nats.conf (below) in the working directory."
+      : "Start once on $NATS_IP (JetStream on, storing its state in /tmp/nats).";
     if (b.kind === "mooncake-master") return "Start once on $MOONCAKE_MASTER_IP before the workers.";
     if (b.kind === "mooncake-store") {
       const ports = b.ports || [];
@@ -393,11 +395,28 @@ export const AgentX = ({ data }) => {
   const tabText = (t) => (t.block ? t.text : t.file ? t.file.content : exportText);
   const KV_LABEL = { none: "No KV offload", hicache: "HiCache (host DRAM)", mooncake: "Mooncake store (external linker)" };
 
+  // Clipboard API first; it only exists on HTTPS / localhost, so fall back to a hidden textarea +
+  // execCommand("copy") (plain-HTTP previews, older browsers). Report what actually happened.
   const copy = (text, id) => {
-    navigator.clipboard.writeText(text);
-    setCopied(id);
-    setTimeout(() => setCopied(null), 1500);
+    const show = (state) => { setCopied(state); setTimeout(() => setCopied(null), 1500); };
+    const fallback = () => {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.top = "-1000px";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      show(ok ? id : `failed:${id}`);
+    };
+    if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(() => show(id), fallback);
+    else fallback();
   };
+  const copyLabel = (id, label) => (copied === id ? "Copied" : copied === `failed:${id}` ? "Copy failed" : label);
 
   // ==== 5. Styles ====
   const accent = isDark ? "#E85D4D" : "#D45D44";
@@ -450,10 +469,6 @@ export const AgentX = ({ data }) => {
     derived: "Derived — not run in SemiAnalysis InferenceX AgentX",
   }[status];
   const routerLabel = { sglang: "SGLang", dynamo: "Dynamo + SGLang" };
-  const ckptLabel = (k) => {
-    const c = data.checkpoints.find((x) => x.id === k);
-    return c ? `${k} (${c.precision.toUpperCase()})` : k;
-  };
   const concLabel = (p) => `c${p.concs.join(" / c")}`;
   const link = (href, text) => (href ? <a style={S.a} href={href} target="_blank" rel="noopener noreferrer">{text}</a> : null);
 
@@ -472,7 +487,7 @@ export const AgentX = ({ data }) => {
         <span style={S.title} className="sg-agentx-row sg-agentx-row-ckpt">Checkpoint</span>
         <div style={S.chips}>
           {ckptsFor(hw).map((k) => (
-            <button key={k} style={S.chip(ckpt === k)} onClick={() => pickCkpt(k)}>{ckptLabel(k)}</button>
+            <button key={k} style={S.chip(ckpt === k)} onClick={() => pickCkpt(k)}>{k}</button>
           ))}
         </div>
       </div>
@@ -582,11 +597,11 @@ export const AgentX = ({ data }) => {
             {data.hardware.find((h) => h.id === hw).label} · {cell.label} · {concLabel(point)} · {KV_LABEL[kv]} · {routerLabel[router]}
           </span>
           <div style={S.winActions}>
-            <button style={S.winButton} onClick={() => copy(single ? blockText[0] : tabText(tabs.find((t) => t.id === activeTab)), "tab")}>{copied === "tab" ? "Copied" : "⧉ Copy"}</button>
-            <button style={S.winButton} onClick={() => copy(copyAllText, "all")}>{copied === "all" ? "Copied" : "⧉ Copy all"}</button>
+            <button style={S.winButton} onClick={() => copy(single ? blockText[0] : tabText(tabs.find((t) => t.id === activeTab)), "tab")}>{copyLabel("tab", "⧉ Copy")}</button>
+            <button style={S.winButton} onClick={() => copy(copyAllText, "all")}>{copyLabel("all", "⧉ Copy all")}</button>
             <button style={S.winButton} className="sg-agentx-link" title="Copy a link that opens this page with this selection"
               onClick={() => { setLinked(true); copy(`${window.location.origin}${window.location.pathname}?${query}`, "link"); }}>
-              {copied === "link" ? "Copied" : "🔗 Copy link"}
+              {copyLabel("link", "🔗 Copy link")}
             </button>
           </div>
         </div>
@@ -605,7 +620,7 @@ export const AgentX = ({ data }) => {
             <>
               <div style={first ? S.secHeadFirst : S.secHead}>
                 <span>{label}</span>
-                <button style={S.miniButton} onClick={() => copy(text, id)}>{copied === id ? "Copied" : "⧉ Copy"}</button>
+                <button style={S.miniButton} onClick={() => copy(text, id)}>{copyLabel(id, "⧉ Copy")}</button>
               </div>
               <pre style={S.pre} className={className}>{text}</pre>
             </>
