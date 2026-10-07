@@ -39,8 +39,8 @@ from typing import (
 from openai.types.responses import (
     ResponseFunctionToolCall,
     ResponseInputItemParam,
-    ResponseOutputItem,
 )
+from openai.types.responses import ResponseOutputItem as OpenAIResponseOutputItem
 from openai.types.responses import ResponseOutputMessage as OpenAIResponseOutputMessage
 from openai.types.responses import (
     ResponseOutputText,
@@ -1832,6 +1832,11 @@ class ShellCallOutput(BaseModel):
     max_output_length: Optional[int] = Field(default=None, gt=0)
 
 
+ResponseOutputItem: TypeAlias = Union[
+    ShellCall, ResponseOutputMessage, OpenAIResponseOutputItem
+]
+
+
 ResponseInputOutputItem: TypeAlias = Union[
     ShellCall,
     ShellCallOutput,
@@ -2154,15 +2159,7 @@ class ResponsesResponse(BaseModel):
     created_at: int = Field(default_factory=lambda: int(time.time()))
     model: str
 
-    output: List[
-        Union[
-            ShellCall,
-            ResponseOutputMessage,
-            ResponseOutputItem,
-            ResponseReasoningItem,
-            ResponseFunctionToolCall,
-        ]
-    ] = Field(default_factory=list)
+    output: List[ResponseOutputItem] = Field(default_factory=list)
     status: Literal[
         "queued", "in_progress", "completed", "incomplete", "failed", "cancelled"
     ]
@@ -2220,27 +2217,14 @@ class ResponsesResponse(BaseModel):
         sampling_params: Any,
         model_name: str,
         created_time: int,
-        output: List[
-            Union[
-                ResponseOutputMessage,
-                ResponseOutputItem,
-                ResponseReasoningItem,
-                ResponseFunctionToolCall,
-            ]
-        ],
+        output: List[ResponseOutputItem],
         status: str,
         usage: Optional[UsageInfo],
     ) -> ResponsesResponse:
         """Create a response from a request."""
 
         # Determine if the output is plain text only to set text.format
-        def _is_text_only(
-            items: List[
-                Union[
-                    ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall
-                ]
-            ],
-        ) -> bool:
+        def _is_text_only(items: List[ResponseOutputItem]) -> bool:
             if not items:
                 return False
             for it in items:
