@@ -60,7 +60,7 @@ CUDA_VISIBLE_DEVICES=0,1 sglang generate \
   --cfg-parallel-size 2 \
   --tp-size 1 \
   --ulysses-degree 1 \
-  --quality lossless \
+  --quality exact \
   --enable-torch-compile false \
   --warmup-mode request \
   --width 640 --height 640 --num-frames 4 \

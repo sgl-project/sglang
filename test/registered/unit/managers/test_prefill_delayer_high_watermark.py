@@ -1,10 +1,15 @@
+import time
 import unittest
 from unittest.mock import MagicMock
 
+import torch
+
 from sglang.srt.managers.prefill_delayer import (
+    PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
     _NegotiateOutput,
+    _State,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -137,6 +142,45 @@ class TestPrefillDelayerHighWatermark(CustomTestCase):
             tracker.observe_attempt(0)
 
         self.assertEqual(tracker.max_prefill_bs, 0)
+
+
+class TestPrefillDelayerClockSkew(CustomTestCase):
+    def test_queue_timeout_follows_gathered_flag(self):
+        delayer = PrefillDelayer.__new__(PrefillDelayer)
+        delayer.__dict__.update(
+            _max_delay_passes=100,
+            _token_usage_low_watermark=None,
+            _queue_min_ratio=0.5,
+            _max_delay_ms=500,
+            _queue_trigger_enabled=True,
+            _prefill_max_requests=4,
+            attn_dp_enabled=False,
+            num_dp_ranks=1,
+            skip_first_delayer=False,
+        )
+        for local_expired in (False, True):
+            for gathered_expired in (False, True):
+                with self.subTest(
+                    local_expired=local_expired, gathered_expired=gathered_expired
+                ):
+                    delayer._gather_info = MagicMock(
+                        return_value=torch.tensor(
+                            [[1, 0, 8, 4, 1, int(gathered_expired)]]
+                        )
+                    )
+                    start_time = float("-inf") if local_expired else time.perf_counter()
+                    out = delayer._negotiate_should_allow_prefill_pure(
+                        prev_state=_State(delayed_count=1, start_time=start_time),
+                        local_prefillable=True,
+                        token_usage=0.8,
+                        running_batch=8,
+                        max_prefill_bs=4,
+                        max_running_requests=128,
+                        waiting_queue_len=1,
+                    )
+                    self.assertEqual(out.output_allow, gathered_expired)
+                    kwargs = delayer._gather_info.call_args.kwargs
+                    self.assertEqual(kwargs["queue_timeout_expired"], local_expired)
 
 
 if __name__ == "__main__":
