@@ -92,6 +92,9 @@
 //                      defaults to both, in that order
 //   showPlaygroundLink optional — false hides the "Open the Playground" footer
 //                      for cookbooks that only expose the deployment matrix
+// Component props besides `config` / `benchmarks`:
+//   agenticLink        optional — heading id of the page's agentic long-context
+//                      section; adds a footer link to it under the Playground link
 //   github             optional — "Submit verified cell" issue-template overrides
 //   playgroundFeatures optional — consumed by _playground.jsx (see its header)
 //
@@ -102,7 +105,7 @@
 //     HTML tags only; factor into helper functions, not sub-components.
 //   - Import plain-data config from the MDX file, pass through as a prop.
 
-export const Deployment = ({ config, benchmarks }) => {
+export const Deployment = ({ config, benchmarks, agenticLink }) => {
   if (!config) {
     return <div style={{padding: 12, color: "#b91c1c"}}>Deployment: missing <code>config</code> prop</div>;
   }
@@ -2517,6 +2520,44 @@ export const Deployment = ({ config, benchmarks }) => {
             }}
           >
             Open the Playground →
+          </button>
+        </div>
+      )}
+
+      {/* Agentic long-context link (opt-in per page) — same scroll-only pattern. */}
+      {agenticLink && (
+        <div
+          style={{
+            padding: "0 12px 6px",
+            fontSize: "12px",
+            color: isDark ? "#9ca3af" : "#6b7280",
+            display: "flex",
+            flexWrap: "wrap",
+            alignItems: "center",
+            gap: "2px 6px",
+          }}
+        >
+          <span>Need to serve Agentic Long-Context workloads?</span>
+          <button
+            type="button"
+            onClick={() => {
+              const el = document.getElementById(agenticLink);
+              if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+            }}
+            style={{
+              background: "transparent",
+              border: "none",
+              padding: 0,
+              color: isDark ? "#FDBA74" : "#C2410C",
+              cursor: "pointer",
+              fontSize: "12px",
+              fontWeight: 600,
+              textDecoration: "underline",
+              textUnderlineOffset: "2px",
+              whiteSpace: "nowrap",
+            }}
+          >
+            Refer to the Agentic Long-Context section →
           </button>
         </div>
       )}
