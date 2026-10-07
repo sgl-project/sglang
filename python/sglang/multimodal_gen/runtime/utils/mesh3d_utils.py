@@ -146,15 +146,129 @@ def export_to_trimesh(mesh_output: Any) -> Any:
 REMESH_TARGET_FACES = 40000
 
 
-def mesh_simplify(mesh: Any, target_faces: int = REMESH_TARGET_FACES) -> Any:
-    """Quadric-decimate mesh to at most target_faces faces (Hunyuan3D-2.1 remesh)."""
-    from fast_simplification import simplify
+def _qem_vertex_quadrics(v: np.ndarray, f: np.ndarray) -> np.ndarray:
+    """Sum of the plane quadrics of the faces around each vertex, (V, 4, 4)."""
+    p0 = v[f[:, 0]]
+    n = np.cross(v[f[:, 1]] - p0, v[f[:, 2]] - p0)
+    n /= np.maximum(np.linalg.norm(n, axis=1), 1e-20)[:, None]
+    plane = np.concatenate([n, -(n * p0).sum(1, keepdims=True)], axis=1)
+    face_q = (plane[:, :, None] * plane[:, None, :]).reshape(len(f), 16)
+    idx = f.T.ravel()
+    q = np.stack(
+        [
+            np.bincount(idx, weights=np.tile(face_q[:, c], 3), minlength=len(v))
+            for c in range(16)
+        ],
+        axis=1,
+    )
+    return q.reshape(-1, 4, 4)
 
+
+def _qem_collapse_targets(
+    q: np.ndarray, va: np.ndarray, vb: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Optimal position and quadric error for collapsing each edge (va, vb)."""
+    mid = (va + vb) / 2
+    x = mid.copy()
+    a = q[:, :3, :3]
+    solvable = np.abs(np.linalg.det(a)) > 1e-12
+    if solvable.any():
+        x[solvable] = np.linalg.solve(a[solvable], -q[solvable, :3, 3:])[:, :, 0]
+        # an optimum far from the edge is unstable; use the midpoint instead
+        far = np.linalg.norm(x - mid, axis=1) > 2 * np.linalg.norm(vb - va, axis=1)
+        x[far] = mid[far]
+    xh = np.concatenate([x, np.ones((len(x), 1))], axis=1)
+    return x, np.maximum(np.einsum("ni,nij,nj->n", xh, q, xh), 0)
+
+
+def _qem_decimate(
+    vertices: np.ndarray, faces: np.ndarray, target_faces: int, max_rounds: int = 100
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Quadric-error edge-collapse decimation, vectorized in numpy.
+
+    Each round collapses a set of edges at once: an edge is taken if it is the
+    cheapest edge of both its endpoints, so no two collapses share a vertex. The
+    cheapest such edges are taken up to the remaining face budget, skipping any
+    collapse that would flip a triangle. Boundary edges and vertices are kept.
+    """
+    v = np.asarray(vertices, dtype=np.float64).copy()
+    f = np.asarray(faces, dtype=np.int64).copy()
+    for _ in range(max_rounds):
+        if len(f) <= target_faces:
+            break
+        nv = len(v)
+        e = np.sort(np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1)
+        key, count = np.unique(e[:, 0] * nv + e[:, 1], return_counts=True)
+        e = np.stack([key // nv, key % nv], axis=1)
+        on_boundary = np.zeros(nv, dtype=bool)
+        on_boundary[e[count == 1].ravel()] = True
+        e = e[(count == 2) & ~on_boundary[e[:, 0]] & ~on_boundary[e[:, 1]]]
+        q = _qem_vertex_quadrics(v, f)
+        x, cost = _qem_collapse_targets(q[e[:, 0]] + q[e[:, 1]], v[e[:, 0]], v[e[:, 1]])
+        normals = np.cross(v[f[:, 1]] - v[f[:, 0]], v[f[:, 2]] - v[f[:, 0]])
+        budget = max(1, (len(f) - target_faces) // 2)  # a collapse removes ~2 faces
+
+        def collapse(idx):
+            new_v, remap = v.copy(), np.arange(nv)
+            new_v[e[idx, 0]] = x[idx]
+            remap[e[idx, 1]] = e[idx, 0]
+            new_f = remap[f]
+            live = (
+                (new_f[:, 0] != new_f[:, 1])
+                & (new_f[:, 1] != new_f[:, 2])
+                & (new_f[:, 0] != new_f[:, 2])
+            )
+            new_normals = np.cross(
+                new_v[new_f[:, 1]] - new_v[new_f[:, 0]],
+                new_v[new_f[:, 2]] - new_v[new_f[:, 0]],
+            )
+            flipped = live & ((normals * new_normals).sum(1) <= 0)
+            owner = np.full(nv, -1)
+            owner[e[idx, 0]] = owner[e[idx, 1]] = np.arange(len(idx))
+            bad = np.unique(owner[f[flipped]].ravel())
+            return new_v, new_f[live], bad[bad >= 0]
+
+        blocked = np.zeros(len(e), dtype=bool)
+        idx, bad = np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+        for _ in range(8):
+            c = np.where(blocked, np.inf, cost)
+            best = np.full(nv, np.inf)
+            np.minimum.at(best, e[:, 0], c)
+            np.minimum.at(best, e[:, 1], c)
+            idx = np.flatnonzero(
+                np.isfinite(c) & (c == best[e[:, 0]]) & (c == best[e[:, 1]])
+            )
+            idx = idx[np.argsort(cost[idx])[:budget]]
+            if len(idx) == 0:
+                break
+            new_v, new_f, bad = collapse(idx)
+            if len(bad) == 0:
+                break
+            blocked[idx[bad]] = True
+        for _ in range(8):
+            if len(idx) == 0 or len(bad) == 0:
+                break
+            idx = np.delete(idx, bad)
+            if len(idx):
+                new_v, new_f, bad = collapse(idx)
+        if len(idx) == 0 or len(bad):
+            break
+        # collapses can leave two faces on the same vertices; keep one
+        _, first = np.unique(np.sort(new_f, axis=1), axis=0, return_index=True)
+        v, f = new_v, new_f[np.sort(first)]
+    used = np.unique(f)
+    remap = np.full(len(v), -1)
+    remap[used] = np.arange(len(used))
+    return v[used], remap[f]
+
+
+def mesh_simplify(mesh: Any, target_faces: int = REMESH_TARGET_FACES) -> Any:
+    """Decimate mesh to at most target_faces faces (Hunyuan3D-2.1 remesh)."""
     if isinstance(mesh, trimesh.Scene):
         mesh = mesh.dump(concatenate=True)
     if len(mesh.faces) <= target_faces:
         return mesh
-    vertices, faces = simplify(mesh.vertices, mesh.faces, target_count=target_faces)
+    vertices, faces = _qem_decimate(mesh.vertices, mesh.faces, target_faces)
     return trimesh.Trimesh(vertices=vertices, faces=faces)
 
 
