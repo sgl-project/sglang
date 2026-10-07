@@ -1903,6 +1903,9 @@ class Envs:
         "/tmp/sglang_weight_cache_{device_uuid}.ready"
     )
 
+    # Feature-owned ROCm controls.
+    SGLANG_ROCM_K3_FLYDSL_SOURCE = EnvStr("auto")
+
 
 envs = Envs()
 EnvField._allow_set_name = False

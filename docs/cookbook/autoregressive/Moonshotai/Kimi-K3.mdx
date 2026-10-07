@@ -215,14 +215,14 @@ Outside the two verified B300 1×8 `Unified` cells, no cell has a serving round 
 
 <a id="amd-env" />
 
-**AMD ROCm/AITER environment (MI350X / MI355X).** The MI35x cell emits `SGLANG_USE_AITER=1 SGLANG_AITER_K3_OPT=1 AITER_FLYDSL_FORCE=1 AITER_SITUV2_A8W4=1` — the first three turn on the AITER ROCm path, its K3-specific fused kernels, and the FlyDSL MoE kernels; the rest of this table is what you can change on top. Everything here is gfx950/ROCm-only and inert elsewhere. These knobs first ship in the `20260903` daily ROCm image pinned above — on an older image they are simply unread — and the two SiTU rows also need an AITER revision at or past [ROCm/aiter#4534](https://github.com/ROCm/aiter/pull/4534) (FlyDSL 0.3.0).
+**AMD ROCm/AITER environment (MI350X / MI355X).** The MI35x cell emits `SGLANG_USE_AITER=1 SGLANG_ROCM_K3_AITER_OPT=1 AITER_FLYDSL_FORCE=1 AITER_SITUV2_A8W4=1` — the first three turn on the AITER ROCm path, its K3-specific fused kernels, and the FlyDSL MoE kernels; the rest of this table is what you can change on top. Everything here is gfx950/ROCm-only and inert elsewhere. These knobs first ship in the `20260903` daily ROCm image pinned above — on an older image they are simply unread — and the two SiTU rows also need an AITER revision at or past [ROCm/aiter#4534](https://github.com/ROCm/aiter/pull/4534) (FlyDSL 0.3.0).
 
 | Env var | Default | Effect |
 |---|---|---|
 | `AITER_SITUV2_A8W4=1` | unset | SiTU v2 MoE with A8W4 activation quantization, on AITER's GU-interleaved preshuffled weight layout. The performance default the cell ships. |
 | `AITER_SITUV2_A4W4=1` | unset | A4W4 instead, on the generic separated shuffle layout. Numerically correct but slower than A8W4 (530.8 vs 537.3 tok/s median output on 8×MI35x). Setting **both** gives A8W4 precedence — SGLang follows AITER and keeps the GU-interleaved layout. |
 | `SGLANG_ROCM_K3_KDA_FUSED_BACKEND=aiter` | unset | Opt in to the fused ROCm KDA decode boundary: the `f_b` projection is deferred into the gfx950 FlyDSL kernel so decode fuses `f_b` + convolution + recurrent state update + gated RMSNorm. Any other value (or unset) keeps the unfused KDA path. |
-| `SGLANG_K3_FLYDSL_SOURCE` | `auto` | Which FlyDSL implementation backs the fused decode: `auto` prefers SGLang's vendored kernels and falls back to the AITER module, `sglang` / `aiter` pin one. Leave it alone unless you are bisecting the two. |
+| `SGLANG_ROCM_K3_FLYDSL_SOURCE` | `auto` | Which FlyDSL implementation backs the fused decode: `auto` prefers SGLang's vendored kernels and falls back to the AITER module, `sglang` / `aiter` pin one. Leave it alone unless you are bisecting the two. |
 
 The fused KDA backend is fail-closed at two levels: it arms during model init only when the flag is exactly `aiter` **and** the gfx950 FlyDSL kernels are importable, and each decode step re-validates shapes, dtypes, strides, state indices, and output buffers before dispatch — anything unexpected falls back to the stock KDA implementation rather than erroring. Batch size 2 automatically picks a separately validated kernel schedule; every other batch keeps the original build options. Measured on a 69-layer graph the fused boundary is 9.20 → 8.38 µs/layer (−8.9%), with GSM8K 1319 at 0.950.
 
