@@ -158,6 +158,9 @@ class TRTLLMMHAMetadata:
     encoder_cache_seqlens: torch.Tensor = None
     encoder_page_table: torch.Tensor = None
     encoder_row_map: torch.Tensor = None
+    # Prefix before trailing one-token requests in an extend-shaped batch.
+    mixed_prefill_reqs: int = 0
+    mixed_prefill_tokens: int = 0
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -1259,6 +1262,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # (sync-free); for plain prefill these equal the full seq lens.
             metadata.max_seq_len_q = int(max(forward_batch.extend_seq_lens_cpu))
             if (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.spec_info is None
+            ):
+                # The eager runner normalizes MIXED to EXTEND. A causal
+                # one-token query can use decode even for a new request.
+                lengths = forward_batch.extend_seq_lens_cpu
+                prefix = len(lengths)
+                while prefix and lengths[prefix - 1] == 1:
+                    prefix -= 1
+                if 0 < prefix < len(lengths):
+                    metadata.mixed_prefill_reqs = prefix
+                    metadata.mixed_prefill_tokens = sum(lengths[:prefix])
+            if (
                 forward_batch.extend_prefix_lens_cpu is not None
                 and any(forward_batch.extend_prefix_lens_cpu)
             ) or forward_batch.forward_mode.is_draft_extend_v2():
@@ -1782,8 +1798,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 cu_seqlens_kv,
                 use_zigzag_page_table=False,
                 out=None,
+                page_table_override=None,
             ):
-                block_tables = page_table
+                block_tables = (
+                    page_table if page_table_override is None else page_table_override
+                )
                 if use_zigzag_page_table:
                     block_tables = self.forward_metadata.zigzag_page_table
                     zigzag_swa_pt = self.forward_metadata.zigzag_swa_page_table
@@ -1827,14 +1846,49 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 out = native_out if uses_native_fp4 else forward_batch._attn_output
                 if out is not None:
                     out = out.view_as(q)
-                o = _trtllm_context_attn(
-                    q,
-                    self.forward_metadata.cu_seqlens_q,
-                    self.forward_metadata.cache_seqlens_int32,
-                    self.forward_metadata.max_seq_len_q,
-                    cu_seqlens_kv=self.forward_metadata.cu_seqlens_k,
-                    out=out,
-                )
+                metadata = self.forward_metadata
+                if (
+                    metadata.mixed_prefill_reqs
+                    and q.dtype == torch.bfloat16
+                    and self.data_type == torch.bfloat16
+                    and not uses_native_fp4
+                    and layer.attn_type == AttentionType.DECODER
+                ):
+                    # Preserve request order and reuse the shared output buffer.
+                    prefix_reqs = metadata.mixed_prefill_reqs
+                    prefix_tokens = metadata.mixed_prefill_tokens
+                    if out is None:
+                        out = torch.empty_like(q)
+                    _trtllm_context_attn(
+                        q[:prefix_tokens],
+                        metadata.cu_seqlens_q[: prefix_reqs + 1],
+                        metadata.cache_seqlens_int32[:prefix_reqs],
+                        metadata.max_seq_len_q,
+                        cu_seqlens_kv=metadata.cu_seqlens_k[: prefix_reqs + 1],
+                        out=out[:prefix_tokens],
+                        page_table_override=page_table[:prefix_reqs],
+                    )
+                    self._run_fixed_q_len_decode(
+                        q[prefix_tokens:],
+                        kv_cache,
+                        page_table[prefix_reqs:],
+                        metadata.cache_seqlens_int32[prefix_reqs:],
+                        bmm1_scale=bmm1_scale,
+                        bmm2_scale=bmm2_scale,
+                        window_left=layer.sliding_window_size,
+                        sinks=attention_sink,
+                        out=out[prefix_tokens:],
+                    )
+                    o = out
+                else:
+                    o = _trtllm_context_attn(
+                        q,
+                        metadata.cu_seqlens_q,
+                        metadata.cache_seqlens_int32,
+                        metadata.max_seq_len_q,
+                        cu_seqlens_kv=metadata.cu_seqlens_k,
+                        out=out,
+                    )
 
         if uses_native_fp4:
             o = self._finalize_nvfp4_output(o, forward_batch)
