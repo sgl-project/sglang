@@ -27,7 +27,12 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ReqKvInfo
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    FINISH_LENGTH,
+    Req,
+    ReqKvInfo,
+)
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -40,6 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
     MatchResult,
+    TreeLock,
     zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -56,6 +62,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.pool_host import PoolEntry
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -71,11 +78,13 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
+    BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     _TREE_CORE_REGISTRY,
@@ -107,7 +116,6 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.session.streaming_session import SessionSlot
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.mem_cache_utils import finish_req
@@ -231,6 +239,46 @@ class _FakeFullComponent(TreeComponent):
 
     def _recede_session_coverage(self, session_id, leaf, fallback) -> None:
         pass
+
+
+class _ExtraPoolFullComponent(FullComponent):
+    """FULL component that also stores every page under a pool of its own,
+    staged through the anchor's host pool."""
+
+    EXTRA_POOL = PoolName.DRAFT
+
+    def buffer_mode_host_pool_entries(self, host_pool_group):
+        anchor = host_pool_group.anchor_entry
+        return [
+            PoolEntry(
+                name=self.EXTRA_POOL,
+                host_pool=anchor.host_pool,
+                device_pool=anchor.device_pool,
+                layer_mapper=anchor.layer_mapper,
+            )
+        ]
+
+    def buffer_backup_keys(self, node, hash_values):
+        return {self.EXTRA_POOL: list(hash_values)}
+
+    def build_hicache_transfers(self, node, phase, **kwargs):
+        if phase == CacheTransferPhase.BACKUP_HOST:
+            # Two transfers of the pool, each keyed by its own pages: the
+            # storage write must keep the keys per transfer.
+            value = node.component_data[BASE_COMPONENT_TYPE].value
+            keys = list(node.hash_value)
+            split = len(keys) // 2
+            page_size = self.tree_core.page_size
+            halves = [
+                (value[: split * page_size], keys[:split]),
+                (value[split * page_size :], keys[split:]),
+            ]
+            return [
+                PoolTransfer(name=self.EXTRA_POOL, device_indices=rows, keys=part)
+                for rows, part in halves
+                if part
+            ]
+        return super().build_hicache_transfers(node, phase, **kwargs)
 
 
 def _drop_hicache_atexit_pin(cache):
@@ -463,6 +511,9 @@ def build_fixture(
     enable_session_radix_cache: bool = False,
     tree_page_size: Optional[int] = None,
     mamba_cache_chunk_size: Optional[int] = None,
+    component_registry_override: Optional[
+        dict[ComponentType, type[TreeComponent]]
+    ] = None,
     tree_core_backend: Optional[str] = None,
 ):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
@@ -597,6 +648,7 @@ def build_fixture(
         enable_session_radix_cache=enable_session_radix_cache,
         eviction_policy=cfg.eviction_policy,
         is_eagle=cfg.is_eagle,
+        component_registry_override=component_registry_override,
     )
     requested_backend = tree_core_backend or _selected_tree_core_test_backend()
     selected_backend = resolve_tree_core_backend(requested_backend, cache_init_params)
@@ -1130,13 +1182,18 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         # every in-flight backup.
         lock_params = cache.inc_lock_ref(leaf_id).to_dec_params()
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
+        keys = list(snapshot.hash_values)
+        # Entries are keyed by the write's ack id, not by the node.
         pipeline.ongoing_write_through = {
-            leaf_id: _UnifiedBufferBackupEntry(
-                intent=_UnifiedBackupIntent(snapshot=snapshot),
+            -1: _UnifiedBufferBackupEntry(
+                intent=_UnifiedBackupIntent(
+                    snapshot=snapshot, pool=PoolName.KV, keys=keys
+                ),
                 host_indices=torch.empty(0, dtype=torch.int64),
                 aux_xfers=[],
                 lock_params=lock_params,
                 occupied_units=0,
+                keys_by_pool={PoolName.KV: keys},
             )
         }
         cache.buffer_pipeline = pipeline
@@ -1793,7 +1850,7 @@ class UnifiedRadixCacheSuite:
         req.kv.kv_committed_len = kv_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
-        req.lock_receipt = DecLockRefParams()
+        req.lock = None
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", input_ids + output_ids)
         req.set_extend_range(
@@ -1854,7 +1911,7 @@ class UnifiedRadixCacheSuite:
         req.kv.kv_allocated_len = kv_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
-        req.lock_receipt = DecLockRefParams()
+        req.lock = None
         req.extra_key = None
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
@@ -1916,8 +1973,7 @@ class UnifiedRadixCacheSuite:
         req.kv.kv_allocated_len = kv_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
-        req.lock_receipt = DecLockRefParams()
-        req.swa_prefix_lock_released = True
+        req.lock = None
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", tokens)
         req.set_extend_range(
@@ -1925,7 +1981,7 @@ class UnifiedRadixCacheSuite:
         )
 
         avail_before = allocator.available_size()
-        release_kv_cache(req, cache, is_insert=False)
+        release_kv_cache(req, cache, checkpoint=False)
 
         self.assertEqual(allocator.available_size(), avail_before + kv_len)
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
@@ -1949,7 +2005,7 @@ class UnifiedRadixCacheSuite:
         req.kv.kv_committed_len = kv_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
-        req.lock_receipt = DecLockRefParams()
+        req.lock = None
         req.extra_key = None
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
@@ -1959,12 +2015,9 @@ class UnifiedRadixCacheSuite:
         self.assertGreater(len(req.prefix_indices), 0)
         self.assertEqual(req.kv.cache_protected_len, len(req.prefix_indices))
         self.assertIsNotNone(req.last_node)
-        self.assertFalse(req.swa_prefix_lock_released)
+        self.assertFalse(req.lock.swa_released)
 
-        cache.dec_lock_ref(
-            req.last_node,
-            req.lock_receipt,
-        )
+        cache.unlock(req.lock)
         cache.sanity_check()
 
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
@@ -1988,7 +2041,7 @@ class UnifiedRadixCacheSuite:
         req.kv.kv_committed_len = len(tokens)
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
-        req.lock_receipt = DecLockRefParams()
+        req.lock = None
         req.extra_key = None
         req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
 
@@ -2004,10 +2057,7 @@ class UnifiedRadixCacheSuite:
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
         self.assertEqual(len(m.device_indices), len(tokens))
 
-        cache.dec_lock_ref(
-            req.last_node,
-            req.lock_receipt,
-        )
+        cache.unlock(req.lock)
         cache.sanity_check()
 
     def test_diagnostics(self):
@@ -2090,7 +2140,7 @@ class UnifiedRadixCacheSuite:
         req.kv.kv_committed_len = kv_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
-        req.lock_receipt = DecLockRefParams()
+        req.lock = None
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", input_ids)
         req.set_extend_range(
@@ -2213,7 +2263,7 @@ class UnifiedRadixCacheSuite:
         req.kv.kv_committed_len = kv_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
-        req.lock_receipt = DecLockRefParams()
+        req.lock = None
         req.extra_key = None
         req.kv.set_evicted_seqlen(ComponentType.SWA, 0)
 
@@ -2241,10 +2291,7 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(req.kv.cache_protected_len, len(tokens))
 
-        cache.dec_lock_ref(
-            req.last_node,
-            req.lock_receipt,
-        )
+        cache.unlock(req.lock)
         cache.dec_lock_ref(last_device_node, lock_result.to_dec_params())
         cache.sanity_check()
 
@@ -2309,7 +2356,7 @@ class UnifiedRadixCacheSuite:
             1,
             "Mamba locked before release",
         )
-        cache.dec_swa_lock_only(node_a, lock_result.to_dec_params())
+        cache.release_swa(TreeLock(node_a, lock_result.to_dec_params()))
         self.assertEqual(_device_lock_ref(cache, node_a, ComponentType.SWA), 0)
         self.assertEqual(
             _device_lock_ref(cache, node_a, ComponentType.MAMBA),
@@ -2389,7 +2436,7 @@ class UnifiedRadixCacheSuite:
         )
 
         # B: early SWA release, then final release -- both replay B's receipt.
-        cache.dec_swa_lock_only(node, lock_b.to_dec_params())
+        cache.release_swa(TreeLock(node, lock_b.to_dec_params()))
         self.assertEqual(
             _device_lock_ref(cache, node, ComponentType.MAMBA),
             1,
@@ -2402,7 +2449,7 @@ class UnifiedRadixCacheSuite:
             "B's final release spares A",
         )
 
-        cache.dec_swa_lock_only(node, lock_a.to_dec_params())
+        cache.release_swa(TreeLock(node, lock_a.to_dec_params()))
         self.assertEqual(
             _device_lock_ref(cache, node, ComponentType.MAMBA),
             0,
@@ -2443,7 +2490,7 @@ class UnifiedRadixCacheSuite:
         # Early SWA release (decode advanced past the window), via the public
         # path the scheduler calls. The leaf's SWA is tombstoned and the
         # co-located lower-tier Mamba lock must drop in the same release.
-        cache.dec_swa_lock_only(node_a, lock_result.to_dec_params())
+        cache.release_swa(TreeLock(node_a, lock_result.to_dec_params()))
         self.assertEqual(
             _device_lock_ref(cache, node_a, ComponentType.SWA), 0, "SWA early-released"
         )
@@ -2479,7 +2526,7 @@ class UnifiedRadixCacheSuite:
         self.assertIn(ComponentType.MAMBA, skipped.skipped_lock_components)
         self.assertEqual(_device_lock_ref(cache, node_a, ComponentType.MAMBA), 1)
 
-        cache.dec_swa_lock_only(node_a, skipped.to_dec_params())
+        cache.release_swa(TreeLock(node_a, skipped.to_dec_params()))
         self.assertEqual(
             _device_lock_ref(cache, node_a, ComponentType.MAMBA),
             1,
@@ -2644,7 +2691,7 @@ class UnifiedRadixCacheSuite:
         self.assertGreaterEqual(_device_lock_ref(cache, node_a, ComponentType.MAMBA), 1)
         self.assertGreaterEqual(_device_lock_ref(cache, node_a, ComponentType.FULL), 1)
 
-        cache.dec_swa_lock_only(node_a, lock_result.to_dec_params())
+        cache.release_swa(TreeLock(node_a, lock_result.to_dec_params()))
         self.assertEqual(
             _device_lock_ref(cache, node_a, ComponentType.SWA), 0, "SWA released"
         )
@@ -2902,7 +2949,7 @@ class UnifiedRadixCacheSuite:
         req.kv.kv_committed_len = pre_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
-        req.lock_receipt = DecLockRefParams()
+        req.lock = None
         req.extra_key = None
 
         swa_avail_before = allocator.swa_attn_allocator.available_size()
@@ -2927,10 +2974,7 @@ class UnifiedRadixCacheSuite:
             f"before={swa_avail_before}, after={swa_avail_after}",
         )
 
-        cache.dec_lock_ref(
-            req.last_node,
-            req.lock_receipt,
-        )
+        cache.unlock(req.lock)
         cache.sanity_check()
 
     def test_swa_lru_fresh_leaf_cap_rebuilds_both_nodes(self):
@@ -2991,7 +3035,7 @@ class UnifiedRadixCacheSuite:
         req.kv.kv_committed_len = pre_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
-        req.lock_receipt = DecLockRefParams()
+        req.lock = None
         req.extra_key = None
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
@@ -3003,10 +3047,7 @@ class UnifiedRadixCacheSuite:
             "Nothing should be evicted when prefill fits inside the cushion",
         )
 
-        cache.dec_lock_ref(
-            req.last_node,
-            req.lock_receipt,
-        )
+        cache.unlock(req.lock)
         cache.sanity_check()
 
     def test_swa_sanity_check_passes_after_deep_match(self):
@@ -3080,10 +3121,7 @@ class UnifiedRadixCacheSuite:
         else:
             lock_result = cache.inc_lock_ref(node)
             self.assertGreater(_device_lock_ref(cache, node, aux), 0)
-            cache.dec_swa_lock_only(
-                node,
-                lock_result.to_dec_params(),
-            )
+            cache.release_swa(TreeLock(node, lock_result.to_dec_params()))
             # FULL still locked -> not a device leaf -> no inline evict; the
             # value stays evictable for the explicit aux eviction below.
             self.assertIsNotNone(_device_value(cache, node, aux))
@@ -4045,8 +4083,14 @@ class UnifiedRadixCacheSuite:
         pipeline = cache.buffer_pipeline
         controller = cache.cache_controller
         _write_backup(cache, leaf)
-        node_ids = [intent.snapshot.node_id for intent in pipeline.pending_write_queue]
+        # One intent per pool of every node on the path.
+        intents = list(pipeline.pending_write_queue)
+        node_ids = sorted({intent.snapshot.node_id for intent in intents})
         self.assertGreaterEqual(len(node_ids), 2)
+        self.assertEqual(
+            pipeline.inflight_backup_pools[leaf],
+            {intent.pool for intent in intents if intent.snapshot.node_id == leaf},
+        )
 
         device_allocators = [allocator]
         if self.cfg.has_swa:
@@ -4078,9 +4122,19 @@ class UnifiedRadixCacheSuite:
         self.assertFalse(pipeline.pending_write_queue)
         self.assertFalse(controller.write_queue)
         self.assertEqual(len(controller.ack_write_queue), 1)
+        # Every intent is a write of its own, acked under its own id.
         ack = controller.ack_write_queue[0]
-        self.assertEqual(ack.node_ids, node_ids)
-        self.assertEqual(set(pipeline.ongoing_write_through), set(node_ids))
+        self.assertEqual(len(ack.node_ids), len(intents))
+        self.assertEqual(list(ack.node_ids), list(pipeline.ongoing_write_through))
+        self.assertEqual(
+            sorted(
+                {
+                    entry.intent.snapshot.node_id
+                    for entry in pipeline.ongoing_write_through.values()
+                }
+            ),
+            node_ids,
+        )
         staged_avail = self._host_avail_sizes(cache)
         self.assertNotEqual(staged_avail, avail0)
 
@@ -4090,7 +4144,7 @@ class UnifiedRadixCacheSuite:
             self.assertGreater(_device_lock_ref(cache, node_id, ComponentType.FULL), 0)
         cache.writing_check(finish_count=1)
         self.assertFalse(pipeline.ongoing_write_through)
-        self.assertEqual(len(pipeline.ongoing_backup), len(node_ids))
+        self.assertEqual(len(pipeline.ongoing_backup), len(intents))
         for node_id in node_ids:
             self.assertEqual(_device_lock_ref(cache, node_id, ComponentType.FULL), 0)
         # Each storage write still owns its staging until its separate ACK.
@@ -4117,13 +4171,259 @@ class UnifiedRadixCacheSuite:
         )
         for n in chain:
             self.assertTrue(
-                cache.storage_existence_cache.contains_all(
-                    PoolName.KV, cache.tree_core.get_hash_values(n)
+                cache.storage_existence_cache.pool(PoolName.KV).contains_all(
+                    cache.tree_core.get_hash_values(n)
                 )
             )
-        # Re-hit absorbed by the (FULL-focused) belief skip.
+            for transfer in _aux_storage_key_transfers(cache, n) or ():
+                self.assertTrue(
+                    cache.storage_existence_cache.pool(transfer.name).contains_all(
+                        transfer.keys
+                    )
+                )
+        # Re-hit absorbed when every pool is believed present.
         _write_backup(cache, leaf)
         self.assertNotIn(leaf, cache.buffer_pipeline.inflight_backup_node_ids)
+
+        if self.cfg.has_swa:
+            # Only the SWA window dropped: the next insert queues the SWA pool
+            # alone. A private SWA arena's write proceeds even with FULL staging
+            # at the live cap (shared or anchor-aliased layouts keep the gate).
+            swa_transfer = _aux_storage_key_transfers(cache, leaf)[0]
+            cache.storage_existence_cache.pool(PoolName.SWA).invalidate_beyond(
+                swa_transfer.keys, keep_pages=0
+            )
+            host_group = controller.mem_pool_host
+            private_swa = (
+                pipeline._shared_host_domain() is None
+                and host_group.entry_map[PoolName.SWA].host_pool
+                is not host_group.anchor_entry.host_pool
+            )
+            staged_before = pipeline.write_staged_tokens_
+            if private_swa:
+                pipeline.write_staged_tokens_ = host_group.size
+            with (
+                mock.patch.object(controller, "write", wraps=controller.write) as stage,
+                mock.patch.object(
+                    controller, "write_storage", wraps=controller.write_storage
+                ) as write_storage,
+                mock.patch.object(
+                    controller, "page_set_func", wraps=controller.page_set_func
+                ) as write_full,
+                mock.patch.object(
+                    pipeline, "_write_intents", wraps=pipeline._write_intents
+                ) as admissions,
+            ):
+                # The fixture parks the stock trigger; arm it here.
+                cache.write_through_threshold = 1
+                self._insert(cache, allocator, req_to_token_pool, seq_ab)
+                self.assertEqual(
+                    [
+                        (i.snapshot.node_id, i.pool)
+                        for i in pipeline.pending_write_queue
+                    ],
+                    [(leaf, PoolName.SWA)],
+                )
+                # One admission per node per walk.
+                self.assertEqual(admissions.call_count, len(node_ids))
+                self.assertTrue(cache.buffer_backup_pending(leaf))
+                self._pump_hicache_until(
+                    cache,
+                    lambda: (
+                        not pipeline.inflight_backup_node_ids
+                        and not pipeline.ongoing_backup
+                    ),
+                    "selective buffer backup did not drain",
+                )
+            self.assertFalse(cache.buffer_backup_pending(leaf))
+            if private_swa:
+                pipeline.write_staged_tokens_ -= host_group.size - staged_before
+            self.assertTrue(stage.called)
+            self.assertTrue(
+                all(call.args[0].numel() == 0 for call in stage.call_args_list)
+            )
+            # SWA writes carry no KV page; the window's keys ride the transfer.
+            self.assertTrue(write_storage.called)
+            snapshot = cache.tree_core.snapshot_buffer_backup(
+                leaf, cache.hicache_storage_pass_prefix_keys
+            )
+            for call in write_storage.call_args_list:
+                host_indices, _, hash_value, prefix_keys = call.args[:4]
+                self.assertEqual(host_indices.numel(), 0)
+                self.assertEqual(hash_value, [])
+                transfers = call.kwargs["extra_pools"]
+                self.assertEqual(
+                    [t.name for t in transfers if t.indices_from_pool is None],
+                    [PoolName.SWA],
+                )
+                self.assertEqual(prefix_keys, snapshot.prefix_keys)
+            write_full.assert_not_called()
+            self.assertTrue(
+                cache.storage_existence_cache.pool(PoolName.SWA).contains_all(
+                    swa_transfer.keys
+                )
+            )
+            self.assertEqual(self._host_avail_sizes(cache), avail0)
+        cache.sanity_check()
+
+    @staticmethod
+    def _writes_by_pool(write_storage, extra):
+        """Key tuples of the KV writes and of the ``extra`` pool's writes
+        among the storage writes recorded by ``write_storage``."""
+        kv_writes, extra_writes = set(), set()
+        for call in write_storage.call_args_list:
+            host_indices, _, hash_value = call.args[:3]
+            transfers = call.kwargs.get("extra_pools") or []
+            names = [transfer.name for transfer in transfers]
+            if hash_value:
+                assert extra not in names
+                kv_writes.add(tuple(hash_value))
+            elif extra in names:
+                # The pool's transfers reach storage as one contiguous span.
+                assert host_indices.numel() == 0 and names == [extra]
+                extra_writes.add(tuple(transfers[0].keys))
+        return kv_writes, extra_writes
+
+    def test_buffer_only_writes_component_pools_independently(self):
+        """A component's own pool (aliased host entry, per-pool keys,
+        BACKUP_HOST transfers) is written, believed and re-written
+        independently of the KV pool."""
+        self._skip_unsupported_hicache_test()
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        # Component buffer-mode hooks are Python-core only.
+        cache, allocator, req_to_token_pool = build_fixture(
+            self.cfg,
+            component_registry_override={ComponentType.FULL: _ExtraPoolFullComponent},
+            tree_core_backend="python",
+        )
+        self._init_buffer_hicache(cache, storage_dir)
+        extra = _ExtraPoolFullComponent.EXTRA_POOL
+        controller = cache.cache_controller
+        self.assertIn(extra, controller.mem_pool_host.entry_map)
+        avail0 = self._host_avail_sizes(cache)
+
+        seq = self._buffer_swa_seq()
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        chain = self._path_chain(cache, leaf)
+        pipeline = cache.buffer_pipeline
+        expected_intents = []
+        expected_backlog = 0
+        for node_id in chain:
+            snapshot = cache.tree_core.snapshot_buffer_backup(
+                node_id, cache.hicache_storage_pass_prefix_keys
+            )
+            expected_backlog += len(snapshot.key)
+            expected_intents.extend(
+                (node_id, pool) for pool, _ in pipeline._write_intents(snapshot)
+            )
+        pipeline.write_backlog_cap = expected_backlog
+        if self.cfg.has_swa:
+            self.assertEqual(
+                {pool for node_id, pool in expected_intents if node_id == leaf},
+                {PoolName.KV, PoolName.DRAFT, PoolName.SWA},
+            )
+        self.assertFalse(cache.buffer_backup_pending(leaf))
+        with mock.patch.object(
+            controller, "write_storage", wraps=controller.write_storage
+        ) as write_storage:
+            _write_backup(cache, leaf)
+            self.assertEqual(
+                [
+                    (intent.snapshot.node_id, intent.pool)
+                    for intent in pipeline.pending_write_queue
+                ],
+                expected_intents,
+            )
+            self.assertEqual(pipeline.write_backlog_tokens_, expected_backlog)
+            self.assertEqual(pipeline._backlog_cap_hits, 0)
+            self.assertTrue(cache.buffer_backup_pending(leaf))
+            self._pump_hicache_until(
+                cache,
+                lambda: (
+                    not cache.buffer_pipeline.inflight_backup_node_ids
+                    and not cache.buffer_pipeline.ongoing_backup
+                ),
+                "buffer backup pipeline did not drain",
+            )
+        self.assertFalse(cache.buffer_backup_pending(leaf))
+        # Each pool of each node is a write of its own: the KV chain with its
+        # pages, the component's pool with no KV rows and its transfers
+        # keyed by their own pages.
+        expected = {tuple(cache.tree_core.get_hash_values(n)) for n in chain}
+        kv_writes, extra_writes = self._writes_by_pool(write_storage, extra)
+        self.assertEqual(kv_writes, expected)
+        self.assertEqual(extra_writes, expected)
+
+        page_hashes = self._all_page_hashes(cache, leaf)
+        self.assertEqual(
+            self._storage_exists_count(
+                cache, page_hashes, [PoolTransfer(name=extra, keys=page_hashes)]
+            ),
+            len(page_hashes),
+        )
+        for n in chain:
+            keys = cache.tree_core.get_hash_values(n)
+            self.assertTrue(
+                cache.storage_existence_cache.pool(PoolName.KV).contains_all(keys)
+            )
+            self.assertTrue(
+                cache.storage_existence_cache.pool(extra).contains_all(keys)
+            )
+        self.assertEqual(self._host_avail_sizes(cache), avail0)
+
+        # Only the component's pool dropped from the beliefs: its requested
+        # backup writes that pool alone, staged through the anchor's host
+        # pool with no KV rows.
+        for n in chain:
+            cache.storage_existence_cache.pool(extra).invalidate_beyond(
+                cache.tree_core.get_hash_values(n), keep_pages=0
+            )
+        with (
+            mock.patch.object(controller, "write", wraps=controller.write) as stage,
+            mock.patch.object(
+                controller, "write_storage", wraps=controller.write_storage
+            ) as write_storage,
+            mock.patch.object(
+                controller, "page_set_func", wraps=controller.page_set_func
+            ) as write_full,
+        ):
+            cache.request_buffer_backup(leaf)
+            intents = list(pipeline.pending_write_queue)
+            self.assertEqual(
+                [(intent.snapshot.node_id, intent.pool) for intent in intents],
+                [(n, extra) for n in chain],
+            )
+            self._pump_hicache_until(
+                cache,
+                lambda: (
+                    not pipeline.inflight_backup_node_ids
+                    and not pipeline.ongoing_backup
+                ),
+                "component-pool backup did not drain",
+            )
+        self.assertTrue(stage.called)
+        self.assertTrue(all(call.args[0].numel() == 0 for call in stage.call_args_list))
+        self.assertEqual(len(write_storage.call_args_list), len(chain))
+        kv_writes, extra_writes = self._writes_by_pool(write_storage, extra)
+        self.assertEqual(kv_writes, set())
+        self.assertEqual(extra_writes, expected)
+        write_full.assert_not_called()
+        for n in chain:
+            self.assertTrue(
+                cache.storage_existence_cache.pool(extra).contains_all(
+                    cache.tree_core.get_hash_values(n)
+                )
+            )
+        self.assertEqual(self._host_avail_sizes(cache), avail0)
+
+        # Everything believed stored: a requested backup is absorbed.
+        cache.request_buffer_backup(leaf)
+        self.assertNotIn(leaf, pipeline.inflight_backup_node_ids)
         cache.sanity_check()
 
     def test_buffer_only_read_path_roundtrip(self):
@@ -4242,10 +4542,18 @@ class UnifiedRadixCacheSuite:
             for component_type in cons.tree_components:
                 self.assertIsNone(_host_value(cons, cur, component_type))
         self.assertTrue(
-            cons.storage_existence_cache.contains_all(
-                PoolName.KV, self._all_page_hashes(cons, leaf)
+            cons.storage_existence_cache.pool(PoolName.KV).contains_all(
+                self._all_page_hashes(cons, leaf)
             )
         )
+        # The fetch is evidence for every pool it delivered, so the
+        # consumer's own re-write of the span is skipped pool by pool.
+        for transfer in _aux_storage_key_transfers(cons, leaf) or ():
+            self.assertTrue(
+                cons.storage_existence_cache.pool(transfer.name).contains_all(
+                    transfer.keys
+                )
+            )
         loaded_k, loaded_v = self._snapshot_full_kv(cons_alloc, mc.device_indices)
         self.assertTrue(torch.equal(loaded_k, expected_k))
         self.assertTrue(torch.equal(loaded_v, expected_v))
@@ -4605,7 +4913,7 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(int(spliced.numel()), len(seq), "load-back degraded")
         cons.ready_to_load_host_cache()
-        cons.inc_lock_ref(last_node)  # _req_inc_lock_ref
+        cons.inc_lock_ref(last_node)  # the admission lock
 
         self.assertEqual(cons.swa_evictable_size(), 0)  # window is protected
         # FULL stays roomy: only SWA can fail below.
@@ -7719,7 +8027,7 @@ class UnifiedRadixCacheSuite:
         temporal, _ = self._snapshot_mamba_state(pool, slot)
         self.assertTrue(torch.all(temporal == 11))
         pool.mamba_allocator.free(other_slots)
-        cache.dec_lock_ref(req.last_node, req.lock_receipt)
+        cache.unlock(req.lock)
 
     def test_load_back_success_copies_mamba_state_into_request_slot(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
@@ -9033,7 +9341,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         req.kv.kv_committed_len = len(tokens)
         req.kv.kv_allocated_len = len(tokens)
         req.kv.cache_protected_len = 0
-        req.lock_receipt = DecLockRefParams()
+        req.lock = None
         req.extra_key = None
         req.kv.mamba_last_track_seqlen = len(tokens)
         return req
@@ -9930,7 +10238,7 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
 
         lock_result = cache.inc_lock_ref(node)
         self.assertGreaterEqual(_device_lock_ref(cache, node, ComponentType.SWA), 1)
-        cache.dec_swa_lock_only(node, lock_result.to_dec_params())
+        cache.release_swa(TreeLock(node, lock_result.to_dec_params()))
         self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 0)
         self.assertGreaterEqual(_device_lock_ref(cache, node, ComponentType.FULL), 1)
 
@@ -10064,7 +10372,7 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
             (
                 "dec_swa_lock_only",
                 lambda: make(DecSwaLockOnlyResult),
-                lambda: cache.dec_swa_lock_only(node, DecLockRefParams()),
+                lambda: cache.release_swa(TreeLock(node, DecLockRefParams())),
                 None,
             ),
         ]
@@ -10587,7 +10895,7 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         req.kv.kv_committed_len = seq_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
-        req.lock_receipt = DecLockRefParams()
+        req.lock = None
         req.extra_key = None
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
@@ -10607,10 +10915,7 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
             "the match after the insert must reach the leaf the insert created",
         )
 
-        cache.dec_lock_ref(
-            req.last_node,
-            req.lock_receipt,
-        )
+        cache.unlock(req.lock)
         cache.sanity_check()
 
 
@@ -10798,6 +11103,9 @@ class TestAnchorLockOutcomePolicy(CustomTestCase):
                     cache, key, indices, operation=operation
                 )
             )
+        )
+        cache._retire_ongoing_prefetch.side_effect = lambda *args: (
+            UnifiedRadixCache._retire_ongoing_prefetch(cache, *args)
         )
         controller = cache.cache_controller
         controller.terminate_prefetch.return_value = (4, None)
@@ -11070,21 +11378,23 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
         self._insert(cache, allocator, req_to_token_pool, seq)
         leaf = self._match_leaf(cache, seq)
         lock = cache.inc_lock_ref(leaf)
-        cache.dec_swa_lock_only(leaf, lock.to_dec_params())
+        cache.release_swa(TreeLock(leaf, lock.to_dec_params()))
         self._assert_protocol_violation(
             lambda: cache.dec_lock_ref(leaf, lock.to_dec_params()), "lock_ref=0"
         )
 
     def test_finish_after_early_release_with_skip_swa(self):
-        """The correct F2 flow: skip_swa honors the early release."""
+        """The correct F2 flow: unlock honors the early release."""
         sw = self.cfg.sliding_window_size
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 2 * sw)
         self._insert(cache, allocator, req_to_token_pool, seq)
         leaf = self._match_leaf(cache, seq)
-        lock = cache.inc_lock_ref(leaf)
-        cache.dec_swa_lock_only(leaf, lock.to_dec_params())
-        cache.dec_lock_ref(leaf, lock.to_dec_params(), skip_swa=True)
+        lock = cache.lock(leaf)
+        cache.release_swa(lock)
+        self.assertTrue(lock.swa_released)
+        cache.release_swa(lock)  # a repeat is a no-op
+        cache.unlock(lock)
         self.assertEqual(self._swa_ref(cache, leaf), 0)
         self.assertEqual(_device_lock_ref(cache, leaf, ComponentType.FULL), 0)
         cache.sanity_check()
@@ -11233,10 +11543,7 @@ class TestSegmentLockFuzz(_InsertWalkSuite):
                         or receipt.component_lock_uuids[ComponentType.SWA] is None
                     ):
                         continue
-                    cache.dec_swa_lock_only(
-                        node_id,
-                        receipt.to_dec_params(),
-                    )
+                    cache.release_swa(TreeLock(node_id, receipt.to_dec_params()))
                     held[idx][2] = True
                 else:
                     cache.evict(
@@ -11281,9 +11588,8 @@ class TestSegmentLockFuzzWithMamba(TestSegmentLockFuzz):
 
 
 class TestStreamingSessionLockLifecycle(CustomTestCase):
-    """A streaming session must persist swa_prefix_lock_released: closing or
-    aborting a session whose first turn early-released its SWA lock must not
-    release the SWA segment a second time."""
+    """A streaming session owns its record and prefix lock from the first
+    turn's row allocation; every move of that lock keeps the tree balanced."""
 
     cfg = CacheConfig(
         page_size=1,
@@ -11293,52 +11599,133 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         max_context_len=64,
     )
 
-    def _lock_and_early_release(self, cache, allocator):
-        tokens = array("q", range(1, 9))
-        value = allocator.alloc(len(tokens))
-        cache.insert(InsertParams(key=RadixKey(tokens), value=value))
-        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
-        node = match.last_device_node
-        lock = cache.inc_lock_ref(node)
-        self.assertIsNotNone(lock.component_lock_uuids[ComponentType.SWA])
-        cache.dec_swa_lock_only(node, lock.to_dec_params())
-        return node, lock
-
-    def _streaming_req(self, node, lock, *, session):
-        # No KV row is held: the slot only carries the tree lock receipt.
-        kv = ReqKvInfo()
+    def _session(self, session_id):
         return SimpleNamespace(
-            kv=kv,
-            detach_kv=lambda: kv,
-            last_node=node,
-            lock_receipt=lock.to_dec_params(),
-            swa_prefix_lock_released=True,
-            session=session,
-            finished_reason=None,
+            session_id=session_id,
+            streaming=True,
+            finish_req=lambda req: None,
+            abort_req=lambda: None,
         )
 
-    def test_close_after_early_release_releases_swa_once(self):
-        cache, allocator, _ = build_fixture(self.cfg)
-        node, lock = self._lock_and_early_release(cache, allocator)
-        req = self._streaming_req(node, lock, session=None)
-        slot = SessionSlot()
-        cache.session.slots["s"] = slot
-        slot.save_from_req(req, is_first=True)
+    def _turn(self, tokens, session):
+        req = Req(
+            rid="turn",
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req.session = session
+        req.extra_key = None
+        req.output_ids = array("q")
+        req.refresh_fill_ids()
+        return req
+
+    def _admitted_turn(self, cache, allocator, pool, tokens, session):
+        """A first turn with its own row and the root lock admission took."""
+        req = self._turn(tokens, session)
+        pool.alloc([req])
+        pool.write(
+            (req.kv.req_pool_idx, slice(0, len(tokens))),
+            allocator.alloc(len(tokens)),
+        )
+        req.kv.kv_committed_len = len(tokens)
+        req.kv.kv_allocated_len = len(tokens)
+        req.last_node = cache.root_node_handle()
+        req.lock = cache.lock(req.last_node)
+        return req
+
+    def test_slot_publishes_first_prompt_but_not_its_output(self):
+        cache, allocator, pool = build_fixture(self.cfg)
+        tokens = list(range(1, 9))
+        req = self._admitted_turn(cache, allocator, pool, tokens, self._session("s"))
+        cache.maybe_hand_to_session(req)
+        slot = cache.session.slots["s"]
+
+        cache.checkpoint(req, up_to=len(tokens))
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(slot.lock.node, match.last_device_node)
+        self.assertIs(req.last_node, slot.virtual_node)
+
+        req.output_ids = array("q", range(9, 13))
+        req.refresh_fill_ids()
+        pool.write((req.kv.req_pool_idx, slice(8, 12)), allocator.alloc(4))
+        req.kv.kv_committed_len = 12
+        req.kv.kv_allocated_len = 12
+        req.finished_reason = FINISH_LENGTH(length=4)
+        release_kv_cache(req, cache, checkpoint=True)
+
+        self.assertIs(cache.session.slots["s"], slot)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", range(1, 13))))
+        )
+        self.assertEqual(len(match.device_indices), len(tokens))
         cache.session.release_session("s")
         cache.sanity_check()
 
-    def test_first_req_mid_abort_after_early_release(self):
+    def test_session_turn_releases_slot_swa_prefix_lock_once(self):
         cache, allocator, pool = build_fixture(self.cfg)
-        node, lock = self._lock_and_early_release(cache, allocator)
-        session = SimpleNamespace(
-            session_id="s2", streaming=True, abort_req=lambda: None
+        tokens = list(range(1, 9))
+        req = self._admitted_turn(cache, allocator, pool, tokens, self._session("s"))
+        cache.maybe_hand_to_session(req)
+        cache.checkpoint(req, up_to=len(tokens))
+        slot = cache.session.slots["s"]
+
+        cache.release_swa_prefix_lock(req)
+        self.assertTrue(slot.lock.swa_released)
+        self.assertIsNone(req.lock)
+        cache.release_swa_prefix_lock(req)
+
+        req.finished_reason = FINISH_LENGTH(length=0)
+        self.assertTrue(cache.session.try_cache_finished_req(req))
+        cache.session.release_session("s")
+        cache.sanity_check()
+
+    def _later_turn(self, cache, allocator, pool):
+        """A finished first turn, then a second turn on the slot's record."""
+        session = self._session("s")
+        first = self._admitted_turn(cache, allocator, pool, list(range(1, 9)), session)
+        cache.maybe_hand_to_session(first)
+        cache.checkpoint(first, up_to=8)
+        first.finished_reason = FINISH_LENGTH(length=0)
+        self.assertTrue(cache.session.try_cache_finished_req(first))
+
+        tokens = list(range(1, 13))
+        req = self._turn(tokens, session)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
         )
-        req = self._streaming_req(node, lock, session=session)
+        req.last_node = match.last_device_node
+        pool.write((req.kv.req_pool_idx, slice(8, 12)), allocator.alloc(4))
+        req.kv.kv_committed_len = 12
+        req.kv.kv_allocated_len = 12
+        cache.maybe_hand_to_session(req)
+        return cache.session.slots["s"], req
+
+    def test_later_turn_borrows_without_publishing(self):
+        cache, allocator, pool = build_fixture(self.cfg)
+        slot, req = self._later_turn(cache, allocator, pool)
+        slot_lock = slot.lock
+
+        cache.checkpoint(req, up_to=12)
+        self.assertIs(slot.lock, slot_lock)
+
+        req.finished_reason = FINISH_LENGTH(length=0)
+        self.assertTrue(cache.session.try_cache_finished_req(req))
+        cache.session.release_session("s")
+        cache.sanity_check()
+
+    def test_later_turn_abort_releases_like_any_request(self):
+        """The record and the slot's lock, SWA part already released, go back
+        before the KV is checkpointed."""
+        cache, allocator, pool = build_fixture(self.cfg)
+        slot, req = self._later_turn(cache, allocator, pool)
+        slot_lock = slot.lock
+        cache.release_swa_prefix_lock(req)
+        self.assertTrue(slot_lock.swa_released)
+
         req.finished_reason = FINISH_ABORT()
-        # The session leaves an abort to the normal release, whose unpin
-        # must not release the SWA lock a second time.
-        self.assertFalse(cache.session.try_cache_finished_req(req))
-        cache.unpin(req)
+        release_kv_cache(req, cache, checkpoint=True)
+        self.assertNotIn("s", cache.session.slots)
         cache.sanity_check()
 
 

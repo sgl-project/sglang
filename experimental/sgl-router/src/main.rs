@@ -10,10 +10,7 @@ use sgl_router::{
         KvIndexerEndpointConfig, LogFormat, PolicyKind,
     },
     discovery::{spawn_discovery, ModelId},
-    policies::{
-        factory::build_registry as build_policy_registry, prefix_provider::RadixTreePrefixProvider,
-        PolicyRegistry,
-    },
+    policies::{factory::build_registry as build_policy_registry, PolicyRegistry},
     policies_reorg::factory::build_resolver as build_reorg_resolver,
     proxy::Proxy,
     server::{
@@ -22,7 +19,7 @@ use sgl_router::{
         shutdown::drain_for_termination,
     },
     state::{
-        kv_events::{BlockSizeOracle, BootstrapTracker, KvEventIndex},
+        kv_events::{BlockSizeOracle, BootstrapTracker, KvEventIndex, RadixTreePrefixProvider},
         load_monitor::router_inflight_load::{
             spawn_janitor, JanitorHandle, RouterInflightLoadRegistry, SystemTimeClock,
         },

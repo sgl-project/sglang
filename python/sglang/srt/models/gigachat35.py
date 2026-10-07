@@ -365,6 +365,7 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
             is_nextn=is_nextn,
             prefix=prefix,
             alt_stream=alt_stream,
+            build_stages=False,
         )
 
         attn_layer_id = config.num_hidden_layers if is_nextn else layer_id
