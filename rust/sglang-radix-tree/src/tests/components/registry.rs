@@ -18,18 +18,18 @@ fn registration_requires_explicit_replacement_and_preserves_kind() {
         ));
     }
     assert!(matches!(
-        registry.register_tree_component("full", FULL, full_factory, false),
+        registry.register_tree_component("full_default", FULL, full_factory, false),
         Err(ComponentInitError::DuplicateFactoryKey(_))
     ));
     assert!(matches!(
-        registry.register_tree_component("full", SWA, full_factory, true),
+        registry.register_tree_component("full_default", SWA, full_factory, true),
         Err(ComponentInitError::ComponentTypeMismatch {
             expected: FULL,
             actual: SWA
         })
     ));
     registry
-        .register_tree_component("full", FULL, full_factory, true)
+        .register_tree_component("full_default", FULL, full_factory, true)
         .unwrap();
     registry
         .register_tree_component("custom_full", FULL, full_factory, false)
@@ -39,9 +39,9 @@ fn registration_requires_explicit_replacement_and_preserves_kind() {
     assert_eq!(
         registry.registered_tree_components(),
         HashMap::from([
-            ("full".to_owned(), FULL),
-            ("swa".to_owned(), SWA),
-            ("mamba".to_owned(), MAMBA),
+            ("full_default".to_owned(), FULL),
+            ("swa_default".to_owned(), SWA),
+            ("mamba_default".to_owned(), MAMBA),
             ("custom_full".to_owned(), FULL),
         ])
     );
@@ -59,7 +59,7 @@ fn exercise_snapshot_replacement<K: TreeComponentKey>() {
     let old_events = Arc::clone(&events);
     registry
         .register_tree_component(
-            "swa",
+            "swa_default",
             SWA,
             move |argument: &TreeComponentArgument<'_>| {
                 old_events.lock().unwrap().push("old");
@@ -72,7 +72,7 @@ fn exercise_snapshot_replacement<K: TreeComponentKey>() {
     let factory_events = Arc::clone(&events);
     registry
         .register_tree_component(
-            "full",
+            "full_default",
             FULL,
             move |argument: &TreeComponentArgument<'_>| {
                 assert_eq!(argument.is_bigram, K::IS_BIGRAM);
@@ -88,7 +88,7 @@ fn exercise_snapshot_replacement<K: TreeComponentKey>() {
                 let new_events = Arc::clone(&factory_events);
                 registry
                     .register_tree_component(
-                        "swa",
+                        "swa_default",
                         SWA,
                         move |argument: &TreeComponentArgument<'_>| {
                             new_events.lock().unwrap().push("new");
@@ -107,7 +107,7 @@ fn exercise_snapshot_replacement<K: TreeComponentKey>() {
         swa_sliding_window_size: Some(4),
         ..Default::default()
     };
-    let keys = ["full".to_owned(), "swa".to_owned()];
+    let keys = ["full_default".to_owned(), "swa_default".to_owned()];
     let first = registry
         .snapshot(&keys)
         .unwrap()
@@ -138,17 +138,17 @@ fn factory_selection_rejects_unknown_duplicate_and_invalid_layouts() {
     for keys in [
         vec![""],
         vec!["missing"],
-        vec!["full", "full"],
-        vec!["full", "custom_full"],
+        vec!["full_default", "full_default"],
+        vec!["full_default", "custom_full"],
     ] {
         let keys = keys.into_iter().map(str::to_owned).collect::<Vec<_>>();
         assert!(registry.snapshot(&keys).is_err());
     }
     for keys in [
         vec![],
-        vec!["swa"],
-        vec!["swa", "full"],
-        vec!["full", "mamba", "swa"],
+        vec!["swa_default"],
+        vec!["swa_default", "full_default"],
+        vec!["full_default", "mamba_default", "swa_default"],
     ] {
         let keys = keys.into_iter().map(str::to_owned).collect::<Vec<_>>();
         let snapshot = registry.snapshot(&keys).unwrap();
@@ -179,7 +179,7 @@ fn factories_validate_requested_and_produced_kinds_and_key_mode() {
         is_bigram: false,
     };
     assert!(matches!(
-        registry.create_tree_component::<Vec<i64>>("full", &argument),
+        registry.create_tree_component::<Vec<i64>>("full_default", &argument),
         Err(ComponentInitError::ComponentTypeMismatch {
             expected: SWA,
             actual: FULL
@@ -195,7 +195,7 @@ fn factories_validate_requested_and_produced_kinds_and_key_mode() {
     argument.component_type = FULL;
     argument.is_bigram = true;
     assert!(matches!(
-        registry.create_tree_component::<Vec<i64>>("full", &argument),
+        registry.create_tree_component::<Vec<i64>>("full_default", &argument),
         Err(ComponentInitError::KeyModeMismatch)
     ));
 }
@@ -216,7 +216,11 @@ fn invalid_configuration_and_factory_errors_are_returned() {
         )
         .unwrap();
     let params = CacheInitParams::default();
-    for (key, component_type) in [("fails", FULL), ("swa", SWA), ("mamba", MAMBA)] {
+    for (key, component_type) in [
+        ("fails", FULL),
+        ("swa_default", SWA),
+        ("mamba_default", MAMBA),
+    ] {
         let argument = TreeComponentArgument {
             component_type,
             params: &params,
@@ -237,7 +241,7 @@ fn invalid_configuration_and_factory_errors_are_returned() {
         is_bigram: false,
     };
     assert!(matches!(
-        registry.create_tree_component::<Vec<i64>>("full", &argument),
+        registry.create_tree_component::<Vec<i64>>("full_default", &argument),
         Err(ComponentInitError::InvalidConfiguration(
             "page_size must be at least 1"
         ))
@@ -248,14 +252,14 @@ fn invalid_configuration_and_factory_errors_are_returned() {
 fn ordered_factories_reject_zero_component_configuration() {
     for (key, params) in [
         (
-            "swa",
+            "swa_default",
             CacheInitParams {
                 swa_sliding_window_size: Some(0),
                 ..Default::default()
             },
         ),
         (
-            "mamba",
+            "mamba_default",
             CacheInitParams {
                 mamba_cache_chunk_size: Some(0),
                 ..Default::default()
@@ -264,7 +268,7 @@ fn ordered_factories_reject_zero_component_configuration() {
     ] {
         let result = UnifiedTreeCore::<Vec<i64>>::with_component_factories(
             params,
-            vec!["full".to_owned(), key.to_owned()],
+            vec!["full_default".to_owned(), key.to_owned()],
         );
         assert!(matches!(
             result,

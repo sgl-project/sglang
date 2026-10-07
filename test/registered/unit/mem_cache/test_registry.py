@@ -346,7 +346,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
 
         ctx = _make_ctx(self)
         ctx.params.req_to_token_pool = SimpleNamespace(req_to_c128_sidecar=object())
-        ctx.params.component_registry_override = {ComponentType.FULL: "full"}
+        ctx.params.component_registry_override = {ComponentType.FULL: "full_default"}
         with patch.dict(python_components._PYTHON_TREE_COMPONENT_REGISTRY):
             for _ in range(2):
                 create_unified_radix_cache(ctx, cache_class=MagicMock())
@@ -355,7 +355,10 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             )
             self.assertEqual(
                 ctx.params.component_registry_override,
-                {ComponentType.FULL: "full", ComponentType.C128: "c128_sidecar"},
+                {
+                    ComponentType.FULL: "full_default",
+                    ComponentType.C128: "c128_sidecar",
+                },
             )
             self.assertIs(
                 python_components.get_python_tree_component("c128_sidecar"),

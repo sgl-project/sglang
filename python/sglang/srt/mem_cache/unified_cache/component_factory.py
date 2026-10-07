@@ -11,45 +11,36 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.components.base import TreeComponent
 
 DEFAULT_COMPONENT_FACTORY_KEYS: dict[ComponentType, str] = {
-    ComponentType.FULL: "full",
-    ComponentType.SWA: "swa",
-    ComponentType.MAMBA: "mamba",
+    ComponentType.FULL: "full_default",
+    ComponentType.SWA: "swa_default",
+    ComponentType.MAMBA: "mamba_default",
 }
 
 
 def resolve_component_factory_keys(
     params: CacheInitParams,
 ) -> dict[ComponentType, str | type[TreeComponent]]:
-    """Resolve component selectors while preserving legacy Python class inputs."""
+    """Merge factory keys while preserving legacy Python class inputs."""
     overrides = params.component_registry_override or {}
     active = params.tree_components or ()
     for component_type, selector in overrides.items():
-        if not isinstance(selector, type) and component_type not in active:
-            raise ValueError(
-                f"component_registry_override targets inactive {component_type}"
-            )
-    result = {}
-    for component_type in active:
-        selector = overrides.get(
-            component_type,
-            DEFAULT_COMPONENT_FACTORY_KEYS.get(component_type, component_type),
-        )
-        if isinstance(selector, ComponentType):
-            if selector != component_type:
-                raise ValueError(
-                    f"component_registry_override cannot use {selector.name} "
-                    f"for {component_type.name}"
-                )
-            if selector not in DEFAULT_COMPONENT_FACTORY_KEYS:
-                raise ValueError(f"No default component factory for {selector.name}")
-            selector = DEFAULT_COMPONENT_FACTORY_KEYS[selector]
         if isinstance(selector, str):
             if not selector.strip():
                 raise ValueError("Component factory key must be non-empty")
+            if component_type not in active:
+                raise ValueError(
+                    f"component_registry_override targets inactive {component_type}"
+                )
         elif not isinstance(selector, type):
             raise TypeError(
-                "component_registry_override requires a factory name, "
-                "ComponentType, or Python component class"
+                "component_registry_override requires a factory name "
+                "or Python component class"
             )
-        result[component_type] = selector
-    return result
+    factory_keys: dict[ComponentType, str | type[TreeComponent]] = dict(
+        DEFAULT_COMPONENT_FACTORY_KEYS
+    )
+    factory_keys.update(overrides)
+    for component_type in active:
+        if component_type not in factory_keys:
+            raise ValueError(f"No default component factory for {component_type.name}")
+    return {component_type: factory_keys[component_type] for component_type in active}

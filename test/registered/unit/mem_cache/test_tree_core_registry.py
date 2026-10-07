@@ -116,7 +116,9 @@ class NamedComponentRegistryTest(CustomTestCase):
         self.assertIs(
             python_components.get_python_tree_component("test_full"), _StubFullComponent
         )
-        self.assertIsNotNone(python_components.get_python_tree_component("full"))
+        self.assertIsNotNone(
+            python_components.get_python_tree_component("full_default")
+        )
 
     def test_registration_is_idempotent_but_rejects_conflicting_names(self):
         for _ in range(2):
@@ -206,36 +208,34 @@ class NamedComponentRegistryTest(CustomTestCase):
             create_python_tree_components(
                 mock.Mock(),
                 _cache_init_params(
-                    component_registry_override={ComponentType.SWA: "swa"}
+                    component_registry_override={ComponentType.SWA: "swa_default"}
                 ),
             )
 
-    def test_component_selectors_reject_cross_kind_aliases_and_inactive_overrides(self):
-        for override in (
-            {ComponentType.FULL: ComponentType.SWA},
-            {ComponentType.SWA: "swa"},
-        ):
-            with (
-                self.subTest(override=override),
-                self.assertRaises(ValueError),
-            ):
+    def test_component_selectors_reject_enum_values(self):
+        for selector in (ComponentType.FULL, ComponentType.SWA):
+            with self.subTest(selector=selector), self.assertRaises(TypeError):
                 resolve_component_factory_keys(
-                    _cache_init_params(component_registry_override=override)
+                    _cache_init_params(
+                        component_registry_override={ComponentType.FULL: selector}
+                    )
                 )
 
-    def test_same_kind_enum_selects_builtin_factory(self):
-        params = _cache_init_params(
-            component_registry_override={ComponentType.FULL: ComponentType.FULL}
-        )
+    def test_override_merge_preserves_defaults_and_caller_input(self):
+        defaults = dict(DEFAULT_COMPONENT_FACTORY_KEYS)
+        overrides = {ComponentType.FULL: "test_full"}
+        params = _cache_init_params(component_registry_override=overrides)
+        params.tree_components = (ComponentType.FULL, ComponentType.SWA)
         self.assertEqual(
-            resolve_component_factory_keys(params), {ComponentType.FULL: "full"}
+            resolve_component_factory_keys(params),
+            {ComponentType.FULL: "test_full", ComponentType.SWA: "swa_default"},
         )
-        components = create_python_tree_components(mock.Mock(), params)
-        self.assertIs(
-            type(components[ComponentType.FULL]),
-            python_components.get_python_tree_component(
-                DEFAULT_COMPONENT_FACTORY_KEYS[ComponentType.FULL]
-            ),
+        self.assertEqual(DEFAULT_COMPONENT_FACTORY_KEYS, defaults)
+        self.assertEqual(overrides, {ComponentType.FULL: "test_full"})
+        params.component_registry_override = None
+        self.assertEqual(
+            resolve_component_factory_keys(params),
+            {ComponentType.FULL: "full_default", ComponentType.SWA: "swa_default"},
         )
 
 
@@ -299,9 +299,9 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
             tree_core_registry,
             "_registered_tree_components",
             return_value={
-                "full": int(ComponentType.FULL),
-                "swa": int(ComponentType.SWA),
-                "mamba": int(ComponentType.MAMBA),
+                "full_default": int(ComponentType.FULL),
+                "swa_default": int(ComponentType.SWA),
+                "mamba_default": int(ComponentType.MAMBA),
             },
         )
         self.native_registry = native_registry.start()
@@ -421,7 +421,7 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
         self.assertIsInstance(custom.components[ComponentType.FULL], _StubFullComponent)
         self.assertIs(
             type(default.components[ComponentType.FULL]),
-            python_components.get_python_tree_component("full"),
+            python_components.get_python_tree_component("full_default"),
         )
 
     def test_replacing_factory_affects_only_new_cache_instances(self):

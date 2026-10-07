@@ -82,7 +82,7 @@ Supported component sets are `[Full]`, `[Full, SWA]`, `[Full, Mamba]`, and `[Ful
 
 ## Named component overrides
 
-`CacheInitParams.component_registry_override` maps component kinds to factory names, for example `{ComponentType.FULL: "custom_full"}`. A same-kind enum selector, such as `{ComponentType.FULL: ComponentType.FULL}`, resolves to the built-in key `"full"`. Cross-kind enum aliases are rejected because component kinds identify fixed storage slots.
+`CacheInitParams.component_registry_override` maps component kinds to factory names, for example `{ComponentType.FULL: "custom_full"}`. Override values are strings or legacy Python component classes; `ComponentType` values are rejected. The resolver merges overrides into a copy of the default factory keys and selects only active component kinds.
 
 Three separate registries connect backend selection and component construction:
 
@@ -137,6 +137,6 @@ Python registration rejects conflicting factories unless `replace=True` is suppl
 
 Finish Python registration or replacement before constructing caches; Python factories must not mutate their registry during construction.
 
-The built-in keys are `full`, `swa`, and `mamba`; enum selectors resolve through those keys. Replacing a built-in Python factory selects Python because the native compatibility check requires its original class. No custom native implementation is enabled by default. New native behavior must be compiled into the extension; Python factories cannot turn arbitrary Python `TreeComponent` subclasses into native implementations.
+The built-in keys are `full_default`, `swa_default`, and `mamba_default`. Replacing a built-in Python factory selects Python because the native compatibility check requires its original class. No custom native implementation is enabled by default. New native behavior must be compiled into the extension; Python factories cannot turn arbitrary Python `TreeComponent` subclasses into native implementations.
 
 Overrides are programmatic configuration, not a server CLI flag. A registered radix-cache backend can populate `ctx.params.component_registry_override` before calling `create_unified_radix_cache(ctx)`; `--radix-cache-backend` selects that backend. Python registration must run in each scheduler process, for example through an installed `sglang.srt.plugins` entry point. The C128 and MLX factories supply named Python defaults while preserving explicit caller overrides.

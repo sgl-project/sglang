@@ -244,7 +244,7 @@ fn exercise_registered_component<K: TreeComponentKey>(key: K) {
         )
         .unwrap();
     let snapshot = registry
-        .snapshot(&["full".to_owned(), "counting".to_owned()])
+        .snapshot(&["full_default".to_owned(), "counting".to_owned()])
         .unwrap();
     let mut tc =
         UnifiedTreeCore::with_component_factory_snapshot(CacheInitParams::default(), snapshot)

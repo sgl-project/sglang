@@ -144,7 +144,7 @@ impl Default for TreeComponentRegistry {
         };
         registry
             .register_tree_component(
-                "full",
+                "full_default",
                 ComponentType::Full,
                 |_: &TreeComponentArgument<'_>| Ok(FullComponent),
                 false,
@@ -152,7 +152,7 @@ impl Default for TreeComponentRegistry {
             .unwrap();
         registry
             .register_tree_component(
-                "swa",
+                "swa_default",
                 ComponentType::Swa,
                 |argument: &TreeComponentArgument<'_>| {
                     if argument.params.swa_sliding_window_size.is_none() {
@@ -167,7 +167,7 @@ impl Default for TreeComponentRegistry {
             .unwrap();
         registry
             .register_tree_component(
-                "mamba",
+                "mamba_default",
                 ComponentType::Mamba,
                 |argument: &TreeComponentArgument<'_>| {
                     if argument.params.mamba_cache_chunk_size.is_none() {
@@ -314,9 +314,9 @@ pub fn registered_tree_components() -> HashMap<String, ComponentType> {
 
 pub fn default_factory_key(component_type: ComponentType) -> &'static str {
     match component_type {
-        ComponentType::Full => "full",
-        ComponentType::Swa => "swa",
-        ComponentType::Mamba => "mamba",
+        ComponentType::Full => "full_default",
+        ComponentType::Swa => "swa_default",
+        ComponentType::Mamba => "mamba_default",
     }
 }
 

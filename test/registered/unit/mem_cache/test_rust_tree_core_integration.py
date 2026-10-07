@@ -135,9 +135,9 @@ def test_match_on_the_empty_tree_returns_no_indices():
 
 
 @pytest.mark.parametrize("is_eagle", [False, True])
-@pytest.mark.parametrize("selector", [ComponentType.FULL, "full"])
+@pytest.mark.parametrize("factory_key", [None, "full_default"])
 def test_builtin_component_factory_constructs_native_cache_and_matches(
-    is_eagle, selector
+    is_eagle, factory_key
 ):
     cache = UnifiedRadixCache(
         CacheInitParams(
@@ -147,7 +147,9 @@ def test_builtin_component_factory_constructs_native_cache_and_matches(
             page_size=1,
             is_eagle=is_eagle,
             tree_components=(ComponentType.FULL,),
-            component_registry_override={ComponentType.FULL: selector},
+            component_registry_override=(
+                {ComponentType.FULL: factory_key} if factory_key is not None else None
+            ),
             tree_core_backend="rust",
         )
     )
@@ -168,14 +170,14 @@ def test_native_component_registry_is_read_only_and_independent(monkeypatch):
     )
     python_components.register_python_tree_component("test_python_only", FullComponent)
     expected = {
-        "full": int(ComponentType.FULL),
-        "swa": int(ComponentType.SWA),
-        "mamba": int(ComponentType.MAMBA),
+        "full_default": int(ComponentType.FULL),
+        "swa_default": int(ComponentType.SWA),
+        "mamba_default": int(ComponentType.MAMBA),
     }
     snapshot = mem_cache.registered_tree_components()
     assert snapshot == expected
     snapshot["test_python_only"] = int(ComponentType.FULL)
-    snapshot.pop("full")
+    snapshot.pop("full_default")
     assert mem_cache.registered_tree_components() == expected
     assert not hasattr(mem_cache, "register_tree_component")
     assert not hasattr(mem_cache, "TreeComponentBinding")
@@ -186,7 +188,7 @@ def test_native_factory_selection_constructs_independent_cores(is_eagle):
     cores = [
         _tree_core(
             is_eagle=is_eagle,
-            component_registry_override={ComponentType.FULL: "full"},
+            component_registry_override={ComponentType.FULL: "full_default"},
         )
         for _ in range(2)
     ]
@@ -214,7 +216,9 @@ def test_native_factory_selection_constructs_independent_cores(is_eagle):
 
 
 @pytest.mark.parametrize("is_bigram", [False, True])
-@pytest.mark.parametrize("factory_keys", [["full"], ["full", "swa"]])
+@pytest.mark.parametrize(
+    "factory_keys", [["full_default"], ["full_default", "swa_default"]]
+)
 def test_native_binding_derives_component_kinds_from_factory_keys(
     is_bigram, factory_keys
 ):
@@ -236,9 +240,9 @@ def test_native_binding_derives_component_kinds_from_factory_keys(
         ([], "component sets"),
         ([""], "must be non-empty"),
         (["missing"], "unknown component factory"),
-        (["full", "full"], "duplicate component type Full"),
-        (["swa"], "component sets"),
-        (["swa", "full"], "component sets"),
+        (["full_default", "full_default"], "duplicate component type Full"),
+        (["swa_default"], "component sets"),
+        (["swa_default", "full_default"], "component sets"),
     ],
 )
 def test_native_binding_rejects_invalid_factory_selections(
@@ -272,10 +276,10 @@ def test_native_binding_accepts_only_factory_key_strings(is_bigram, invalid_key)
     "tree_components, factory_key, message",
     [
         ((ComponentType.FULL,), "missing", "unknown component factory"),
-        ((ComponentType.FULL,), "swa", "expected FULL"),
+        ((ComponentType.FULL,), "swa_default", "expected FULL"),
         (
             (ComponentType.FULL, ComponentType.FULL),
-            "full",
+            "full_default",
             "duplicate component type Full",
         ),
     ],

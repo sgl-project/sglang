@@ -16,9 +16,9 @@ PythonTreeComponentFactory = (
     type[TreeComponent] | Callable[[PythonTreeComponentArgument], TreeComponent]
 )
 _DEFAULT_PYTHON_TREE_COMPONENT_FACTORIES: dict[str, PythonTreeComponentFactory] = {
-    "full": FullComponent,
-    "swa": SWAComponent,
-    "mamba": MambaComponent,
+    "full_default": FullComponent,
+    "swa_default": SWAComponent,
+    "mamba_default": MambaComponent,
 }
 _PYTHON_TREE_COMPONENT_REGISTRY = dict(_DEFAULT_PYTHON_TREE_COMPONENT_FACTORIES)
 

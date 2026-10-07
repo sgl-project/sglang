@@ -523,7 +523,7 @@ def build_fixture(
     tree_page_size: Optional[int] = None,
     mamba_cache_chunk_size: Optional[int] = None,
     component_registry_override: Optional[
-        dict[ComponentType, ComponentType | str | type[TreeComponent]]
+        dict[ComponentType, str | type[TreeComponent]]
     ] = None,
     tree_core_backend: Optional[str] = None,
 ):
