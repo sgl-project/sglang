@@ -16,6 +16,7 @@ from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
 from sglang.srt.distributed import parallel_state as ps
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
+    can_use_custom_all_reduce_v2,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp import comm
@@ -184,6 +185,8 @@ def test_custom_all_reduce_v2_stays_exact_around_fused_calls(dcp):
     group, _ = dcp
     if not envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
         pytest.skip("SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 is off")
+    if not can_use_custom_all_reduce_v2(group=group.cpu_group, device=group.device):
+        pytest.skip("custom all-reduce v2 does not serve this group")
     ca_comm = group.ca_comm
     # GroupCoordinator logs a failed custom all-reduce setup and carries on.
     assert isinstance(ca_comm, CustomAllReduceV2) and not ca_comm.disabled, (
