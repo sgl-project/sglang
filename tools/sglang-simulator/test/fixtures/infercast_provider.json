@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "contract": "infercast-forward-latency",
+  "supported_forward_modes": ["EXTEND", "MIXED"],
+  "cases": [
+    {
+      "id": "homogeneous_control",
+      "forward_mode": "EXTEND",
+      "requests": [
+        {"extend_length": 64, "past_kv_length": 128},
+        {"extend_length": 64, "past_kv_length": 128}
+      ]
+    },
+    {
+      "id": "page_boundary",
+      "forward_mode": "EXTEND",
+      "requests": [
+        {"extend_length": 63, "past_kv_length": 63},
+        {"extend_length": 64, "past_kv_length": 64},
+        {"extend_length": 65, "past_kv_length": 65},
+        {"extend_length": 64, "past_kv_length": 64}
+      ]
+    },
+    {
+      "id": "high_hit",
+      "forward_mode": "EXTEND",
+      "requests": [
+        {"extend_length": 1, "past_kv_length": 4096},
+        {"extend_length": 15, "past_kv_length": 2048},
+        {"extend_length": 16, "past_kv_length": 1024},
+        {"extend_length": 32, "past_kv_length": 1024}
+      ]
+    },
+    {
+      "id": "tail_chunk",
+      "forward_mode": "EXTEND",
+      "requests": [
+        {"extend_length": 1, "past_kv_length": 512},
+        {"extend_length": 63, "past_kv_length": 512},
+        {"extend_length": 64, "past_kv_length": 512},
+        {"extend_length": 128, "past_kv_length": 512}
+      ]
+    },
+    {
+      "id": "mixed",
+      "forward_mode": "MIXED",
+      "requests": [
+        {"extend_length": 1, "past_kv_length": 1024},
+        {"extend_length": 1, "past_kv_length": 1024},
+        {"extend_length": 126, "past_kv_length": 0},
+        {"extend_length": 128, "past_kv_length": 0}
+      ]
+    },
+    {
+      "id": "one_token_extend_not_decode",
+      "forward_mode": "EXTEND",
+      "requests": [
+        {"extend_length": 1, "past_kv_length": 63},
+        {"extend_length": 1, "past_kv_length": 65}
+      ]
+    },
+    {
+      "id": "token_delta",
+      "forward_mode": "EXTEND",
+      "requests": [
+        {"extend_length": 1, "past_kv_length": 128},
+        {"extend_length": 128, "past_kv_length": 128}
+      ]
+    }
+  ]
+}

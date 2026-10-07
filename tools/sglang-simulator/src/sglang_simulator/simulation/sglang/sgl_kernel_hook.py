@@ -1,5 +1,13 @@
+import importlib.util
 import sys
 import types
+from pathlib import Path
+
+
+class _SimulatorQuantizationConfig:
+    @staticmethod
+    def override_quantization_method(*_args, **_kwargs):
+        return None
 
 
 def install_load_utils_stub() -> None:
@@ -13,3 +21,36 @@ def install_load_utils_stub() -> None:
 
     module._load_architecture_specific_ops = lambda *args, **kwargs: None
     module._preload_cuda_library = lambda *args, **kwargs: None
+
+
+def install_quantization_stub() -> None:
+    """Avoid importing accelerator quantization kernels for dummy model loads."""
+    module_name = "sglang.srt.layers.quantization"
+    if module_name in sys.modules:
+        return
+
+    package_paths = {
+        path
+        for entry in sys.path
+        if (path := Path(entry) / "sglang/srt/layers/quantization").is_dir()
+    }
+    package_paths.update(
+        path
+        for root in Path(__file__).resolve().parents
+        if (path := root / "python/sglang/srt/layers/quantization").is_dir()
+    )
+    sglang_spec = importlib.util.find_spec("sglang")
+    if sglang_spec is not None and sglang_spec.submodule_search_locations is not None:
+        package_paths.update(
+            path
+            for root in sglang_spec.submodule_search_locations
+            if (path := Path(root) / "srt/layers/quantization").is_dir()
+        )
+
+    module = types.ModuleType(module_name)
+    module.__package__ = "sglang.srt.layers"
+    module.__path__ = [str(path) for path in sorted(package_paths)]
+    module.QUANTIZATION_METHODS = {"fp8": _SimulatorQuantizationConfig}
+    module.QuantizationConfig = _SimulatorQuantizationConfig
+    module.get_quantization_config = lambda *_args, **_kwargs: None
+    sys.modules[module_name] = module
