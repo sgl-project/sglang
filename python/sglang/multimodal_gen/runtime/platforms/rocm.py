@@ -17,7 +17,6 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import sglang.multimodal_gen.envs as envs
-from sglang.multimodal_gen.runtime.platforms.aiter import IS_GFX1250
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -25,6 +24,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     PlatformEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import is_gfx1250_supported
 
 logger = init_logger(__name__)
 
@@ -246,12 +246,12 @@ class RocmPlatform(Platform):
                     exc_info=True,
                 )
 
-        if IS_GFX1250:
+        if is_gfx1250_supported():
             count = cls._force_math_sdpa_in_attention(vae)
             if count > 0:
                 logger.info(
                     "Pinned %d VAE attention modules to the math SDPA backend "
-                    "(AOTriton faults above head_dim 256 on gfx1250)",
+                    "(AOTriton fails above head_dim 256 on gfx1250)",
                     count,
                 )
 
@@ -274,14 +274,10 @@ class RocmPlatform(Platform):
     def _force_math_sdpa_in_attention(module: torch.nn.Module) -> int:
         """Wrap VAE attention forwards so SDPA resolves to the math backend.
 
-        Both AOTriton backends fault for head_dim > 256 on gfx1250 while
-        reporting themselves usable, so torch never falls back on its own. VAE
-        attention is a single head over the channel count, which is above that
-        bound for every VAE here, and math is also the faster path at that
-        shape.
-
-        Matches on structure rather than class so diffusers' Attention and
-        sglang's own blocks are both covered.
+        On gfx1250, AOTriton's flash and mem_efficient SDPA backends fail when
+        head_dim > 256. On ROCm 10.0 (AOTriton 0.13.50) the VAE returns wrong
+        values with no error. On ROCm 10.1 (0.14.50) it raises
+        hipErrorProfilerNotInitialized after the full denoise.
         """
         count = 0
         for child in module.modules():
