@@ -521,7 +521,8 @@ class TestKVLocPlan(unittest.TestCase):
         """When the plan's first reader is a captured table, the table is built
         in that buffer -- no table of the plan's own, no copy -- and serves the
         plan's other readers; the same buffer again is left alone, and another
-        captured reader copies it rather than building again."""
+        captured reader copies it rather than building again; an eager reader
+        of the batch takes the batch's rows of it."""
         builds = []
         real = kv_index_translator.build_kv_read_table
 
@@ -539,6 +540,12 @@ class TestKVLocPlan(unittest.TestCase):
             table = plan.read_table(rows=bs + 1)
             self.assertEqual(table.ids.data_ptr(), captured.data_ptr())
             self.assertEqual(table.row_stride, captured.stride(0))
+            # An eager reader of the batch (fa3, trtllm_mha) gets the batch's
+            # rows of that table: its kernels size the batch by them.
+            eager = self.target.read_table(plan, rows=bs)
+            self.assertEqual(eager.ids.shape[0], bs)
+            self.assertEqual(eager.row_ids.numel(), bs)
+            self.assertEqual(eager.ids.data_ptr(), captured.data_ptr())
             width = table.ids.shape[1]
             reference = _reference(
                 self.req_to_token,

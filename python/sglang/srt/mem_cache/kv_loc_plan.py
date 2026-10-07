@@ -313,12 +313,13 @@ class KVLocPlan:
         read_extent)``, built on first use and shared by every reader of the
         iteration. ``rows`` past the plan's batch (a captured graph's padded
         lanes) are appended reading the sink, by copying, never by translating
-        again. On a sub-pool whose reads stay virtual (static, or DCP, where the
-        producing kernel selects this rank's share) it is the `req_to_token`
-        passthrough. ``stream`` is the first reader's CSR stream (no table yet),
-        packed from the gather that builds the table; ``into``, the first
-        reader's own capture-stable table, built in place to serve as the
-        plan's for this iteration."""
+        again; a reader that asks for ``rows`` gets exactly that many, a view of
+        a table a wider reader built. On a sub-pool whose reads stay virtual
+        (static, or DCP, where the producing kernel selects this rank's share)
+        it is the `req_to_token` passthrough. ``stream`` is the first reader's
+        CSR stream (no table yet), packed from the gather that builds the
+        table; ``into``, the first reader's own capture-stable table, built in
+        place to serve as the plan's for this iteration."""
         space = self._source.space(kind)
         table = self._read_tables.get(space.key)
         if table is None or (
@@ -331,6 +332,12 @@ class KVLocPlan:
         else:
             assert stream is None and into is None, (
                 "a stream or a destination goes to the table's first build"
+            )
+        if rows is not None and table.ids.shape[0] > rows:
+            # Built wider, for a captured graph's padded lanes: this reader's
+            # kernels size their batch by the table's rows.
+            table = msgspec.structs.replace(
+                table, ids=table.ids[:rows], row_ids=table.row_ids[:rows]
             )
         return table
 
