@@ -1055,6 +1055,26 @@ class SWAComponent(TreeComponent):
             host_indices = self._swa_kv_pool_host.alloc(num_tokens)
         return host_indices
 
+    def buffer_backup_keys(
+        self, node: UnifiedTreeNode, hash_values: list[str]
+    ) -> dict[PoolName, list[str]]:
+        # Buffer mode stages the node's own SWA rows, one key per page from
+        # the chain's tail, so admission needs no transfer (and no device op).
+        if not self.tree_core.is_host_memory_buffer_only:
+            return {}
+        cd = node.component_data[self.component_type]
+        if not self.tree_core.has_swa_host_pool or cd.value is None:
+            return {PoolName.SWA: []}
+        rows = (
+            node.component_data[BASE_COMPONENT_TYPE].value
+            if self._unified_allocator() is not None
+            else cd.value
+        )
+        num_pages = len(rows) // self._swa_kv_pool_host.page_size
+        if num_pages == 0 or num_pages > len(hash_values):
+            return {PoolName.SWA: []}
+        return {PoolName.SWA: list(hash_values[-num_pages:])}
+
     def build_hicache_transfers(
         self,
         node: UnifiedTreeNode,
