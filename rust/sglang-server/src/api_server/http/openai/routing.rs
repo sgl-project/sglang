@@ -69,3 +69,77 @@ impl PDRouting {
         request.disagg_prefill_dp_rank = self.disagg_prefill_dp_rank;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn list_routing_preserves_pairing_and_dp_hints_across_choices() {
+        // mini_lb injects scalars; the GPU fixture does not cover lists or
+        // distinguish nonzero DP hints in its single-rank topology.
+        let fields: PDRoutingFields = serde_json::from_value(json!({
+            "bootstrap_host": ["prefill-a", "prefill-b"],
+            "bootstrap_port": [8998, null],
+            "bootstrap_room": [9007199254740993_i64, 9007199254740995_i64],
+            "routed_dp_rank": 1,
+            "disagg_prefill_dp_rank": 3,
+        }))
+        .unwrap();
+        let routing = fields.into_routing(2, 2).unwrap();
+        let requests = [0, 0, 1, 1].map(|prompt_index| {
+            let mut request = GenerateRequest::default();
+            routing.apply(&mut request, prompt_index);
+            request
+        });
+        assert_eq!(
+            requests.each_ref().map(|r| r.bootstrap_host.as_deref()),
+            [
+                Some("prefill-a"),
+                Some("prefill-a"),
+                Some("prefill-b"),
+                Some("prefill-b")
+            ]
+        );
+        assert_eq!(
+            requests.each_ref().map(|r| r.bootstrap_port),
+            [Some(8998), Some(8998), None, None]
+        );
+        assert_eq!(
+            requests.each_ref().map(|r| r.bootstrap_room),
+            [
+                Some(9007199254740993),
+                Some(9007199254740993),
+                Some(9007199254740995),
+                Some(9007199254740995)
+            ]
+        );
+        assert!(requests.iter().all(|r| r.routed_dp_rank == Some(1)));
+        assert!(requests.iter().all(|r| r.disagg_prefill_dp_rank == Some(3)));
+    }
+
+    #[test]
+    fn null_list_elements_are_rejected_except_for_ports() {
+        for body in [
+            r#"{"bootstrap_host":[null]}"#,
+            r#"{"bootstrap_room":[null]}"#,
+        ] {
+            assert!(serde_json::from_str::<PDRoutingFields>(body).is_err());
+        }
+    }
+
+    #[test]
+    fn host_clone_budget_includes_choices_for_scalars_and_lists() {
+        // 263173 bytes fit in the native one-choice budget, but 255 choices
+        // exceed 64 MiB. A one-element list must not bypass the same limit.
+        let host = "x".repeat(263173);
+        for value in [json!(host), json!([host])] {
+            let fields: PDRoutingFields =
+                serde_json::from_value(json!({"bootstrap_host": value})).unwrap();
+            let error = fields.into_routing(1, 255).err().unwrap().to_string();
+            assert!(error.contains("bootstrap_host"), "{error}");
+            assert!(error.contains("would allocate more than"), "{error}");
+        }
+    }
+}
