@@ -44,6 +44,9 @@ _PREFILL_BASE_CTA_TARGET = 1024
 LOW_RATIO_PAGE_TABLE_BUCKET = 64
 # AITER varctx cta_info row: [batch_packed, chunk_start, chunk_count, ctx_len].
 _DECODE_CTA_INFO_WIDTH = 4
+# Row-group decode: a request's verify rows share each key load from this many requests up;
+# below it each row scoring as its own sequence is faster (gfx950, H = 32, 8K..64K context).
+_ROWGROUP_MIN_GROUPED_SEQS = 4
 
 # Budget for the pooled prefill logits block, in MiB. Rows are split to fit it
 # (see `logits_rows_per_chunk`), so this caps the indexer's transient footprint
@@ -64,6 +67,17 @@ class FP4DecodeWorkspace(NamedTuple):
     # Held only so AITER's schedule scratch never returns to the graph memory
     # pool: the captured builder writes it again on every replay.
     schedule_scratch: torch.Tensor
+
+
+class FP4RowgroupDecodeWorkspace(NamedTuple):
+    """Decode workspace of the schedule-free row-group kernel."""
+
+    guarded_page_table: torch.Tensor
+    max_seq_len: int
+    # sequence b's rows are query_start_loc[b] .. [b + 1] - 1, rows_per_seq each,
+    # all on page-table row query_start_loc[b]
+    query_start_loc: torch.Tensor
+    rows_per_seq: int
 
 
 class FP4PrefillWorkspace(NamedTuple):
@@ -242,6 +256,33 @@ def prepare_fp4_decode_workspace(
     )
 
 
+def prepare_fp4_rowgroup_decode_workspace(
+    page_table: torch.Tensor,
+    rows_per_request: int,
+    page_table_bucket: int = 4,
+) -> FP4RowgroupDecodeWorkspace:
+    """The decode workspace of the row-group logits kernel: the padded page table and the
+    rows' sequences, no schedule. ``rows_per_request`` consecutive rows belong to one
+    request (one page-table row, non-decreasing bounds); they score as one sequence once
+    there are enough requests, else every row is its own. Capture-safe."""
+    guarded, max_seq_len = _guard_page_table(
+        page_table, page_table_bucket=page_table_bucket
+    )
+    rows = guarded.shape[0]
+    grouped = (
+        rows_per_request > 1
+        and rows % rows_per_request == 0
+        and rows // rows_per_request >= _ROWGROUP_MIN_GROUPED_SEQS
+    )
+    rows_per_seq = rows_per_request if grouped else 1
+    query_start_loc = torch.arange(
+        0, rows + 1, rows_per_seq, dtype=torch.int32, device=guarded.device
+    )
+    return FP4RowgroupDecodeWorkspace(
+        guarded, max_seq_len, query_start_loc, rows_per_seq
+    )
+
+
 def prepare_fp4_prefill_workspace(
     page_table: torch.Tensor,
     c4_seq_lens: torch.Tensor,
@@ -307,6 +348,53 @@ def prepare_fp4_prefill_workspace(
     return workspace
 
 
+def _rowgroup_decode_logits(
+    *,
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_payload: torch.Tensor,
+    k_scale: torch.Tensor,
+    weights: torch.Tensor,
+    weight_scale: float,
+    workspace: FP4RowgroupDecodeWorkspace,
+    row_ends: torch.Tensor,
+) -> torch.Tensor:
+    """Decode logits from AITER's row-group kernel over a row-group workspace."""
+    from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4, make_fp4_mqa_plan
+
+    num_rows, heads = q_fp4.shape[0], q_fp4.shape[-2]
+    q = workspace.rows_per_seq
+    max_seq_len = workspace.max_seq_len
+    plan = make_fp4_mqa_plan(
+        num_seqs=num_rows // q,
+        max_qlen=q,
+        num_rows=num_rows,
+        heads=heads,
+        page_size=_KV_BLOCK_SIZE,
+        max_seq_len=max_seq_len,
+    )
+    # past each row's bound the logits are left unwritten; the length-aware top-k never reads them
+    logits = _alloc_logits(num_rows, max_seq_len, q_fp4.device, is_decode=True)
+    flydsl_pa_mqa_logits_fp4(
+        q_fp4.view(torch.uint8).reshape(num_rows, 1, heads, _HEAD_DIM // 2),
+        q_scale.reshape(num_rows, 1, *_Q_SCALE_SHAPE),
+        k_payload.view(torch.uint8),
+        k_scale,
+        workspace.guarded_page_table[::q],
+        weights,
+        None,
+        max_seq_len,
+        weight_scale=weight_scale,
+        kv_block_size=_KV_BLOCK_SIZE,
+        out=logits,
+        row_ends=row_ends,
+        query_start_loc=workspace.query_start_loc,
+        max_query_len=q,
+        plan=plan,
+    )
+    return logits
+
+
 def aiter_fp4_paged_mqa_logits(
     *,
     q_fp4: torch.Tensor,
@@ -318,7 +406,9 @@ def aiter_fp4_paged_mqa_logits(
     c4_seq_lens: torch.Tensor,
     weight_scale: float,
     is_decode: bool,
-    decode_workspace: Optional[FP4DecodeWorkspace] = None,
+    decode_workspace: Optional[
+        Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace]
+    ] = None,
     prefill_workspace: Optional[FP4PrefillWorkspace] = None,
     page_table_bucket: int = 4,
 ) -> torch.Tensor:
@@ -335,6 +425,17 @@ def aiter_fp4_paged_mqa_logits(
     # can leave it stale, in which case fall back to building the schedule here.
     if workspace is not None and workspace.guarded_page_table.shape[0] != num_tokens:
         workspace = None
+    if is_decode and isinstance(workspace, FP4RowgroupDecodeWorkspace):
+        return _rowgroup_decode_logits(
+            q_fp4=q_fp4,
+            q_scale=q_scale,
+            k_payload=k_payload,
+            k_scale=k_scale,
+            weights=weights,
+            weight_scale=weight_scale,
+            workspace=workspace,
+            row_ends=c4_seq_lens,
+        )
     # Built on the fallback path below; kept in scope so the schedule scratch
     # outlives the logits kernel that reads it.
     fallback_schedule = None

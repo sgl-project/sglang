@@ -4,7 +4,7 @@ payload / scale index-K pools, then the top-k v2 transform -- the DeepGEMM path'
 from __future__ import annotations
 
 import itertools
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -22,6 +22,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     LOW_RATIO_PAGE_TABLE_BUCKET,
     FP4DecodeWorkspace,
     FP4PrefillWorkspace,
+    FP4RowgroupDecodeWorkspace,
     aiter_fp4_paged_mqa_logits,
     index_q_rope_pack_weights_flydsl,
     indexer_head_weights,
@@ -29,11 +30,13 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     pack_fp4_query_flydsl,
     prepare_fp4_decode_workspace,
     prepare_fp4_prefill_workspace,
+    prepare_fp4_rowgroup_decode_workspace,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
     index_k_norm_rope_pack_store_split,
 )
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     _as_int_list,
 )
@@ -100,8 +103,26 @@ def _indexer_inputs(layer, x, q_lora, pos):
 
 def build_low_ratio_decode_workspaces(
     metadata_by_ratio: Dict[int, PagedIndexerMetadata],
-) -> Dict[int, FP4DecodeWorkspace]:
-    """Capture-safe: everything the schedule kernel touches is pinned in the workspace."""
+    *,
+    num_requests: Optional[int] = None,
+) -> Dict[int, Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace]]:
+    """Capture-safe: everything the schedule kernel touches is pinned in the workspace.
+    With the row-group kernel there is no schedule; a request's rows (``num_requests``
+    requests of equal row counts, consecutive: decode 1, target-verify its draft rows)
+    score as one sequence."""
+    if envs.SGLANG_HIP_FP4_INDEXER_ROWGROUP.get():
+        workspaces = {}
+        for ratio, meta in metadata_by_ratio.items():
+            rows = meta.page_table.shape[0]
+            rows_per_request = (
+                rows // num_requests if num_requests and rows % num_requests == 0 else 1
+            )
+            workspaces[ratio] = prepare_fp4_rowgroup_decode_workspace(
+                meta.page_table,
+                rows_per_request,
+                page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+            )
+        return workspaces
     return {
         ratio: prepare_fp4_decode_workspace(
             meta.page_table,

@@ -29,6 +29,7 @@ from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     FP4KWriteMetadata,
+    FP4RowgroupDecodeWorkspace,
     _decode_cta_count,
     _guard_page_table,
     aiter_fp4_paged_mqa_logits,
@@ -40,6 +41,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     prepare_fp4_decode_workspace,
     prepare_fp4_k_write_metadata,
     prepare_fp4_prefill_workspace,
+    prepare_fp4_rowgroup_decode_workspace,
     read_fp4_index_k_split,
     store_fp4_index_k_cache_split,
 )
@@ -776,6 +778,80 @@ def test_prefill_paged_mqa_logits(batch: int, seq_len: int) -> None:
     logits = _run_logits(case, is_decode=False, prefill_ws=workspace)
 
     _assert_logits_agree(logits, case)
+
+
+def _verify_rows_case(case, rows_per_request: int):
+    """Each request's row as the last ``rows_per_request`` causal rows of a target-verify
+    step: page table, Q and weights repeated per row, bounds ramping up to the context."""
+    q = rows_per_request
+    offs = torch.arange(q - 1, -1, -1, device=get_device(), dtype=torch.int32)
+    row_ends = (case["context"][:, None] - offs[None, :]).clamp_min(0).reshape(-1)
+
+    def rep(t):
+        return t.repeat_interleave(q, dim=0).contiguous()
+
+    return {
+        **case,
+        "q_fp4": rep(case["q_fp4"].view(torch.uint8)).view(case["q_fp4"].dtype),
+        "q_scale": rep(case["q_scale"]),
+        "weights": rep(case["weights"]),
+        "page_table": rep(case["page_table"]),
+        "c4_seq_lens": row_ends.contiguous(),
+        "context": row_ends.contiguous(),
+        "ref_logits_fp4": rep(case["ref_logits_fp4"]),
+        "ref_logits_bf16": rep(case["ref_logits_bf16"]),
+    }
+
+
+@pytest.mark.parametrize(
+    "batch,seq_len,rows_per_request",
+    [(1, 256, 1), (3, 512, 6), (4, 512, 6), (6, 1024, 6), (8, 2048, 1)],
+)
+def test_rowgroup_decode_logits_match_varctx(
+    batch: int, seq_len: int, rows_per_request: int
+) -> None:
+    """The row-group decode path agrees with the varctx kernel within tolerance and picks the
+    same top-k; a request's rows scored as one sequence or one a row are bit for bit equal."""
+    torch.manual_seed(batch * 300 + seq_len + rows_per_request)
+    case = _verify_rows_case(
+        _build_logits_case(batch, seq_len, shuffle_pages=True), rows_per_request
+    )
+    varctx = _run_logits(
+        case,
+        is_decode=True,
+        decode_ws=prepare_fp4_decode_workspace(case["page_table"], case["c4_seq_lens"]),
+    )
+    grouped_ws = prepare_fp4_rowgroup_decode_workspace(
+        case["page_table"], rows_per_request
+    )
+    per_row_ws = prepare_fp4_rowgroup_decode_workspace(case["page_table"], 1)
+    assert isinstance(grouped_ws, FP4RowgroupDecodeWorkspace)
+    assert grouped_ws.max_seq_len == (
+        prepare_fp4_decode_workspace(
+            case["page_table"], case["c4_seq_lens"]
+        ).max_seq_len
+    )
+    grouped = _run_logits(case, is_decode=True, decode_ws=grouped_ws)
+    per_row = _run_logits(case, is_decode=True, decode_ws=per_row_ws)
+
+    for row, ctx in enumerate(case["context"].tolist()):
+        if ctx == 0:
+            continue
+        assert torch.equal(grouped[row, :ctx], per_row[row, :ctx]), f"row {row}"
+        torch.testing.assert_close(
+            grouped[row, :ctx],
+            case["ref_logits_fp4"][row, :ctx],
+            rtol=2.0e-3,
+            atol=2.0e-3,
+        )
+        torch.testing.assert_close(
+            grouped[row, :ctx], varctx[row, :ctx], rtol=1e-5, atol=1e-6
+        )
+        k = min(64, ctx)
+        assert torch.equal(
+            grouped[row, :ctx].topk(k).indices.sort().values,
+            varctx[row, :ctx].topk(k).indices.sort().values,
+        ), f"row {row} top-{k}"
 
 
 @pytest.mark.parametrize("is_decode", [True, False])

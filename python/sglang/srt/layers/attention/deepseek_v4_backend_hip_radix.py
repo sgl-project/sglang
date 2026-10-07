@@ -119,6 +119,7 @@ if TYPE_CHECKING:
         FP4DecodeWorkspace,
         FP4KWriteMetadata,
         FP4PrefillWorkspace,
+        FP4RowgroupDecodeWorkspace,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -659,9 +660,9 @@ class DSV4Metadata:
     # Per-step scratch for the TP-padded query heads (models/deepseek_v4.py).
     q_pad_buffer: Optional[torch.Tensor] = None
     # low-ratio FlyDSL indexer workspaces by ratio; address-pinned like the c4 ones, rebuilt in place
-    fp4_low_ratio_decode_workspaces: Dict[int, FP4DecodeWorkspace] = field(
-        default_factory=dict, repr=False
-    )
+    fp4_low_ratio_decode_workspaces: Dict[
+        int, Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace]
+    ] = field(default_factory=dict, repr=False)
     fp4_low_ratio_prefill_workspaces: Dict[int, FP4PrefillWorkspace] = field(
         default_factory=dict, repr=False
     )
@@ -1689,7 +1690,8 @@ class DeepseekV4HipRadixBackend(
                         if not low_ratio_decode_rows_are_identity(
                             self, forward_batch, ratio
                         )
-                    }
+                    },
+                    num_requests=forward_batch.batch_size,
                 )
             )
 

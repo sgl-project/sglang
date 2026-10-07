@@ -1614,6 +1614,9 @@ class Envs:
     SGLANG_HIP_SHARED_ACT_MXFP8 = EnvBool(_default_hip)
     SGLANG_HIP_WO_A_MXFP8 = EnvBool(_default_hip)
     SGLANG_HIP_FFN_NORM_MXFP8 = EnvBool(_default_hip)
+    # V4.1 low-ratio decode / target-verify indexer: score with aiter's schedule-free row-group
+    # FP4 MQA logits kernel, a request's verify rows sharing each key load.
+    SGLANG_HIP_FP4_INDEXER_ROWGROUP = EnvBool(_default_hip)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
