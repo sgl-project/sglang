@@ -45,7 +45,7 @@
 //                      `builder` metadata (topologySummary, errors, warnings,
 //                      verification, resolvedSettings). UI-only scope/expand and
 //                      local head-address/rank state never enter the URL hash.
-//   cells              {match, verified?, verificationStatus?, nnodes?, dockerImage?, warn?, redirect?,
+//   cells              {match, verified?, verificationStatus?, nnodes?, warn?, redirect?,
 //                      env, flags}[] — one per
 //                      (hw × match dims); env/flags are flat literals, only
 //                      {{PLACEHOLDER}} subst applied. `nnodes` supplies the node
@@ -79,7 +79,6 @@
 //                      override the page value per cell (entry → config → "P50").
 //                      Legacy "Mean" data is being re-measured to P50; drop once done
 //   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
-//   cells[].dockerImage optional — pins a role-specific build before dockerImages lookup
 //   dockerImages       optional — `docker run` image, keyed by
 //                      `hw|variant|quant` then `variant|quant` then
 //                      `hw|quant|strategy` then `hw|quant` then `hw`;
@@ -843,7 +842,7 @@ export const Deployment = ({ config, benchmarks }) => {
       // new-variant preview image); the strategy key covers a tier that needs
       // one (e.g. a spec-decoding preview image).
       const di = config.dockerImages || {};
-      const image = cell.dockerImage || di[`${sel.hw}|${sel.variant}|${sel.quant}`]
+      const image = di[`${sel.hw}|${sel.variant}|${sel.quant}`]
         || di[`${sel.variant}|${sel.quant}`]
         || di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
         || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";

@@ -1283,32 +1283,13 @@ sglang serve ... \
 
 Two further limits are worth knowing before you size a run. The pool is a per-node process, so a worker that spans nodes would shard its keyspace by node. And under PD disaggregation the §3.8 pairs run the linker on the prefill role only, so the decode worker offloads nothing; in aggregated serving the single worker offloads its own KV.
 
-### 3.10 PD disaggregation on GB300 (Mooncake)
+### 3.10 Mooncake unified-cache external linker on GB300
 
-The GB300 Pro Official FP4 recipes provide separate prefill and decode roles.
-Both selections are marked **Not Verified** because the standalone SGLang
-workers and router configuration have not been validated on GPUs.
-
-#### Roles and cache settings
-
-Select **GB300 → Pro Official → FP4 → Disagg Prefill → Low-Latency → 2 Nodes**,
-then launch the command on both prefill nodes with ranks 0 and 1. Select
-**Disagg Decode → 4 Nodes** and launch on all four decode nodes with ranks 0–3.
-Each node has four GB300 GPUs. Set **Head node IP** separately for each worker;
-it is the first node of that worker, not the Mooncake master.
-
-The **Unified Cache External Linker** card appears on the GB300 prefill recipe
-and defaults to **enabled, Mooncake**. It adds
-`--hicache-storage-backend-extra-config '{"enable_group_semantics":true}'`.
-Turning it off removes its flags and store environment. Enabling it removes
-HiCache flags because the two cache paths are mutually exclusive. The GB300
-decode recipe does not enable the linker. This UI scope reflects this recipe;
-the linker itself also supports aggregated serving.
+On the existing **GB300 → Pro Official → FP4** aggregated recipe, the Playground's **Unified Cache External Linker** card can select Mooncake. The card is **off by default**: start the Mooncake master and stores before enabling it, then set **Mooncake master**, **Mooncake metadata**, and **This node fabric IP** in the command panel's **Env** dialog. Enabling the linker adds `--enable-unified-cache-external-linker`, selects the `mooncake` backend, sets the 140 GB RDMA segment, and adds `--hicache-storage-backend-extra-config '{"enable_group_semantics":true}'`. It removes HiCache flags because the two cache paths are mutually exclusive.
 
 #### Mooncake prerequisites
 
-Use the pinned image for the services and workers. Start a master with HTTP
-metadata enabled before any stores or inference workers:
+Run the services in `lmsysorg/sglang:nightly-dev-cu13-20260916-c9a8fba9` or an image with the same Mooncake components. Start the master with HTTP metadata enabled before any stores or inference workers:
 
 <Accordion title="Start the Mooncake master (on the infrastructure host)">
 
@@ -1321,18 +1302,15 @@ mooncake_master --port=50051 \
 
 </Accordion>
 
-Start **four separate stores on each decode node**, with ports 8800–8803 and
-180 GB per store. Prefill contributes a 140 GB segment per rank, with
-`MOONCAKE_STANDALONE_STORAGE=0`. The NIC list below is the source recipe's list;
-check that those devices exist on your fabric.
+Start **four separate stores on each decode node**, with ports 8800–8803 and 180 GB per store. The NIC list below comes from the source deployment; check that those devices exist on your fabric.
 
 <Accordion title="Start one decode-node store (repeat for ports 8800–8803)">
 
 ```bash Command
-export MOONCAKE_MASTER=<master-ip>:50051
-export MOONCAKE_TE_META_DATA_SERVER=http://<master-ip>:8080/metadata
-export MOONCAKE_LOCAL_HOSTNAME=<this-node-fabric-ip>
-export MC_TCP_BIND_ADDRESS=<this-node-fabric-ip>
+export MOONCAKE_MASTER="<master-ip>:50051"
+export MOONCAKE_TE_META_DATA_SERVER="http://<master-ip>:8080/metadata"
+export MOONCAKE_LOCAL_HOSTNAME="<this-node-fabric-ip>"
+export MC_TCP_BIND_ADDRESS="<this-node-fabric-ip>"
 export MOONCAKE_PROTOCOL=rdma
 export MOONCAKE_DEVICE=mlx5_0,mlx5_1,mlx5_2,mlx5_3
 export MOONCAKE_GLOBAL_SEGMENT_SIZE=180gb
@@ -1345,15 +1323,177 @@ python3 -m mooncake.mooncake_store_service --port 8800
 
 </Accordion>
 
-Wait for every store to be ready; the source recipe permits 600 seconds for
-cold starts. Set **Mooncake master**, **Mooncake metadata**, and **This node
-fabric IP** in the command panel's **Env** dialog on each prefill node. Advertise
-the routable fabric address explicitly: a BMC interface must not become the
-transfer-engine address. Docker output includes host networking, RDMA device
-access, and unlimited memlock.
+Wait for every store to be ready; the source deployment allows 600 seconds for cold starts. Advertise each node's routable fabric address, not its BMC address. The aggregated command builder exposes the three Mooncake addresses above without changing its verified base cell.
 
-After both roles are ready, the Playground prints an SGLang router command
-targeting prefill port **30000** and decode port **30100**, with client traffic
-on **8000**. Use its cURL example to reach that frontend. Its routing behavior
-differs from the source recipe's Dynamo session affinity; a successful source
-sweep does not qualify the standalone router adaptation.
+#### Standalone 1P1D reference (not verified)
+
+The following prefill and decode commands are **static, unverified standalone SGLang adaptations** of the source 1P1D deployment, which used a Dynamo frontend. They are intentionally outside the command builder and its verified benchmark matrix. Run each role on its own nodes with four GB300 GPUs per node; set `NODE_RANK=0` on the head node and increment it on the remaining nodes. The head IP is specific to each role.
+
+<Accordion title="Unverified prefill worker (2 nodes, ranks 0–1)">
+
+```bash Command
+export HEAD_IP="<prefill-head-ip>"
+export NODE_RANK=0  # Set to this worker node's rank
+export MOONCAKE_MASTER="<master-ip>:50051"
+export MOONCAKE_TE_META_DATA_SERVER="http://<master-ip>:8080/metadata"
+export MOONCAKE_LOCAL_HOSTNAME="<this-node-fabric-ip>"
+export SGLANG_ENABLE_PREFILL_WAR_READ_DONE=1
+export SGLANG_RAGGED_VERIFY_MODE=static
+export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=900
+export SGLANG_DSV4_MHC_PREWARM=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_JIT_DEEPGEMM_PRECOMPILE=1
+export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
+export SGLANG_DEFAULT_THINKING=1
+export SGLANG_DSV4_REASONING_EFFORT=high
+export SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1
+export SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1
+export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1
+export SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1
+export SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=17408
+export SGLANG_OPT_USE_ONLINE_COMPRESS=0
+export NCCL_MNNVL_ENABLE=1
+export NCCL_CUMEM_ENABLE=1
+export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True
+export MC_FORCE_MNNVL=1
+export NCCL_TIMEOUT=100000
+export NCCL_MNNVL_UUID_QUERY_TIMEOUT=100000
+export SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1
+export SGLANG_LOG_FORWARD_ITERS=1
+export SGLANG_LOG_MS=1
+export SGLANG_REQUEST_STATE_WAIT_TIMEOUT=60
+export SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH=1
+export MOONCAKE_PROTOCOL=rdma
+export MOONCAKE_DEVICE=mlx5_0,mlx5_1,mlx5_2,mlx5_3
+export MOONCAKE_GLOBAL_SEGMENT_SIZE=140gb
+export MOONCAKE_STANDALONE_STORAGE=0
+export MC_STORE_CLIENT_METRIC_INTERVAL=5
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
+export MC_TCP_BIND_ADDRESS="<this-node-fabric-ip>"
+sglang serve \
+  --trust-remote-code \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --enable-metrics \
+  --enable-cache-report \
+  --watchdog-timeout 86400 \
+  --stream-interval 60 \
+  --tp-size 8 \
+  --dp-size 8 \
+  --ep-size 8 \
+  --nnodes 2 \
+  --node-rank "$NODE_RANK" \
+  --dist-init-addr "${HEAD_IP}:20000" \
+  --enable-dp-attention \
+  --enable-dp-lm-head \
+  --moe-dense-tp-size 1 \
+  --moe-a2a-backend megamoe \
+  --enable-deepseek-v4-fp4-indexer \
+  --enable-w4a4-mxfp4-megamoe \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-mode prefill \
+  --load-balance-method total_tokens \
+  --mem-fraction-static 0.8 \
+  --page-size 256 \
+  --swa-full-tokens-ratio 0.02 \
+  --chunked-prefill-size 131072 \
+  --disable-flashinfer-autotune \
+  --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":8}' \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 6 \
+  --speculative-num-steps 1 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 7 \
+  --enable-unified-cache-external-linker \
+  --unified-cache-external-linker-backend mooncake \
+  --hicache-storage-backend-extra-config '{"enable_group_semantics":true}' \
+  --max-running-requests 256 \
+  --cuda-graph-max-bs-decode 256 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+</Accordion>
+
+<Accordion title="Unverified decode worker (4 nodes, ranks 0–3)">
+
+```bash Command
+export HEAD_IP="<decode-head-ip>"
+export NODE_RANK=0  # Set to this worker node's rank
+export SGLANG_RAGGED_VERIFY_MODE=static
+export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=900
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_JIT_DEEPGEMM_PRECOMPILE=1
+export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
+export SGLANG_DEFAULT_THINKING=1
+export SGLANG_DSV4_REASONING_EFFORT=high
+export SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1
+export SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1
+export SGLANG_OPT_DEEPGEMM_MEGA_MOE=1
+export SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096
+export SGLANG_OPT_USE_ONLINE_COMPRESS=0
+export NCCL_MNNVL_ENABLE=1
+export NCCL_CUMEM_ENABLE=1
+export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True
+export MC_FORCE_MNNVL=1
+export NCCL_TIMEOUT=100000
+export NCCL_MNNVL_UUID_QUERY_TIMEOUT=100000
+export SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1
+export SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION=8
+export SGLANG_LOG_FORWARD_ITERS=1
+export SGLANG_LOG_MS=1
+export SGLANG_REQUEST_STATE_WAIT_TIMEOUT=60
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
+sglang serve \
+  --trust-remote-code \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --enable-metrics \
+  --enable-cache-report \
+  --watchdog-timeout 86400 \
+  --stream-interval 60 \
+  --tp-size 16 \
+  --dp-size 16 \
+  --ep-size 16 \
+  --nnodes 4 \
+  --node-rank "$NODE_RANK" \
+  --dist-init-addr "${HEAD_IP}:20000" \
+  --enable-dp-attention \
+  --enable-dp-lm-head \
+  --moe-dense-tp-size 1 \
+  --moe-a2a-backend megamoe \
+  --enable-deepseek-v4-fp4-indexer \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-mode decode \
+  --load-balance-method total_tokens \
+  --mem-fraction-static 0.9 \
+  --page-size 256 \
+  --swa-full-tokens-ratio 0.02 \
+  --max-running-requests 3072 \
+  --disable-flashinfer-autotune \
+  --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":8}' \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 6 \
+  --speculative-num-steps 1 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 7 \
+  --cuda-graph-max-bs-decode 256 \
+  --host 0.0.0.0 \
+  --port 30100
+```
+
+</Accordion>
+
+After both roles are ready, a standalone SGLang router can direct requests to prefill port 30000 and decode port 30100, with client traffic on port 8000. Its routing behavior differs from the source Dynamo frontend and has not been GPU-validated with these workers.
+
+<Accordion title="Unverified standalone SGLang router">
+
+```bash Command
+export PREFILL_HEAD_IP="<prefill-head-ip>"
+export DECODE_HEAD_IP="<decode-head-ip>"
+python3 -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill "http://${PREFILL_HEAD_IP}:30000" 8998 \
+  --decode "http://${DECODE_HEAD_IP}:30100" \
+  --host 0.0.0.0 --port 8000
+```
+
+</Accordion>

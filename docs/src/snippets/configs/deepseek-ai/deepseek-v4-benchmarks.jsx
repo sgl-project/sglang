@@ -7,7 +7,7 @@ export const benchmarks = [
   // B200 + FP4
   // ====================================================================
   {
-    match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.16",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -17,7 +17,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.16",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
@@ -27,7 +27,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.16",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
@@ -37,7 +37,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -47,7 +47,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
@@ -57,7 +57,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
@@ -67,7 +67,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -77,7 +77,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
@@ -87,7 +87,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
@@ -100,7 +100,7 @@ export const benchmarks = [
   // B200 + NVFP4
   // ====================================================================
   {
-    match: { hw: "b200", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "b200", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -110,7 +110,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b200", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "b200", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -120,12 +120,12 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b200", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "b200", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "dev@07c8f7294",
     accuracy: { gsm8k_pct: 96.82, aime25_pct: 98.96 },
   },
   {
-    match: { hw: "b200", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "b200", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "dev@07c8f7294",
     accuracy: { gsm8k_pct: 96.44, aime25_pct: 98.33 },
   },
@@ -133,7 +133,7 @@ export const benchmarks = [
   // B300 + FP4
   // ====================================================================
   {
-    match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -143,7 +143,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
@@ -153,7 +153,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
@@ -163,7 +163,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -173,7 +173,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
@@ -185,7 +185,7 @@ export const benchmarks = [
   {
     // At conc 4096 the engine is saturated (running at its max batch), so extra requests
     // queue — the high TTFT is queue wait, not compute; throughput is at its ceiling here.
-    match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
@@ -198,7 +198,7 @@ export const benchmarks = [
   // B300 + NVFP4
   // ====================================================================
   {
-    match: { hw: "b300", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "b300", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -208,7 +208,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b300", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "b300", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -221,10 +221,10 @@ export const benchmarks = [
   // GB200 + FP4
   // ====================================================================
   {
-    match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
   },
   {
-    match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.12.post1",
     latencyPercentile: "Mean",
     speed: [
@@ -235,22 +235,22 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
   },
   {
-    match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2", pdMode: "unified" },
+    match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2" },
   },
   {
-    match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2", pdMode: "unified" },
+    match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
   },
   {
-    match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "multi-2", pdMode: "unified" },
+    match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
   },
   // ====================================================================
   // GB200 + NVFP4
   // ====================================================================
   {
-    match: { hw: "gb200", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb200", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "PR #25820",
     latencyPercentile: "Mean",
     speed: [
@@ -262,7 +262,7 @@ export const benchmarks = [
     accuracy: { gsm8k_pct: 96.66 },
   },
   {
-    match: { hw: "gb200", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2", pdMode: "unified" },
+    match: { hw: "gb200", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
     sglang_version: "PR #25820",
     latencyPercentile: "Mean",
     speed: [
@@ -277,7 +277,7 @@ export const benchmarks = [
   // GB300 + FP4
   // ====================================================================
   {
-    match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.16",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -288,7 +288,7 @@ export const benchmarks = [
     accuracy: { gpqa_pct: 87.03, aime25_pct: 96.25, gsm8k_pct: 97.04 },
   },
   {
-    match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.16",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
@@ -298,7 +298,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.16",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
@@ -308,7 +308,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -318,7 +318,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
@@ -328,7 +328,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
@@ -338,7 +338,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -348,7 +348,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
@@ -358,7 +358,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
@@ -384,7 +384,7 @@ export const benchmarks = [
   // cell IS from the shipped command. Re-measure when convenient.
   // ====================================================================
   {
-    match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "main @ 273d978bed",
     latencyPercentile: "Mean",
     speed: [
@@ -396,7 +396,7 @@ export const benchmarks = [
     accuracy: { gsm8k_pct: 96.13 },
   },
   {
-    match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "main @ 273d978bed",
     latencyPercentile: "Mean",
     speed: [
@@ -408,7 +408,7 @@ export const benchmarks = [
     accuracy: { gsm8k_pct: 96.44 },
   },
   {
-    match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "main @ 273d978bed",
     latencyPercentile: "Mean",
     speed: [
@@ -423,7 +423,7 @@ export const benchmarks = [
   // GB300 + NVFP4
   // ====================================================================
   {
-    match: { hw: "gb300", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -433,7 +433,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "gb300", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -446,7 +446,7 @@ export const benchmarks = [
   // H200 + FP8
   // ====================================================================
   {
-    match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -456,7 +456,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
@@ -466,7 +466,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
@@ -476,19 +476,19 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "multi-2", pdMode: "unified" },
+    match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "multi-2" },
   },
   {
-    match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "balanced", nodes: "multi-2", pdMode: "unified" },
+    match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "balanced", nodes: "multi-2" },
   },
   {
-    match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "high-throughput", nodes: "multi-2", pdMode: "unified" },
+    match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "high-throughput", nodes: "multi-2" },
   },
   // ====================================================================
   // H200 + FP4
   // ====================================================================
   {
-    match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.16",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -498,7 +498,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.16",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
@@ -508,7 +508,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.16",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
@@ -518,7 +518,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -528,7 +528,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
@@ -538,7 +538,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
@@ -548,7 +548,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -562,7 +562,7 @@ export const benchmarks = [
     // tok/s/GPU is pinned (~535-572) from conc 64 through the ht conc-4096 cell and the excess
     // concurrency just queues — P50 TTFT climbs to ~46s here and minutes at higher conc. The
     // throughput numbers are real but reflect that ceiling, not linear scaling.
-    match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
@@ -572,7 +572,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
@@ -585,7 +585,7 @@ export const benchmarks = [
   // H100 + FP4
   // ====================================================================
   {
-    match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -595,7 +595,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
@@ -605,7 +605,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
@@ -615,82 +615,82 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "h100", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2", pdMode: "unified" },
+    match: { hw: "h100", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2" },
   },
   {
-    match: { hw: "h100", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2", pdMode: "unified" },
+    match: { hw: "h100", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
   },
   {
-    match: { hw: "h100", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "multi-2", pdMode: "unified" },
+    match: { hw: "h100", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
   },
   // ====================================================================
   // MI300X + FP8 (Flash)
-  { match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single", pdMode: "unified" } },
+  { match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single" } },
   // MI355X + FP4 (Flash)
-  { match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" } },
+  { match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" } },
   // MI355X + FP8 (Flash)
-  { match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single", pdMode: "unified" } },
+  { match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single" } },
   // MI355X + FP4 (Pro)
-  { match: { hw: "mi355x", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "mi355x", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "mi355x", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" } },
+  { match: { hw: "mi355x", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "mi355x", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "mi355x", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" } },
   // MI355X + FP8 (Pro)
-  { match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "balanced", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "high-throughput", nodes: "single", pdMode: "unified" } },
+  { match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "high-throughput", nodes: "single" } },
   // ====================================================================
   // B200 + FP4 — Flash Vision (Exp)
   // ====================================================================
   {
-    match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "dev-dsv4-flash-vision",
     accuracy: { mmmu_pro_pct: 75.14 },
     notes: "MMMU-Pro (standard, 10-option) measured with sgl-eval on 4×B200 (TP=4) at temperature 1.0, top-p 0.95, --reasoning-effort max, with the bundled DSpark head enabled (--speculative-algorithm DSPARK).",
   },
   {
-    match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "PR #37253 @ 31854c3",
     accuracy: { mmmu_pro_pct: 74.10 },
     notes: "MMMU-Pro (standard, 10-option) measured with sgl-eval on 4×B200 (TP=4, DP=4, DeepEP) at temperature 1.0, top-p 0.95, --reasoning-effort max; target-only (DP Attention is incompatible with DSpark).",
   },
   {
-    match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "PR #37253 @ 31854c3",
     accuracy: { mmmu_pro_pct: 73.76 },
     notes: "MMMU-Pro (standard, 10-option) measured with sgl-eval on 4×B200 (TP=4, DP=4, MegaMoE) at temperature 1.0, top-p 0.95, --reasoning-effort max; target-only (DP Attention is incompatible with DSpark).",
   },
   // B300 / GB200 / H200 / H100 — Flash Vision (Exp), all pending
-  { match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" } },
+  { match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" } },
+  { match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" } },
   {
-    match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "PR #37253 @ 61f962c",
     accuracy: { mmmu_pro_pct: 74.10 },
     notes: "MMMU-Pro (standard, 10-option) measured with sgl-eval on 4×GB300 (TP=4) at temperature 1.0, top-p 0.95, --reasoning-effort max, with the bundled DSpark head enabled (--speculative-algorithm DSPARK).",
   },
   {
-    match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "PR #37253 @ 61f962c",
     accuracy: { mmmu_pro_pct: 73.41 },
     notes: "MMMU-Pro (standard, 10-option) measured with sgl-eval on 4×GB300 (TP=4, DP=4, DeepEP) at temperature 1.0, top-p 0.95, --reasoning-effort max; target-only (DP Attention is incompatible with DSpark).",
   },
   {
-    match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single", pdMode: "unified" },
+    match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "PR #37253 @ 61f962c",
     accuracy: { mmmu_pro_pct: 74.57 },
     notes: "MMMU-Pro (standard, 10-option) measured with sgl-eval on 4×GB300 (TP=4, DP=4, MegaMoE) at temperature 1.0, top-p 0.95, --reasoning-effort max; target-only (DP Attention is incompatible with DSpark).",
   },
-  { match: { hw: "h200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "h200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" } },
-  { match: { hw: "h100", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single", pdMode: "unified" } },
+  { match: { hw: "h200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "h200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "h100", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
 ];

@@ -23,10 +23,7 @@
 // `(rowValues, base) => [...]` for cross-row composition (e.g. preset x cluster
 // size); a function returning null means "leave the base untouched".
 // Changing the Deploy selection resets every axis back to inherit-from-base.
-//   pdDisagg     — role + transfer backend + IB device + optional router;
-//                  modesHideWhen hands matching selections' role to Deploy
-//   umbp        — external linker; backends accept hide/defaultWhen constraints;
-//                 roleOverrides may scope flags/env with a backend id
+//   pdDisagg     — role + transfer backend + IB device + optional router
 //   hicache     — enable + backend + write policy
 //   hisparse    — enable + host ratio (decode-only)
 //   flagSelects — generic: a config-declared LIST of single-selects, each with
@@ -380,12 +377,8 @@ export const Playground = ({ config }) => {
   const flagSpelling = (flags, heads, fallback) =>
     heads.find((head) =>
       (flags || []).some((f) => f.split(/[\s=]/)[0] === head)) || fallback;
-  // Older pinned builds use --enable-dp-attention plus the global DP size.
-  const dpAttnSizeIn = (flags) => parseIntFlagAny(flags, ATTN_DP_HEADS)
-    ?? (hasFlag(flags, "--enable-dp-attention")
-      ? (parseIntFlagAny(flags, DP_HEADS) ?? parseIntFlagAny(flags, TP_HEADS) ?? 1)
-      : null);
-  const dpAttnOnIn = (flags) => (dpAttnSizeIn(flags) ?? 1) > 1;
+  // DP-Attention is on when the attention DP size is above 1 (1 = off).
+  const dpAttnOnIn = (flags) => (parseIntFlagAny(flags, ATTN_DP_HEADS) ?? 1) > 1;
 
   // Insertion-anchor sets (priority-ordered; each includes siblings so
   // insertion still works in partial cells).
@@ -402,7 +395,7 @@ export const Playground = ({ config }) => {
     stripFlagsByFirstToken, stripEnvByPrefix, insertBeforeTail, insertAfter,
     parseIntFlag, hasFlag, findFlagArg,
     TP_HEADS, EP_HEADS, DP_HEADS, ATTN_DP_HEADS, parseIntFlagAny, flagSpelling,
-    dpAttnOnIn, dpAttnSizeIn,
+    dpAttnOnIn,
     ANCHOR_NEAR_MODEL_PATH, ANCHOR_NEAR_TP, ANCHOR_NEAR_DP,
     ANCHOR_NEAR_DPATTN, ANCHOR_NEAR_MOE,
   };
@@ -417,17 +410,22 @@ export const Playground = ({ config }) => {
     "--hicache-storage-backend-extra-config",
   ];
 
-  // A scoped Deploy role replaces the Playground's separate Mode selector.
-  const pdHasModeSelector = (fc, sel) => !!fc && (fc.modes || []).length > 0
-    && !(fc.modesHideWhen && matchConstraint(sel, fc.modesHideWhen));
-
-  // `umbp.roleOverrides: [{mode, when, backend?, enable, allowTp, env?, flags?, note?}]` —
+  // `umbp.roleOverrides: [{mode, when, enable, allowTp, env?, flags?, note?}]` —
   // first entry whose PD role and `when` match the live selection. `enable` is
   // the default when the reader has not toggled the card; `allowTp` lifts
   // requiresDpAttention; env / flags join the recipe while it is on.
-  const umbpRoleOverride = (fc, sel, h, backend) => (fc.roleOverrides || []).find((r) =>
-    r && sel && r.mode === sel.pdMode && (!backend || !r.backend || r.backend === backend)
+  const umbpRoleOverride = (fc, sel, h) => (fc.roleOverrides || []).find((r) =>
+    r && sel && r.mode === (sel.pdMode || "off")
       && (!r.when || h.matchConstraint(sel, r.when)));
+
+  const umbpBackend = (value, fc, sel, h, derived) => {
+    const visible = (fc.backends || []).filter((b) => !h.evaluateChip(b, sel).hidden);
+    const requested = value.backend || (derived && derived.backend);
+    return (visible.find((b) => b.id === requested)
+      || visible.find((b) => b.defaultWhen && h.matchConstraint(sel, b.defaultWhen))
+      || visible.find((b) => b.id === fc.defaultBackend)
+      || visible[0] || { id: fc.defaultBackend || "mori" }).id;
+  };
 
   // -------- Prefill-CP flag family (shared by the attention axis) --------
   // Every flag head that toggles/parameterizes prefill context parallelism:
@@ -489,7 +487,7 @@ export const Playground = ({ config }) => {
       // zigzag/interleave).
       deriveFromBase: (cell, fc, h) => {
         const flags = (cell && cell.flags) || [];
-        const dpVal = h.dpAttnSizeIn(flags);
+        const dpVal = h.parseIntFlagAny(flags, h.ATTN_DP_HEADS);
         const dpAttn = dpVal !== null ? dpVal : false;
         const cpSize = h.parseIntFlag(flags, "--attn-cp-size");
         return {
@@ -521,7 +519,7 @@ export const Playground = ({ config }) => {
           if (knobEntry("cp").freeSize) return null;
           const dpIntent = (value.dpAttn !== null && value.dpAttn !== undefined)
             ? value.dpAttn
-            : (h.dpAttnSizeIn(flags) ?? false);
+            : (h.parseIntFlagAny(flags, h.ATTN_DP_HEADS) ?? false);
           if (typeof dpIntent === "number" && dpIntent > 1) return null;
           return h.parseIntFlagAny(flags, h.TP_HEADS);
         };
@@ -585,7 +583,6 @@ export const Playground = ({ config }) => {
         if (dpForced) {
           flags = h.stripFlagsByFirstToken(flags, [
             ...h.ATTN_DP_HEADS,
-            "--enable-dp-attention",
             "--enable-dp-attention-local-control-broadcast",
           ]);
           // The cell's DP-only env would otherwise outlive the flags it tunes.
@@ -598,8 +595,6 @@ export const Playground = ({ config }) => {
           // Capture the spelling before stripping — the TP/EP handlers do the
           // same, and a lookup on the stripped array always hits the fallback.
           const dpHead = h.flagSpelling(flags, h.ATTN_DP_HEADS, "--attn-dp-size");
-          const legacyDp = h.hasFlag(flags, "--enable-dp-attention");
-          const globalDpHead = h.flagSpelling(flags, h.DP_HEADS, "--dp-size");
           // The local-control-broadcast companion only means anything with DP
           // attention on, so it has to go down with it — stripping just
           // `--attn-dp-size` would leave it orphaned in the command.
@@ -609,15 +604,11 @@ export const Playground = ({ config }) => {
             h.hasFlag(flags, "--enable-dp-attention-local-control-broadcast");
           flags = h.stripFlagsByFirstToken(flags, [
             ...h.ATTN_DP_HEADS,
-            "--enable-dp-attention",
-            ...(legacyDp && typeof value.dpAttn === "number" ? h.DP_HEADS : []),
             "--enable-dp-attention-local-control-broadcast",
           ]);
           if (typeof value.dpAttn === "number" && value.dpAttn > 0) {
             flags = h.insertAfter(flags, h.ANCHOR_NEAR_TP, [
-              ...(legacyDp
-                ? ["--enable-dp-attention", `${globalDpHead} ${value.dpAttn}`]
-                : [`${dpHead} ${value.dpAttn}`]),
+              `${dpHead} ${value.dpAttn}`,
               ...(hadLocalBroadcast
                 ? ["--enable-dp-attention-local-control-broadcast"] : []),
             ]);
@@ -762,7 +753,7 @@ export const Playground = ({ config }) => {
         // gate is applied to the emit branches, not to `mq` itself.
         const mq = fc.megamoeQuant;
         const mqActive = !!mq && !(mq.hideHw || []).includes(sel && sel.hw);
-        if (mq && (value.mmQuant !== null || value.backend !== null)) {
+        if (mq) {
           const quantKeys = [];
           const quantFlagHeads = [];
           for (const o of (mq.options || [])) {
@@ -1057,7 +1048,7 @@ export const Playground = ({ config }) => {
         const backends = fc.transferBackends || [];
         // A config that omits `modes` has the role on the Deploy panel instead;
         // this card then only tunes the transport for whatever role is selected.
-        const mode = pdHasModeSelector(fc, sel)
+        const mode = (fc.modes || []).length
           ? value.mode
           : ((sel && sel.pdMode) || "off");
 
@@ -1189,16 +1180,15 @@ export const Playground = ({ config }) => {
         if ((fc.incompatibleSpeculativeAlgorithms || []).includes(specAlgorithm)) {
           return null;
         }
-        const mode = context.h.findFlagArg(context.flags, "--disaggregation-mode");
-        if (mode === "prefill" || mode === "decode") {
-          return { pdMode: mode };
+        if (value.mode === "prefill" || value.mode === "decode") {
+          return { pdMode: value.mode };
         }
         return null;
       },
 
       render: ({ axisId, value, setValue, fc, base, s, h, renderSelect }) => {
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
-        const showModes    = pdHasModeSelector(fc, base);
+        const showModes    = (fc.modes            || []).length > 0;
         const showBackends = (fc.transferBackends || []).length > 0;
         const showIb       = (fc.ibDevices        || []).length > 0;
         if (!showModes && !showBackends && !showIb) return null;
@@ -1456,17 +1446,6 @@ export const Playground = ({ config }) => {
     // So enabling this strips the whole HiCache family instead of layering on
     // it, and it is declared after hicache so that strip runs last.
     umbp: {
-      // Backends use the same hide/defaultWhen constraints as PD transports.
-      // Both rendering and command composition must resolve the visible pick.
-      resolveBackend: (value, fc, sel, h, derived) => {
-        const visible = (fc.backends || []).filter((b) => !h.evaluateChip(b, sel).hidden);
-        const requested = value.backend || (derived && derived.backend);
-        return (visible.find((b) => b.id === requested)
-          || visible.find((b) => b.defaultWhen && h.matchConstraint(sel, b.defaultWhen))
-          || visible.find((b) => b.id === fc.defaultBackend)
-          || visible[0] || { id: fc.defaultBackend || "mori" }).id;
-      },
-
       initState: () => ({ enable: null, backend: null }),
 
       deriveFromBase: (cell, fc, h) => {
@@ -1478,29 +1457,20 @@ export const Playground = ({ config }) => {
       },
 
       apply: ({ flags, env, value, fc, sel, h, derived }) => {
-        if (fc.showWhen && !fc.showWhen(sel)) return { flags, env };
-        const backend = AXIS_HANDLERS.umbp.resolveBackend(value, fc, sel, h, derived);
-        const roleDefault = umbpRoleOverride(fc, sel, h);
-        const roleOverride = umbpRoleOverride(fc, sel, h, backend);
+        const roleOverride = umbpRoleOverride(fc, sel, h);
         const ownedHeads = [
           "--enable-unified-cache-external-linker",
           "--unified-cache-external-linker-backend",
           ...((fc.requiredFlags || []).map((f) => f.split(/\s/)[0])),
-          ...((roleDefault && roleDefault.flags) || []).map((f) => f.split(/\s/)[0]),
         ];
         flags = h.stripFlagsByFirstToken(flags, ownedHeads);
-        const ownedEnv = [...(fc.requiredEnv || []), ...((roleDefault && roleDefault.env) || [])];
+        const ownedEnv = [...(fc.requiredEnv || []), ...((roleOverride && roleOverride.env) || [])];
+        if (ownedEnv.length) {
+          env = h.stripEnvByPrefix(env, ownedEnv.map((e) => e.split("=")[0]));
+        }
         const enabled = value.enable !== null
           ? value.enable
-          : (roleDefault ? !!roleDefault.enable : !!(derived && derived.enable));
-        const extraEnv = [...(fc.requiredEnv || []), ...((roleOverride && roleOverride.env) || [])];
-        if (ownedEnv.length) {
-          const keys = ownedEnv.map((e) => e.split("=")[0]);
-          // Keep inherited values in place so an unchanged recipe does not
-          // display environment lines as removed and re-added at the tail.
-          env = env.filter((e) => !keys.includes(e.split("=")[0])
-            || (enabled && extraEnv.includes(e)));
-        }
+          : (roleOverride ? !!roleOverride.enable : !!(derived && derived.enable));
         if (!enabled) return { flags, env };
         if (fc.onlyHw && sel && !fc.onlyHw.includes(sel.hw)) return { flags, env };
         // The linker keys by DP rank; under pure TP each rank opens its own
@@ -1513,12 +1483,14 @@ export const Playground = ({ config }) => {
           return { flags, env };
         }
         flags = h.stripFlagsByFirstToken(flags, HICACHE_HEADS);
+        const backend = umbpBackend(value, fc, sel, h, derived);
         flags = h.insertBeforeTail(flags, [
           "--enable-unified-cache-external-linker",
           `--unified-cache-external-linker-backend ${backend}`,
           ...(fc.requiredFlags || []),
           ...((roleOverride && roleOverride.flags) || []),
         ]);
+        const extraEnv = [...(fc.requiredEnv || []), ...((roleOverride && roleOverride.env) || [])];
         env = [...env, ...extraEnv.filter((e) => !env.includes(e))];
         return { flags, env };
       },
@@ -1526,14 +1498,13 @@ export const Playground = ({ config }) => {
       render: ({ axisId, value, setValue, fc, base, s, h, renderChip, renderSelect, derived }) => {
         if (fc.onlyHw && !fc.onlyHw.includes(base.hw)) return null;
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
-        const backend = AXIS_HANDLERS.umbp.resolveBackend(value, fc, base, h, derived);
-        const roleDefault = umbpRoleOverride(fc, base, h);
-        const roleOverride = umbpRoleOverride(fc, base, h, backend);
+        const roleOverride = umbpRoleOverride(fc, base, h);
         const enabled = value.enable !== null
           ? value.enable
-          : (roleDefault ? !!roleDefault.enable : !!(derived && derived.enable));
+          : (roleOverride ? !!roleOverride.enable : !!(derived && derived.enable));
         const needsDp = !!fc.requiresDpAttention && !base.dpAttnOn
           && !(roleOverride && roleOverride.allowTp);
+        const backend = umbpBackend(value, fc, base, h, derived);
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
@@ -1753,7 +1724,7 @@ export const Playground = ({ config }) => {
     // force DP-Attention off in the attention axis, which composes earlier).
     const pdFc = pgFeatures.pdDisagg;
     const pdDelta = allDeltas.pdDisagg;
-    const pdRoleSel = (pdHasModeSelector(pdFc, sel) && pdDelta)
+    const pdRoleSel = (pdFc && (pdFc.modes || []).length && pdDelta)
       ? pdDelta.mode
       : ((sel && sel.pdMode) || "off");
     for (const [axisId, handler] of Object.entries(AXIS_HANDLERS)) {
@@ -1821,7 +1792,7 @@ export const Playground = ({ config }) => {
       // must resolve them too or it hands back an image that cannot run the
       // command.
       const di = config.dockerImages || {};
-      const image = cell.dockerImage || di[`${sel.hw}|${sel.variant}|${sel.quant}`]
+      const image = di[`${sel.hw}|${sel.variant}|${sel.quant}`]
         || di[`${sel.variant}|${sel.quant}`]
         || di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
         || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
@@ -1848,9 +1819,7 @@ export const Playground = ({ config }) => {
         mi350x: AMD_RDMA_DOCKER_FLAGS,
         mi355x: AMD_RDMA_DOCKER_FLAGS,
       };
-      const hardwareEntry = (config.hardware || []).find((entry) => entry.id === sel.hw);
-      const fabricFlags = (hardwareEntry && hardwareEntry.multiNodeDockerFlags)
-        || HW_MULTINODE_DOCKER_FLAGS[sel.hw] || [];
+      const fabricFlags = HW_MULTINODE_DOCKER_FLAGS[sel.hw] || [];
       // Mirrors the vendor branches in _deployment.jsx: ROCm reaches its GPUs
       // through /dev/kfd + /dev/dri and the video group (not --gpus all), and
       // Ascend NPUs are reached with --device, one per /dev/davinciN core (16
@@ -2542,7 +2511,7 @@ export const Playground = ({ config }) => {
   const constraintEffective = baseCell
     ? applyAllDeltas(baseCell.flags, baseCell.env, deltas, base, derivedMap)
     : null;
-  const pdCardOwnsMode = pdHasModeSelector(pgFeatures.pdDisagg, base);
+  const pdCardOwnsMode = ((pgFeatures.pdDisagg && pgFeatures.pdDisagg.modes) || []).length > 0;
   const pdMode = pdCardOwnsMode
     ? ((constraintEffective && constraintEffective.pdMode) || "off")
     : (base.pdMode || "off");
@@ -2663,7 +2632,7 @@ export const Playground = ({ config }) => {
 
   // PD-Disagg router, if configured. When a PD role is active, cURL retargets
   // to the router port and a companion router block renders below the command.
-  const pdRouter = (pgPdRole
+  const pdRouter = (pdMode !== "off"
     && resolveRouter(config.playgroundFeatures
       && config.playgroundFeatures.pdDisagg, base)) || null;
   const curlEnv = (pdRouter && pdRouter.port != null)
