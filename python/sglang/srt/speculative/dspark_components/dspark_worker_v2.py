@@ -561,9 +561,24 @@ class DSparkWorkerV2(BaseSpecWorker):
                             make_draft_sampler_capture_hook(self._draft_sampler)
                         )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
-            self._draft_worker.init_cuda_graphs(
-                capture_decode_cuda_graph=capture_decode_cuda_graph
+            # The persistent qh16/qseqlen4 kernel faults on the odd decode
+            # buckets (bs=30 was the first). Capture only bs=32 for this draft.
+            # The target keeps the full bucket list so a one-request verify
+            # replays its own graph instead of padding into the mamba buffer.
+            decode_cfg = get_exec().graph.cuda_graph_config.decode
+            saved_bs = decode_cfg.bs
+            narrow = bool(getattr(self, "_draft_mla_no_dcp", False)) and bool(
+                saved_bs
             )
+            if narrow:
+                decode_cfg.bs = [32] if 32 in list(saved_bs) else [max(saved_bs)]
+            try:
+                self._draft_worker.init_cuda_graphs(
+                    capture_decode_cuda_graph=capture_decode_cuda_graph
+                )
+            finally:
+                if narrow:
+                    decode_cfg.bs = saved_bs
 
     def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
         return maybe_build_draft_sampler(
