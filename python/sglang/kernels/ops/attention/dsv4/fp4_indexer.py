@@ -658,7 +658,10 @@ def _e2m1_decode(code):
 @triton.jit
 def _e8m0_decode(code):
     # code: uint 0..255 -> 2^(code - 127), written directly as the FP32 exponent
-    # field. Code 0 (never stored: the quantizer clamps to 1..254) gives 0.
+    # field. The scorer only sees codes 1..254: the quantizer clamps to that range
+    # and masked loads use 127. Code 0 gives 0 and 255 gives inf here, unlike
+    # _ue8m0_to_fp32 in dequant_k_cache.py, which follows torch.float8_e8m0fnu
+    # (2^-127 and NaN).
     return (code.to(tl.int32) << 23).to(tl.float32, bitcast=True)
 
 
