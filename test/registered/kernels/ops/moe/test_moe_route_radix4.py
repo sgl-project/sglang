@@ -102,7 +102,9 @@ def _oracle(scores, bias, renormalize, scaling):
 
 def _assert_matches_oracle(scores, bias, renormalize=True, scaling=2.5):
     ref_w, ref_ids = _oracle(scores, bias, renormalize, scaling)
-    w, ids = moe_route_radix4.route_radix4(scores, bias, TOPK, renormalize, scaling)
+    w, ids = moe_route_radix4.route_radix4(
+        scores, bias, TOPK, renormalize, scaling, fuse_sort=False
+    )
     # Column by column: the position a winner lands in is part of the contract.
     assert torch.equal(ids, ref_ids)
     # The kernel's sigmoid is an approximate hardware sequence (matched to
@@ -163,7 +165,9 @@ def test_route_radix4_nan_never_wins():
     # NaN sorts above every finite key under a raw monotone bit map, so without
     # the floor these two would be picked before the real winner.
     scores[:, 101] = 5.0
-    ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5)[1]
+    ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5, fuse_sort=False)[
+        1
+    ]
     assert not bool(((ids == 100) | (ids == 500)).any())
     _assert_matches_oracle(scores, bias)
 
@@ -185,7 +189,7 @@ def test_route_radix4_saturated_row():
     bias = torch.zeros(NUM_EXPERTS, dtype=torch.float32, device="cuda")
     scores = torch.full((2, NUM_EXPERTS), -200.0, dtype=torch.float32, device="cuda")
     scores[0, :16] = -120.0
-    w, _ = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5)
+    w, _ = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5, fuse_sort=False)
     assert torch.equal(w, torch.zeros_like(w))
     _assert_matches_oracle(scores, bias)
 
@@ -198,9 +202,13 @@ def test_route_radix4_reproducible():
     scores = torch.randn(512, NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
     bias = torch.zeros(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
 
-    first_w, first_ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5)
+    first_w, first_ids = moe_route_radix4.route_radix4(
+        scores, bias, TOPK, True, 2.5, fuse_sort=False
+    )
     for _ in range(16):
-        w, ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5)
+        w, ids = moe_route_radix4.route_radix4(
+            scores, bias, TOPK, True, 2.5, fuse_sort=False
+        )
         assert torch.equal(ids, first_ids)
         assert torch.equal(w, first_w)
 
@@ -233,7 +241,9 @@ def test_route_radix4_matches_aiter(dtype, renormalize):
     bias = torch.randn(NUM_EXPERTS, dtype=dtype, device="cuda", generator=generator)
 
     ref_w, ref_ids = _aiter_route(scores, bias, renormalize)
-    w, ids = moe_route_radix4.route_radix4(scores, bias, TOPK, renormalize, 2.5)
+    w, ids = moe_route_radix4.route_radix4(
+        scores, bias, TOPK, renormalize, 2.5, fuse_sort=False
+    )
     assert torch.equal(ids, ref_ids)
     torch.testing.assert_close(w, ref_w, rtol=1e-5, atol=1e-6)
 
@@ -252,7 +262,9 @@ def test_route_radix4_tie_order_is_aiters(pool):
         scores[row, torch.randperm(NUM_EXPERTS, generator=generator)[:pool]] = 4.0
 
     ref_w, ref_ids = _aiter_route(scores, bias)
-    w, ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5)
+    w, ids = moe_route_radix4.route_radix4(
+        scores, bias, TOPK, True, 2.5, fuse_sort=False
+    )
     assert torch.equal(ids, ref_ids)
     torch.testing.assert_close(w, ref_w, rtol=1e-5, atol=1e-6)
 
@@ -271,7 +283,9 @@ def test_route_radix4_tie_straddling_the_cutoff_matches_aiter():
         scores[row, perm[10:30]] = 1.0
 
     ref_w, ref_ids = _aiter_route(scores, bias)
-    w, ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5)
+    w, ids = moe_route_radix4.route_radix4(
+        scores, bias, TOPK, True, 2.5, fuse_sort=False
+    )
     assert torch.equal(ids, ref_ids)
     torch.testing.assert_close(w, ref_w, rtol=1e-5, atol=1e-6)
 
@@ -283,7 +297,9 @@ def test_route_radix4_graph_replay():
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        w, ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5)
+        w, ids = moe_route_radix4.route_radix4(
+            scores, bias, TOPK, True, 2.5, fuse_sort=False
+        )
     graph.replay()
     torch.cuda.synchronize()
 
