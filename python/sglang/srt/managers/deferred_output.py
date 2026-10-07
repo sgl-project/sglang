@@ -12,8 +12,15 @@ can keep a finished request from streaming until that work completes:
 
 The scheduler skips deferred requests when streaming, polls every source on
 each iteration and while idle, streams the requests a source releases, and
-does not report itself idle while a source has pending requests. All calls
-run on the scheduler thread.
+keeps polling instead of sleeping while a source has pending requests. All
+calls run on the scheduler thread.
+
+Held requests do not count against ``Scheduler.is_fully_idle``. Under tensor
+parallelism only the rank that streams outputs holds them, and idle-gated
+operations (cache flushes, memory release, storage attach) must see the same
+state on every rank. A held request has already released its KV cache, so a
+source must own the data it publishes. Sources are not supported with PD
+disaggregation.
 """
 
 from __future__ import annotations
