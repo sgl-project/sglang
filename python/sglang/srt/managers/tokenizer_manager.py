@@ -1352,6 +1352,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
+            self._validate_top_logprobs_num(obj)
             requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states
             )
@@ -1458,6 +1459,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"{token_id}; valid range is [0, {vocab_size})."
                 )
 
+    def _validate_top_logprobs_num(self, obj: GenerateReqInput) -> None:
+        # None is the unset default; normalize turns it into 0. A set value
+        # must be a width torch.topk can serve for this vocabulary.
+        if obj.top_logprobs_num is None:
+            return
+        check_top_logprobs_num(obj.top_logprobs_num, self.model_config.vocab_size)
+
     def _create_tokenized_object(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1489,7 +1497,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
-            check_top_logprobs_num(obj.top_logprobs_num, self.model_config.vocab_size)
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )

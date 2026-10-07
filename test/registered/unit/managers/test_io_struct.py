@@ -741,17 +741,36 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                 req.normalize_batch_and_arguments()
             self.assertEqual(req.text, "Hello")
 
+    def test_parallel_sampling_validates_every_request_n(self):
+        """A later request is bounded on its own, not by the first item.
+
+        The first item is beam search, so its n may exceed MAX_N. The second
+        is not, and the same n must 400 before either prompt is copied.
+        """
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[
+                {"n": MAX_N + 1, "beam_width": MAX_N + 8},
+                {"n": MAX_N + 1},
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, r"n must be an integer in \[1,"):
+            req.normalize_batch_and_arguments()
+        self.assertEqual(req.text, ["Hello", "World"])
+
     def test_tokenized_generate_rejects_top_logprobs_past_vocab(self):
-        """The tokenizer call site must reject a k torch.topk cannot serve."""
+        """Logprob validation must reject a k torch.topk cannot serve."""
         from types import SimpleNamespace
 
         from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
         vocab_size = 32
         manager = TokenizerManager.__new__(TokenizerManager)
-        manager.preferred_sampling_params = None
-        manager.sampling_params_class = SamplingParams
-        manager.tokenizer = None
+        manager.context_len = 128
+        manager.num_reserved_tokens = 0
+        manager.allow_auto_truncate = False
+        manager.validate_total_tokens = False
+        manager.is_generation = True
         manager.model_config = SimpleNamespace(vocab_size=vocab_size)
         req = GenerateReqInput(
             text="Hello",
@@ -759,7 +778,14 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             top_logprobs_num=vocab_size + 1,
         )
         with self.assertRaisesRegex(ValueError, "top_logprobs_num"):
-            manager._create_tokenized_object(req, "Hello", [1])
+            manager._validate_one_request(req, [1])
+
+        accepted = GenerateReqInput(
+            text="Hello",
+            sampling_params={},
+            top_logprobs_num=vocab_size,
+        )
+        manager._validate_one_request(accepted, [1])
 
     def test_parallel_sampling_preserves_reasoning_controls(self):
         single = GenerateReqInput(

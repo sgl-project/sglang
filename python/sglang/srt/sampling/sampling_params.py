@@ -48,21 +48,19 @@ MAX_N = 128
 logger = logging.getLogger(__name__)
 
 
-def check_n(n: Any) -> None:
-    """Reject a parallel-sample count that would replicate the prompt."""
+def check_n(n: Any, beam_width: Optional[int] = None) -> None:
+    """Reject an n that would replicate the prompt or slice beam results.
+
+    Beam search (beam_width > 1) does not replicate the prompt, so n is not
+    capped at MAX_N. It is stored as num_return and used as a slice, so 0
+    drops every sequence and a negative n drops from the end.
+    """
+    if beam_width is not None and beam_width > 1:
+        if type(n) is not int or n < 1:
+            raise ValueError(f"n must be an integer >= 1, got {n}.")
+        return
     if type(n) is not int or not 1 <= n <= MAX_N:
         raise ValueError(f"n must be an integer in [1, {MAX_N}], got {n}.")
-
-
-def check_beam_n(n: Any) -> None:
-    """Reject a non-positive beam n.
-
-    Beam search does not replicate the prompt, so n is not capped at MAX_N.
-    It is stored as num_return and used as a slice, so 0 drops every sequence
-    and a negative n drops from the end.
-    """
-    if type(n) is not int or n < 1:
-        raise ValueError(f"n must be an integer >= 1, got {n}.")
 
 
 def check_top_logprobs_num(value: Any, vocab_size: int) -> None:
@@ -266,12 +264,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                 f"top_k must be -1 (disable) or in [1, vocab_size({vocab_size})], "
                 f"got {self.top_k}."
             )
-        # A positive beam n is not a fan-out count. A non-positive one is
-        # still rejected: it becomes num_return.
-        if self.beam_width and self.beam_width > 1:
-            check_beam_n(self.n)
-        else:
-            check_n(self.n)
+        # Same bound io_struct applies before prompt replication.
+        check_n(self.n, self.beam_width)
         if not -2.0 <= self.frequency_penalty <= 2.0:
             raise ValueError(
                 f"frequency_penalty must be in [-2, 2], got {self.frequency_penalty}."
