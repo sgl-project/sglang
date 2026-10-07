@@ -393,9 +393,6 @@ class Conv3dLocalIsland(nn.Conv3d):
       but placements can be customized).
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
     def forward(self, input):
         if isinstance(input, DTensor):
             # NOTE: DTensor typing stubs are incomplete; at runtime DTensor has
@@ -487,21 +484,6 @@ class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.num_attention_heads = num_heads
         self.num_channels_latents = out_dim
         self.layer_names = ["blocks"]
-        self.cnt = 0
-        self.teacache_thresh = 0
-        self.coefficients = []
-        self.accumulated_rel_l1_distance = 0
-        self.previous_modulated_input = None
-        self.previous_resiual = None
-        self.previous_e0_even = None
-        self.previous_e0_odd = None
-        self.previous_residual_even = None
-        self.previous_residual_odd = None
-        self.is_even = False
-        self.should_calc_even = True
-        self.should_calc_odd = True
-        self.accumulated_rel_l1_distance_even = 0
-        self.accumulated_rel_l1_distance_odd = 0
         self.__post_init__()
 
     def _init_freqs(self):
