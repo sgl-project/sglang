@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -203,6 +204,28 @@ def test_matching_and_absent_versions_are_accepted(tmp_path: Path) -> None:
     other.mkdir()
     _write(other, stripped)
     assert _load(other, installed_versions={"cutedsl": "4.2.0"}) is not None
+
+
+def test_every_shipped_table_loads_under_another_package_version() -> None:
+    shipped = sorted(
+        (Path(gemm_config_store._PACKAGE_CONFIG_DIR) / "base_gemm").glob("*.json")
+    )
+    assert shipped
+    pattern = re.compile(
+        r"provider=(\w+),E=(\d+),N1=(\d+),N2=(\d+),K=(\d+),device_name=(.+)\.json"
+    )
+    for path in shipped:
+        key, experts, n1, n2, k, device = pattern.fullmatch(path.name).groups()
+        table = load_config_table(
+            key,
+            num_local_experts=int(experts),
+            n_gemm1=int(n1),
+            n_gemm2=int(n2),
+            k=int(k),
+            device_name=device,
+            installed_versions={"cutedsl": "0.0.0-not-the-recorded-one"},
+        )
+        assert table is not None, path.name
 
 
 if __name__ == "__main__":
