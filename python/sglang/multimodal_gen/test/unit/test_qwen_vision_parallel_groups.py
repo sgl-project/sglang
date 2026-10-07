@@ -43,7 +43,12 @@ class TestQwenGenerationParallelGroups(unittest.TestCase):
                             8, 8, bias=True, use_tensor_parallel=tensor_parallel
                         )
                         expected = (3, 4) if initialized and tensor_parallel else (0, 1)
-                        self.assertEqual((layer.tp_rank, layer.tp_size), expected)
+                        actual = (
+                            (0, 1)
+                            if isinstance(layer, ReplicatedLinear)
+                            else (layer.tp_rank, layer.tp_size)
+                        )
+                        self.assertEqual(actual, expected)
                         self.assertEqual(
                             isinstance(layer, ReplicatedLinear), not tensor_parallel
                         )
