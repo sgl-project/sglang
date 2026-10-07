@@ -99,7 +99,7 @@ class GlmOcrVisionBlock(nn.Module):
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
-            use_dp_attention_reduce=is_dp_attention_enabled(),
+            use_dp_attention_reduce=is_dp_attention_enabled() and not use_data_parallel,
         )
         self.mlp = GlmOcrVisionMLP(
             dim,

@@ -114,7 +114,7 @@ class Glm4vVisionMLP(nn.Module):
             prefix=add_prefix("down_proj", prefix),
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
-            use_dp_attention_reduce=is_dp_attention_enabled(),
+            use_dp_attention_reduce=is_dp_attention_enabled() and not use_data_parallel,
         )
         self.act_fn = SiluAndMul()
 
@@ -154,7 +154,7 @@ class Glm4vVisionBlock(nn.Module):
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
-            use_dp_attention_reduce=is_dp_attention_enabled(),
+            use_dp_attention_reduce=is_dp_attention_enabled() and not use_data_parallel,
         )
         self.mlp = Glm4vVisionMLP(
             dim,
@@ -274,7 +274,7 @@ class Glm4vPatchMerger(nn.Module):
             prefix=add_prefix("down_proj", prefix),
             tp_size=tp_size,
             tp_rank=tp_rank,
-            use_dp_attention_reduce=is_dp_attention_enabled(),
+            use_dp_attention_reduce=is_dp_attention_enabled() and not use_data_parallel,
         )
         self.extra_activation_func = nn.GELU()
 
