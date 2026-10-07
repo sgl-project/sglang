@@ -33,6 +33,8 @@ def build_flashinfer_kda_checkpoint_plan(
 
     checkpoint_counts = [length // chunk_size for length in extend_lens]
     checkpoint_starts = list(accumulate(checkpoint_counts, initial=0))
+    # NOTE(kpham-sgl): GDN writes all periodic checkpoints, then SGLang selects
+    # the tracked rows; KDA writes only mapped destinations (-1 skips a boundary).
     checkpoint_destinations = [-1] * checkpoint_starts[-1]
     num_tracked_checkpoints = 0
     for row, tracked in enumerate(track_mask):
