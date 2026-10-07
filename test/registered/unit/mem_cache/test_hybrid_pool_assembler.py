@@ -743,18 +743,16 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
     stack gains an INDEXER entry whose mirror and layer mapping cover only the
     DSA layers that own index buffers."""
 
-    def test_stack_declares_indexer_and_skips_empty_layers(self):
+    def _build_stack(self, kv_pool, *, drafts=(), hicache_size=0):
         from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
-        kv_pool = _dsa_pool_stub(layer_num=3)
-        kv_pool.skip_topk_layers = [False, True, False]  # device layer 1: no buffer
         mamba_pool = SimpleNamespace(layer_num=2, size=8)
         # transfer layers 0,2,4 are DSA (device 0,1,2), 1,3 are Mamba
         full_mapping = {0: 0, 2: 1, 4: 2}
         mamba_mapping = {1: 0, 3: 1}
         params = SimpleNamespace(
             page_size=64,
-            mtp_draft_device_pools=(),
+            mtp_draft_device_pools=drafts,
             token_to_kv_pool_allocator=None,
             tp_cache_group=None,
             attn_cp_cache_group=None,
@@ -767,8 +765,10 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
             ),
         )
         real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
+        kv_host_sizes = []
 
         def dummy_kv_host(**kwargs):
+            kv_host_sizes.append(kwargs["host_size"])
             return MLATokenToKVPoolHost(
                 kwargs["kv_pool"],
                 host_to_device_ratio=2,
@@ -806,10 +806,13 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
                 hybrid_pool_assembler, "_get_allocator_type", return_value="default"
             ),
             patch.object(
+                hybrid_pool_assembler, "_split_hicache_size", return_value=(20.0, 12.0)
+            ),
+            patch.object(
                 hybrid_pool_assembler,
                 "get_memory",
                 return_value=SimpleNamespace(
-                    hicache_size=0,
+                    hicache_size=hicache_size,
                     hicache_ratio=2,
                     hicache_mem_layout="page_first",
                     hicache_write_policy="write_through",
@@ -828,6 +831,13 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
                 storage_backend=None,
                 use_mla=True,
             )
+        (kv_host_size,) = kv_host_sizes
+        return group, config, kv_host_size
+
+    def test_stack_declares_indexer_and_skips_empty_layers(self):
+        kv_pool = _dsa_pool_stub(layer_num=3)
+        kv_pool.skip_topk_layers = [False, True, False]  # device layer 1: no buffer
+        group, config, _ = self._build_stack(kv_pool)
 
         names = [e.name for e in group.entries]
         self.assertEqual(names, [PoolName.KV, PoolName.INDEXER, PoolName.MAMBA])
@@ -843,6 +853,32 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
         self.assertEqual(
             [c.decl.pool_name for c in config.pools], [PoolName.KV, PoolName.INDEXER]
         )
+
+    def test_explicit_host_size_includes_declared_index_pools(self):
+        # The indexer host pool takes its token capacity from the KV host pool,
+        # so both must fit in the KV share of --hicache-size.
+        kv_pool = _dsa_pool_stub(layer_num=3)
+        kv_pool.skip_topk_layers = [False, True, False]
+        draft = _dsa_pool_stub(layer_num=1)
+        # One token's host bytes: bf16 576-wide KV rows on every target layer
+        # and the packed draft layer; 132-byte index rows only on the 2 live
+        # target layers and the draft layer.
+        for drafts, expected_kv, expected_index in (
+            ((), 576 * 2 * 3, 132 * 2),
+            ((draft,), 576 * 2 * 4, 132 * 3),
+        ):
+            with self.subTest(drafts=len(drafts)):
+                group, config, kv_host_size = self._build_stack(
+                    kv_pool, drafts=drafts, hicache_size=32
+                )
+                indexer = group.entry_map[PoolName.INDEXER].host_pool
+                self.assertEqual(indexer.size_per_token, expected_index)
+                self.assertAlmostEqual(
+                    kv_host_size, 20.0 * expected_kv / (expected_kv + expected_index)
+                )
+
+        _, _, kv_host_size = self._build_stack(kv_pool, hicache_size=0)
+        self.assertIsNone(kv_host_size)
 
 
 class TestDeclaredPoolPlanning(CustomTestCase):

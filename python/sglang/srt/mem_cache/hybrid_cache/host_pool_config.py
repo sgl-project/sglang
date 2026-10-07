@@ -252,6 +252,16 @@ def _kv_row_signature(pool: Any, *, use_mla: bool) -> tuple:
     return (pool.head_num, pool.head_dim, pool.v_head_dim, pool.store_dtype)
 
 
+def packed_kv_rows_match(
+    *, kv_pool: Any, drafts: tuple[Any, ...], use_mla: Optional[bool] = None
+) -> bool:
+    """Whether every draft KV row has the target's shape and dtype."""
+    if use_mla is None:
+        use_mla = is_mla_pool(kv_pool)
+    target = _kv_row_signature(kv_pool, use_mla=use_mla)
+    return all(_kv_row_signature(d, use_mla=use_mla) == target for d in drafts)
+
+
 def check_packed_kv_rows(
     *, kv_pool: Any, drafts: tuple[Any, ...], use_mla: Optional[bool] = None
 ):

@@ -198,6 +198,28 @@ def _split_hicache_size(
     )
 
 
+def _layout_root_budget_share(config: HostPoolGroupConfig) -> float:
+    """Fraction of the KV host budget left for KV rows.
+
+    Declared dependent pools (e.g. the DSA indexer) take their token capacity
+    from the KV host pool, so together they must fit in the KV share of
+    --hicache-size instead of allocating beyond it.
+    """
+    root, *dependents = config.pools
+    dependent_bytes = sum(
+        c.decl.storage_info.bytes_per_token_per_layer * len(c.layer_mapping)
+        for c in dependents
+    )
+    if not dependent_bytes:
+        return 1.0
+    # Only MLA pools declare dependents, and their host rows are kv_cache_dim.
+    kv_bytes = sum(
+        pool.kv_cache_dim * pool.store_dtype.itemsize * pool.layer_num
+        for pool in (root.decl.device_pool, *root.packed_draft_device_pools)
+    )
+    return kv_bytes / (kv_bytes + dependent_bytes)
+
+
 def build_pool_entry(
     *,
     name: PoolName,
@@ -1151,6 +1173,8 @@ def build_hybrid_mamba_stack(
             for b in pool.qsa_compressed_k_buffer_pool
         )
         kv_host_size *= kv_bytes / (kv_bytes + index_bytes)
+    if kv_host_size is not None:
+        kv_host_size *= _layout_root_budget_share(config)
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
