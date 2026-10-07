@@ -19,7 +19,10 @@ from diffusers.schedulers.scheduling_utils import (
 from diffusers.utils import deprecate
 
 from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
-from sglang.multimodal_gen.runtime.models.schedulers.unipc import UniPCSchedulerMixin
+from sglang.multimodal_gen.runtime.models.schedulers.unipc import (
+    UniPCSchedulerMixin,
+    compute_unipc_bh_coefficients,
+)
 
 
 class FlowUniPCMultistepScheduler(
@@ -373,27 +376,9 @@ class FlowUniPCMultistepScheduler(
         else:
             rks = torch.ones(1, device=device, dtype=h.dtype)
 
-        R = []
-        b = []
-
-        hh = -h if self.predict_x0 else h
-        h_phi_1 = torch.expm1(hh)  # h\phi_1(h) = e^h - 1
-        h_phi_k = h_phi_1 / hh - 1
-
-        factorial_i = 1
-
-        if self.config.solver_type == "bh1":
-            B_h = hh
-        elif self.config.solver_type == "bh2":
-            B_h = torch.expm1(hh)
-        else:
-            raise NotImplementedError()
-
-        for i in range(1, order + 1):
-            R.append(torch.pow(rks, i - 1))
-            b.append(h_phi_k * factorial_i / B_h)
-            factorial_i *= i + 1
-            h_phi_k = h_phi_k / hh - 1 / factorial_i
+        R, b, h_phi_1, B_h = compute_unipc_bh_coefficients(
+            h, rks, order, self.predict_x0, self.config.solver_type
+        )
 
         R = torch.stack(R)
         b = torch.stack(b)
@@ -532,27 +517,9 @@ class FlowUniPCMultistepScheduler(
             rks = torch.stack(rks_list + [torch.ones_like(rks_list[0])])
             D1s = torch.stack(D1s_list, dim=1) if len(D1s_list) > 0 else None
 
-        R = []
-        b = []
-
-        hh = -h if self.predict_x0 else h
-        h_phi_1 = torch.expm1(hh)  # h\phi_1(h) = e^h - 1
-        h_phi_k = h_phi_1 / hh - 1
-
-        factorial_i = 1
-
-        if self.config.solver_type == "bh1":
-            B_h = hh
-        elif self.config.solver_type == "bh2":
-            B_h = torch.expm1(hh)
-        else:
-            raise NotImplementedError()
-
-        for i in range(1, order + 1):
-            R.append(torch.pow(rks, i - 1))
-            b.append(h_phi_k * factorial_i / B_h)
-            factorial_i *= i + 1
-            h_phi_k = h_phi_k / hh - 1 / factorial_i
+        R, b, h_phi_1, B_h = compute_unipc_bh_coefficients(
+            h, rks, order, self.predict_x0, self.config.solver_type
+        )
 
         R = torch.stack(R)
         # Avoid torch.tensor(list_of_gpu_scalars) which syncs to host

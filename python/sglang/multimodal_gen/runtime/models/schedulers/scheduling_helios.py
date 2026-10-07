@@ -14,6 +14,9 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from sglang.multimodal_gen.runtime.models.schedulers.unipc import (
+    compute_unipc_bh_coefficients,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
@@ -406,26 +409,9 @@ class HeliosScheduler:
         rks.append(1.0)
         rks = torch.tensor(rks, device=device)
 
-        R = []
-        b = []
-
-        hh = -h if self.predict_x0 else h
-        h_phi_1 = torch.expm1(hh)
-        h_phi_k = h_phi_1 / hh - 1
-        factorial_i = 1
-
-        if self.config.solver_type == "bh1":
-            B_h = hh
-        elif self.config.solver_type == "bh2":
-            B_h = torch.expm1(hh)
-        else:
-            raise NotImplementedError()
-
-        for i in range(1, order + 1):
-            R.append(torch.pow(rks, i - 1))
-            b.append(h_phi_k * factorial_i / B_h)
-            factorial_i *= i + 1
-            h_phi_k = h_phi_k / hh - 1 / factorial_i
+        R, b, h_phi_1, B_h = compute_unipc_bh_coefficients(
+            h, rks, order, self.predict_x0, self.config.solver_type
+        )
 
         R = torch.stack(R)
         b = torch.tensor(b, device=device)
@@ -497,25 +483,9 @@ class HeliosScheduler:
         rks.append(1.0)
         rks = torch.tensor(rks, device=device)
 
-        R = []
-        b = []
-        hh = -h if self.predict_x0 else h
-        h_phi_1 = torch.expm1(hh)
-        h_phi_k = h_phi_1 / hh - 1
-        factorial_i = 1
-
-        if self.config.solver_type == "bh1":
-            B_h = hh
-        elif self.config.solver_type == "bh2":
-            B_h = torch.expm1(hh)
-        else:
-            raise NotImplementedError()
-
-        for i in range(1, order + 1):
-            R.append(torch.pow(rks, i - 1))
-            b.append(h_phi_k * factorial_i / B_h)
-            factorial_i *= i + 1
-            h_phi_k = h_phi_k / hh - 1 / factorial_i
+        R, b, h_phi_1, B_h = compute_unipc_bh_coefficients(
+            h, rks, order, self.predict_x0, self.config.solver_type
+        )
 
         R = torch.stack(R)
         b = torch.tensor(b, device=device)

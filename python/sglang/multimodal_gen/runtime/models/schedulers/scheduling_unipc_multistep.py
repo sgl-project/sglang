@@ -35,7 +35,10 @@ from diffusers.schedulers.scheduling_utils import (
 from diffusers.utils import deprecate, is_scipy_available
 
 from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
-from sglang.multimodal_gen.runtime.models.schedulers.unipc import UniPCSchedulerMixin
+from sglang.multimodal_gen.runtime.models.schedulers.unipc import (
+    UniPCSchedulerMixin,
+    compute_unipc_bh_coefficients,
+)
 
 if is_scipy_available():
     import scipy.stats
@@ -796,27 +799,9 @@ class UniPCMultistepScheduler(
         rks.append(torch.ones((), dtype=h.dtype, device=h.device))
         rks = torch.stack(rks).to(device=device)
 
-        R = []
-        b = []
-
-        hh = -h if self.predict_x0 else h
-        h_phi_1 = torch.expm1(hh)  # h\phi_1(h) = e^h - 1
-        h_phi_k = h_phi_1 / hh - 1
-
-        factorial_i = 1
-
-        if self.config.solver_type == "bh1":
-            B_h = hh
-        elif self.config.solver_type == "bh2":
-            B_h = torch.expm1(hh)
-        else:
-            raise NotImplementedError()
-
-        for i in range(1, order + 1):
-            R.append(torch.pow(rks, i - 1))
-            b.append(h_phi_k * factorial_i / B_h)
-            factorial_i *= i + 1
-            h_phi_k = h_phi_k / hh - 1 / factorial_i
+        R, b, h_phi_1, B_h = compute_unipc_bh_coefficients(
+            h, rks, order, self.predict_x0, self.config.solver_type
+        )
 
         R = torch.stack(R)
         b = torch.stack(b).to(device=device)
@@ -934,27 +919,9 @@ class UniPCMultistepScheduler(
         rks.append(torch.ones((), dtype=h.dtype, device=h.device))
         rks = torch.stack(rks).to(device=device)
 
-        R = []
-        b = []
-
-        hh = -h if self.predict_x0 else h
-        h_phi_1 = torch.expm1(hh)  # h\phi_1(h) = e^h - 1
-        h_phi_k = h_phi_1 / hh - 1
-
-        factorial_i = 1
-
-        if self.config.solver_type == "bh1":
-            B_h = hh
-        elif self.config.solver_type == "bh2":
-            B_h = torch.expm1(hh)
-        else:
-            raise NotImplementedError()
-
-        for i in range(1, order + 1):
-            R.append(torch.pow(rks, i - 1))
-            b.append(h_phi_k * factorial_i / B_h)
-            factorial_i *= i + 1
-            h_phi_k = h_phi_k / hh - 1 / factorial_i
+        R, b, h_phi_1, B_h = compute_unipc_bh_coefficients(
+            h, rks, order, self.predict_x0, self.config.solver_type
+        )
 
         R = torch.stack(R)
         b = torch.stack(b).to(device=device)

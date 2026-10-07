@@ -5,6 +5,38 @@ import numpy as np
 import torch
 
 
+def compute_unipc_bh_coefficients(
+    h: torch.Tensor,
+    rks: torch.Tensor,
+    order: int,
+    predict_x0: bool,
+    solver_type: str,
+):
+    """Build UniPC coefficients, leaving tensor assembly to each scheduler."""
+    R = []
+    b = []
+
+    hh = -h if predict_x0 else h
+    h_phi_1 = torch.expm1(hh)  # h\phi_1(h) = e^h - 1
+    h_phi_k = h_phi_1 / hh - 1
+    factorial_i = 1
+
+    if solver_type == "bh1":
+        B_h = hh
+    elif solver_type == "bh2":
+        B_h = torch.expm1(hh)
+    else:
+        raise NotImplementedError()
+
+    for i in range(1, order + 1):
+        R.append(torch.pow(rks, i - 1))
+        b.append(h_phi_k * factorial_i / B_h)
+        factorial_i *= i + 1
+        h_phi_k = h_phi_k / hh - 1 / factorial_i
+
+    return R, b, h_phi_1, B_h
+
+
 class UniPCSchedulerMixin:
     """Shared sample transforms and step state; subclasses own schedules and solvers."""
 
