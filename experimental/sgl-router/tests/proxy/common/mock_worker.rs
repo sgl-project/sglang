@@ -73,6 +73,7 @@ impl MockWorker {
         // "tiny" model the tests register a tokenizer + policy under.
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat))
+            .route("/v1/completions", post(chat))
             .route("/generate", post(generate))
             .route("/v1/embeddings", post(embeddings))
             .route("/v1/classify", post(classify))
@@ -401,6 +402,7 @@ impl MockWorker {
         };
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(error_handler))
+            .route("/generate", post(error_handler))
             .route("/server_info", get(serve_tiny_server_info))
             .route("/abort_request", abort_request_route(abort_log.clone()))
             .with_state(state);

@@ -63,6 +63,7 @@ fn router(
         let profile = EngineProfile {
             protocol: WireProtocol::default(),
             dp_ranks,
+            openai: None,
         };
         registry.add_with_cb(spec, None, profile).unwrap();
     }
