@@ -140,13 +140,15 @@ def test_admission_schedule_loop_and_workload_agree(admission, steps):
         device=torch.device("cuda"),
     )
     assert calls == list(range(steps)) and len(plans) == steps
+    # H3's velocity convention gives a +1 denoised target for a unit
+    # prediction from zero rows once the schedule reaches sigma=0.
     torch.testing.assert_close(
         video[branch.video_target_slice],
-        -torch.ones_like(video[branch.video_target_slice]),
+        torch.ones_like(video[branch.video_target_slice]),
     )
     torch.testing.assert_close(
         audio[branch.audio_target_slice],
-        -torch.ones_like(audio[branch.audio_target_slice]),
+        torch.ones_like(audio[branch.audio_target_slice]),
     )
 
 
