@@ -25,7 +25,7 @@ from sglang.kernels.cake_kernels._support import flashinfer_module_available
 from sglang.kernels.ops.moe.cake import cake_fused_topk_deepseek
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 OP = "moe.fused_topk_deepseek"
 
@@ -190,3 +190,84 @@ def test_single_group_topk_above_one_is_outside_the_contract(dtype):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def _fi_cake_routing_is_bit_exact() -> bool:
+    """True when the installed FlashInfer ships the bit-exact Cake routing kernels.
+
+    FlashInfer marks it with ``fused_routing_dsv3.CAKE_DSV3_ROUTING_BIT_EXACT``
+    (Cake CAKE-1009: tanh.approx sigmoid like the stock ``tanhf`` lowering, FP64
+    normalisation with a double scaling factor, one RN conversion, no fast-math).
+    """
+    from flashinfer.fused_moe import fused_routing_dsv3
+
+    return bool(getattr(fused_routing_dsv3, "CAKE_DSV3_ROUTING_BIT_EXACT", False))
+
+
+def _logits(profile, num_tokens, num_experts, device, gen):
+    if profile == "randn":
+        scores = torch.randn(num_tokens, num_experts, device=device, generator=gen)
+        bias = torch.randn(num_experts, device=device, generator=gen)
+        return scores, bias
+    # "real": RMS-normalised hidden states through a gate projection plus per-expert
+    # offsets (DeepSeek-V3 gate logit statistics), fp32 bias around +0.3.
+    hidden = torch.randn(num_tokens, 1024, device=device, generator=gen)
+    hidden = hidden * torch.rsqrt(hidden.pow(2).mean(-1, keepdim=True) + 1e-6)
+    gate = torch.randn(num_experts, 1024, device=device, generator=gen) * (1.7 / 32.0)
+    offsets = torch.randn(num_experts, device=device, generator=gen) * 0.5
+    scores = hidden @ gate.t() + offsets
+    bias = torch.randn(num_experts, device=device, generator=gen) * 0.6 + 0.3
+    return scores, bias
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("profile", ["randn", "real"])
+@pytest.mark.parametrize(
+    "num_tokens,params",
+    [
+        (64, (256, 8, 4, 8)),
+        (4096, (256, 8, 4, 8)),
+        (65536, (256, 8, 4, 8)),
+        (4096, (128, 4, 2, 4)),
+        (4096, (128, 1, 1, 1)),
+    ],
+)
+def test_route_is_bitwise_neutral_against_stock(num_tokens, params, dtype, profile):
+    """``SGLANG_CAKE_ROUTES=dsv3_grouped_routing`` changes no bit of the routing.
+
+    The facade (FlashInfer ``backend="cake"``) writes the same expert ids, weights
+    and routing replay as the stock ``backend="default"`` kernel on random and
+    real-logit inputs up to T=65536, so the opt-in route is logprob-neutral.
+    """
+    device = _skip_unless_supported()
+    if not _fi_cake_routing_is_bit_exact():
+        pytest.skip(
+            "installed FlashInfer predates the bit-exact Cake DeepSeek routing "
+            "(fused_routing_dsv3.CAKE_DSV3_ROUTING_BIT_EXACT)"
+        )
+    num_experts, n_group, topk_group, topk = params
+    gen = torch.Generator(device=device)
+    gen.manual_seed(num_tokens * 7 + num_experts)
+    scores, bias = _logits(profile, num_tokens, num_experts, device, gen)
+    scores = scores.to(dtype).contiguous()
+    bias = bias.to(dtype).contiguous()
+    scale = 2.5 if topk > 1 else 1.0
+
+    from flashinfer.fused_moe import fused_topk_deepseek as fi_fused_topk_deepseek
+
+    def run(call):
+        values = torch.empty(num_tokens, topk, dtype=dtype, device=device)
+        indices = torch.full((num_tokens, topk), -1, dtype=torch.int32, device=device)
+        replay = torch.full((num_tokens, topk), -1, dtype=torch.int16, device=device)
+        call(scores, bias, n_group, topk_group, topk, scale, values, indices, True, replay)
+        torch.cuda.synchronize()
+        return values, indices, replay
+
+    v_cake, i_cake, r_cake = run(cake_fused_topk_deepseek)
+    v_fi, i_fi, r_fi = run(
+        lambda *args: fi_fused_topk_deepseek(*args, backend="default")
+    )
+    assert torch.equal(i_cake, i_fi)
+    assert torch.equal(r_cake, r_fi)
+    int_view = torch.int32 if dtype == torch.float32 else torch.int16
+    assert torch.equal(v_cake.view(int_view), v_fi.view(int_view))
