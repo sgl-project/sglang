@@ -1926,6 +1926,10 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         note="Buffer-mode anchor pinning is always on; set "
         "SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP=0 to disable it."
     ),
+    "SGLANG_ENABLE_PREFILL_WAR_READ_DONE": _DeprecatedEnv(
+        note="Prefill read-done is on by default; set "
+        "SGLANG_FORCE_PREFILL_COARSE_WAR_BARRIER=1 to disable it."
+    ),
     # Replaced by CLI flags.
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": _DeprecatedEnv(
         note="Please use '--enable-prefill-delayer' instead."

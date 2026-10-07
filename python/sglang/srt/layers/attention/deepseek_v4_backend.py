@@ -2338,22 +2338,32 @@ class DeepseekV4AttnBackend(
 
         metadata = self.forward_metadata
         assert isinstance(metadata, DSV4Metadata)
-        # The tail never takes the sparse path, so it carries no chunk cache.
-        use_sparse_prefill = (
-            not get_platform().is_sm120
-            and metadata.late_layer_tail is None
-            and (
-                num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
-                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-            )
-        )
-        if use_sparse_prefill:
+        if self._use_sparse_prefill(forward_batch, num_qo_tokens=num_qo_tokens):
             metadata.sparse_prefill_cache = self._build_sparse_prefill_chunk_cache(
                 forward_batch, metadata.core_attn_metadata, num_qo_tokens=num_qo_tokens
             )
         # Dense prefill reads only core_attn_metadata, which metadata init has
         # already snapshotted, so it reaches the same boundary without a cache.
         return SharedReadEnds.PRE_REPLAY
+
+    def _use_sparse_prefill(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> bool:
+        # Shared by the snapshot hook and the forward; a forward that goes sparse
+        # without a snapshotted cache would read req_to_token after read-done.
+        # sparse_prefill_fwd does not support SM120. The tail stays dense: its
+        # window floor lives in swa_page_indices, which the chunk cache ignores.
+        return (
+            not self.trtllm_attn
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not get_platform().is_sm120
+            and self.forward_metadata.late_layer_tail is None
+            and self.token_to_kv_pool.request_window is None
+            and (
+                num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
+                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+            )
+        )
 
     def _build_sparse_prefill_chunk_cache(
         self,
@@ -3359,18 +3369,7 @@ class DeepseekV4AttnBackend(
                     f"{extra_indices.shape=}'s last dimension is not aligned to 64"
                 )
 
-            # sparse_prefill_fwd does not support SM120. The tail stays dense: its
-            # window floor lives in swa_page_indices, which the chunk cache ignores.
-            if (
-                forward_batch.forward_mode.is_extend_without_speculative()
-                and not get_platform().is_sm120
-                and self.forward_metadata.late_layer_tail is None
-                and token_to_kv_pool.request_window is None
-                and (
-                    q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-                    or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-                )
-            ):
+            if self._use_sparse_prefill(forward_batch, num_qo_tokens=q.shape[0]):
                 if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
                     return self._forward_prefill_sparse_q8kv8(
                         q=q,
