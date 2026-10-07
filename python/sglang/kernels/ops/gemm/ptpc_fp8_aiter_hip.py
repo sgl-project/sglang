@@ -43,6 +43,10 @@ def available() -> bool:
 
 
 def _pad_rows(weight: torch.Tensor) -> tuple[torch.Tensor, int, int]:
+    # Contiguous [N, K] so the transpose below is column-major. hipBLASLt
+    # accepts only row-major A times column-major B; calling contiguous() on
+    # the transpose turns B row-major and _scaled_mm raises.
+    weight = weight.contiguous()
     out_features, in_features = weight.shape
     padded = out_features + (-out_features) % _N_ALIGN
     if padded != out_features:
@@ -55,12 +59,17 @@ def _pad_rows(weight: torch.Tensor) -> tuple[torch.Tensor, int, int]:
     return weight, out_features, padded
 
 
+def _as_scaled_mm_weight(weight_nk: torch.Tensor) -> torch.Tensor:
+    """[N, K] contiguous FP8 -> [K, N] column-major, unshuffled."""
+    return weight_nk.t()
+
+
 def pack(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Quantize [out, in] BF16 -> ([K, N] FP8 weight, [1, N] scales, out).
 
     Returns the logical `out` alongside the padded tensors so `run` can slice
-    the padding away. The weight is unshuffled: ``torch._scaled_mm`` reads
-    ``[K, N]`` directly.
+    the padding away. The returned ``[K, N]`` weight is column-major:
+    hipBLASLt rejects a row-major B.
     """
     ops = _ops()
     if ops is None:
@@ -71,7 +80,7 @@ def pack(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
     weight, out_features, padded = _pad_rows(weight)
     quantized, scale = per_token_quant(weight.contiguous(), quant_dtype=fp8)
     return (
-        quantized.t().contiguous(),
+        _as_scaled_mm_weight(quantized),
         scale.reshape(1, padded).contiguous().float(),
         out_features,
     )
@@ -103,7 +112,7 @@ def pack_prequantized(
             [scale.reshape(-1), scale.reshape(-1).new_ones(padded - out_features)]
         )
     return (
-        weight.t().contiguous(),
+        _as_scaled_mm_weight(weight),
         scale.reshape(1, padded).contiguous().float(),
         out_features,
     )
