@@ -1414,6 +1414,11 @@ def run_dsa_sparse_fp8_decode_case(
     cache; `flashmla_sparse` and `fa3` decode kernels assert BF16 K and
     would fall back to the inline-quantize-of-bf16 path that production
     doesn't take in FP8 deployments."""
+    supported, reason = dsa_impl_capability(dsa_decode_backend)
+    if not supported:
+        testcase.skipTest(
+            f"DSA decode impl `{dsa_decode_backend}` not supported: {reason}"
+        )
     if dsa_decode_backend not in DSA_FP8_COMPATIBLE_DECODE_IMPLS:
         testcase.skipTest(
             f"DSA decode impl `{dsa_decode_backend}` does not support FP8 KV "
