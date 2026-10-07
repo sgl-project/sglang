@@ -50,19 +50,18 @@ def _flatten_qsa_kv_cache(cache: torch.Tensor, name: str) -> torch.Tensor:
     """Adapt NPU KV cache layouts to rank-3 physical-token pools.
 
     Sparse attention receives rank-3 [slots, heads, dim] caches.
-    NPU pools expose rank-4 paged or FIA layouts, requiring this NPU-only adapter.
+    This NPU-only adapter requires the rank-4 paged or FIA layouts exposed by
+    the pool; already flattened rank-3 inputs are not part of its contract.
     The conversion must share the original storage; incompatible strides raise
     instead of silently copying the KV pool.
     """
-    if cache.ndim == 3:
-        return cache
-    if cache.ndim == 4:
-        # [pages, page_size, heads, dim], including FIA's [slots, 1, heads, dim].
-        # Unlike flatten/reshape, view cannot silently allocate a copy.
-        return cache.view(
-            cache.shape[0] * cache.shape[1], cache.shape[2], cache.shape[3]
-        )
-    raise ValueError(f"{name} must be rank 3 or 4, got shape {tuple(cache.shape)}")
+    if cache.ndim != 4:
+        raise ValueError(f"{name} must be rank 4, got shape {tuple(cache.shape)}")
+    # [pages, page_size, heads, dim], including FIA's [slots, 1, heads, dim].
+    # Unlike flatten/reshape, view cannot silently allocate a copy.
+    return cache.view(
+        cache.shape[0] * cache.shape[1], cache.shape[2], cache.shape[3]
+    )
 
 
 def _npu_sparse_attention(

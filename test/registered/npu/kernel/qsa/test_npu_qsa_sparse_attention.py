@@ -29,7 +29,7 @@ def inputs(heads=3, kv_heads=1, rows=4):
 
 
 @pytest.mark.parametrize("heads,kv_heads", [(3, 1), (6, 1), (12, 1), (24, 2)])
-@pytest.mark.parametrize("layout", ["flat", "paged", "fia"])
+@pytest.mark.parametrize("layout", ["paged", "fia"])
 @pytest.mark.parametrize("rows", [4, 33])
 def test_dispatch_graph(heads, kv_heads, layout, rows, monkeypatch):
     q, k, v, s = inputs(heads, kv_heads, rows)
@@ -92,6 +92,7 @@ def test_dispatch_graph(heads, kv_heads, layout, rows, monkeypatch):
 )
 def test_invalid_metadata_never_falls_back(case, monkeypatch):
     q, k, v, s = inputs()
+    k, v = k.unsqueeze(1), v.unsqueeze(1)
     if case in ("fp16", "fp32"):
         dtype = torch.float16 if case == "fp16" else torch.float32
         q, k, v = (x.to(dtype) for x in (q, k, v))
@@ -117,6 +118,7 @@ def test_invalid_metadata_never_falls_back(case, monkeypatch):
 @pytest.mark.parametrize("cache_name", ["k", "v"])
 def test_cache_adapter_rejects_implicit_copy(cache_name, monkeypatch):
     q, k, v, slots = inputs()
+    k, v = k.unsqueeze(1), v.unsqueeze(1)
     # Same [pages, page_size, heads, dim] shape as a valid pool, but the
     # first two strides cannot be merged into a view. flatten would copy it.
     incompatible = torch.empty(
@@ -145,8 +147,9 @@ def test_kernel_errors_propagate(monkeypatch):
         raise RuntimeError("intentional sparse attention failure")
 
     monkeypatch.setattr(impl, "sparse_attention", fail)
+    q, k, v, slots = inputs()
     with pytest.raises(RuntimeError, match="intentional"):
-        backend_module._npu_sparse_attention(*inputs())
+        backend_module._npu_sparse_attention(q, k.unsqueeze(1), v.unsqueeze(1), slots)
 
 
 @pytest.mark.parametrize(

@@ -1430,6 +1430,35 @@ def test_qsa_npu_topk_fixed_width(monkeypatch, device, columns, topk):
         assert actual[row, count:].tolist() == [-1] * (topk - count)
 
 
+@pytest.mark.parametrize("layout", ["paged", "fia"])
+def test_qsa_npu_cache_adapter_shares_storage(layout):
+    storage = torch.arange(3 * 4 * 16 * 2 * 8).reshape(3, 4, 16, 2, 8)
+    cache = storage[1]
+    if layout == "fia":
+        cache = cache.view(64, 1, 2, 8)
+    actual = qsa_backend_module._flatten_qsa_kv_cache(cache, "k_cache")
+    assert actual.shape == (64, 2, 8)
+    assert actual.data_ptr() == cache.data_ptr()
+    assert actual.storage_offset() == cache.storage_offset()
+    torch.testing.assert_close(actual, storage[1].view(64, 2, 8))
+    actual[0, 0, 0] = -1
+    assert cache[0, 0, 0, 0].item() == -1
+
+
+@pytest.mark.parametrize("ndim", [0, 1, 2, 3, 5])
+@pytest.mark.parametrize("name", ["k_cache", "v_cache"])
+def test_qsa_npu_cache_adapter_rejects_wrong_rank(ndim, name):
+    cache = torch.empty((2,) * ndim)
+    with pytest.raises(ValueError, match=f"{name} must be rank 4"):
+        qsa_backend_module._flatten_qsa_kv_cache(cache, name)
+
+
+def test_qsa_npu_cache_adapter_rejects_implicit_copy():
+    cache = torch.empty(16, 4, 2, 8).transpose(0, 1)
+    with pytest.raises(RuntimeError, match="view size is not compatible"):
+        qsa_backend_module._flatten_qsa_kv_cache(cache, "k_cache")
+
+
 @pytest.mark.parametrize("device", ["cpu", "npu"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["flat", "paged", "fia"])
@@ -1457,8 +1486,10 @@ def test_qsa_npu_sparse_attention_reference(monkeypatch, device, dtype, layout):
         k, v = k.unsqueeze(1), v.unsqueeze(1)
     q, k, v, slots = q.to(device), k.to(device), v.to(device), slots.to(device)
     if device == "npu":
-        # The legacy generic shape is intentionally outside the model wrapper.
-        with pytest.raises(ValueError, match="Unsupported NPU"):
+        # Flat caches violate the pool layout; the other legacy generic shapes
+        # reach the kernel but are intentionally outside its model contract.
+        error = "k_cache must be rank 4" if layout == "flat" else "Unsupported NPU"
+        with pytest.raises(ValueError, match=error):
             qsa_backend_module._npu_sparse_attention(q, k, v, slots)
         return
     if device == "cpu" and layout != "flat":
@@ -1499,6 +1530,8 @@ def test_qsa_npu_sparse_attention_nonfinite_padding(monkeypatch, device, padding
         if device == "npu"
         else qsa_sparse_attention
     )
+    if device == "npu":
+        k, v = k.unsqueeze(1), v.unsqueeze(1)
     actual = attention(q, k, v, slots)
 
     torch.testing.assert_close(actual, expected)
@@ -1590,7 +1623,9 @@ def test_qsa_npu_operator_chain_graph_replay():
         metadata.sequence_lengths.copy_(lengths * 4)
         logical = expand_qsa_block_indices(blocks, positions, lengths * 4, 4, 2048)
         slots = QwenSparseAttnBackend._logical_to_physical(logical, metadata)
-        return qsa_backend_module._npu_sparse_attention(q, k, v, slots)
+        return qsa_backend_module._npu_sparse_attention(
+            q, k.view(2, 16, 1, 256), v.view(2, 16, 1, 256), slots
+        )
 
     for _ in range(2):
         forward()
