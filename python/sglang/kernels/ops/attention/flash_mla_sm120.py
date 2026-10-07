@@ -728,13 +728,15 @@ def _validate_flashinfer_sparse_mla_backend(
             f"kv_cache_dtype={kv_cache_dtype}, prefill_impl={prefill_impl!r}, "
             f"decode_impl={decode_impl!r}."
         )
-    # This validator owns only configurations that actually select the native
-    # FlashInfer backend.  Other GLM SM12 FP8 backend pairs (notably the raw
-    # TileLang path) have their own layout validation and must pass through.
     # flashinfer_sparse_mla stays the auto-selected default on this
     # platform; triton_sparse_mla is a validated alternative prefill
-    # implementation that the user may select explicitly.
-    if uses_flashinfer_sparse_mla and is_glm_sm12_fp8:
+    # implementation that the user may select explicitly. Pairs that select
+    # either one must use only these two; other GLM SM12 FP8 backend pairs
+    # (notably the raw TileLang path) have their own layout validation and
+    # must pass through.
+    if (
+        uses_flashinfer_sparse_mla or "triton_sparse_mla" in selected
+    ) and is_glm_sm12_fp8:
         unsupported = selected - {"flashinfer_sparse_mla", "triton_sparse_mla"}
         if unsupported:
             raise ValueError(

@@ -46,7 +46,7 @@ class TestFlashInferSparseMLAAdapter(unittest.TestCase):
             workspace_buffer=torch.zeros(2 * 1024 * 1024, dtype=torch.uint8),
             flashinfer_sparse_mla_runner=FakeRunner(),
             flashinfer_sparse_mla_lse=torch.empty(4096, 8),
-            real_page_size=64,
+            physical_page_size=64,
             kv_cache_dim=528,
             qk_nope_head_dim=256,
             kv_lora_rank=512,
