@@ -54,7 +54,7 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, TokenSpan
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
@@ -245,19 +245,36 @@ class TestKVLocPlan(unittest.TestCase):
         self.assertIsNone(plan.write_ids(self.private_draft, kind=_SWA))
 
     def test_cols_slice_names_a_split_batch_s_tokens(self):
-        """Two-batch overlap splits a forward's tokens; each half's columns are
-        the flat window index of its tokens, whatever the forward's own
-        columns were."""
+        """Two-batch overlap splits a forward's tokens; each half names its
+        tokens of the window, whatever the forward's own columns were. A
+        contiguous half is a run of tokens, read as a view of the window's ids;
+        only columns spread over the rows become a flat index."""
         plan = self._plan()
         bs = int(self.rpi.numel())
         everything = plan.cols_slice(None, slice(1, None))
-        self.assertTrue(torch.equal(everything, torch.arange(1, self.window.numel())))
+        self.assertEqual(everything, TokenSpan(1, self.window.numel()))
+        self.assertEqual(plan.cols_slice(everything, slice(1, 3)), TokenSpan(2, 4))
+        # A static plan's halves, and a translating one's, both read views.
+        static = self._plan(self.private_draft)
+        for p, reader in ((plan, self.target), (static, self.private_draft)):
+            half = p.cols_slice(None, slice(0, 2))
+            self.assertIsInstance(half, TokenSpan)
+            whole = p.write_ids(reader)
+            ids = p.write_ids(reader, cols=half)
+            self.assertTrue(torch.equal(ids, whole[:2]))
+            self.assertEqual(
+                ids.untyped_storage().data_ptr(), whole.untyped_storage().data_ptr()
+            )
         first = plan.cols_slice(slice(0, 1), slice(None))
         width = self.window.numel() // bs
         self.assertTrue(torch.equal(first, torch.arange(bs) * width))
         ragged = torch.tensor([3, -1, 0])
         self.assertTrue(torch.equal(plan.cols_slice(ragged, slice(1, 3)), ragged[1:]))
-        for cols, tokens in ((None, slice(1, None)), (slice(0, 1), slice(None))):
+        for cols, tokens in (
+            (None, slice(1, None)),
+            (everything, slice(1, 3)),
+            (slice(0, 1), slice(None)),
+        ):
             self.assertTrue(
                 torch.equal(
                     plan.write_ids(self.target, cols=plan.cols_slice(cols, tokens)),

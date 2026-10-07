@@ -96,9 +96,19 @@ def window_read_extent(forward_mode, spec_info, write_ids, batch_size: int) -> i
     return 0
 
 
-# Part of a `[batch, window]` write window: a slice of its columns, or a flat
-# index into it (-1: the sink).
-Cols = Union[slice, torch.Tensor]
+class TokenSpan(msgspec.Struct, frozen=True):
+    """A contiguous run ``[start, stop)`` of a write window's flat tokens:
+    one half of a batch split in two (two-batch overlap). A ``slice`` in
+    `Cols` names columns of every row; this names tokens of the flattened
+    window, which a reader takes as a view."""
+
+    start: int
+    stop: int
+
+
+# Part of a `[batch, window]` write window: a slice of its columns, a
+# contiguous run of its flat tokens, or a flat index into it (-1: the sink).
+Cols = Union[slice, TokenSpan, torch.Tensor]
 
 
 def pad_with_sink(ids: Optional[torch.Tensor], n: int) -> Optional[torch.Tensor]:
@@ -228,6 +238,8 @@ class KVLocPlan:
     def _cols(self, ids: Optional[torch.Tensor], cols: Optional[Cols]):
         if ids is None or cols is None:
             return ids
+        if isinstance(cols, TokenSpan):
+            return ids[cols.start : cols.stop]
         if isinstance(cols, torch.Tensor):
             return torch.where(cols >= 0, ids[cols.clamp(min=0)], 0)
         bs = int(self.req_pool_indices.numel())
@@ -236,11 +248,12 @@ class KVLocPlan:
             return ids[cols]
         return ids.view(bs, -1)[:, cols].reshape(-1)
 
-    def cols_slice(self, cols: Optional[Cols], tokens: slice) -> torch.Tensor:
-        """The ``tokens`` of a forward that writes ``cols``, as a flat index
-        into the window: the columns of one half of a batch split in two
-        (two-batch overlap). Tokens past the window are left out; the consumer
-        pads them with the sink."""
+    def cols_slice(self, cols: Optional[Cols], tokens: slice) -> Cols:
+        """The ``tokens`` of a forward that writes ``cols``: the columns of
+        one half of a batch split in two (two-batch overlap). A contiguous
+        half stays a `TokenSpan`; only columns spread over the rows become a
+        flat index into the window. Tokens past the window are left out; the
+        consumer pads them with the sink."""
         if isinstance(cols, torch.Tensor):
             return cols[tokens]
         window = (
@@ -248,6 +261,12 @@ class KVLocPlan:
             if self.write_virtual is not None
             else self.write_physical
         )
+        if cols is None or isinstance(cols, TokenSpan):
+            base = 0 if cols is None else cols.start
+            end = window.numel() if cols is None else cols.stop
+            start, stop, step = tokens.indices(end - base)
+            if step == 1:
+                return TokenSpan(base + start, base + max(start, stop))
         index = torch.arange(window.numel(), device=window.device)
         return self._cols(index, cols)[tokens]
 
