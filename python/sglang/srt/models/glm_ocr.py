@@ -35,7 +35,6 @@ from sglang.srt.layers.attention.vision import (
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -52,6 +51,7 @@ from sglang.srt.models.glm4v import (
     Glm4vVisionMLP,
     Glm4vVisionModel,
     Glm4vVisionPatchEmbed,
+    glm4v_vision_reduces_over_attn_tp,
 )
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix
@@ -99,7 +99,9 @@ class GlmOcrVisionBlock(nn.Module):
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
-            use_dp_attention_reduce=is_dp_attention_enabled() and not use_data_parallel,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.mlp = GlmOcrVisionMLP(
             dim,
