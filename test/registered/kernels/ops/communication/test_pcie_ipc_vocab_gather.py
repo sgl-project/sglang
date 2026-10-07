@@ -184,6 +184,7 @@ def test_falls_back_to_nccl_for_slices_the_workspace_cannot_take() -> None:
     pcie_ipc = _gather(width, dtype)
     for x in (
         _local(MAX_ROWS + 1, width, dtype),  # past the workspace
+        _local(2 * MAX_ROWS, width // 2, dtype),  # fits by elements, past max_rows
         _local(2, width, torch.float16),  # not the workspace dtype
     ):
         _assert_bitwise_equal(pcie_ipc(x), _nccl(x))
