@@ -30,7 +30,7 @@ from sglang.srt.managers.schedule_batch import (
     mamba_lazy_spec_in_window,
 )
 from sglang.srt.mem_cache.common import (
-    maybe_cache_unfinished_req,
+    checkpoint_kv_cache,
     release_kv_cache,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -126,7 +126,7 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(req, self.tree_cache)
+                release_kv_cache(req, self.tree_cache, checkpoint=True)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -377,11 +377,11 @@ class SchedulerBatchResultProcessor:
                         release_kv_cache(
                             req,
                             self.tree_cache,
-                            is_insert=sampling_mask_finish_reason is None,
+                            checkpoint=sampling_mask_finish_reason is None,
                         )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        maybe_cache_unfinished_req(req, self.tree_cache)
+                        checkpoint_kv_cache(req, self.tree_cache)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
@@ -469,10 +469,10 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(req, self.tree_cache, checkpoint=True)
                         req.time_stats.set_completion_time()
                     else:
-                        maybe_cache_unfinished_req(req, self.tree_cache)
+                        checkpoint_kv_cache(req, self.tree_cache)
                 else:
                     # being chunked reqs' prefill is not finished
                     req.inflight_middle_chunks -= 1
@@ -1337,7 +1337,7 @@ class SchedulerBatchResultProcessor:
             )
             if callable(prepare_release):
                 prepare_release(req)
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.time_stats.set_completion_time()
 
     def _handle_finish_state_updated_req(
@@ -1377,7 +1377,7 @@ class SchedulerBatchResultProcessor:
                 and known_mamba_boundary
                 and req.kv.mamba_next_track_idx == req.kv.mamba_last_track_idx
             ):
-                req.mamba_lazy_is_insert = False
+                req.mamba_lazy_checkpoint = False
 
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
@@ -1424,12 +1424,12 @@ class SchedulerBatchResultProcessor:
                 )
                 if callable(prepare_release):
                     prepare_release(req)
-                is_insert = (
-                    req.mamba_lazy_is_insert
+                checkpoint = (
+                    req.mamba_lazy_checkpoint
                     if get_exec().mamba.enable_mamba_extra_buffer_lazy
                     else True
                 )
-                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
             req.time_stats.set_completion_time()
 
@@ -1552,7 +1552,7 @@ class SchedulerBatchResultProcessor:
                 or keep_written_by_this_step
                 or keep_may_be_written_in_flight
             ):
-                req.mamba_lazy_is_insert = False
+                req.mamba_lazy_checkpoint = False
             return
 
         if not crossed or planned_pos is None:

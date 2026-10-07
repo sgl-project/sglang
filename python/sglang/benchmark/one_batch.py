@@ -484,13 +484,13 @@ class TreeCacheNamespace(SimpleNamespace):
     def supports_mamba(self) -> bool:
         return False
 
-    def is_chunk_cache(self) -> bool:
-        return False
-
-    def is_tree_cache(self) -> bool:
-        return not self.is_chunk_cache()
+    def supports_prefix_sharing(self) -> bool:
+        return True
 
     def evict(self, params: EvictParams):
+        pass
+
+    def maybe_hand_to_session(self, req):
         pass
 
 
