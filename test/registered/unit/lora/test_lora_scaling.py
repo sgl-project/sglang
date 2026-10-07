@@ -14,6 +14,7 @@ import torch
 from sglang.srt.lora import lora_config
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -61,7 +62,7 @@ def _new_adapter(config):
     )
 
 
-class TestLoRAScaling(unittest.TestCase):
+class TestLoRAScaling(CustomTestCase):
     def test_scaling_from_dict(self):
         for rank in (1, 8, 64):
             for flag in (None, False, True):
