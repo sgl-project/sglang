@@ -1231,6 +1231,11 @@ def _fa4_page_constraint(view: Any) -> dict:
         # page_size==1, so skip the 128 auto-force for it and keep the default.
         and (view.speculative_eagle_topk or 0) <= 1
     ):
+        if (
+            "DiffusionGemmaForBlockDiffusion"
+            in model_config_of(view).hf_config.architectures
+        ):
+            return {"page_size": 1}
         logger.warning(
             f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {view.page_size} to 128."
         )
@@ -1446,11 +1451,11 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     if (
         moe_runner_backend == "auto"
         and view.quantization == "modelopt_fp4"
-        and get_platform().is_sm120
+        and (get_platform().is_sm120 or get_platform().is_sm110)
     ):
         moe_runner_backend = "flashinfer_cutlass"
         logger.info(
-            "Use flashinfer_cutlass as MoE runner backend on SM120 for "
+            "Use flashinfer_cutlass as MoE runner backend on SM110/SM120 for "
             "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
         )
     if moe_runner_backend != view.moe_runner_backend:
@@ -1586,6 +1591,12 @@ def _dllm_attention_backend(view: Any) -> dict:
     from sglang.srt.dllm.algorithm import get_algorithm_cls
 
     algorithm_cls = get_algorithm_cls(view.dllm_algorithm)
+    if view.attention_backend in algorithm_cls.supported_attention_backends and all(
+        getattr(view, field, None)
+        in (None, *algorithm_cls.supported_attention_backends)
+        for field in ("prefill_attention_backend", "decode_attention_backend")
+    ):
+        return {}
     if backend := algorithm_cls.required_attention_backend:
         fields = (
             "attention_backend",
