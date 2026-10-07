@@ -127,7 +127,11 @@ if TYPE_CHECKING:
         MatchResult,
     )
     from sglang.srt.mem_cache.events import KVCacheEventRecorder
-    from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
+    from sglang.srt.mem_cache.hicache_storage import (
+        PoolName,
+        PoolTransfer,
+        PoolTransferResult,
+    )
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         BackupKV,
@@ -548,6 +552,20 @@ class UnifiedTreeCoreInterface(ABC):
     ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
         """Read a node's device->host backup spec (device value + transfers) now."""
         ...
+
+    def buffer_backup_pool_keys(
+        self, node_id: NodeId, hash_values: list[str]
+    ) -> dict[ComponentType, dict[PoolName, list[str]]]:
+        """Per component, the storage keys per pool a buffer-mode backup of
+        the node writes (``TreeComponent.buffer_backup_keys``); Rust cores name none."""
+        return {}
+
+    def build_backup_kv_action(self, node_id: NodeId) -> BackupKV:
+        """The write-through backup action for a node and its unstored
+        ancestors; only component-requested buffer backups need it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose build_backup_kv_action"
+        )
 
     @abstractmethod
     def build_storage_backup_spec(

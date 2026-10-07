@@ -120,4 +120,4 @@ def test_gate_sum_preserves_fp32_intermediates():
     gate = torch.randn(2, 1, 1152, dtype=x.dtype, device=x.device)[..., 256:384]
     expected = (x.float() + gate.float() * update.float()).to(x.dtype)
     assert not torch.equal(expected, x + gate * update)
-    assert torch.equal(kandinsky6._apply_gate_sum(x, update, gate), expected)
+    assert torch.equal(kandinsky6.residual_gate_fp32(x, update, gate), expected)
