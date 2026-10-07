@@ -331,12 +331,16 @@ class SchedulerDllmMixin:
     ) -> AddReqResult:
         """Process staging DLLM requests with resource allocation."""
         for req in reqs:
-            if req.dllm_block_done and req.kv.holds_kv:
-                if self.dllm_config.first_done_first_out_mode:
-                    self._clear_dllm_future(req)
-                self.stash_chunked_request(req)
-                self.req_to_token_pool.free(req)
-                req.init_next_round_input()
+            if req.kv.holds_kv:
+                # Prompt chunks can advance without waiting for overlap results.
+                if req.extend_range.end <= len(req.origin_input_ids):
+                    req.dllm_block_done = True
+                if req.dllm_block_done:
+                    if self.dllm_config.first_done_first_out_mode:
+                        self._clear_dllm_future(req)
+                    self.stash_chunked_request(req)
+                    self.req_to_token_pool.free(req)
+                    req.init_next_round_input()
             res = adder.add_dllm_staging_req(req)
             if res == AddReqResult.NO_TOKEN:
                 return res
