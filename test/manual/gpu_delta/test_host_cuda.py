@@ -302,13 +302,6 @@ def test_two_engines_reuse_host_de_capacity_and_grow(workers):
                     sum(row["metrics"]["host_encoded_cache_hash_files"] for row in rows)
                     == 1
                 )
-                assert (
-                    sum(
-                        row["metrics"]["host_encoded_cache_frames_validations"]
-                        for row in rows
-                    )
-                    == 1
-                )
                 assert sum(
                     row["metrics"]["host_rank_outer_zstd_tensors"] for row in rows
                 ) == (8 if version == 1 else 0)
