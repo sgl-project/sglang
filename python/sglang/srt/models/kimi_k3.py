@@ -2851,12 +2851,19 @@ class KimiK3DeltaAttention(nn.Module):
                 hidden_states
             )
 
+        self.attn._k3_kda_beta_is_raw = False
         if not forward_batch.forward_mode.is_decode():
             forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
             if not forward_batch.forward_mode.is_target_verify():
-                # Only chunk_kda (extend) wants pre-activated beta; the verify
-                # kernel sigmoids it in-kernel like decode.
-                beta = beta.float().sigmoid()
+                # Extend sigmoids beta itself. FlashKDA only admits the raw
+                # logits, so keep them in fp32 and tell the backend; Triton
+                # still sigmoids when beta_is_raw is set. Verify sigmoids
+                # in-kernel, same as decode.
+                if envs.SGLANG_AITER_KDA_FLASH_PREFILL.get():
+                    beta = beta.float()
+                    self.attn._k3_kda_beta_is_raw = True
+                else:
+                    beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 

@@ -1944,6 +1944,9 @@ class Envs:
     SGLANG_ROCM_K3_ATTN_RES_TUNED_LAUNCH = EnvBool(True)
     SGLANG_ROCM_K3_AITER_M16384_PROFILE = EnvBool(False)
 
+    # Feature-owned ROCm controls.
+    SGLANG_AITER_KDA_FLASH_PREFILL = EnvBool(False)
+
 
 envs = Envs()
 EnvField._allow_set_name = False
