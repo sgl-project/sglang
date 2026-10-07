@@ -303,6 +303,8 @@ _bcg_low_ratio_source_projections_fn = None
 
 
 def _set_forward_metadata(attn_backend, metadata) -> None:
+    # The layers being left were the last readers of their candidates.
+    attn_backend.forward_metadata.candidate_metadata = None
     attn_backend.forward_metadata = metadata
 
 
@@ -1001,6 +1003,7 @@ _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
 
 # Late-layer tail rows a prefill CUDA graph captures, as full windows: the tail
 # of a batch is padded to it, and a batch whose tail is longer replays eagerly.
+# Measured on 4x B300: 32 windows cost 8 concurrent 7K-token requests 13%.
 _PREFILL_GRAPH_TAIL_WINDOWS = 8
 
 
@@ -1250,6 +1253,8 @@ class DeepseekV4AttnBackend(
         # The model switches onto this metadata in enter_late_layer_tail.
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
         self._graph_tail_metadata_of_rows: Dict[int, DSV4Metadata] = {}
+        # The first, largest prefill CUDA graph's metadata; the others view its q_pad_buffer.
+        self._graph_q_pad_owner: Optional[DSV4Metadata] = None
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
@@ -2696,11 +2701,14 @@ class DeepseekV4AttnBackend(
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ):
-        max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
+        max_seq_len = self._prefill_graph_max_seq_len_of(forward_batch)
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
+        )
+        self._share_graph_q_pad_scratch(
+            self.forward_metadata, forward_batch.out_cache_loc.shape[0]
         )
         if self.low_ratio_prefill_graph and forward_batch.forward_mode.is_extend():
             for ratio in self.low_ratios:
@@ -2709,6 +2717,15 @@ class DeepseekV4AttnBackend(
                 )
         self._use_graph_tail_metadata(forward_batch, max_seq_len)
         return self.forward_metadata
+
+    def _prefill_graph_max_seq_len_of(self, forward_batch: ForwardBatch) -> int:
+        """Context width of a prefill CUDA graph's metadata. An in-graph indexer or
+        compressor reads the full width; otherwise the batch's own context is enough."""
+        if forward_batch.max_seq_len_override is not None:
+            return forward_batch.max_seq_len_override
+        if self.has_c4 or self.has_c128 or self.low_ratio_prefill_graph:
+            return self.MAX_SEQ_LEN_FOR_CAPTURE
+        return int(forward_batch.seq_lens_cpu.max().item())
 
     def _use_graph_tail_metadata(
         self, forward_batch: ForwardBatch, max_seq_len: int
@@ -2727,9 +2744,22 @@ class DeepseekV4AttnBackend(
         )
         graph_rows = live.late_layer_tail.token_indices.shape[0]
         captured = self._graph_tail_metadata_of_rows.setdefault(graph_rows, live)
-        if captured is not live:
+        if captured is live:
+            self._share_graph_q_pad_scratch(captured, graph_rows)
+        else:
             captured.refresh_for_breakable_cuda_graph_replay_(live)
         self.tail_forward_metadata = captured
+
+    def _share_graph_q_pad_scratch(self, metadata: DSV4Metadata, rows: int) -> None:
+        """Give a prefill CUDA graph's metadata a view of the shared query scratch.
+        One per graph would stay allocated for as long as the graph lives."""
+        owner = self._graph_q_pad_owner
+        if owner is None:
+            self._graph_q_pad_owner = metadata
+            return
+        scratch = owner.q_pad_buffer
+        if scratch is not None and scratch.shape[0] >= rows:
+            metadata.q_pad_buffer = scratch[:rows]
 
     def _source_projection_buffers(self, num_tokens: int, ratio: int) -> dict:
         cfg = self.model_runner.model_config.hf_text_config
@@ -2770,9 +2800,7 @@ class DeepseekV4AttnBackend(
         metadata_batch = (
             static_forward_batch if static_forward_batch is not None else forward_batch
         )
-        max_seq_len = (
-            metadata_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
-        )
+        max_seq_len = self._prefill_graph_max_seq_len_of(metadata_batch)
         static_metadata = self._build_forward_metadata(
             metadata_batch,
             max_seq_len_override=max_seq_len,
