@@ -16,7 +16,9 @@
 This module intentionally supports only exact unquantized BF16 Llama 3.1 70B
 configurations: TP8 on SM100 or SM103, or TP4 on SM103, and an extend batch
 containing exactly 4096 token rows. Decode and other row counts continue through the native Llama model
-path.
+path. Each packed-QKV launcher is prepared once per weight with ``max_rows`` set
+to the topology's local row count, so the symmetric scratch is sized at the first
+routed batch and never grows afterwards.
 """
 
 from __future__ import annotations
@@ -206,12 +208,16 @@ def _model_contract_reason(
 
 def _validate_prepare_signature(prepare: Callable[..., Any]) -> None:
     parameters = inspect.signature(prepare).parameters
-    if tuple(parameters) != ("inp", "w", "group", "backend", "verbose"):
+    if tuple(parameters) != ("inp", "w", "group", "backend", "max_rows", "verbose"):
         raise RuntimeError("FlashInfer prepared AGMM API has an incompatible signature")
     if parameters["backend"].kind is not inspect.Parameter.KEYWORD_ONLY:
         raise RuntimeError("FlashInfer prepared AGMM backend must be keyword-only")
     if parameters["backend"].default != "auto":
         raise RuntimeError("FlashInfer prepared AGMM backend default changed")
+    if parameters["max_rows"].kind is not inspect.Parameter.KEYWORD_ONLY:
+        raise RuntimeError("FlashInfer prepared AGMM max_rows must be keyword-only")
+    if parameters["max_rows"].default is not None:
+        raise RuntimeError("FlashInfer prepared AGMM max_rows default changed")
     if parameters["verbose"].kind is not inspect.Parameter.KEYWORD_ONLY:
         raise RuntimeError("FlashInfer prepared AGMM verbose must be keyword-only")
     if parameters["verbose"].default is not False:
@@ -238,7 +244,7 @@ def _bind_model_contract(
 class _PreparedBinding:
     weight: Any
     group: Any
-    local_rows: int
+    max_rows: int
     launcher: Callable[[Any], Any]
 
 
@@ -262,7 +268,7 @@ class LlamaFlashInferAgmmTrueSP:
         self._group = None
         self._rank = None
         self._packed_weights: dict[int, Any] = {}
-        self._bindings: dict[tuple[int, int], _PreparedBinding] = {}
+        self._bindings: dict[int, _PreparedBinding] = {}
 
     @staticmethod
     def _validate_runtime_config() -> _Topology:
@@ -414,8 +420,12 @@ class LlamaFlashInferAgmmTrueSP:
 
     def _prepared_qkv(self, inp: Any, qkv: Any, group: Any):
         weight = self._packed_qkv_weight(qkv)
-        local_rows = int(inp.shape[0])
-        key = (id(weight), local_rows)
+        max_rows = self._topology.local_rows
+        if int(inp.shape[0]) != max_rows:
+            raise RuntimeError(
+                "AGMM packed-QKV input rows differ from the bound topology"
+            )
+        key = id(weight)
         binding = self._bindings.get(key)
         if binding is None:
             launcher = self._prepare_all_gather_matmul(
@@ -423,11 +433,12 @@ class LlamaFlashInferAgmmTrueSP:
                 weight,
                 group,
                 backend="auto",
+                max_rows=max_rows,
                 verbose=False,
             )
             if not callable(launcher):
                 raise RuntimeError("FlashInfer AGMM preparation returned no launcher")
-            binding = _PreparedBinding(weight, group, local_rows, launcher)
+            binding = _PreparedBinding(weight, group, max_rows, launcher)
             self._bindings[key] = binding
         elif binding.weight is not weight or binding.group is not group:
             raise RuntimeError("FlashInfer AGMM prepared binding changed")

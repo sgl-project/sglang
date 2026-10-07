@@ -214,16 +214,38 @@ class EligibilityTests(unittest.TestCase):
         )
 
     def test_prepared_api_signature_is_exact(self):
-        def accepted(inp, w, group, *, backend="auto", verbose=False):
+        def accepted(inp, w, group, *, backend="auto", max_rows=None, verbose=False):
             return None
 
         self.module._validate_prepare_signature(accepted)
 
-        def missing_backend(inp, w, group, *, verbose=False):
+        def missing_backend(inp, w, group, *, max_rows=None, verbose=False):
             return None
 
         with self.assertRaisesRegex(RuntimeError, "incompatible signature"):
             self.module._validate_prepare_signature(missing_backend)
+
+        def missing_max_rows(inp, w, group, *, backend="auto", verbose=False):
+            return None
+
+        with self.assertRaisesRegex(RuntimeError, "incompatible signature"):
+            self.module._validate_prepare_signature(missing_max_rows)
+
+        def positional_max_rows(
+            inp, w, group, backend="auto", max_rows=None, *, verbose=False
+        ):
+            return None
+
+        with self.assertRaisesRegex(RuntimeError, "backend must be keyword-only"):
+            self.module._validate_prepare_signature(positional_max_rows)
+
+        def sized_max_rows(
+            inp, w, group, *, backend="auto", max_rows=4096, verbose=False
+        ):
+            return None
+
+        with self.assertRaisesRegex(RuntimeError, "max_rows default changed"):
+            self.module._validate_prepare_signature(sized_max_rows)
 
     def test_route_source_contains_no_explicit_device_synchronization(self):
         source = inspect.getsource(self.module)
@@ -355,8 +377,10 @@ class PreparedBindingTests(unittest.TestCase):
             calls = []
             launches = []
 
-            def prepare(inp, w, group, *, backend="auto", verbose=False):
-                calls.append((inp, w, group, backend, verbose))
+            def prepare(
+                inp, w, group, *, backend="auto", max_rows=None, verbose=False
+            ):
+                calls.append((inp, w, group, backend, max_rows, verbose))
 
                 def launch(current):
                     launches.append(current)
@@ -380,8 +404,25 @@ class PreparedBindingTests(unittest.TestCase):
                 route._prepared_qkv(second, qkv, group), ("output", second)
             )
             self.assertEqual(len(calls), 1)
-            self.assertEqual(calls[0][3:], ("auto", False))
+            self.assertEqual(
+                calls[0][3:], ("auto", route._topology.local_rows, False)
+            )
             self.assertEqual(launches, [first, second])
+
+            other_weight = FakeSourceWeight(route._topology.packed_qkv_n)
+            other_qkv = types.SimpleNamespace(weight=other_weight)
+            self.assertEqual(
+                route._prepared_qkv(first, other_qkv, group), ("output", first)
+            )
+            self.assertEqual(len(calls), 2)
+            self.assertIs(calls[1][1], other_weight.packed)
+
+            short = types.SimpleNamespace(
+                shape=(route._topology.local_rows - 1, 8192)
+            )
+            with self.assertRaisesRegex(RuntimeError, "differ from the bound topology"):
+                route._prepared_qkv(short, qkv, group)
+            self.assertEqual(len(calls), 2)
 
     def test_row_collectives_use_the_bound_topology(self):
         module = load_module()
