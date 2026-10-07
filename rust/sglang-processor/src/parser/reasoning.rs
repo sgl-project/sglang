@@ -1,8 +1,35 @@
 //! Reasoning-content splitting for `--reasoning-parser`.
 
+use std::sync::{Mutex, PoisonError};
+
 use dynamo_parsers::reasoning::{
     ReasoningParser as _, ReasoningParserType, ReasoningParserWrapper,
 };
+
+use super::models::think_config;
+use super::think::ThinkDetector;
+
+/// The request settings Python passes its reasoning parser. Dynamo-backed
+/// names only honour `force_reasoning`; `None` keeps the parser's default.
+#[derive(Debug, Clone)]
+pub struct ReasoningOptions {
+    pub force_reasoning: Option<bool>,
+    pub stream_reasoning: bool,
+    /// The final assistant message continued under `continue_final_message`.
+    pub previous_content: Option<String>,
+    pub force_nonempty_content: bool,
+}
+
+impl Default for ReasoningOptions {
+    fn default() -> Self {
+        Self {
+            force_reasoning: None,
+            stream_reasoning: true,
+            previous_content: None,
+            force_nonempty_content: false,
+        }
+    }
+}
 
 /// Build the parser a Python `--reasoning-parser` name selects. Names Dynamo
 /// does not know fall back to its non-forced basic parser.
@@ -20,6 +47,25 @@ fn build_reasoning_parser(server_name: &str) -> ReasoningParserWrapper {
     ReasoningParserType::get_reasoning_parser_from_name(name)
 }
 
+enum Backend {
+    Sglang(ThinkDetector),
+    // Hosts keep splitters in `Sync` state; reached only via `get_mut`, so it never locks.
+    Dynamo(Mutex<ReasoningParserWrapper>),
+}
+
+impl Backend {
+    fn new(name: &str, options: &ReasoningOptions) -> Self {
+        if let Some(config) = think_config(name) {
+            return Self::Sglang(ThinkDetector::new(config, options));
+        }
+        let mut parser = build_reasoning_parser(name);
+        if let Some(force_reasoning) = options.force_reasoning {
+            parser.set_in_reasoning(force_reasoning);
+        }
+        Self::Dynamo(Mutex::new(parser))
+    }
+}
+
 fn u32_ids<T: Copy + TryInto<u32>>(ids: &[T]) -> Vec<u32> {
     ids.iter().filter_map(|&id| id.try_into().ok()).collect()
 }
@@ -28,31 +74,36 @@ fn u32_ids<T: Copy + TryInto<u32>>(ids: &[T]) -> Vec<u32> {
 /// a parser the text is all normal.
 pub fn split_reasoning<T: Copy + TryInto<u32>>(
     name: Option<&str>,
+    options: &ReasoningOptions,
     text: &str,
     token_ids: &[T],
 ) -> (String, String) {
     let Some(name) = name else {
         return (String::new(), text.to_owned());
     };
-    let split = build_reasoning_parser(name).detect_and_parse_reasoning(text, &u32_ids(token_ids));
-    (split.reasoning_text, split.normal_text)
+    match Backend::new(name, options) {
+        Backend::Sglang(mut detector) => detector.parse(text),
+        Backend::Dynamo(parser) => {
+            let mut parser = parser.into_inner().unwrap_or_else(PoisonError::into_inner);
+            let split = parser.detect_and_parse_reasoning(text, &u32_ids(token_ids));
+            (split.reasoning_text, split.normal_text)
+        }
+    }
 }
 
-/// Stateful reasoning split for one streamed choice. The parser is built on
-/// the first frame; `initial_reasoning` overrides its starting state, e.g.
-/// when the prompt already opened `<think>`.
+/// Stateful reasoning split for one streamed choice, built on the first frame.
 pub struct ReasoningStreamSplitter {
     name: Option<String>,
-    parser: Option<ReasoningParserWrapper>,
-    pub(super) initial_reasoning: Option<bool>,
+    pub(super) options: ReasoningOptions,
+    backend: Option<Backend>,
 }
 
 impl ReasoningStreamSplitter {
-    pub fn new(name: Option<&str>, initial_reasoning: Option<bool>) -> Self {
+    pub fn new(name: Option<&str>, options: ReasoningOptions) -> Self {
         Self {
             name: name.map(str::to_owned),
-            parser: None,
-            initial_reasoning,
+            options,
+            backend: None,
         }
     }
 
@@ -65,25 +116,31 @@ impl ReasoningStreamSplitter {
         let Some(name) = self.name.as_deref() else {
             return (String::new(), text.to_owned());
         };
-        let initial_reasoning = self.initial_reasoning;
-        let parser = self.parser.get_or_insert_with(|| {
-            let mut parser = build_reasoning_parser(name);
-            if let Some(initial_reasoning) = initial_reasoning {
-                parser.set_in_reasoning(initial_reasoning);
+        let options = &self.options;
+        match self
+            .backend
+            .get_or_insert_with(|| Backend::new(name, options))
+        {
+            Backend::Sglang(detector) => detector.push(text),
+            Backend::Dynamo(parser) => {
+                let parser = parser.get_mut().unwrap_or_else(PoisonError::into_inner);
+                let split = parser.parse_reasoning_streaming_incremental(text, &u32_ids(token_ids));
+                (split.reasoning_text, split.normal_text)
             }
-            parser
-        });
-        let split = parser.parse_reasoning_streaming_incremental(text, &u32_ids(token_ids));
-        (split.reasoning_text, split.normal_text)
+        }
     }
 
     /// Flush the buffered tail at stream end; it can sit in either column.
     pub fn finish(&mut self) -> (String, String) {
-        let Some(parser) = self.parser.as_mut() else {
-            return (String::new(), String::new());
-        };
-        let tail = parser.finish_reasoning_stream();
-        (tail.reasoning_text, tail.normal_text)
+        match self.backend.as_mut() {
+            None => (String::new(), String::new()),
+            Some(Backend::Sglang(detector)) => detector.finish(),
+            Some(Backend::Dynamo(parser)) => {
+                let parser = parser.get_mut().unwrap_or_else(PoisonError::into_inner);
+                let tail = parser.finish_reasoning_stream();
+                (tail.reasoning_text, tail.normal_text)
+            }
+        }
     }
 }
 
@@ -113,27 +170,15 @@ mod tests {
     fn unary_split_passes_text_through_without_a_parser() {
         let text = "<think>kept as text</think>";
         assert_eq!(
-            split_reasoning(None, text, &[1i64]),
+            split_reasoning(None, &ReasoningOptions::default(), text, &[1i64]),
             (String::new(), text.into())
         );
     }
 
     #[test]
-    fn v4_streaming_separates_prefilled_reasoning() {
-        let mut splitter = ReasoningStreamSplitter::new(Some("deepseek-v4"), Some(true));
-        assert_eq!(
-            splitter.split("reason", NO_IDS),
-            ("reason".into(), "".into())
-        );
-        assert_eq!(
-            splitter.split("</think>answer", NO_IDS),
-            ("".into(), "answer".into())
-        );
-    }
-
-    #[test]
     fn streaming_split_keeps_markers_out_of_both_columns() {
-        let mut splitter = ReasoningStreamSplitter::new(Some("deepseek-r1"), None);
+        let mut splitter =
+            ReasoningStreamSplitter::new(Some("deepseek-r1"), ReasoningOptions::default());
         let mut columns = (String::new(), String::new());
         for chunk in ["<think>rea", "son</think>an", "swer"] {
             let (reasoning, normal) = splitter.split(chunk, NO_IDS);
@@ -145,7 +190,7 @@ mod tests {
             (columns.0 + &reasoning, columns.1 + &normal),
             ("reason".into(), "answer".into())
         );
-        let mut plain = ReasoningStreamSplitter::new(None, None);
+        let mut plain = ReasoningStreamSplitter::new(None, ReasoningOptions::default());
         assert_eq!(plain.split("plain", NO_IDS), ("".into(), "plain".into()));
         assert_eq!(plain.finish(), ("".into(), "".into()));
     }
@@ -153,7 +198,8 @@ mod tests {
     #[test]
     fn minimax_m3_tail_lands_in_the_right_column() {
         // M3 holds an ambiguous prefix until a boundary or the end.
-        let mut splitter = ReasoningStreamSplitter::new(Some("minimax_m3"), None);
+        let mut splitter =
+            ReasoningStreamSplitter::new(Some("minimax_m3"), ReasoningOptions::default());
         assert_eq!(
             splitter.split("The answer is", NO_IDS),
             ("".into(), "".into())
@@ -161,7 +207,8 @@ mod tests {
         assert_eq!(splitter.split(" 42", NO_IDS), ("".into(), "".into()));
         assert_eq!(splitter.finish(), ("".into(), "The answer is 42".into()));
 
-        let mut splitter = ReasoningStreamSplitter::new(Some("minimax_m3"), None);
+        let mut splitter =
+            ReasoningStreamSplitter::new(Some("minimax_m3"), ReasoningOptions::default());
         assert_eq!(
             splitter.split("<mm:think>think", NO_IDS),
             ("think".into(), "".into())

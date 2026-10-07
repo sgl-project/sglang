@@ -17,7 +17,10 @@ use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::{json, Number, Value};
-use sglang_processor::openai::{lower_completion, OpenAiHeaders, OpenAiSettings, Responder};
+use sglang_processor::openai::{
+    lower_chat, lower_completion, OpenAiHeaders, OpenAiSettings, Responder,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// SGLang upstream's coarse bytes-per-token estimate; only relative load ordering matters.
@@ -90,6 +93,10 @@ impl PreparedRequest {
             // router's own `routed_dp_rank` and bootstrap fields from duplicating keys.
             if let Value::Object(fields) = &mut generate {
                 fields.retain(|_, value| !value.is_null());
+            }
+            if path == CHAT_PATH {
+                ctx.metrics
+                    .record_input_ids_forwarding(&model.0, InputIdsForwarding::Forwarded);
             }
             return Ok(Self {
                 responder: Some(responder),
@@ -393,13 +400,33 @@ fn lower_openai(
             .tokenizer_metrics_custom_labels_header
             .as_deref()
             .and_then(|name| header_str(headers, name)),
+        sglext_ids: ["x-sglext-return-input-ids", "x-sglext-return-output-ids"]
+            .iter()
+            .any(|name| header_str(headers, name) == Some("1")),
     };
     let tokenizer = ctx.tokenizers.openai();
-    if path != COMPLETIONS_PATH {
-        return Err("chat_unsupported");
+    if path == COMPLETIONS_PATH {
+        return lower_completion(body, &headers, &settings, tokenizer)
+            .map(|(body, responder)| (body, Responder::Completion(responder)))
+            .map_err(|unsupported| unsupported.0);
     }
-    lower_completion(body, &headers, &settings, tokenizer)
-        .map(|(body, responder)| (body, Responder::Completion(responder)))
+    // Only renderers verified against SGLang render every chat.
+    if forwarding_scope(ctx, model) != ForwardingScope::AllText {
+        return Err("chat_rendering_unverified");
+    }
+    let engine_kwargs = settings
+        .default_chat_template_kwargs
+        .clone()
+        .unwrap_or_default();
+    if engine_kwargs.into_iter().collect::<HashMap<_, _>>()
+        != ctx.config.model.default_chat_template_kwargs
+    {
+        return Err("default_chat_template_kwargs_differ");
+    }
+    let render = |request: &Value| ctx.tokenizers.encode_chat(&model.0, request);
+    let chat_model = ctx.tokenizers.chat_model();
+    lower_chat(body, &headers, &settings, chat_model, render, tokenizer)
+        .map(|(body, responder)| (body, Responder::Chat(responder)))
         .map_err(|unsupported| unsupported.0)
 }
 

@@ -21,10 +21,12 @@ use serde::de::DeserializeOwned;
 
 use crate::ProcessorError;
 
+pub(crate) mod models;
 mod reasoning;
+mod think;
 mod tools;
 
-pub use self::reasoning::{ReasoningStreamSplitter, split_reasoning};
+pub use self::reasoning::{ReasoningOptions, ReasoningStreamSplitter, split_reasoning};
 pub use self::tools::{
     ToolConstraint, chat_tool_definitions, dynamo_tool_choice, dynamo_tool_parser_name,
     tool_constraint,
@@ -118,7 +120,10 @@ impl ChatResponseProcessor {
             parallel_tool_calls,
             choices: (0..choice_count)
                 .map(|_| ChoiceResponseProcessor {
-                    reasoning: ReasoningStreamSplitter::new(reasoning_parser.as_deref(), None),
+                    reasoning: ReasoningStreamSplitter::new(
+                        reasoning_parser.as_deref(),
+                        ReasoningOptions::default(),
+                    ),
                 })
                 .collect(),
         }
@@ -126,7 +131,7 @@ impl ChatResponseProcessor {
 
     pub fn with_reasoning_state(mut self, reasoning_state: Option<bool>) -> Self {
         for choice in &mut self.choices {
-            choice.reasoning.initial_reasoning = reasoning_state;
+            choice.reasoning.options.force_reasoning = reasoning_state;
         }
         self
     }

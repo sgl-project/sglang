@@ -1,5 +1,7 @@
 //! Response pieces shared by the OpenAI endpoints, shaped as Python serializes them.
 
+use std::collections::HashMap;
+
 use serde_json::{Map, Value, json};
 
 /// A complete HTTP response the host sends instead of a stream.
@@ -73,6 +75,149 @@ pub(super) fn usage(prompt: u64, completion: u64, reasoning: u64, cached: Option
         "prompt_tokens_details": cached.filter(|&n| n > 0).map(|n| json!({"cached_tokens": n})),
         "reasoning_tokens": reasoning,
     })
+}
+
+pub(super) fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The non-streaming response over `ret`, the `/generate` items for `choices`.
+/// Prompt and cached tokens count once per prompt, i.e. every `n`-th item.
+pub(super) fn unary_reply(
+    ret: &[Value],
+    n: usize,
+    cache_report: bool,
+    object: &str,
+    model: &str,
+    choices: Vec<Value>,
+) -> Option<Reply> {
+    let first = &ret.first()?["meta_info"];
+    let stride = |key: &str| -> u64 {
+        ret.iter()
+            .step_by(n)
+            .map(|r| meta_u64(&r["meta_info"], key))
+            .sum()
+    };
+    let all = |key: &str| -> u64 { ret.iter().map(|r| meta_u64(&r["meta_info"], key)).sum() };
+    let cached = cache_report.then(|| stride("cached_tokens"));
+    let mut metadata = json!({"weight_version": first["weight_version"]});
+    if let Some(versions) = first.get("weight_versions") {
+        metadata["weight_versions"] = versions.clone();
+    }
+    let response = json!({
+        "id": first["id"],
+        "object": object,
+        "created": now(),
+        "model": model,
+        "choices": choices,
+        "usage": usage(stride("prompt_tokens"), all("completion_tokens"), all("reasoning_tokens"), cached),
+        "metadata": metadata,
+    });
+    Some(Reply {
+        status: 200,
+        body: response.to_string(),
+    })
+}
+
+/// What a stream does with one `/generate` SSE payload.
+pub(super) enum Payload {
+    Done,
+    Frame(Value),
+    Events(Vec<String>),
+}
+
+/// Stream state both endpoints keep: whether it started, stopped or failed,
+/// and each choice's latest token counts.
+#[derive(Default)]
+pub(super) struct StreamState {
+    pub started: bool,
+    pub stopped: bool,
+    pub failed: bool,
+    pub done: bool,
+    pub last_id: Value,
+    /// Per choice: characters of cumulative text and logprobs already sent.
+    pub text_offsets: HashMap<u64, usize>,
+    pub logprob_counts: HashMap<u64, usize>,
+    prompt: HashMap<u64, u64>,
+    completion: HashMap<u64, u64>,
+    reasoning: HashMap<u64, u64>,
+    cached: HashMap<u64, u64>,
+}
+
+impl StreamState {
+    /// The checks Python makes before reading a frame. `Err` replaces the
+    /// whole stream, before anything was sent.
+    pub(super) fn payload(&mut self, data: &[u8]) -> Result<Payload, Reply> {
+        if self.done {
+            return Ok(Payload::Events(Vec::new()));
+        }
+        if data == b"[DONE]" {
+            return Ok(Payload::Done);
+        }
+        let Ok(content) = serde_json::from_slice::<Value>(data) else {
+            return Ok(Payload::Events(Vec::new()));
+        };
+        if let Some(message) = content.pointer("/error/message").and_then(Value::as_str) {
+            if !self.started {
+                return Err(error_reply(message, "BadRequestError", 400));
+            }
+            self.failed = true;
+            return Ok(Payload::Events(vec![stream_error_event(
+                message,
+                "BadRequestError",
+                400,
+            )]));
+        }
+        self.started = true;
+        Ok(Payload::Frame(content))
+    }
+
+    /// An abort or error just ended the stream; Python stops there, without
+    /// waiting for the other choices.
+    pub(super) fn ending(&self) -> bool {
+        !self.done && (self.stopped || self.failed)
+    }
+
+    /// Record the frame's id and choice `index`'s token counts.
+    pub(super) fn record(&mut self, index: u64, meta: &Value) {
+        self.last_id = meta["id"].clone();
+        self.prompt.insert(index, meta_u64(meta, "prompt_tokens"));
+        self.completion
+            .insert(index, meta_u64(meta, "completion_tokens"));
+        self.reasoning
+            .insert(index, meta_u64(meta, "reasoning_tokens"));
+        self.cached.insert(index, meta_u64(meta, "cached_tokens"));
+    }
+
+    /// Choice `index`'s usage, for `continuous_usage_stats`.
+    pub(super) fn choice_usage(&self, index: u64, cache_report: bool) -> Value {
+        let cached = cache_report.then(|| self.cached[&index]);
+        usage(
+            self.prompt[&index],
+            self.completion[&index],
+            self.reasoning[&index],
+            cached,
+        )
+    }
+
+    /// The final usage chunk's; prompt and cached tokens count once per prompt.
+    pub(super) fn total_usage(&self, n: usize, cache_report: bool) -> Value {
+        let per_prompt = |map: &HashMap<u64, u64>| -> u64 {
+            map.iter()
+                .filter(|(i, _)| *i % n as u64 == 0)
+                .map(|(_, v)| v)
+                .sum()
+        };
+        let cached = cache_report.then(|| per_prompt(&self.cached));
+        usage(
+            per_prompt(&self.prompt),
+            self.completion.values().sum(),
+            self.reasoning.values().sum(),
+            cached,
+        )
+    }
 }
 
 /// `model_dump_json(exclude_none=True)`: drop `null` fields, recursively.
