@@ -3,8 +3,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
+from sglang.srt.configs.beam import BeamConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -99,9 +101,29 @@ def test_get_model_config_reports_deepseek_ocr_layer_layout():
     }
 
 
+@pytest.mark.parametrize(
+    "tp_size,ep_size,num_experts,shard_size", [(4, 1, 256, 1280), (8, 8, 32, 5120)]
+)
+def test_get_model_config_supports_beam(
+    tmp_path, tp_size, ep_size, num_experts, shard_size
+):
+    BeamConfig().save_pretrained(tmp_path)
+    tuned_config = _load_common_utils().get_model_config(
+        str(tmp_path), tp_size, ep_size
+    )
+
+    assert tuned_config == {
+        "num_experts": num_experts,
+        "topk": 8,
+        "hidden_size": 5120,
+        "shard_intermediate_size": shard_size,
+        "dtype": torch.bfloat16,
+        "block_shape": None,
+        "architecture": "BeamForCausalLM",
+    }
+
+
 if __name__ == "__main__":
     import sys
-
-    import pytest
 
     sys.exit(pytest.main([__file__, "-v"]))
