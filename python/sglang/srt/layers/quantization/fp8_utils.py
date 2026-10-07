@@ -2255,7 +2255,7 @@ def apply_fp8_linear_bmm_flashinfer(
 
 
 def apply_fp8_linear(
-    input: torch.Tensor,
+    input: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
@@ -2277,6 +2277,12 @@ def apply_fp8_linear(
             "SGLANG_ENABLE_TORCH_COMPILE"
         )
     output_padding = 17 if pad_output else None
+
+    if _is_hip and isinstance(input, tuple):
+        # A producer fusion hands over (fp8, per-token scale); unpack it and
+        # let the prequantized path below run as if the caller had quantized.
+        input, input_scale = input
+        use_per_token_if_dynamic = True
 
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
