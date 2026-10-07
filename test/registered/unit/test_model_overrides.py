@@ -2237,24 +2237,44 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         _run(capable=True, verified=True, explicit=False).assert_not_called()
 
     def test_sm120_fp8_einsum_build_verification(self):
-        """Only an imported sgl-deep-gemm release with SM120 fp8_einsum counts."""
+        """Only an unmodified, imported sgl-deep-gemm release counts."""
+        import base64
+        import hashlib
         import importlib.util
         import pathlib
-        from importlib.metadata import PackageNotFoundError
+        from importlib.metadata import FileHash, PackageNotFoundError, PackagePath
         from types import SimpleNamespace
 
         from sglang.srt.arg_groups import model_hook
 
-        def _verified(installed, *, shadowed=False):
+        def _record(name, content, *, hashed=True):
+            file = PackagePath(name)
+            digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest())
+            file.hash = (
+                FileHash("sha256=" + digest.rstrip(b"=").decode()) if hashed else None
+            )
+            return file
+
+        def _verified(installed, *, shadowed=False, overwritten=None, hashed=True):
             with tempfile.TemporaryDirectory() as root:
                 site = pathlib.Path(root, "site-packages")
                 checkout = pathlib.Path(root, "DeepGEMM")
+                contents = {
+                    "deep_gemm/__init__.py": b"release",
+                    "deep_gemm/_C.so": b"release extension",
+                }
                 for base in (site, checkout):
-                    (base / "deep_gemm").mkdir(parents=True)
-                    (base / "deep_gemm" / "__init__.py").touch()
+                    for name, content in contents.items():
+                        (base / name).parent.mkdir(parents=True, exist_ok=True)
+                        (base / name).write_bytes(content)
+                if overwritten is not None:
+                    (site / overwritten).write_bytes(b"other DeepGEMM build")
                 dist = SimpleNamespace(
                     version=installed,
-                    files=[pathlib.PurePosixPath("deep_gemm/__init__.py")],
+                    files=[
+                        _record(name, content, hashed=hashed)
+                        for name, content in contents.items()
+                    ],
                     locate_file=lambda path: site / path,
                 )
                 imported = (checkout if shadowed else site) / "deep_gemm"
@@ -2283,8 +2303,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertFalse(_verified("unknown"))
         self.assertTrue(_verified("0.1.5"))
         self.assertTrue(_verified("0.2.1.post1"))
-        # A verified wheel does not vouch for a different imported checkout.
+        # A verified wheel does not vouch for a different imported checkout,
+        # for another build installed over it, or for files it did not hash.
         self.assertFalse(_verified("0.2.1.post1", shadowed=True))
+        self.assertFalse(_verified("0.2.1.post1", overwritten="deep_gemm/__init__.py"))
+        self.assertFalse(_verified("0.2.1.post1", overwritten="deep_gemm/_C.so"))
+        self.assertFalse(_verified("0.2.1.post1", hashed=False))
 
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (

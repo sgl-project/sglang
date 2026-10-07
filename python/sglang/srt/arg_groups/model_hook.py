@@ -82,7 +82,7 @@ _SM120_FP8_EINSUM_MIN_SGL_DEEP_GEMM = "0.1.5"
 
 
 def _sm120_fp8_einsum_build_verified() -> bool:
-    """Whether the importable ``deep_gemm`` is a verified sgl-deep-gemm release."""
+    """Whether the importable ``deep_gemm`` is an unmodified verified release."""
     import importlib.util
     from importlib.metadata import PackageNotFoundError, distribution
     from pathlib import Path
@@ -101,9 +101,40 @@ def _sm120_fp8_einsum_build_verified() -> bool:
     if spec is None or spec.origin is None:
         return False
     package_init = Path("deep_gemm", "__init__.py")
-    if not any(Path(file) == package_init for file in dist.files or ()):
+    # Another DeepGEMM installed over the same directory keeps this metadata,
+    # so the package and its extension must match the hashes the release
+    # recorded.
+    recorded = [
+        file
+        for file in dist.files or ()
+        if file.parts[:1] == ("deep_gemm",)
+        and (
+            file.name == "__init__.py"
+            or (file.name.startswith("_C") and file.suffix == ".so")
+        )
+    ]
+    if package_init not in {Path(file) for file in recorded}:
         return False
-    return Path(dist.locate_file(package_init)).resolve() == Path(spec.origin).resolve()
+    if Path(dist.locate_file(package_init)).resolve() != Path(spec.origin).resolve():
+        return False
+    return all(_recorded_hash_matches(dist, file) for file in recorded)
+
+
+def _recorded_hash_matches(dist: Any, file: Any) -> bool:
+    import base64
+    import hashlib
+
+    if file.hash is None or file.hash.mode != "sha256":
+        return False
+    digest = hashlib.sha256()
+    try:
+        with open(dist.locate_file(file), "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        return False
+    encoded = base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode()
+    return encoded == file.hash.value
 
 
 def _apply_sm120_fp8_wo_a_gemm_default() -> None:
