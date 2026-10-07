@@ -57,18 +57,23 @@ The controller then calls `finish_mamba_state_eviction` or
 `finish_swa_state_eviction` to resume eviction. This keeps I/O outside the Rust
 tree's mutex; both tree cores implement the same contract.
 
-Native code compiled into this extension can construct a core with
-`UnifiedTreeCore::with_component_factory(params, component_types, factory)`.
-The factory receives each `ComponentType` and `&CacheInitParams`, returns a native
-component, and can capture additional construction settings. Use
-`create_tree_component` for component kinds that retain their default behavior.
-Factories are supplied per construction; the core retains the resulting components.
+Rust code compiled into this extension registers named native factories with
+`register_tree_component(name, kind, factory, replace)`. Factories support plain
+and bigram keys. Each binding snapshots its selected factories before construction;
+replacing a registration affects future bindings and preserves the registered kind.
 
-Both concrete binding classes also provide a Rust-only `with_component_factory`
-constructor, preserving binding validation and Python error conversion. Python
-constructor signatures and class-based component overrides remain unchanged.
-This hook customizes implementations of the existing component kinds; it does
-not introduce a global registry or Python callbacks in tree operations.
+Both concrete binding constructors accept an optional
+`component_factory_overrides` dictionary from component type IDs to factory keys.
+For example, after Rust registers `custom_swa`, construct a binding with
+`RustUnifiedTreeCoreBinding(init_params, [0, 1], {1: "custom_swa"})`.
+Rust callers can pass a `HashMap<ComponentType, String>` to either binding's
+`with_component_factories` constructor.
+Unspecified kinds use `full_default`, `swa_default`, and `mamba_default`.
+Unknown keys, inactive kinds, and kind mismatches raise errors.
+
+Selection is exposed at the native binding boundary; `CacheInitParams` and
+Python's class-based component overrides are unchanged. Registration and factory
+invocation remain in Rust, with no Python callbacks in tree operations.
 
 ```bash
 # Build (libtorch from the installed torch package):

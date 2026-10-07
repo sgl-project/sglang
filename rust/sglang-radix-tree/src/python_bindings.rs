@@ -11,9 +11,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tch::{Device, Kind, Tensor};
 
-use crate::components::{
-    ComponentSet, ComponentType, FULL, MAMBA, SWA, TreeComponent, create_tree_component,
-};
+use crate::components::registry::{TreeComponentKey, resolve_tree_component_factories};
+use crate::components::{ComponentSet, ComponentType, FULL, MAMBA, SWA, TreeComponent};
 use crate::node::ChildKeyType;
 use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError};
 use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
@@ -994,13 +993,10 @@ struct TreeCoreBinding<K: ChildKeyType> {
 
 // Send + Sync lets allow_threads release the GIL around core calls.
 impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
-    /// Build a tree core for the given component types from the cache's
-    /// init params.
-    fn with_component_factory(
+    fn parse_construction_params(
         init_params: &TreeCoreInitParamsBinding,
         component_types: Vec<u8>,
-        factory: impl FnMut(ComponentType, &CacheInitParams) -> Arc<dyn TreeComponent<K> + Send + Sync>,
-    ) -> PyResult<Self> {
+    ) -> PyResult<(CacheInitParams, Vec<ComponentType>)> {
         let component_types = component_types
             .into_iter()
             .map(parse_component_type)
@@ -1038,9 +1034,17 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             )));
         }
         let params = init_params.to_cache_init_params()?;
+        Ok((params, component_types))
+    }
+
+    fn from_component_factory(
+        params: CacheInitParams,
+        component_types: Vec<ComponentType>,
+        factory: impl FnMut(ComponentType, &CacheInitParams) -> Arc<dyn TreeComponent<K> + Send + Sync>,
+    ) -> Self {
         let device = params.device;
         let page_size = params.page_size;
-        Ok(TreeCoreBinding {
+        Self {
             core: Mutex::new(UnifiedTreeCore::with_component_factory(
                 params,
                 component_types,
@@ -1048,7 +1052,40 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             )),
             device,
             page_size,
-        })
+        }
+    }
+
+    fn with_component_factory(
+        init_params: &TreeCoreInitParamsBinding,
+        component_types: Vec<u8>,
+        factory: impl FnMut(ComponentType, &CacheInitParams) -> Arc<dyn TreeComponent<K> + Send + Sync>,
+    ) -> PyResult<Self> {
+        let (params, component_types) =
+            Self::parse_construction_params(init_params, component_types)?;
+        Ok(Self::from_component_factory(
+            params,
+            component_types,
+            factory,
+        ))
+    }
+
+    fn with_component_factories(
+        init_params: &TreeCoreInitParamsBinding,
+        component_types: Vec<u8>,
+        overrides: HashMap<ComponentType, String>,
+    ) -> PyResult<Self>
+    where
+        K: TreeComponentKey,
+    {
+        let (params, component_types) =
+            Self::parse_construction_params(init_params, component_types)?;
+        let factories = resolve_tree_component_factories(&component_types, &overrides)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(Self::from_component_factory(
+            params,
+            component_types,
+            |component_type, params| factories.create::<K>(component_type, params),
+        ))
     }
 
     /// Lock the core for one adapter call. A panic can leave a mutation half-applied,
@@ -2708,6 +2745,21 @@ macro_rules! tree_core_binding {
         }
 
         impl $name {
+            /// Resolve this binding's component factory keys through the Rust registry.
+            pub(crate) fn with_component_factories(
+                init_params: &TreeCoreInitParamsBinding,
+                component_types: Vec<u8>,
+                overrides: HashMap<ComponentType, String>,
+            ) -> PyResult<Self> {
+                catch_native_panic(|| {
+                    Ok(Self {
+                        inner: TreeCoreBinding::with_component_factories(
+                            init_params, component_types, overrides,
+                        )?,
+                    })
+                })
+            }
+
             /// Construct this binding with component factories supplied by compiled Rust code.
             pub(crate) fn with_component_factory(
                 init_params: &TreeCoreInitParamsBinding,
@@ -2729,28 +2781,17 @@ macro_rules! tree_core_binding {
             /// Build a tree core for the given component types from the cache's
             /// init params.
             #[new]
-            fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self> {
-                Self::with_component_factory(init_params, component_types, create_tree_component::<$key>)
-            }
-
-            #[cfg(feature = "inspection")]
-            #[staticmethod]
-            fn inspect_with_component_factory(
+            #[pyo3(signature = (init_params, component_types, component_factory_overrides = None))]
+            fn new(
                 init_params: &TreeCoreInitParamsBinding,
                 component_types: Vec<u8>,
-                panic_factory: bool,
-            ) -> PyResult<(Self, Vec<u8>)> {
-                let mut constructed = Vec::new();
-                let binding = Self::with_component_factory(
-                    init_params,
-                    component_types,
-                    |component_type, params| {
-                        assert!(!panic_factory, "component factory test panic");
-                        constructed.push(component_type as u8);
-                        create_tree_component::<$key>(component_type, params)
-                    },
-                )?;
-                Ok((binding, constructed))
+                component_factory_overrides: Option<HashMap<u8, String>>,
+            ) -> PyResult<Self> {
+                let overrides = component_factory_overrides.unwrap_or_default()
+                    .into_iter()
+                    .map(|(kind, name)| Ok((parse_component_type(kind)?, name)))
+                    .collect::<PyResult<HashMap<_, _>>>()?;
+                Self::with_component_factories(init_params, component_types, overrides)
             }
 
             /// Drop the entire tree and reinitialize empty state.
@@ -3989,7 +4030,49 @@ fn get_hash_str(
     })
 }
 
+#[cfg(feature = "inspection")]
+fn register_inspection_component_factories() {
+    use crate::components::registry::{TreeComponentArgument, register_tree_component};
+    use crate::components::{FullComponent, MambaComponent, SwaComponent};
+
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
+    REGISTERED.call_once(|| {
+        register_tree_component(
+            "inspection_full",
+            FULL,
+            |_: &TreeComponentArgument<'_>| FullComponent,
+            false,
+        )
+        .expect("inspection component factory registration failed");
+        register_tree_component(
+            "inspection_swa",
+            SWA,
+            |args: &TreeComponentArgument<'_>| SwaComponent::new(args.params),
+            false,
+        )
+        .expect("inspection component factory registration failed");
+        register_tree_component(
+            "inspection_mamba",
+            MAMBA,
+            |args: &TreeComponentArgument<'_>| MambaComponent::new(args.params),
+            false,
+        )
+        .expect("inspection component factory registration failed");
+        register_tree_component(
+            "inspection_factory_panic",
+            FULL,
+            |_: &TreeComponentArgument<'_>| -> FullComponent {
+                panic!("named component factory test panic")
+            },
+            false,
+        )
+        .expect("inspection component factory registration failed");
+    });
+}
+
 fn register_mem_cache_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    #[cfg(feature = "inspection")]
+    register_inspection_component_factories();
     m.add_class::<TlruFloatConfigBinding>()?;
     m.add_function(wrap_pyfunction!(get_hash_str, m)?)?;
     m.add_class::<TreeCoreInitParamsBinding>()?;

@@ -133,21 +133,29 @@ def test_match_on_the_empty_tree_returns_no_indices():
 
 @pytest.mark.parametrize("is_bigram", [False, True])
 @pytest.mark.parametrize("component_types", [[0], [0, 1], [0, 2], [0, 1, 2]])
-def test_native_component_factory_builds_working_bindings(is_bigram, component_types):
+@pytest.mark.parametrize("partial_override", [False, True])
+def test_named_component_factory_builds_working_bindings(
+    is_bigram, component_types, partial_override
+):
     bindings = load_tree_core_extension(inspection=True)
     binding_class = (
         bindings.RustBigramUnifiedTreeCoreBinding
         if is_bigram
         else bindings.RustUnifiedTreeCoreBinding
     )
-    binding, requested_kinds = binding_class.inspect_with_component_factory(
-        bindings.TreeCoreInitParamsBinding(
-            swa_sliding_window_size=8, mamba_cache_chunk_size=4
-        ),
-        component_types,
-        False,
+    init_params = bindings.TreeCoreInitParamsBinding(
+        swa_sliding_window_size=8, mamba_cache_chunk_size=4
     )
-    assert requested_kinds == component_types
+    factory_keys = {0: "inspection_full", 1: "inspection_swa", 2: "inspection_mamba"}
+    overrides = {
+        kind: factory_keys[kind]
+        for kind in component_types
+        if not partial_override or kind == int(ComponentType.FULL)
+    }
+    binding = binding_class(
+        init_params, component_types, component_factory_overrides=overrides
+    )
+    default_binding = binding_class(init_params, component_types)
     tokens = array("q", range(4 + is_bigram))
     inserted = binding.insert(
         bindings.InsertParamsBinding(
@@ -174,8 +182,34 @@ def test_native_component_factory_builds_working_bindings(is_bigram, component_t
         12,
         13,
     ]
+    assert default_binding.match_prefix(match_params).device_indices.numel() == 0
     binding.reset()
     assert binding.match_prefix(match_params).device_indices.numel() == 0
+
+
+@pytest.mark.parametrize("is_bigram", [False, True])
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({0: "unregistered_factory"}, "unknown component factory"),
+        ({0: ""}, "must be non-empty"),
+        ({0: "   "}, "must be non-empty"),
+        ({1: "inspection_swa"}, "component Swa is not enabled"),
+        ({255: "inspection_full"}, "unknown component type"),
+        ({0: "inspection_swa"}, "has type Swa, expected Full"),
+    ],
+)
+def test_named_component_factory_rejects_invalid_overrides(
+    is_bigram, overrides, message
+):
+    bindings = load_tree_core_extension(inspection=True)
+    binding_class = (
+        bindings.RustBigramUnifiedTreeCoreBinding
+        if is_bigram
+        else bindings.RustUnifiedTreeCoreBinding
+    )
+    with pytest.raises(ValueError, match=message):
+        binding_class(bindings.TreeCoreInitParamsBinding(), [0], overrides)
 
 
 @pytest.mark.parametrize("is_bigram", [False, True])
@@ -190,7 +224,7 @@ def test_native_component_factory_builds_working_bindings(is_bigram, component_t
         ([0, 2], {}, "requires mamba_cache_chunk_size"),
     ],
 )
-def test_native_component_factory_validates_before_invocation(
+def test_named_component_factory_validates_before_invocation(
     is_bigram, component_types, init_overrides, message
 ):
     bindings = load_tree_core_extension(inspection=True)
@@ -200,32 +234,67 @@ def test_native_component_factory_validates_before_invocation(
         else bindings.RustUnifiedTreeCoreBinding
     )
     with pytest.raises(ValueError, match=message):
-        binding_class.inspect_with_component_factory(
-            bindings.TreeCoreInitParamsBinding(**init_overrides), component_types, True
+        binding_class(
+            bindings.TreeCoreInitParamsBinding(**init_overrides),
+            component_types,
+            {0: "inspection_factory_panic"},
         )
 
 
 @pytest.mark.parametrize("is_bigram", [False, True])
-def test_native_component_factory_panics_become_runtime_errors(is_bigram):
+@pytest.mark.parametrize(
+    "swa_key,message",
+    [
+        ("unregistered_factory", "unknown component factory"),
+        ("", "must be non-empty"),
+        ("inspection_full", "has type Full, expected Swa"),
+    ],
+)
+def test_named_component_factory_resolves_all_keys_before_invocation(
+    is_bigram, swa_key, message
+):
     bindings = load_tree_core_extension(inspection=True)
     binding_class = (
         bindings.RustBigramUnifiedTreeCoreBinding
         if is_bigram
         else bindings.RustUnifiedTreeCoreBinding
     )
-    with pytest.raises(RuntimeError, match="component factory test panic"):
-        binding_class.inspect_with_component_factory(
-            bindings.TreeCoreInitParamsBinding(), [0], True
+    with pytest.raises(ValueError, match=message):
+        binding_class(
+            bindings.TreeCoreInitParamsBinding(swa_sliding_window_size=8),
+            [0, 1],
+            {0: "inspection_factory_panic", 1: swa_key},
         )
+
+
+@pytest.mark.parametrize("is_bigram", [False, True])
+def test_named_component_factory_panic_does_not_change_defaults(is_bigram):
+    bindings = load_tree_core_extension(inspection=True)
+    binding_class = (
+        bindings.RustBigramUnifiedTreeCoreBinding
+        if is_bigram
+        else bindings.RustUnifiedTreeCoreBinding
+    )
+    init_params = bindings.TreeCoreInitParamsBinding()
+    with pytest.raises(RuntimeError, match="named component factory test panic"):
+        binding_class(init_params, [0], {0: "inspection_factory_panic"})
+    assert (
+        binding_class(init_params, [0]).empty_match_result().device_indices.numel() == 0
+    )
 
 
 @pytest.mark.parametrize(
     "binding_class",
     [mem_cache.RustUnifiedTreeCoreBinding, mem_cache.RustBigramUnifiedTreeCoreBinding],
 )
-def test_native_component_factories_are_not_exposed_to_python(binding_class):
+def test_named_component_factory_registration_stays_native(binding_class):
     assert not hasattr(binding_class, "with_component_factory")
-    assert not hasattr(binding_class, "inspect_with_component_factory")
+    assert not hasattr(mem_cache, "register_tree_component")
+    assert not hasattr(mem_cache, "registered_tree_components")
+    with pytest.raises(ValueError, match="unknown component factory"):
+        binding_class(
+            mem_cache.TreeCoreInitParamsBinding(), [0], {0: "inspection_full"}
+        )
 
 
 @pytest.mark.parametrize("instance_backend", [None, "rust"])

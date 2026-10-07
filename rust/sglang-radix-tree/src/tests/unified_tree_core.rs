@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use tch::Tensor;
 
 use super::*;
+use crate::components::registry::{TreeComponentArgument, TreeComponentRegistry};
 use crate::components::{ComponentSet, FULL, MAMBA, SWA, SwaComponent};
 use crate::node::{NodeAccessError, ValueSlotIdx};
 use crate::test_utils::{accumulate_step, action_kinds};
@@ -220,7 +221,7 @@ impl<K: ChildKeyType> TreeComponent<K> for CountingComponentForTest {
     }
 }
 
-fn exercise_component_factory<K: ChildKeyType>(key: K) {
+fn exercise_component_factory<K: TreeComponentKey>(key: K) {
     let counter = Arc::new(CountingComponentForTest::default());
     let weak_counter = Arc::downgrade(&counter);
     let validator_calls = Arc::clone(&counter.validator_calls);
@@ -296,6 +297,64 @@ fn component_factory_rejects_duplicates_before_invoking_the_factory() {
         vec![FULL, FULL],
         |_, _| panic!("factory must not run for duplicate component types"),
     );
+}
+
+fn exercise_registered_factory<K: TreeComponentKey>(key: K) {
+    let registry = TreeComponentRegistry::default();
+    let validator_calls = Arc::new(Mutex::new(0));
+    let observed_calls = Arc::clone(&validator_calls);
+    registry
+        .register_tree_component(
+            "counting",
+            SWA,
+            move |argument: &TreeComponentArgument<'_>| {
+                assert_eq!(argument.component_type, SWA);
+                assert_eq!(argument.is_bigram, K::IS_BIGRAM);
+                CountingComponentForTest {
+                    validator_calls: Arc::clone(&validator_calls),
+                }
+            },
+            false,
+        )
+        .unwrap();
+    let component_types = vec![FULL, SWA];
+    let selected = registry
+        .snapshot(
+            &component_types,
+            &HashMap::from([(SWA, "counting".to_owned())]),
+        )
+        .unwrap();
+    let defaults = registry
+        .snapshot(&component_types, &HashMap::new())
+        .unwrap();
+    let params = CacheInitParams {
+        swa_sliding_window_size: Some(4),
+        ..Default::default()
+    };
+    let default_driver = defaults.create::<K>(SWA, &params);
+    let mut tc = UnifiedTreeCore::with_component_factory(
+        params,
+        component_types,
+        |component_type, params| selected.create::<K>(component_type, params),
+    );
+    assert!(!Arc::ptr_eq(&default_driver, &tc.component_by_type_(SWA)));
+    for expected_calls in 1..=2 {
+        let values = Tensor::from_slice(&[10i64, 11]);
+        tc.add_new_node_(tc.arena.root(), key.clone(), &values, 0, None);
+        let result = tc.match_prefix(&MatchPrefixParams {
+            key: &key,
+            namespace: Default::default(),
+        });
+        assert!(result.device_indices.equal(&values));
+        assert_eq!(*observed_calls.lock().unwrap(), expected_calls);
+        tc.reset();
+    }
+}
+
+#[test]
+fn registered_selection_is_instance_local_and_dispatches_after_reset() {
+    exercise_registered_factory(vec![1i64, 2]);
+    exercise_registered_factory(vec![(1i64, 2i64), (2, 3)]);
 }
 
 // Swa-flavored stub driver: any dispatched call panics as unimplemented.

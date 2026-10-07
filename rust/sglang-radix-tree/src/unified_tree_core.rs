@@ -8,6 +8,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use tch::{Device, Kind, Tensor};
 
+use crate::components::registry::{TreeComponentKey, resolve_tree_component_factories};
 use crate::components::{self, ComponentSet, TreeComponent};
 use crate::components::{
     BASE_COMPONENT_TYPE, ComponentType, FULL, MAMBA, NUM_COMPONENT_TYPES, SWA,
@@ -800,12 +801,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         });
     }
 
-    pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self {
-        Self::with_component_factory(
-            params,
-            component_types,
-            components::create_tree_component::<K>,
-        )
+    pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self
+    where
+        K: TreeComponentKey,
+    {
+        let factories = resolve_tree_component_factories(&component_types, &HashMap::new())
+            .unwrap_or_else(|error| panic!("{error}"));
+        Self::with_component_factory(params, component_types, |component_type, params| {
+            factories.create::<K>(component_type, params)
+        })
     }
 
     /// Construct this tree's drivers with a factory invoked once per component kind.
