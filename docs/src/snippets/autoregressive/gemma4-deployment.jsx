@@ -90,6 +90,9 @@ export const Gemma4Deployment = () => {
       '26b-a4b': { tp: 1, mem: 0.80 },
     },
     arc_b: {
+      e2b: { tp: 4, mem: 0.80 },
+      e4b: { tp: 4, mem: 0.80 },
+      '12b': { tp: 4, mem: 0.80 },
       '31b': { tp: 4, mem: 0.80 },
       '26b-a4b': { tp: 4, mem: 0.75 },
     },
@@ -215,7 +218,7 @@ export const Gemma4Deployment = () => {
 
   const handleRadioChange = (optionName, value) => {
     setValues((prev) => {
-      if (prev.hardware === 'arc_b' && optionName === 'modelSize' && !['31b', '26b-a4b'].includes(value)) {
+      if (prev.hardware === 'arc_b' && optionName === 'modelSize' && !['e2b', 'e4b', '12b', '31b', '26b-a4b'].includes(value)) {
         return prev;
       }
       if (prev.hardware === 'arc_b' && optionName === 'checkpoint' && value !== 'standard') {
@@ -227,7 +230,7 @@ export const Gemma4Deployment = () => {
 
       const next = { ...prev, [optionName]: value };
       if (optionName === 'hardware' && value === 'arc_b') {
-        if (!['31b', '26b-a4b'].includes(next.modelSize)) {
+        if (!['e2b', 'e4b', '12b', '31b', '26b-a4b'].includes(next.modelSize)) {
           next.modelSize = '31b';
         }
         next.checkpoint = 'standard';
@@ -411,7 +414,7 @@ export const Gemma4Deployment = () => {
                   const isArcBModelLocked =
                     values.hardware === 'arc_b' &&
                     option.name === 'modelSize' &&
-                    !['31b', '26b-a4b'].includes(item.id);
+                    !['e2b', 'e4b', '12b', '31b', '26b-a4b'].includes(item.id);
                   const isArcBCheckpointLocked =
                     values.hardware === 'arc_b' &&
                     option.name === 'checkpoint' &&
