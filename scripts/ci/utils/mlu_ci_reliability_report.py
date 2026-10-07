@@ -308,7 +308,7 @@ def result_bucket(record: dict[str, Any]) -> tuple[str, str]:
         status = str(metadata.get("status") or "")
         failure_type = str(metadata.get("failure_type") or "")
         failure_stage = str(metadata.get("failure_stage") or "")
-        if "success" in status and not failure_type:
+        if status == "success" and not failure_type:
             return "success", "success"
         if failure_type:
             return failure_type, failure_stage or "unknown"
@@ -554,7 +554,12 @@ def parse_args() -> argparse.Namespace:
         ),
         default="pull_request_target",
     )
-    parser.add_argument("--days", type=int, default=7)
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="Days to include (1-30; result artifact retention is 30 days)",
+    )
     parser.add_argument(
         "--end-time", help="UTC ISO-8601 report end time; defaults to now"
     )
@@ -570,8 +575,8 @@ def main() -> int:
     if not REPOSITORY_RE.fullmatch(args.repo):
         print("--repo must be in owner/repository form", file=sys.stderr)
         return 2
-    if args.days < 1 or args.days > 90:
-        print("--days must be between 1 and 90", file=sys.stderr)
+    if args.days < 1 or args.days > 30:
+        print("--days must be between 1 and 30", file=sys.stderr)
         return 2
     end = (
         parse_timestamp(args.end_time) if args.end_time else datetime.now(timezone.utc)

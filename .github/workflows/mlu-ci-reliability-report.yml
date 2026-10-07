@@ -1,12 +1,17 @@
 name: MLU CI Reliability Report
 
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/mlu-ci-reliability-report.yml'
+      - 'scripts/ci/utils/mlu_ci_reliability_report.py'
+      - 'scripts/ci/utils/test_mlu_ci_reliability_report.py'
   schedule:
     - cron: '17 0 * * 1' # Every Monday at 00:17 UTC
   workflow_dispatch:
     inputs:
       days:
-        description: 'Number of days to include'
+        description: 'Number of days to include (1-30; result artifacts are retained for 30 days)'
         required: false
         default: '7'
         type: string
@@ -14,11 +19,32 @@ on:
 permissions: {}
 
 concurrency:
-  group: mlu-ci-reliability-report
+  group: mlu-ci-reliability-report-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout reporter tests
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Test MLU CI reliability reporter
+        run: python -m unittest discover -s scripts/ci/utils -p 'test_mlu_ci_reliability_report.py'
+
   report:
+    needs: test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -70,8 +96,6 @@ jobs:
     permissions:
       actions: read
       issues: write
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Download report data
         uses: actions/download-artifact@v4
@@ -79,8 +103,32 @@ jobs:
           name: mlu-ci-reliability-${{ github.run_id }}
           path: report-data
 
-      - name: Publish report to the RFC issue
-        run: |
-          gh issue comment 32300 \
-            --repo "${GITHUB_REPOSITORY}" \
-            --body-file report-data/mlu-ci-reliability.md
+      - name: Update report in the tracking issue
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- mlu-ci-reliability-report -->';
+            const body = fs.readFileSync('report-data/mlu-ci-reliability.md', 'utf8');
+            if (!body.includes(marker)) {
+              throw new Error('Report is missing its comment marker');
+            }
+            const issue = { ...context.repo, issue_number: 42935 };
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...issue,
+              per_page: 100,
+            });
+            const existing = comments.find(comment =>
+              comment.user?.login === 'github-actions[bot]' &&
+              comment.user?.type === 'Bot' &&
+              comment.body?.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                ...context.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({ ...issue, body });
+            }
