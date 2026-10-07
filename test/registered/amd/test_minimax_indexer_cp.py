@@ -10,7 +10,7 @@ register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")
 
 BLOCK, TOPK, HEADS, DIM = 128, 16, 4, 128
 INIT_BLOCKS, LOCAL_BLOCKS = 1, 2
-NDT = 4
+DRAFT_TOKENS = 4
 
 
 def _inputs(batch, max_len, dtype, device):
@@ -35,12 +35,12 @@ def _inputs(batch, max_len, dtype, device):
 
 
 def _verify_rows(reqs, prefix, dtype, device):
-    """Chain verify as the backend funnel lays it out: each request's NDT draft rows
+    """Chain verify as the backend funnel lays it out: each request's DRAFT_TOKENS draft rows
     consecutively, row i seeing prefix + i + 1 tokens."""
-    _, cache, table, slots, _ = _inputs(reqs, prefix + NDT, dtype, device)
-    slots = slots.repeat_interleave(NDT)
-    lengths = (prefix + torch.arange(1, NDT + 1, device=device)).repeat(reqs)
-    q = torch.randn((reqs * NDT, HEADS, DIM), device=device, dtype=torch.bfloat16)
+    _, cache, table, slots, _ = _inputs(reqs, prefix + DRAFT_TOKENS, dtype, device)
+    slots = slots.repeat_interleave(DRAFT_TOKENS)
+    lengths = (prefix + torch.arange(1, DRAFT_TOKENS + 1, device=device)).repeat(reqs)
+    q = torch.randn((reqs * DRAFT_TOKENS, HEADS, DIM), device=device, dtype=torch.bfloat16)
     return q, cache, table, slots, lengths
 
 
@@ -132,12 +132,12 @@ class TestMiniMaxIndexerCP(unittest.TestCase):
         row alone does, including rows whose lengths straddle a block boundary."""
         device = torch.device("cuda")
         prefix = 255 * BLOCK + 126  # rows end at 32767..32770, across block 256
-        max_len = prefix + NDT
+        max_len = prefix + DRAFT_TOKENS
         for dtype in (torch.bfloat16, torch.float8_e4m3fnuz):
             with self.subTest(dtype=dtype):
                 q, cache, table, slots, lengths = _verify_rows(4, prefix, dtype, device)
                 packed = _cp_topk(
-                    q, cache, table, slots, lengths, max_len, 1.0, packed_queries=NDT
+                    q, cache, table, slots, lengths, max_len, 1.0, packed_queries=DRAFT_TOKENS
                 )
                 for head in range(HEADS):
                     native = _native_topk(
