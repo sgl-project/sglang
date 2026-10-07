@@ -1,9 +1,16 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
     resolve_auto_min_free_slots,
     resolve_min_free_slots,
+)
+from sglang.srt.managers.prefill_delayer import (
+    PrefillDelayer,
+    PrefillDelayerSinglePassExecutor,
+    RecentPrefillBatchSizeTracker,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -407,6 +414,30 @@ class TestMinFreeSlotsDelayer(unittest.TestCase):
             delayer.should_delay(running_bs=7, num_allocatable_reqs=41, waiting_bs=1)
         )
 
+    def test_expired_deadline_stays_released_until_admission(self):
+        delayer = MinFreeSlotsDelayer(min_free_slots=2, max_delay_passes=2)
+        delayer.on_prefill_admitted(active_running_bs=0, admitted_bs=8)
+
+        for _ in range(2):
+            self.assertTrue(
+                delayer.should_delay(
+                    running_bs=7, num_allocatable_reqs=41, waiting_bs=1
+                )
+            )
+        # Another admission gate may reject the released pass. The expired
+        # deadline must not restart before a request is actually admitted.
+        for _ in range(5):
+            self.assertFalse(
+                delayer.should_delay(
+                    running_bs=7, num_allocatable_reqs=41, waiting_bs=1
+                )
+            )
+
+        delayer.on_prefill_admitted(active_running_bs=7, admitted_bs=1)
+        self.assertTrue(
+            delayer.should_delay(running_bs=7, num_allocatable_reqs=41, waiting_bs=1)
+        )
+
     def test_admission_resets_max_delay_passes(self):
         delayer = MinFreeSlotsDelayer(min_free_slots=2, max_delay_passes=1)
         delayer.on_prefill_admitted(active_running_bs=0, admitted_bs=8)
@@ -464,6 +495,97 @@ class TestMinFreeSlotsDelayer(unittest.TestCase):
     def test_negative_max_delay_passes_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "must be non-negative"):
             MinFreeSlotsDelayer(min_free_slots=2, max_delay_passes=-1)
+
+
+class TestMinFreeSlotsDelayerWithPrefillDelayer(unittest.TestCase):
+    """Both replacement batching and the adaptive prefill delayer are enabled."""
+
+    MAX_RUNNING_REQUESTS = 48
+    PREFILL_DELAYER_MAX_DELAY_PASSES = 30
+
+    def _make_prefill_delayer(self):
+        schedule = SimpleNamespace(
+            prefill_delayer_queue_min_ratio=0.5,
+            prefill_delayer_max_delay_ms=None,
+            prefill_max_requests=8,
+            disable_overlap_schedule=False,
+        )
+        parallel = SimpleNamespace(dp_size=1, enable_dp_attention=False, attn_tp_size=1)
+
+        def gather_local_rank(output, local, group):
+            output.copy_(local)
+
+        with (
+            patch(
+                "sglang.srt.managers.prefill_delayer.get_schedule",
+                return_value=schedule,
+            ),
+            patch(
+                "sglang.srt.managers.prefill_delayer.get_parallel",
+                return_value=parallel,
+            ),
+        ):
+            delayer = PrefillDelayer(
+                cpu_group=None,
+                max_delay_passes=self.PREFILL_DELAYER_MAX_DELAY_PASSES,
+                token_usage_low_watermark=None,
+                debug_log_enabled=False,
+            )
+        gather_patch = patch(
+            "sglang.srt.managers.prefill_delayer.all_gather_single",
+            side_effect=gather_local_rank,
+        )
+        gather_patch.start()
+        self.addCleanup(gather_patch.stop)
+        # The adaptive delayer's one-time startup bypass has been consumed.
+        delayer.skip_first_delayer = False
+        return delayer
+
+    def test_replacement_is_admitted_when_both_delayers_are_enabled(self):
+        min_free_slots_delayer = MinFreeSlotsDelayer(
+            min_free_slots=4, scale_with_observed_target=True
+        )
+        min_free_slots_delayer.on_prefill_admitted(active_running_bs=0, admitted_bs=8)
+        prefill_delayer = self._make_prefill_delayer()
+        tracker = RecentPrefillBatchSizeTracker()
+        tracker.observe_attempt(8)
+
+        # Seven requests stay active and one replacement waits, mirroring the
+        # scheduler order: replacement batching, then the PrefillAdder gate,
+        # then finalize() for the pass.
+        running_bs = 7
+        admitted_pass = None
+        num_passes = 2 * (8 + self.PREFILL_DELAYER_MAX_DELAY_PASSES)
+        for pass_index in range(num_passes):
+            executor = PrefillDelayerSinglePassExecutor(
+                prefill_delayer, token_usage=0.9
+            )
+            admitted_bs = 0
+            if not min_free_slots_delayer.should_delay(
+                running_bs=running_bs,
+                num_allocatable_reqs=self.MAX_RUNNING_REQUESTS - running_bs,
+                waiting_bs=1,
+            ) and executor.negotiate_should_allow_prefill(
+                local_prefillable=True,
+                running_batch=running_bs,
+                max_prefill_bs=tracker.max_prefill_bs,
+                max_running_requests=self.MAX_RUNNING_REQUESTS,
+                waiting_queue_len=1,
+            ):
+                admitted_bs = 1
+            observed_prefill_bs = executor.finalize(actual_prefill_bs=admitted_bs)
+            if observed_prefill_bs > 0:
+                tracker.observe_attempt(observed_prefill_bs)
+            if admitted_bs:
+                admitted_pass = pass_index
+                break
+
+        self.assertIsNotNone(
+            admitted_pass, f"replacement starved for {num_passes} scheduler passes"
+        )
+        # Replacement batching waits for the observed target of 8 passes, then
+        # the adaptive delayer applies its own bounded wait.
+        self.assertEqual(admitted_pass, 8 + self.PREFILL_DELAYER_MAX_DELAY_PASSES - 1)
 
 
 if __name__ == "__main__":

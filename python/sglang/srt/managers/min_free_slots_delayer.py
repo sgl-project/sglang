@@ -135,7 +135,10 @@ class MinFreeSlotsDelayer:
             else self._max_delay_passes
         )
         if self._delay_passes >= max_delay_passes:
-            self._delay_passes = 0
+            # Keep the expired deadline latched until an admission resets it.
+            # Another admission gate, such as the adaptive prefill delayer, may
+            # still reject this pass; restarting the budget here would let the
+            # two delays alternate and hold the refill indefinitely.
             return False
 
         self._delay_passes += 1
