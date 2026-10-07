@@ -30,6 +30,7 @@ from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
     MHCState,
+    SumGroup,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -395,11 +396,13 @@ class Glm5NextLinearAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        from sglang.srt.layers.cp.interleave import mixer_parallelism
-
-        head_shard_size, head_shard_rank, self.tensor_parallel_over_cp = (
-            mixer_parallelism()
+        from sglang.srt.runtime_context import (
+            get_linear_attn_tp_rank,
+            get_linear_attn_tp_size,
         )
+
+        head_shard_size = get_linear_attn_tp_size()
+        head_shard_rank = get_linear_attn_tp_rank()
 
         self.hidden_size = hidden_size
         self.config = config
@@ -634,12 +637,12 @@ class Glm5NextLinearAttention(nn.Module):
             return hidden_states
 
         from sglang.srt.layers.cp.interleave import (
-            mixer_to_rank_order,
-            mixer_to_sequence_order,
+            cp_interleave_to_rank_order,
+            cp_interleave_to_sequence_order,
         )
 
         gathered_rows = hidden_states.shape[0]
-        hidden_states = mixer_to_sequence_order(hidden_states, forward_batch)
+        hidden_states = cp_interleave_to_sequence_order(hidden_states, forward_batch)
 
         if self.do_fuse_qkvbfg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
@@ -665,7 +668,7 @@ class Glm5NextLinearAttention(nn.Module):
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
 
-        return mixer_to_rank_order(
+        return cp_interleave_to_rank_order(
             self.o_proj(core_attn_out)[0], forward_batch, gathered_rows
         )
 
@@ -802,8 +805,9 @@ class Glm5NextDecoderLayer(nn.Module):
                 declare_attn(
                     read=residual.attn_readout,
                     update=residual.attn_update,
-                    tensor_parallel_over_cp=self.is_linear_attn
-                    and self.self_attn.tensor_parallel_over_cp,
+                    tp_group=SumGroup.TP
+                    if self.is_linear_attn and get_parallel().cp_tp_group_sharing
+                    else SumGroup.ATTN_TP,
                 ),
                 self.input_layernorm,
                 {
@@ -1096,6 +1100,63 @@ class Glm5NextModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        from sglang.srt.layers.cp.utils import (
+            cp_gather_after_forward,
+            cp_shard_model_inputs,
+            is_cp_active,
+        )
+
+        if not is_cp_active(forward_batch):
+            return self._forward(
+                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+            )
+
+        # The wrapper has already injected vision features into complete token
+        # embeddings. CP starts here, not before multimodal preprocessing.
+        if input_ids is None:
+            input_ids = forward_batch.input_ids
+        if input_embeds is None and self.pp_group.is_first_rank:
+            input_embeds = self.embed_tokens(input_ids)
+        if input_embeds is None:
+            # Later pipeline ranks receive sharded residuals from the preceding
+            # rank; only positions and IDs need their local CP view.
+            from sglang.srt.layers.cp.utils import cp_shard_position_ids
+
+            hidden_states = self._forward(
+                cp_shard_position_ids(input_ids, forward_batch),
+                cp_shard_position_ids(positions, forward_batch),
+                forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        else:
+            with cp_shard_model_inputs(
+                input_embeds, positions, forward_batch, input_ids
+            ) as (local_embeds, local_positions, local_ids):
+                hidden_states = self._forward(
+                    local_ids,
+                    local_positions,
+                    forward_batch,
+                    local_embeds,
+                    pp_proxy_tensors,
+                )
+
+        if not self.pp_group.is_last_rank:
+            return hidden_states
+        if isinstance(hidden_states, tuple):
+            hidden_states, aux = hidden_states
+            return cp_gather_after_forward(hidden_states, forward_batch), [
+                cp_gather_after_forward(value, forward_batch) for value in aux
+            ]
+        return cp_gather_after_forward(hidden_states, forward_batch)
+
+    def _forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
         total_num_layers = self.end_layer - self.start_layer
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -1198,6 +1259,10 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
+    # The wrapper keeps full multimodal inputs; its language model owns CP
+    # sharding/gathering after embedding injection and before logits.
+    supports_full_sequence_cp = True
+
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
             "model.visual": "visual",
@@ -1528,11 +1593,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
-    def prepare_forward_batch(self, forward_batch: ForwardBatch):
-        from sglang.srt.layers.cp.interleave import validate_mixer_batch
-
-        validate_mixer_batch(forward_batch)
-
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
@@ -1602,14 +1662,25 @@ class Glm5NextForConditionalGeneration(nn.Module):
             positions = forward_batch.mrope_positions
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden_states = general_mm_embed_routine(
-                input_ids=input_ids,
-                forward_batch=forward_batch,
-                language_model=self.model,
-                multimodal_model=self,
-                positions=positions,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+            if input_embeds is not None and not forward_batch.contains_mm_inputs():
+                # Preserve input_embeds / replace_embeds supplied by the runner.
+                # The MM routine otherwise performs a fresh token lookup.
+                hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    input_embeds=input_embeds,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+            else:
+                hidden_states = general_mm_embed_routine(
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    language_model=self.model,
+                    multimodal_model=self,
+                    positions=positions,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:

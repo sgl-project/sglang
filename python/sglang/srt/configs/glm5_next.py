@@ -261,11 +261,10 @@ class Glm5NextTextConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> KimiLinearCacheParams:
-        from sglang.srt.layers.cp.interleave import mixer_parallelism
+        from sglang.srt.runtime_context import get_linear_attn_tp_size
 
-        head_shard_size, _, _ = mixer_parallelism()
         shape = KimiLinearStateShape.create(
-            tp_world_size=head_shard_size,
+            tp_world_size=get_linear_attn_tp_size(),
             num_heads=self.linear_attn_config["num_heads"],
             head_dim=self.linear_attn_config["head_dim"],
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],

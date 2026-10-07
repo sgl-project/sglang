@@ -15,26 +15,141 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestInterleaveMixer(CustomTestCase):
-    def test_multimodal_mixer_input_is_rejected_only_during_cp_extend(self):
-        metadata = InterleaveContextParallelMetadata(
-            total_seq_lens=4, per_rank_actual_token=[1] * 4
+    def test_wrapper_preserves_explicit_embedding_overrides(self):
+        """Full-sequence CP must not replace caller embeddings with token lookup."""
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+
+        ids = torch.tensor([1, 2, 3])
+        embeddings = torch.arange(6).reshape(3, 2).float()
+
+        class Decoder:
+            def get_input_embeddings(self):
+                return lambda ids: torch.zeros(len(ids), 2)
+
+            def __call__(self, *, input_embeds, **kwargs):
+                return input_embeds * 2
+
+        model = SimpleNamespace(
+            model=Decoder(),
+            is_mrope_enabled=False,
+            capture_aux_hidden_states=False,
+            pp_group=SimpleNamespace(is_last_rank=False),
         )
-        for extend in (False, True):
-            for cp_metadata in (None, metadata):
-                for multimodal in (False, True):
-                    with self.subTest(extend=extend, cp=cp_metadata, mm=multimodal):
-                        batch = SimpleNamespace(
-                            forward_mode=SimpleNamespace(
-                                is_context_parallel_extend=lambda: extend
-                            ),
-                            attn_cp_metadata=cp_metadata,
-                            contains_mm_inputs=lambda: multimodal,
-                        )
-                        if extend and cp_metadata is not None and multimodal:
-                            with self.assertRaisesRegex(ValueError, "text-only"):
-                                interleave.validate_mixer_batch(batch)
-                        else:
-                            interleave.validate_mixer_batch(batch)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            contains_mm_inputs=lambda: False,
+            input_embeds=embeddings.clone(),
+        )
+        result = Glm5NextForConditionalGeneration.forward(
+            model, ids, torch.arange(3), batch, input_embeds=embeddings
+        )
+        torch.testing.assert_close(result, embeddings * 2)
+        torch.testing.assert_close(batch.input_embeds, embeddings)
+
+    def test_kda_cache_uses_the_same_head_partition_as_linear_attention(self):
+        from sglang.srt.configs.glm5_next import Glm5NextTextConfig
+        from sglang.srt.runtime_context import (
+            get_context,
+            get_linear_attn_tp_rank,
+            get_linear_attn_tp_size,
+            get_parallel,
+        )
+
+        config = Glm5NextTextConfig(
+            linear_attn_config={
+                "num_heads": 32,
+                "head_dim": 128,
+                "short_conv_kernel_size": 4,
+                "kda_layers": [0],
+            }
+        )
+        for sharing, expected_heads, expected_rank in ((True, 8, 3), (False, 32, 0)):
+            with (
+                self.subTest(sharing=sharing),
+                get_context().override_server_args(
+                    tp_size=4,
+                    attn_cp_size=4,
+                    enable_prefill_cp=True,
+                    cp_strategy="interleave",
+                    cp_tp_group_sharing=sharing,
+                ),
+                get_parallel().override(tp_rank=3, attn_cp_rank=3, attn_tp_rank=0),
+            ):
+                self.assertEqual(get_linear_attn_tp_size(), 32 // expected_heads)
+                self.assertEqual(get_linear_attn_tp_rank(), expected_rank)
+                self.assertEqual(
+                    config.mamba2_cache_params.shape.temporal,
+                    (expected_heads, 128, 128),
+                )
+
+    def test_language_model_cp_boundary_consumes_completed_embeddings(self):
+        from sglang.srt.layers.cp import base
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.models.glm5_next import Glm5NextModel
+        from sglang.srt.runtime_context import get_context, get_parallel
+
+        # Some IDs represent multimodal placeholders outside the vocabulary.
+        # The model boundary must use the embeddings the wrapper already made.
+        ids = torch.tensor([1, 900000, 900000, 2, 3])
+        positions = torch.arange(5)
+        embeddings = torch.arange(10).reshape(5, 2).float()
+        metadata = InterleaveContextParallelMetadata(
+            total_seq_lens=5,
+            per_rank_actual_token=[3, 3],
+            per_rank_logical_token=[3, 2],
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            attn_cp_metadata=metadata,
+            input_ids=ids,
+            spec_info=None,
+            extend_seq_lens_cpu=[5],
+        )
+        expected = embeddings * 2
+        packed = torch.zeros(2, 3, 2)
+        packed[0, :3] = expected[::2]
+        packed[1, :2] = expected[1::2]
+
+        def gather(output, local):
+            output.copy_(packed.flatten(0, 1))
+
+        for rank in range(2):
+
+            def body(
+                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors=None
+            ):
+                logical = 3 if rank == 0 else 2
+                torch.testing.assert_close(input_embeds[:logical], embeddings[rank::2])
+                torch.testing.assert_close(
+                    positions[:logical], torch.arange(rank, 5, 2)
+                )
+                torch.testing.assert_close(input_ids[:logical], ids[rank::2])
+                return input_embeds * 2
+
+            model = SimpleNamespace(
+                pp_group=SimpleNamespace(is_last_rank=True), _forward=body
+            )
+            with (
+                self.subTest(rank=rank),
+                get_context().override_server_args(
+                    tp_size=2,
+                    attn_cp_size=2,
+                    enable_prefill_cp=True,
+                    cp_strategy="interleave",
+                ),
+                get_parallel().override(
+                    tp_rank=rank, attn_cp_rank=rank, attn_tp_rank=0, attn_cp_group=None
+                ),
+                patch.object(base, "_STRATEGY", interleave.InterleaveCPStrategy(2)),
+                patch.object(interleave, "attn_cp_all_gather_into_tensor", gather),
+                patch.object(interleave, "is_allocation_symmetric", return_value=False),
+            ):
+                result = Glm5NextModel.forward(
+                    model, None, positions, batch, input_embeds=embeddings
+                )
+                torch.testing.assert_close(result, expected)
+                self.assertFalse(hasattr(batch, "input_ids_global"))
 
     def test_pooling_gathers_keys_and_scores_but_keeps_queries_local(self):
         from sglang.srt.layers.cp import base, interleave, interleave_kpool
@@ -112,15 +227,15 @@ class TestInterleaveMixer(CustomTestCase):
                     "get_parallel",
                     return_value=SimpleNamespace(attn_cp_size=4),
                 ):
-                    restored = interleave.mixer_to_sequence_order(packed, batch)
+                    restored = interleave.cp_interleave_to_sequence_order(packed, batch)
                     torch.testing.assert_close(restored, sequence)
                     # A causal mixer must see the original order, not rank-major rows.
                     mixed = restored.cumsum(0)
-                    output = interleave.mixer_to_rank_order(
+                    output = interleave.cp_interleave_to_rank_order(
                         mixed, batch, packed.shape[0]
                     )
                     torch.testing.assert_close(
-                        interleave.mixer_to_rank_order(
+                        interleave.cp_interleave_to_rank_order(
                             sequence, batch, packed.shape[0]
                         ),
                         packed,
@@ -137,8 +252,8 @@ class TestInterleaveMixer(CustomTestCase):
             attn_cp_metadata=None,
         )
         hidden = torch.arange(6).reshape(3, 2)
-        self.assertIs(interleave.mixer_to_sequence_order(hidden, batch), hidden)
-        self.assertIs(interleave.mixer_to_rank_order(hidden, batch, 3), hidden)
+        self.assertIs(interleave.cp_interleave_to_sequence_order(hidden, batch), hidden)
+        self.assertIs(interleave.cp_interleave_to_rank_order(hidden, batch, 3), hidden)
 
     def test_kpool_local_queries_keep_full_compression_request_order(self):
         from sglang.srt.layers.cp import interleave_kpool

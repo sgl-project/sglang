@@ -5,9 +5,13 @@ GPUs. All recipes must retain GSM8K accuracy; the Low Latency recipe also
 checks EAGLE speculative acceptance and single-request decode performance.
 """
 
+import base64
+import io
 import unittest
 
-from sglang.srt.utils import kill_process_tree
+import requests
+from PIL import Image
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
@@ -16,6 +20,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     _wait_for_gpu_idle_in_ci,
     popen_launch_server,
+    terminate_and_kill_process_tree,
     try_cached_model,
 )
 
@@ -46,7 +51,7 @@ COMMON_SERVER_ARGS = [
 
 def _stop_server(process):
     if process:
-        kill_process_tree(process.pid)
+        terminate_and_kill_process_tree(process)
         _wait_for_gpu_idle_in_ci(timeout=GPU_IDLE_TIMEOUT)
 
 
@@ -140,19 +145,58 @@ class TestGLM53FlashB200ContextParallel(
     gsm8k_num_shots = 20
     server_args = [
         *COMMON_SERVER_ARGS,
-        "--language-only",
         "--enable-prefill-cp",
         "--cp-strategy",
         "interleave",
         "--attn-cp-size",
         "4",
-        # KDA partitions heads over these four CP ranks. EP1 keeps every MoE
+        # KDA partitions heads over TP4, sharing the CP group. EP1 keeps every MoE
         # on TP4; dense FFNs also use TP4 rather than per-rank computation.
         "--ep-size",
         "1",
         "--moe-dense-tp-size",
         "4",
     ]
+
+    def test_image_input(self):
+        # Color is supplied only by the image: the prompt cannot substitute for
+        # the encoder. Exercise two images to catch missing/cached embeddings.
+        for color in ("red", "blue"):
+            with self.subTest(color=color):
+                png = io.BytesIO()
+                Image.new("RGB", (256, 256), color=color).save(png, format="PNG")
+                image_url = (
+                    "data:image/png;base64," + base64.b64encode(png.getvalue()).decode()
+                )
+                response = requests.post(
+                    self.base_url + "/v1/chat/completions",
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": image_url},
+                                    },
+                                    {
+                                        "type": "text",
+                                        "text": "What is the dominant color of this image? Answer with one English color word.",
+                                    },
+                                ],
+                            }
+                        ],
+                        "temperature": 0,
+                        # The checkpoint template always opens a thinking block.
+                        # Allow it to finish before checking the final answer.
+                        "max_tokens": 1024,
+                    },
+                    timeout=180,
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                answer = response.json()["choices"][0]["message"]["content"]
+                self.assertIn(color, answer.lower(), response.text)
 
 
 if __name__ == "__main__":
