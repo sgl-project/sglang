@@ -20,13 +20,34 @@ from sglang.multimodal_gen.runtime.server_args.server_args import (
 )
 
 
+def _ring_capable_backends():
+    """Ring-capable backend classes, as importable on this platform."""
+    backends = [FlashAttentionBackend]
+    if current_platform.is_rocm():
+        from sglang.multimodal_gen.runtime.layers.attention.backends.aiter import (
+            AITerBackend,
+        )
+
+        backends.append(AITerBackend)
+    return backends
+
+
 class TestRingAdmission(unittest.TestCase):
     def test_default_is_not_ring_capable(self):
         self.assertFalse(AttentionBackend.supports_ring_rotation())
         self.assertFalse(SDPABackend.supports_ring_rotation())
+        self.assertFalse(SDPABackend.supports_ring_kv_chunk())
 
     def test_lse_backends_declare_support(self):
         self.assertTrue(FlashAttentionBackend.supports_ring_rotation())
+
+    def test_ring_backends_expose_a_kv_chunk_kernel(self):
+        # the masked tail-pad path dispatches on supports_ring_kv_chunk rather
+        # than on the backend name, so a ring-capable backend that never got the
+        # kernel would be admitted and then raise inside the per-hop merge
+        for backend in _ring_capable_backends():
+            with self.subTest(backend=backend.get_enum().name):
+                self.assertTrue(backend.supports_ring_kv_chunk())
 
     def test_server_args_names_match_capabilities(self):
         # the name-level list gates before backend classes are importable on

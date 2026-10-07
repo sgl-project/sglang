@@ -371,6 +371,23 @@ class AITerImpl(AttentionImpl):
             return output, softmax_lse
         return output
 
+    def forward_ring_kv_chunk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attend local queries to one rotated KV chunk for ring merging."""
+        # aiter's only BF16 entry point is batched, so one packed chunk is the
+        # batch-1 case of the call forward already makes.
+        output, softmax_lse = self.forward(
+            query.unsqueeze(0),
+            key.unsqueeze(0),
+            value.unsqueeze(0),
+            return_softmax_lse=True,
+        )
+        return output.squeeze(0), softmax_lse.squeeze(0)
+
     @torch.compiler.disable
     def forward_varlen(
         self,
