@@ -240,6 +240,7 @@ class Glm5NextVisionBlock(GlmOcrVisionBlock):
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
         )
         self.mlp = Glm5NextVisionMLP(
             dim,
