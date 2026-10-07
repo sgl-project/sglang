@@ -102,6 +102,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.utils.numerics_policy import apply_numerics_policy
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
@@ -384,6 +385,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not current_platform.is_mps():
             current_platform.set_device(current_platform.get_device(self.local_rank))
         self._cap_device_memory_for_tests()
+        apply_numerics_policy(
+            allow_cudnn_tf32=self.server_args.allow_cudnn_tf32,
+            allow_bf16_reduced_precision_reduction=(
+                self.server_args.allow_bf16_reduced_precision_reduction
+            ),
+        )
         # num_gpus is the total world size across every node; the co-located,
         # CPU-contending worker count on THIS host is num_gpus // nnodes.
         local_num_gpus = self.server_args.num_gpus // self.server_args.nnodes
