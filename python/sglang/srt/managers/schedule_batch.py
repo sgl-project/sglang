@@ -107,18 +107,16 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
-    MatchPrefixParams,
     TreeLock,
-    zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
     backup_kv_cache,
     evict_from_tree_cache,
+    match_kv_cache,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -1624,16 +1622,6 @@ class Req(ReqDllmMixin):
         token_ids_to_match = self.full_untruncated_fill_ids
         key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
 
-        # SWA lives in a per-request ring that's not content-stable and is never
-        # stored in the radix tree, so a reused prefix carries stale SWA. Cap the
-        # match by the trailing sliding window so it gets re-prefilled, rewriting
-        # this request's SWA ring. No-op for other layouts.
-        if tree_cache is not None:
-            reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-            if reprefill_tail:
-                capped = max(0, input_len - reprefill_tail)
-                key_limit = capped if key_limit is None else min(key_limit, capped)
-
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
         if self.positional_embed_overrides is not None:
@@ -1643,54 +1631,15 @@ class Req(ReqDllmMixin):
         if tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
-            # unified_kv SWA lives in a per-request ring that is not content-stable
-            # and never cached in the radix tree, so a reused prefix carries stale
-            # SWA. Cap the match by the trailing sliding window so it is re-prefilled
-            # into this request's ring. No-op for other layouts (returns 0).
-            reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-            if reprefill_tail:
-                capped = max(0, input_len - reprefill_tail)
-                key_limit = capped if key_limit is None else min(key_limit, capped)
-            match_result = tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(
-                        token_ids=token_ids_to_match,
-                        extra_key=self.extra_key,
-                        limit=key_limit,
-                        cache_salt=self.cache_salt,
-                    ),
-                    req=self,
-                    cow_mamba=cow_mamba,
-                )
+            match_result = match_kv_cache(
+                self,
+                tree_cache,
+                token_ids_to_match,
+                cow_mamba=cow_mamba,
+                max_prefix_len=key_limit,
             )
-            if envs.SGLANG_RADIX_FORCE_MISS.get():
-                match_result = zero_match_result(
-                    tree_cache, match_result, extra_key=self.extra_key
-                )
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.best_match_node,
-                self.host_hit_length,
-                self.swa_host_hit_length,
-                self.swa_branching_seqlen,
-                self.mamba_host_hit_length,
-                self.mamba_branching_seqlen,
-            ) = (
-                match_result.device_indices,
-                match_result.last_device_node,
-                match_result.last_host_node,
-                match_result.best_match_node,
-                match_result.host_hit_length,
-                match_result.swa_host_hit_length,
-                match_result.swa_branching_seqlen,
-                match_result.mamba_host_hit_length,
-                match_result.mamba_branching_seqlen,
-            )
-            if match_result.cache_protected_len is not None:
-                self.kv.cache_protected_len = match_result.cache_protected_len
-            else:
+            self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
+            if match_result.cache_protected_len is None:
                 self.kv.cache_protected_len = len(self.prefix_indices)
 
             if self.is_dllm():

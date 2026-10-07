@@ -77,7 +77,6 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     ScheduleBatch,
 )
-from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
@@ -93,6 +92,7 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     dsv41_dspark_needs_rebootstrap,
     kv_to_page_indices,
+    match_kv_cache,
     page_align_floor,
     release_kv_cache,
     restore_kv_cache,
@@ -782,22 +782,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.pending_reqs.append(decode_req)
 
     def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
-        """
-        Match a request against the decode-side radix cache, lock the matched
-        node to prevent eviction, and return the matched prefix information.
-        """
         max_prefix_len = None
         if self._uses_swa_tail_prealloc():
             fill_len = self._pre_alloc_fill_len(req)
             max_prefix_len = fill_len - self._swa_tail_len(fill_len)
         # Match and lock only reusable FULL KV. The entire SWA tail must be
         # freshly allocated, including when the prefix comes from L2/L3.
-        result = match_prefix_for_req(
-            self.tree_cache,
+        result = match_kv_cache(
             req,
+            self.tree_cache,
             req.origin_input_ids,
             cow_mamba=self.tree_cache.supports_mamba(),
-            include_req=True,
             max_prefix_len=max_prefix_len,
         )
         req.lock = self.tree_cache.lock(result.last_device_node)
