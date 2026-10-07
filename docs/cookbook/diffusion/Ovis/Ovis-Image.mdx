@@ -1,0 +1,115 @@
+---
+title: Ovis-Image
+description: "Generate images with Ovis-Image 7B using native SGLang components, parallel inference, and CPU offload."
+tag: NEW
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/ATH-MaaS/ovis-image.jsx';
+
+<DiffusionModelTags tags={["image", "text-to-image", "English + Chinese text", "7B transformer"]} />
+
+## 1. Quick start
+
+On Linux with NVIDIA CUDA, follow the [diffusion installation guide](/docs/sglang-diffusion/installation)
+and install from a source checkout containing this integration:
+
+```bash Install
+pip install -e 'python[diffusion]'
+```
+
+Use the public Diffusers-format `ATH-MaaS/Ovis-Image-7B` checkpoint. The legacy
+`AIDC-AI/Ovis-Image-7B` identifier and local component directories also work.
+
+<Deployment config={config} />
+
+## 2. Model capabilities
+
+[Ovis-Image](https://huggingface.co/ATH-MaaS/Ovis-Image-7B) generates images from
+text, with particular emphasis on English and Chinese typography, posters,
+signs, and layout-sensitive compositions. Its architecture combines a 7B
+diffusion transformer, a Qwen3 text encoder, and an AutoencoderKL VAE.
+
+Choose it for text-centric image generation and ordinary scenes. This integration
+covers text-to-image requests using the public Diffusers checkpoint. Image editing,
+original single-file weights, quantization, LoRA, approximate DiT caches,
+`torch.compile`, and breakable CUDA graphs are excluded and explicit requests
+for these features raise errors. The model and adapted implementation use Apache 2.0.
+
+## 3. Sampling
+
+Defaults match the official recipe: 1024 x 1024, 50 steps, guidance scale 5,
+256 text tokens, an empty negative prompt, and BF16 components. Width and height
+must be divisible by 16. `max_sequence_length` accepts 1 through 256.
+
+```bash Generate
+sglang generate \
+  --model-path ATH-MaaS/Ovis-Image-7B \
+  --prompt 'A shop sign reading "HELLO 世界", beside a red bicycle.' \
+  --seed 42 --generator-device cpu --save-output
+```
+
+The checkpoint chat template and official description prefix are applied by the
+pipeline. Encoder padding is zeroed before removing the first 28 tokens. The
+transformer attends to every remaining fixed-length position, including zeroed
+padding, as in the reference implementation.
+
+## 4. Runtime features
+
+The pipeline uses native Qwen3, DiT, and AutoencoderKL components and the shared
+conditioning cache, denoising loop, and residency management. Request-specific
+RoPE and sequence padding are rebuilt when prompts or dimensions change.
+
+Single-node topology obeys `GPUs = CFG × TP × Ulysses × Ring`; TP times Ulysses
+must divide the transformer's 24 attention heads. Ring uses FlashAttention.
+CFG parallelism requires guidance greater than one. Component and layerwise
+offload apply to the transformer, text encoder, and VAE. Tiled decode and
+`spatial_shard` VAE decode use the existing VAE controls.
+
+Native VAE tiling activates only when width or height exceeds 1024. Selecting
+Tiled or Spatial parallel in the deployment builder therefore changes the
+example request to width 1536 and height 1024 (`size: "1536x1024"`). Untiled
+requests keep the default 1024 x 1024 size. Enabling tiling for a 1024 x 1024
+request alone does not exercise tiled decoding.
+
+Floating-point reduction order can differ across parallel topologies and attention
+backends. Compare runs using the same seed, CPU generator, dimensions, precision,
+and scheduler; output differences do not imply a change to the CFG algorithm.
+
+## 5. Reproduce correctness checks
+
+Checkpoint-free component tests use real tensors and official small models:
+
+```bash Component tests
+python test/registered/unit/diffusion/test_ovis_image.py
+python test/registered/unit/diffusion/test_ovis_image_config.py
+```
+
+Full checkpoint and multi-GPU checks use the manual runner. Download only
+`model_index.json`, `scheduler/`, `tokenizer/`, `text_encoder/`, `transformer/`,
+and `vae/` from model revision `41be1c5821a92c970d63d7eb595a2fd3fe32b22e`.
+Use a separate reference environment with Diffusers commit
+`c6df88a511a98740646ee55577b590c9852650ce`.
+
+```bash Native TP2 x SP2
+torchrun --standalone --nproc-per-node 4 \
+  test/manual/diffusion/validate_ovis_image.py \
+  --mode native --model-path MODEL_PATH --output results/tp2-sp2 \
+  --tp 2 --ulysses 2
+```
+
+```bash HTTP lifecycle
+MODEL_PATH=MODEL_PATH python -m pytest -q \
+  python/sglang/multimodal_gen/test/server/test_server_ovis_image.py
+```
+
+The runner saves initial latents, conditioning, first predictions, the latent
+trajectory, images, latency, peak allocated memory, and environment metadata.
+The full checkpoint matrix is manual; no performance baseline or reference image
+is added to default CI without corresponding hardware evidence.
+
+## 6. Run in ComfyUI
+
+The original single-file ComfyUI execution path is excluded from this integration.
+Use the native HTTP image-generation endpoint or offline `sglang generate`.

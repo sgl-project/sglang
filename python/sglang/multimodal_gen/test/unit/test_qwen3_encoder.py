@@ -52,6 +52,7 @@ def test_default_position_ids_batch_shape():
     torch.nn.Module.__init__(model)
     layer = _CaptureLayer()
     model.config = SimpleNamespace(output_hidden_states=False)
+    model.preserve_hf_numerics = False
     model.layers = torch.nn.ModuleList([layer])
     model.norm = _IdentityNorm()
 

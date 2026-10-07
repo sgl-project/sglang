@@ -1555,6 +1555,12 @@
                     ]
                   },
                   {
+                    "group": "Ovis",
+                    "pages": [
+                      "cookbook/diffusion/Ovis/Ovis-Image"
+                    ]
+                  },
+                  {
                     "group": "SenseNova",
                     "tag": "NEW",
                     "pages": [
