@@ -1058,29 +1058,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         # 3. Transformer blocks
-        attn_backend = get_global_server_args().attention_backend
-        transformer_block = (
-            WanTransformerBlock_VSA
-            if (attn_backend and attn_backend.lower() == "video_sparse_attn")
-            else WanTransformerBlock
-        )
         self.blocks = nn.ModuleList(
             [
-                transformer_block(
-                    inner_dim,
-                    config.ffn_dim,
-                    config.num_attention_heads,
-                    config.qk_norm,
-                    config.cross_attn_norm,
-                    config.eps,
-                    config.added_kv_proj_dim,
-                    self._supported_attention_backends
-                    | {AttentionBackendEnum.VIDEO_SPARSE_ATTN},
-                    prefix=f"blocks.{i}",
-                    attention_type=config.attention_type,
-                    sla_topk=config.sla_topk,
-                    quant_config=quant_config,
-                )
+                self._make_block(index=i, config=config, quant_config=quant_config)
                 for i in range(config.num_layers)
             ]
         )
@@ -1127,6 +1107,36 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         self.layer_names = ["blocks"]
+
+    def _make_block(
+        self,
+        *,
+        index: int,
+        config: WanVideoConfig,
+        quant_config: QuantizationConfig | None,
+    ) -> nn.Module:
+        """Block factory; subclasses override it to substitute their block class."""
+        attn_backend = get_global_server_args().attention_backend
+        transformer_block = (
+            WanTransformerBlock_VSA
+            if (attn_backend and attn_backend.lower() == "video_sparse_attn")
+            else WanTransformerBlock
+        )
+        return transformer_block(
+            config.num_attention_heads * config.attention_head_dim,
+            config.ffn_dim,
+            config.num_attention_heads,
+            config.qk_norm,
+            config.cross_attn_norm,
+            config.eps,
+            config.added_kv_proj_dim,
+            self._supported_attention_backends
+            | {AttentionBackendEnum.VIDEO_SPARSE_ATTN},
+            prefix=f"blocks.{index}",
+            attention_type=config.attention_type,
+            sla_topk=config.sla_topk,
+            quant_config=quant_config,
+        )
 
     @lru_cache(maxsize=1)
     def _compute_rope_for_sequence_shard(
