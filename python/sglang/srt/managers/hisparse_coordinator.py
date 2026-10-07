@@ -5,7 +5,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.utils import get_device_module, is_hip, is_xpu
+from sglang.srt.utils import get_device_module, is_gfx95_supported, is_hip, is_xpu
 
 if is_xpu():
     from sgl_kernel import (
@@ -47,7 +47,7 @@ from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import HiSparseMHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 
 device_module = get_device_module()
 
@@ -70,16 +70,65 @@ class HiSparseTokenStats(NamedTuple):
     host_token_usage: float
 
 
+def _can_use_separate_copy(
+    *,
+    is_hip_backend: bool,
+    use_aiter: bool,
+    gfx95: bool,
+    is_dsv4_hisparse: bool,
+    is_m3_hisparse: bool,
+) -> bool:
+    """Whether the ROCm gfx95/AITER plan-then-copy path is safe for this pool.
+
+    DSV4 and MiniMax M3 each use their own dedicated swap-in path
+    (load_cache_to_device_buffer_dsv4_mla / swap_in_selected_blocks) and never
+    go through _run_swap_in_kernel/_run_copy_only_kernel, so neither qualifies.
+    """
+    return (
+        is_hip_backend
+        and use_aiter
+        and gfx95
+        and not is_dsv4_hisparse
+        and not is_m3_hisparse
+    )
+
+
+def _can_use_batched_prefix(
+    *,
+    is_hip_backend: bool,
+    use_aiter: bool,
+    gfx95: bool,
+    is_dsv4_hisparse: bool,
+    swap_in_block_size: int,
+    top_k: int,
+    device_buffer_size: int,
+) -> bool:
+    """Whether the gfx95 wave64 batched-prefix scan is qualified for this pool.
+
+    Unconditional on the qualified path: any disqualifying input falls back to
+    the unbatched per-request scan automatically, with no separate opt-in.
+    """
+    return (
+        is_hip_backend
+        and use_aiter
+        and gfx95
+        and not is_dsv4_hisparse
+        and (swap_in_block_size, top_k, device_buffer_size) == (1024, 2048, 4096)
+    )
+
+
 def resolve_shared_index_layers(
     *,
     hf_text_config,
     is_speculative: bool,
+    allow_synchronous_shared: bool = False,
 ) -> Optional[List[bool]]:
     """Per-layer "reuses the previous layer's top-k index" pattern, or None.
 
     Mirrors DeepseekV2AttentionMLA's skip_topk derivation (index_topk_pattern /
     index_topk_freq / cli_factor); None when the model has no sharing or the
-    prefetch cannot run (PP, speculative decoding, kill-switch).
+    sharing cannot run (PP or speculative decoding). The prefetch kill-switch
+    also drops the pattern unless synchronous shared-plan copies are supported.
     """
     if not is_deepseek_dsa(hf_text_config):
         return None
@@ -98,7 +147,7 @@ def resolve_shared_index_layers(
             "swap-in."
         )
         return None
-    if envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get():
+    if envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get() and not allow_synchronous_shared:
         logger.info(
             "HiSparse shared-index prefetch disabled via "
             "SGLANG_DISABLE_HISPARSE_PREFETCH; using synchronous swap-in."
@@ -219,6 +268,33 @@ class HiSparseCoordinator:
                 )
                 self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
+        self._separate_copy = _can_use_separate_copy(
+            is_hip_backend=_is_hip,
+            use_aiter=envs.SGLANG_USE_AITER.get(),
+            gfx95=is_gfx95_supported(),
+            is_dsv4_hisparse=self.is_dsv4_hisparse,
+            is_m3_hisparse=self.is_m3_hisparse,
+        )
+        if self._separate_copy and self.skip_io:
+            raise ValueError(
+                "HiSparse planned copies on ROCm gfx95 with AITER require real KV IO; "
+                "disable SGLANG_DEBUG_HISPARSE_SKIP_IO."
+            )
+
+        # Batched prefixes are qualified only for the linear gfx95 metadata
+        # planner. The separate real copy still immediately follows planning.
+        # Unconditional on the qualified path: unsupported configurations
+        # (wrong hardware, AITER off, or a swap-in shape other than
+        # 1024/2048/4096) fall back to the unbatched scan automatically.
+        self.enable_batched_prefix = _can_use_batched_prefix(
+            is_hip_backend=_is_hip,
+            use_aiter=envs.SGLANG_USE_AITER.get(),
+            gfx95=is_gfx95_supported(),
+            is_dsv4_hisparse=self.is_dsv4_hisparse,
+            swap_in_block_size=self.swap_in_block_size,
+            top_k=self.top_k,
+            device_buffer_size=self.device_buffer_size,
+        )
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -247,6 +323,11 @@ class HiSparseCoordinator:
         )
         self.req_to_host_pool_allocated_len = torch.zeros(
             max_num_req_slots, dtype=torch.int64, device="cpu"
+        )
+        # Speculative target verification restores the immutable staged prefix
+        # from host; generated KV stays in the allocator's resident tail pages.
+        self.spec_prefill_lens = torch.zeros(
+            max_num_req_slots, dtype=torch.int64, device=device
         )
 
         self.write_staging_stream = device_module.Stream()
@@ -320,9 +401,11 @@ class HiSparseCoordinator:
         layer_num: int,
         max_num_req_slots: int,
     ) -> None:
-        """Set up the plan-then-IO prefetch for shared-index (IndexShare) models:
-        the anchor's kernel records its miss plan and skip layers replay it on
-        `prefetch_stream`, overlapping their IO with the intervening compute."""
+        """Allocate miss plans and, when enabled, the shared-index prefetch stream.
+
+        ROCm gfx95/AITER synchronous copies use the same plan without a side stream.
+        Models without index sharing record and copy a fresh plan per layer.
+        """
         if shared_index_layers is not None and len(shared_index_layers) != layer_num:
             # Attention-layer count differs from num_hidden_layers (e.g. Longcat
             # doubles it): pattern would be misindexed, fall back to synchronous.
@@ -340,22 +423,33 @@ class HiSparseCoordinator:
             )
             shared_index_layers = None
         self._is_shared_index_layer = list(shared_index_layers or [False] * layer_num)
-        self.enable_prefetch = any(self._is_shared_index_layer)
+        separate_copy = self._separate_copy
+        has_shared_indices = any(self._is_shared_index_layer)
+        self.enable_prefetch = has_shared_indices and not (
+            separate_copy and envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get()
+        )
+        self._sync_shared = (
+            separate_copy and has_shared_indices and not self.enable_prefetch
+        )
         self._prefetch_groups, self._prefetch_slot = _build_prefetch_groups(
             self._is_shared_index_layer
         )
-        if not self.enable_prefetch:
+        if not (self.enable_prefetch or separate_copy):
             return
 
         # Small fixed grid for the copy-only kernel: low SM footprint so the
         # copies overlap compute with little contention.
-        self._prefetch_copy_blocks = 4
-        max_group_size = max(len(g) for g in self._prefetch_groups.values())
-        self.prefetch_stream = device_module.Stream()
-        self._prefetch_events = [device_module.Event() for _ in range(max_group_size)]
+        self._prefetch_copy_blocks = 16 if separate_copy else 4
+        if self.enable_prefetch:
+            max_group_size = max(len(g) for g in self._prefetch_groups.values())
+            self.prefetch_stream = device_module.Stream()
+            self._prefetch_events = [
+                device_module.Event() for _ in range(max_group_size)
+            ]
         # Plan recorded by the current anchor, replayed by its skip layers. One
         # buffer set suffices: the last skip layer's event wait orders the next
-        # anchor's writes after this group's copies.
+        # anchor's writes after this group's copies. Synchronous shared-plan
+        # copies instead finish on the current stream before its next anchor.
         self._miss_src = torch.zeros(
             (max_num_req_slots, self.top_k), dtype=torch.int64, device=self.device
         )
@@ -366,8 +460,10 @@ class HiSparseCoordinator:
             (max_num_req_slots,), dtype=torch.int32, device=self.device
         )
         logger.info(
-            "HiSparse: shared-index prefetch (plan-then-IO) enabled; %d anchor "
+            "HiSparse: planned copies (prefetch=%s, synchronous_shared=%s); %d anchor "
             "group(s), %d skip layer(s) of %d total.",
+            self.enable_prefetch,
+            self._sync_shared,
             len(self._prefetch_groups),
             sum(self._is_shared_index_layer),
             layer_num,
@@ -547,6 +643,118 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[:, req.kv.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
+        self.spec_prefill_lens[req.kv.req_pool_idx] = allocated_len
+        if (
+            get_spec().speculative_algorithm is not None
+            and not self.is_dsv4_hisparse
+        ):
+            self._preserve_speculative_partial_page(req)
+
+    def _preserve_speculative_partial_page(self, req: Req) -> None:
+        """Keep an unaligned prompt tail in a non-evictable physical page.
+
+        Staging clears prompt mappings. A later alloc_extend must nevertheless
+        extend from a valid last physical location, not slot0. Short prompts
+        retain their ordered buffer and never enter the LRU path during verify.
+        Long prompts use the buffer's already-reserved extra page, which verify
+        never uses for the ordinary decode latest-token special case. Thus this
+        needs no extra allocation outside the scheduler's admission budget.
+        """
+        prefix_len = req.kv.kv_allocated_len
+        tail_len = prefix_len % self.page_size
+        if tail_len == 0:
+            return
+        start = prefix_len - tail_len
+        buffer_start = min(start, self.device_buffer_size)
+        assert buffer_start + tail_len <= int(
+            self.req_device_buffer_size[req.kv.req_pool_idx]
+        )
+        tail = self.req_to_device_buffer[
+            req.kv.req_pool_idx, buffer_start : buffer_start + tail_len
+        ]
+        host_locs = self.req_to_host_pool[req.kv.req_pool_idx, start:prefix_len]
+        for layer_id in range(self.mem_pool_device.layer_num):
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                host_locs,
+                tail,
+                layer_id,
+                io_backend="kernel",
+            )
+        logical = self.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, start:prefix_len
+        ]
+        self.mem_pool_device.full_to_hisparse_device_index_mapping[logical] = tail
+
+    def gather_for_verify(
+        self,
+        req_pool_indices: torch.Tensor,
+        query_seq_lens: torch.Tensor,
+        topk_tokens: torch.Tensor,
+        layer_id: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Materialize each verify query before another query can evict its KV.
+
+        Inputs are request-major [batch, queries, top_k]. Prompt misses use the
+        existing swap kernel; accepted/generated and draft KV use their resident
+        mappings. Copy each query's selected rows into independent scratch, then
+        let the ordinary sparse attention kernel consume the whole verify batch.
+        Shapes and control flow are static under graph capture/replay.
+        """
+        assert not self.is_dsv4_hisparse
+        assert not self.enable_prefetch, "Speculative swap must remain synchronous"
+        batch_size, num_queries, top_k = topk_tokens.shape
+        assert top_k == self.top_k
+        assert query_seq_lens.shape == (batch_size, num_queries)
+        cache = self.mem_pool_device.kv_buffer[layer_id]
+        scratch = cache.new_empty((batch_size, num_queries, top_k, *cache.shape[1:]))
+        present = torch.empty_like(topk_tokens, dtype=torch.bool)
+        prefix_lens = self.spec_prefill_lens[req_pool_indices]
+        # No generated token is sent to the host swap kernel. Exclude its
+        # latest-token special case and keep all top_k columns in the short
+        # prompt fast path, even when generated rows occupy earlier columns.
+        swap_lens = (prefix_lens + 1).clamp(min=top_k)
+        real = torch.arange(batch_size, device=topk_tokens.device) < self.num_real_reqs
+        for query in range(num_queries):
+            tokens = topk_tokens[:, query]
+            valid = (
+                real[:, None]
+                & (tokens >= 0)
+                & (tokens < query_seq_lens[:, query, None])
+            )
+            safe_tokens = torch.where(valid, tokens, 0).long()
+            logical = self.req_to_token_pool.req_to_token[
+                req_pool_indices[:, None], safe_tokens
+            ]
+            resident = self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                logical
+            ]
+            host_needed = valid & (resident == 0) & (tokens < prefix_lens[:, None])
+            host_tokens = torch.where(host_needed, tokens, -1).to(torch.int32)
+            swapped = self._run_swap_in_kernel(
+                req_pool_indices, swap_lens, host_tokens, layer_id
+            )
+            locations = torch.where(resident > 0, resident, swapped)
+            available = valid & ((resident > 0) | (host_needed & (swapped >= 0)))
+            # The gather finishes before the next swap mutates the same LRU
+            # buffer. Invalid rows use an in-bounds address and are masked out
+            # of the attention page table below.
+            scratch[:, query].copy_(cache[locations.clamp(min=0).long()])
+            present[:, query] = available
+        page_table = torch.arange(
+            batch_size * num_queries * top_k,
+            device=topk_tokens.device,
+            dtype=torch.int32,
+        ).view(batch_size, num_queries, top_k)
+        page_table = torch.where(present, page_table, -1)
+        materialized = scratch.view(batch_size * num_queries * top_k, *cache.shape[1:])
+        # kv_buffer holds the storage dtype (uint8 for FP8 KV). Attention needs
+        # the KV dtype, as get_key_buffer() returns, to pick its kernel and
+        # element width; the raw bytes would be read as BF16 at twice the size.
+        kv_dtype = getattr(self.mem_pool_device, "dtype", cache.dtype)
+        if kv_dtype != cache.dtype:
+            materialized = materialized.view(kv_dtype)
+        return materialized, page_table.view(batch_size * num_queries, top_k)
 
     def _grow_device_buffers(
         self,
@@ -953,19 +1161,11 @@ class HiSparseCoordinator:
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those
-        # extra slots may carry stale mapping entries pointing at buffer slots
-        # we just freed via free_hisparse_indices(all_hi). If left set, the
+        # extra slots may carry mapping entries pointing at buffer slots
+        # released below via free_hisparse_indices(all_hi). If left set, the
         # subsequent release_kv_cache -> allocator.free -> free_hisparse path
         # re-frees them (double-free into the page allocator's free list).
         allocated_len = req.kv.kv_allocated_len
-
-        # release memory -- only free actually-allocated buffer indices
-        current_cap = int(self.req_device_buffer_size[req.kv.req_pool_idx])
-        if current_cap > 0:
-            side_buf_hi = self.req_to_device_buffer[req.kv.req_pool_idx, :current_cap]
-            all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
-            if all_hi.numel() > 0:
-                self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
 
         allocated_locs = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :allocated_len
@@ -973,6 +1173,17 @@ class HiSparseCoordinator:
         compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
             allocated_locs
         )
+        # Speculative alloc_extend also owns device pages outside the side
+        # buffer. Collect them before clearing their mappings. Free both sets
+        # together so aliases of the same physical page are deduplicated by
+        # the device allocator, not released twice in separate calls.
+        current_cap = int(self.req_device_buffer_size[req.kv.req_pool_idx])
+        side_buf_hi = self.req_to_device_buffer[req.kv.req_pool_idx, :current_cap]
+        mapped_hi = self.mem_pool_device.full_to_hisparse_device_index_mapping[
+            compressed_locs
+        ]
+        all_hi = torch.cat((side_buf_hi, mapped_hi))
+        self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
 
         host_indices = self.mem_pool_host.allocated_host_indices(
@@ -1001,13 +1212,15 @@ class HiSparseCoordinator:
         layer_id: int,
         record_plan: bool = False,
     ) -> torch.Tensor:
-        """Run the full plan+IO swap-in kernel for one layer; return its slot table.
+        """Plan and copy one layer's misses; return its device slot table.
 
         record_plan (set on the anchor of a shared-index group) also records the
         miss plan into self._miss_{src,dst,count} for the skip layers to replay.
+        The ROCm gfx95/AITER path separates planning and copying into ordered kernels.
         """
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs, : self.top_k]
+        separate_copy = self._separate_copy
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
             if self.is_dsv4_hisparse
@@ -1019,10 +1232,12 @@ class HiSparseCoordinator:
                 miss_dst=self._miss_dst[:num_reqs],
                 miss_count=self._miss_count[:num_reqs],
             )
-            if record_plan
+            if record_plan or separate_copy
             else {}
         )
-        skip_io_kwargs = {} if _is_xpu else dict(skip_io=self.skip_io)
+        skip_io_kwargs = {} if _is_xpu else dict(skip_io=self.skip_io or separate_copy)
+        if self.enable_batched_prefix:
+            plan["batched_prefix"] = True
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -1043,6 +1258,11 @@ class HiSparseCoordinator:
             **skip_io_kwargs,
             **plan,
         )
+        if separate_copy:
+            # Only this kernel omits IO while producing the plan. The copy
+            # immediately follows on the same stream before attention can read
+            # the cache; never toggle the coordinator's debug skip_io flag.
+            self._run_copy_only_kernel(num_reqs, layer_id)
         return top_k_indices
 
     def swap_in_selected_blocks(
@@ -1114,6 +1334,12 @@ class HiSparseCoordinator:
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
         if not self.enable_prefetch:
+            if self._sync_shared and self._is_shared_index_layer[layer_id]:
+                # Shared-index layers use their anchor's slots and miss plan.
+                # The same-stream copy replaces a fork/event wait, not the IO.
+                num_reqs = req_pool_indices.size(0)
+                self._run_copy_only_kernel(num_reqs, layer_id)
+                return self.top_k_device_locs_buffer[:num_reqs]
             return self._run_swap_in_kernel(
                 req_pool_indices,
                 compressed_seq_lens,

@@ -182,6 +182,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -257,6 +258,17 @@ elif current_platform.is_out_of_tree():
 
 
 logger = logging.getLogger(__name__)
+
+
+def _can_use_synchronous_hisparse_shared(
+    *,
+    is_hip_backend: bool,
+    use_aiter: bool,
+    gfx95: bool,
+    is_hisparse_dsa_pool: bool,
+) -> bool:
+    """Whether the synchronous shared-plan path is safe for this runner."""
+    return is_hip_backend and use_aiter and gfx95 and is_hisparse_dsa_pool
 
 
 @dataclass(frozen=True)
@@ -963,11 +975,19 @@ class ModelRunner:
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
             return
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        if self.is_draft_worker and isinstance(self.token_to_kv_pool, DSATokenToKVPool):
+            # Resident draft KV uses logical slots. The shared allocator's
+            # coordinator owns the target's sparse KV, not this draft pool.
+            return
         from sglang.srt.managers.hisparse_coordinator import (
             HiSparseCoordinator,
             resolve_shared_index_layers,
         )
+        from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+        from sglang.srt.utils import is_gfx95_supported, is_hip
 
         hisparse_cfg = parse_hisparse_config()
         hisparse_top_k = getattr(
@@ -985,6 +1005,14 @@ class ModelRunner:
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
                 is_speculative=self.spec_algorithm.is_speculative(),
+                allow_synchronous_shared=_can_use_synchronous_hisparse_shared(
+                    is_hip_backend=is_hip(),
+                    use_aiter=envs.SGLANG_USE_AITER.get(),
+                    gfx95=is_gfx95_supported(),
+                    is_hisparse_dsa_pool=isinstance(
+                        self.token_to_kv_pool, HiSparseDSATokenToKVPool
+                    ),
+                ),
             ),
         )
 
@@ -1448,6 +1476,21 @@ class ModelRunner:
             if size_full is not None:
                 return size_full
         return self.effective_max_total_num_tokens
+
+    @property
+    def request_token_capacity(self):
+        """Tokens one request's KV may span on this worker.
+
+        A PD HiSparse decode receives a request's KV straight into the
+        host-backed logical pool (logical indices only) and holds just a fixed
+        hot buffer per request on the device, so one request is bounded by the
+        logical pool, which is also what DecodePreallocQueue admits against.
+        Everywhere else, including an aggregated HiSparse server, whose
+        prefill extends take a device slot per token, it is the device pool.
+        """
+        if self.enable_hisparse and get_disagg().disaggregation_mode == "decode":
+            return self.max_token_pool_size
+        return self.effective_logical_max_total_num_tokens
 
     def _load_format_scope(self, load_format: Optional[str]):
         """Make this runner's load format the published one while it loads.
