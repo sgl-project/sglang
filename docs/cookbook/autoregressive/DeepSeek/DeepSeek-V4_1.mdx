@@ -191,7 +191,7 @@ Prefill/decode disaggregation is validated token-identical against a single serv
 
 One deployment note: Mooncake needs the RDMA fabric visible inside the container, so launch with `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1`. Without it Mooncake selects its NVLink transport, which only serves buffers from its own allocator and fails with `Requested address ... not found`. If you hit that, force TCP with `MOONCAKE_PROTOCOL=tcp` and `MC_FORCE_TCP=1` — the Playground's Mooncake option sets both.
 
-PD and speculative decoding cannot be combined.
+The generic Playground PD presets above were validated without speculative decoding. The GB300 AgentX deployment in §3.7 runs DSpark on both PD roles with matching TP2 and draft block size; do not infer that the generic presets have the same validation.
 
 ### 3.5 HiCache (Hierarchical KV Caching)
 
@@ -257,3 +257,147 @@ sglang serve \
   --tool-call-parser auto \
   --watchdog-timeout 3600
 ```
+
+### 3.7 Agentic long-context on GB300 with Dynamo and SGLang
+
+The [InferenceX GB300 AgentX submission](https://github.com/SemiAnalysisAI/InferenceX/pull/3598) measured two aggregated and six Mooncake-disaggregated DeepSeek-V4.1-Flash deployments in [sweep 37260940238](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/37260940238). The commands below reproduce the serving settings of its TP2 aggregate and 1P1D concurrency-96 deployments. Run them in `lmsysorg/sglang:nightly-dev-20260928-81f27fb3@sha256:d9e4917808cfaa4b3be033a0c85a3a73d71eb93c17accbfa2ac3e96f551f3a33` on GB300 NVL72, with the checkpoint available as `deepseek-ai/DeepSeek-V4.1-Flash`. These are **Dynamo-fronted AgentX recipes**; the Deployment panel above remains the separate, verified general-serving matrix.
+
+Use the same model, image, and Dynamo `1.5.0.dev20260914` build on every worker. For disaggregation, give each worker two GB300 GPUs, expose the RDMA devices inside its container, and start etcd and NATS before the frontend and workers. Set `ETCD_IP` and `NATS_IP` to reachable addresses on each host. The example binds each worker to port 30000; workers on one host need distinct ports and GPU assignments. The following container flags expose the network, GPU, and RDMA resources required by the roles; mount the model or supply `HF_TOKEN` if the checkpoint is not cached.
+
+```bash Command
+docker run --rm -it --gpus all --network host --ipc host --shm-size 32g \
+  --device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK \
+  --ulimit memlock=-1 \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  lmsysorg/sglang:nightly-dev-20260928-81f27fb3@sha256:d9e4917808cfaa4b3be033a0c85a3a73d71eb93c17accbfa2ac3e96f551f3a33 \
+  bash
+```
+
+Install Dynamo in each worker container:
+
+```bash Command
+PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install --pre \
+  --extra-index-url https://pypi.nvidia.com \
+  "ai-dynamo-runtime==1.5.0.dev20260914" "ai-dynamo==1.5.0.dev20260914"
+```
+
+On the infrastructure host, start etcd and NATS in separate terminals:
+
+```bash Command
+etcd --data-dir /tmp/etcd --listen-client-urls http://0.0.0.0:2379 \
+  --advertise-client-urls "http://${ETCD_IP}:2379"
+```
+
+```bash Command
+nats-server --port 4222
+```
+
+On every worker host, set the common environment before starting its worker. Host-resident Engram tables are part of the measured TP2 aggregate and both disaggregated roles; `per_rank` is the measured layout. Do not apply this setting to the TP4 concurrency-1 aggregate point: that point explicitly sets `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=0` and keeps its tables in HBM.
+
+```bash Command
+export ETCD_ENDPOINTS="http://${ETCD_IP}:2379"
+export NATS_SERVER="nats://${NATS_IP}:4222"
+export DYN_REQUEST_PLANE=tcp
+export SGLANG_DEFAULT_THINKING=1
+export SGLANG_DSV41_REASONING_EFFORT=high
+export SGLANG_DSPARK_OPT_MARKOV_W2_BF16=True
+export SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1
+export SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank
+export SGLANG_TIMEOUT_KEEP_ALIVE=900
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export CUDA_VISIBLE_DEVICES=0,1
+```
+
+For the TP2/EP2 aggregate point, start one worker on two GPUs. The DSpark draft is embedded in the checkpoint; no separate draft model is loaded.
+
+```bash Command
+SGLANG_RAGGED_VERIFY_MODE=static python3 -m dynamo.sglang \
+  --model-path deepseek-ai/DeepSeek-V4.1-Flash \
+  --served-model-name deepseek-ai/DeepSeek-V4.1-Flash \
+  --host 0.0.0.0 --port 30000 --request-plane tcp \
+  --tensor-parallel-size 2 --expert-parallel-size 2 \
+  --chunked-prefill-size 4096 --prefill-decode-interval 16 \
+  --max-running-requests 2 --cuda-graph-max-bs-decode 64 \
+  --mem-fraction-static 0.8 \
+  --speculative-algorithm DSPARK --speculative-dspark-block-size 5 \
+  --reasoning-parser auto --tool-call-parser auto \
+  --watchdog-timeout 3600 --trust-remote-code --enable-metrics \
+  --weight-loader-prefetch-checkpoints \
+  --model-loader-extra-config '{"enable_multithread_load":true}'
+```
+
+For the measured 1P1D point, start prefill and decode on separate nodes, each with two GPUs. Both roles use the same Mooncake transport and DSpark block size. Run the common environment block above on both nodes, then set these transport variables on both:
+
+```bash Command
+export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=900
+export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True
+export NCCL_MNNVL_ENABLE=1
+export NCCL_CUMEM_ENABLE=1
+export MC_FORCE_MNNVL=1
+```
+
+Prefill worker:
+
+```bash Command
+SGLANG_ENABLE_PREFILL_WAR_READ_DONE=1 python3 -m dynamo.sglang \
+  --model-path deepseek-ai/DeepSeek-V4.1-Flash \
+  --served-model-name deepseek-ai/DeepSeek-V4.1-Flash \
+  --host 0.0.0.0 --port 30000 --request-plane tcp \
+  --tensor-parallel-size 2 --expert-parallel-size 2 \
+  --disaggregation-mode prefill --disaggregation-bootstrap-port 8998 \
+  --disaggregation-transfer-backend mooncake \
+  --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}' \
+  --chunked-prefill-size 16384 --max-prefill-tokens 16384 \
+  --swa-prefix-tails 4096 --max-running-requests 64 \
+  --mem-fraction-static 0.85 \
+  --speculative-algorithm DSPARK --speculative-dspark-block-size 5 \
+  --reasoning-parser auto --tool-call-parser auto \
+  --watchdog-timeout 3600 --trust-remote-code --enable-metrics \
+  --weight-loader-prefetch-checkpoints \
+  --model-loader-extra-config '{"enable_multithread_load":true}'
+```
+
+Decode worker:
+
+```bash Command
+python3 -m dynamo.sglang \
+  --model-path deepseek-ai/DeepSeek-V4.1-Flash \
+  --served-model-name deepseek-ai/DeepSeek-V4.1-Flash \
+  --host 0.0.0.0 --port 30000 --request-plane tcp \
+  --tensor-parallel-size 2 --expert-parallel-size 2 \
+  --disaggregation-mode decode --disaggregation-transfer-backend mooncake \
+  --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}' \
+  --max-running-requests 128 --cuda-graph-max-bs-decode 128 \
+  --mem-fraction-static 0.85 \
+  --speculative-algorithm DSPARK --speculative-dspark-block-size 5 \
+  --reasoning-parser auto --tool-call-parser auto \
+  --watchdog-timeout 3600 --trust-remote-code --enable-metrics \
+  --weight-loader-prefetch-checkpoints \
+  --model-loader-extra-config '{"enable_multithread_load":true}'
+```
+
+Start the Dynamo frontend with `ETCD_ENDPOINTS` and `NATS_SERVER` set to the same endpoints as the workers. Its HTTP endpoint is port 8000. The 1P1D concurrency-96 point uses a one-hour session-affinity TTL; the multi-decode points use one second.
+
+```bash Command
+DYN_NATS_REQUEST_TIMEOUT_SECS=1800 python3 -m dynamo.frontend \
+  --http-port 8000 --router-mode kv \
+  --router-session-affinity-ttl-secs 3600 \
+  --active-decode-blocks-threshold None \
+  --active-prefill-tokens-threshold None \
+  --active-prefill-tokens-threshold-frac None
+```
+
+The complete measured matrix uses the same base settings, with these role counts and overrides:
+
+| Shape | AgentX concurrency | Changed serving settings |
+| --- | ---: | --- |
+| Aggregate TP4/EP1 | 1 | Four GPUs; host Engram off; `--chunked-prefill-size 4096`; `--max-running-requests 2` |
+| Aggregate TP2/EP2 | 1 | Two GPUs; command above |
+| 1P2D, one decode per node | 16 | Three two-GPU nodes; two decode workers; decode admission and graph batch 64; frontend affinity TTL 1 second |
+| 1P2D, both decode workers on one node | 48, 64 | Six GPUs across two nodes; same decode and affinity settings |
+| 1P1D | 96 | Four GPUs across two nodes; commands above |
+| 1P1D with prefill HiCache | 160 | Prefill adds `--enable-hierarchical-cache --hicache-ratio 1 --hicache-write-policy write_back --hicache-io-backend direct`; decode admission and graph batch 192 |
+| 2P1D with prefill HiCache | 256 | Two prefill nodes and one decode node; each prefill admission 128 and the same HiCache flags; decode admission and graph batch 256; frontend affinity TTL 1 second |
+
+The [aggregate](https://github.com/SemiAnalysisAI/InferenceX/blob/0f45d5f4c3d57f9804f7655d7b3b294acdd53441/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/agg-variants.yaml) and [disaggregated](https://github.com/SemiAnalysisAI/InferenceX/blob/0f45d5f4c3d57f9804f7655d7b3b294acdd53441/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml) source recipes record each exact override. AgentX's benchmark client applies its synthetic acceptance length for throughput measurement; that client control is not a serving flag.
