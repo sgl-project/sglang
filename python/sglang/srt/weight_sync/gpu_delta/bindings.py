@@ -42,66 +42,18 @@ def swizzle_scale_bytes(scale: torch.Tensor) -> torch.Tensor:
     )
 
 
-def interleave_gate_up_bytes(
-    gate: torch.Tensor, up: torch.Tensor, group_rows: int, up_first: bool
-) -> torch.Tensor:
-    """Fuse projections using row groups without interpreting packed nibbles."""
-    if gate.dtype != torch.uint8 or up.dtype != torch.uint8 or gate.shape != up.shape:
-        raise ValueError("gate/up must be equal-shaped uint8 tensors")
-    rows, cols = gate.shape[-2:]
-    if rows % group_rows:
-        raise ValueError("projection rows must be divisible by the interleave group")
-    first, second = (up, gate) if up_first else (gate, up)
-    return torch.stack(
-        (
-            first.reshape(*first.shape[:-2], rows // group_rows, group_rows, cols),
-            second.reshape(*second.shape[:-2], rows // group_rows, group_rows, cols),
-        ),
-        dim=-3,
-    ).reshape(*gate.shape[:-2], 2 * rows, cols)
-
-
-def flashinfer_delta_layout(
-    tensor: torch.Tensor,
-    dtype: str,
-    backend: str,
-    kind: str,
-    projection: str = "down",
-) -> torch.Tensor:
-    """Transform one complete projection's mask into its physical byte plane.
-
-    ``nvfp4/cutedsl`` uses up-first 64-row groups; ``nvfp4/megamoe``
-    describes gate-first 16-row groups. This helper does not admit a runtime
-    backend: admission separately checks actual model tensors and aliases.
-    BF16 is unchanged byte storage (including its byte axis), for ordinary
-    FlashInfer dense GEMMs. Numerical alpha transforms are intentionally absent.
-    """
-    if tensor.dtype != torch.uint8:
-        raise ValueError("delta layout takes uint8 bits, never floating-point masks")
-    if backend not in {"cutedsl", "megamoe"}:
-        raise ValueError(f"unsupported FlashInfer delta backend: {backend}")
-    if dtype == "bf16":
-        if kind != "weight" or projection != "down":
-            raise ValueError("BF16 helper supports plain weight storage only")
-        return tensor
-    if dtype != "nvfp4" or kind not in {"weight", "scale"}:
-        raise ValueError(f"unsupported delta plane: {dtype}/{kind}")
-    if projection not in {"gate", "up", "down"}:
-        raise ValueError(f"unsupported projection: {projection}")
-    out = tensor
+def cutedsl_scale_delta(mask: torch.Tensor, projection: str) -> torch.Tensor:
+    """Map one NVFP4 projection's XOR mask to CuTe's padded scale storage."""
     if projection != "down":
-        zero = torch.zeros_like(tensor)
-        gate, up = (tensor, zero) if projection == "gate" else (zero, tensor)
-        out = interleave_gate_up_bytes(
-            gate,
-            up,
-            group_rows=64 if backend == "cutedsl" else 16,
-            up_first=backend == "cutedsl",
-        )
-    if kind == "scale":
-        out = swizzle_scale_bytes(out)
-    # Transposed MegaMoE weight views do not move physical storage bytes.
-    return out
+        rows, cols = mask.shape
+        if rows % 64:
+            raise ValueError("CuTe DSL gate/up scale rows must be divisible by 64")
+        # CuTe gate/up storage interleaves up-first 64-row groups.
+        grouped = mask.reshape(rows // 64, 64, cols)
+        zero = torch.zeros_like(grouped)
+        pair = (zero, grouped) if projection == "gate" else (grouped, zero)
+        mask = torch.stack(pair, dim=1).reshape(2 * rows, cols)
+    return swizzle_scale_bytes(mask)
 
 
 _DTYPES = {
@@ -249,15 +201,6 @@ def _scale_images(layer, stem, expert):
 
 
 def _moe_binding(name, meta, layer, expert, projection, suffix):
-    if layer.moe_tp_size != 1:
-        raise ValueError("direct GPU delta requires expert TP=1")
-    quant = layer.quant_method
-    if not getattr(quant, "_is_cutedsl_v2_standard", False):
-        raise ValueError("runtime NVFP4 delta requires standard flashinfer_cutedsl")
-    if not layer.moe_runner_config.is_gated:
-        raise ValueError("runtime NVFP4 delta currently requires gated experts")
-    if layer.use_presharded_weights:
-        raise ValueError("presharded canonical checkpoints are not admitted")
     local = layer._map_global_expert_id_to_local_expert_id(expert)
     stem = "w2" if projection == "down" else "w13"
     half = 0 if projection == "gate" else 1  # scalar metadata stays gate-first
@@ -316,13 +259,7 @@ def _moe_binding(name, meta, layer, expert, projection, suffix):
     else:
 
         def xor(mask):
-            transformed = flashinfer_delta_layout(
-                mask.reshape(rows, cols),
-                dtype="nvfp4",
-                backend="cutedsl",
-                kind="scale",
-                projection=projection,
-            )
+            transformed = cutedsl_scale_delta(mask.reshape(rows, cols), projection)
             for image in images:
                 image.view(torch.uint8).bitwise_xor_(transformed)
 
@@ -503,7 +440,18 @@ class ParameterBindings:
             layer = self.modules.get(prefix)
             if layer is None:
                 raise ValueError(f"canonical expert has no runtime layer: {name}")
-            self.moe_layers[prefix] = layer
+            if prefix not in self.moe_layers:
+                if (
+                    layer.moe_tp_size != 1
+                    or not layer.quant_method._is_cutedsl_v2_standard
+                    or not layer.moe_runner_config.is_gated
+                    or layer.use_presharded_weights
+                ):
+                    raise ValueError(
+                        "GPU delta requires standard gated CuTe DSL experts, TP=1 "
+                        "and an unsharded canonical checkpoint"
+                    )
+                self.moe_layers[prefix] = layer
             binding = _moe_binding(name, meta, layer, int(expert), projection, suffix)
             if binding is None:
                 self.excluded[name] = (
@@ -524,10 +472,6 @@ class ParameterBindings:
                 if target is None:
                     continue
                 module = self.modules[candidate.rsplit(".", 1)[0]]
-                if meta["dtype"] != _dtype_name(target.dtype):
-                    raise ValueError(
-                        f"numerical fused mapping requires an adapter: {name}"
-                    )
                 target = gate_up_target(target, module, shard, slices)
                 target_name = candidate
                 break

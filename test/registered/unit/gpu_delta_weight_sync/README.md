@@ -4,9 +4,9 @@ The experimental receiver applies canonical XOR deltas directly to existing
 execution-layout buffers. Static bundled MTP layer weights remain unchanged;
 its shared embedding/head buffers continue to follow the target. The disk update
 API remains independent. Pure Torch byte transforms cover CuTe DSL NVFP4 expert
-layouts and BF16 dense storage;
-the standalone MegaMoE transform helper does not admit an integrated MegaMoE
-runtime on this branch.
+layouts and BF16 dense storage. Backend-specific CuTe scale conversion and
+model-specific indexer conversion remain focused helpers; no MegaMoE runtime is
+admitted on this branch.
 
 Canonical names, shapes and dtypes come from the original immutable local
 safetensors checkpoint headers at first delta admission. The feature supports the
@@ -219,10 +219,13 @@ is no per-inner-frame copy or cross-process DE allocation sharing. Raw targets,
 zero-frame omission, immutable-file/hash policy, cache release and drain rules
 are unchanged. Plain and wrapped LZ4 reuse one persistent native decoder.
 Defaults remain Snappy for ordinary updates and LZ4-Zstd for initial sync in Miles.
-Plain-LZ4 native qualification and matched performance measurements are pending.
+Three-codec native and full-model receiver matrices are qualified on B300; the
+learned-update E2E is a separate, earlier source scope.
 
-Protocol 4 carries the selected `codec` and explicit `frame_bytes` (64 KiB, 512 KiB, 1 MiB or
-4 MiB; default 1 MiB). Matrix frames contain only input/output offsets and lengths, without
+Protocol 4 carries the selected `codec` and explicit positive integer `frame_bytes`
+up to 4 MiB (default 1 MiB). Actual encoded/decoded sizes and pointer alignment
+must satisfy the hardware decoder's limits. Matrix frames contain only
+input/output offsets and lengths, without
 redundant codec/file fields. For wrapped codecs, each natural tensor's outer descriptor
 names one immutable owner file and independent Zstd chunks of at most 1 MiB output, exactly
 covering its aligned inner-codec arena. LZ4 uses raw byte blocks with bitshuffle
@@ -239,8 +242,7 @@ There is no GPU outer decoder, legacy protocol or automatic fallback.
 `GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS=0` (default) or `1` selects nvCOMP
 hardware chunk sorting once when the decoder is constructed, for either inner algorithm.
 Sorting executes inside the paused decode call; preparation does not sort or
-reorder the frames. The codec extension and sorting options await native GPU
-qualification and matched benchmarks; existing Snappy results do not measure LZ4.
+reorder the frames. The matched three-codec full-model matrix uses sorting off.
 
 `GPU_DELTA_DECODE_STAGES` accepts 2 (default), 3 or 4 and is frozen at backend
 initialization. Each extra stage adds one largest-batch decoded HBM buffer and

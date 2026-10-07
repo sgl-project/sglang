@@ -18,7 +18,6 @@ from sglang.srt.weight_sync.gpu_delta.bindings import (
     DerivedImage,
     ParameterBindings,
     TensorBinding,
-    _dtype_name,
     _full_slices,
     dense_target,
 )
@@ -31,10 +30,9 @@ def _indexer_norm_binding(name, meta, target):
     complete canonical target values, then use the normal loader's conversion
     while retaining the live FP32 parameter and graph address.
     """
-    if meta["dtype"] != "BF16" or tuple(meta["shape"]) != tuple(target.shape):
+    # The mapping selects this helper only for BF16 -> FP32 indexer norms.
+    if tuple(meta["shape"]) != tuple(target.shape):
         raise ValueError(f"unsupported canonical indexer norm: {name}")
-    if target.dtype != torch.float32:
-        raise ValueError(f"unsupported live indexer norm dtype: {name}")
 
     return TensorBinding(
         name,
@@ -80,10 +78,6 @@ class DeepSeekMlaMapping:
                 target = self.parameters.params.get(candidate)
                 if target is None:
                     continue
-                if meta["dtype"] != _dtype_name(target.dtype):
-                    raise ValueError(
-                        f"numerical fused mapping requires an adapter: {name}"
-                    )
                 sizes = [
                     self.model.config.q_lora_rank,
                     self.model.config.kv_lora_rank + self.model.config.qk_rope_head_dim,

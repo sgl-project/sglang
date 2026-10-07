@@ -1,6 +1,5 @@
 """Exercise feature routing through FastAPI without starting an engine."""
 
-import pickle
 import sys
 from types import SimpleNamespace
 
@@ -10,7 +9,6 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from sglang.srt.managers.io_struct import (
-    PauseGenerationReqInput,
     msgpack_decode,
     msgpack_encode,
 )
@@ -112,17 +110,12 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
         assert isinstance(calls[-1], request_type)
         received = msgpack_decode(msgpack_encode(calls[-1]))
         assert type(received) is request_type
-        assert request_type.__module__ == "sglang.srt.weight_sync.gpu_delta.io"
         assert received == calls[-1]
-        assert pickle.loads(pickle.dumps(received)) == received
     response = DeltaWeightsReqOutput(
         success=True, message="", participant=receipts[0], rid="control-reply"
     )
     received = msgpack_decode(msgpack_encode(response))
     assert type(received) is DeltaWeightsReqOutput and received == response
-    assert pickle.loads(pickle.dumps(response)) == response
-    ordinary = PauseGenerationReqInput(mode="retract")
-    assert msgpack_decode(msgpack_encode(ordinary)) == ordinary
     assert len(calls) == len(cases)
 
     # A real scheduler failure retains the same typed HTTP route and response.

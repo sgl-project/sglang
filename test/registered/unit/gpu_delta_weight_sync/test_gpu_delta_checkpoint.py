@@ -267,9 +267,11 @@ class TestCanonicalCheckpointHeaders(unittest.TestCase):
                 "serialized NVFP4",
             ),
             (
-                self.runner.model.quant_config,
-                "is_nvfp4_online",
-                True,
+                self.runner.model,
+                "quant_config",
+                types.SimpleNamespace(
+                    is_checkpoint_nvfp4_serialized=False, is_nvfp4_online=True
+                ),
                 "serialized NVFP4",
             ),
             (

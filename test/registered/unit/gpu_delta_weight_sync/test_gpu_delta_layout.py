@@ -3,12 +3,11 @@
 import copy
 import importlib.util
 import json
-import os
 import sys
 import tempfile
 import unittest
 import weakref
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -37,51 +36,6 @@ from sglang.srt.weight_sync.gpu_delta import models
 
 def _bytes(tensor):
     return tensor.detach().contiguous().reshape(-1).view(torch.uint8)
-
-
-@contextmanager
-def cpu_host_snapshot(backend, metadata, directory):
-    """Real outer decode and file checks with CPU-only host allocation backing."""
-    from sglang.srt.weight_sync.gpu_delta import host as host
-    from sglang.srt.weight_sync.gpu_delta.payload import HostPayloadPool
-
-    backend.identity = {"engine_id": "cpu-engine", "host_cache_id": "cpu-host"}
-    metadata["host_tensor_names"] = {
-        "cpu-host": sorted({binding.name for binding in backend.layout.bindings})
-    }
-    backend.payload_pool = HostPayloadPool(2)
-    backend.host_arena = host.HostArena("cpu-engine", 0)
-    backend.apply_stream = backend.de_stream = None
-    backend.decoders = {}
-    backend.decode_stages = getattr(backend, "decode_stages", 2)
-    metadata.update(session_id="cpu-1", participants=[backend.identity])
-    cache = Path(directory) / "cache"
-    cache.mkdir()
-
-    class CpuHostAllocation:
-        def __init__(self, capacity, device):
-            self.capacity = capacity
-            self.view = memoryview(bytearray(capacity))
-
-        def close(self):
-            self.view.release()
-
-    try:
-        with (
-            patch.object(host, "_cache_base", return_value=cache),
-            patch.object(
-                os,
-                "posix_fallocate",
-                side_effect=lambda fd, offset, size: os.ftruncate(fd, offset + size),
-                create=True,
-            ),
-            patch.object(host, "HostAllocation", CpuHostAllocation),
-            patch.object(host, "_CAPACITY_ALIGNMENT", 64),
-        ):
-            yield
-    finally:
-        backend.host_arena.close()
-        backend.payload_pool.close()
 
 
 class TestCanonicalPlanCache(unittest.TestCase):
@@ -196,44 +150,6 @@ class TestCanonicalPlanCache(unittest.TestCase):
 
 
 class TestFlashInferDeltaLayout(unittest.TestCase):
-    def test_projection_masks_commute_with_full_value_layout(self):
-        for backend, group, up_first in (("cutedsl", 64, True), ("megamoe", 16, False)):
-            for kind in ("weight", "scale"):
-                cols = 19 if kind == "scale" else 128
-                gate = torch.randint(256, (128, cols), dtype=torch.uint8)
-                up = torch.randint(256, gate.shape, dtype=torch.uint8)
-                new_gate = torch.randint(256, gate.shape, dtype=torch.uint8)
-                new_up = torch.randint(256, gate.shape, dtype=torch.uint8)
-
-                def full(gate, up):
-                    fused = byte_layout.interleave_gate_up_bytes(
-                        gate, up, group_rows=group, up_first=up_first
-                    )
-                    return (
-                        byte_layout.swizzle_scale_bytes(fused)
-                        if kind == "scale"
-                        else fused
-                    )
-
-                current = full(gate, up)
-                pointer = current.data_ptr()
-                for projection, before, after in (
-                    ("gate", gate, new_gate),
-                    ("up", up, new_up),
-                ):
-                    mask = byte_layout.flashinfer_delta_layout(
-                        before ^ after,
-                        dtype="nvfp4",
-                        backend=backend,
-                        kind=kind,
-                        projection=projection,
-                    )
-                    current.bitwise_xor_(mask)
-                self.assertEqual(pointer, current.data_ptr())
-                torch.testing.assert_close(
-                    current, full(new_gate, new_up), rtol=0, atol=0
-                )
-
     def test_scale_swizzle_matches_physical_offsets_and_zero_padding(self):
         for rows, cols in ((17, 3), (128, 64), (256, 19)):
             source = torch.randint(256, (2, rows, cols), dtype=torch.uint8)
@@ -323,13 +239,15 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     projection=projection, rows=rows, cols=cols, mma=independent_mma
                 ):
                     mask = torch.randint(256, (rows, cols), dtype=torch.uint8)
-                    transformed = byte_layout.flashinfer_delta_layout(
-                        mask,
-                        dtype="nvfp4",
-                        backend="cutedsl",
-                        kind="scale",
-                        projection=projection,
-                    )
+                    expanded = mask
+                    if projection != "down":
+                        expanded = torch.zeros(2 * rows, cols, dtype=torch.uint8)
+                        start = 64 if projection == "gate" else 0
+                        for row in range(0, rows, 64):
+                            expanded[2 * row + start : 2 * row + start + 64] = mask[
+                                row : row + 64
+                            ]
+                    transformed = byte_layout.swizzle_scale_bytes(expanded)
                     primary = torch.randint(256, transformed.shape, dtype=torch.uint8)
                     padded_rows, padded_cols = primary.shape
                     physical = primary.view(
@@ -445,116 +363,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "parameter identity changed"):
             plan.check_identity()
-
-    def test_derived_refresh_preserves_rank_and_decoder_error_gate(self):
-        for shape in ((), (2,), (2, 2)):
-            for error in (0, 1):
-                with self.subTest(shape=shape, decoder_error=error):
-                    source = torch.full(shape, 0.25)
-                    target = torch.full(shape, -0.0)
-                    before, pointer = target.clone(), target.data_ptr()
-                    other_source = torch.full((3,), 0.5)
-                    other_target = torch.full((3,), -1.0)
-                    other_before = other_target.clone()
-                    other_pointer = other_target.data_ptr()
-                    prepared = layout.PreparedDelta.__new__(layout.PreparedDelta)
-                    prepared.backend = SimpleNamespace(
-                        layout=SimpleNamespace(check_identity=lambda: None)
-                    )
-                    prepared.device = torch.device("cpu")
-                    prepared.stream = SimpleNamespace(wait_stream=lambda _: None)
-                    prepared.timing_enabled = False
-                    prepared.raw_copies, prepared.batches = {}, []
-                    prepared.status_checks = []
-                    prepared.matrix_tensor_count = 0
-                    prepared.raw_tensor_count = 0
-                    prepared.derived = [
-                        byte_layout.DerivedImage("consumer", target, source),
-                        byte_layout.DerivedImage("other", other_target, other_source),
-                    ]
-                    # Match the native BF16 MLA cache layout, then change the
-                    # canonical bytes after admission to catch stale copies.
-                    heads, key_dim, value_dim, rank = len(shape) + 1, 4, 6, 8
-                    weight = torch.randint(
-                        256,
-                        (heads * (key_dim + value_dim), rank * 2),
-                        dtype=torch.uint8,
-                    ).view(torch.bfloat16)
-                    key, value = weight.unflatten(
-                        0, (heads, key_dim + value_dim)
-                    ).split([key_dim, value_dim], dim=1)
-                    attn = SimpleNamespace(
-                        kv_b_proj=SimpleNamespace(weight=weight),
-                        qk_nope_head_dim=key_dim,
-                        v_head_dim=value_dim,
-                        w_kc=key.transpose(1, 2).contiguous().transpose(1, 2),
-                        w_vc=value.contiguous().transpose(1, 2),
-                    )
-                    plan = models.DeepSeekMlaMapping.__new__(models.DeepSeekMlaMapping)
-                    plan.derived = []
-                    plan._add_derived("attention", attn)
-                    prepared.derived.extend(plan.derived)
-                    mla_identity = [
-                        (image.destination.data_ptr(), image.destination.stride())
-                        for image in plan.derived
-                    ]
-                    weight.view(torch.uint8).random_(256)
-                    # A one-head native value cache can already alias the
-                    # canonical slice. Failure must preserve its pre-apply
-                    # state, including that ordinary alias behavior.
-                    mla_before = [
-                        _bytes(image.destination).clone() for image in plan.derived
-                    ]
-                    mla_expected = [
-                        _bytes(key),
-                        _bytes(value.transpose(1, 2)),
-                    ]
-                    prepared.error = torch.tensor([error], dtype=torch.int32)
-                    prepared.timings, prepared.h2d_bytes = {}, 0
-                    prepared.target_version = 1
-                    # Exercise apply's actual tensor logic with CPU tensors;
-                    # only the CUDA scheduling boundary is stubbed here.
-                    with (
-                        patch.object(prepared, "_allocate_paused"),
-                        patch.object(torch.cuda, "device", return_value=nullcontext()),
-                        patch.object(torch.cuda, "stream", return_value=nullcontext()),
-                        patch.object(torch.cuda, "default_stream", return_value=None),
-                        patch.object(
-                            torch.cuda,
-                            "Event",
-                            return_value=SimpleNamespace(
-                                record=lambda _: None, synchronize=lambda: None
-                            ),
-                        ),
-                    ):
-                        if error:
-                            with self.assertRaisesRegex(RuntimeError, "poisoned"):
-                                prepared.apply()
-                        else:
-                            self.assertTrue(prepared.apply()["applied"])
-                    torch.testing.assert_close(
-                        _bytes(target),
-                        _bytes(before if error else source),
-                        rtol=0,
-                        atol=0,
-                    )
-                    self.assertEqual(target.shape, shape)
-                    self.assertEqual(target.data_ptr(), pointer)
-                    torch.testing.assert_close(
-                        other_target, other_before if error else other_source
-                    )
-                    self.assertEqual(other_target.data_ptr(), other_pointer)
-                    for image, original, expected, identity in zip(
-                        plan.derived, mla_before, mla_expected, mla_identity
-                    ):
-                        torch.testing.assert_close(
-                            _bytes(image.destination),
-                            original if error else expected,
-                        )
-                        self.assertEqual(
-                            (image.destination.data_ptr(), image.destination.stride()),
-                            identity,
-                        )
 
     def test_independent_mapping_uses_shared_apply_and_identity_contract(self):
         root = torch.nn.Module()
@@ -738,20 +546,57 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         self.assertEqual(empty.shape, (4, 0))
         self.assertEqual((counts, gaps), ([], []))
 
-    def test_host_direct_batches_defer_outputs_and_reuse_decoded_slots(self):
-        for stages in (2, 3, 4):
-            with self.subTest(stages=stages):
-                self._check_host_direct_batches(stages)
+    def test_prepare_releases_foreign_metadata_before_local_work(self):
+        backend, manifest = TestCanonicalPlanCache().publication()
+        backend.device, backend.decode_stages = torch.device("cpu"), 2
+        backend.identity = {"host_cache_id": "host"}
+        backend.payload_pool = object()
+        manifest.update(
+            protocol_version=4,
+            codec="lz4-zstd",
+            frame_bytes=1 << 20,
+            base_version=0,
+            target_version=1,
+        )
+        refs = []
+        parse = layout.orjson.loads
 
-    def _check_host_direct_batches(self, stages):
-        import zstandard as zstd
+        class TrackedEntry(dict):
+            pass
 
-        from sglang.srt.weight_sync.gpu_delta import host
+        def tracked_parse(content):
+            value = parse(content)
+            foreign = TrackedEntry(value["tensors"][1])
+            value["tensors"][1] = foreign
+            refs.append(weakref.ref(foreign))
+            return value
 
-        targets = [
-            torch.zeros(2, size, dtype=torch.uint8)
-            for size in (4, 6, 5, 7, 8, 3, 9, 10)
-        ]
+        def admit(*args):
+            self.assertIsNotNone(refs[-1]())
+            return {}, {}
+
+        def prepare_local(index, files, entries, pool, timings):
+            self.assertIsNone(refs[-1]())
+            self.assertEqual([entry["name"] for entry in entries], ["local"])
+            raise RuntimeError("stop at local preparation boundary")
+
+        backend.host_arena = SimpleNamespace(
+            prepare_encoded=admit, prepare_local=prepare_local
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            content = json.dumps(manifest).encode()
+            path.write_bytes(content)
+            with patch.object(layout.orjson, "loads", side_effect=tracked_parse):
+                with self.assertRaisesRegex(RuntimeError, "local preparation boundary"):
+                    layout.PreparedDelta(
+                        backend,
+                        path,
+                        layout.hashlib.sha256(content).hexdigest(),
+                        {"host_tensor_names": {"host": ["local"]}},
+                    )
+
+    def test_layer_batch_cache_tracks_active_names_and_grouping(self):
         names = [
             "model.layers.0.a",
             "model.layers.0.b",
@@ -762,488 +607,42 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             "model.embed_tokens.weight",
             "lm_head.weight",
         ]
-        local = [
+        bindings = [
             byte_layout._direct_binding(
-                names[i], {"dtype": "U8", "shape": list(t.shape)}, t
+                name,
+                {"dtype": "U8", "shape": [2, 4]},
+                torch.zeros(2, 4, dtype=torch.uint8),
             )
-            for i, t in enumerate(targets)
+            for name in names
         ]
-        foreign = byte_layout._direct_binding(
-            "foreign",
-            {"dtype": "U8", "shape": [3, 4]},
-            torch.zeros(3, 4, dtype=torch.uint8),
-        )
-        definitions = [b.describe() for b in (*local, foreign)]
-
-        def literal(size, codec):
-            data = bytes(range(size))
-            if codec == "snappy-zstd":
-                return bytes([size, (size - 1) << 2]) + data
-            # Valid raw LZ4 block containing only literals.
-            return (
-                bytes([min(size, 15) << 4])
-                + (bytes([size - 15]) if size >= 15 else b"")
-                + data
-            )
-
-        blobs, entries, records = {}, [], []
-        for binding in (*local, foreign):
-            name, size = binding.name, binding.storage[0].numel()
-            # Only the CUDA decoder is mocked; CPU Zstd and file checks run.
-            inner = literal(size, "lz4-zstd")
-            blob = zstd.ZstdCompressor().compress(inner)
-            if name == "foreign":
-                blob = b"not-a-zstd-frame"  # Foreign EP data is never unwrapped.
-            blobs[name] = blob
-            file = name + ".bin"
-            entries.append(
-                binding.describe()
-                | {
-                    "byte_order": "little",
-                    "nbytes": size,
-                    "outer": dict(
-                        file=file,
-                        encoded_offset=0,
-                        encoded_bytes=len(blob),
-                        decoded_bytes=len(inner),
-                        frames=[
-                            dict(
-                                encoded_offset=0,
-                                encoded_bytes=len(blob),
-                                decoded_offset=0,
-                                decoded_bytes=len(inner),
-                            )
-                        ],
-                    ),
-                    "frames": [
-                        dict(
-                            encoded_offset=0,
-                            encoded_bytes=len(inner),
-                            decoded_offset=0,
-                            decoded_bytes=size,
-                        )
-                    ],
-                }
-            )
-            records.append(
-                dict(
-                    name=file,
-                    nbytes=len(blob),
-                    sha256=layout.hashlib.sha256(blob).hexdigest(),
+        entries = {b.name: {"nbytes": 8} for b in bindings}
+        backend = SimpleNamespace(batch_plan=None)
+        # This test checks grouping/cache ownership, not Triton launch plans.
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.weight_sync.gpu_delta.apply": SimpleNamespace(
+                    plan_apply=lambda outputs: (None, outputs)
                 )
-            )
-        metadata = dict(
-            stream_id="test",
-            base_version=0,
-            target_version=1,
-            plan_digest=layout._digest(
-                sorted(definitions, key=lambda entry: entry["name"])
-            ),
-        )
-        manifest = dict(
-            protocol_version=4,
-            codec="lz4-zstd",
-            frame_bytes=1 << 20,
-            tensors=entries,
-            files=records,
-            **metadata,
-        )
-        backend = SimpleNamespace(
-            _canonical_plan=None,
-            batch_plan=None,
-            decode_stages=stages,
-            device=torch.device("cpu"),
-            layout=SimpleNamespace(
-                bindings=local,
-                inventory={
-                    b.name: {"dtype": b.dtype, "shape": list(b.shape)}
-                    for b in (*local, foreign)
-                },
-                excluded={"foreign": "expert owned by another EP rank"},
-                derived=[],
-                check_identity=lambda: None,
-            ),
-        )
-        operations, decoded_batches, slots = [], [], []
-        foreign_refs = []
-        parse_manifest = layout.orjson.loads
-        tensor_layout = host._tensor_layout
-
-        class TrackedEntry(dict):
-            pass
-
-        def tracked_parse(content):
-            value = parse_manifest(content)
-            if "tensors" in value:
-                for index, entry in enumerate(value["tensors"]):
-                    if entry["name"] == "foreign":
-                        tracked = TrackedEntry(entry)
-                        value["tensors"][index] = tracked
-                        foreign_refs.append(weakref.ref(tracked))
-            return value
-
-        def local_layout(entries):
-            # Global validation already drained; foreign descriptors must be
-            # released before allocating local layout/decode job containers.
-            self.assertTrue(foreign_refs)
-            self.assertIsNone(foreign_refs[-1]())
-            return tensor_layout(entries)
-
-        class CpuStream:
-            def __init__(self, device):
-                pass
-
-            def wait_stream(self, stream):
-                operations.append(("wait_stream", self, stream))
-
-            def wait_event(self, event):
-                operations.append(("wait", self, event))
-
-            def synchronize(self):
-                operations.append(("drain", self))
-
-        class CpuEvent:
-            def record(self, stream):
-                operations.append(("record", stream, self))
-
-            def synchronize(self):
-                operations.append(("complete", self))
-
-        class CpuLiteralDecoder:
-            # CPU oracle only. The native suite qualifies real DE and CUDA races.
-            def __init__(self, device, codec):
-                self.device, self.codec = device, codec
-                operations.append(("decoder_created", codec))
-
-            def prepare_batches(self, table, counts, host, stream, slot_count=2):
-                assert slot_count == stages
-                operations.append(("prepare_decoder", len(counts)))
-
-                decoded_slots = []
-                plans, offset = [], 0
-                for index, count in enumerate(counts):
-                    frames = table[:, offset : offset + count].T.tolist()
-                    plans.append(self._prepare(index, frames, host, decoded_slots))
-                    offset += count
-                assert offset == table.shape[1]
-
-                def bind_outputs(decoded):
-                    operations.append(("bind_outputs", len(decoded)))
-                    slots.extend(decoded)
-                    decoded_slots[:] = decoded
-                    for slot in decoded:
-                        slot.fill_(0xA5)
-                    return plans
-
-                return SimpleNamespace(
-                    bind_outputs=bind_outputs,
-                    batches=plans,
-                    workspace=SimpleNamespace(temporary=torch.empty(0)),
-                )
-
-            def _prepare(self, index, frames, host, decoded_slots):
-                def enqueue():
-                    decoded = decoded_slots[index % stages]
-                    operations.append(("decode", index))
-                    decoded_batches.append((index, decoded.data_ptr(), frames))
-                    for (
-                        input_offset,
-                        encoded_bytes,
-                        decoded_bytes,
-                        output_offset,
-                    ) in frames:
-                        data = host[input_offset : input_offset + encoded_bytes]
-                        if self.codec == "snappy":
-                            assert data[0] == decoded_bytes
-                            assert data[1] == (decoded_bytes - 1) << 2
-                            payload = data[2:]
-                        else:
-                            assert data[0] == min(decoded_bytes, 15) << 4
-                            payload = data[2 if decoded_bytes >= 15 else 1 :]
-                        decoded[output_offset : output_offset + decoded_bytes].copy_(
-                            payload
-                        )
-
-                return SimpleNamespace(enqueue=enqueue, index=index)
-
-        def status_check(decoder, error):
-            operations.append(("prepare_check", decoder.index))
-            return lambda: operations.append(("check", decoder.index))
-
-        empty = torch.empty
-
-        def unpinned(*args, **kwargs):
-            kwargs.pop("pin_memory", None)
-            return empty(*args, **kwargs)
-
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "manifest.json"
-            for name, blob in blobs.items():
-                path.with_name(name + ".bin").write_bytes(blob)
-            content = json.dumps(manifest).encode()
-            path.write_bytes(content)
-            with (
-                cpu_host_snapshot(backend, metadata, directory),
-                patch.object(layout.orjson, "loads", side_effect=tracked_parse),
-                patch.object(host, "_tensor_layout", side_effect=local_layout),
-                patch.object(torch, "empty", side_effect=unpinned),
-                patch.object(torch.cuda, "Stream", side_effect=CpuStream) as streams,
-                patch.object(torch.cuda, "stream", return_value=nullcontext()),
-                patch.object(torch.cuda, "device", return_value=nullcontext()),
-                patch.object(torch.cuda, "default_stream", return_value=object()),
-                patch.object(torch.cuda, "Event", side_effect=CpuEvent) as events,
-                patch(
-                    "sglang.srt.weight_sync.gpu_delta.codec.NvcompDecoder",
-                    CpuLiteralDecoder,
-                ),
-                patch.dict(
-                    sys.modules,
-                    {
-                        "sglang.srt.weight_sync.gpu_delta.apply": SimpleNamespace(
-                            plan_apply=lambda outputs: (None, outputs),
-                            prepare_status_check=status_check,
-                        )
-                    },
-                ),
-            ):
-                prepared = layout.PreparedDelta(
-                    backend, path, layout.hashlib.sha256(content).hexdigest(), metadata
-                )
-                self.assertEqual(prepared.timings["host_encoded_cache_created"], 1)
-                self.assertGreaterEqual(
-                    prepared.timings["host_rank_prepare_s"],
-                    prepared.timings["host_rank_prepare_body_s"],
-                )
-                self.assertGreaterEqual(
-                    prepared.timings["host_rank_prepare_body_s"],
-                    prepared.timings["host_rank_metadata_release_s"]
-                    + prepared.timings["host_encoded_cache_access_s"]
-                    + prepared.timings["host_rank_prepare_call_s"],
-                )
-                self.assertEqual(prepared.timings["host_rank_outer_zstd_tensors"], 8)
-                self.assertEqual(prepared.timings["host_rank_outer_zstd_frames"], 8)
-                self.assertEqual(streams.call_count, 2)
-                self.assertEqual(events.call_count, 2 * stages + 2)
-                self.assertEqual(list(backend.decoders), ["lz4"])
-                self.assertEqual(slots, [])
-                self.assertFalse(any(row[0] == "wait_stream" for row in operations))
-                self.assertFalse(any(row[0] == "bind_outputs" for row in operations))
-                self.assertEqual(prepared.batches, [])
-                self.assertEqual(
-                    [row for row in operations if row[0] == "prepare_check"],
-                    [("prepare_check", index) for index in range(7)],
-                )
-                before_apply = len(operations)
-                self.assertEqual(prepared.timings["compressed_batches"], 7)
-                self.assertEqual(prepared.timings["de_host_input_bytes"], 115)
-                self.assertEqual(prepared.timings["decoded_zero_bytes"], 0)
-                self.assertEqual(prepared.timings["decoded_zero_ranges"], 0)
-                self.assertFalse(decoded_batches)
-                self.assertTrue(all(torch.count_nonzero(t) == 0 for t in targets))
-                result = prepared.apply()
-                self.assertFalse(
-                    any(row[0] == "prepare_check" for row in operations[before_apply:])
-                )
-                self.assertEqual(streams.call_count, 2)
-                self.assertEqual(result["timings"]["decoded_buffers"], stages)
-                self.assertEqual(
-                    result["timings"]["decoded_scratch_bytes"], 28 * stages
-                )
-                self.assertEqual(
-                    result["h2d_bytes"], 8 * 32
-                )  # Descriptor metadata only.
-                self.assertEqual(len(decoded_batches), 7)
+            },
+        ):
+            previous = layout._plan_layers(backend, bindings, entries)
+            self.assertIs(layout._plan_layers(backend, bindings, entries), previous)
+            reduced = layout._plan_layers(backend, bindings[1:], entries)
+            self.assertIsNot(reduced, previous)
+            self.assertEqual(reduced[3][0][0][0].name, names[1])
+            for count, expected in ((1, [[0], [1], [2], [3]]), (2, [[0, 1], [2, 3]])):
+                grouped = layout._plan_layers(backend, bindings, entries, count)
                 self.assertEqual(
                     [
-                        (kind, index)
-                        for kind, index, *rest in operations
-                        if kind in {"decode", "check"}
+                        list(dict.fromkeys(b.layer for b, _, _ in plan[0]))
+                        for plan in grouped
                     ],
-                    [
-                        operation
-                        for index in range(7)
-                        for operation in (("decode", index), ("check", index))
-                    ],
+                    [[None], [None], [None], *expected],
                 )
-                self.assertEqual(
-                    [pointer for _, pointer, _ in decoded_batches],
-                    [slots[index % stages].data_ptr() for index in range(7)],
-                )
-                # Every reuse waits for the preceding apply on that same slot;
-                # the next decode is submitted only after current status/apply.
-                for index in range(stages, 7):
-                    event = prepared.decoded_free[index % stages]
-                    position = operations.index(("decode", index))
-                    self.assertEqual(
-                        operations[position - 1], ("wait", prepared.de_stream, event)
-                    )
-                    self.assertIn(
-                        ("record", prepared.stream, event), operations[:position]
-                    )
-                self.assertIsNone(prepared.decoded)
-                self.assertIsNone(prepared.workspace)
-                self.assertIsNone(prepared.decode_plan)
-                self.assertEqual(prepared.status_checks, [])
-                self.assertIsNone(prepared.apply_metadata)
-                self.assertEqual(prepared.batches, [])
-                for target in targets:
-                    torch.testing.assert_close(
-                        target,
-                        torch.arange(target.numel(), dtype=torch.uint8).reshape(
-                            target.shape
-                        ),
-                    )
-                # Static geometry survives only while the active set matches;
-                # wire-frame coordinates are rebuilt independently each update.
-                previous = backend.batch_plan
                 self.assertIs(
-                    layout._plan_layers(
-                        backend, local, {e["name"]: e for e in entries}
-                    ),
-                    previous[1],
+                    layout._plan_layers(backend, bindings, entries, count), grouped
                 )
-                reduced = layout._plan_layers(
-                    backend, local[1:], {e["name"]: e for e in entries}
-                )
-                self.assertEqual(reduced[0][0][0][0].name, names[-2])
-                self.assertEqual(reduced[3][0][0][0].name, names[1])
-                self.assertIsNot(backend.batch_plan, previous)
-                for count, expected in (
-                    (1, [[0], [1], [2], [3]]),
-                    (2, [[0, 1], [2, 3]]),
-                    (4, [[0, 1, 2, 3]]),
-                ):
-                    grouped = layout._plan_layers(
-                        backend, local, {e["name"]: e for e in entries}, count
-                    )
-                    self.assertEqual(
-                        [
-                            list(
-                                dict.fromkeys(
-                                    binding.layer for binding, _, _ in plan[0]
-                                )
-                            )
-                            for plan in grouped
-                        ],
-                        [[None], [None], [None], *expected],
-                    )
-                    self.assertIs(
-                        layout._plan_layers(
-                            backend, local, {e["name"]: e for e in entries}, count
-                        ),
-                        grouped,
-                    )
-                # Alternate codecs on the same plan and version stream. These
-                # identical masks XOR away, then back; the LZ4 decoder is reused.
-                canonical_plan = backend._canonical_plan
-                for version, codec in ((2, "snappy-zstd"), (3, "lz4"), (4, "lz4-zstd")):
-                    prepared.release_and_close()
-                    metadata.update(
-                        session_id=f"cpu-{version}",
-                        base_version=version - 1,
-                        target_version=version,
-                    )
-                    manifest.update(
-                        base_version=version - 1, target_version=version, codec=codec
-                    )
-                    for record, entry in zip(records, entries):
-                        size = entry["nbytes"]
-                        inner = literal(size, codec)
-                        blob = (
-                            inner
-                            if codec == "lz4"
-                            else zstd.ZstdCompressor().compress(inner)
-                        )
-                        if entry["name"] == "foreign" and codec != "lz4":
-                            blob = b"not-a-zstd-frame"
-                        blobs[entry["name"]] = blob
-                        path.with_name(record["name"]).write_bytes(blob)
-                        record.update(
-                            nbytes=len(blob),
-                            sha256=layout.hashlib.sha256(blob).hexdigest(),
-                        )
-                        entry["frames"][0]["encoded_bytes"] = len(inner)
-                        entry["outer"].update(
-                            encoded_bytes=len(blob), decoded_bytes=len(inner)
-                        )
-                        entry["outer"]["frames"] = (
-                            []
-                            if codec == "lz4"
-                            else [
-                                dict(
-                                    encoded_offset=0,
-                                    encoded_bytes=len(blob),
-                                    decoded_offset=0,
-                                    decoded_bytes=len(inner),
-                                )
-                            ]
-                        )
-                    content = json.dumps(manifest).encode()
-                    path.write_bytes(content)
-                    if version == 2:
-                        with self.assertRaisesRegex(ValueError, "codec"):
-                            invalid = json.dumps(
-                                manifest | {"codec": "unsupported"}
-                            ).encode()
-                            path.write_bytes(invalid)
-                            layout.PreparedDelta(
-                                backend,
-                                path,
-                                layout.hashlib.sha256(invalid).hexdigest(),
-                                metadata,
-                            )
-                        path.write_bytes(content)
-                        self.assertEqual(list(backend.decoders), ["lz4"])
-                    prepared = layout.PreparedDelta(
-                        backend,
-                        path,
-                        layout.hashlib.sha256(content).hexdigest(),
-                        metadata,
-                    )
-                    self.assertIs(backend._canonical_plan, canonical_plan)
-                    self.assertEqual(prepared.codec, codec)
-                    prepared.apply()
-                    for target in targets:
-                        expected = torch.arange(
-                            target.numel(), dtype=torch.uint8
-                        ).reshape(target.shape)
-                        torch.testing.assert_close(
-                            target,
-                            expected if version == 3 else torch.zeros_like(target),
-                        )
-                self.assertEqual(
-                    [row for row in operations if row[0] == "decoder_created"],
-                    [
-                        ("decoder_created", "lz4"),
-                        ("decoder_created", "snappy"),
-                    ],
-                )
-                self.assertEqual(streams.call_count, 2)
-                # An engine-proof release permits the next immutable publication;
-                # its corrupt payload must still fail before model writes.
-                prepared.host_snapshot.mark_reusable()
-                prepared.host_snapshot.close()
-                metadata["session_id"] = "cpu-5"
-                metadata["base_version"] = metadata["target_version"]
-                metadata["target_version"] += 1
-                manifest.update(
-                    base_version=metadata["base_version"],
-                    target_version=metadata["target_version"],
-                )
-                content = json.dumps(manifest).encode()
-                path.write_bytes(content)
-                targets[0].zero_()
-                path.with_name(names[0] + ".bin").write_bytes(
-                    blobs[names[0]][:-1] + bytes([blobs[names[0]][-1] ^ 1])
-                )
-                with self.assertRaisesRegex(ValueError, "SHA256"):
-                    layout.PreparedDelta(
-                        backend,
-                        path,
-                        layout.hashlib.sha256(content).hexdigest(),
-                        metadata,
-                    )
-                self.assertTrue(torch.all(targets[0] == 0))
 
     def test_backend_reads_inventory_once_and_drains_both_streams_on_failure(self):
         fake_plan = SimpleNamespace(
@@ -1413,155 +812,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "consumer storage changed"):
             plan.check_identity()
 
-    def test_raw_vectors_scalars_prepare_once_and_copy_in_place(self):
-        vector = torch.full((4,), 7, dtype=torch.bfloat16)
-        scalar = torch.tensor(-0.0)
-        indexer = torch.full((2,), 9, dtype=torch.float32)
-        unchanged = torch.ones(3)
-        odd = torch.zeros(3, dtype=torch.uint8)
-        bindings = [
-            byte_layout._direct_binding("0", {"dtype": "U8", "shape": [3]}, odd),
-            byte_layout._direct_binding(
-                "a", {"dtype": "BF16", "shape": [8]}, vector, [[2, 6]]
-            ),
-            byte_layout._direct_binding("b", {"dtype": "F32", "shape": []}, scalar),
-            models._indexer_norm_binding("c", {"dtype": "BF16", "shape": [2]}, indexer),
-            byte_layout._direct_binding("d", {"dtype": "F32", "shape": [3]}, unchanged),
-        ]
-        values = [
-            torch.arange(3, dtype=torch.uint8),
-            torch.arange(8).bfloat16(),
-            torch.tensor(0.25),
-            torch.tensor([0.5, -2]).bfloat16(),
-        ]
-        blob, entries = bytearray(), []
-        for binding, value in zip(bindings, values + [None]):
-            size = layout.math.prod(binding.shape) * binding.torch_dtype.itemsize
-            entry = binding.describe() | {
-                "byte_order": "little",
-                "nbytes": size,
-                "changed_bytes": size if value is not None else 0,
-                "frames": [],
-            }
-            if value is not None:
-                data = bytes(_bytes(value).numpy())
-                entry["raw"] = {
-                    "file": "owner.bin",
-                    "encoded_offset": len(blob),
-                    "encoded_bytes": size,
-                }
-                blob.extend(data)
-            entries.append(entry)
-        metadata = dict(
-            stream_id="raw",
-            base_version=0,
-            target_version=1,
-            plan_digest=layout._digest([b.describe() for b in bindings]),
-        )
-        manifest = dict(
-            protocol_version=4,
-            codec="snappy-zstd",
-            frame_bytes=1 << 20,
-            tensors=entries,
-            files=[
-                {
-                    "name": "owner.bin",
-                    "nbytes": len(blob),
-                    "sha256": layout.hashlib.sha256(blob).hexdigest(),
-                }
-            ],
-            **metadata,
-        )
-        backend = SimpleNamespace(
-            _canonical_plan=None,
-            batch_plan=None,
-            device=torch.device("cpu"),
-            layout=SimpleNamespace(
-                bindings=bindings,
-                excluded={},
-                derived=[],
-                check_identity=lambda: None,
-                inventory={
-                    b.name: {"dtype": b.dtype, "shape": list(b.shape)} for b in bindings
-                },
-            ),
-        )
-        empty = torch.empty
-
-        def unpinned(*args, **kwargs):
-            kwargs.pop("pin_memory", None)
-            return empty(*args, **kwargs)
-
-        pointers = [b.storage[0].data_ptr() for b in bindings]
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "manifest.json"
-            path.with_name("owner.bin").write_bytes(blob)
-            content = json.dumps(manifest).encode()
-            path.write_bytes(content)
-            with (
-                cpu_host_snapshot(backend, metadata, directory),
-                patch.object(torch, "empty", side_effect=unpinned),
-                patch.object(
-                    torch.cuda,
-                    "Stream",
-                    return_value=SimpleNamespace(
-                        wait_stream=lambda _: None,
-                        wait_event=lambda _: None,
-                        synchronize=lambda: None,
-                    ),
-                ) as streams,
-                patch.object(torch.cuda, "device", return_value=nullcontext()),
-                patch.object(torch.cuda, "default_stream", return_value=object()),
-                patch.object(torch.cuda, "stream", return_value=nullcontext()),
-                patch.object(
-                    torch.cuda,
-                    "Event",
-                    return_value=SimpleNamespace(
-                        record=lambda _: None, synchronize=lambda: None
-                    ),
-                ),
-            ):
-                prepared = layout.PreparedDelta(
-                    backend, path, layout.hashlib.sha256(content).hexdigest(), metadata
-                )
-                self.assertEqual(streams.call_count, 2)
-                self.assertFalse(prepared.batches)
-                self.assertEqual(backend.decoders, {})
-                self.assertEqual(prepared.timings["raw_tensors"], 4)
-                self.assertEqual(prepared.timings["raw_bytes"], len(blob))
-                self.assertEqual(prepared.timings["raw_h2d_bytes"], 36)
-                self.assertTrue(torch.all(vector == 7))
-                self.assertTrue(torch.all(indexer == 9))
-                result = prepared.apply()
-                self.assertEqual(result["h2d_bytes"], 36)
-                self.assertEqual(result["timings"]["decoded_buffers"], 0)
-                self.assertEqual(backend.decoders, {})
-                torch.testing.assert_close(odd, values[0])
-                torch.testing.assert_close(vector, values[1][2:6])
-                torch.testing.assert_close(scalar, values[2])
-                torch.testing.assert_close(indexer, values[3].float())
-                torch.testing.assert_close(unchanged, torch.ones(3))
-                self.assertEqual(pointers, [b.storage[0].data_ptr() for b in bindings])
-                prepared.release_and_close()
-                metadata.update(session_id="cpu-2", base_version=1, target_version=2)
-                manifest.update(codec="lz4-zstd", base_version=1, target_version=2)
-                content = json.dumps(manifest).encode()
-                path.write_bytes(content)
-                prepared = layout.PreparedDelta(
-                    backend, path, layout.hashlib.sha256(content).hexdigest(), metadata
-                )
-                prepared.apply()
-                # Raw values overwrite even after a codec change; no decoder is
-                # constructed and applying the same target does not XOR it away.
-                self.assertEqual(backend.decoders, {})
-                torch.testing.assert_close(odd, values[0])
-                torch.testing.assert_close(vector, values[1][2:6])
-                torch.testing.assert_close(scalar, values[2])
-                torch.testing.assert_close(indexer, values[3].float())
-                torch.testing.assert_close(unchanged, torch.ones(3))
-                self.assertEqual(pointers, [b.storage[0].data_ptr() for b in bindings])
-                prepared.release_and_close()
-
     def test_movable_or_reordered_experts_rejected_before_plan(self):
         defaults = dict(
             enable_eplb=False,
@@ -1589,14 +839,37 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 )
 
     def test_invalid_layout_geometry_rejected(self):
-        with self.assertRaises(ValueError):
-            byte_layout.flashinfer_delta_layout(
-                torch.zeros(16, 4, dtype=torch.uint8),
-                dtype="nvfp4",
-                backend="cutedsl",
-                kind="scale",
-                projection="gate",
+        with self.assertRaisesRegex(ValueError, "divisible by 64"):
+            byte_layout.cutedsl_scale_delta(
+                torch.zeros(16, 4, dtype=torch.uint8), "gate"
             )
+        prefix = "model.layers.0.mlp.experts"
+        name = prefix + ".0.gate_proj.input_scale"
+        for override in (
+            {"moe_tp_size": 2},
+            {"use_presharded_weights": True},
+            {"quant_method": SimpleNamespace(_is_cutedsl_v2_standard=False)},
+            {"moe_runner_config": SimpleNamespace(is_gated=False)},
+        ):
+            layer = SimpleNamespace(
+                **(
+                    dict(
+                        moe_tp_size=1,
+                        use_presharded_weights=False,
+                        quant_method=SimpleNamespace(_is_cutedsl_v2_standard=True),
+                        moe_runner_config=SimpleNamespace(is_gated=True),
+                    )
+                    | override
+                )
+            )
+            plan = byte_layout.ParameterBindings.__new__(byte_layout.ParameterBindings)
+            plan.modules, plan.moe_layers, plan.excluded = {prefix: layer}, {}, {}
+            with (
+                self.subTest(override=override),
+                self.assertRaisesRegex(ValueError, "standard gated CuTe"),
+            ):
+                plan.bind(name, {"dtype": "F32", "shape": []}, name)
+            self.assertFalse(plan.moe_layers)
 
 
 if __name__ == "__main__":

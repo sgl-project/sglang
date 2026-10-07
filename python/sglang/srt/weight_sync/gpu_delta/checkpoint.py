@@ -44,10 +44,8 @@ def read_canonical_checkpoint_inventory(model_runner):
         raise ValueError("GPU delta does not support secondary or remapped sources")
     if config.decryption_key_file is not None:
         raise ValueError("GPU delta does not support encrypted checkpoint sources")
-    quant_config = getattr(model, "quant_config", None)
-    if not getattr(quant_config, "is_checkpoint_nvfp4_serialized", False) or getattr(
-        quant_config, "is_nvfp4_online", False
-    ):
+    quant_config = model.quant_config
+    if not getattr(quant_config, "is_checkpoint_nvfp4_serialized", False):
         raise ValueError("GPU delta requires a serialized NVFP4 checkpoint")
 
     folder = Path(model_config.model_path)

@@ -226,158 +226,25 @@ def test_workspace_query_cache_uses_exact_geometry_and_preserves_failure(monkeyp
 
 @pytest.mark.parametrize("name", ["snappy", "lz4"])
 @pytest.mark.parametrize("stages", [2, 3, 4])
-def test_host_input_plans_split_output_and_status_slots(monkeypatch, name, stages):
-    # CPU-backed device views exercise the actual slab construction and C ABI
-    # arguments without requiring CUDA, nvCOMP or a host-DE allocation locally.
-    device = torch.device("cuda", 0)
-
-    class DeviceView:
-        def __init__(self, value):
-            self.value = value
-            self.device = device
-            self.pointer_queries = self.size_queries = 0
-
-        def data_ptr(self):
-            self.pointer_queries += 1
-            return self.value.data_ptr()
-
-        def numel(self):
-            self.size_queries += 1
-            return self.value.numel()
-
-        def __getattr__(self, name):
-            return getattr(self.value, name)
-
-        def __getitem__(self, key):
-            return DeviceView(self.value[key])
-
-        def copy_(self, source, non_blocking):
-            assert non_blocking
-            uploads.append(tuple(self.value.shape))
-            self.value.copy_(source)
-            return self
-
-    empty = torch.empty
-    uploads, admitted = [], []
-    monkeypatch.setitem(
-        sys.modules,
-        "sglang.srt.weight_sync.gpu_delta.memory",
-        SimpleNamespace(require_de_capable=admitted.append),
-    )
-
-    def allocate(shape, dtype, device, **kwargs):
-        value = empty(shape, dtype=dtype, device="cpu")
-        return value if str(device) == "cpu" else DeviceView(value)
-
-    monkeypatch.setattr(torch, "empty", allocate)
-    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
-    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+def test_host_input_plans_reject_invalid_geometry_before_device_work(
+    monkeypatch, name, stages
+):
+    # Native tests exercise successful slab construction/slot reuse. Keep the
+    # vector arithmetic and output-lease failures here without a fake CUDA API.
     decoder = object.__new__(codec.NvcompDecoder)
-    decoder.device = device
-    decoder.backend = "hardware"
+    decoder.device = torch.device("cpu")
     decoder.inner_codec = name
     decoder.maximum_chunk_bytes = 4 << 20
-    decoder._algorithm, options_type = codec._DECOMPRESS_OPTIONS[name]
-    decoder._options = options_type()
     decoder.alignments = codec._Alignments(16, 16, 16)
-    decoder.temporary_bytes = lambda geometry: 64 if geometry[0] else 0
-    launches = []
-    decoder._decode = lambda *arguments: launches.append(arguments) or 0
-    stream = SimpleNamespace(device=device, cuda_stream=1234)
-    host = allocate(512, torch.uint8, "cpu")
-    batches = [
-        [(0, 20, 64, 0), (32, 17, 32, 128)],
-        [(64, 25, 128, 16)],
-        [(96, 30, 64, 32)],
-    ]
-    batches = [batches[index % len(batches)] for index in range(7)]
-    count = sum(map(len, batches))
-    table, counts = _frame_table(batches)
-    original_table = table.copy()
-    prepared_plan = decoder.prepare_batches(table, counts, host, stream, stages)
-    workspace = prepared_plan.workspace
-    np.testing.assert_array_equal(table, original_table)
-    # The caller can release/reuse its numeric table after preparation; pinned
-    # input/size rows and delayed output offsets are owned by the plan.
-    table.fill(-1)
-    # Preparation uploads input/size metadata without any output allocation,
-    # output pointer upload or decompression. Paused binding fills just row 3.
-    assert uploads == [(3, count)] and not launches
-    original_batches = tuple(prepared_plan.batches)
-    assert not prepared_plan.decoded_slots
-    outputs = tuple(allocate(256, torch.uint8, device) for _ in range(stages))
-    plans = prepared_plan.bind_outputs(outputs)
-    assert tuple(plans) == original_batches
-    assert all(plan.decoded_slots is prepared_plan.decoded_slots for plan in plans)
-    assert all(output.pointer_queries == output.size_queries == 1 for output in outputs)
-    assert uploads == [(3, count), (count,)] and not launches
-    assert workspace.statuses.shape == workspace.actual_sizes.shape == (stages, 2)
-    assert plans[0].metadata.stride(0) == count
-    assert plans[0].metadata.untyped_storage().data_ptr() == (
-        plans[1].metadata.untyped_storage().data_ptr()
+    table, counts = _frame_table([[(0, 20, 64, 0), (32, 17, 32, 128)]])
+    geometry, bounds, remainders = decoder._frame_geometry(
+        table, counts, 0, 512, stages
     )
-    assert plans[0].host_metadata.untyped_storage().data_ptr() == (
-        plans[1].host_metadata.untyped_storage().data_ptr()
+    assert (geometry, bounds, remainders) == (
+        [(2, 64, 96)],
+        [160] + [0] * (stages - 1),
+        [0] + [None] * (stages - 1),
     )
-    for index, (plan, frames) in enumerate(zip(plans, batches)):
-        slot = index % stages
-        assert plan.host_input is host
-        assert plan.decoded_slots[slot] is outputs[slot]
-        assert plan.stream is stream
-        assert plan.metadata.value.tolist() == [
-            [host.data_ptr() + frame[0] for frame in frames],
-            [frame[1] for frame in frames],
-            [frame[2] for frame in frames],
-            [outputs[slot].data_ptr() + frame[3] for frame in frames],
-        ]
-        plan.enqueue()
-        arguments = launches[-1]
-        assert arguments[:4] == (
-            plan.metadata[0].data_ptr(),
-            plan.metadata[1].data_ptr(),
-            plan.expected_sizes.data_ptr(),
-            workspace.actual_sizes[slot].data_ptr(),
-        )
-        assert arguments[4:8] == (
-            len(frames),
-            workspace.temporary.data_ptr(),
-            workspace.temporary.numel(),
-            plan.metadata[3].data_ptr(),
-        )
-        assert arguments[9:] == (workspace.statuses[slot].data_ptr(), 1234)
-        assert type(arguments[8]) is options_type
-    # The first wrap reuses slot zero; slot one's delayed apply can still
-    # read its status and size result. A single DE stream owns the temp buffer.
-    assert plans[0].statuses.data_ptr() == plans[stages].statuses.data_ptr()
-    assert plans[0].actual_sizes.data_ptr() == plans[stages].actual_sizes.data_ptr()
-    assert plans[0].statuses.data_ptr() != plans[1].statuses.data_ptr()
-    assert plans[0].actual_sizes.data_ptr() != plans[1].actual_sizes.data_ptr()
-    plans[1].statuses.value.fill_(7)
-    plans[1].actual_sizes.value.fill_(128)
-    plans[stages].statuses.value.zero_()
-    plans[stages].actual_sizes.value.fill_(64)
-    assert plans[1].statuses.value.tolist() == [7]
-    assert plans[1].actual_sizes.value.tolist() == [128]
-    assert admitted == [
-        workspace.temporary.data_ptr(),
-        workspace.actual_sizes.data_ptr(),
-        workspace.statuses.data_ptr(),
-        plans[0].metadata.untyped_storage().data_ptr(),
-        *(output.data_ptr() for output in outputs),
-    ]
-
-    # Overlapping pairs are rejected even when other slots are disjoint,
-    # before an output-pointer upload or native submission.
-    for slots, error in (
-        ((outputs[0], outputs[1][:64], *outputs[2:]), "Out-of-bounds"),
-        ((outputs[0], outputs[1][1:], *outputs[2:]), "Misaligned decoded"),
-        ((outputs[0], outputs[0][16:], *outputs[2:]), "must not overlap"),
-        (outputs[:1], "count differs"),
-    ):
-        with pytest.raises(ValueError, match=error):
-            prepared_plan.bind_outputs(slots)
-    # Numeric admission must reject bad rows before any allocation or upload,
-    # including arithmetic which would otherwise wrap int64 vector operations.
     for rows, error in (
         ([(496, 32, 64, 0)], "outside input"),
         ([(np.iinfo(np.int64).max, 32, 64, 0)], "outside input"),
@@ -387,42 +254,52 @@ def test_host_input_plans_split_output_and_status_slots(monkeypatch, name, stage
         ([(0, 32, 64, 0), (32, 32, 64, 65)], "Misaligned decoded"),
     ):
         with pytest.raises(ValueError, match=error):
-            decoder.prepare_batches(*_frame_table([rows]), host, stream, stages)
-    for invalid in (
-        original_table.astype(np.int32),
-        original_table[:, ::-1],
-        original_table[:, :-1],
-    ):
+            decoder._frame_geometry(*_frame_table([rows]), 0, 512, stages)
+    for invalid in (table.astype(np.int32), table[:, ::-1], table[:, :-1]):
         with pytest.raises(ValueError, match="contiguous int64"):
-            decoder.prepare_batches(invalid, counts, host, stream, stages)
-    assert len(uploads) == 2 and len(launches) == 7 and len(admitted) == 4 + stages
-
-    # Compressible 4 MiB output is admitted without allocating output slots;
-    # both actual lengths must fit the device, including an expanded input.
+            decoder._frame_geometry(invalid, counts, 0, 512, stages)
     maximum = decoder.maximum_chunk_bytes
-    large = decoder.prepare_batches(
-        *_frame_table([[(0, 20, maximum, 0)]]), host, stream, stages
-    )
-    assert large.output_bounds == [maximum] + [0] * (stages - 1)
-    assert not large.decoded_slots and len(launches) == 7
+    # A compressible full 4 MiB output is legal; either actual length exceeding
+    # hardware's bound is not. This is independent of the inner algorithm.
+    assert decoder._frame_geometry(
+        *_frame_table([[(0, 20, maximum, 0)]]), 0, 512, stages
+    )[1] == [maximum] + [0] * (stages - 1)
     for encoded, decoded in ((maximum + 1, 64), (20, maximum + 1)):
         with pytest.raises(ValueError, match="device limit"):
-            decoder.prepare_batches(
-                *_frame_table([[(0, encoded, decoded, 0)]]), host, stream, stages
+            decoder._frame_geometry(
+                *_frame_table([[(0, encoded, decoded, 0)]]), 0, 512, stages
             )
     decoder.maximum_chunk_bytes = 1 << 20
     with pytest.raises(ValueError, match="device limit"):
-        decoder.prepare_batches(
-            *_frame_table([[(0, 20, maximum, 0)]]), host, stream, stages
-        )
-    assert len(uploads) == 3 and len(launches) == 7
-    empty_plan = decoder.prepare_batches(*_frame_table([[], []]), host, stream, stages)
-    assert empty_plan.workspace.temporary.numel() == 0
-    assert empty_plan.workspace.statuses.shape == (stages, 0)
-    assert empty_plan.output_bounds == [0] * stages
-    for batch in empty_plan.batches:
-        batch.enqueue()
-    assert len(uploads) == 3 and len(launches) == 7
+        decoder._frame_geometry(*_frame_table([[(0, 20, maximum, 0)]]), 0, 512, stages)
+    assert decoder._frame_geometry(*_frame_table([[], []]), 0, 512, stages) == (
+        [(0, 0, 0), (0, 0, 0)],
+        [0] * stages,
+        [None] * stages,
+    )
+
+    plan = object.__new__(codec.PreparedDecodePlan)
+    plan.decoder, plan.slot_count = decoder, stages
+    plan.output_bounds, plan.output_remainders = [128] * stages, [0] * stages
+    plan.decoded_slots = []
+    # Every malformed output must fail before CUDA context, allocation or upload.
+    monkeypatch.setattr(torch.cuda, "device", lambda _: pytest.fail("entered CUDA"))
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.weight_sync.gpu_delta.memory",
+        SimpleNamespace(require_de_capable=lambda _: pytest.fail("queried device")),
+    )
+    outputs = [torch.empty(256, dtype=torch.uint8) for _ in range(stages)]
+    a, b, *rest = outputs
+    for slots, error in (
+        ((a, b[:64], *rest), "Out-of-bounds"),
+        ((a, b[1:], *rest), "Misaligned decoded"),
+        ((a, a[16:], *rest), "must not overlap"),
+        ((a,), "count differs"),
+    ):
+        with pytest.raises(ValueError, match=error):
+            plan.bind_outputs(slots)
+        assert not plan.decoded_slots
 
 
 if __name__ == "__main__":
