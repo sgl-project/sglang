@@ -1903,6 +1903,13 @@ class Envs:
         "/tmp/sglang_weight_cache_{device_uuid}.ready"
     )
 
+    # Feature-owned ROCm controls.
+    SGLANG_AITER_MLA_A8W8_ASM = EnvBool(False)
+    SGLANG_AITER_MLA_ZERO_PAD_FP8_PREFILL = EnvBool(False)
+    SGLANG_AITER_MLA_FLYDSL_FP8_PREFILL = EnvBool(True)
+    SGLANG_AITER_MLA_FLYDSL_FP8_PREFILL_REQUIRED = EnvBool(False)
+    SGLANG_AITER_MLA_FLYDSL_FUSED_KV_PROJ = EnvBool(False)
+
 
 envs = Envs()
 EnvField._allow_set_name = False

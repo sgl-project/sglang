@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -32,6 +33,8 @@ from sglang.srt.utils import BumpAllocator, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+logger = logging.getLogger(__name__)
 
 if _is_cuda:
     from sglang.kernels.ops.attention.concat_mla import concat_mla_k
@@ -169,6 +172,41 @@ def forward_dsa_indexer_for_mha(
 
 
 class DeepseekMHAForwardMixin:
+    def _project_prefix_kv_fp8(self, kv_a: torch.Tensor, k_pe: torch.Tensor):
+        """Project one prefix chunk straight to unit-scale FP8 K/V.
+
+        Chunked MHA replays kv_b_proj over every prefix chunk. The BF16 result
+        is quantized again before FlyDSL. MXFP4 weights can write the FP8 K/V,
+        including the RoPE concat, in the GEMM epilogue instead.
+        """
+        if not _is_hip or k_pe is None:
+            return None
+        if not envs.SGLANG_AITER_MLA_FLYDSL_FUSED_KV_PROJ.get():
+            return None
+        weight = getattr(self.kv_b_proj, "weight", None)
+        if weight is None or weight.dtype != torch.uint8:
+            return None
+        if kv_a.dim() == 3:
+            kv_a = kv_a.squeeze(1)
+        if k_pe.dim() == 2:
+            k_pe = k_pe.unsqueeze(1)
+        if k_pe.shape[1] != self.num_local_heads:
+            k_pe = k_pe.expand(-1, self.num_local_heads, -1)
+        if not getattr(self, "_prefix_kv_fp8_logged", False):
+            logger.info("MLA prefix chunks project K/V directly to unit-scale FP8")
+            self._prefix_kv_fp8_logged = True
+        from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+
+        return self.kv_b_proj(
+            (
+                kv_a,
+                k_pe,
+                self.qk_nope_head_dim,
+                self.v_head_dim,
+                fp8_dtype,
+            )
+        )[0]
+
     def init_mha_forward(self: DeepseekV2AttentionMLA):
         self.disable_chunked_prefix_cache = get_schedule().disable_chunked_prefix_cache
 
@@ -525,31 +563,39 @@ class DeepseekMHAForwardMixin:
                     forward_batch.prefix_chunk_seq_lens_cpu[i],
                     forward_batch.prefix_chunk_starts_cpu[i],
                 )
-                kv = self.kv_b_proj(kv_a_normed)[0]
-                kv = kv.view(
-                    -1,
-                    self.num_local_heads,
-                    self.qk_nope_head_dim + self.v_head_dim,
+                fused_kv = (
+                    self._project_prefix_kv_fp8(kv_a_normed, k_pe)
+                    if pack_fn is None
+                    else None
                 )
-                v_dense = kv[..., self.qk_nope_head_dim :]
-                k_nope = kv[..., : self.qk_nope_head_dim]
-
-                if pack_fn is not None:
-                    k, v = pack_fn(k_nope, k_pe, v_dense)
+                if fused_kv is not None:
+                    k, v = fused_kv
                 else:
-                    v = v_dense
-                    k = torch.empty(
-                        (
-                            k_nope.shape[0],
-                            self.num_local_heads,
-                            self.qk_nope_head_dim + self.qk_rope_head_dim,
-                        ),
-                        dtype=v.dtype,
-                        device=v.device,
+                    kv = self.kv_b_proj(kv_a_normed)[0]
+                    kv = kv.view(
+                        -1,
+                        self.num_local_heads,
+                        self.qk_nope_head_dim + self.v_head_dim,
                     )
-                    k[..., : self.qk_nope_head_dim] = k_nope
-                    k[..., self.qk_nope_head_dim :] = k_pe
-                del kv_a_normed, k_pe, kv, k_nope, v_dense
+                    v_dense = kv[..., self.qk_nope_head_dim :]
+                    k_nope = kv[..., : self.qk_nope_head_dim]
+
+                    if pack_fn is not None:
+                        k, v = pack_fn(k_nope, k_pe, v_dense)
+                    else:
+                        v = v_dense
+                        k = torch.empty(
+                            (
+                                k_nope.shape[0],
+                                self.num_local_heads,
+                                self.qk_nope_head_dim + self.qk_rope_head_dim,
+                            ),
+                            dtype=v.dtype,
+                            device=v.device,
+                        )
+                        k[..., : self.qk_nope_head_dim] = k_nope
+                        k[..., self.qk_nope_head_dim :] = k_pe
+                del kv_a_normed, k_pe
 
             output, lse = self.attn_mha(
                 q,
