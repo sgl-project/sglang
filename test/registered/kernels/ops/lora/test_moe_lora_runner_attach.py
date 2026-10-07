@@ -211,6 +211,23 @@ class TestEngineAdmission(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, "float8_e4m3fn"):
             MoeLoraRunner._weight_family(self._fp8_layer(weight_dtype=torch.bfloat16))
 
+    def test_fp8_family_selects_its_vendors(self):
+
+        for vendor, rows in (
+            ("cutedsl", "expert_major"),
+            ("cutedsl", "route_major"),
+            ("triton", "route_major"),
+            # No masked slab domain: decode plans run the route-major
+            # provider, same as the Marlin nvfp4 vendor.
+            ("triton", "expert_major"),
+        ):
+            assert select_provider_cls(rows, "fp8", vendor)
+        # Unsupported FP8 vendor choices resolve to the FP8 family default.
+        for absent in ("marlin", "deepgemm"):
+            assert select_provider_cls(
+                "expert_major", "fp8", absent
+            ) is select_provider_cls("expert_major", "fp8")
+
     def test_every_listed_vendor_resolves_and_others_fall_back_to_the_first(self):
         """Mixed-quant layers resolve independently, falling back to their family's vendor."""
         from sglang.srt.lora.moe.base_gemm_provider import VENDORS

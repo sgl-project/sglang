@@ -432,6 +432,8 @@ def test_lora_engine_inventory_is_cuda_only(platform, eligible):
     [
         "prepare_masked_bf16",
         "prepare_contiguous_bf16",
+        "prepare_masked_fp8",
+        "prepare_contiguous_fp8",
     ],
 )
 def test_lora_cute_dsl_grouped_gemms_are_inventoried(function):
