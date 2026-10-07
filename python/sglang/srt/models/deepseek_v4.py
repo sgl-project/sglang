@@ -2621,7 +2621,7 @@ class MQALayer(MqaAttentionBase):
             and not should_skip_mlp_all_reduce()
         )
         o, _ = self.wo_b(
-            o if isinstance(o, Mxfp8SwizzledInput) else o.flatten(1),
+            o.flatten(1) if isinstance(o, torch.Tensor) else o,
             skip_all_reduce=defer_all_reduce,
         )
         if defer_all_reduce:
