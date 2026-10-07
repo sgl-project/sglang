@@ -507,10 +507,31 @@ class TestForcedBudgetRejectsSimulatedAcceptLength(CustomTestCase):
             self.assertTrue(updated)
             apply.assert_called_once_with(None)
 
+    def test_pin_rejected_with_multinomial_unit_accept_length(self):
+        # multinomial draws from N(1, 1), so it can accept past the trimmed
+        # verify window even though the configured length is 1.
+        with (
+            envs.SGLANG_SIMULATE_ACC_LEN.override(1.0),
+            envs.SGLANG_SIMULATE_ACC_METHOD.override("multinomial"),
+        ):
+            updated, apply = self._set(0.4)
+            self.assertFalse(updated)
+            apply.assert_not_called()
+            updated, apply = self._set(None)
+            self.assertTrue(updated)
+            apply.assert_called_once_with(None)
+
     def test_pin_allowed_without_or_with_unit_simulated_accept_length(self):
-        for simulate_acc_len in (-1.0, 1.0):
-            with self.subTest(simulate_acc_len=simulate_acc_len):
-                with envs.SGLANG_SIMULATE_ACC_LEN.override(simulate_acc_len):
+        for simulate_acc_len, method in (
+            (-1.0, "match-expected"),
+            (-1.0, "multinomial"),
+            (1.0, "match-expected"),
+        ):
+            with self.subTest(simulate_acc_len=simulate_acc_len, method=method):
+                with (
+                    envs.SGLANG_SIMULATE_ACC_LEN.override(simulate_acc_len),
+                    envs.SGLANG_SIMULATE_ACC_METHOD.override(method),
+                ):
                     updated, apply = self._set(0.4)
                 self.assertTrue(updated)
                 apply.assert_called_once_with(0.4)
