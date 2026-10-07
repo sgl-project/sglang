@@ -10,12 +10,15 @@ import msgspec
 import torch
 from torch.export.graph_signature import InputKind
 
-from sglang.kernels.ops.attention.compiled_mlx_radix import (
+from sglang.kernels.ops.attention.mlx.radix_attention import (
     radix_decode as mlx_radix_decode,
 )
-from sglang.kernels.ops.attention.mlx_radix_export import radix_decode
+from sglang.kernels.ops.attention.mlx.radix_attention_export import radix_decode
 from sglang.srt.compilation.torch_compile_decoration import _to_torch
-from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph, host_alias
+from sglang.srt.hardware_backend.mps.compiled_graph import (
+    CompiledMlxGraph,
+    host_alias,
+)
 from sglang.srt.hardware_backend.mps.compiled_region import (
     RegionBatch,
     UnsupportedMlxRegion,
@@ -32,7 +35,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.tensor_bridge import MlxTensorView, _export_evaluated_mlx
 
 logger = logging.getLogger(__name__)
@@ -196,10 +199,7 @@ class CompiledMlxRunner(BaseRunner):
             raise TypeError("MLX graph decode requires the standard MHA KV pool")
         self._layers = ()
         self._init_backend()
-        self._max_batch_size = min(
-            get_exec().graph.mps_graph_max_batch_size,
-            model_runner.req_to_token_pool.size,
-        )
+        self._max_batch_size = min(16, model_runner.req_to_token_pool.size)
         self._graphs = {}
         self._unsupported_batches = {}
         self._pool_identity = None
@@ -224,7 +224,7 @@ class CompiledMlxRunner(BaseRunner):
         elif not forward_batch.forward_mode.is_decode():
             reason = "non-decode mode"
         elif not 1 <= forward_batch.batch_size <= self._max_batch_size:
-            reason = "batch outside configured graph range"
+            reason = "batch outside supported graph range"
         elif (
             forward_batch.input_embeds is not None
             or forward_batch.spec_info is not None
@@ -360,7 +360,7 @@ class CompiledMlxRunner(BaseRunner):
             self.compile_seconds += elapsed
             self._graphs[size] = graph
             logger.info(
-                "%s decode graph ready: batch=%d, export=%.3fs",
+                "%s decode graph ready: batch=%d, attention=radix, export=%.3fs",
                 type(graph).__name__,
                 size,
                 elapsed,
@@ -374,11 +374,15 @@ class CompiledMlxRunner(BaseRunner):
             or get_parallel().dp_size != 1
         ):
             raise ValueError("Compiled MLX requires single-rank execution")
-        self._async = not get_exec().graph.disable_mps_graph_async
+        # Only a scheduler that fences ingress and pool reuse may enable lookahead.
+        self._async = False
         self._pending = None
         self.prefetch_count = 0
         self.prefetch_hits = 0
         self.prefetch_discards = 0
+
+    def enable_lookahead(self):
+        self._async = True
 
     def _make_wrapper(self):
         mr = self.model_runner

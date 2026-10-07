@@ -1895,10 +1895,7 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         mps_runner = None
-        if (
-            get_exec().graph.mps_execution_backend == "mlx-compiled"
-            and not get_exec().graph.disable_mps_graph_async
-        ):
+        if get_exec().graph.mps_execution_backend == "mlx-compiled":
             from sglang.srt.hardware_backend.mps.compiled_runner import (
                 CompiledMlxRunner,
             )
@@ -1908,6 +1905,7 @@ class Scheduler(
                 raise RuntimeError(
                     "Asynchronous MPS decode requires the compiled runner"
                 )
+            mps_runner.enable_lookahead()
         while True:
             if mps_runner is not None:
                 mps_runner.drain()

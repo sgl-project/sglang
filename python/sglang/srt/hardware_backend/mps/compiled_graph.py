@@ -202,11 +202,16 @@ def _lower(target, args, kw):
         variance = mx.mean(mx.square(value - mean), axis=axes, keepdims=True)
         eps = args[4] if len(args) > 4 else 1e-5
         inverse = mx.rsqrt(variance + eps)
-        out = (value - mean) * inverse
-        if len(args) > 2 and args[2] is not None:
-            out = out * args[2].astype(mx.float32)
-        if len(args) > 3 and args[3] is not None:
-            out = out + args[3].astype(mx.float32)
+        weight = args[2] if len(args) > 2 else None
+        bias = args[3] if len(args) > 3 else None
+        if len(axes) == 1:
+            out = mx.fast.layer_norm(x, weight, bias, eps)
+        else:
+            out = (value - mean) * inverse
+            if weight is not None:
+                out = out * weight.astype(mx.float32)
+            if bias is not None:
+                out = out + bias.astype(mx.float32)
         out = out.astype(x.dtype)
         if name == "aten.native_layer_norm.default":
             stats_dtype = args[2].dtype if args[2] is not None else x.dtype
@@ -263,6 +268,18 @@ def _rms_pattern(node):
             and mean.args[2]
         ):
             return x, eps
+    return None
+
+
+def _weighted_rms_pattern(node, norms):
+    if str(node.target) != "aten.mul.Tensor":
+        return None
+    for normalized, weight in (node.args, node.args[::-1]):
+        if normalized not in norms or not isinstance(weight, torch.fx.Node):
+            continue
+        x, eps = norms[normalized]
+        if tuple(weight.meta["val"].shape) == (x.meta["val"].shape[-1],):
+            return x, weight, eps
     return None
 
 
@@ -331,10 +348,16 @@ class CompiledMlxGraph:
         self.norms = {
             node: pattern for node in self.nodes if (pattern := _rms_pattern(node))
         }
+        self.weighted_norms = {
+            node: pattern
+            for node in self.nodes
+            if (pattern := _weighted_rms_pattern(node, self.norms))
+        }
         logger.info(
-            "Direct MLX export: %d nodes, %d fused RMSNorms",
+            "Direct MLX export: %d nodes, %d fused RMSNorms (%d weighted)",
             len(self.nodes),
             len(self.norms),
+            len(self.weighted_norms),
         )
         self.compiled = {
             tail: mx.compile(self._function(tail), shapeless=False)
@@ -365,7 +388,10 @@ class CompiledMlxGraph:
                 if node.op != "call_function":
                     raise ValueError(f"Unsupported direct MLX graph node: {node.op}")
                 args, kw = resolve(node.args), resolve(node.kwargs)
-                if node in self.norms:
+                if node in self.weighted_norms:
+                    x, weight, eps = self.weighted_norms[node]
+                    values[node] = mx.fast.rms_norm(values[x], values[weight], eps)
+                elif node in self.norms:
                     x, eps = self.norms[node]
                     values[node] = mx.fast.rms_norm(values[x], None, eps)
                 elif str(node.target) == "sglang.mlx_radix_decode.default":

@@ -40,17 +40,18 @@ def _ensure_toolchain():
             "Apple toolchain not found. Install the Xcode Command Line Tools "
             "with `xcode-select --install` (or a full Xcode install) and retry."
         )
-    try:
-        subprocess.check_output(
-            ["xcrun", "-sdk", "macosx", "metal", "--version"],
-            stderr=subprocess.STDOUT,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+    compiler = subprocess.run(
+        ["xcrun", "-sdk", "macosx", "metal", "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if compiler.returncode:
         raise SystemExit(
-            "Apple Metal shader compiler not found. Install a full Xcode "
-            "(not just Command Line Tools) so that `xcrun -sdk macosx metal` "
-            "is available, then retry."
-        ) from exc
+            "Apple Metal shader compiler unavailable. Install full Xcode; if its "
+            "Metal component is missing, run `xcodebuild -downloadComponent "
+            f"MetalToolchain`, then retry.\n{compiler.stdout}"
+        )
 
 
 def _ensure_build_requires():
@@ -95,9 +96,13 @@ metallib_name = "sgl_metal_kernels.metallib"
 # Metal shader sources (compiled with `xcrun metal`) and C++ host sources
 # (compiled with `c++`). Add new kernels by appending to these lists.
 metal_shader_sources = [
+    "csrc/metal/radix_attention.metal",
     "csrc/metal/rope_pool_fused.metal",
 ]
 cxx_sources = [
+    "csrc/metal/bindings.cpp",
+    "csrc/metal/metal_common.cpp",
+    "csrc/metal/radix_attention.cpp",
     "csrc/metal/rope_pool_fused.cpp",
 ]
 
@@ -225,7 +230,7 @@ class BuildMetalExtension(build_ext):
             f"-mmacosx-version-min={deployment_target}",
             f"-L{python_lib}",
             f"-L{mlx_lib}",
-            f"-Wl,-rpath,{mlx_lib}",
+            "-Wl,-rpath,@loader_path/../mlx/lib",
             *[f"-l{lib}" for lib in libraries],
             *[arg for fw in frameworks for arg in ("-framework", fw)],
         ]

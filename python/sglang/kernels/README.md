@@ -33,6 +33,12 @@ Place model-specific implementations and tuning data inside the corresponding
 logical operator group, rather than creating a model-specific top-level group
 under `ops/`.
 
+MLX attention entry points and their Torch export contracts live together in
+`ops/attention/mlx/`: `radix_attention.py` runs the operator and
+`radix_attention_export.py` defines its read-only export contract. Keep that
+subpackage lazy. The shared Metal build, bindings and shaders remain under
+`aot/`; runner state and Torch buffer ownership remain in `srt`.
+
 `lora` is its own group because it has a distinct responsibility: the adapter
 kernels that only the LoRA runtime in `srt/lora` calls (`dense/` SGMV GEMMs and
 their tuning data, `moe/` fused MoE-LoRA). It also keeps the experimental

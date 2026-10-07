@@ -44,10 +44,13 @@ import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.j
 
 For unquantized dense Qwen3 on a single Apple GPU, you can keep Torch MPS weight
 loading and KV ownership while exporting decode to direct compiled MLX
-(`--mps-execution-backend mlx-compiled`). Bounded asynchronous greedy lookahead
-is enabled by default, enqueueing dependent decode work before the current token
-is read by the host. Use `--disable-mps-graph-async` for synchronous debugging. Prefill
-remains eager MPS. See the
+(`--mps-execution-backend mlx-compiled`). This single runner option selects
+custom AOT Metal radix attention; no dense-cache or SDPA selector is needed.
+Build the `sgl_kernel` Metal extension and bundled metallib in the serving
+environment using the installation instructions linked below.
+The normal scheduler enables bounded asynchronous greedy lookahead before the
+current token is read by the host. Standalone one-batch runs are synchronous.
+Prefill remains eager MPS. See the
 [Apple Silicon guide](/docs/hardware-platforms/apple_metal#experimental-direct-compiled-mlx-decode)
 for installation, limits and measured results. This experimental option leaves
 native MLX unchanged and is not faster at every batch size. The current M4 Pro

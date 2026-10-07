@@ -208,6 +208,16 @@ jobs:
           uv venv
           uv pip install -e "python[srt_mps,test]"
 
+      - name: Build AOT Metal kernels
+        timeout-minutes: 15
+        run: |
+          if ! xcrun -sdk macosx metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          uv pip install setuptools wheel nanobind
+          uv run python python/sglang/kernels/aot/setup_metal.py bdist_wheel
+          uv pip install --no-deps --force-reinstall python/sglang/kernels/aot/dist/*.whl
+
       - name: Report torch version and MPS availability
         run: |
           uv run python -c "import torch; print('torch', torch.__version__, 'mps', torch.mps.is_available())"
@@ -249,6 +259,16 @@ jobs:
           mv python/pyproject_other.toml python/pyproject.toml
           uv venv --python 3.11
           uv pip install -e "python[srt_mps,test]"
+
+      - name: Build AOT Metal kernels
+        timeout-minutes: 15
+        run: |
+          if ! xcrun -sdk macosx metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          uv pip install setuptools wheel nanobind
+          uv run python python/sglang/kernels/aot/setup_metal.py bdist_wheel
+          uv pip install --no-deps --force-reinstall python/sglang/kernels/aot/dist/*.whl
 
       # Needs a warm HF cache or network and roughly 24 GB of unified memory.
       - name: Run MPS e2e smoke tests

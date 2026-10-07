@@ -1,4 +1,4 @@
-"""Attention compute kernels (Triton): decode / extend / prefill / metadata.
+"""Attention compute kernels: decode / extend / prefill / metadata.
 
 The Triton kernels migrated here live in this package
 (``sglang.kernels.ops.attention.<module>``); import them from there. Their
@@ -22,15 +22,15 @@ from sglang.kernels.spec import (
 
 register_kernel(
     KernelSpec(
-        op="attention.compiled_mlx_radix_decode",
-        backend=KernelBackend.MLX,
-        target="sglang.kernels.ops.attention.compiled_mlx_radix:radix_decode",
+        op="attention.mlx_radix_decode",
+        backend=KernelBackend.AOT,
+        target="sglang.kernels.ops.attention.mlx.radix_attention:radix_decode",
         capabilities=frozenset({CapabilityRequirement(device=DeviceType.MPS)}),
         format_signature=FormatSignature(
             supported_dtypes=("float32", "float16", "bfloat16"),
             description="MLX arrays; read-only GQA decode with optional previous-token K/V",
         ),
-        description="Direct MLX Metal radix attention, usable inside mx.compile.",
+        description="AOT Metal radix attention with lazy MLX graph integration.",
     )
 )
 

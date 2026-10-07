@@ -1,4 +1,4 @@
-"""Compare default async and synchronous compiled MLX with eager Torch MPS."""
+"""Compare scheduler-managed compiled radix decode with eager Torch MPS."""
 
 import importlib.util
 import os
@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_mps_ci(est_time=400, suite="stage-b-e2e-mps")
+register_mps_ci(est_time=300, suite="stage-b-e2e-mps")
 
 
 @unittest.skipUnless(
@@ -27,7 +27,6 @@ register_mps_ci(est_time=400, suite="stage-b-e2e-mps")
 )
 class TestCompiledMlxServing(CustomTestCase):
     backend = "mlx-compiled"
-    disable_async = False
     model_name = "Qwen/Qwen3-0.6B"
 
     def test_decode_and_prefix_reuse_match_eager(self):
@@ -44,27 +43,20 @@ class TestCompiledMlxServing(CustomTestCase):
                 env=env,
                 device="mps",
                 return_stdout_stderr=(log, log),
-                other_args=(
-                    [
-                        "--device",
-                        "mps",
-                        "--mps-execution-backend",
-                        backend,
-                        "--context-length",
-                        "1024",
-                        "--max-total-tokens",
-                        "4096",
-                        "--max-running-requests",
-                        "4",
-                        "--mem-fraction-static",
-                        "0.6",
-                    ]
-                    + (
-                        ["--disable-mps-graph-async"]
-                        if self.disable_async and backend != "eager"
-                        else []
-                    )
-                ),
+                other_args=[
+                    "--device",
+                    "mps",
+                    "--mps-execution-backend",
+                    backend,
+                    "--context-length",
+                    "1024",
+                    "--max-total-tokens",
+                    "4096",
+                    "--max-running-requests",
+                    "4",
+                    "--mem-fraction-static",
+                    "0.6",
+                ],
             )
             try:
                 outputs = []
@@ -123,6 +115,26 @@ class TestCompiledMlxServing(CustomTestCase):
                     [item["output_ids"] for item in response.json()],
                     [[42] * 2, [42] * 7],
                 )
+                response = requests.post(
+                    DEFAULT_URL_FOR_TEST + "/generate",
+                    json={
+                        "input_ids": [42] * 31,
+                        "return_logprob": True,
+                        "top_logprobs_num": 5,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 5,
+                            "ignore_eos": True,
+                        },
+                    },
+                    timeout=180,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                results[backend].append(payload["output_ids"])
+                distributions[backend].append(
+                    payload["meta_info"]["output_top_logprobs"]
+                )
             finally:
                 terminate_and_kill_process_tree(process)
             if backend != "eager":
@@ -130,9 +142,11 @@ class TestCompiledMlxServing(CustomTestCase):
                 output = log.read()
                 self.assertIn("Compiled MLX: executions=", output, output)
                 self.assertNotIn("using eager MPS", output, output)
+                self.assertIn("attention=radix", output, output)
+                self.assertRegex(output, r"Compiled MLX:.*enqueued=[1-9]")
         if self.model_name == "Qwen/Qwen3-0.6B":
             self.assertEqual(results["eager"][1], results[self.backend][1])
-        for request in range(2):
+        for request in range(3):
             for step, (eager_id, mlx_id) in enumerate(
                 zip(results["eager"][request], results[self.backend][request])
             ):
@@ -145,7 +159,12 @@ class TestCompiledMlxServing(CustomTestCase):
                     for value, token, _ in distributions[self.backend][request][step]
                 }
                 for token in eager.keys() & mlx.keys():
-                    self.assertAlmostEqual(eager[token], mlx[token], delta=0.25)
+                    self.assertAlmostEqual(
+                        eager[token],
+                        mlx[token],
+                        delta=0.25,
+                        msg=f"{self.model_name}: request={request}, step={step}, token={token}",
+                    )
                 if eager_id != mlx_id:
                     # BF16 can break a tied greedy choice (e.g. the next country).
                     self.assertIn(mlx_id, eager)
@@ -153,10 +172,6 @@ class TestCompiledMlxServing(CustomTestCase):
                     self.assertLessEqual(eager[eager_id] - eager[mlx_id], 0.125)
                     self.assertLessEqual(mlx[mlx_id] - mlx[eager_id], 0.125)
                     break  # Subsequent distributions have different prefixes.
-
-
-class TestSynchronousCompiledMlxServing(TestCompiledMlxServing):
-    disable_async = True
 
 
 class TestLlamaCompiledMlxServing(TestCompiledMlxServing):

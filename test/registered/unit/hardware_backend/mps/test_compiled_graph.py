@@ -19,8 +19,38 @@ register_mps_ci(est_time=30, suite="stage-a-unit-test-mps")
     "Requires Torch MPS and MLX",
 )
 class TestCompiledGraph(CustomTestCase):
+    def test_weighted_rms_fusion_preserves_intermediate_casts(self):
+        from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph
+        from sglang.srt.utils.tensor_bridge import mlx_to_torch
+
+        class Norm(torch.nn.Module):
+            def __init__(self, cast_before_weight):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.randn(128, device="mps", dtype=torch.bfloat16)
+                )
+                self.cast_before_weight = cast_before_weight
+
+            def forward(self, value):
+                x = value.float()
+                normalized = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
+                if self.cast_before_weight:
+                    normalized = normalized.to(value.dtype)
+                return (normalized * self.weight).to(value.dtype)
+
+        inputs = (torch.randn(3, 128, device="mps", dtype=torch.bfloat16),)
+        for cast_before_weight in (False, True):
+            with self.subTest(cast_before_weight=cast_before_weight):
+                model = Norm(cast_before_weight)
+                graph = CompiledMlxGraph(model=model, example_inputs=inputs)
+                self.addCleanup(graph.close)
+                self.assertEqual(len(graph.weighted_norms), int(not cast_before_weight))
+                torch.mps.synchronize()
+                actual = mlx_to_torch(graph.launch(graph.bind(inputs))[0])
+                torch.testing.assert_close(actual, model(*inputs))
+
     def test_whole_forward_preserves_logits_and_checks_attention_and_metadata(self):
-        from sglang.kernels.ops.attention.compiled_mlx_radix import radix_decode
+        from sglang.kernels.ops.attention.mlx.radix_attention import radix_decode
         from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph
         from sglang.srt.hardware_backend.mps.compiled_region import (
             UnsupportedMlxRegion,
@@ -212,12 +242,16 @@ class TestCompiledGraph(CustomTestCase):
                 self.norm = torch.nn.LayerNorm(64, device="mps", dtype=dtype)
 
             def forward(self, x):
+                original = x
                 x = self.norm(x)
                 return (
                     torch.nn.functional.gelu(x),
                     torch.nn.functional.gelu(x, approximate="tanh"),
                     torch.relu(x),
                     torch.tanh(x),
+                    *torch.native_layer_norm(
+                        original, (64,), self.norm.weight, self.norm.bias, self.norm.eps
+                    ),
                 )
 
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
@@ -305,22 +339,28 @@ class TestCompiledGraph(CustomTestCase):
     def test_async_requires_compiled_local_mps_execution(self):
         from sglang.srt.server_args import ServerArgs
 
-        self.assertFalse(ServerArgs(model_path="dummy").disable_mps_graph_async)
+        self.assertEqual(ServerArgs(model_path="dummy").mps_execution_backend, "eager")
         enabled = ServerArgs(
             model_path="dummy",
             device="mps",
             mps_execution_backend="mlx-compiled",
         )
         enabled.resolve_once()
-        self.assertFalse(enabled.disable_mps_graph_async)
-        synchronous = ServerArgs(
-            model_path="dummy",
-            device="mps",
-            mps_execution_backend="mlx-compiled",
-            disable_mps_graph_async=True,
-        )
-        synchronous.resolve_once()
-        self.assertTrue(synchronous.disable_mps_graph_async)
+        for option in (
+            {"enable_hierarchical_cache": True},
+            {"enable_lmcache": True},
+            {"enable_session_radix_cache": True},
+        ):
+            with (
+                self.subTest(option=option),
+                self.assertRaisesRegex(ValueError, "local"),
+            ):
+                ServerArgs(
+                    model_path="dummy",
+                    device="mps",
+                    mps_execution_backend="mlx-compiled",
+                    **option,
+                ).resolve_once()
         with self.assertRaisesRegex(ValueError, "standard Torch MPS"):
             ServerArgs(
                 model_path="dummy",
@@ -439,12 +479,25 @@ class TestCompiledGraph(CustomTestCase):
         model.static_reads = {}
         runner._fallback_reasons = set()
         runner._layers = ()
-        runner._async = True
+        runner._async = False
         runner._pending = None
         runner.execution_count = runner.prefetch_count = 0
         runner.prefetch_hits = runner.prefetch_discards = 0
         events = []
         launch, evaluate = graph.launch, mx.eval
+
+        torch.mps.synchronize()
+        synchronous = graph.launch(graph.bind(_batch_inputs(batch)))
+        runner._prefetch(
+            graph=graph,
+            arrays=graph.bind(_batch_inputs(batch)),
+            outputs=synchronous,
+            batch=batch,
+            metadata=runner._metadata(batch),
+            weights=runner._weights(),
+        )
+        self.assertIsNone(runner._pending)
+        runner.enable_lookahead()
 
         def record_launch(*args, **kwargs):
             events.append("launch")
@@ -471,6 +524,21 @@ class TestCompiledGraph(CustomTestCase):
         )
         runner.drain()
         pending = runner._pending
+        runner.model_runner.model_config.context_len = 2
+        runner._pending = None
+        count = runner.prefetch_count
+        runner._prefetch(
+            graph=graph,
+            arrays=graph.bind(_batch_inputs(batch)),
+            outputs=pending.outputs,
+            batch=batch,
+            metadata=runner._metadata(batch),
+            weights=runner._weights(),
+        )
+        self.assertIsNone(runner._pending)
+        self.assertEqual(runner.prefetch_count, count)
+        runner.model_runner.model_config.context_len = 32
+        runner._pending = pending
         batch.input_ids = torch.tensor(pending.tokens.tolist(), device="mps")
         batch.positions = batch.positions + 1
         batch.seq_lens = batch.seq_lens + 1
