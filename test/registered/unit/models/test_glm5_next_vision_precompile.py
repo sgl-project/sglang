@@ -11,6 +11,11 @@ They do not run Triton: the kernel entry point is a recording stub and the
 vision tower is a fake, so nothing here shows that the hook's call and a real
 vision call share one compiled kernel. That is the GPU test's job
 (``test_glm5_next_vision_precompile_gpu.py``).
+
+The vision-MLP tests check the warmup's input ranks and grad mode, and
+``TestGlm5NextVisionPrecompileReuse`` runs the real ``torch.compile``d
+activation on CPU to show that serving-shaped calls in each serving grad mode
+reuse the warmed graphs instead of compiling again.
 """
 
 import sys
@@ -22,6 +27,7 @@ import torch
 from torch import nn
 
 import sglang.srt.models.glm5_next as glm5_next
+from sglang.srt.utils.common import DynamicGradMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -59,10 +65,14 @@ class _RecordingActivationModule(nn.Module):
         nn.Module.__init__(self)
         setattr(self, first_linear, SimpleNamespace(input_size=in_features))
         self.calls = calls
+        self.grad_modes = []
         self.in_features = in_features
 
     def forward(self, x):
         self.calls.append((tuple(x.shape), x.dtype, x.device))
+        self.grad_modes.append(
+            (torch.is_grad_enabled(), torch.is_inference_mode_enabled())
+        )
         return x
 
 
@@ -152,8 +162,10 @@ class TestGlm5NextVisionPrecompile(CustomTestCase):
         visual.mlp = _RecordingMLP(3072, mlp_calls)
         visual.merger = _RecordingMerger(1536, merger_calls)
         self._run_hook(_make_model(visual), lambda *a, **k: None)
+        # The block MLP is served (S, 1, H) by GlmOcrVisionBlock.forward and
+        # the merger (S, H); dynamo guards on rank, so the warmup matches both.
         self.assertEqual(
-            [shape for shape, _, _ in mlp_calls], [(64, 3072), (4096, 3072)]
+            [shape for shape, _, _ in mlp_calls], [(64, 1, 3072), (4096, 1, 3072)]
         )
         self.assertEqual(
             [shape for shape, _, _ in merger_calls], [(64, 1536), (4096, 1536)]
@@ -161,6 +173,27 @@ class TestGlm5NextVisionPrecompile(CustomTestCase):
         for _, dtype, device in mlp_calls + merger_calls:
             self.assertEqual(dtype, torch.bfloat16)
             self.assertEqual(device, visual.device)
+
+    def _warmup_grad_modes(self, encoder_only: bool):
+        visual = _FakeVisionTower(hidden_size=1536, num_heads=12, backend="fa3")
+        visual.mlp = _RecordingMLP(3072, [])
+        visual.merger = _RecordingMerger(1536, [])
+        model = _make_model(visual)
+        model.encoder_only = encoder_only
+        self._run_hook(model, lambda *a, **k: None)
+        return visual.mlp.grad_modes + visual.merger.grad_modes
+
+    def test_mlp_warmup_uses_the_scheduler_grad_mode(self):
+        # (grad_enabled, inference_mode) as DynamicGradMode applies it.
+        self.assertEqual(set(self._warmup_grad_modes(False)), {(False, False)})
+        DynamicGradMode.set_inference_mode(True)
+        try:
+            self.assertEqual(set(self._warmup_grad_modes(False)), {(False, True)})
+        finally:
+            DynamicGradMode.set_inference_mode(False)
+
+    def test_mlp_warmup_uses_inference_mode_in_the_encoder_server(self):
+        self.assertEqual(set(self._warmup_grad_modes(True)), {(False, True)})
 
     def test_mlp_precompile_skips_without_the_modules_or_off_first_rank(self):
         calls = []
@@ -200,6 +233,71 @@ class TestGlm5NextVisionPrecompile(CustomTestCase):
         self.assertFalse(
             any(line.startswith("ERROR") for line in logs.output), logs.output
         )
+
+
+class _CompiledActivation(nn.Module):
+    """Runs the real ``torch.compile``d ``swiglu_clamped`` on a gate_up-shaped
+    input that keeps the caller's leading dimensions, as the real modules do."""
+
+    def __init__(self, first_linear: str, in_features: int):
+        nn.Module.__init__(self)
+        setattr(self, first_linear, SimpleNamespace(input_size=in_features))
+
+    def forward(self, x):
+        return glm5_next.swiglu_clamped(torch.cat([x, x], dim=-1), 7.0)
+
+
+class _CompiledMLP(_CompiledActivation, glm5_next.Glm5NextVisionMLP):
+    def __init__(self, in_features):
+        _CompiledActivation.__init__(self, "gate_up_proj", in_features)
+
+
+class _CompiledMerger(_CompiledActivation, glm5_next.Glm5NextVisionPatchMerger):
+    def __init__(self, in_features):
+        _CompiledActivation.__init__(self, "proj", in_features)
+
+
+class TestGlm5NextVisionPrecompileReuse(CustomTestCase):
+    """Runs the real compiled activation: after the hook, serving-shaped calls
+    in the serving grad mode at a new token count must not compile again."""
+
+    def setUp(self):
+        torch._dynamo.reset()
+
+    def tearDown(self):
+        DynamicGradMode.set_inference_mode(False)
+        torch._dynamo.reset()
+
+    def _assert_serving_calls_reuse(self, encoder_only, serving_mode):
+        from torch._dynamo.utils import counters
+
+        visual = _FakeVisionTower(hidden_size=32, num_heads=2, backend="fa3")
+        visual.mlp = _CompiledMLP(32)
+        visual.merger = _CompiledMerger(16)
+        model = _make_model(visual)
+        model.encoder_only = encoder_only
+        with self.assertNoLogs(glm5_next.logger, level="WARNING"):
+            model.precompile_kernels_after_loading()
+        graphs = counters["stats"]["unique_graphs"]
+        self.assertGreater(graphs, 0)
+
+        with serving_mode():
+            for tokens in (1000, 1500):
+                # GlmOcrVisionBlock.forward hands its MLP (S, 1, H); the
+                # vision model hands the merger (S, H).
+                visual.mlp(torch.zeros((tokens, 1, 32), dtype=torch.bfloat16))
+                visual.merger(torch.zeros((tokens // 4, 16), dtype=torch.bfloat16))
+        self.assertEqual(counters["stats"]["unique_graphs"], graphs)
+
+    def test_scheduler_no_grad_serving_reuses_the_warmup(self):
+        self._assert_serving_calls_reuse(False, DynamicGradMode)
+
+    def test_scheduler_inference_mode_serving_reuses_the_warmup(self):
+        DynamicGradMode.set_inference_mode(True)
+        self._assert_serving_calls_reuse(False, DynamicGradMode)
+
+    def test_encoder_server_serving_reuses_the_warmup(self):
+        self._assert_serving_calls_reuse(True, torch.inference_mode)
 
 
 if __name__ == "__main__":

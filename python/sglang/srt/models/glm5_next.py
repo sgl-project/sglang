@@ -120,6 +120,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     BumpAllocator,
+    DynamicGradMode,
     LazyValue,
     add_prefix,
     log_info_on_rank0,
@@ -1382,30 +1383,41 @@ class Glm5NextForConditionalGeneration(nn.Module):
         here settles dynamo on the dynamic kernels while memory is free; the
         inductor cache then serves later boots. Failures are logged at WARNING
         and swallowed, as for the attention precompile.
+
+        Dynamo guards on tensor rank and on inference mode, so the warmup
+        mirrors the serving calls: the block MLP receives ``(S, 1, H)`` from
+        ``GlmOcrVisionBlock.forward`` while the merger receives ``(S, H)``,
+        and the calls run under the grad mode of the path that serves images
+        (``torch.inference_mode`` in the encoder server, ``DynamicGradMode``
+        in the scheduler).
         """
         if self.visual is None or not self.pp_group.is_first_rank:
             return
         targets = []
-        for cls, first_linear in (
-            (Glm5NextVisionMLP, "gate_up_proj"),
-            (Glm5NextVisionPatchMerger, "proj"),
+        for cls, first_linear, batch_dims in (
+            (Glm5NextVisionMLP, "gate_up_proj", (1,)),
+            (Glm5NextVisionPatchMerger, "proj", ()),
         ):
             module = next(
                 (m for m in self.visual.modules() if isinstance(m, cls)), None
             )
             if module is not None:
-                targets.append((module, getattr(module, first_linear).input_size))
+                in_features = getattr(module, first_linear).input_size
+                targets.append((module, (*batch_dims, in_features)))
         if not targets:
             return
         try:
             device = self.visual.device
             dtype = self.visual.dtype
-            with torch.no_grad():
-                for module, in_features in targets:
+            grad_mode = (
+                torch.inference_mode() if self.encoder_only else DynamicGradMode()
+            )
+            with grad_mode:
+                for module, feature_shape in targets:
                     for tokens in (64, 4096):
                         module(
                             torch.zeros(
-                                (tokens, in_features), dtype=dtype, device=device
+                                (tokens, *feature_shape), dtype=dtype, device=device
                             )
                         )
             if device.type == "cuda":
