@@ -44,7 +44,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         offset = 0
         for i, req in enumerate(reqs):
             req_pool_indices.append(req.kv.req_pool_idx)
-            pre_len = len(req.prefix_indices)
+            pre_len = req.prefix_len
 
             chunk = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx][
                 pre_len : pre_len + req.extend_range.length
@@ -98,7 +98,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             self.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
 
         self.extend_num_tokens = extend_num_tokens
-        self.prefix_lens = [len(r.prefix_indices) for r in reqs]
+        self.prefix_lens = [r.prefix_len for r in reqs]
         self.extend_lens = [r.extend_range.length for r in reqs]
         self.extend_logprob_start_lens = None
         self.extend_input_logprob_token_ids = None

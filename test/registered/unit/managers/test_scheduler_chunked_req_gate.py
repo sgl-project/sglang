@@ -35,6 +35,7 @@ def _make_req(
     req.output_ids = array("q")
     req.full_untruncated_fill_ids = array("q", fill_ids)
     req.prefix_indices = prefix_indices
+    req.prefix_len = len(req.prefix_indices)
     req.extend_range = Range(fill_len - extend_input_len, fill_len)
     req.inflight_middle_chunks = 0
     req.host_hit_length = 0
@@ -117,7 +118,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     return s
 
 
-class TestStashGatePreservesPrefixIndices(CustomTestCase):
+class TestStashGatePreservesPrefix(CustomTestCase):
     """Consumer side: real ChunkCache.checkpoint mutates
     req.prefix_indices iff stash actually runs, so prefix_indices content
     is the bug-detection signal. The stash gate is content-based:
@@ -146,32 +147,28 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=req)
         return s, req, initial_prefix, pool
 
-    def test_parked_chunked_req_keeps_real_prefix_indices(self):
-        # A parked chunk has fill_len == len(prefix_indices): no new KV was
-        # computed, so the gate must skip stash and leave prefix_indices intact.
+    def test_parked_chunked_req_keeps_its_prefix(self):
+        # A parked chunk has fill_len == prefix_len: no new KV was computed,
+        # so the gate must skip stash and leave the prefix intact.
         s, req, initial_prefix, _ = self._build(fill_len=self.INITIAL_PREFIX_LEN)
 
         Scheduler.get_next_batch_to_run(
             s, running_batch=s.running_batch, last_batch=s.last_batch
         )
 
-        self.assertEqual(req.prefix_indices.shape[0], self.INITIAL_PREFIX_LEN)
+        self.assertEqual(req.prefix_len, self.INITIAL_PREFIX_LEN)
         self.assertTrue(torch.equal(req.prefix_indices, initial_prefix))
 
-    def test_scheduled_chunked_req_advances_prefix_indices_via_real_stash(self):
+    def test_scheduled_chunked_req_advances_prefix_via_real_stash(self):
         # Symmetric guard against over-gating: when fill_len has advanced past
-        # the cached prefix, stash must run and advance prefix_indices.
+        # the cached prefix, stash must run and advance prefix_len.
         s, req, _, pool = self._build(fill_len=self.POST_RESET_FILL_LEN)
 
         Scheduler.get_next_batch_to_run(
             s, running_batch=s.running_batch, last_batch=s.last_batch
         )
 
-        expected = pool.req_to_token[self.POOL_IDX, : self.POST_RESET_FILL_LEN].to(
-            dtype=torch.int64
-        )
-        self.assertEqual(req.prefix_indices.shape[0], self.POST_RESET_FILL_LEN)
-        self.assertTrue(torch.equal(req.prefix_indices, expected))
+        self.assertEqual(req.prefix_len, self.POST_RESET_FILL_LEN)
 
     def test_no_chunked_req_never_mutates_state(self):
         # The outer `if chunked_req is not None` guard must hold on the retract

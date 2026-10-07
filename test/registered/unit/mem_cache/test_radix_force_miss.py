@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
@@ -33,6 +34,7 @@ class _StubReq:
         self.extra_key = None
         self.cache_salt = None
         self.prefix_indices = None
+        self.prefix_len = 0
         self.last_node = None
         self.last_host_node = None
         self.best_match_node = None
@@ -40,6 +42,8 @@ class _StubReq:
         self.num_matched_prefix_tokens = 0
         self.swa_branching_seqlen = None
         self.kv = SimpleNamespace(cache_protected_len=None)
+
+    set_prefix_indices = Req.set_prefix_indices
 
     def _compute_max_prefix_len(self, input_len):
         return max(input_len - 1, 0)

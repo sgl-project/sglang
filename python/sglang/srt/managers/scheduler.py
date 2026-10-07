@@ -3153,7 +3153,7 @@ class Scheduler(
             ):
                 last_host_node = req.last_node
 
-            matched_len = len(req.prefix_indices) + req.host_hit_length
+            matched_len = req.prefix_len + req.host_hit_length
             req.storage_prefetch_last_match_len = matched_len
 
             if (
@@ -3227,7 +3227,7 @@ class Scheduler(
             and buffer_pipeline.has_staged(req.cache_request_handle)
         ):
             return False
-        current_match_len = len(req.prefix_indices) + req.host_hit_length
+        current_match_len = req.prefix_len + req.host_hit_length
         if current_match_len >= previous_match_len:
             return False
         if (
@@ -3676,12 +3676,9 @@ class Scheduler(
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
 
-            # Stash (cache) the previous chunk only when it produced new KV
-            # beyond what is already cached. A parked chunk (add_chunked_req
-            # hybrid-SWA early-return) leaves extend_range.end ==
-            # len(prefix_indices), so there is nothing new to cache and
-            # stashing would be a no-op.
-            if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
+            # A parked chunk (add_chunked_req hybrid-SWA early-return) leaves
+            # extend_range.end at prefix_len: it computed no new KV, so nothing to stash.
+            if self.chunked_req.extend_range.end > self.chunked_req.prefix_len:
                 self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
@@ -3905,7 +3902,7 @@ class Scheduler(
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
         if self.chunked_req is not None and self.dynamic_chunk_sizer is not None:
-            history_len = len(self.chunked_req.prefix_indices)
+            history_len = self.chunked_req.prefix_len
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size

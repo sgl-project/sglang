@@ -145,7 +145,7 @@ def _bootstrap_addr(req: Req) -> str:
 
 def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     """Start a decode-radix request that owns its whole KV row at the root."""
-    req.prefix_indices = torch.empty((0,), dtype=torch.int64)
+    req.set_prefix_indices(torch.empty((0,), dtype=torch.int64))
     req.last_node = tree_cache.root_node_handle(req.extra_key)
     req.last_host_node = req.last_node
     req.best_match_node = req.last_node
@@ -2202,11 +2202,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # inserts committed KV into the radix tree. The last output token
         # hasn't had KV committed yet (output_ids is 1 ahead).
         req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
-        # Set prefix_indices so downstream consumers (init_next_round_input,
-        # prepare_for_extend) see the correct prefix length. In the agg path
-        # this is done inside init_next_round_input, but decode-disagg needs
-        # allocation info before batch assembly so we set it here.
-        req.prefix_indices = (
+        # Decode-disagg allocates before batch assembly, so it binds the prefix
+        # here instead of in init_next_round_input.
+        req.set_prefix_indices(
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
         req.set_extend_range(total_prefix_len, req.kv.kv_committed_len)
@@ -3162,9 +3160,7 @@ class SchedulerDisaggregationDecodeMixin:
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).
                 if req.kv.kv_committed_len is not None:
-                    req.set_extend_range(
-                        len(req.prefix_indices), req.kv.kv_committed_len
-                    )
+                    req.set_extend_range(req.prefix_len, req.kv.kv_committed_len)
             else:
                 waiting_queue.append(req)
 
