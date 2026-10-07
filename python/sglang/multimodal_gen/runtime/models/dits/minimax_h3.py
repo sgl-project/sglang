@@ -67,6 +67,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
+    LinearMethodBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
@@ -397,10 +398,12 @@ def _modulate_rmsnorm_scale_shift(
 
 
 def _accepts_mxfp8_input(linear: nn.Module) -> bool:
+    quant_method = linear.quant_method
     return (
         isinstance(linear, LinearBase)
-        and linear.quant_method is not None
-        and linear.quant_method.accepts_mxfp8_input(linear)
+        and quant_method is not None
+        and isinstance(quant_method, LinearMethodBase)
+        and quant_method.accepts_mxfp8_input(linear)
     )
 
 
