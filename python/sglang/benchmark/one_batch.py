@@ -438,11 +438,8 @@ def prepare_extend_inputs_for_correctness_test(
         req.full_untruncated_fill_ids.extend(input_ids[i][bench_args.cut_len :])
         if model_runner is not None:
             # Use req.kv.req_pool_idx instead of i to handle slot 0 padding correctly
-            req.set_prefix_indices(
-                model_runner.req_to_token_pool.req_to_token[
-                    req.kv.req_pool_idx, : bench_args.cut_len
-                ].to(torch.int64)
-            )
+            # The cut prefix is already in the request's row from the first extend.
+            req.prefix_len = bench_args.cut_len
             req.logprob_start_len = -1
         req.set_extend_range(req.prefix_len, len(req.full_untruncated_fill_ids))
     return reqs

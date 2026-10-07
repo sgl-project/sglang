@@ -145,7 +145,7 @@ def _bootstrap_addr(req: Req) -> str:
 
 def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     """Start a decode-radix request that owns its whole KV row at the root."""
-    req.set_prefix_indices(torch.empty((0,), dtype=torch.int64))
+    req.prefix_len = 0
     req.last_node = tree_cache.root_node_handle(req.extra_key)
     req.last_host_node = req.last_node
     req.best_match_node = req.last_node
@@ -2204,9 +2204,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
         # Decode-disagg allocates before batch assembly, so it binds the prefix
         # here instead of in init_next_round_input.
-        req.set_prefix_indices(
-            prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
-        )
+        req.prefix_len = prefix_len
         req.set_extend_range(total_prefix_len, req.kv.kv_committed_len)
         self.tree_cache.maybe_hand_to_session(req)
 
