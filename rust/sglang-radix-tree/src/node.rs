@@ -183,6 +183,11 @@ pub struct Node<K: ChildKeyType> {
     pub rotation_base: Option<i64>,
     /// The in-flight write-through backup's ack id.
     pub write_through_pending_id: Option<usize>,
+    /// A buffer-mode backup of this node is queued, staged or awaiting its
+    /// storage ack. The backup's pin is itself a lock walk, so the SWA window
+    /// lock must leave the node whole until that ack; mirrors Python
+    /// `BufferModePipeline.backup_pending`.
+    pub buffer_backup_pending: bool,
     /// Load-back anchor currently reading this node's Full host slots.
     /// Auxiliary transfers are protected by their component locks.
     pub load_back_pending_id: Option<NodeId>,
@@ -411,6 +416,7 @@ impl<K: ChildKeyType> Node<K> {
             external_cache_stored: false,
             rotation_base: None,
             write_through_pending_id: None,
+            buffer_backup_pending: false,
             load_back_pending_id: None,
             last_access_counter: 0,
             creation_counter: 0,
@@ -438,6 +444,7 @@ impl<K: ChildKeyType> Node<K> {
             external_cache_stored: false,
             rotation_base: None,
             write_through_pending_id: None,
+            buffer_backup_pending: false,
             load_back_pending_id: None,
             last_access_counter: 0,
             creation_counter: 0,

@@ -6511,3 +6511,71 @@ fn swa_lock_window_only_matches_python_env_bool() {
     assert!(env_bool("SGLANG_TEST_ENV_BOOL_SWA_UNSET", true));
     assert!(!env_bool("SGLANG_TEST_ENV_BOOL_SWA_UNSET", false));
 }
+
+/// A buffer-mode HiCache backup pins its node with `inc_lock_ref`, and that pin
+/// is itself a lock walk: without this guard the walk splits the very node the
+/// write is about to read, the node keeps its id as the shorter in-window tail,
+/// and the written keys stop matching the chain. The pipeline marks the node
+/// for the enqueue -> storage-ack window instead, mirroring the
+/// `buffer_backup_pending` term Python added to `_maybe_split_for_window_lock`.
+#[test]
+fn swa_lock_walk_leaves_a_buffer_backup_pending_node_whole() {
+    // Page size 1: 32-token live ancestor + 7-token endpoint + 8-token window.
+    let mut tc = swa_core(8, 1);
+    let ancestor = tc
+        .arena
+        .alloc_child(tc.arena.root(), (1..=32).collect(), 0, None)
+        .unwrap();
+    let endpoint = tc
+        .arena
+        .alloc_child(ancestor, (33..=39).collect(), 0, None)
+        .unwrap();
+    store_swa_device(&mut tc, ancestor);
+    store_swa_device(&mut tc, endpoint);
+    let ancestor_id = tc.arena.node(ancestor).id;
+
+    // Pending: the walk pins the node whole, which is what the write reads.
+    tc.set_buffer_backup_pending(ancestor_id, true);
+    let pending_pin = tc
+        .inc_lock_ref(tc.arena.node(endpoint).id, ComponentSet::EMPTY)
+        .expect("live test node");
+    assert_eq!(tc.arena.node(ancestor).key.atom_len(), 32);
+    assert_eq!(tc.swa_protected_size(), 39);
+    tc.dec_lock_ref(
+        tc.arena.node(endpoint).id,
+        &pending_pin.to_dec_params(),
+        false,
+    )
+    .expect("live test node");
+
+    // Acked: the same walk splits again. The guard tracks the flag, not the
+    // node, so the control arm really is the pre-guard behaviour.
+    tc.set_buffer_backup_pending(ancestor_id, false);
+    tc.inc_lock_ref(tc.arena.node(endpoint).id, ComponentSet::EMPTY)
+        .expect("live test node");
+    assert_eq!(tc.arena.node(ancestor).key.atom_len(), 1);
+    assert_eq!(tc.swa_protected_size(), 8);
+}
+
+/// The pipeline clears the mark from its stale sweep too, where the node it
+/// names may already be freed: an id no slot maps to must be ignored, not
+/// panic, and must not resurrect the flag on a recycled slot.
+#[test]
+fn set_buffer_backup_pending_ignores_a_freed_id() {
+    let mut tc = swa_core(8, 1);
+    let node = tc
+        .arena
+        .alloc_child(tc.arena.root(), (1..=3).collect(), 0, None)
+        .unwrap();
+    let stale_id = tc.arena.node(node).id;
+    tc.arena.free_leaf(node).unwrap();
+
+    tc.set_buffer_backup_pending(stale_id, true);
+
+    let fresh = tc
+        .arena
+        .alloc_child(tc.arena.root(), (4..=6).collect(), 0, None)
+        .unwrap();
+    assert!(!tc.arena.node(fresh).buffer_backup_pending);
+    assert_ne!(tc.arena.node(fresh).id, stale_id, "ids are never reused");
+}

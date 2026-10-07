@@ -3856,6 +3856,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(self.arena.node(node_id).backuped())
     }
 
+    /// Mark or clear the buffer-mode backup-pending flag the SWA window lock
+    /// consults before splitting the node a lock walk would pin. Mirrors the
+    /// `buffer_backup_pending` term of Python `_maybe_split_for_window_lock`;
+    /// the set itself lives in the Python pipeline, which pushes it here. An
+    /// unknown id is ignored: a freed node already dropped the flag with its
+    /// slot, and slot reuse mints a fresh id.
+    pub fn set_buffer_backup_pending(&mut self, node_id: NodeId, pending: bool) {
+        if let Ok(idx) = self.arena.resolve(node_id) {
+            self.arena.node_mut(idx).buffer_backup_pending = pending;
+        }
+    }
+
     /// Whether the node is a (default or named) root.
     pub fn is_root(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
         let node_id = self.arena.resolve(node_id)?;

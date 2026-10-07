@@ -105,24 +105,29 @@ impl SwaComponent {
     /// Cap the part of a live, unlocked SWA node that a lock walk pins at what
     /// the trailing window still needs (device tier). Mirrors Python
     /// `_maybe_split_for_window_lock`: the node keeps its id and becomes the
-    /// in-window tail, so a lock receipt anchored on it stays valid.
+    /// in-window tail, so a lock receipt anchored on it stays valid. A node
+    /// with a buffer-mode backup pending is left whole, as in Python: that
+    /// write reads all of it, and the backup's own pin is the walk itself.
     fn maybe_split_for_window_lock_<K: ChildKeyType>(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
         uncovered: usize,
     ) {
-        let (is_root, already_locked, has_device_value, write_through_pending, node_len) = {
+        let (is_root, already_locked, has_device_value, write_pending, node_len) = {
             let node = tree_core.arena.node(node_id);
             (
                 node.is_root(),
                 node.device_lock_ref(SWA) > 0,
                 node.has_device_value(SWA),
-                node.write_through_pending_id.is_some(),
+                // A write-through backup or a buffer-mode backup reads the node
+                // as it is now, and in buffer mode the walk that would split the
+                // node is the backup's own D2H pin.
+                node.write_through_pending_id.is_some() || node.buffer_backup_pending,
                 node.key.atom_len(),
             )
         };
-        if is_root || already_locked || !has_device_value || write_through_pending {
+        if is_root || already_locked || !has_device_value || write_pending {
             return;
         }
         let page_size = tree_core.page_size;

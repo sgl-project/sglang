@@ -536,6 +536,16 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def set_buffer_backup_pending(self, node_id: NodeId, pending: bool) -> None:
+        """Mirror the buffer pipeline's pending-write set onto one node.
+
+        A core that owns its own split decision has to be told: the node must
+        stay whole while a buffer-mode write that reads it is in flight, since
+        the write's own D2H pin is a lock walk. The Python core reads the same
+        set off the cache instead, so it is a no-op there."""
+        ...
+
+    @abstractmethod
     def insert_host(
         self,
         node_id: NodeId,

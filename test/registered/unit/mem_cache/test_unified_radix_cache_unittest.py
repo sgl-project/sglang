@@ -4426,6 +4426,42 @@ class UnifiedRadixCacheSuite:
         self.assertNotIn(leaf, pipeline.inflight_backup_node_ids)
         cache.sanity_check()
 
+    def test_buffer_backup_pin_does_not_split_the_node_it_writes(self):
+        """The backup's own D2H pin is a lock walk: the node it writes must
+        keep its keys, so the SWA window split has to leave it whole."""
+        self._skip_unsupported_hicache_test()
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_buffer_hicache(cache, storage_dir)
+        seq = self._buffer_swa_seq()
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        chain = self._path_chain(cache, leaf)
+        before = [_node_key_length(cache, n) for n in chain]
+        controller = cache.cache_controller
+        with mock.patch.object(
+            controller, "write_storage", wraps=controller.write_storage
+        ) as write_storage:
+            _write_backup(cache, leaf)
+            self._pump_hicache_until(
+                cache,
+                lambda: (
+                    not cache.buffer_pipeline.inflight_backup_node_ids
+                    and not cache.buffer_pipeline.ongoing_backup
+                ),
+                "buffer backup pipeline did not drain",
+            )
+        self.assertEqual([_node_key_length(cache, n) for n in chain], before)
+        kv_writes = {
+            tuple(c.args[2]) for c in write_storage.call_args_list if c.args[2]
+        }
+        self.assertEqual(
+            kv_writes, {tuple(cache.tree_core.get_hash_values(n)) for n in chain}
+        )
+
     def test_buffer_only_read_path_roundtrip(self):
         """Read path end to end: prefetch -> staged (host bounce only,
         nothing device-side, unmatchable, stable readiness, counters fed) ->

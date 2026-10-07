@@ -586,6 +586,7 @@ class BufferModePipeline:
         pools.discard(pool)
         if not pools:
             del self.inflight_backup_pools[node_id]
+            self._cache.tree_core.set_buffer_backup_pending(node_id, False)
 
     @staticmethod
     def _queued_span_key(intent: _UnifiedBackupIntent) -> tuple[NodeId, int]:
@@ -678,6 +679,9 @@ class BufferModePipeline:
             intent = _UnifiedBackupIntent(snapshot=snapshot, pool=pool, keys=list(keys))
             self.pending_write_queue.append(intent)
             self.inflight_backup_pools.setdefault(node_id, set()).add(pool)
+            # The node must stay whole until the write's ack: its own D2H pin
+            # is a lock walk, and a split there skips the keys it writes.
+            self._cache.tree_core.set_buffer_backup_pending(node_id, True)
             self._retain_queued_span(intent)
 
     def _backup_oversize(self, kv_tokens: int, aux_xfers: list[PoolTransfer]) -> bool:

@@ -794,6 +794,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def set_host_memory_buffer_only(self) -> None:
         self._binding.set_host_memory_buffer_only()
 
+    def set_buffer_backup_pending(self, node_id: NodeId, pending: bool) -> None:
+        self._binding.set_buffer_backup_pending(node_id, pending)
+
     @property
     def is_host_memory_buffer_only(self) -> bool:
         return self._binding.is_host_memory_buffer_only()
