@@ -133,15 +133,15 @@ class WanS2VAudioEncoder(AudioEncoder):
             return_tensors="pt",
         ).input_values
 
-        result = self.model(
+        result = self.model.wav2vec2(
             input_values.to(self.device),
             output_hidden_states=True,
         )
-        feat = (
-            torch.cat(result.hidden_states)
-            if return_all_layers
-            else result.hidden_states[-1]
-        )
+        # The checkpoint uses do_stable_layer_norm: the encoder's final LayerNorm is part of the last
+        # layer's output. transformers 5.17 returns hidden_states[-1] before that norm (5.12 after it);
+        # last_hidden_state is post-norm in both, so use it as the last layer.
+        hidden_states = (*result.hidden_states[:-1], result.last_hidden_state)
+        feat = torch.cat(hidden_states) if return_all_layers else hidden_states[-1]
         feat = linear_interpolation(feat, input_fps=50, output_fps=self.video_rate)
         return feat.to(dtype)
 
