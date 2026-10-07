@@ -50,19 +50,28 @@ def _require_hardware_device(device: torch.device, algorithm: str) -> int:
     from sglang.srt.weight_sync.gpu_delta.memory import _driver
 
     driver = _driver()
-    mask, maximum = ctypes.c_int(), ctypes.c_int()
-    for attribute, result in ((136, mask), (137, maximum)):
-        status = driver.cuDeviceGetAttribute(
-            ctypes.byref(result), attribute, device.index
-        )
-        if status:
-            raise RuntimeError(f"GPU-delta DE device admission failed: CUDA {status}")
-    # CUDA's CUmemDecompressAlgorithm bits, not compute-capability inference.
-    if not mask.value & {"Snappy": 1 << 1, "LZ4": 1 << 2}[algorithm]:
+    status, mask = driver.cuDeviceGetAttribute(
+        driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK,
+        device.index,
+    )
+    if status:
+        raise RuntimeError(f"GPU-delta DE device admission failed: CUDA {status}")
+    status, maximum = driver.cuDeviceGetAttribute(
+        driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_MAXIMUM_LENGTH,
+        device.index,
+    )
+    if status:
+        raise RuntimeError(f"GPU-delta DE device admission failed: CUDA {status}")
+    algorithms = driver.CUmemDecompressAlgorithm
+    required = {
+        "Snappy": algorithms.CU_MEM_DECOMPRESS_ALGORITHM_SNAPPY,
+        "LZ4": algorithms.CU_MEM_DECOMPRESS_ALGORITHM_LZ4,
+    }[algorithm]
+    if not mask & required:
         raise RuntimeError(f"Device has no hardware {algorithm} decompressor")
-    if maximum.value <= 0:
+    if maximum <= 0:
         raise RuntimeError("Device has no positive hardware decompression limit")
-    return maximum.value
+    return maximum
 
 
 class _Alignments(ctypes.Structure):

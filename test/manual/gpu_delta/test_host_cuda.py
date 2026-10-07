@@ -5,7 +5,6 @@ The test barriers coordinate the oracle only; production preparation has no
 collectives. Both 4- and 8-worker rank pools exercise the same exact bytes.
 """
 
-import ctypes
 import hashlib
 import json
 import multiprocessing
@@ -205,17 +204,15 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
             source = None
             assert arena.allocation is not None
             del plan, plans, decoded
-            properties, granularity = memory._AllocationProperties(), ctypes.c_size_t()
             driver = arena.allocation.driver
-            memory._check(
-                driver.cuMemGetAllocationPropertiesFromHandle(
-                    ctypes.byref(properties), arena.allocation.handle.value
-                ),
+            properties = memory._check(
+                driver.cuMemGetAllocationPropertiesFromHandle(arena.allocation.handle),
                 "native allocation properties",
             )
-            memory._check(
+            granularity = memory._check(
                 driver.cuMemGetAllocationGranularity(
-                    ctypes.byref(granularity), ctypes.byref(properties), 0
+                    properties,
+                    driver.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM,
                 ),
                 "native allocation granularity",
             )
@@ -228,7 +225,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                     mapping_pointer=arena.tensor.data_ptr(),
                     metrics=metrics,
                     exact_host_de_bytes=True,
-                    allocation_granularity=granularity.value,
+                    allocation_granularity=granularity,
                 )
             )
         stream.synchronize()

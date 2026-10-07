@@ -7,7 +7,6 @@
 
 """Prepared groups of byte-affine XOR destinations; imported only at admission."""
 
-import ctypes
 import math
 import statistics
 import time
@@ -20,36 +19,22 @@ import triton.language as tl
 
 
 @cache
-def _occupancy_driver():
-    driver = ctypes.CDLL("libcuda.so.1")
-    query = driver.cuOccupancyMaxActiveBlocksPerMultiprocessor
-    query.argtypes = [
-        ctypes.POINTER(ctypes.c_int),
-        ctypes.c_void_p,
-        ctypes.c_int,
-        ctypes.c_size_t,
-    ]
-    query.restype = ctypes.c_int
-    return driver
-
-
-@cache
 def _resident_ctas(kernel, device_index):
     """One resource-residency wave, cached per loaded kernel and CUDA device."""
+    from cuda.bindings import driver
+
     with torch.cuda.device(device_index):
-        blocks = ctypes.c_int()
-        status = _occupancy_driver().cuOccupancyMaxActiveBlocksPerMultiprocessor(
-            ctypes.byref(blocks),
-            ctypes.c_void_p(kernel.function),
+        status, blocks = driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+            driver.CUfunction(int(kernel.function)),
             kernel.metadata.num_warps * 32,
             kernel.metadata.shared,
         )
-        if status or blocks.value <= 0:
+        if status != driver.CUresult.CUDA_SUCCESS or blocks <= 0:
             raise RuntimeError(
-                f"CUDA occupancy query failed: status={status}, blocks={blocks.value}"
+                f"CUDA occupancy query failed: status={status}, blocks={blocks}"
             )
         return (
-            blocks.value
+            blocks
             * torch.cuda.get_device_properties(device_index).multi_processor_count
         )
 

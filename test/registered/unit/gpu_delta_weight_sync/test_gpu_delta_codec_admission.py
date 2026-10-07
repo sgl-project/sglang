@@ -85,16 +85,25 @@ def test_codec_abi_and_frozen_hardware_options(
     calls, admissions, device_queries = [], [], []
     attributes = {136: {"Snappy": 2, "LZ4": 4}[algorithm], 137: 4 << 20}
 
-    def device_attribute(result, attribute, device):
+    def device_attribute(attribute, device):
         device_queries.append((attribute, device))
-        ctypes.cast(result, ctypes.POINTER(ctypes.c_int))[0] = attributes[attribute]
-        return 0
+        return 0, attributes[attribute]
 
     monkeypatch.setitem(
         sys.modules,
         "sglang.srt.weight_sync.gpu_delta.memory",
         SimpleNamespace(
-            _driver=lambda: SimpleNamespace(cuDeviceGetAttribute=device_attribute)
+            _driver=lambda: SimpleNamespace(
+                CUdevice_attribute=SimpleNamespace(
+                    CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK=136,
+                    CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_MAXIMUM_LENGTH=137,
+                ),
+                CUmemDecompressAlgorithm=SimpleNamespace(
+                    CU_MEM_DECOMPRESS_ALGORITHM_SNAPPY=2,
+                    CU_MEM_DECOMPRESS_ALGORITHM_LZ4=4,
+                ),
+                cuDeviceGetAttribute=device_attribute,
+            )
         ),
     )
 
