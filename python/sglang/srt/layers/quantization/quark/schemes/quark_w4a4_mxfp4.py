@@ -816,3 +816,25 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             return y.view(*output_shape)
         else:
             return y
+
+    def apply_into(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        output: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run MXFP4 linear directly into caller-owned contiguous storage."""
+        if (
+            bias is not None
+            or getattr(layer, "dequantized_bf16", False)
+            or x.ndim != 2
+            or not output.is_contiguous()
+            or output.shape != (x.shape[0], layer.weight.shape[0])
+            or output.dtype != self.out_dtype
+        ):
+            output.copy_(self.apply_weights(layer, x, bias))
+            return output
+        # The existing three-tuple contract selects fused dynamic activation
+        # quantization + GEMM and writes the result directly into `output`.
+        return self.apply_weights(layer, (x, None, output), bias)
