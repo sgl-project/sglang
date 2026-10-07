@@ -55,6 +55,84 @@
 #include "dspark_markov_walk_common.cuh"
 #include <cstdint>
 
+#define DSPARK_MW_WG_D32                                                    \
+  "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, " \
+  "%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}"
+#define DSPARK_MW_WG_D32_OUT(d)                                                                               \
+  "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3]), "+r"(d[4]), "+r"(d[5]), "+r"(d[6]), "+r"(d[7]), "+r"(d[8]), \
+      "+r"(d[9]), "+r"(d[10]), "+r"(d[11]), "+r"(d[12]), "+r"(d[13]), "+r"(d[14]), "+r"(d[15]), "+r"(d[16]),  \
+      "+r"(d[17]), "+r"(d[18]), "+r"(d[19]), "+r"(d[20]), "+r"(d[21]), "+r"(d[22]), "+r"(d[23]), "+r"(d[24]), \
+      "+r"(d[25]), "+r"(d[26]), "+r"(d[27]), "+r"(d[28]), "+r"(d[29]), "+r"(d[30]), "+r"(d[31])
+
+// PTX only this kernel uses (wgmma, cache-hinted 16-B accesses, the ring hand-off), in the common header's
+// `sglang::device::ptx`
+namespace sglang::device::ptx {
+
+SGL_DEVICE void wg_fence() {
+  asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
+}
+SGL_DEVICE void wg_commit() {
+  asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
+}
+SGL_DEVICE void wg_wait0() {
+  asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
+}
+// d (+)= A B, m64n64k32 s8 -> s32, A from registers; scale_d = acc ? accumulate : overwrite
+SGL_DEVICE void wgmma_rs(int (&d)[32], const uint4& a, unsigned desc_lo, unsigned desc_hi, int acc) {
+  asm volatile(
+      "{\n.reg .pred p;\n.reg .b64 bd;\nsetp.ne.b32 p, %37, 0;\nmov.b64 bd, {%36, %38};\n"
+      "wgmma.mma_async.sync.aligned.m64n64k32.s32.s8.s8 " DSPARK_MW_WG_D32 ", {%32, %33, %34, %35}, bd, p;\n}"
+      : DSPARK_MW_WG_D32_OUT(d)
+      : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(desc_lo), "r"(acc), "r"(desc_hi));
+}
+// no instruction: every later read of d stays below the wgmma wait (the compiler does not know d is written async)
+SGL_DEVICE void wg_fence_operand(int (&d)[32]) {
+  asm volatile("" : DSPARK_MW_WG_D32_OUT(d)::"memory");
+}
+SGL_DEVICE uint4 ldg_nc(const void* p) {  // read-only path (u rows: shared by many CTAs, L1 merges)
+  uint4 v;
+  asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+  return v;
+}
+SGL_DEVICE uint4 ldg_ef(const void* p, unsigned long long pol) {  // streamed once (base): L2 evict_first
+  uint4 v;
+  asm volatile("ld.global.L2::cache_hint.v4.u32 {%0, %1, %2, %3}, [%4], %5;"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(p), "l"(pol));
+  return v;
+}
+SGL_DEVICE void stg_ef(void* p, uint4 v, unsigned long long pol) {
+  asm volatile("st.global.L2::cache_hint.v4.u32 [%0], {%1, %2, %3, %4}, %5;" ::"l"(p),
+               "r"(v.x),
+               "r"(v.y),
+               "r"(v.z),
+               "r"(v.w),
+               "l"(pol)
+               : "memory");
+}
+SGL_DEVICE unsigned long long evict_last_policy() {
+  unsigned long long pol;
+  asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
+  return pol;
+}
+// ring hand-off (see the protocol above); the writer sides are RMWs, which racecheck does not report against the polls
+SGL_DEVICE int ld_acquire_s32(const int* p) {
+  int v;
+  asm volatile("ld.acquire.cta.shared::cta.s32 %0, [%1];" : "=r"(v) : "r"(to_shared(p)) : "memory");
+  return v;
+}
+SGL_DEVICE void exch_release_s32(int* p, int v) {
+  asm volatile("{ .reg .b32 o; atom.release.cta.shared::cta.exch.b32 o, [%0], %1; }" ::"r"(to_shared(p)), "r"(v)
+               : "memory");
+}
+SGL_DEVICE int add_acq_rel_s32(int* p, int v) {
+  int old;
+  asm volatile("atom.acq_rel.cta.shared::cta.add.u32 %0, [%1], %2;" : "=r"(old) : "r"(to_shared(p)), "r"(v) : "memory");
+  return old;
+}
+
+}  // namespace sglang::device::ptx
+
 namespace sglang::dspark_markov_walk::wgmma {
 
 constexpr int kMaxB = 64;
@@ -66,77 +144,11 @@ constexpr int kW1fBytes = 528;              // 512 B fragment-ordered q_hi | q_l
 constexpr int kPairU64 = 16;                // one {key, count} pair per 128-B line
 constexpr int kStepU64 = kMaxB * kPairU64;  // one step's pairs in a set
 
-SGL_DEVICE void wg_fence() {
-  asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
-}
-SGL_DEVICE void wg_commit() {
-  asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
-}
-SGL_DEVICE void wg_wait0() {
-  asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
-}
 // K-major, no swizzle, LBO 128, SBO 256: the high word is the constant SBO field, the low word start address | LBO.
 // Offsets inside the 228 KiB window never carry out of the 14-bit address field, so they are 32-bit adds.
 constexpr unsigned kDescHi = 256 >> 4;
 SGL_DEVICE unsigned wg_desc_lo(unsigned addr) {
   return ((addr & 0x3FFFF) >> 4) | ((128 >> 4) << 16);
-}
-#define DSPARK_MW_WG_D32                                                    \
-  "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, " \
-  "%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}"
-#define DSPARK_MW_WG_D32_OUT(d)                                                                               \
-  "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3]), "+r"(d[4]), "+r"(d[5]), "+r"(d[6]), "+r"(d[7]), "+r"(d[8]), \
-      "+r"(d[9]), "+r"(d[10]), "+r"(d[11]), "+r"(d[12]), "+r"(d[13]), "+r"(d[14]), "+r"(d[15]), "+r"(d[16]),  \
-      "+r"(d[17]), "+r"(d[18]), "+r"(d[19]), "+r"(d[20]), "+r"(d[21]), "+r"(d[22]), "+r"(d[23]), "+r"(d[24]), \
-      "+r"(d[25]), "+r"(d[26]), "+r"(d[27]), "+r"(d[28]), "+r"(d[29]), "+r"(d[30]), "+r"(d[31])
-// d (+)= A B, m64n64k32 s8 -> s32, A from registers; scale_d = acc ? accumulate : overwrite
-SGL_DEVICE void wgmma_rs(int (&d)[32], const uint4& a, unsigned blo, int acc) {
-  asm volatile(
-      "{\n.reg .pred p;\n.reg .b64 bd;\nsetp.ne.b32 p, %37, 0;\nmov.b64 bd, {%36, %38};\n"
-      "wgmma.mma_async.sync.aligned.m64n64k32.s32.s8.s8 " DSPARK_MW_WG_D32 ", {%32, %33, %34, %35}, bd, p;\n}"
-      : DSPARK_MW_WG_D32_OUT(d)
-      : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(blo), "r"(acc), "r"(kDescHi));
-}
-SGL_DEVICE uint4 ldg_nc(const void* p) {  // read-only path (u rows: shared by many CTAs, L1 merges)
-  uint4 v;
-  asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
-  return v;
-}
-SGL_DEVICE uint4 ldg_ef(const void* p, u64 pol) {  // streamed once (base): L2 evict_first
-  uint4 v;
-  asm volatile("ld.global.L2::cache_hint.v4.u32 {%0, %1, %2, %3}, [%4], %5;"
-               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-               : "l"(p), "l"(pol));
-  return v;
-}
-SGL_DEVICE void stg_ef(void* p, uint4 v, u64 pol) {
-  asm volatile("st.global.L2::cache_hint.v4.u32 [%0], {%1, %2, %3, %4}, %5;" ::"l"(p),
-               "r"(v.x),
-               "r"(v.y),
-               "r"(v.z),
-               "r"(v.w),
-               "l"(pol)
-               : "memory");
-}
-SGL_DEVICE u64 evict_last_policy() {
-  u64 pol;
-  asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
-  return pol;
-}
-// ring hand-off (see the protocol above); the writer sides are RMWs, which racecheck does not report against the polls
-SGL_DEVICE int ld_acquire_s32(const int* p) {
-  int v;
-  asm volatile("ld.acquire.cta.shared::cta.s32 %0, [%1];" : "=r"(v) : "r"(smem_u32(p)) : "memory");
-  return v;
-}
-SGL_DEVICE void exch_release_s32(int* p, int v) {
-  asm volatile("{ .reg .b32 o; atom.release.cta.shared::cta.exch.b32 o, [%0], %1; }" ::"r"(smem_u32(p)), "r"(v)
-               : "memory");
-}
-SGL_DEVICE int add_acq_rel_s32(int* p, int v) {
-  int old;
-  asm volatile("atom.acq_rel.cta.shared::cta.add.u32 %0, [%1], %2;" : "=r"(old) : "r"(smem_u32(p)), "r"(v) : "memory");
-  return old;
 }
 
 // W2 placement: kRes of the kTiles tiles SMEM-resident, the others (kStreamMask) streamed through a kRing-slot TMA ring
@@ -177,14 +189,14 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
   const int wg = warp >> 2, wq = warp & 3, g = lane >> 2, tig = lane & 3;
   const int row_base = blockIdx.x * kRowsCta;
 
-  const u64 round = ld_relaxed(state);
+  const u64 round = ptx::ld_relaxed(state);
   const int set = static_cast<int>(round & 1);
   const int set_u64 = state_steps * kStepU64;
   u64* pairs = state + 16 + set * set_u64;
   auto pair = [&](int k, int b) { return pairs + kPairU64 * (k * kMaxB + b); };
   if (blockIdx.x == 0)
     for (int i = threadIdx.x; i < state_steps * kMaxB * 2; i += kThr)
-      st_relaxed(state + 16 + (set ^ 1) * set_u64 + (i >> 1) * kPairU64 + (i & 1), 0);
+      ptx::st_relaxed(state + 16 + (set ^ 1) * set_u64 + (i >> 1) * kPairU64 + (i & 1), 0);
   const uint2 seed2 = make_uint2(static_cast<unsigned>(seed), static_cast<unsigned>(seed >> 32));
 
   // ---- work split
@@ -204,15 +216,15 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
   auto str_idx = [&](int t) { return __popc(kStreamMask & ((1u << t) - 1u)); };  // t < kTiles <= 32: shift < 32
 
   // ---- once per round: resident tiles + row scales by TMA, ring prefill
-  const u64 pol_last = evict_last_policy(), pol_first = evict_first_policy();
-  auto res_mbar = [&](int i) { return smem_u32(&mbar_res[i]); };
+  const u64 pol_last = ptx::evict_last_policy(), pol_first = ptx::evict_first_policy();
+  auto res_mbar = [&](int i) { return ptx::to_shared(&mbar_res[i]); };
   auto issue_fill = [&](int q) {  // thread-local: tag, arm, copy (q < nq)
     const int slot = q % kRing;
-    exch_release_s32(&slot_q[slot], q);
-    const unsigned mb = smem_u32(&mbar_full[slot]);
-    mbar_expect_tx(mb, kTileBytes);
-    bulk_g2s_hint(
-        smem_u32(ring_s + slot * kTileBytes),
+    ptx::exch_release_s32(&slot_q[slot], q);
+    const unsigned mb = ptx::to_shared(&mbar_full[slot]);
+    ptx::mbar_expect_tx(mb, kTileBytes);
+    ptx::bulk_g2s_hint(
+        ptx::to_shared(ring_s + slot * kTileBytes),
         w2_str + (static_cast<size_t>(blockIdx.x) * kStr + q % kStr) * kTileBytes,
         kTileBytes,
         mb,
@@ -220,21 +232,21 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
   };
   if (threadIdx.x == 0) {
     for (int i = 0; i <= kRes; ++i)
-      mbar_init(res_mbar(i), 1);
+      ptx::mbar_init(res_mbar(i), 1);
     for (int s = 0; s < kRing; ++s) {
-      mbar_init(smem_u32(&mbar_full[s]), 1);
+      ptx::mbar_init(ptx::to_shared(&mbar_full[s]), 1);
       slot_cnt[s] = 0;
     }
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    ptx::fence_mbarrier_init();
     // scales first (every epilogue needs them), then the ring prefill, then the resident tiles in first-use order
-    mbar_expect_tx(res_mbar(kRes), kRowsCta * 4);
-    bulk_g2s_hint(smem_u32(scale_s), row_scale + row_base, kRowsCta * 4, res_mbar(kRes), pol_first);
+    ptx::mbar_expect_tx(res_mbar(kRes), kRowsCta * 4);
+    ptx::bulk_g2s_hint(ptx::to_shared(scale_s), row_scale + row_base, kRowsCta * 4, res_mbar(kRes), pol_first);
     for (int q = 0; q < kRing && q < nq; ++q)
       issue_fill(q);
     for (int i = 0; i < kRes; ++i) {
-      mbar_expect_tx(res_mbar(i), kTileBytes);
-      bulk_g2s_hint(
-          smem_u32(res_s + i * kTileBytes),
+      ptx::mbar_expect_tx(res_mbar(i), kTileBytes);
+      ptx::bulk_g2s_hint(
+          ptx::to_shared(res_s + i * kTileBytes),
           w2_res + (static_cast<size_t>(blockIdx.x) * kRes + i) * kTileBytes,
           kTileBytes,
           res_mbar(i),
@@ -246,11 +258,11 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
     inv_t_s[i] = inv_temperature(temps[i]);
   }
   __syncthreads();  // barriers initialized (no thread touches one before this); loads still in flight
-  mbar_wait_cta(res_mbar(kRes), 0);
+  ptx::mbar_wait_cta(res_mbar(kRes), 0);
 
   const float inv_t = live ? inv_t_s[b] : 0.f;
   const float t2 = inv_t * 1.4426950408889634f;
-  const unsigned res_desc0 = wg_desc_lo(smem_u32(res_s)), ring_desc0 = wg_desc_lo(smem_u32(ring_s));
+  const unsigned res_desc0 = wg_desc_lo(ptx::to_shared(res_s)), ring_desc0 = wg_desc_lo(ptx::to_shared(ring_s));
   uint4 nb0 = make_uint4(0, 0, 0, 0), nb1 = make_uint4(0, 0, 0, 0);  // base of this thread's next tile (bf16 x 8 x 2)
 
   for (int k = 0; k < num_steps; ++k) {
@@ -261,7 +273,7 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
       const unsigned char* src = w1f + static_cast<size_t>(tok_s[b]) * kW1fBytes;
 #pragma unroll
       for (int j = 0; j < 8; ++j)
-        a[j] = ldg_nc(src + j * 64 + tig * 16);
+        a[j] = ptx::ldg_nc(src + j * 64 + tig * 16);
       s_lo = __ldg(reinterpret_cast<const float*>(src + 516));
     } else {
 #pragma unroll
@@ -270,8 +282,8 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
     }
     const int ob = (b * kb + k) * ld + row_base + 8 * tig;  // element offset of (b, k, run 0 of tile 0)
     if (k == 0) {  // the first tile's base (later steps load it before the previous step's exchange)
-      if (phase < lim0) nb0 = ldg_ef(base + ob + phase * kTileRows, pol_first);
-      if (phase < lim1) nb1 = ldg_ef(base + ob + phase * kTileRows + 32, pol_first);
+      if (phase < lim0) nb0 = ptx::ldg_ef(base + ob + phase * kTileRows, pol_first);
+      if (phase < lim1) nb1 = ptx::ldg_ef(base + ob + phase * kTileRows + 32, pol_first);
     }
     float cur_v = -INFINITY;
     int cur_r = -1;
@@ -285,32 +297,32 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
       if (streamed) {
         q = k * kStr + str_idx(t);
         const int slot = q % kRing;
-        while (ld_acquire_s32(&slot_q[slot]) != q) {
+        while (ptx::ld_acquire_s32(&slot_q[slot]) != q) {
         }
-        mbar_wait_cta(smem_u32(&mbar_full[slot]), static_cast<unsigned>((q / kRing) & 1));
+        ptx::mbar_wait_cta(ptx::to_shared(&mbar_full[slot]), static_cast<unsigned>((q / kRing) & 1));
         bd = ring_desc0 + slot * (kTileBytes >> 4);
       } else {
         const int ri = t - str_idx(t);
-        if (k == 0) mbar_wait_cta(res_mbar(ri), 0);  // first use of a resident tile: its own TMA (overlaps step 0)
+        if (k == 0) ptx::mbar_wait_cta(res_mbar(ri), 0);  // first use of a resident tile: its own TMA (overlaps step 0)
         bd = res_desc0 + ri * (kTileBytes >> 4);
       }
       int d[32];
-      wg_fence();
+      ptx::wg_fence();
 #pragma unroll
       for (int j = 0; j < 8; ++j)
-        wgmma_rs(d, a[j], bd + j * (kChunkBytes >> 4), j);
-      wg_commit();
+        ptx::wgmma_rs(d, a[j], bd + j * (kChunkBytes >> 4), kDescHi, j);
+      ptx::wg_commit();
       // this tile's base was loaded one tile ago; the next tile's goes out under this MMA.  Runs past valid_rows (and
       // dead requests) load nothing: their registers keep a stale tile, masked below.
       const int o = ob + t * kTileRows;
       const uint4 bb0 = nb0, bb1 = nb1;
-      if (t + wpb < lim0) nb0 = ldg_ef(base + o + wpb * kTileRows, pol_first);
-      if (t + wpb < lim1) nb1 = ldg_ef(base + o + wpb * kTileRows + 32, pol_first);
-      wg_wait0();
-      asm volatile("" : DSPARK_MW_WG_D32_OUT(d)::"memory");  // keep every read of d below the wait (d is written async)
-      if (streamed && lane == 0) {                           // this warp is done reading the slot
+      if (t + wpb < lim0) nb0 = ptx::ldg_ef(base + o + wpb * kTileRows, pol_first);
+      if (t + wpb < lim1) nb1 = ptx::ldg_ef(base + o + wpb * kTileRows + 32, pol_first);
+      ptx::wg_wait0();
+      ptx::wg_fence_operand(d);     // keep every read of d below the wait (d is written async)
+      if (streamed && lane == 0) {  // this warp is done reading the slot
         const int slot = q % kRing;
-        const int done = add_acq_rel_s32(&slot_cnt[slot], 1) + 1;
+        const int done = ptx::add_acq_rel_s32(&slot_cnt[slot], 1) + 1;
         if (done == (q / kRing + 1) * consumers && q + kRing < nq) issue_fill(q + kRing);
       }
       if (!live) continue;
@@ -354,8 +366,8 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
       if (inv_t > 0.f) {
         // corrected (sampling requests only: the verifier's q), valid runs only
         if (corrected != nullptr) {
-          if (t < lim0) stg_ef(corrected + o, make_uint4(pk[0], pk[1], pk[2], pk[3]), pol_first);
-          if (t < lim1) stg_ef(corrected + o + 32, make_uint4(pk[4], pk[5], pk[6], pk[7]), pol_first);
+          if (t < lim0) ptx::stg_ef(corrected + o, make_uint4(pk[0], pk[1], pk[2], pk[3]), pol_first);
+          if (t < lim1) ptx::stg_ef(corrected + o + 32, make_uint4(pk[4], pk[5], pk[6], pk[7]), pol_first);
         }
 #pragma unroll
         for (int p2 = 0; p2 < 8; ++p2) {
@@ -376,12 +388,12 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
         for (int run = 0; run < 2; ++run) {
           const float* l8 = lg + 8 * run;
           const float m =
-              __uint_as_float(bf16x8_max(pk[4 * run], pk[4 * run + 1], pk[4 * run + 2], pk[4 * run + 3]) << 16);
+              __uint_as_float(ptx::bf16x8_max(pk[4 * run], pk[4 * run + 1], pk[4 * run + 2], pk[4 * run + 3]) << 16);
           const float mz = m * t2;
           float cs[8], c = 0.f;
 #pragma unroll
           for (int qq = 0; qq < 8; ++qq) {
-            c += ex2_ftz(fmaf(l8[qq], t2, -mz));
+            c += ptx::ex2_ftz(fmaf(l8[qq], t2, -mz));
             cs[qq] = c;
           }
           const unsigned xu = run == 0 ? xr.x : xr.z, xg = run == 0 ? xr.y : xr.w;
@@ -392,7 +404,7 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
           for (int qq = 6; qq >= 0; --qq)
             qi = tt < cs[qq] ? qq : qi;
           const float g2 = gumbel2_fast(xg);
-          const float key_v = mz + lg2_ftz(c) + g2;
+          const float key_v = mz + ptx::lg2_ftz(c) + g2;
           if (key_v > cur_v) {
             cur_v = key_v;
             cur_r = r + 32 * run + qi;
@@ -402,8 +414,8 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
 #pragma unroll
         for (int run = 0; run < 2; ++run) {
           const unsigned* p8 = pk + 4 * run;
-          const unsigned m2 = bf16x8_max(p8[0], p8[1], p8[2], p8[3]);
-          const int qi = bf16x8_first_eq(p8[0], p8[1], p8[2], p8[3], m2);  // ties -> smallest row
+          const unsigned m2 = ptx::bf16x8_max(p8[0], p8[1], p8[2], p8[3]);
+          const int qi = ptx::bf16x8_first_eq(p8[0], p8[1], p8[2], p8[3], m2);  // ties -> smallest row
           const float m = __uint_as_float(m2 << 16);
           if (m > cur_v) {
             cur_v = m;
@@ -423,8 +435,8 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
     // under the exchange
     if (k + 1 < num_steps) {
       const int o1 = ob + ld + phase * kTileRows;
-      if (phase < lim0) nb0 = ldg_ef(base + o1, pol_first);
-      if (phase < lim1) nb1 = ldg_ef(base + o1 + 32, pol_first);
+      if (phase < lim0) nb0 = ptx::ldg_ef(base + o1, pol_first);
+      if (phase < lim1) nb1 = ptx::ldg_ef(base + o1 + 32, pol_first);
     }
     __syncthreads();
     if (warp == 0) {
@@ -437,15 +449,15 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
           for (int p = 0; p < wpb; ++p)
             bst = max(bst, wbest_s[bq][p]);
           atomicMax(pair(k, bq), bst);
-          red_add_release(pair(k, bq) + 1, 1);
+          ptx::red_add_release(pair(k, bq) + 1, 1);
         }
       }
       // both of a lane's requests polled in the same round trip; a request the lane does not hold starts "arrived"
       const u64 n = gridDim.x;
       ulonglong2 v0 = make_ulonglong2(0, lane < nb ? 0 : n), v1 = make_ulonglong2(0, lane + 32 < nb ? 0 : n);
       do {
-        if (v0.y < n) v0 = ld_relaxed_v2(pair(k, lane));
-        if (v1.y < n) v1 = ld_relaxed_v2(pair(k, lane + 32));
+        if (v0.y < n) v0 = ptx::ld_relaxed_v2(pair(k, lane));
+        if (v1.y < n) v1 = ptx::ld_relaxed_v2(pair(k, lane + 32));
       } while (v0.y < n || v1.y < n);
       key[0] = v0.x;
       key[1] = v1.x;
@@ -464,14 +476,14 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
             const unsigned char* src = w1f + static_cast<size_t>(tok) * kW1fBytes;  // row spans 5 128-B lines
 #pragma unroll
             for (int l = 0; l < 5; ++l)
-              asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(src + 128 * l));
+              ptx::prefetch_l2_evict_last(src + 128 * l);
           }
         }
       }
     }
     __syncthreads();
   }
-  if (blockIdx.x == 0 && threadIdx.x == 0) st_relaxed(state, round + 1);
+  if (blockIdx.x == 0 && threadIdx.x == 0) ptx::st_relaxed(state, round + 1);
 }
 
 /**

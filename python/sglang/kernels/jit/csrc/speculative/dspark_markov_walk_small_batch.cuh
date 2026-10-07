@@ -100,14 +100,14 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
   const int row_base = tile0 * 16;
   const uint4* g_frag = frag + static_cast<size_t>(tile0) * kTileVecs;
 
-  const u64 round = ld_relaxed(state);
+  const u64 round = ptx::ld_relaxed(state);
   const int set = static_cast<int>(round & 1);
   const int set_u64 = state_steps * kStepU64;
   u64* pairs = state + 16 + set * set_u64;  // pair (k, b) at pairs + kPairU64 * (k * kMaxB + b)
   auto pair = [&](int k, int b) { return pairs + kPairU64 * (k * kMaxB + b); };
   if (blockIdx.x == 0)  // clear the set round r+1 uses (it may differ in B, and in K <= state_steps)
     for (int i = threadIdx.x; i < state_steps * kMaxB * 2; i += kThreads)
-      st_relaxed(state + 16 + (set ^ 1) * set_u64 + (i >> 1) * kPairU64 + (i & 1), 0);
+      ptx::st_relaxed(state + 16 + (set ^ 1) * set_u64 + (i >> 1) * kPairU64 + (i & 1), 0);
   const uint2 seed2 = make_uint2(static_cast<unsigned>(seed), static_cast<unsigned>(seed >> 32));
   const int npass = (nb + kGrp - 1) / kGrp;
   const int n_items = num_steps * npass;  // (step, pass) in walk order
@@ -121,32 +121,32 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
     __nv_bfloat16* dst = base_s + (it & 1) * kGrp * rows_cta;
     for (int i = threadIdx.x; i < nr * kChunks; i += kThreads) {
       const int rr = i / kChunks, c = i % kChunks;
-      cp_async16(
+      ptx::cp_async16(
           dst + rr * rows_cta + c * 8,
           base + (static_cast<size_t>(r0 + rr) * kb + k) * ld + min(row_base + c * 8, last8));
     }
-    cp_async_commit();
+    ptx::cp_async_commit();
   };
 
   // ---- once per round: base of item 0, W2 slice (+ row scales) on-chip
   prefetch_base(0);
-  const u64 pol = evict_first_policy();
-  const unsigned a_mbar = smem_u32(&mbar_load);
+  const u64 pol = ptx::evict_first_policy();
+  const unsigned a_mbar = ptx::to_shared(&mbar_load);
   if (threadIdx.x == 0) {
-    mbar_init(a_mbar, 1);
+    ptx::mbar_init(a_mbar, 1);
     for (int ps = 0; ps < npass; ++ps)
-      mbar_init(smem_u32(&mbar_u[ps]), kThreads);  // every thread arrives
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+      ptx::mbar_init(ptx::to_shared(&mbar_u[ps]), kThreads);  // every thread arrives
+    ptx::fence_mbarrier_init();
     constexpr unsigned kW2Bytes = tiles_smem * kTileVecs * 16, kScaleBytes = tiles_per_cta * 64, kChunk = 16384;
-    mbar_expect_tx(a_mbar, kW2Bytes + kScaleBytes);
+    ptx::mbar_expect_tx(a_mbar, kW2Bytes + kScaleBytes);
     for (unsigned off = 0; off < kW2Bytes; off += kChunk)
-      bulk_g2s_hint(
-          smem_u32(reinterpret_cast<unsigned char*>(w_s) + off),
+      ptx::bulk_g2s_hint(
+          ptx::to_shared(reinterpret_cast<unsigned char*>(w_s) + off),
           reinterpret_cast<const unsigned char*>(g_frag) + off,
           off + kChunk <= kW2Bytes ? kChunk : kW2Bytes - off,
           a_mbar,
           pol);
-    bulk_g2s_hint(smem_u32(scale_s), row_scale + row_base, kScaleBytes, a_mbar, pol);
+    ptx::bulk_g2s_hint(ptx::to_shared(scale_s), row_scale + row_base, kScaleBytes, a_mbar, pol);
   }
   for (int b = threadIdx.x; b < nb; b += kThreads) {
     tok_s[b] = clamp_row(anchor[b], valid_rows);
@@ -160,11 +160,11 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
     const int t = tiles_smem + warp * NG + gi;
 #pragma unroll
     for (int j = 0; j < 8; ++j)
-      a_reg[gi][j] = ldcg_hint(g_frag + (t * 8 + j) * 32 + lane, pol);
+      a_reg[gi][j] = ptx::ldcg_hint(g_frag + (t * 8 + j) * 32 + lane, pol);
   }
   // only thread 0 (which initialized it) waits on the load barrier: another thread could reach a try_wait before the
   // init (nothing orders them); the barrier below then publishes the landed tiles to everyone
-  if (threadIdx.x == 0) mbar_wait_cta(a_mbar, 0);
+  if (threadIdx.x == 0) ptx::mbar_wait_cta(a_mbar, 0);
   __syncthreads();
 
   // GEMV over this warp's NG + TS tiles; ub = this lane's B column source (a W1q row: q_hi | q_lo words),
@@ -183,10 +183,10 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
       const uint32_t b1 = ub[(g & 1) * 64 + j * 8 + 4 + tig];
 #pragma unroll
       for (int gi = 0; gi < NG; ++gi)
-        mma_s8(acc[gi], a_reg[gi][j], b0, b1);
+        ptx::mma_s8(acc[gi], a_reg[gi][j], b0, b1);
 #pragma unroll
       for (int ts = 0; ts < TS; ++ts)
-        mma_s8(acc[NG + ts], as[ts], b0, b1);
+        ptx::mma_s8(acc[NG + ts], as[ts], b0, b1);
     }
   };
 
@@ -195,15 +195,15 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
   auto fetch_u = [&](int ps) {
     constexpr int kRowVecs = kURowBytes / 16;
     const int r0 = ps * kGrp, nr = min(kGrp, nb - r0);
-    unsigned tq;  // %tid.x re-read here: no threadIdx-derived index kept live across the step (255 registers, 0 spill)
-    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(tq));
+    // %tid.x re-read here: no threadIdx-derived index kept live across the step (255 registers, 0 spill)
+    const unsigned tq = ptx::tid_x();
     if (tq < nr * kRowVecs) {
       const int b = r0 + tq / kRowVecs, v = tq % kRowVecs;
-      cp_async16(
+      ptx::cp_async16(
           reinterpret_cast<uint4*>(u_s) + b * kRowVecs + v,
           reinterpret_cast<const uint4*>(w1q) + static_cast<size_t>(tok_s[b]) * kRowVecs + v);
     }
-    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(smem_u32(&mbar_u[ps])) : "memory");
+    ptx::cp_async_mbar_arrive_noinc(ptx::to_shared(&mbar_u[ps]));
   };
   constexpr int kXchgWarp = kWarps - 1;
   const u64 n = gridDim.x;
@@ -215,7 +215,7 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
     for (int ps = 0; ps < npass; ++ps) {
       const int it = k * npass + ps, r0 = ps * kGrp, nr = min(kGrp, nb - r0);
       if (ps + 1 < npass) fetch_u(ps + 1);
-      mbar_wait_cta(smem_u32(&mbar_u[ps]), k & 1);
+      ptx::mbar_wait_cta(ptx::to_shared(&mbar_u[ps]), k & 1);
       {
         const int rq = r0 + (g >> 1);
         int acc[NG + TS][4];
@@ -233,8 +233,8 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
         }
       }
       tick(2);
-      cp_async_wait<0>();  // this item's base (the only group in flight)
-      __syncthreads();     // bias + base of item it visible; every thread is past item it-1's epilogue
+      ptx::cp_async_wait<0>();  // this item's base (the only group in flight)
+      __syncthreads();          // bias + base of item it visible; every thread is past item it-1's epilogue
       tick(3);
       if (it + 1 < n_items) prefetch_base(it + 1);  // into the buffer item it-1 used
       // epilogue: wpr = kWarps / (nr rounded up to a power of 2) whole warps per request (8 for a lone request:
@@ -315,8 +315,8 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
             for (int i = 6; i >= 0; --i)
               idx = lg[i] == m ? i : idx;  // ties -> smallest row, as torch.argmax
           } else {
-            const unsigned m2 = bf16x8_max(o.x, o.y, o.z, o.w);
-            idx = bf16x8_first_eq(o.x, o.y, o.z, o.w, m2);
+            const unsigned m2 = ptx::bf16x8_max(o.x, o.y, o.z, o.w);
+            idx = ptx::bf16x8_first_eq(o.x, o.y, o.z, o.w, m2);
             m = __uint_as_float(m2 << 16);
           }
           if (r < valid_rows) best = max(best, pack_key(m, r + idx));
@@ -342,19 +342,19 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
         const char* row = reinterpret_cast<const char*>(w1q + static_cast<size_t>(key_row(best)) * kURowWords);
 #pragma unroll
         for (int line = 0; line < 5; ++line)
-          asm volatile("prefetch.global.L2 [%0];" ::"l"(row + line * 128));
+          ptx::prefetch_l2(row + line * 128);
         atomicMax(pair(k, b), best);
       }
       u64 key[kMaxB / 32] = {};  // the winner key of requests lane + 32 q (zero-initialized: kept in registers)
       for (int b = lane; b < nb; b += 32)
-        red_add_release(pair(k, b) + 1, 1);
+        ptx::red_add_release(pair(k, b) + 1, 1);
 #pragma unroll
       for (int q = 0; q < kMaxB / 32; ++q) {
         const int b = lane + 32 * q;
         if (b < nb) {
           ulonglong2 v;
           do {
-            v = ld_relaxed_v2(pair(k, b));
+            v = ptx::ld_relaxed_v2(pair(k, b));
           } while (v.y < n);
           key[q] = v.x;
         }
@@ -373,7 +373,7 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
     tick(6);
   }
   // every CTA has seen every final count (no CTA still reads this round's state): CTA 0 closes the round
-  if (blockIdx.x == 0 && threadIdx.x == 0) st_relaxed(state, round + 1);
+  if (blockIdx.x == 0 && threadIdx.x == 0) ptx::st_relaxed(state, round + 1);
 }
 
 /**

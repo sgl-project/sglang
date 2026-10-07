@@ -112,13 +112,13 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_single_kernel(
   // load of the kernel, so its latency hides under the W2 load below
   const float temperature = temps[0];
 
-  const u64 round = ld_relaxed(state);
+  const u64 round = ptx::ld_relaxed(state);
   const int set = static_cast<int>(round & 1);
   // {key, arrivals} pairs, 16-B aligned (state + 2), one pair per step; set r&1, CTA 0 clears the other set
   u64* pairs = state + 2 + set * 2 * state_steps;
   if (blockIdx.x == 0)
     for (int i = threadIdx.x; i < 2 * state_steps; i += kThreads)
-      st_relaxed(state + 2 + (set ^ 1) * 2 * state_steps + i, 0);
+      ptx::st_relaxed(state + 2 + (set ^ 1) * 2 * state_steps + i, 0);
   const float inv_t = inv_temperature(temperature);
   const bool sampling = inv_t > 0.f;
   // corrected logits only feed the verifier's q = softmax(corrected / T): sampling rounds only
@@ -132,27 +132,27 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_single_kernel(
     const __nv_bfloat16* src = base + static_cast<size_t>(k) * ld;
     __nv_bfloat16* dst = base_s + (k & 1) * rows_cta;
     for (int i = threadIdx.x; i < rows_cta / 8; i += kThreads)
-      cp_async16(dst + i * 8, src + min(row_base + i * 8, vec_last));
-    cp_async_commit();
+      ptx::cp_async16(dst + i * 8, src + min(row_base + i * 8, vec_last));
+    ptx::cp_async_commit();
   };
 
   // ---- once per round: base[0], W2 slice (+ row scales) on-chip, gumbel[0]
   prefetch_base(0);  // base logits: normal L2 priority (just written, and steps 1.. read the other rows)
-  const u64 pol = evict_first_policy();
-  const unsigned a_mbar = smem_u32(&mbar_load);
+  const u64 pol = ptx::evict_first_policy();
+  const unsigned a_mbar = ptx::to_shared(&mbar_load);
   if (threadIdx.x == 0) {
-    mbar_init(a_mbar, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    ptx::mbar_init(a_mbar, 1);
+    ptx::fence_mbarrier_init();
     constexpr unsigned kW2Bytes = tiles_smem * kTileVecs * 16, kScaleBytes = tiles_per_cta * 64, kChunk = 16384;
-    mbar_expect_tx(a_mbar, kW2Bytes + kScaleBytes);
+    ptx::mbar_expect_tx(a_mbar, kW2Bytes + kScaleBytes);
     for (unsigned off = 0; off < kW2Bytes; off += kChunk)
-      bulk_g2s_hint(
-          smem_u32(reinterpret_cast<unsigned char*>(w_s) + off),
+      ptx::bulk_g2s_hint(
+          ptx::to_shared(reinterpret_cast<unsigned char*>(w_s) + off),
           reinterpret_cast<const unsigned char*>(g_frag) + off,
           off + kChunk <= kW2Bytes ? kChunk : kW2Bytes - off,
           a_mbar,
           pol);
-    bulk_g2s_hint(smem_u32(scale_s), row_scale + row_base, kScaleBytes, a_mbar, pol);
+    ptx::bulk_g2s_hint(ptx::to_shared(scale_s), row_scale + row_base, kScaleBytes, a_mbar, pol);
   }
   if (threadIdx.x == 0) tok_s = clamp_row(anchor[0], valid_rows);
   uint4 a_reg[NG][8];
@@ -161,14 +161,14 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_single_kernel(
     const int t = tiles_smem + warp * NG + gi;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-      a_reg[gi][j] = ldcg_hint(g_frag + (t * 8 + j) * 32 + lane, pol);
+      a_reg[gi][j] = ptx::ldcg_hint(g_frag + (t * 8 + j) * 32 + lane, pol);
     }
   }
   if (sampling) fill_gumbel_v(gum_s, row_base, rows_cta, 0, round, seed2, threadIdx.x, kThreads);
-  cp_async_wait<0>();
+  ptx::cp_async_wait<0>();
   // only thread 0 (which initialized it) waits on the load barrier: another thread could reach a try_wait
   // before the init (nothing orders them); the barrier below then publishes the landed tiles to everyone
-  if (threadIdx.x == 0) mbar_wait_cta(a_mbar, 0);
+  if (threadIdx.x == 0) ptx::mbar_wait_cta(a_mbar, 0);
   __syncthreads();
 
   constexpr int kXchgThread = (kWarps - 1) * 32;
@@ -193,10 +193,10 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_single_kernel(
       const uint32_t b1 = ub[(g & 1) * 64 + j * 8 + 4 + tig];
 #pragma unroll
       for (int gi = 0; gi < NG; ++gi)
-        mma_s8(acc[gi], a_reg[gi][j], b0, b1);
+        ptx::mma_s8(acc[gi], a_reg[gi][j], b0, b1);
 #pragma unroll
       for (int ts = 0; ts < TS; ++ts)
-        mma_s8(acc[NG + ts], as[ts], b0, b1);
+        ptx::mma_s8(acc[NG + ts], as[ts], b0, b1);
     }
   };
 
@@ -208,15 +208,15 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_single_kernel(
     if (threadIdx.x < kURowWords) u_s[threadIdx.x] = w1q[static_cast<size_t>(prev) * kURowWords + threadIdx.x];
     if (k + 1 < num_steps) {
       prefetch_base(k + 1);
-      cp_async_wait<1>();  // step k's slice (committed a step ago) has landed
+      ptx::cp_async_wait<1>();  // step k's slice (committed a step ago) has landed
     } else {
-      cp_async_wait<0>();
+      ptx::cp_async_wait<0>();
     }
     __syncthreads();
     {
       int acc[NG + TS][4];
       gemv(acc, u_s);
-      asm volatile("mov.u32 %0, %%tid.x;" : "=r"(tid_p));
+      tid_p = ptx::tid_x();
       // bias, split over the 4 tig lanes (every lane holds the dots): lane tig converts tiles tig, tig + 4, tig + 8
       {
         constexpr int NT = NG + TS;
@@ -329,14 +329,14 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_single_kernel(
       const char* row = reinterpret_cast<const char*>(w1q + static_cast<size_t>(key_row(cta_best)) * kURowWords);
 #pragma unroll
       for (int line = 0; line < 5; ++line)
-        asm volatile("prefetch.global.L2 [%0];" ::"l"(row + line * 128));
+        ptx::prefetch_l2(row + line * 128);
       atomicMax(pairs + 2 * k, cta_best);
-      red_add_release(pairs + 2 * k + 1, 1);
+      ptx::red_add_release(pairs + 2 * k + 1, 1);
     }
     if (threadIdx.x == kXchgThread) {
       ulonglong2 v;
       do {
-        v = ld_relaxed_v2(pairs + 2 * k);
+        v = ptx::ld_relaxed_v2(pairs + 2 * k);
       } while (v.y < n);
       const unsigned tok = key_row(v.x);
       tok_s = tok;
@@ -356,7 +356,7 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_single_kernel(
     __syncthreads();
   }
   // every CTA has seen every final count (no CTA still reads this round's state): CTA 0 closes the round
-  if (blockIdx.x == 0 && threadIdx.x == 0) st_relaxed(state, round + 1);
+  if (blockIdx.x == 0 && threadIdx.x == 0) ptx::st_relaxed(state, round + 1);
 }
 
 /**
