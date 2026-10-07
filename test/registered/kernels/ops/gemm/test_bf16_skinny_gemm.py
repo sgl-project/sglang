@@ -2,29 +2,24 @@
 
 A row's tiling and FP32 accumulation order depend only on (N, K), so a row must give
 the same bits alone or in any batch of up to 16 rows, also under CUDA graph replay.
-With SGLANG_ENABLE_BF16_SKINNY_LM_HEAD=1 both LM-head callers (target logits and the DSpark
-draft projection) must route qualifying batches to it and everything else to cuBLAS.
+Row offsets are 64-bit, and the launch follows the operands' device. The LM-head
+dispatch is tested in test/registered/unit/layers/test_logits_processor_bf16_lm_head.py.
 """
 
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
-from sglang.kernels.ops.gemm import bf16_skinny_gemm as skinny
 from sglang.kernels.ops.gemm.bf16_skinny_gemm import (
     MAX_M,
     bf16_skinny_gemm,
     bf16_skinny_supported,
 )
-from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.models.dspark import project_through_lm_head
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 # A TP4 DeepSeek-V4.1 LM head shard, and a small shape whose N is not a block multiple.
 SHAPES = [(32320, 4096), (1000, 256)]
@@ -99,6 +94,43 @@ class TestBf16SkinnyGemm(CustomTestCase):
             )
         )
 
+    def test_row_offsets_beyond_int32(self):
+        # Three weight rows 2**30 + 256 elements apart: the last row starts past
+        # 2**31 elements, so 32-bit row offsets would wrap.
+        n, k, row_stride = 3, 256, 2**30 + 256
+        size = (n - 1) * row_stride + k
+        self.assertGreater((n - 1) * row_stride, 2**31)
+        if torch.cuda.mem_get_info()[0] < size * 2 + 2**30:
+            self.skipTest("needs about 5 GiB of free GPU memory")
+        x, w = _inputs(6, n, k, seed=7)
+        storage = torch.empty(size, dtype=torch.bfloat16, device="cuda")
+        w_far = storage.as_strided((n, k), (row_stride, 1))
+        w_far.copy_(w)
+        self.assertTrue(bf16_skinny_supported(x, w_far))
+        self.assertTrue(
+            torch.equal(
+                _bits(bf16_skinny_gemm(x, w_far)), _bits(bf16_skinny_gemm(x, w))
+            )
+        )
+
+    @unittest.skipUnless(torch.cuda.device_count() >= 2, "needs two GPUs")
+    def test_operands_on_a_non_current_device(self):
+        x, w = _inputs(6, 1000, 256, seed=6)
+        ref, bound = _error_bound(x, w)
+        x1, w1 = x.to("cuda:1"), w.to("cuda:1")
+        torch.cuda.synchronize(0)
+        torch.cuda.synchronize(1)
+        with torch.cuda.device(0):
+            # Keep device 0 busy, so a launch on its stream instead of device 1's
+            # would not have run when device 1 is synchronized below.
+            torch.cuda._sleep(2**31)
+            out = bf16_skinny_gemm(x1, w1)
+        torch.cuda.synchronize(1)
+        self.assertEqual(out.device, x1.device)
+        err = (out.cpu().double() - ref.cpu()).abs()
+        self.assertTrue(bool((err <= bound.cpu()).all()))
+        torch.cuda.synchronize(0)
+
     def test_supported_inputs(self):
         x, w = _inputs(4, 1000, 256)
         self.assertTrue(bf16_skinny_supported(x, w))
@@ -113,48 +145,8 @@ class TestBf16SkinnyGemm(CustomTestCase):
         for name, (a, b) in rejected.items():
             with self.subTest(name):
                 self.assertFalse(bf16_skinny_supported(a, b))
-
-
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-class TestLmHeadDispatch(CustomTestCase):
-    """Both production LM-head callers use the kernel only when enabled and eligible."""
-
-    def _target_logits(self, hidden, weight):
-        processor = SimpleNamespace(use_fp32_lm_head=False, rl_on_policy_target=None)
-        return LogitsProcessor._compute_lm_head(
-            processor, hidden, SimpleNamespace(weight=weight)
-        )
-
-    def _draft_logits(self, hidden, weight):
-        return project_through_lm_head(
-            hidden, SimpleNamespace(weight=weight, quant_method=None)
-        )
-
-    def test_callers_route_to_the_kernel(self):
-        x, w = _inputs(6, 1000, 256, seed=4)
-        cases = {
-            "eligible": (True, x, w, True),
-            "disabled": (False, x, w, False),
-            "rows > 16": (True, _inputs(MAX_M + 1, 1000, 256, seed=4)[0], w, False),
-            "float16": (True, x.half(), w.half(), False),
-            "strided columns": (True, x.t().contiguous().t(), w, False),
-        }
-        for caller in (self._target_logits, self._draft_logits):
-            for name, (enabled, hidden, weight, expect_kernel) in cases.items():
-                with self.subTest(caller=caller.__name__, case=name):
-                    with (
-                        envs.SGLANG_ENABLE_BF16_SKINNY_LM_HEAD.override(enabled),
-                        mock.patch.object(
-                            skinny, "bf16_skinny_gemm", wraps=bf16_skinny_gemm
-                        ) as kernel,
-                    ):
-                        logits = caller(hidden, weight)
-                    self.assertEqual(kernel.called, expect_kernel)
-                    if expect_kernel:
-                        want = bf16_skinny_gemm(hidden, weight)
-                    else:
-                        want = hidden @ weight.T
-                    self.assertTrue(torch.equal(_bits(logits), _bits(want)))
+        with self.subTest("ROCm"), mock.patch.object(torch.version, "hip", "6.4"):
+            self.assertFalse(bf16_skinny_supported(x, w))
 
 
 if __name__ == "__main__":
