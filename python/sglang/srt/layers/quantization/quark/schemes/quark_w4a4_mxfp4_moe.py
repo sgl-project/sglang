@@ -980,6 +980,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         from sglang.srt.layers.moe.moe_runner.aiter import (
             AiterMoeQuantInfo,
             AiterQuantType,
+            aiter_swiglu_oai_limit,
         )
 
         if hasattr(torch, "float4_e2m1fn_x2"):
@@ -1015,7 +1016,11 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             expert_mask=layer.dispatcher.expert_mask_gpu,
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),
-            swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
+            swiglu_limit=(
+                aiter_swiglu_oai_limit(self.moe_runner_config)
+                or self.moe_runner_config.swiglu_limit
+                or 0.0
+            ),
             fused_moe_kwargs=_fused_moe_kwargs,
         )
         return self.runner.run(dispatch_output, quant_info)

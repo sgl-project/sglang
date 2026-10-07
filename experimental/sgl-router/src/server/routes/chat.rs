@@ -23,7 +23,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
-use forward::{forward_request, SelectedWorkers};
+use forward::{forward_request, RequestDurationGuard, SelectedWorkers};
 use preparation::{
     parse_embedding_request, parse_routing_fields, PreparedRequest, CLASSIFY_PATH, EMBEDDINGS_PATH,
 };
@@ -60,10 +60,7 @@ pub async fn chat_completions(
         body,
         routing.needs_request_tokens(&ctx),
     )?;
-    let workers = routing
-        .select_workers(&ctx, &request, &headers, &[])
-        .await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    routing.dispatch(&ctx, request, headers, start).await
 }
 
 /// SGLang's native `/generate`: same request and response schema as the engine.
@@ -77,10 +74,7 @@ pub async fn generate(
     let model = ModelId(ctx.config.model.id.clone());
     let routing = ModelRouting::lookup(&ctx, &model)?;
     let request = PreparedRequest::generate(&ctx, model, body)?;
-    let workers = routing
-        .select_workers(&ctx, &request, &headers, &[])
-        .await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    routing.dispatch(&ctx, request, headers, start).await
 }
 
 /// OpenAI `/v1/embeddings`, forwarded to the engine's with the same request and response.
@@ -112,10 +106,7 @@ async fn embedding_input(
     let routing = ModelRouting::lookup(&ctx, &model)?;
     require_plain_workers(&ctx, &model, path)?;
     let request = PreparedRequest::embeddings(&ctx, path, model, body, value)?;
-    let workers = routing
-        .select_workers(&ctx, &request, &headers, &[])
-        .await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    routing.dispatch(&ctx, request, headers, start).await
 }
 
 /// SGLang's `/v1/rerank`, forwarded as sent to the model this router serves.
@@ -129,10 +120,7 @@ pub async fn rerank(
     let routing = ModelRouting::lookup(&ctx, &model)?;
     require_plain_workers(&ctx, &model, "/v1/rerank")?;
     let request = PreparedRequest::rerank(model, body)?;
-    let workers = routing
-        .select_workers(&ctx, &request, &headers, &[])
-        .await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    routing.dispatch(&ctx, request, headers, start).await
 }
 
 /// Prefill and decode engines serve generation only.
@@ -168,6 +156,58 @@ impl<'a> ModelRouting<'a> {
             // so a load-only bucket skips the body parse.
             Self::Reorg(resolver) => resolver.needs_request_tokens(),
         }
+    }
+
+    /// Select workers for `request` and forward it to them. An attempt that
+    /// fails before any response reaches the client is retried, after a
+    /// backoff, on workers it has not tried, up to `--retry-max-attempts`.
+    async fn dispatch(
+        &self,
+        ctx: &AppContext,
+        mut request: PreparedRequest,
+        headers: HeaderMap,
+        start: Instant,
+    ) -> Result<Response<Body>, ApiError> {
+        let mut excluded = Vec::new();
+        let mut failed = None;
+        let mut duration = None;
+        for attempt in 0..ctx.config.proxy.max_attempts.get() {
+            if attempt > 0 {
+                // A retry never starts past the request's stale deadline, so the
+                // backoff is capped by what remains of it. Backing off before
+                // selecting lets the pick see fresh breaker and load state.
+                let deadline = ctx.router_inflight_load.stale_request_timeout();
+                let Some(remaining) = deadline.checked_sub(start.elapsed()) else {
+                    break;
+                };
+                tokio::time::sleep(ctx.config.proxy.backoff(attempt).min(remaining)).await;
+                if start.elapsed() >= deadline {
+                    break;
+                }
+            }
+            let workers = match self
+                .select_workers(ctx, &request, &headers, &excluded)
+                .await
+            {
+                Ok(workers) => workers,
+                // Every eligible worker already failed this request: report the last failure.
+                Err(error) => return failed.ok_or(error),
+            };
+            if failed.is_some() {
+                ctx.metrics.record_retry(&request.model.0);
+            }
+            let duration = duration
+                .get_or_insert_with(|| RequestDurationGuard::new(ctx, &request.model, start));
+            let attempt =
+                forward_request(ctx, &mut request, workers, headers.clone(), start, duration)
+                    .await?;
+            if attempt.retry_excluding.is_empty() {
+                return Ok(attempt.response);
+            }
+            excluded.extend(attempt.retry_excluding);
+            failed = Some(attempt.response);
+        }
+        Ok(failed.expect("at least one attempt"))
     }
 
     /// Pick a plain worker, or a prefill worker followed by a decode peer in PD mode,
