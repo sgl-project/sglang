@@ -86,7 +86,6 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     DecodeInputs,
     PrefillInputs,
     RowShard,
-    has_dense_fp4_indexer,
     is_sm100_or_newer,
     make_candidate_indexer,
     make_full_topk_indexer,
@@ -1037,6 +1036,7 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
     if t.shape[0] == num_rows:
         return t
     return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))
+
 
 # Arbitrary floor: below it the dense scores are short enough that the
 # all-gather's fixed latency eats most of what sharding saves.
