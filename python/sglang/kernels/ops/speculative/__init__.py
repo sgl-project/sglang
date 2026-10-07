@@ -1,8 +1,8 @@
-"""Speculative-decoding kernels (Triton).
+"""Speculative-decoding kernels.
 
-The Triton kernels migrated here live in this package
-(``sglang.kernels.ops.speculative.<module>``); import them from there. Their
-``KernelSpec`` metadata is registered below for inventory (backend = Triton).
+The kernels live in this package (``sglang.kernels.ops.speculative.<module>``);
+import them from there. Their ``KernelSpec`` metadata is registered below for
+inventory.
 """
 
 from sglang.kernels.registry import register_kernel
@@ -54,5 +54,19 @@ register_kernel(
         ),
     )
 )
+
+# Exactly SM90: wgmma / mma.sync int8 kernels launched as cooperative grids, tuned on H100.
+for _fn in ("markov_walk_i8", "markov_walk_i8b", "markov_walk_i8s"):
+    register_kernel(
+        KernelSpec(
+            op=f"speculative.dspark_{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.speculative.dspark.markov_walk:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+            ),
+        )
+    )
+del _fn
 
 __all__ = []

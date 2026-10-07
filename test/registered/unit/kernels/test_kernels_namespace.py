@@ -313,6 +313,11 @@ def test_reclassified_public_entry_points_are_inventoried():
         ("gemm.convrot_int8_fused_linear", (12, 0), True),
         ("gemm.convrot_int8_fused_linear", (12, 1), True),
         ("gemm.convrot_int8_fused_linear", (12, 2), False),
+        ("speculative.dspark_markov_walk_i8", (9, 0), True),
+        ("speculative.dspark_markov_walk_i8b", (10, 0), False),
+        ("speculative.dspark_markov_walk_i8s", (8, 9), False),
+        ("speculative.dspark_markov_walk_i8s", (9, 0), True),
+        ("speculative.dspark_markov_walk_i8s", (10, 0), False),
     ],
 )
 def test_registered_architecture_boundaries(op, sm, expected):
