@@ -2,6 +2,9 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.kernels.ops.diffusion.common.fallback_torch import (
+    fuse_scale_shift_kernel_native,
+)
 from sglang.kernels.ops.diffusion.common.numerics import mul_rn_f32
 from sglang.kernels.ops.diffusion.common.platform import (
     is_cuda,
@@ -10,6 +13,7 @@ from sglang.kernels.ops.diffusion.common.platform import (
     lazy_fallback,
     select_impl,
 )
+from sglang.srt.utils import is_gfx1250_supported
 
 
 @triton.jit
@@ -435,6 +439,11 @@ def try_fused_scaled_residual_bf16(
     return output
 
 
+# fuse_scale_shift_kernel_blc_opt miscompiles in bf16 under ROCm 10.1's Triton
+# (3.8.0+git669b31ac), returning values ~7x too small; fp32 is unaffected.
+_SCALE_SHIFT_BF16_NATIVE = is_gfx1250_supported()
+
+
 def fuse_scale_shift_kernel(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -445,6 +454,11 @@ def fuse_scale_shift_kernel(
 ):
     assert (x.is_cuda and scale.is_cuda) or (x.is_xpu and scale.is_xpu)
     assert x.is_contiguous()
+
+    if _SCALE_SHIFT_BF16_NATIVE and x.dtype is torch.bfloat16:
+        return fuse_scale_shift_kernel_native(
+            x, scale, shift, scale_constant, block_l, block_c
+        )
 
     B, L, C = x.shape
     output = torch.empty_like(x)
