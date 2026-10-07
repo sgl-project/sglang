@@ -82,6 +82,7 @@ class _Run:
         self.post_inputs = {}
         self.attn_defer = []
         self.moe_pieces = []
+        self.coefficients = []
 
     def current(self):
         return self.stack[-1].name
@@ -100,7 +101,9 @@ class _Run:
     def _mix_stats_impl(self, hc, x, **kwargs):
         assert x is self.residual
         self.events.append(("stats", hc.name, self.current()))
-        return tuple(mock.Mock() for _ in range(3))
+        coefficients = tuple(mock.Mock() for _ in range(3))
+        self.coefficients.extend(coefficients)
+        return coefficients
 
     def _combine(self, hc, state, quantized=None):
         self.events.append(("combine", hc.name, self.current()))
@@ -272,8 +275,22 @@ DECODE = [
 
 
 class TestMhcPrefillStatsOverlap(CustomTestCase):
+    def _assert_side_stream_lifetimes(self, run):
+        # The residual is read on the stats stream and both triplets are read on
+        # the main stream; each must be recorded there so the caching allocator
+        # does not reuse its memory early.
+        self.assertEqual(
+            run.residual.record_stream.call_args_list, [mock.call(run.side)] * 2
+        )
+        self.assertEqual(len(run.coefficients), 6)
+        for coefficient in run.coefficients:
+            coefficient.record_stream.assert_called_once_with(run.main)
+
     def _assert_in_line(self, run, events):
         self.assertEqual(events, IN_LINE)
+        run.residual.record_stream.assert_not_called()
+        for coefficient in run.coefficients:
+            coefficient.record_stream.assert_not_called()
         self.assertEqual(run.attn_defer, [False])
         self.assertEqual(run.moe_pieces, [False])
         self.assertIs(run.post_inputs["attn"], run.attn_plain)
@@ -289,6 +306,7 @@ class TestMhcPrefillStatsOverlap(CustomTestCase):
                     self.assertEqual(run.moe_pieces, [True])
                     self.assertIs(run.post_inputs["attn"], run.attn_reduced)
                     self.assertIs(run.post_inputs["ffn"], run.moe_reduced)
+                    self._assert_side_stream_lifetimes(run)
 
     def test_other_prefill_widths_compute_stats_in_line(self):
         for rows in NARROW_ROWS:
@@ -304,6 +322,7 @@ class TestMhcPrefillStatsOverlap(CustomTestCase):
                     self.assertEqual(run(), DECODE)
                     self.assertEqual(run.attn_defer, [False])
                     self.assertEqual(run.moe_pieces, [False])
+                    self._assert_side_stream_lifetimes(run)
 
     def test_batch_invariant_mode_disables_the_overlap(self):
         run = _Run(8192, ForwardMode.EXTEND)
