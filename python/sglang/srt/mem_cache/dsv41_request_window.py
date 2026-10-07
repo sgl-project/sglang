@@ -68,8 +68,9 @@ def window_layout(
     n = pos.numel()
     if n == 0:
         raise ValueError("request-window layout needs at least one query")
-    req = req.to(torch.int64)
-    pos = pos.to(torch.int64)
+    # The copy kernels read req and pos by address as dense arrays.
+    req = req.to(torch.int64).contiguous()
+    pos = pos.to(torch.int64).contiguous()
     device = pos.device
     groups = n if num_groups is None else int(num_groups)
     offset = torch.arange(n, device=device)

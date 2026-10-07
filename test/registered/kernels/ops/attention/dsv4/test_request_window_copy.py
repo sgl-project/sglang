@@ -146,6 +146,36 @@ class TestRequestWindowCopy(CustomTestCase):
                         window.commit(layer)
                         self._check(window, layer, expected)
 
+    def test_strided_request_inputs(self):
+        # The kernels read req and pos by address, so a strided view (here every
+        # other element, with an out-of-range request between them) must not
+        # reach them as is.
+        def strided(values, filler):
+            t = torch.tensor(values, device="cuda")
+            return torch.stack([t, torch.full_like(t, filler)], dim=1).flatten()[::2]
+
+        for kv_layout in KVLayout:
+            with self.subTest(layout=kv_layout.value):
+                window = self._window(kv_layout, page_size=16)
+                req = strided([0, 0, 1, 3], filler=99)
+                pos = strided([9, 10, 4, 30], filler=0)
+                self.assertFalse(req.is_contiguous())
+                lw = window_layout(
+                    req, pos, window=WINDOW, capacity=window.capacity, num_groups=3
+                )
+                self.assertTrue(lw.req.is_contiguous() and lw.pos.is_contiguous())
+                window.activate(lw)
+                window.tags.fill_(-1)
+                valid = lw.history_valid
+                loc = (
+                    lw.history_req * window.capacity + lw.history_pos % window.capacity
+                )
+                window.tags[:, loc[valid]] = lw.history_pos[valid]
+                expected = _reference(window, lw, 0)
+                window.commit(0)
+                torch.cuda.synchronize()
+                self._check(window, 0, expected)
+
     def test_graph_replay_follows_refreshed_layout(self):
         for kv_layout in KVLayout:
             with self.subTest(layout=kv_layout.value):

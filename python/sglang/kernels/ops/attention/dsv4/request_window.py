@@ -129,6 +129,12 @@ def _words(buf: torch.Tensor, layout: KVLayout, page_size: int) -> torch.Tensor:
     return buf.view(torch.int32)
 
 
+def _assert_dense(*tensors: torch.Tensor) -> None:
+    # The kernels index these with the program id, ignoring strides.
+    for t in tensors:
+        assert t.dim() == 1 and t.is_contiguous(), (t.shape, t.stride())
+
+
 def _meta(layout: KVLayout, page_size: int) -> dict:
     assert layout.data_bytes % 4 == 0 and layout.scale_bytes % 4 == 0
     data_words, scale_words = layout.data_bytes // 4, layout.scale_bytes // 4
@@ -160,6 +166,7 @@ def gather_window_history(
     n = history_loc.numel()
     if n == 0:
         return
+    _assert_dense(history_req, history_pos, history_valid, history_loc)
     state_words = _words(state, layout, page_size)
     workspace_words = _words(workspace, layout, page_size)
     _gather_history_kernel[(n,)](
@@ -198,6 +205,7 @@ def commit_window_tokens(
     if n == 0:
         return
     assert tags.dtype == torch.int64 and tags.is_contiguous()
+    _assert_dense(write_loc, req, pos, commit_mask)
     workspace_words = _words(workspace, layout, page_size)
     state_words = _words(state, layout, page_size)
     _commit_tokens_kernel[(n,)](
