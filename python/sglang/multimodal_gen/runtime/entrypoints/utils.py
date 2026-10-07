@@ -1024,6 +1024,17 @@ def _save_image_frame(
         imageio.imwrite(path, frame, quality=quality)
 
 
+def warm_image_writer() -> None:
+    """Run imageio's one-time plugin setup (~30 ms) before the first request saves."""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            _save_image_frame(
+                os.path.join(tmp, "warm.jpg"), np.zeros((8, 8, 3), np.uint8), 75, None
+            )
+    except Exception:
+        logger.debug("Image writer warmup failed", exc_info=True)
+
+
 def save_outputs(
     outputs: Sequence[Any],
     data_type: DataType,
