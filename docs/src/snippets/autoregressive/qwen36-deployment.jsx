@@ -25,12 +25,12 @@ export const Qwen36Deployment = () => {
       name: 'quantization',
       title: 'Quantization',
       // NVFP4 checkpoints are available for both model sizes on Blackwell (B200/B300).
-      // BMG currently supports BF16 only for Qwen3.6-35B-A3B.
+      // BMG currently supports BF16 only for Qwen3.6.
       getDynamicItems: (values) => {
         const isArcB = values.hardware === 'arc_b';
         const items = [
           { id: 'fp8', label: 'FP8', default: !isArcB, disabled: isArcB,
-            disabledReason: isArcB ? 'FP8 is not supported on BMG for Qwen3.6-35B-A3B' : '' },
+            disabledReason: isArcB ? 'FP8 is not supported on BMG for Qwen3.6' : '' },
           { id: 'bf16', label: 'BF16', default: isArcB },
         ];
         const nvfp4Supported = values.hardware === 'b200' || values.hardware === 'b300';
@@ -116,6 +116,7 @@ export const Qwen36Deployment = () => {
       b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
       b300: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
       xeon: { bf16: { tp: 6 },           fp8: { tp: 6 } },
+      arc_b: { bf16: { tp: 4, mem: 0.8 } },
     },
   };
 
@@ -170,17 +171,7 @@ export const Qwen36Deployment = () => {
   }, [values.speculative, values.hardware, values.modelSize]);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => {
-      if (prev.hardware === 'arc_b' && optionName === 'modelSize' && value !== '35b-a3b') {
-        return prev;
-      }
-
-      const next = { ...prev, [optionName]: value };
-      if (optionName === 'hardware' && value === 'arc_b' && next.modelSize !== '35b-a3b') {
-        next.modelSize = '35b-a3b';
-      }
-      return next;
-    });
+    setValues((prev) => ({ ...prev, [optionName]: value }));
   };
 
   const generateCommand = () => {
@@ -270,18 +261,12 @@ export const Qwen36Deployment = () => {
             <div style={itemsStyle}>
               {items.map((item) => {
                 const isChecked = values[option.name] === item.id;
-                const isArcBModelLocked =
-                  values.hardware === 'arc_b' &&
-                  option.name === 'modelSize' &&
-                  item.id !== '35b-a3b';
-                const isDisabled = !!item.disabled || isArcBModelLocked;
-                const title = item.disabledReason
-                  || (isArcBModelLocked ? 'Qwen3.6-27B is not supported on BMG yet' : '');
+                const isDisabled = !!item.disabled;
                 return (
                   <label
                     key={item.id}
                     style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}
-                    title={title}
+                    title={item.disabledReason || ''}
                   >
                     <input
                       type="radio"
