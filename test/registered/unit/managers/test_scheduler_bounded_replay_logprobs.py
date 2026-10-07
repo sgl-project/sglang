@@ -125,6 +125,14 @@ class TestBoundedReplayPromptLogprobs(CustomTestCase):
         session.create_req.assert_called_once()
         req.set_finish_with_abort.assert_not_called()
 
+    def test_streaming_session_negative_start_rejected(self):
+        # Only nonnegative starts are dropped for streaming sessions; -2 resolves
+        # to prompt position 0 and would raise in the forward pass.
+        session = SimpleNamespace(streaming=True, close_on_finish=False)
+        req = _admit(bounded_replay=True, logprob_start_len=-2, session=session)
+        session.create_req.assert_called_once()
+        self._assert_rejected(req)
+
     def test_non_streaming_session_prompt_logprobs_rejected(self):
         session = SimpleNamespace(streaming=False, close_on_finish=False)
         req = _admit(bounded_replay=True, logprob_start_len=0, session=session)
