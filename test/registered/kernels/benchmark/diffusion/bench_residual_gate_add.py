@@ -81,9 +81,7 @@ def benchmark() -> None:
     repeats = 5 if is_in_ci() else 20
     rounds = 5 if is_in_ci() else 13
 
-    print(
-        "| workload | gate | torch us | triton us | cuda us | reference | " "ref/cuda |"
-    )
+    print("| workload | gate | torch us | triton us | cuda us | reference | ref/cuda |")
     print("|---|---|---:|---:|---:|---|---:|")
 
     for workload in workloads:

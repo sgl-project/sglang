@@ -101,7 +101,6 @@ class W8A8Fp8Config(QuantizationConfig):
 
 
 class W8A8Fp8LinearMethod(LinearMethodBase):
-
     def __init__(self, quantization_config: W8A8Fp8Config):
         self.cutlass_fp8_supported = cutlass_fp8_supported()
         self.quantization_config = quantization_config

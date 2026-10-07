@@ -48,7 +48,6 @@ def _prepare(serving, batch, explicit_shift):
 
 
 class TestPrepareRolloutRequestScheduler(unittest.TestCase):
-
     def test_inherits_serving_grid_without_explicit_shift(self):
         serving = _serving_scheduler()
         batch = _rollout_batch()
@@ -126,7 +125,6 @@ class _FusedParamModule(torch.nn.Module):
 
 
 class TestWeightsUpdaterFusedParams(unittest.TestCase):
-
     def test_merge_index_reaches_weight_loader_as_shard_id(self):
         module = _FusedParamModule()
         calls = []

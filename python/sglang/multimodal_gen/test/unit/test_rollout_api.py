@@ -21,7 +21,6 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
 
 
 class TestTensorToBytesRoundtrip(unittest.TestCase):
-
     def _roundtrip(self, t: torch.Tensor):
         encoded = tensor_to_bytes(t)
         self.assertIsInstance(encoded, bytes)

@@ -50,6 +50,19 @@ class RocmPlatform(Platform):
 
     @classmethod
     @lru_cache(maxsize=1)
+    def get_gcn_arch_name(cls, device_id: int = 0) -> str:
+        """Return the GCN architecture string (e.g. "gfx1151", "gfx950")."""
+        return str(torch.cuda.get_device_properties(device_id).gcnArchName)
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def is_gfx1151(cls) -> bool:
+        return torch.cuda.is_available() and cls.get_gcn_arch_name().startswith(
+            "gfx1151"
+        )
+
+    @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         return torch.cuda.get_device_properties(device_id).total_memory
 
@@ -332,8 +345,16 @@ class RocmPlatform(Platform):
         Kw>1) are replaced; pointwise or 1-D-temporal convolutions are left
         untouched.  Modules with non-default ``groups`` or ``dilation`` are
         skipped as the 2-D decomposition assumes groups=1 and dilation=1.
+
+        Spatial-parallel convs shard the height dimension across ranks and get
+        their missing rows from a halo exchange, so their ``_padding`` carries
+        no height padding.  Replacing their ``forward`` would drop the halo
+        exchange and silently shrink the output height, so for those the 2-D
+        decomposition is installed as the inner ``_halo_conv_forward`` kernel
+        instead, leaving the halo exchange and output trim intact.
         """
         patched = 0
+        patched_halo = 0
         skipped = 0
         for _name, child in module.named_modules():
             if not isinstance(child, nn.Conv3d):
@@ -345,6 +366,15 @@ class RocmPlatform(Platform):
                 skipped += 1
                 continue
             if child.groups != 1 or any(d != 1 for d in child.dilation):
+                skipped += 1
+                continue
+
+            is_spatial_parallel = hasattr(child, "height_halo_size")
+            if is_spatial_parallel and (
+                not hasattr(child, "_halo_conv_forward")
+                or child.padding_mode != "zeros"
+            ):
+                # No safe hook to patch without breaking the halo exchange.
                 skipped += 1
                 continue
 
@@ -386,17 +416,48 @@ class RocmPlatform(Platform):
                     compute_bf16=_bf16,
                 )
 
-            child.forward = types.MethodType(_patched_forward, child)
-            patched += 1
+            def _patched_halo_conv_forward(
+                self,
+                x,
+                *,
+                _stride=stride,
+                _kt=kt,
+                _bf16=use_bf16,
+            ):
+                # ``x`` is already halo-exchanged and causally padded; only the
+                # conv's own ``padding`` is still outstanding.
+                pad_t, pad_h, pad_w = self.padding
+                if pad_t or pad_h or pad_w:
+                    x = F.pad(x, (pad_w, pad_w, pad_h, pad_h, pad_t, pad_t))
+                x = x.to(self.weight.dtype)
+                return RocmPlatform._conv3d_as_batched_conv2d(
+                    x,
+                    self._weight_2d,
+                    self.bias,
+                    _stride,
+                    _kt,
+                    compute_bf16=_bf16,
+                )
+
+            if is_spatial_parallel:
+                child._halo_conv_forward = types.MethodType(
+                    _patched_halo_conv_forward, child
+                )
+                patched_halo += 1
+            else:
+                child.forward = types.MethodType(_patched_forward, child)
+                patched += 1
 
         logger.info(
-            "Conv3D→Conv2D: patched %d CausalConv3d (3D kernel, compute=%s), "
-            "skipped %d (1D/pointwise/grouped)",
+            "Conv3D→Conv2D: patched %d CausalConv3d + %d spatial-parallel halo "
+            "kernels (3D kernel, compute=%s), skipped %d (1D/pointwise/grouped/"
+            "unsupported spatial-parallel)",
             patched,
+            patched_halo,
             "BF16" if use_bf16 else "same dtype",
             skipped,
         )
-        return patched
+        return patched + patched_halo
 
     @classmethod
     def enable_dit_layerwise_offload_by_default(cls) -> bool:

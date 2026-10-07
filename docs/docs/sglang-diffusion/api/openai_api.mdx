@@ -75,6 +75,7 @@ curl -sS "http://localhost:30010/v1/models"
       "max_model_len": null,
       "num_gpus": 4,
       "task_type": "T2V",
+      "supported_task_types": ["T2V"],
       "dit_precision": "bf16",
       "vae_precision": "fp16",
       "pipeline_name": "WanPipeline",
@@ -95,6 +96,45 @@ curl -sS "http://localhost:30010/v1/models/wan-t2v"
 ---
 
 ## Endpoints
+
+### Select a request task
+
+`GET /v1/models` reports `task_type` (the configured default) and
+`supported_task_types` (the tasks implemented by that configured pipeline).
+`GET /model_info` also reports the supported `output_types`. A pipeline may
+support image and video output on one server when its implementation and
+loaded components provide both paths.
+
+Send the optional SGLang extension `task_type` as a case-insensitive enum name:
+
+| Interface | Task field | Output constraint |
+| --- | --- | --- |
+| `POST /v1/images/generations` JSON | `"task_type": "t2i"` | Image |
+| `POST /v1/images/edits` multipart | `-F task_type=i2i` | Image |
+| `POST /v1/videos` JSON or multipart | `"task_type": "i2v"` or `-F task_type=i2v` | Video |
+| OpenAI Python client | `extra_body={"task_type": "t2i"}` | Selected endpoint |
+| Native Python `generate` sampling parameters | `"task_type": "t2i"` | Selected task |
+| `sglang generate` | `--task-type t2i` | Selected task |
+
+Choose only a task in the server's advertised set. An unsupported task, a task
+with the wrong output type for the endpoint, or missing required conditioning
+returns HTTP 400. For example, `i2v` needs image input, while `v2v` and `f2v`
+need video input. Model-specific size, frame count, and reference constraints
+still apply.
+
+If you omit `task_type`, the server uses the endpoint and supplied inputs to
+choose a compatible task, preferring its default when compatible. It asks for
+an explicit task if several alternatives remain (for example `v2v` versus
+`f2v`). Pipelines with one task keep that task as their default. Sending a
+request never changes the server default or subsequent requests.
+
+### Prompt enhancement
+
+Image generation, image edits and video creation accept `enhance_prompt=true`
+when the server is configured with `--prompt-enhancer-config`. An independent
+SRT service rewrites the prompt before diffusion runs. The default is `false`;
+image responses return `data[].revised_prompt`, and video responses return
+`revised_prompt`. See [deployment and model compatibility](/docs/sglang-diffusion/models_with_pe).
 
 ### Model-specific request fields
 
@@ -129,7 +169,7 @@ The server implements an OpenAI-compatible Images API under the `/v1/images` nam
 
 #### Request quality
 
-`quality` selects a model-owned sampling level when that model advertises one: use `lossless` for the reference path or `high` for a validated accelerated path. Omit it (or send OpenAI's default `auto`) to keep the runtime default. It is distinct from `output_quality`, which controls only output-file compression. The same extension is accepted by image edits and video requests.
+`quality` selects a cumulative request-level optimization tier: `exact` keeps the selected deployment's reference path and all unconditional bit-exact replacements, so output is bit-identical to it in the same environment; `lossless` additionally enables the request-gated DiT/VAE fusions that keep the reference math and every operand's precision and only move the rounding; `high` includes the full `lossless` set and may also enable model-owned sparse, caching, lower-precision, or other approximate paths. `extra-high` is accepted as the former name of `lossless`. The tier does not override separately configured quantization, attention, or caching options. Omit it (or send OpenAI's default `auto`) to keep the `lossless` runtime default. It is distinct from `output_quality`, which controls only output-file compression. The same extension is accepted by image edits and video requests.
 
 **Python Example (b64_json response):**
 
@@ -174,6 +214,10 @@ curl -sS -X POST "http://localhost:30010/v1/images/generations" \
 **Endpoint:** `POST /v1/images/edits`
 
 This endpoint accepts a multipart form upload with input images and a text prompt. The server can return either a base64-encoded image or a URL to download the image.
+
+Uploaded filenames are sanitized, and saved uploads are constrained to the
+server's upload directory. This also applies to image uploads for video and mesh
+generation.
 
 **Curl Example (b64_json response):**
 
@@ -274,6 +318,15 @@ curl -sS -X POST "http://localhost:30010/v1/videos" \
         "size": "1280x720"
       }'
 ```
+
+#### MP4 encoding
+
+`x264_preset` picks the libx264 preset for the returned MP4: `ultrafast`,
+`superfast`, `veryfast`, `faster`, `fast` (the default), `medium`, `slow`,
+`slower`, `veryslow` or `placebo`. Faster presets finish encoding sooner and
+trade file size and fidelity at the same `output_compression`/`output_quality`.
+Send it at the top level of a JSON body or as a multipart form field;
+`sglang generate` takes `--x264-preset`.
 
 **List videos**
 

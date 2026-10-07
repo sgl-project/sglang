@@ -7,7 +7,8 @@ import struct
 import threading
 import time
 import uuid
-from typing import Dict, List, Optional, Tuple
+from queue import Full, Queue
+from typing import List, Optional, Tuple
 
 import msgspec
 import numpy as np
@@ -28,6 +29,9 @@ from mori.io import (
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
+    ABORT_TAG,
+    AbortNotification,
+    AckTarget,
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
@@ -45,11 +49,11 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import run_with_deadline
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"
-_TAG_ABORT = b"ABORT"
 
 
 def _normalize_state_indices_per_component(
@@ -290,8 +294,33 @@ class TransferTarget:
     peer_info: KVArgsRegisterInfo
 
 
+class _MoriTransferSubmissionError(RuntimeError):
+    def __init__(self, message: str, statuses: List[TransferStatus]):
+        super().__init__(message)
+        self.statuses = statuses
+
+
+class _SubmissionLocal(threading.local):
+    """Per-thread sink for statuses issued by a submission still in progress.
+
+    `statuses` is None outside a tracked submission, so a leaf that records
+    into it is a no-op on threads that are not submitting.
+    """
+
+    statuses: Optional[List[TransferStatus]] = None
+
+
 class MoriKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    # Implements teardown() below, so runtime PD role switching is supported.
+    supports_role_switch = True
+    # The ABORT ack is held until the transfer worker or drainer quiesces the room.
+    supports_deferred_decode_kv_release = True
+
+    # The bootstrap socket carries several message kinds, so the status message
+    # is tagged. Mori has always shipped the failure reason with it.
+    kv_status_msg_tag = MORI_GUARD
+    kv_status_msg_carries_reason = True
 
     def __init__(
         self,
@@ -307,8 +336,12 @@ class MoriKVManager(CommonKVManager):
         self.aux_mem_descs: List[MemoryDesc] = []
         self.state_mem_descs: List[List[MemoryDesc]] = []
         self.transfer_lock = threading.Lock()
+        self._submission_local = _SubmissionLocal()
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
+        # Set by teardown() to make worker threads exit (PoC: P<->D role switch).
+        self._stopped = False
+        self._worker_threads: List[threading.Thread] = []
         self._send_aux_rdma = envs.SGLANG_MORI_SEND_AUX_RDMA.get()
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -318,10 +351,16 @@ class MoriKVManager(CommonKVManager):
             ]
             self._wait_poll_ms = envs.SGLANG_MORI_WAIT_POLL_MS.get()
             self._transfer_timeout_ms = envs.SGLANG_MORI_TRANSFER_TIMEOUT_MS.get()
-            self._room_status_notified: Dict[int, bool] = {}
-            self._room_notify_lock = threading.Lock()
+            self._abort_ack_lock = threading.Lock()
+            if self.enable_deferred_decode_kv_release:
+                self._drain_queue: Queue[
+                    Optional[Tuple[TransferKVChunk, List[TransferStatus]]]
+                ] = Queue(maxsize=self._num_shards)
             for shard, queue in enumerate(self._transfer_queues):
-                threading.Thread(
+                # Track the thread so teardown() can join it: otherwise every
+                # P->D->P flip that re-enters PREFILL leaks _num_shards threads
+                # (each parked forever in FastQueue.get()).
+                t = threading.Thread(
                     target=self._transfer_worker,
                     args=(queue,),
                     daemon=True,
@@ -329,11 +368,24 @@ class MoriKVManager(CommonKVManager):
                         f"mori-xfer-dp{self.system_dp_rank}-"
                         f"tp{self.attn_tp_rank}-s{shard}"
                     ),
-                ).start()
+                )
+                t.start()
+                self._worker_threads.append(t)
+                if self.enable_deferred_decode_kv_release:
+                    t = threading.Thread(
+                        target=self._drain_worker,
+                        daemon=True,
+                        name=(
+                            f"mori-drain-dp{self.system_dp_rank}-"
+                            f"tp{self.attn_tp_rank}-s{shard}"
+                        ),
+                    )
+                    t.start()
+                    self._worker_threads.append(t)
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.room_to_bootstrap_addr: Dict[int, str] = {}
             self._start_decode_thread()
+            self._start_heartbeat_checker_thread()
 
     def _init_engine(self) -> IOEngine:
         if self.kv_args.ib_device:
@@ -349,7 +401,11 @@ class MoriKVManager(CommonKVManager):
             f"{uuid.uuid4().hex[:8]}"
         )
 
-        engine = IOEngine(engine_key, config)
+        engine = run_with_deadline(
+            lambda: IOEngine(engine_key, config),
+            timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
+            what=f"Mori IOEngine({engine_key!r}, host={self.local_ip!r})",
+        )
         poll_mode = PollCqMode.POLLING
 
         qp_per_transfer = envs.SGLANG_MORI_QP_PER_TRANSFER.get()
@@ -409,24 +465,24 @@ class MoriKVManager(CommonKVManager):
                 component_descs.append(desc)
             self.state_mem_descs.append(component_descs)
 
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        current = self.request_status.get(bootstrap_room)
-        if current is None:
-            # Room not yet created or already cleared.
-            # Only allow initial creation: Bootstrapping (normal) or
-            # WaitingForInput (dummy CP rank, see CommonKVSender.__init__).
-            if status not in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
-                return
-        elif current == KVPoll.Failed and status != KVPoll.Failed:
-            # Failed is terminal — never overwrite with non-Failed.
-            return
-        super().update_status(bootstrap_room, status)
-
     def _transfer_worker(self, queue: FastQueue) -> None:
         while True:
             kv_chunk = queue.get()
+            # teardown() pushes a None sentinel to unblock get() and stop the
+            # worker: FastQueue.get() blocks indefinitely, so checking _stopped
+            # alone can never wake a parked worker during a role switch.
+            if kv_chunk is None:
+                break
+            self._mark_transfer_started(kv_chunk)
             try:
-                self._process_transfer_chunk(kv_chunk)
+                is_quiescent = self._process_transfer_chunk(kv_chunk)
+            except _MoriTransferSubmissionError as exc:
+                logger.exception(
+                    "Mori transfer submission failed for room %s",
+                    kv_chunk.room,
+                )
+                self._handle_submission_failure(kv_chunk, exc)
+                continue
             except Exception as exc:
                 failure_reason = f"transfer worker raised: {exc!r}"
                 try:
@@ -437,7 +493,9 @@ class MoriKVManager(CommonKVManager):
                 except Exception:
                     pass
                 try:
-                    self._conclude_room_failure(kv_chunk.room, failure_reason)
+                    self.conclude_failure(
+                        bootstrap_room=kv_chunk.room, failure_reason=failure_reason
+                    )
                 except Exception:
                     try:
                         logger.exception(
@@ -446,45 +504,174 @@ class MoriKVManager(CommonKVManager):
                         )
                     except Exception:
                         pass
+                self._mark_transfer_quiescent(kv_chunk)
+                continue
 
-    def _process_transfer_chunk(self, kv_chunk: TransferKVChunk) -> None:
+            if is_quiescent:
+                self._mark_transfer_quiescent(kv_chunk)
+
+    def _handle_submission_failure(
+        self, kv_chunk: TransferKVChunk, exc: _MoriTransferSubmissionError
+    ) -> None:
+        failure_reason = str(exc)
+        if exc.statuses:
+            self._enqueue_transfer_drain(kv_chunk, exc.statuses, failure_reason)
+            return
+        self._mark_transfer_quiescent(kv_chunk)
+        self.conclude_failure(
+            bootstrap_room=kv_chunk.room, failure_reason=failure_reason
+        )
+
+    def _mark_transfer_started(self, kv_chunk: TransferKVChunk) -> None:
+        if not self.enable_deferred_decode_kv_release:
+            return
+        with self._abort_ack_lock:
+            self._staging_outstanding[kv_chunk.room] += 1
+
+    def _mark_transfer_quiescent(self, kv_chunk: TransferKVChunk) -> None:
+        if not self.enable_deferred_decode_kv_release:
+            return
+
+        room = kv_chunk.room
+        targets = None
+        with self._abort_ack_lock:
+            self._staging_outstanding[room] -= 1
+            if self._staging_outstanding[room] <= 0:
+                self._staging_outstanding.pop(room)
+                targets = self._deferred_ack_targets.pop(room, None)
+        self._send_abort_acks(room, targets)
+
+    def _process_transfer_chunk(self, kv_chunk: TransferKVChunk) -> bool:
         room = kv_chunk.room
         if self._should_skip_transfer(room):
-            return
+            return True
 
         if kv_chunk.wait_event is not None:
             kv_chunk.wait_event.synchronize()
 
         if self._should_skip_transfer(room):
-            return
+            return True
 
-        statuses, target_infos = self._submit_kv_transfer(
-            room,
-            kv_chunk.prefill_kv_indices,
-            kv_chunk.index_slice,
-            kv_chunk.is_last_chunk,
-            aux_index=kv_chunk.prefill_aux_index,
-            state_indices=kv_chunk.state_indices,
+        statuses = self._submit_transfer_chunk(kv_chunk)
+
+        if self._should_skip_transfer(room):
+            if not self.enable_deferred_decode_kv_release:
+                return True
+            # Aborted after submit: the writes must still quiesce before the ACK,
+            # but that wait belongs to the drainer, not this shard worker.
+            self._enqueue_transfer_drain(kv_chunk, statuses, None)
+            return False
+
+        failure_reason, is_quiescent = self._wait_for_chunk_completion(
+            kv_chunk, statuses
         )
-
+        if not is_quiescent:
+            # The drainer now owns the decrement.
+            return False
         if self._should_skip_transfer(room):
-            return
-
-        failure_reason = self._wait_transfer_completion(statuses)
-        if self._should_skip_transfer(room):
-            return
+            return True
         if failure_reason is not None:
-            self._conclude_room_failure(room, failure_reason)
-            return
+            self.conclude_failure(bootstrap_room=room, failure_reason=failure_reason)
+            return True
 
         if kv_chunk.is_last_chunk:
-            self._notify_decode_for_room(
-                room, KVPoll.Success, target_infos=target_infos
+            # conclude_transfer downgrades to Failed when a failure was recorded
+            # while this chunk was in flight, and applies the same status locally
+            # and on the wire.
+            self.conclude_transfer(bootstrap_room=room, status=KVPoll.Success)
+        return True
+
+    def _wait_for_chunk_completion(
+        self, kv_chunk: TransferKVChunk, statuses: List[TransferStatus]
+    ) -> Tuple[Optional[str], bool]:
+        try:
+            failure_reason = self._wait_transfer_completion(statuses)
+            is_quiescent = not self.enable_deferred_decode_kv_release or not any(
+                status.InProgress() for status in statuses
             )
-            self.update_status(room, KVPoll.Success)
+        except Exception as exc:
+            if not self.enable_deferred_decode_kv_release:
+                raise
+            failure_reason = f"Transfer completion failed: {exc!r}"
+            is_quiescent = False
+
+        if not is_quiescent:
+            self._enqueue_transfer_drain(kv_chunk, statuses, failure_reason)
+        return failure_reason, is_quiescent
+
+    def _submit_transfer_chunk(self, kv_chunk: TransferKVChunk) -> List[TransferStatus]:
+        if not self.enable_deferred_decode_kv_release:
+            return self._submit_kv_transfer(
+                kv_chunk.room,
+                kv_chunk.prefill_kv_indices,
+                kv_chunk.index_slice,
+                kv_chunk.is_last_chunk,
+                aux_index=kv_chunk.prefill_aux_index,
+                state_indices=kv_chunk.state_indices,
+            )
+
+        self._submission_local.statuses = []
+        try:
+            return self._submit_kv_transfer(
+                kv_chunk.room,
+                kv_chunk.prefill_kv_indices,
+                kv_chunk.index_slice,
+                kv_chunk.is_last_chunk,
+                aux_index=kv_chunk.prefill_aux_index,
+                state_indices=kv_chunk.state_indices,
+            )
+        except Exception as exc:
+            raise _MoriTransferSubmissionError(
+                f"Transfer submission failed: {exc}",
+                list(self._submission_local.statuses),
+            ) from exc
+        finally:
+            self._submission_local.statuses = None
+
+    def _enqueue_transfer_drain(
+        self,
+        kv_chunk: TransferKVChunk,
+        statuses: List[TransferStatus],
+        failure_reason: Optional[str],
+    ) -> None:
+        # Conclude before the handoff so decode hears now and later chunks skip;
+        # only the ACK waits for the drain.
+        if failure_reason is not None:
+            self.conclude_failure(
+                bootstrap_room=kv_chunk.room, failure_reason=failure_reason
+            )
+        self._drain_queue.put((kv_chunk, statuses))
+
+    def _drain_worker(self) -> None:
+        while True:
+            item = self._drain_queue.get()
+            # teardown() pushes a None sentinel, as for the transfer workers.
+            if item is None:
+                break
+            kv_chunk, statuses = item
+            while True:
+                try:
+                    self._drain_transfer_statuses(kv_chunk, statuses)
+                    break
+                except Exception:
+                    logger.exception(
+                        "Mori transfer drainer failed for room %s; retrying",
+                        kv_chunk.room,
+                    )
+                    time.sleep(max(self._wait_poll_ms, 1) / 1000)
+
+    def _drain_transfer_statuses(
+        self, kv_chunk: TransferKVChunk, statuses: List[TransferStatus]
+    ) -> None:
+        for status in statuses:
+            if status.InProgress():
+                status.Wait()
+        self._mark_transfer_quiescent(kv_chunk)
 
     def _should_skip_transfer(self, room: int) -> bool:
-        if room not in self.request_status or self.check_status(room) == KVPoll.Failed:
+        # Single read: clear() may pop the room concurrently.
+        status = self.request_status.get(room)
+        if status is None or status == KVPoll.Failed:
             logger.debug(
                 "Skipping chunk for room %s because it has already failed or been aborted",
                 room,
@@ -516,60 +703,6 @@ class MoriKVManager(CommonKVManager):
             if status.Failed():
                 return f"KV transfer failed: {status.Message()}"
         return "KV transfer failed due to unknown reason"
-
-    def _notify_decode_for_room(
-        self,
-        room: int,
-        status: KVPoll,
-        failure_reason: Optional[str] = None,
-        target_infos: Optional[List[TransferInfo]] = None,
-    ) -> None:
-        with self._room_notify_lock:
-            if room not in self.request_status or self._room_status_notified.get(room):
-                return
-
-            emitted_status = status
-            emitted_reason = failure_reason
-
-            if emitted_status == KVPoll.Success:
-                with self.failure_lock:
-                    recorded = self.failure_records.get(room)
-                if recorded is not None:
-                    emitted_status = KVPoll.Failed
-                    emitted_reason = recorded
-                elif self.request_status.get(room) == KVPoll.Failed:
-                    emitted_status = KVPoll.Failed
-                    emitted_reason = (
-                        emitted_reason or "request marked Failed before notify"
-                    )
-
-            if emitted_status == KVPoll.Failed:
-                with self.failure_lock:
-                    self.failure_records.setdefault(
-                        room, emitted_reason or "KV transfer failed"
-                    )
-                self.update_status(room, KVPoll.Failed)
-
-            infos = target_infos
-            if infos is None:
-                with self.transfer_lock:
-                    room_infos = self.transfer_infos.get(room)
-                    infos = (
-                        list(room_infos.values()) if room_infos is not None else None
-                    )
-
-            self._room_status_notified[room] = True
-
-        if infos:
-            self.notify_decode_status(infos, room, emitted_status, emitted_reason)
-
-    def _conclude_room_failure(
-        self, room: int, failure_reason: Optional[str] = None
-    ) -> None:
-        if failure_reason is None:
-            with self.failure_lock:
-                failure_reason = self.failure_records.get(room, "KV transfer failed")
-        self._notify_decode_for_room(room, KVPoll.Failed, failure_reason)
 
     def add_transfer_request(
         self,
@@ -707,48 +840,57 @@ class MoriKVManager(CommonKVManager):
         return payload
 
     def _handle_abort_message(self, msg: List[bytes]) -> None:
-        """Handle best-effort ABORT notifications from the decode side."""
-        if len(msg) < 2:
-            logger.warning("Malformed ABORT message: too few frames (%d)", len(msg))
+        """Handle ABORT and defer its ACK until this rank's writes drain."""
+        notification = AbortNotification.from_zmq(msg)
+        if notification is None:
             return
-
-        try:
-            bootstrap_room = int(msg[1].decode("ascii"))
-        except (ValueError, UnicodeDecodeError):
-            logger.warning("Malformed ABORT message: invalid room field %r", msg[1])
-            return
+        bootstrap_room = notification.room
 
         with self.transfer_lock:
             current = self.request_status.get(bootstrap_room)
-            if current is None:
-                logger.debug(
-                    "ABORT for room %s is not tracked; ignoring",
-                    bootstrap_room,
-                )
-                return
-            if current == KVPoll.Success:
-                logger.debug(
-                    "ABORT for room %s already succeeded; ignoring",
-                    bootstrap_room,
-                )
-                return
-            if current == KVPoll.Failed:
-                return
+            room_active = current is not None and current != KVPoll.Success
+            if room_active and current != KVPoll.Failed:
+                self.update_status(bootstrap_room, KVPoll.Failed)
 
-            self.update_status(bootstrap_room, KVPoll.Failed)
+        if room_active:
+            logger.debug("Room %s marked Failed via ABORT from decode", bootstrap_room)
+        else:
+            logger.debug(
+                "ABORT for room %s is already complete or not tracked",
+                bootstrap_room,
+            )
 
-        logger.debug("Room %s marked Failed via ABORT from decode", bootstrap_room)
+        self._arm_abort_ack(bootstrap_room, notification)
+
+    def _arm_abort_ack(
+        self,
+        bootstrap_room: int,
+        notification: AbortNotification,
+    ) -> None:
+        if not self.enable_deferred_decode_kv_release:
+            return
+        ack_target: Optional[AckTarget] = notification.deferred_ack_target()
+        if ack_target is None:
+            return
+
+        with self._abort_ack_lock:
+            if self._staging_outstanding.get(bootstrap_room, 0) > 0:
+                self.register_deferred_ack_target(bootstrap_room, ack_target)
+                return
+        self._send_abort_ack(bootstrap_room, ack_target)
 
     def _start_bootstrap_thread(self) -> None:
+        recv = self._make_worker_recv(self.server_socket)
+
         def bootstrap_worker():
-            while True:
+            while not self._stopped:
                 try:
-                    msg = self.server_socket.recv_multipart()
-                    if not msg:
+                    msg = recv()
+                    if msg is None:
                         continue
 
                     tag = msg[0]
-                    if tag == _TAG_ABORT:
+                    if tag == ABORT_TAG:
                         self._handle_abort_message(msg)
                         continue
 
@@ -762,118 +904,117 @@ class MoriKVManager(CommonKVManager):
                     else:
                         self._handle_transfer_message(payload)
                 except Exception:
+                    if self._stopped:
+                        break
                     logger.exception("Bootstrap worker failed")
 
-        threading.Thread(target=bootstrap_worker, daemon=True).start()
-
-    def _cleanup_room_tracking(self, bootstrap_room: int) -> None:
-        bootstrap_addr = self.room_to_bootstrap_addr.pop(bootstrap_room, None)
-        if bootstrap_addr is not None:
-            rooms = self.addr_to_rooms_tracker.get(bootstrap_addr)
-            if rooms is not None:
-                rooms.discard(bootstrap_room)
-                if not rooms:
-                    self.addr_to_rooms_tracker.pop(bootstrap_addr, None)
+        t = threading.Thread(target=bootstrap_worker, daemon=True)
+        t.start()
+        self._worker_threads.append(t)
 
     def _start_decode_thread(self) -> None:
+        recv = self._make_worker_recv(self.server_socket)
+
         def decode_worker():
-            while True:
+            while not self._stopped:
                 try:
-                    msg = self.server_socket.recv_multipart()
+                    msg = recv()
+                    if msg is None:
+                        continue
                     if msg and msg[0] == MoriKVManager.AUX_DATA_HEADER:
                         self._handle_aux_data(msg)
                         continue
+                    if self.handle_abort_ack_message(msg):
+                        continue
 
-                    if not msg or msg[0] != MORI_GUARD:
+                    parsed = self.parse_kv_status_message(msg)
+                    if parsed is None:
                         logger.warning(
                             "Received malformed status message on decode worker"
                         )
                         continue
-                    payload = msg[1:]
-                    if len(payload) < 3:
-                        logger.warning("Incomplete status payload received")
-                        continue
-                    bootstrap_room = int(payload[0].decode("ascii"))
-                    if bootstrap_room not in self.request_status:
-                        logger.debug(
-                            "Dropping late status for cleared room %s",
-                            bootstrap_room,
-                        )
-                        continue
-                    status_code = int(payload[1].decode("ascii"))
-                    prefill_rank = int(payload[2].decode("ascii"))
-                    failure_reason = (
-                        payload[3].decode("utf-8")
-                        if len(payload) > 3 and payload[3]
-                        else None
+                    room, status, prefill_rank, reason = parsed
+                    self.apply_prefill_status(
+                        bootstrap_room=room,
+                        status=status,
+                        prefill_rank=prefill_rank,
+                        failure_reason=reason,
                     )
-
-                    if status_code == KVPoll.Success:
-                        tracker = self.prefill_response_tracker[bootstrap_room]
-                        tracker.add(prefill_rank)
-                        expected = self.required_prefill_response_num_table.get(
-                            bootstrap_room, 1
-                        )
-                        if len(tracker) >= expected:
-                            self.prefill_response_tracker.pop(bootstrap_room, None)
-                            self.update_status(bootstrap_room, KVPoll.Success)
-                            self._cleanup_room_tracking(bootstrap_room)
-                    elif status_code == KVPoll.Failed:
-                        if failure_reason:
-                            self.record_failure(bootstrap_room, failure_reason)
-                        self.prefill_response_tracker.pop(bootstrap_room, None)
-                        self.update_status(bootstrap_room, KVPoll.Failed)
-                        self._cleanup_room_tracking(bootstrap_room)
-                    else:
-                        logger.warning(
-                            "Unknown status code %s received for room %s",
-                            status_code,
-                            bootstrap_room,
-                        )
                 except Exception:
+                    if self._stopped:
+                        break
                     logger.exception("Decode status worker failed")
 
-        threading.Thread(target=decode_worker, daemon=True).start()
+        t = threading.Thread(target=decode_worker, daemon=True)
+        t.start()
+        self._worker_threads.append(t)
 
-    def _compute_prefill_unique_rank(self) -> int:
-        """Unique id per prefill sender, encoding TP/PP/CP ranks.
-        Must match Mooncake's formula so decode's response set size matches
-        expected_response_num when multiple CP ranks participate."""
-        return (
-            self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
-            + self.pp_rank * self.attn_cp_size
-            + self.attn_cp_rank
-        )
+    def teardown(self) -> None:
+        """Stop worker threads and release transport resources so this
+        KVManager can be discarded during a P<->D role switch.
 
-    def notify_decode_status(
-        self,
-        infos: List[TransferInfo],
-        bootstrap_room: int,
-        status: KVPoll,
-        failure_reason: Optional[str] = None,
-    ) -> None:
-        if not infos:
-            return
-        payload = [
-            MORI_GUARD,
-            str(bootstrap_room).encode("ascii"),
-            str(int(status)).encode("ascii"),
-            str(self._compute_prefill_unique_rank()).encode("ascii"),
-            failure_reason.encode("utf-8") if failure_reason else b"",
-        ]
-        for info in infos:
+        The KV cache pool memory is owned by the scheduler and is NOT freed
+        here; only mori-side registrations / sockets / engine are released.
+        """
+        self._stopped = True
+        # Transfer workers (PREFILL role) park in FastQueue.get(), which has no
+        # timeout; push a None sentinel per shard to wake and stop them so the
+        # join below returns instead of leaking the thread.
+        for queue in getattr(self, "_transfer_queues", []):
             try:
-                na = NetworkAddress(info.endpoint, info.dst_port)
-                socket = self._connect_threadsafe(na.to_tcp(), is_ipv6=na.is_ipv6)
-                socket.send_multipart(payload)
+                queue.put(None)
             except Exception:
-                logger.exception(
-                    "Failed to sync status %s to decode endpoint %s:%s for room %s",
-                    status,
-                    info.endpoint,
-                    info.dst_port,
-                    bootstrap_room,
-                )
+                logger.exception("Failed to signal mori transfer worker on teardown")
+        # Drain workers park in Queue.get() the same way. A full queue means a
+        # drainer is stuck in status.Wait(); its join below times out.
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and self.enable_deferred_decode_kv_release
+        ):
+            for _ in range(self._num_shards):
+                try:
+                    self._drain_queue.put_nowait(None)
+                except Full:
+                    break
+        # Join workers before touching their sockets: ZMQ sockets aren't
+        # thread-safe, so don't close server_socket while a worker may poll it.
+        for t in self._worker_threads:
+            t.join(timeout=3.0)
+        self._worker_threads = []
+        # Drop the queues so their buffered tasks/senders are released too.
+        self._transfer_queues = []
+        try:
+            self.server_socket.close(linger=0)
+        except Exception:
+            logger.exception("Failed to close mori server_socket during teardown")
+        # destroy() force-closes every socket in the context (incl. per-thread
+        # cached PUSH sockets); plain term() would block waiting on them.
+        try:
+            self._zmq_ctx.destroy(linger=0)
+        except Exception:
+            logger.exception("Failed to destroy mori zmq context during teardown")
+        # Deregister RDMA memory and drop the IOEngine reference.
+        try:
+            for descs in (self.kv_mem_descs, self.aux_mem_descs):
+                for desc in descs:
+                    try:
+                        self.engine.deregister_memory(desc)
+                    except Exception:
+                        pass
+            for component_descs in self.state_mem_descs:
+                for desc in component_descs:
+                    try:
+                        self.engine.deregister_memory(desc)
+                    except Exception:
+                        pass
+        finally:
+            self.kv_mem_descs = []
+            self.aux_mem_descs = []
+            self.state_mem_descs = []
+            self.engine = None
+        logger.info(
+            "MoriKVManager torn down (was role=%s)", self.disaggregation_mode.value
+        )
 
     def _add_remote_peer(self, register_info: KVArgsRegisterInfo) -> None:
         engine_key = register_info.engine_key
@@ -902,6 +1043,20 @@ class MoriKVManager(CommonKVManager):
         src_k_descs = src_descs[:num_local_layers]
         src_v_descs = src_descs[num_local_layers:]
 
+        # Both peers expose the same PP-local layout. Their descriptor indices
+        # are already aligned, so applying the Prefill rank's global layer
+        # offset would incorrectly index into a local list.
+        if len(src_descs) == len(dst_mem_descs):
+            dst_k_descs = dst_mem_descs[:num_local_layers]
+            dst_v_descs = dst_mem_descs[num_local_layers:]
+            return (
+                src_k_descs,
+                src_v_descs,
+                dst_k_descs,
+                dst_v_descs,
+                num_local_layers,
+            )
+
         start_layer = self.kv_args.prefill_start_layer
         end_layer = start_layer + num_local_layers
         dst_total_layers = len(dst_mem_descs) // 2
@@ -910,8 +1065,18 @@ class MoriKVManager(CommonKVManager):
                 "Destination KV descriptors do not match prefill pp configuration"
             )
         dst_k_descs = dst_mem_descs[start_layer:end_layer]
+        if (
+            num_local_layers < dst_total_layers
+            and dst_total_layers % num_local_layers != 0
+        ):
+            # Decode has draft-model KV while Prefill has target-model KV only:
+            # [K_main..., V_main..., draft_K..., draft_V...].
+            multiplier_ratio = dst_total_layers // num_local_layers
+            dst_v_offset = num_local_layers * multiplier_ratio
+        else:
+            dst_v_offset = dst_total_layers
         dst_v_descs = dst_mem_descs[
-            dst_total_layers + start_layer : dst_total_layers + end_layer
+            dst_v_offset + start_layer : dst_v_offset + end_layer
         ]
         return src_k_descs, src_v_descs, dst_k_descs, dst_v_descs, num_local_layers
 
@@ -920,6 +1085,10 @@ class MoriKVManager(CommonKVManager):
     ) -> tuple[List[MemoryDesc], List[MemoryDesc], int]:
         src_descs = self.kv_mem_descs
         num_local_layers = len(src_descs)
+        # Same-PP peers register matching local descriptor lists.
+        if len(src_descs) == len(dst_mem_descs):
+            return src_descs, dst_mem_descs, num_local_layers
+
         start_layer = self.kv_args.prefill_start_layer
         end_layer = start_layer + num_local_layers
         if end_layer > len(dst_mem_descs):
@@ -948,7 +1117,13 @@ class MoriKVManager(CommonKVManager):
             [plan.sizes],
             [transfer_uid],
         )
+        self._record_submitted_statuses(statuses)
         return statuses
+
+    def _record_submitted_statuses(self, statuses: List[TransferStatus]) -> None:
+        active_statuses = self._submission_local.statuses
+        if active_statuses is not None:
+            active_statuses.extend(statuses)
 
     def _build_contiguous_transfer_plan(
         self, grouped_plan: GroupedIndexPlan, item_len: int
@@ -957,6 +1132,10 @@ class MoriKVManager(CommonKVManager):
         return grouped_plan.materialize(item_len)
 
     def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> TPSliceConfig:
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_head_slice_params,
+        )
+
         page_size = self.kv_args.page_size
 
         src_item_len = self.kv_args.kv_item_lens[0]
@@ -972,27 +1151,21 @@ class MoriKVManager(CommonKVManager):
         if total_kv_heads <= 0:
             total_kv_heads = self.kv_args.kv_head_num * prefill_tp_size
 
-        src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
 
         bytes_per_head_slice = bytes_per_token_dst // dst_heads_per_rank
         if bytes_per_head_slice == 0:
             raise ValueError("Head slice size evaluates to zero")
 
-        src_replication = max(1, prefill_tp_size // total_kv_heads)
-
-        local_tp_rank = self.kv_args.engine_rank % prefill_tp_size
-        dst_tp_rank = peer_info.decode_tp_rank % decode_tp_size
-
-        if prefill_tp_size > decode_tp_size:
-            src_head_start = 0
-            num_heads_to_send = src_heads_per_rank
-            unique_head_idx = local_tp_rank // src_replication
-            dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
-        else:
-            src_head_start = (dst_tp_rank * dst_heads_per_rank) % src_heads_per_rank
-            num_heads_to_send = dst_heads_per_rank
-            dst_head_start = 0
+        src_head_start, num_heads_to_send, dst_head_start, _ = (
+            compute_head_slice_params(
+                prefill_tp_size,
+                decode_tp_size,
+                self.kv_args.engine_rank,
+                peer_info.decode_tp_rank,
+                total_kv_heads,
+            )
+        )
 
         src_head_slice_offset = src_head_start * bytes_per_head_slice
         dst_head_slice_offset = dst_head_start * bytes_per_head_slice
@@ -1083,7 +1256,7 @@ class MoriKVManager(CommonKVManager):
         statuses: List[TransferStatus] = []
         kv_item_len = self.kv_args.kv_item_lens[0]
 
-        if self.is_mla_backend:
+        if self.is_mla_backend or self.is_hybrid_mla_backend:
             src_descs, dst_descs, layers_current_pp_stage = (
                 self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
             )
@@ -1185,11 +1358,13 @@ class MoriKVManager(CommonKVManager):
             remote_offsets.append([dst_aux_index * item_len])
             sizes.append([item_len])
             uids.append(self.engine.allocate_transfer_uid())
-        return list(
+        statuses = list(
             self.engine.batch_write(
                 src_descs, local_offsets, dst_descs, remote_offsets, sizes, uids
             )
         )
+        self._record_submitted_statuses(statuses)
+        return statuses
 
     def send_aux_tcp(
         self,
@@ -1282,6 +1457,11 @@ class MoriKVManager(CommonKVManager):
             )
 
             if st == "mamba":
+                if peer_info.decode_tp_size != self.attn_tp_size and 0 in src_dims:
+                    raise RuntimeError(
+                        "Replicated Mamba PD state transfer currently requires "
+                        "matching prefill/decode attention TP sizes"
+                    )
                 statuses.extend(
                     self._send_mamba_state(
                         peer_info,
@@ -1295,7 +1475,16 @@ class MoriKVManager(CommonKVManager):
                         dst_dims,
                     )
                 )
-            elif st in ("swa", "dsa", "swa_ring", "c128_state", "minimax_index_k"):
+            elif st in (
+                "swa",
+                "dsa",
+                "qsa_pending",
+                "qsa_compressed",
+                "swa_ring",
+                "c128_state",
+                "minimax_index_k",
+                "minimax_dense_kv",
+            ):
                 statuses.extend(
                     self._send_swa_dsa_state(
                         peer_info,
@@ -1398,6 +1587,7 @@ class MoriKVManager(CommonKVManager):
                 [[size]],
                 [transfer_uid],
             )
+            self._record_submitted_statuses(batch_statuses)
             statuses.extend(batch_statuses)
 
         return statuses
@@ -1422,14 +1612,24 @@ class MoriKVManager(CommonKVManager):
                 f"PD state transfer does not support TP-mismatched non-MLA SWA models "
                 f"(prefill_tp_size={self.attn_tp_size}, decode_tp_size={peer_info.decode_tp_size})"
             )
-        if state_type == "minimax_index_k":
+        if state_type in (
+            "qsa_pending",
+            "qsa_compressed",
+            "minimax_index_k",
+            "minimax_dense_kv",
+        ):
             if self.pp_size is not None and self.pp_size > 1:
+                # MORI registration does not exchange state_layer_ids. Compact
+                # sparse-state lists therefore cannot be paired safely across
+                # pipeline stages until that metadata is added to its protocol.
                 raise RuntimeError(
-                    "PD disagg: PP>1 not supported for MiniMax sparse index yet."
+                    f"MORI PD disaggregation requires PP=1 for {state_type}; "
+                    "PP>1 needs peer state_layer_ids for global-layer descriptor "
+                    "pairing."
                 )
             if peer_info.decode_tp_size != self.attn_tp_size:
                 raise RuntimeError(
-                    "PD disagg: heterogeneous TP not supported for MiniMax sparse index yet."
+                    f"PD disagg: heterogeneous TP not supported for {state_type} yet."
                 )
 
         common_len = min(src_state_indices.size, dst_state_indices.size)
@@ -1448,7 +1648,13 @@ class MoriKVManager(CommonKVManager):
             # These components are position- or request-indexed: truncating
             # silently misaligns rows and corrupts KV. Paged swa/dsa tolerate
             # a 1-page drift -> keep truncation.
-            if state_type in ("swa_ring", "c128_state"):
+            if state_type in (
+                "qsa_pending",
+                "qsa_compressed",
+                "swa_ring",
+                "c128_state",
+                "minimax_dense_kv",
+            ):
                 raise RuntimeError(
                     f"{state_type.upper()} state index length mismatch: "
                     f"src={src_state_indices.size}, dst={dst_state_indices.size}"
@@ -1507,21 +1713,20 @@ class MoriKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[npt.NDArray[np.int32]]] = None,
-    ) -> Tuple[List[TransferStatus], Optional[List[TransferInfo]]]:
+    ) -> List[TransferStatus]:
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
 
         if (
             bootstrap_room not in self.request_status
             or self.request_status.get(bootstrap_room) == KVPoll.Failed
         ):
-            return [], None
+            return []
 
         targets: List[TransferTarget] = []
-        target_infos_snapshot: Optional[List[TransferInfo]] = None
         with self.transfer_lock:
             current = self.request_status.get(bootstrap_room)
             if current is None or current == KVPoll.Failed:
-                return [], None
+                return []
 
             transfer_infos = self.transfer_infos.get(bootstrap_room)
             if not transfer_infos:
@@ -1537,52 +1742,41 @@ class MoriKVManager(CommonKVManager):
                         f"Peer info missing for engine {info.engine_key}"
                     )
                 targets.append(TransferTarget(info=info, peer_info=peer_info))
-            if is_last_chunk:
-                target_infos_snapshot = list(transfer_infos.values())
 
         result_statuses: List[TransferStatus] = []
-        try:
-            for target in targets:
-                info = target.info
-                peer_info = target.peer_info
+        for target in targets:
+            info = target.info
+            peer_info = target.peer_info
 
-                if not info.is_dummy:
-                    dst_indices_chunk = info.dst_kv_indices[index_slice]
-                    result_statuses.extend(
-                        self.send_kvcache(peer_info, kv_indices, dst_indices_chunk)
+            if not info.is_dummy:
+                dst_indices_chunk = info.dst_kv_indices[index_slice]
+                result_statuses.extend(
+                    self.send_kvcache(peer_info, kv_indices, dst_indices_chunk)
+                )
+
+            if (
+                is_last_chunk
+                and state_indices is not None
+                and not info.is_dummy
+                and self.state_mem_descs
+            ):
+                result_statuses.extend(
+                    self.send_state(peer_info, state_indices, info.dst_state_indices)
+                )
+
+            if (
+                is_last_chunk
+                and aux_index is not None
+                and info.dst_aux_index >= 0
+                and self.pp_group.is_last_rank
+            ):
+                result_statuses.extend(
+                    self.send_aux(
+                        peer_info, aux_index, info.dst_aux_index, bootstrap_room
                     )
+                )
 
-                if (
-                    is_last_chunk
-                    and state_indices is not None
-                    and not info.is_dummy
-                    and self.state_mem_descs
-                ):
-                    result_statuses.extend(
-                        self.send_state(
-                            peer_info, state_indices, info.dst_state_indices
-                        )
-                    )
-
-                if (
-                    is_last_chunk
-                    and aux_index is not None
-                    and info.dst_aux_index >= 0
-                    and self.pp_group.is_last_rank
-                ):
-                    result_statuses.extend(
-                        self.send_aux(
-                            peer_info, aux_index, info.dst_aux_index, bootstrap_room
-                        )
-                    )
-        except Exception as e:
-            logger.exception(
-                "Mori KV transfer submission failed for bootstrap_room=%s",
-                bootstrap_room,
-            )
-            raise RuntimeError(f"Transfer submission failed: {e}") from e
-
-        return result_statuses, target_infos_snapshot
+        return result_statuses
 
 
 class MoriKVSender(CommonKVSender):
@@ -1591,16 +1785,12 @@ class MoriKVSender(CommonKVSender):
         mgr: MoriKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
-        dest_tp_ranks: List[int],
-        pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ):
         super().__init__(
             mgr,
             bootstrap_addr,
             bootstrap_room,
-            dest_tp_ranks,
-            pp_rank,
             req_has_disagg_prefill_dp_rank,
         )
         self.conclude_state: Optional[KVPoll] = None
@@ -1672,9 +1862,11 @@ class MoriKVSender(CommonKVSender):
         return status
 
     def clear(self) -> None:
-        super().clear()
-        with self.kv_mgr._room_notify_lock:
-            self.kv_mgr._room_status_notified.pop(self.bootstrap_room, None)
+        if self.kv_mgr.enable_deferred_decode_kv_release:
+            with self.kv_mgr._abort_ack_lock:
+                super().clear()
+        else:
+            super().clear()
 
     def failure_exception(self):
         if self.conclude_state is None:
@@ -1693,7 +1885,6 @@ class MoriKVSender(CommonKVSender):
 
 
 class MoriKVReceiver(CommonKVReceiver):
-
     def __init__(
         self,
         mgr: MoriKVManager,
@@ -1708,9 +1899,6 @@ class MoriKVReceiver(CommonKVReceiver):
         prefill_dp_rank: int,
     ):
         super().init(prefill_dp_rank)
-        if self.bootstrap_room is None:
-            return
-        self.kv_mgr.room_to_bootstrap_addr[self.bootstrap_room] = self.bootstrap_addr
 
     def _register_kv_args(self) -> bool:
         if self.bootstrap_infos is None:
@@ -1838,7 +2026,6 @@ class MoriKVReceiver(CommonKVReceiver):
         if self.bootstrap_room is None:
             return
         super().clear()
-        self.kv_mgr._cleanup_room_tracking(self.bootstrap_room)
 
     def failure_exception(self):
         if self.conclude_state is None:

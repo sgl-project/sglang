@@ -81,6 +81,8 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLModelOutputWithPast,
 )
 
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
+
 logger = logging.getLogger(__name__)
 
 
@@ -911,6 +913,7 @@ class Qwen2_5_VLModel(nn.Module):
         video_embeds = torch.split(video_embeds, split_sizes)
         return video_embeds
 
+    @cached_conditioning
     def get_image_features(
         self,
         pixel_values: torch.FloatTensor,
@@ -1329,7 +1332,9 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
         eos_token_ids = (
             []
             if eos_token_id is None
-            else [eos_token_id] if isinstance(eos_token_id, int) else list(eos_token_id)
+            else [eos_token_id]
+            if isinstance(eos_token_id, int)
+            else list(eos_token_id)
         )
         if pad_token_id is None:
             raise ValueError("pad_token_id must be set for generation")
