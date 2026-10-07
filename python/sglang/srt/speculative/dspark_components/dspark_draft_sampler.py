@@ -170,7 +170,7 @@ class DsparkDraftSampler:
         if self._markov_walker is not None and self._markov_walker.supports(bs):
             draft_tokens = self._walk_int8(base_logits=base_logits, anchor=anchor)
         else:
-            draft_tokens = self._walk_stock(
+            draft_tokens = self._walk_default(
                 base_logits=base_logits, anchor=anchor, sample_hidden=sample_hidden
             )
         if self.confidence_out is not None:
@@ -204,7 +204,7 @@ class DsparkDraftSampler:
             corrected_out=corrected,
         )
 
-    def _walk_stock(self, *, base_logits, anchor, sample_hidden) -> torch.Tensor:
+    def _walk_default(self, *, base_logits, anchor, sample_hidden) -> torch.Tensor:
         bs = base_logits.shape[0]
         # Fused greedy fast path: only valid for the greedy (non-sampling) fold.
         # Gated/RNN subclasses return None (hidden-state-dependent bias); fall
@@ -372,7 +372,7 @@ def maybe_build_draft_sampler(
 def log_int8_markov_walk_off(*, tp_rank: int, reason: str) -> None:
     if tp_rank == 0:
         logger.warning(
-            "SGLANG_DSPARK_OPT_INT8_MARKOV_WALK ignored, the draft keeps the stock "
+            "SGLANG_DSPARK_OPT_INT8_MARKOV_WALK ignored, falling back to the default "
             "markov walk (reason=%s).",
             reason,
         )
@@ -381,7 +381,7 @@ def log_int8_markov_walk_off(*, tp_rank: int, reason: str) -> None:
 def _int8_markov_walk_unsupported_reason(
     *, draft_model, gamma: int, tp_size: int, device
 ) -> Optional[str]:
-    """None when the int8 kernels compute this drafter's stock walk, up to the
+    """None when the int8 kernels compute this drafter's default walk, up to the
     int8 weights and bf16 rounding."""
     if tp_size > 1:
         return f"tp_size={tp_size}, the kernels run on a single rank"
@@ -458,7 +458,7 @@ def _attach_int8_markov_walker(
     if tp_rank == 0:
         logger.info(
             "DSpark int8 markov walk on: kernels %s for bs <= %d (larger graph "
-            "buckets keep the stock walk), gamma=%d, %.0f MiB resident, ready "
+            "buckets keep the default walk), gamma=%d, %.0f MiB resident, ready "
             "in %.1f s.",
             "wgmma" if walker.weights.big_vocab else "single/small_batch/wgmma",
             walker.max_bs,

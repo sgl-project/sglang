@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused int8 DSpark markov walk for a vanilla markov head (rank 256) on Hopper.
 
-One persistent cooperative launch per round replaces the stock walk's gamma x
+One persistent cooperative launch per round replaces the default walk's gamma x
 (W2 GEMV + add + sample) launches (``jit/csrc/speculative/dspark_markov_walk_*``)::
 
     prev = anchor
@@ -12,7 +12,7 @@ One persistent cooperative launch per round replaces the stock walk's gamma x
 
 W2 is int8 with one fp32 scale per row and W1[prev] two int8 planes
 u ~= s_hi q_hi + s_lo q_lo with s_lo = s_hi / 256, so near-ties can differ from
-the stock walk on the bf16 weights. The logits are rounded to bf16 once; argmax
+the default walk on the bf16 weights. The logits are rounded to bf16 once; argmax
 and sampler read exactly those values, and ``corrected_out`` receives exactly
 those bits, which is what the verifier rebuilds q = softmax(corrected / T) from.
 
@@ -542,7 +542,9 @@ class MarkovWalker:
         so the kernel choice is fixed per captured graph bucket."""
         bs, steps, vocab = base_logits.shape
         if not self.supports(bs):
-            raise ValueError(f"bs {bs} outside [1, {self.max_bs}]: use the stock walk")
+            raise ValueError(
+                f"bs {bs} outside [1, {self.max_bs}]: use the default walk"
+            )
         if steps != self.gamma or vocab != self.vocab:
             raise ValueError(
                 f"base_logits {tuple(base_logits.shape)} != "

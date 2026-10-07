@@ -140,7 +140,7 @@ class TestDSparkInt8MarkovWalk(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         prompts = _prompts()
-        cls.stock_greedy, cls.stock_accept_length, cls.stock_log = _serve(
+        cls.default_greedy, cls.default_accept_length, cls.default_log = _serve(
             int8_walk=False, prompts=prompts
         )
         cls.walk_greedy, cls.walk_accept_length, cls.walk_log = _serve(
@@ -148,26 +148,28 @@ class TestDSparkInt8MarkovWalk(CustomTestCase):
         )
 
     def test_walker_attached_to_folded_graph(self):
-        """Guards the identity test against a silent fallback to the stock walk."""
+        """Guards the identity test against a silent fallback to the default walk."""
         self.assertIn(WALK_ON_LOG, self.walk_log)
-        self.assertNotIn(WALK_ON_LOG, self.stock_log)
+        self.assertNotIn(WALK_ON_LOG, self.default_log)
         self.assertIn(FOLDED_LOG, self.walk_log)
-        self.assertIn(FOLDED_LOG, self.stock_log)
+        self.assertIn(FOLDED_LOG, self.default_log)
 
-    def test_greedy_output_matches_stock(self):
+    def test_greedy_output_matches_default(self):
         """Lossless: the int8 draft may differ at near-ties, the output may not."""
         mismatches = [
             i
-            for i, (stock, walk) in enumerate(zip(self.stock_greedy, self.walk_greedy))
-            if stock != walk
+            for i, (expected, walk) in enumerate(
+                zip(self.default_greedy, self.walk_greedy)
+            )
+            if expected != walk
         ]
         self.assertEqual(mismatches, [])
 
     def test_mixed_sampling_accept_length(self):
         """The verifier rebuilds q from corrected_out; a q that is not the sampled
         distribution moves the sampling accept length far either way."""
-        print(f"{self.stock_accept_length=:.3f} {self.walk_accept_length=:.3f}")
-        ratio = self.walk_accept_length / self.stock_accept_length
+        print(f"{self.default_accept_length=:.3f} {self.walk_accept_length=:.3f}")
+        ratio = self.walk_accept_length / self.default_accept_length
         self.assertLess(abs(ratio - 1.0), 0.1)
 
 
