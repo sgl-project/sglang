@@ -1619,9 +1619,10 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        # Pass the full array with a raw-token cap (limit) instead of slicing,
-        # avoiding an O(context) copy per prefill-batch build.
+        # Keep the full array to avoid an O(context) copy during prefill.
         token_ids_to_match = self.full_untruncated_fill_ids
+        # Compute the maximum number of reusable KV rows first. The cache may
+        # need a different raw-token limit to prove those rows during matching.
         key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
 
         # SWA lives in a per-request ring that's not content-stable and is never
@@ -1657,8 +1658,9 @@ class Req(ReqDllmMixin):
                 and get_disagg().disaggregation_mode == DisaggregationMode.NULL.value
                 and not get_spec().enable_multi_layer_eagle
             ):
-                # Execution caps count KV rows; bigram matching additionally
-                # reads the final row's successor without reusing that token.
+                # Convert the reusable-KV-row cap to the raw-token limit consumed by
+                # RadixKey. Bigram matching needs one successor token to prove the
+                # final reusable row.
                 # Multi-layer draft dependencies need a separate proof contract.
                 key_limit = tree_cache.get_match_key_raw_token_limit(
                     max_reusable_kv_rows=key_limit

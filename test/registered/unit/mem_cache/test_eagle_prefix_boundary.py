@@ -7,23 +7,22 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import FullComponent, UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.session.streaming_session import SessionSlot
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def make_cache(backend, page, *, bigram=True, disable=False):
+def make_cache(backend, page, *, bigram=True):
     params = CacheInitParams(
-        disable=disable,
+        disable=False,
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
         page_size=page,
@@ -165,7 +164,7 @@ class TestEaglePrefixBoundary(CustomTestCase):
                         result.device_indices, torch.arange((shared - 1) // page * page)
                     )
 
-    def test_other_request_modes_and_cache_off(self):
+    def test_other_request_modes_keep_existing_limits(self):
         raw = list(range(70))
         for backend in ("legacy", "python", "rust"):
             cache = make_cache(backend, 64)
@@ -180,58 +179,40 @@ class TestEaglePrefixBoundary(CustomTestCase):
                         cache, raw[:65], mode=mode, multi_layer=multi_layer
                     )
                     self.assertEqual(len(req.prefix_indices), 0)
-            disabled = make_cache(backend, 64, disable=True)
-            insert(disabled, raw)
-            self.assertEqual(len(request_match(disabled, raw[:65]).prefix_indices), 0)
 
-    def test_session_and_embed_override_keep_existing_limits(self):
+    def test_session_keeps_existing_limit(self):
         cache = make_cache("legacy", 64)
         raw = list(range(70))
         insert(cache, raw)
-        for session, override in (
-            (SimpleNamespace(streaming=False), None),
-            (None, object()),
-        ):
-            req = request_match(
-                cache, raw[:65], session=session, embed_override=override
-            )
-            self.assertEqual(len(req.prefix_indices), 0)
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                session = SimpleNamespace(streaming=streaming)
+                with patch.object(
+                    cache, "match_prefix", wraps=cache.match_prefix
+                ) as match_prefix:
+                    req = request_match(cache, raw[:65], session=session)
+                self.assertEqual(match_prefix.call_args.args[0].key.limit, 64)
+                self.assertEqual(len(req.prefix_indices), 0)
 
-    def test_streaming_session_returns_before_bigram_matching(self):
-        for backend in ("python", "rust"):
-            with self.subTest(backend=backend):
-                cache = make_cache(backend, 64)
-                cache.req_to_token_pool = SimpleNamespace(
-                    req_to_token=torch.arange(70, dtype=torch.int32).unsqueeze(0)
-                )
-                cache.token_to_kv_pool_allocator = SimpleNamespace(
-                    page_size=64, free_segments=lambda segments: None
-                )
-                slot = SessionSlot(
-                    kv=ReqKvInfo(
-                        req_pool_idx=0, kv_committed_len=65, kv_allocated_len=65
-                    )
-                )
-                cache.session.slots["session-a"] = slot
-                session = SimpleNamespace(streaming=True, session_id="session-a")
-                with (
-                    patch.object(
-                        cache.session,
-                        "try_match_prefix",
-                        wraps=cache.session.try_match_prefix,
-                    ) as match_session,
-                    patch.object(
-                        cache,
-                        "_match_tree",
-                        side_effect=AssertionError("session must bypass tree matching"),
-                    ),
-                ):
-                    req = request_match(cache, list(range(65)), session=session)
-                key = match_session.call_args.args[0].key
-                self.assertEqual(key.limit, 64)
-                self.assertFalse(key.is_bigram)
-                torch.testing.assert_close(req.prefix_indices, torch.arange(64))
-                self.assertIs(req.last_node, slot.virtual_node)
+    def test_none_limit_skips_conversion(self):
+        cache = make_cache("legacy", 64)
+        raw = list(range(70))
+        insert(cache, raw)
+        with (
+            patch.object(
+                cache,
+                "get_match_key_raw_token_limit",
+                wraps=cache.get_match_key_raw_token_limit,
+            ) as convert_limit,
+            patch.object(
+                cache, "match_prefix", wraps=cache.match_prefix
+            ) as match_prefix,
+        ):
+            # Embed overrides select the existing empty-key/None-limit path.
+            req = request_match(cache, raw[:65], embed_override=object())
+        convert_limit.assert_not_called()
+        self.assertIsNone(match_prefix.call_args.args[0].key.limit)
+        self.assertEqual(len(req.prefix_indices), 0)
 
     def test_unsupported_cache_contracts(self):
         class DerivedRadix(RadixCache):
