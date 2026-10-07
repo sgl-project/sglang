@@ -98,7 +98,7 @@ def make_dsa_indexer_pool_decl(
     pool: DSATokenToKVPool, *, name: PoolName = PoolName.INDEXER
 ) -> HostPoolDecl:
     """Index key buffers riding on the full-KV pages: indices and layout both follow KV."""
-    index_page_bytes = pool.slots_per_page * dsa_indexer_bytes_per_token_per_layer(
+    index_page_bytes = pool.index_page_size * dsa_indexer_bytes_per_token_per_layer(
         index_head_dim=pool.index_head_dim,
         quant_block_size=pool.quant_block_size,
     )

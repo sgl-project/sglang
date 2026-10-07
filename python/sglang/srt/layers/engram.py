@@ -247,6 +247,11 @@ class EngramHasher(nn.Module):
         self.image_token_id: Optional[int] = None
         self.history: Optional[torch.Tensor] = None
         self.pad_row = 0
+        # typing only
+        self.token_map: torch.Tensor
+        self.multipliers: torch.Tensor
+        self.primes: torch.Tensor
+        self.offsets: torch.Tensor
 
     def init_history(self, num_req_slots: int, device) -> None:
         """Allocate oldest-first history with a spare row for graph padding."""

@@ -1245,13 +1245,13 @@ class USPAttention(nn.Module):
             if get_ring_parallel_world_size() > 1:
                 if (
                     meta_only_pad
-                    and q.shape[0] == 1
                     and self.backend == AttentionBackendEnum.FA
+                    and not self.causal
                 ):
                     return self._forward_ring_tail_pad(q, k, v, attn_mask_meta)
                 raise NotImplementedError(
                     "USPAttention masked path supports ring parallelism only "
-                    "for batch-1 tail-pad metadata on the FA backend."
+                    "for non-causal tail-pad metadata on the FA backend."
                 )
             if attn_mask is not None and attn_mask.dim() != 2:
                 raise NotImplementedError(
@@ -1505,15 +1505,15 @@ class USPAttention(nn.Module):
             attn_impl=self.attn_impl,
             real_seq_len=int(attn_mask_meta["pad_start"]),
             ring_ws=get_ring_parallel_world_size(),
-        )
+        ).reshape_as(q)
         # Match the Ulysses tail path: masked query rows read as zeros. This
         # rank's chunk covers global rows [rank*chunk, (rank+1)*chunk).
         pad_from = (
-            int(attn_mask_meta["pad_start"]) - get_ring_parallel_rank() * out.shape[0]
+            int(attn_mask_meta["pad_start"]) - get_ring_parallel_rank() * out.shape[1]
         )
-        if pad_from < out.shape[0]:
-            out[max(pad_from, 0) :].zero_()
-        return _usp_output_all_to_all(out.unsqueeze(0), head_dim=2)
+        if pad_from < out.shape[1]:
+            out[:, max(pad_from, 0) :].zero_()
+        return _usp_output_all_to_all(out, head_dim=2)
 
     @staticmethod
     def _gather_sharded_sequence(
