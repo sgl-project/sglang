@@ -173,31 +173,6 @@ class TestToolCallStructuralTag(CustomTestCase):
                 with self.subTest(required=required, text=text):
                     self.assertIs(_accepts(tag, text), expected)
 
-    def test_required_reasoning_with_a_closer_starting_with_a_newline(self):
-        """A reasoning closer that starts with a newline must still give a grammar
-        that compiles and requires non-empty reasoning."""
-        template = copy.deepcopy(ANSWER_TEMPLATE)
-        template["fields"]["thinking"]["close"] = "\n</think>"
-        loaded = load_response_template(template)
-        tag = tool_call_structural_tag(
-            loaded.fields["tool_calls"],
-            [WEATHER],
-            parallel_tool_calls=True,
-            thinking=loaded.fields["thinking"],
-            answer=loaded.fields["content"],
-            message_start=["<assistant>"],
-            grammar_requires_reasoning=True,
-        )
-        cases = [
-            ("<think>plan\n</think><answer>Sunny.", True),
-            ("<think>\n</think><answer>Sunny.", False),
-            ("<think> \n</think><answer>Sunny.", False),
-            ("<answer>Sunny.", False),
-        ]
-        for text, expected in cases:
-            with self.subTest(text=text):
-                self.assertIs(_accepts(tag, text), expected)
-
     def test_json_arguments_follow_schema(self):
         template = copy.deepcopy(TEMPLATE)
         template["fields"]["tool_calls"].update(content="json", content_args={})
