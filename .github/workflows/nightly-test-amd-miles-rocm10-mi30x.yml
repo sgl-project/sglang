@@ -37,7 +37,7 @@ jobs:
             # Single-request decode of Qwen3.8-27B-FP8 runs at ~20 tok/s on MI300X, so long
             # generations outlast the test client's 180 s request timeout.
             skip_tests: tests/e2e/sglang/test_session_server_multi_role/test_qwen38small.py
-          # The 4-GPU suite takes ~155 min on MI355X and over 180 min on MI300X.
+          # The 4- and 8-GPU suites run past 180 min on MI300X; they take ~155 and ~112 min on MI355X.
           - suite: nightly-stage-c-4-gpu-mi350
             runner: linux-mi300-4gpu-sglang
             timeout: 300
@@ -45,7 +45,7 @@ jobs:
             skip_tests: tests/e2e/megatron/model_scripts/test_glm5_2_744b_a40b_5layer_ci.py
           - suite: nightly-stage-c-8-gpu-mi350
             runner: linux-mi300-8gpu-sglang
-            timeout: 180
+            timeout: 300
             skip_tests: ""
     runs-on: ${{ matrix.runner }}
     steps:
