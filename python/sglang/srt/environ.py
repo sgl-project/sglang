@@ -1008,6 +1008,22 @@ class Envs:
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
     # Let aiter plan the KV splits for the asm persistent MLA decode.
     SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
+    # gfx950 fp8 PS-ASM prefill memory-faults for 12-head zero-pad models.
+    # Set to 1 to opt into the 12->16 padded ASM prefill path anyway.
+    SGLANG_AITER_MLA_ZERO_PAD_FP8_PREFILL = EnvBool(False)
+    # gfx950 MLA prefill whose head shape FlyDSL FP8 FMHA can serve
+    # (Kimi-K3 TP8 is 12 heads, QK 192, V 128). Quantize the bf16 Q/K/V
+    # and run that kernel instead of the bf16 opus varlen kernel. The
+    # 12-head PS-ASM pad stays off while this is on.
+    SGLANG_AITER_MLA_FLYDSL_FP8_PREFILL = EnvBool(True)
+    # Fail initialization or a declined launch instead of silently using bf16
+    # FMHA. Intended for benchmark recipes that require FlyDSL provenance.
+    SGLANG_AITER_MLA_FLYDSL_FP8_PREFILL_REQUIRED = EnvBool(False)
+    # For an MXFP4 kv_b_proj on the prefix-prefill path, fuse projection,
+    # K/V split, RoPE concat, and the cast to FP8. FlyDSL then consumes those
+    # unit-scale FP8 K/V tensors directly instead of materializing BF16 K/V
+    # and scanning both tensors again for dynamic per-tensor quantization.
+    SGLANG_AITER_MLA_FLYDSL_FUSED_KV_PROJ = EnvBool(False)
     # Run gfx942 block-FP8 linears with the AITER CK blockscale GEMM instead of Triton.
     SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK = EnvBool(False)
 
