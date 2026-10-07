@@ -128,6 +128,16 @@ const TASKS: &[&str] = &[
 
 const EFFORT_TIERS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
+/// `ChatCompletionMessageGenericParam` roles, matched case-insensitively.
+const GENERIC_ROLES: &[&str] = &[
+    "system",
+    "assistant",
+    "tool",
+    "function",
+    "developer",
+    "latest_reminder",
+];
+
 /// Lower a chat body into a `/generate` body, as
 /// `OpenAIServingChat._convert_to_internal_request` does. `render` returns the
 /// prompt's token ids for the body as sent, or `None` when it cannot.
@@ -336,6 +346,9 @@ fn validate(
     if request.messages.is_empty() || request.n < 1 {
         return invalid;
     }
+    if !request.messages.iter().all(valid_message) {
+        return invalid;
+    }
     if request
         .chat_template_kwargs
         .as_ref()
@@ -364,6 +377,65 @@ fn validate(
     }
     format_json_schema(request.response_format.as_ref())?;
     Ok(())
+}
+
+/// Whether Pydantic accepts `message` as a `ChatCompletionMessageParam` with
+/// text-only content. The renderer drops content parts it does not know, so
+/// any other message goes to the engine, which validates it as Python does.
+fn valid_message(message: &Value) -> bool {
+    let Some(message) = message.as_object() else {
+        return false;
+    };
+    let text_content = |content: &Value| match content {
+        Value::String(_) => true,
+        Value::Array(parts) => parts
+            .iter()
+            .all(|part| part["type"] == "text" && part["text"].is_string()),
+        _ => false,
+    };
+    match message.get("role").and_then(Value::as_str) {
+        // `ChatCompletionMessageUserParam`: the role is case-sensitive and content is required.
+        Some("user") => message.get("content").is_some_and(text_content),
+        Some(role) if GENERIC_ROLES.contains(&role.to_lowercase().as_str()) => {
+            optional(message, "content", text_content)
+                && optional(message, "name", Value::is_string)
+                && optional(message, "tool_call_id", Value::is_string)
+                && optional(message, "reasoning_content", Value::is_string)
+                && optional(message, "phase", |p| {
+                    p == "commentary" || p == "final_answer"
+                })
+                && optional(message, "tool_calls", |calls| {
+                    calls
+                        .as_array()
+                        .is_some_and(|calls| calls.iter().all(valid_tool_call))
+                })
+        }
+        _ => false,
+    }
+}
+
+/// `ToolCall`: `type` defaults to `"function"` but is not nullable.
+fn valid_tool_call(call: &Value) -> bool {
+    let Some(call) = call.as_object() else {
+        return false;
+    };
+    optional(call, "id", Value::is_string)
+        && optional(call, "index", |i| i.is_i64() || i.is_u64())
+        && call.get("type").is_none_or(|t| t == "function")
+        && call
+            .get("function")
+            .and_then(Value::as_object)
+            .is_some_and(|function| {
+                optional(function, "name", Value::is_string)
+                    && optional(function, "arguments", |a| a.is_string() || a.is_object())
+            })
+}
+
+/// An `Optional[...]` field: absent, null, or `valid`.
+fn optional(object: &Map<String, Value>, key: &str, valid: impl Fn(&Value) -> bool) -> bool {
+    object
+        .get(key)
+        .is_none_or(|value| value.is_null() || valid(value))
 }
 
 fn generate_body(
@@ -763,5 +835,66 @@ impl ChatResponder {
         id.as_u64()
             .and_then(|id| self.tokenizer.as_ref()?.byte_level_bytes(id as u32))
             .unwrap_or_else(|| text.as_bytes().to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reason `messages` is not lowered, with a renderer that accepts anything.
+    fn unsupported(messages: Value) -> Option<&'static str> {
+        let body = serde_json::to_vec(&json!({"model": "m", "messages": messages})).unwrap();
+        let render = |_: &Value| Some(vec![1]);
+        let settings = OpenAiSettings::default();
+        lower_chat(
+            &body,
+            &OpenAiHeaders::default(),
+            &settings,
+            &ChatModel::default(),
+            render,
+            None,
+        )
+        .err()
+        .map(|reason| reason.0)
+    }
+
+    #[test]
+    fn messages_python_rejects_go_to_the_engine() {
+        for messages in [
+            json!([{"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "file", "file": {"file_id": "f"}}]}]),
+            json!([{"role": "user"}]),
+            json!([{"role": "user", "content": null}]),
+            json!([{"role": "USER", "content": "hi"}]),
+            json!([{"role": "bot", "content": "hi"}]),
+            json!([{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]),
+            json!([{"role": "user", "content": [{"type": "text"}]}]),
+            json!([{"role": "user", "content": 1}]),
+            json!(["hi"]),
+            json!([{"role": "assistant", "content": "a", "name": 1}]),
+            json!([{"role": "assistant", "content": "a", "phase": "draft"}]),
+            json!([{"role": "assistant", "content": null, "tool_calls": [{"function": null}]}]),
+            json!([{"role": "assistant", "content": null, "tool_calls": [{"type": null, "function": {}}]}]),
+            json!([{"role": "assistant", "content": null, "tool_calls": [{"function": {"arguments": 1}}]}]),
+        ] {
+            assert_eq!(
+                unsupported(messages.clone()),
+                Some("invalid_request"),
+                "{messages}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_messages_are_lowered() {
+        let messages = json!([
+            {"role": "System", "content": "be brief"},
+            {"role": "user", "content": [{"type": "text", "text": "hi"}], "name": 1},
+            {"role": "assistant", "content": null, "phase": null, "tool_calls": [
+                {"id": "c", "index": 0, "type": "function", "function": {"name": "f", "arguments": {}}}
+            ]},
+            {"role": "tool", "content": "42", "tool_call_id": "c"},
+        ]);
+        assert_eq!(unsupported(messages), None);
     }
 }

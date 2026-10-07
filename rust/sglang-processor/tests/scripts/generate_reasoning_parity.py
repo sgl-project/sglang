@@ -33,8 +33,12 @@ def split(parser, force, stream, chunks):
 for path in sorted(FIXTURES.glob("*.json")):
     fixture = json.loads(path.read_text())
     fixture["cases"] = [
-        {"chunks": case["chunks"], "force": force, "stream": stream,
-         **split(fixture["parser"], force, stream, case["chunks"])}
+        {
+            "chunks": case["chunks"],
+            "force": force,
+            "stream": stream,
+            **split(fixture["parser"], force, stream, case["chunks"]),
+        }
         for case in fixture["inputs"]
         for force in (True, False)
         for stream in (True, False)
