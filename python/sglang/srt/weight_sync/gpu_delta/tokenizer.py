@@ -41,27 +41,44 @@ class GpuDeltaTokenizerControl:
         ):
             try:
                 if isinstance(obj, UpdateWeightsFromGpuDeltaReqInput):
-                    return await self._load(obj.manifest_path, obj.release_state)
+                    return await self._load(obj)
                 return await self._clear()
             except Exception as exc:
                 return {"success": False, "message": str(exc), "participants": []}
-        if isinstance(obj, (ApplyGpuDeltaReqInput, ResumeGpuDeltaReqInput)):
+        if isinstance(obj, ApplyGpuDeltaReqInput):
+            result, _ = await self._apply(obj)
+            return result
+        if isinstance(obj, ResumeGpuDeltaReqInput):
             async with self.manager.is_pause_cond:
-                if isinstance(obj, ApplyGpuDeltaReqInput):
-                    self.manager.is_pause = True
                 result = await self._request(obj)
-                if isinstance(obj, ResumeGpuDeltaReqInput) and result["success"]:
+                if result["success"]:
                     self.manager._update_weight_version_if_provided(
                         str(result["participants"][0]["target_version"])
                     )
-                    self.manager.is_pause = False
-                    self.manager.is_pause_cond.notify_all()
+                    if not obj.keep_pause:
+                        self.manager.is_pause = False
+                        self.manager.is_pause_cond.notify_all()
                 return result
         # Preparation/status do not gate generation or acquire its writer lock.
         return await self._request(obj)
 
-    async def _load(self, manifest_path, release_state):
-        path = Path(manifest_path).resolve(strict=True)
+    async def _apply(self, obj):
+        async with self.manager.is_pause_cond:
+            was_paused = self.manager.is_pause
+            self.manager.is_pause = True
+            if obj.abort_all_requests:
+                self.manager.abort_request(abort_all=True)
+            result = await self._request(obj)
+            if (
+                result["success"]
+                and obj.flush_cache
+                and self.manager.mm_processor is not None
+            ):
+                self.manager.mm_processor.clear_preprocess_cache()
+            return result, was_paused
+
+    async def _load(self, obj):
+        path = Path(obj.manifest_path).resolve(strict=True)
         content = await asyncio.to_thread(path.read_bytes)
         manifest = orjson.loads(content)
         if manifest["base_version"] != 0:
@@ -101,13 +118,21 @@ class GpuDeltaTokenizerControl:
         if not result["success"]:
             await self._request(AbortGpuDeltaReqInput(session_id=session_id))
             return result
-        result = await self.request(ApplyGpuDeltaReqInput(session_id=session_id))
+        result, was_paused = await self._apply(
+            ApplyGpuDeltaReqInput(
+                session_id=session_id,
+                flush_cache=obj.flush_cache,
+                abort_all_requests=obj.abort_all_requests,
+            ),
+        )
         if not result["success"]:
             return result
-        result = await self.request(ResumeGpuDeltaReqInput(session_id=session_id))
+        result = await self.request(
+            ResumeGpuDeltaReqInput(session_id=session_id, keep_pause=was_paused)
+        )
         if not result["success"]:
             return result
-        return await self._clear() if release_state else result
+        return await self._clear() if obj.release_state else result
 
     async def _prepare(self, request):
         result = await self._request(request)

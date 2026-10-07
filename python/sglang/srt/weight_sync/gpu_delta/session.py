@@ -172,7 +172,7 @@ class DeltaSession:
         self,
         fence: Callable[[], None],
         retract: Callable[[], None],
-        flush: Callable[[], bool],
+        flush: Callable[[], bool] | None,
     ) -> dict:
         with self._lock:
             session = self._session
@@ -185,7 +185,7 @@ class DeltaSession:
             session.reader_fence_completed_ns = time.monotonic_ns()
             # Never reclaim KV after a failed reader fence.
             retract()
-            if not flush():
+            if flush is not None and not flush():
                 raise ValueError("cache flush failed before delta mutation")
             result = session.prepared.apply()
         except Exception as exc:
@@ -198,13 +198,15 @@ class DeltaSession:
             session.state = "APPLIED"
             return self.status()
 
-    def resume(self, resume: Callable[[int], None]) -> dict:
+    def resume(self, resume: Callable[[int], None], keep_pause: bool = False) -> dict:
         with self._lock:
             session = self._session
             self.version = session.request["target_version"]
             session.state = "RESUMING"
             resume(self.version)
-            session.resumed_ns = time.monotonic_ns()
+            # Version commit does not end a pause retained by the caller.
+            if not keep_pause:
+                session.resumed_ns = time.monotonic_ns()
             session.state = "RESUMED"
             prepared, session.prepared = session.prepared, None
             # Keep host release I/O off the scheduler; this FIFO executor runs
@@ -415,21 +417,25 @@ class GpuDeltaSchedulerControl:
                     lambda: self.scheduler.pause_generation(
                         io.PauseGenerationReqInput(mode="retract")
                     ),
-                    lambda: self.scheduler.flush_cache(empty_cache=False),
+                    (lambda: self.scheduler.flush_cache(empty_cache=False))
+                    if request.flush_cache
+                    else None,
                 )
             elif isinstance(request, delta_io.ResumeGpuDeltaReqInput):
 
                 def resume(version):
                     self.scheduler.record_weight_version_change(str(version))
-                    self.scheduler.continue_generation(
-                        io.ContinueGenerationReqInput(torch_empty_cache=False)
-                    )
+                    if not request.keep_pause:
+                        self.scheduler.continue_generation(
+                            io.ContinueGenerationReqInput(torch_empty_cache=False)
+                        )
 
-                receipt = self.session.resume(resume)
+                receipt = self.session.resume(resume, keep_pause=request.keep_pause)
             elif isinstance(request, delta_io.AbortGpuDeltaReqInput):
                 receipt = self.session.abort(request.session_id)
             else:
                 raise ValueError("unknown delta operation")
+            receipt["generation_paused"] = self.scheduler._engine_paused
             success = receipt["state"] not in {"FAILED", "POISONED"}
             return delta_io.GpuDeltaReqOutput(
                 rid=request.rid,
@@ -444,6 +450,7 @@ class GpuDeltaSchedulerControl:
             }
             if self.session is not None and self.session._session is not None:
                 receipt = self.session.status()
+            receipt["generation_paused"] = self.scheduler._engine_paused
             return delta_io.GpuDeltaReqOutput(
                 rid=request.rid, success=False, message=str(exc), participant=receipt
             )

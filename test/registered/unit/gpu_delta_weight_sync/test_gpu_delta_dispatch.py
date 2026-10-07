@@ -3,6 +3,8 @@
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from sglang.srt.weight_sync.gpu_delta import io as io
 from sglang.srt.weight_sync.gpu_delta import session as delta_runtime
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -11,7 +13,11 @@ from sglang.utils import TypeBasedDispatcher
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-def test_update_owns_pause_fence_retract_and_resume_order(monkeypatch):
+@pytest.mark.parametrize("flush_cache", [True, False])
+@pytest.mark.parametrize("keep_pause", [True, False])
+def test_update_owns_pause_fence_retract_and_resume_order(
+    monkeypatch, flush_cache, keep_pause
+):
     events = []
     scheduler = SimpleNamespace(_engine_paused=False)
 
@@ -76,18 +82,31 @@ def test_update_owns_pause_fence_retract_and_resume_order(monkeypatch):
         deadline = time.monotonic() + 2
         while session.status()["state"] == "PREPARING" and time.monotonic() < deadline:
             time.sleep(0.001)
-        result = wrapped(io.ApplyGpuDeltaReqInput(session_id="p", rid="apply-rid"))
+        result = wrapped(
+            io.ApplyGpuDeltaReqInput(
+                session_id="p", rid="apply-rid", flush_cache=flush_cache
+            )
+        )
         assert result.rid == "apply-rid" and scheduler._engine_paused
-        assert result.success and events == ["fence", "retract", "flush", "apply"]
-        result = wrapped(io.ResumeGpuDeltaReqInput(session_id="p"))
+        expected = ["fence", "retract"] + (["flush"] if flush_cache else []) + ["apply"]
+        assert result.success and events == expected
+        result = wrapped(
+            io.ResumeGpuDeltaReqInput(session_id="p", keep_pause=keep_pause)
+        )
         assert result.success and result.participant["state"] == "RESUMED"
-        assert events[4:6] == [("version", "1"), "resume"]
-        assert not scheduler._engine_paused
+        expected += [("version", "1")] + ([] if keep_pause else ["resume"])
+        assert events[: len(expected)] == expected
+        assert scheduler._engine_paused is keep_pause
+        assert result.participant["generation_paused"] is keep_pause
+        timing = result.participant["scheduler_timing"]
+        assert (timing["resumed_ns"] is None) is keep_pause
+        assert (timing["blocked_s"] is None) is keep_pause
         cleared = wrapped(io.ClearGpuDeltaStateReqInput())
         assert cleared.success and cleared.participant["version"] == 1
-        assert events[6:] == ["release", "close"]
+        assert events[len(expected) :] == ["release", "close"]
         released = wrapped(io.ReleaseGpuDeltaCacheReqInput(owner_rank_ids=["original"]))
         assert released.success and released.participant["state"] == "CLEARED"
-        assert not scheduler._engine_paused
+        assert scheduler._engine_paused is keep_pause
+        assert released.participant["generation_paused"] is keep_pause
     finally:
         session._executor.shutdown(wait=True)

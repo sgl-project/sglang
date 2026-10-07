@@ -72,6 +72,16 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
             UpdateWeightsFromGpuDeltaReqInput,
             {"manifest_path": "/immutable/manifest.json"},
         ),
+        (
+            "update_weights_from_gpu_delta",
+            UpdateWeightsFromGpuDeltaReqInput,
+            {
+                "manifest_path": "/immutable/manifest.json",
+                "release_state": False,
+                "flush_cache": False,
+                "abort_all_requests": True,
+            },
+        ),
         ("clear_gpu_delta_state", ClearGpuDeltaStateReqInput, {}),
         ("get_gpu_delta_info", GetGpuDeltaInfoReqInput, {"engine_id": "e0"}),
         (
@@ -92,12 +102,12 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
         (
             "apply_gpu_delta",
             ApplyGpuDeltaReqInput,
-            session,
+            session | {"flush_cache": False, "abort_all_requests": True},
         ),
         (
             "resume_gpu_delta",
             ResumeGpuDeltaReqInput,
-            session,
+            session | {"keep_pause": True},
         ),
         ("abort_gpu_delta", AbortGpuDeltaReqInput, session),
     ]

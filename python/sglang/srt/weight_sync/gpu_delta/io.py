@@ -8,6 +8,8 @@ from sglang.srt.managers.io_struct import BaseReq, hook_custom_types
 class UpdateWeightsFromGpuDeltaReqInput(BaseReq, kw_only=True):
     manifest_path: str
     release_state: bool = True
+    flush_cache: bool = True
+    abort_all_requests: bool = False
 
 
 class ClearGpuDeltaStateReqInput(BaseReq, kw_only=True):
@@ -40,6 +42,8 @@ class GetGpuDeltaStatusReqInput(BaseReq, kw_only=True):
 
 class ApplyGpuDeltaReqInput(BaseReq, kw_only=True):
     session_id: str
+    flush_cache: bool = True
+    abort_all_requests: bool = False
 
 
 class AbortGpuDeltaReqInput(BaseReq, kw_only=True):
@@ -48,6 +52,7 @@ class AbortGpuDeltaReqInput(BaseReq, kw_only=True):
 
 class ResumeGpuDeltaReqInput(BaseReq, kw_only=True):
     session_id: str
+    keep_pause: bool = False
 
 
 class GpuDeltaReqOutput(BaseReq, kw_only=True):

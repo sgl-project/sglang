@@ -21,6 +21,7 @@ def control(monkeypatch):
     sent, versions = [], []
     manager = SimpleNamespace(
         is_pause=False,
+        mm_processor=None,
         is_pause_cond=asyncio.Condition(),
         _dispatch_to_scheduler=sent.append,
         auto_create_handle_loop=lambda: None,
@@ -51,23 +52,41 @@ def reply(control, obj, state, success=True):
 
 
 @pytest.mark.parametrize("resume_success", [True, False])
+@pytest.mark.parametrize("flush_cache", [True, False])
+@pytest.mark.parametrize("abort_all_requests", [True, False])
 def test_only_update_gates_admission_and_successful_resume_releases_it(
-    control, resume_success
+    control, resume_success, flush_cache, abort_all_requests
 ):
     async def run():
         facade, sent, versions = control
+        cache_clears = []
+        facade.manager.mm_processor = SimpleNamespace(
+            clear_preprocess_cache=lambda: cache_clears.append("clear")
+        )
+
+        def abort(abort_all):
+            assert facade.manager.is_pause and abort_all
+            sent.append("abort")
+
+        facade.manager.abort_request = abort
         status = io.GetGpuDeltaStatusReqInput(session_id="publication-1")
         task = asyncio.create_task(facade.request(status))
         await asyncio.sleep(0)
         assert not facade.manager.is_pause
         reply(facade, status, "PREPARED")
         assert (await task)["success"]
-        update = io.ApplyGpuDeltaReqInput(session_id="publication-1")
+        update = io.ApplyGpuDeltaReqInput(
+            session_id="publication-1",
+            flush_cache=flush_cache,
+            abort_all_requests=abort_all_requests,
+        )
         task = asyncio.create_task(facade.request(update))
         await asyncio.sleep(0)
-        assert sent[-1] is update and facade.manager.is_pause
+        assert sent == [status] + (["abort"] if abort_all_requests else []) + [update]
+        assert facade.manager.is_pause
         reply(facade, update, "APPLIED")
         assert (await task)["success"] and facade.manager.is_pause
+        assert cache_clears == (["clear"] if flush_cache else [])
         resume = io.ResumeGpuDeltaReqInput(session_id="publication-1")
         task = asyncio.create_task(facade.request(resume))
         await asyncio.sleep(0)
@@ -110,8 +129,11 @@ def test_uncertain_update_keeps_admission_paused(control, failure):
     "failure", [None, "prepare", "apply", "resume", "uncertain_apply"]
 )
 @pytest.mark.parametrize("release_state", [True, False])
+@pytest.mark.parametrize("flush_cache", [True, False])
+@pytest.mark.parametrize("abort_all_requests", [True, False])
+@pytest.mark.parametrize("pause_at", [None, "entry", "prepare"])
 def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
-    control, tmp_path, failure, release_state
+    control, tmp_path, failure, release_state, flush_cache, abort_all_requests, pause_at
 ):
     import hashlib
 
@@ -140,6 +162,17 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
 
     async def run():
         facade, _, versions = control
+        facade.manager.is_pause = pause_at == "entry"
+        cache_clears, aborted = [], []
+        facade.manager.mm_processor = SimpleNamespace(
+            clear_preprocess_cache=lambda: cache_clears.append("clear")
+        )
+
+        def abort(abort_all):
+            assert abort_all and facade.manager.is_pause
+            aborted.append("abort")
+
+        facade.manager.abort_request = abort
 
         async def request(obj):
             calls.append(obj)
@@ -153,19 +186,25 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
                 assert obj.stream_id == manifest["stream_id"]
                 assert obj.plan_digest == manifest["plan_digest"]
             elif isinstance(obj, io.GetGpuDeltaStatusReqInput):
+                if pause_at == "prepare":
+                    facade.manager.is_pause = True
                 state, phase = "PREPARED", "status"
             elif isinstance(obj, io.ApplyGpuDeltaReqInput):
                 assert facade.manager.is_pause
+                assert obj.flush_cache is flush_cache
+                assert obj.abort_all_requests is abort_all_requests
+                assert aborted == (["abort"] if abort_all_requests else [])
                 if failure == "uncertain_apply":
                     raise OSError("lost apply acknowledgment")
                 state, phase = "APPLIED", "apply"
             elif isinstance(obj, io.ResumeGpuDeltaReqInput):
                 assert facade.manager.is_pause
+                assert obj.keep_pause is (pause_at is not None)
                 state, phase = "RESUMED", "resume"
             elif isinstance(obj, io.AbortGpuDeltaReqInput):
                 state, phase = "ABORTED", "abort"
             else:
-                assert not facade.manager.is_pause
+                assert facade.manager.is_pause is (pause_at is not None)
                 assert versions == ["7"]
                 state, phase = "CLEARED", "clear"
                 if isinstance(obj, io.ReleaseGpuDeltaCacheReqInput):
@@ -188,11 +227,21 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
         facade._request = request
         # Omitting the option preserves the standalone path-only API.
         options = {} if release_state else {"release_state": False}
+        if not flush_cache:
+            options["flush_cache"] = False
+        if abort_all_requests:
+            options["abort_all_requests"] = True
         result = await facade.request(
             io.UpdateWeightsFromGpuDeltaReqInput(manifest_path=str(path), **options)
         )
         assert result["success"] is (failure is None)
         assert path.read_bytes() == content
+        assert cache_clears == (
+            ["clear"] if flush_cache and failure in {None, "resume"} else []
+        )
+        assert aborted == (
+            ["abort"] if abort_all_requests and failure != "prepare" else []
+        )
         if failure is None:
             expected = [
                 io.GetGpuDeltaInfoReqInput,
@@ -207,7 +256,7 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
                     io.ReleaseGpuDeltaCacheReqInput,
                 ]
             assert [type(obj) for obj in calls] == expected
-            assert not facade.manager.is_pause
+            assert facade.manager.is_pause is (pause_at is not None)
             assert all(rank["version"] == 7 for rank in result["participants"])
             assert all(
                 rank["state"] == ("CLEARED" if release_state else "RESUMED")
@@ -217,7 +266,9 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
             assert not any(
                 isinstance(obj, io.ClearGpuDeltaStateReqInput) for obj in calls
             )
-            assert facade.manager.is_pause is (failure != "prepare")
+            assert facade.manager.is_pause is (
+                pause_at == "entry" or failure != "prepare"
+            )
             assert any(isinstance(obj, io.AbortGpuDeltaReqInput) for obj in calls) is (
                 failure == "prepare"
             )

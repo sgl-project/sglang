@@ -75,9 +75,21 @@ version 0. It supports a direct HF-base 0→V jump using existing describe, prep
 status, apply and resume controls internally. Successful load clears delta
 resources by default. Miles recovery passes `release_state=false` to retain the
 backend for following normal updates; the standalone path-only request keeps the
-default. The second endpoint also clears a separately managed update session.
-Neither endpoint changes model weights during cleanup. An uncertain
-apply/resume remains paused and requires restart; the loader never retries XOR or
+default. `flush_cache=true` clears KV and multimodal preprocessing caches; a
+trusted caller that has already invalidated these may pass `false`. Reader fencing
+and request retraction still run. `abort_all_requests=false` preserves requests
+for requeue; `true` aborts them at the apply boundary, after preparation, with new
+admission closed. A pause already in effect at that boundary is preserved through
+commit and optional resource cleanup. The reply's `generation_paused` reports
+whether generation remains paused. A retained transaction leaves `resumed_ns`
+and `blocked_s` null in that case. Transaction state `RESUMED` means version committed and release queued, not
+that a pre-existing generation pause was lifted.
+
+Staged `apply_gpu_delta` accepts the same `flush_cache` and `abort_all_requests`
+flags at its pause boundary. Prepare does not change serving or cache state.
+`resume_gpu_delta` normally reopens admission; the one-shot path passes `keep_pause=true` when preserving an earlier pause. The second endpoint
+also clears a separately managed update session. Neither endpoint changes model
+weights during cleanup. An uncertain apply/resume remains paused and requires restart; the loader never retries XOR or
 aborts after dispatching apply. A deployment must supply the actual HF base:
 matching names/shapes or dummy weights do not establish base-byte correctness.
 
@@ -135,7 +147,7 @@ matrix frame uses the selected inner codec, including inputs whose
 compressed representation expands; there is no raw-frame fallback. Once an
 engine's original ranks report `PREPARED`, Miles sends that engine
 `apply_gpu_delta`. Each local handler closes generation admission,
-pauses scheduling, fences existing readers, retracts requests, flushes caches and
+pauses scheduling, fences existing readers, retracts requests, optionally flushes caches and
 applies the delta. It returns `APPLIED` only after GPU completion and decoder
 checks. Miles waits for each engine's original ranks to apply, then sends that
 engine `resume_gpu_delta(session_id)`. Independent
@@ -453,7 +465,7 @@ Each original-rank receipt includes `scheduler_timing` on that process's
 the existing reader fence, until its resume clears that flag. It includes
 retraction, cache flush, apply and the wait for its own engine ranks to acknowledge
 apply; it excludes
-background preparation and post-resume cleanup. Open or failed intervals retain
+background preparation and post-resume cleanup. Open, failed or caller-retained pauses keep
 null `resumed_ns` and `blocked_s`. Resume responses carry the completed receipts,
 so measurement needs no extra synchronization or status RPC. This measures
 scheduler blocking, not GPU idle time, HTTP latency or first-token recovery.
