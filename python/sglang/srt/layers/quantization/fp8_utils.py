@@ -1663,7 +1663,10 @@ def dequant_mxfp4(
 
 
 def input_to_float8(
-    x: torch.Tensor, dtype: torch.dtype = fp8_dtype
+    x: torch.Tensor,
+    dtype: torch.dtype = fp8_dtype,
+    *,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """This function quantizes input values to float8 values with tensor-wise quantization."""
     min_val, max_val = x.aminmax()
@@ -1677,6 +1680,12 @@ def input_to_float8(
         fp_max = finfo.max
 
     scale = fp_max / amax
+    if out is not None:
+        assert out.shape == x.shape and out.dtype == dtype
+        assert x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        # FP32 broadcast avoids a full input copy; absmax bounds the FP8 range.
+        torch.mul(x, scale.reshape((1,) * x.ndim), out=out)
+        return out, scale.float().reciprocal()
     x_scl_sat = (x.float() * scale).clamp(min=-fp_max, max=fp_max)
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 

@@ -1474,6 +1474,18 @@ def gguf_quant_weights_iterator(
             yield name, param
 
 
+def supports_quantized_rl_reload(func: Callable) -> Callable:
+    """Allow FlashRL to defer FP8 parameter writes until this method returns.
+
+    Checkpoint names must use the parameter names or QKV/gate-up aliases supported
+    by QuantizedRLModelLoader. FP8 writes must go through param.weight_loader;
+    the method must not read their values afterward, and source tensors must
+    remain unchanged until return. Non-FP8 parameters are loaded immediately.
+    """
+    func._supports_quantized_rl_reload = func
+    return func
+
+
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     if param.numel() == 1 and loaded_weight.numel() == 1:
