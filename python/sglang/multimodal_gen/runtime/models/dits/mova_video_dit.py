@@ -86,14 +86,8 @@ def precompute_freqs_cis(
     return freqs_cis
 
 
-class SelfAttention(nn.Module):
-    """
-    Self-Attention module for MOVA DiT with Sequence Parallelism support.
-
-    SP is handled at the pipeline level (latents are pre-sharded before DiT forward).
-    USPAttention internally handles the all-to-all communication for distributed attention.
-    Input x should already be the local shard [B, S_local, D] when SP is enabled.
-    """
+class _MOVAAttention(nn.Module):
+    """shared projections, normalization and TP head partitioning for MOVA"""
 
     def __init__(
         self,
@@ -129,6 +123,25 @@ class SelfAttention(nn.Module):
         )
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
+
+
+class SelfAttention(_MOVAAttention):
+    """
+    Self-Attention module for MOVA DiT with Sequence Parallelism support.
+
+    SP is handled at the pipeline level (latents are pre-sharded before DiT forward).
+    USPAttention internally handles the all-to-all communication for distributed attention.
+    Input x should already be the local shard [B, S_local, D] when SP is enabled.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
+    ):
+        super().__init__(dim, num_heads, eps, quant_config)
 
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_dim,
@@ -196,7 +209,7 @@ class SelfAttention(nn.Module):
         return out
 
 
-class CrossAttention(nn.Module):
+class CrossAttention(_MOVAAttention):
     """
     Cross-Attention module for MOVA DiT.
 
@@ -214,32 +227,7 @@ class CrossAttention(nn.Module):
         eps: float = 1e-6,
         quant_config: QuantizationConfig | None = None,
     ):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-
-        self.tp_size = get_tp_world_size()
-        if self.num_heads % self.tp_size != 0:
-            raise ValueError(
-                f"num_heads ({self.num_heads}) must be divisible by tp_size ({self.tp_size})."
-            )
-        self.num_heads_per_rank = self.num_heads // self.tp_size
-
-        self.q = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
-        )
-        self.k = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
-        )
-        self.v = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
-        )
-        self.o = RowParallelLinear(
-            dim, dim, bias=True, input_is_parallel=True, quant_config=quant_config
-        )
-        self.norm_q = RMSNorm(dim, eps=eps)
-        self.norm_k = RMSNorm(dim, eps=eps)
+        super().__init__(dim, num_heads, eps, quant_config)
 
         # Use LocalAttention for cross-attention (no SP communication needed)
         self.attn = LocalAttention(
