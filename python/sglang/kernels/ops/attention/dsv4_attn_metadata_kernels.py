@@ -7,6 +7,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils.common import async_h2d
+
 
 def _inputs_on_cuda(*args, **kwargs) -> bool:
     """Route kernel dispatch by input placement: the first tensor argument
@@ -451,7 +453,9 @@ def late_layer_tail_layout(
         floor = torch.full((t,), s - t, dtype=torch.int32, device=device)
         return torch.arange(n - t, n, device=device), tail_lens_cpu, floor
     # One H2D copy for the three length vectors; launch count does not grow with bs.
-    lens = torch.tensor([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device=device)
+    lens = async_h2d(
+        [extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], dtype=torch.int64, device=device
+    )
     extend_lens, tail_lens, seq_lens = lens[0], lens[1], lens[2]
     total = sum(tail_lens_cpu)
     req = torch.repeat_interleave(
