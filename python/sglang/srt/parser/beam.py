@@ -9,35 +9,34 @@ BEAM_RESPONSE_TEMPLATE: dict[str, Any] = {
     "start_anchor_pattern": r"<\|start\|>assistant",
     "fields": {
         "thinking": {
-            "open_pattern": (
-                r"(?:^<\|channel\|>analysis<\|message\|>"
-                r"|<\|start\|>assistant<\|channel\|>analysis<\|message\|>)"
-            ),
-            "close": "<|end|>",
+            "open": "<|channel|>analysis<|message|>",
+            # Consuming the next message's `<|start|>assistant` makes reasoning
+            # end exactly where the answer or a call opens.
+            "close": "<|end|><|start|>assistant",
             "content": "text",
         },
         "content": {
-            "open_pattern": (
-                r"(?:<\|channel\|>final<\|message\|>"
-                r"|<\|start\|>assistant<\|channel\|>final<\|message\|>)"
-            ),
-            "close": ["<|return|>", "<|end|>"],
+            "open": "<|channel|>final<|message|>",
+            # No grammar can keep the `<|call|>` stop token from ending the
+            # answer, and the output keeps it as a possible tool call closer.
+            "close": ["<|return|>", "<|end|>", "<|call|>"],
             "content": "text",
         },
         "tool_calls": {
+            # The prompt and every closer before a call end with
+            # `<|start|>assistant`, so each call opens at ` to=`. Like the
+            # Harmony recipient, the name is any run without whitespace or `<`.
             "open_pattern": (
-                r"(?:<\|start\|>assistant )?to="
-                r"(?P<name>[a-zA-Z_][a-zA-Z0-9_.-]*)"
-                r"<\|channel\|>analysis"
-                r"(?: <\|constrain\|>xml)?<\|message\|>"
+                r" to=(?P<name>[^\s<]+)"
+                r"<\|channel\|>analysis <\|constrain\|>xml<\|message\|>"
             ),
-            "close": ["<|end|>", "<|call|>"],
+            "close": ["<|end|><|start|>assistant", "<|call|>"],
             "repeats": True,
             "content": "xml-inline",
             "content_args": {
                 "tag_pattern": (
                     r'<rfl:parameter name="(?P<key>[^"]+)">'
-                    r"\n?(?P<value>.*?)\n?</rfl:parameter>"
+                    r"\n(?P<value>.*?)\n</rfl:parameter>"
                 ),
                 "value_parser": {
                     "name": "text",
@@ -58,5 +57,4 @@ BEAM_RESPONSE_TEMPLATE: dict[str, Any] = {
 
 class BeamReasoningDetector(ResponseTemplateReasoningDetector):
     response_template = BEAM_RESPONSE_TEMPLATE
-    _default_think_start = "<|channel|>analysis<|message|>"
     reasoning_default = "always"
