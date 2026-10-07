@@ -16,7 +16,7 @@ _GLM4LITE_N_LOCAL = _GLM4LITE_N_ROUTED + 1  # +1 fused shared expert
 
 def _make_model(**kwargs):
     """Create a stub model object for ParameterMapper.from_model()."""
-    return SimpleNamespace(**kwargs)
+    return SimpleNamespace(**{"named_parameters": lambda: iter(()), **kwargs})
 
 
 def _deepseek_mutate(name):
@@ -155,6 +155,24 @@ def glm4lite_mapper():
     )
 
 
+@pytest.fixture
+def glm5_mapper():
+    """GLM-5 (GlmMoeDsa) on CUDA: MLA A-proj fusion plus the fused DSA indexer wk_weights_proj."""
+    return ParameterMapper.from_model(
+        _make_model(
+            stacked_params_mapping=[
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+                ("fused_qkv_a_proj_with_mqa", "q_a_proj", 0),
+                ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
+            ],
+            named_parameters=lambda: iter(
+                [("model.layers.0.self_attn.indexer.wk_weights_proj.weight", None)]
+            ),
+        )
+    )
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -229,6 +247,19 @@ _DEEPSEEK_CASES = [
     ("model.layers.0.self_attn.v_proj.v_scale",             to_expect("model.layers.0.self_attn.attn_mqa.v_scale")),
     # kv_b_proj pass-through (decomposed in post_load_weights)
     ("model.layers.0.self_attn.kv_b_proj.weight",           to_expect("model.layers.0.self_attn.kv_b_proj.weight")),
+    # No fused indexer param (non-CUDA, or fusion disabled): wk stays standalone
+    ("model.layers.0.self_attn.indexer.wk.weight",          to_expect("model.layers.0.self_attn.indexer.wk.weight")),
+]
+
+_GLM5_CASES = [
+    # DSA indexer: wk and weights_proj fill one fused param
+    ("model.layers.0.self_attn.indexer.wk.weight",           to_expect("model.layers.0.self_attn.indexer.wk_weights_proj.weight", 0, 2)),
+    ("model.layers.0.self_attn.indexer.weights_proj.weight", to_expect("model.layers.0.self_attn.indexer.wk_weights_proj.weight", 1, 2)),
+    # The rest of the indexer stays standalone
+    ("model.layers.0.self_attn.indexer.wq_b.weight",         to_expect("model.layers.0.self_attn.indexer.wq_b.weight")),
+    ("model.layers.0.self_attn.indexer.k_norm.weight",       to_expect("model.layers.0.self_attn.indexer.k_norm.weight")),
+    # MLA A-proj fusion
+    ("model.layers.0.self_attn.q_a_proj.weight",             to_expect("model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight", 0, 2)),
 ]
 
 _GLM4LITE_CASES = [
@@ -290,3 +321,8 @@ def test_deepseek(deepseek_mapper, ckpt, expected):
 )
 def test_glm4lite(glm4lite_mapper, ckpt, expected):
     _assert(glm4lite_mapper, ckpt, expected)
+
+
+@pytest.mark.parametrize("ckpt,expected", _GLM5_CASES, ids=[c[0] for c in _GLM5_CASES])
+def test_glm5(glm5_mapper, ckpt, expected):
+    _assert(glm5_mapper, ckpt, expected)

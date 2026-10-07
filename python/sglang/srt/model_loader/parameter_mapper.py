@@ -69,6 +69,13 @@ _SCALE_REMAP_PATTERNS: List[Tuple[str, str, str]] = [
     (".v_scale", ".v_scale", ".attn.v_scale"),
 ]
 
+# On CUDA the DSA indexer's loader fills one wk_weights_proj param from wk and weights_proj
+# (deepseek_weight_loader._load_fused_indexer_wk)
+_FUSED_DSA_INDEXER_MAPPING: List[StackedParamsEntry] = [
+    ("indexer.wk_weights_proj.", "indexer.wk.", 0),
+    ("indexer.wk_weights_proj.", "indexer.weights_proj.", 1),
+]
+
 # Quark quantization scale remapping
 _QUARK_SCALE_REMAP: Dict[str, str] = {
     ".q_proj.output_scale": ".attn.q_scale",
@@ -235,6 +242,11 @@ class ParameterMapper:
         Glm4MoeLiteForCausalLM, LlamaForCausalLM, Qwen2ForCausalLM,
         Qwen3ForCausalLM, Qwen3MoeForCausalLM."""
         stacked_mapping = list(getattr(model, "stacked_params_mapping", []) or [])
+        if any(
+            name.endswith(".indexer.wk_weights_proj.weight")
+            for name, _ in model.named_parameters()
+        ):
+            stacked_mapping += _FUSED_DSA_INDEXER_MAPPING
         expert_mapping = list(getattr(model, "expert_params_mapping", []) or [])
 
         num_local_experts = 0
