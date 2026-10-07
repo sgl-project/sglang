@@ -3,8 +3,9 @@
 A request that sets ``return_outputs_via_store`` keeps its routed experts, indexer
 top-k, and sampling mask out of the response: when it finishes, the tokenizer writes
 them to Mooncake as one bundle and returns ``meta_info["output_store_ref"]`` instead.
-The bundle uses the ``MooncakeBundleTransfer`` dict layout with one row per field, so
-a reader built on the same transfer, with the same ``key_prefix``, can fetch it.
+The bundle uses the ``MooncakeBundleTransfer`` dict layout: each field is one dense
+tensor, stored as the single row of the bundle's tensor batch, so a reader built on
+the same transfer, with the same ``key_prefix``, can fetch it.
 """
 
 from __future__ import annotations
@@ -77,8 +78,9 @@ class OutputStoreStash(Protocol):
         """Nothing to write; checked on the event loop before the put."""
         ...
 
-    def to_bundle_fields(self) -> Dict[str, np.ndarray]:
-        """One array per bundle field; runs on a store worker thread, so it may copy."""
+    def to_bundle_fields(self) -> Dict[str, torch.Tensor]:
+        """One CPU tensor per bundle field, any dtype; runs on a store worker thread,
+        so it may copy."""
         ...
 
 
@@ -112,27 +114,38 @@ class TokenReplayStash(msgspec.Struct):
             )
         return meta_info
 
-    def to_bundle_fields(self) -> Dict[str, np.ndarray]:
+    def to_bundle_fields(self) -> Dict[str, torch.Tensor]:
         fields = {}
         if self.routed_experts is not None:
-            fields["routed_experts"] = self.routed_experts.numpy()
+            fields["routed_experts"] = self.routed_experts
         if self.indexer_topk is not None:
-            fields["indexer_topk"] = self.indexer_topk.numpy()
+            fields["indexer_topk"] = self.indexer_topk
         chunks = self.sampling_mask_chunks
         if chunks is not None:
-            fields["output_token_sampling_mask_lengths"] = np.concatenate(
-                [chunk.lengths for chunk in chunks]
+            fields["output_token_sampling_mask_lengths"] = torch.from_numpy(
+                np.concatenate([chunk.lengths for chunk in chunks])
             )
-            fields["output_token_sampling_mask_token_ids"] = np.concatenate(
-                [chunk.token_ids for chunk in chunks]
+            fields["output_token_sampling_mask_token_ids"] = torch.from_numpy(
+                np.concatenate([chunk.token_ids for chunk in chunks])
             )
-            fields["output_token_sampling_logprobs"] = np.concatenate(
-                [chunk.logprobs for chunk in chunks]
+            fields["output_token_sampling_logprobs"] = torch.from_numpy(
+                np.concatenate([chunk.logprobs for chunk in chunks])
             )
         return fields
 
 
 class OutputStore:
+    """Writes one bundle per response from the tokenizer process.
+
+    The bundle stages every field through host memory, so stashes hold CPU tensors.
+    GPU-resident, batch-granular outputs, such as SpecForge's hidden-state capture,
+    need a second writer instead: on the attention-TP rank 0 scheduler, one
+    ``batch_put_from`` per scheduler batch from registered device memory, holding
+    the batch's responses until the put lands. That writer should keep
+    ``submit_put``/``cleanup_after`` and the ``{"handle", "fields"}`` ref so readers
+    parse one ref format; extract that pair into a Protocol when it is added.
+    """
+
     def __init__(self, config: OutputStoreConfig) -> None:
         import mooncake.structured_object_store as structured_object_store
         from mooncake.store import MooncakeDistributedStore, ReplicateConfig
@@ -152,10 +165,11 @@ class OutputStore:
         if setup_error:
             raise RuntimeError(f"Mooncake output store setup failed: {setup_error}")
 
-        replicate_config = None
-        if config.replica_num > 1:
-            replicate_config = ReplicateConfig()
-            replicate_config.replica_num = config.replica_num
+        # Hard-pinned so Mooncake never evicts a bundle whose ref may be in flight:
+        # the reader removes it after reading, cleanup_after() if it is never sent.
+        replicate_config = ReplicateConfig()
+        replicate_config.replica_num = config.replica_num
+        replicate_config.with_hard_pin = True
 
         self._mooncake = structured_object_store
         self._transfer = structured_object_store.MooncakeBundleTransfer(
@@ -168,6 +182,11 @@ class OutputStore:
             "chunk_bytes": config.chunk_bytes,
             "config": replicate_config,
         }
+        # The tensor batch takes any dtype, bfloat16 included; Mooncake ignores the
+        # codec of a batch field.
+        self._row_schema = structured_object_store.FieldSchema(
+            codec="auto", nullable=False, metadata={"section": "batch"}
+        )
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=_MAX_STORE_WORKERS, thread_name_prefix="output-store"
         )
@@ -185,22 +204,18 @@ class OutputStore:
     def _put(self, stash: OutputStoreStash) -> Dict[str, Any]:
         fields = stash.to_bundle_fields()
         ref = self._transfer.put(
-            {name: [array] for name, array in fields.items()},
+            {name: tensor.contiguous().unsqueeze(0) for name, tensor in fields.items()},
             **self._put_options,
-            field_schemas={
-                name: self._mooncake.FieldSchema(
-                    codec="typed_ragged",
-                    nullable=False,
-                    metadata={"section": "non_tensor_batch", "dtype": str(array.dtype)},
-                )
-                for name, array in fields.items()
-            },
+            field_schemas=dict.fromkeys(fields, self._row_schema),
         )
         return {
             "handle": self._mooncake.export_ref(ref),
             "fields": {
-                name: {"dtype": str(array.dtype), "shape": list(array.shape)}
-                for name, array in fields.items()
+                name: {
+                    "dtype": str(tensor.dtype).removeprefix("torch."),
+                    "shape": list(tensor.shape),
+                }
+                for name, tensor in fields.items()
             },
         }
 

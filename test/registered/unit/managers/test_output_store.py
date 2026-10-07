@@ -138,6 +138,7 @@ def _fake_mooncake(setup_error=0):
 
     class ReplicateConfig:
         replica_num = 1
+        with_hard_pin = False
 
     store_module.MooncakeDistributedStore = MooncakeDistributedStore
     store_module.ReplicateConfig = ReplicateConfig
@@ -192,9 +193,10 @@ class TestOutputStore(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "setup failed"):
             self._store(setup_error=-1)
 
-    def test_put_writes_one_typed_ragged_row_per_field(self):
-        """Readers rely on one row per field and on the packed sampling-mask arrays
-        concatenating every streamed chunk in order, zero-row chunks included."""
+    def test_put_writes_each_field_as_one_tensor_row(self):
+        """Readers rely on one tensor-batch row per field and on the packed
+        sampling-mask arrays concatenating every streamed chunk in order, zero-row
+        chunks included."""
         for replica_num in (1, 2):
             with self.subTest(replica_num=replica_num):
                 store, _ = self._store(
@@ -233,7 +235,11 @@ class TestOutputStore(CustomTestCase):
                         },
                     },
                 )
-                self.assertTrue(all(len(rows) == 1 for rows in data.values()))
+                fields = output_store_ref["fields"]
+                self.assertEqual(
+                    {name: list(rows.shape) for name, rows in data.items()},
+                    {name: [1, *field["shape"]] for name, field in fields.items()},
+                )
                 np.testing.assert_array_equal(
                     data["output_token_sampling_mask_token_ids"][0], [5, 6, 7]
                 )
@@ -241,24 +247,49 @@ class TestOutputStore(CustomTestCase):
                     data["output_token_sampling_logprobs"][0], [-0.5, -1.0]
                 )
                 self.assertEqual(
-                    kwargs["field_schemas"]["indexer_topk"],
-                    {
-                        "codec": "typed_ragged",
-                        "nullable": False,
-                        "metadata": {"section": "non_tensor_batch", "dtype": "int32"},
-                    },
+                    kwargs["field_schemas"],
+                    dict.fromkeys(
+                        fields,
+                        {
+                            "codec": "auto",
+                            "nullable": False,
+                            "metadata": {"section": "batch"},
+                        },
+                    ),
                 )
                 self.assertEqual(
                     (kwargs["type"], kwargs["partition"], kwargs["chunk_bytes"]),
                     ("dict", "run-1", 4096),
                 )
-                if replica_num == 1:
-                    self.assertIsNone(kwargs["config"])
-                else:
-                    self.assertEqual(kwargs["config"].replica_num, 2)
+                # Readers own the bundle's lifetime, so Mooncake must not evict it.
+                self.assertEqual(
+                    (kwargs["config"].replica_num, kwargs["config"].with_hard_pin),
+                    (replica_num, True),
+                )
                 self.assertEqual(
                     stash.inline_meta_info(), {"output_token_sampling_mask_length": 2}
                 )
+
+    def test_put_keeps_dtypes_numpy_cannot_hold(self):
+        """A stash may hand over bfloat16, e.g. diffusion latents, which numpy
+        cannot hold; the ref spells dtypes without the torch prefix."""
+
+        class _LatentStash:
+            def is_empty(self):
+                return False
+
+            def to_bundle_fields(self):
+                return {"latents": torch.ones((3, 4), dtype=torch.bfloat16)}
+
+        store, _ = self._store()
+        output_store_ref = store.submit_put(_LatentStash()).result()
+
+        (data, _) = store._transfer.puts[0]
+        self.assertEqual(data["latents"].dtype, torch.bfloat16)
+        self.assertEqual(
+            output_store_ref["fields"],
+            {"latents": {"dtype": "bfloat16", "shape": [3, 4]}},
+        )
 
     def test_undelivered_bundles_are_removed(self):
         store, _ = self._store()
