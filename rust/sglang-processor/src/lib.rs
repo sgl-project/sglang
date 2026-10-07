@@ -7,6 +7,8 @@
 
 mod error;
 mod model_files;
+#[cfg(feature = "openai")]
+pub mod openai;
 #[cfg(feature = "parser")]
 mod parser;
 #[cfg(feature = "render")]
