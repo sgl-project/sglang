@@ -589,6 +589,7 @@ mod tests {
                         ChatCompletionRequestUserMessageContentPart::Text(
                             ChatCompletionRequestMessageContentPartText {
                                 text: "Hello".into(),
+                                prompt_cache_breakpoint: None,
                             },
                         ),
                     ]),
