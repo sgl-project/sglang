@@ -260,6 +260,23 @@ class TestOvisImageConfig(CustomTestCase):
         ):
             config.validate_server_args(self._normalized_server_args())
 
+    def test_server_rejects_incompatible_attention_head_partitions(self):
+        config = OvisImagePipelineConfig()
+        # A three-way DiT split fits its 24 heads, but not the Qwen encoder.
+        with self.assertRaisesRegex(ValueError, "Qwen attention heads"):
+            config.validate_server_args(self._normalized_server_args(tp_size=3))
+        with self.assertRaisesRegex(ValueError, "DiT attention heads"):
+            config.validate_server_args(
+                self._normalized_server_args(tp_size=2, ulysses_degree=5)
+            )
+        for tp_size, ulysses_degree in ((1, 1), (2, 1), (4, 1), (2, 2), (1, 3)):
+            with self.subTest(tp_size=tp_size, ulysses_degree=ulysses_degree):
+                config.validate_server_args(
+                    self._normalized_server_args(
+                        tp_size=tp_size, ulysses_degree=ulysses_degree
+                    )
+                )
+
     def test_explicit_graph_request_is_rejected_before_server_normalization(self):
         """BCG normalization must not silently erase an unsupported Ovis request."""
         from sglang.multimodal_gen.configs.pipeline_configs.flux import (

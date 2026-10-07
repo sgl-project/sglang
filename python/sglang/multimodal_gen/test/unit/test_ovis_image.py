@@ -426,6 +426,199 @@ class TestOvisImageNumerics(CustomTestCase):
                 torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
 
 
+class TestOvisImageQwenPrecision(CustomTestCase):
+    @torch.no_grad()
+    def test_tp_projection_matches_full_gemm(self):
+        """TP shards must reconstruct the HF projection without split-K rounding."""
+        from unittest.mock import patch
+
+        import torch.nn.functional as F
+
+        from sglang.multimodal_gen.runtime.loader.utils import set_default_torch_dtype
+        from sglang.multimodal_gen.runtime.models.encoders.qwen3 import (
+            Qwen3HfRowParallelLinear,
+        )
+
+        inputs = torch.tensor(
+            [[256, 1, -256, 0], [512, 2, -512, 0]], dtype=torch.bfloat16
+        )
+        weight = torch.tensor([[1, 1, 1, 1], [2, 1, 2, 1]], dtype=torch.bfloat16)
+        bias = torch.tensor([0.5, -0.5], dtype=torch.bfloat16)
+        for input_is_parallel in (False, True):
+            for skip_bias_add in (False, True):
+                for rank in range(2):
+                    with self.subTest(
+                        rank=rank,
+                        input_is_parallel=input_is_parallel,
+                        skip_bias_add=skip_bias_add,
+                    ):
+                        group = SimpleNamespace(world_size=2, rank_in_group=rank)
+                        with (
+                            patch(
+                                "sglang.multimodal_gen.runtime.layers.linear.get_tp_group",
+                                return_value=group,
+                            ),
+                            set_default_torch_dtype(torch.bfloat16),
+                        ):
+                            layer = Qwen3HfRowParallelLinear(
+                                4,
+                                2,
+                                input_is_parallel=input_is_parallel,
+                                skip_bias_add=skip_bias_add,
+                            )
+                        layer.weight.weight_loader(layer.weight, weight)
+                        layer.bias.weight_loader(layer.bias, bias)
+                        collective_inputs = []
+
+                        def gather_shards(value, dim=-1, tp_group=None):
+                            self.assertIs(tp_group, group)
+                            complete = inputs if dim == -1 else weight
+                            torch.testing.assert_close(
+                                value,
+                                complete[:, rank * 2 : (rank + 1) * 2],
+                                atol=0,
+                                rtol=0,
+                            )
+                            collective_inputs.append(value.clone())
+                            return complete.clone()
+
+                        local_input = (
+                            inputs[:, rank * 2 : (rank + 1) * 2]
+                            if input_is_parallel
+                            else inputs
+                        )
+                        with (
+                            patch(
+                                "sglang.multimodal_gen.runtime.models.encoders.qwen3.tensor_model_parallel_all_gather",
+                                gather_shards,
+                            ),
+                            torch.autocast("cpu", dtype=torch.bfloat16),
+                        ):
+                            actual, output_bias = layer(local_input)
+                        expected = F.linear(
+                            inputs, weight, None if skip_bias_add else bias
+                        )
+                        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                        self.assertTrue(
+                            all(x.dtype == torch.bfloat16 for x in collective_inputs)
+                        )
+                        if skip_bias_add:
+                            torch.testing.assert_close(
+                                output_bias, bias, atol=0, rtol=0
+                            )
+                        else:
+                            self.assertIsNone(output_bias)
+
+    @torch.no_grad()
+    def test_tp_projection_can_keep_local_outputs(self):
+        """Callers requesting unreduced partials retain the original row contract."""
+        from unittest.mock import patch
+
+        import torch.nn.functional as F
+
+        from sglang.multimodal_gen.runtime.loader.utils import set_default_torch_dtype
+        from sglang.multimodal_gen.runtime.models.encoders.qwen3 import (
+            Qwen3HfRowParallelLinear,
+        )
+
+        inputs = torch.tensor([[256, 1, -256, 0]], dtype=torch.bfloat16)
+        weight = torch.tensor([[1, 1, 1, 1]], dtype=torch.bfloat16)
+        for rank in range(2):
+            with self.subTest(rank=rank):
+                group = SimpleNamespace(world_size=2, rank_in_group=rank)
+                with (
+                    patch(
+                        "sglang.multimodal_gen.runtime.layers.linear.get_tp_group",
+                        return_value=group,
+                    ),
+                    set_default_torch_dtype(torch.bfloat16),
+                ):
+                    layer = Qwen3HfRowParallelLinear(
+                        4, 1, bias=False, reduce_results=False
+                    )
+                layer.weight.weight_loader(layer.weight, weight)
+                local = inputs[:, rank * 2 : (rank + 1) * 2]
+                actual, bias = layer(local)
+                expected = F.linear(local, weight[:, rank * 2 : (rank + 1) * 2])
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                self.assertIsNone(bias)
+
+    @torch.no_grad()
+    def test_hf_rope_retains_linear_scaling(self):
+        from unittest.mock import patch
+
+        from transformers.models.qwen3.modeling_qwen3 import (
+            Qwen3RotaryEmbedding,
+            apply_rotary_pos_emb,
+        )
+
+        from sglang.multimodal_gen.runtime.models.encoders.qwen3 import Qwen3Attention
+
+        reference_config = Qwen3Config(
+            hidden_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rope_parameters={
+                "rope_type": "linear",
+                "rope_theta": 1000000.0,
+                "factor": 2.0,
+            },
+        )
+        config = OvisImagePipelineConfig().text_encoder_configs[0]
+        config.update_model_arch(reference_config.to_dict())
+        group = SimpleNamespace(world_size=1, rank_in_group=0)
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.layers.linear.get_tp_group",
+                return_value=group,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.encoders.qwen3.get_tp_world_size",
+                return_value=1,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.encoders.qwen3.LocalAttention",
+                return_value=torch.nn.Identity(),
+            ),
+        ):
+            native = Qwen3Attention(
+                config,
+                hidden_size=32,
+                num_heads=4,
+                num_kv_heads=2,
+                rope_theta=1000000.0,
+                rope_scaling=reference_config.rope_parameters,
+            )
+        reference = Qwen3RotaryEmbedding(reference_config)
+        positions = torch.arange(17).expand(2, -1)
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                torch.manual_seed(123)
+                query = torch.randn(2, 17, 32).to(dtype)
+                key = torch.randn(2, 17, 16).to(dtype)
+                cos, sin = reference(query, positions)
+                expected_query, expected_key = apply_rotary_pos_emb(
+                    query.unflatten(-1, (4, 8)).transpose(1, 2),
+                    key.unflatten(-1, (2, 8)).transpose(1, 2),
+                    cos,
+                    sin,
+                )
+                actual_query, actual_key = native._apply_hf_rope(positions, query, key)
+                torch.testing.assert_close(
+                    actual_query,
+                    expected_query.transpose(1, 2).flatten(2),
+                    atol=0,
+                    rtol=0,
+                )
+                torch.testing.assert_close(
+                    actual_key,
+                    expected_key.transpose(1, 2).flatten(2),
+                    atol=0,
+                    rtol=0,
+                )
+
+
 class TestOvisImageWeightShards(CustomTestCase):
     @torch.no_grad()
     def test_single_block_tp_gated_projection_matches_full_checkpoint(self):

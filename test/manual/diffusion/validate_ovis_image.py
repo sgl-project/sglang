@@ -62,7 +62,6 @@ def parse_args():
     parser.add_argument("--ulysses", type=int, default=1)
     parser.add_argument("--ring", type=int, default=1)
     parser.add_argument("--cfg", type=int, choices=(1, 2), default=1)
-    parser.add_argument("--encoder-tp", type=int, default=1)
     parser.add_argument(
         "--offload", choices=("none", "component", "layerwise"), default="none"
     )
@@ -198,6 +197,45 @@ def sdpa_flags():
         "efficient": torch.backends.cuda.mem_efficient_sdp_enabled(),
         "math": torch.backends.cuda.math_sdp_enabled(),
         "cudnn": torch.backends.cuda.cudnn_sdp_enabled(),
+    }
+
+
+def resolved_encoder_tp_group(encoder):
+    """Describe the loaded encoder's bound group and actual linear shards.
+
+    ServerArgs.encoder_tp belongs to disaggregated serving; it does not select
+    the group for this monolithic runner. Inspect loaded modules instead.
+    """
+    group = encoder._encoder_tp_group
+    if group is None:
+        raise ValueError("Loaded native Ovis encoder has no bound TP group")
+    layer = encoder.layers[0]
+    attention = layer.self_attn
+
+    def linear(module):
+        return {
+            "class": f"{type(module).__module__}.{type(module).__qualname__}",
+            "tp_size": module.tp_size,
+            "tp_rank": module.tp_rank,
+            "input_size": module.input_size,
+            "output_size": module.output_size,
+            "weight_shape": list(module.weight.shape),
+            "weight_dtype": str(module.weight.dtype),
+        }
+
+    return {
+        "ranks": list(group.ranks),
+        "world_size": group.world_size,
+        "rank_in_group": group.rank_in_group,
+        "model_class": f"{type(encoder).__module__}.{type(encoder).__qualname__}",
+        "layers": len(encoder.layers),
+        "local_attention_heads": attention.num_heads,
+        "local_kv_heads": attention.num_kv_heads,
+        "head_dim": attention.head_dim,
+        "qkv_proj": linear(attention.qkv_proj),
+        "o_proj": linear(attention.o_proj),
+        "gate_up_proj": linear(layer.mlp.gate_up_proj),
+        "down_proj": linear(layer.mlp.down_proj),
     }
 
 
@@ -450,7 +488,6 @@ def native_run(args):
         ulysses_degree=args.ulysses,
         ring_degree=args.ring,
         enable_cfg_parallel=args.cfg == 2,
-        encoder_tp=args.encoder_tp,
         attention_backend=args.attention,
         warmup_mode="off",
         performance_mode="manual",
@@ -485,6 +522,9 @@ def native_run(args):
             role="diffusion_gpu_worker",
         )
         pipeline = OvisImagePipeline(args.model_path, server)
+        encoder_tp_group = resolved_encoder_tp_group(
+            pipeline.get_module("text_encoder")
+        )
         if server.has_layerwise_offload_components():
             from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
                 get_global_component_residency_manager,
@@ -545,6 +585,7 @@ def native_run(args):
         record["rank_metrics"] = {
             "rank": rank,
             "sdpa_flags": native_sdpa_flags,
+            "resolved_encoder_tp_group": encoder_tp_group,
             **metrics,
         }
         record["source"] = provenance
@@ -575,6 +616,7 @@ def native_run(args):
                 resolved_config=jsonable(server),
             )
             metrics["resolved_config"]["sdpa_flags"] = native_sdpa_flags
+            metrics["resolved_config"]["resolved_encoder_tp_group"] = encoder_tp_group
         else:
             record = {}
         return record, metrics

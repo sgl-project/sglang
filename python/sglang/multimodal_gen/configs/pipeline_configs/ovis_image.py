@@ -88,6 +88,14 @@ class OvisImagePipelineConfig(ImagePipelineConfig):
     def validate_server_args(self, server_args) -> None:
         self.__post_init__()
         super().validate_server_args(server_args)
+        tp_size = getattr(server_args, "tp_size", 1) or 1
+        ulysses_degree = getattr(server_args, "ulysses_degree", 1) or 1
+        dit_heads = self.dit_config.arch_config.num_attention_heads
+        encoder_heads = self.text_encoder_configs[0].arch_config.num_attention_heads
+        if dit_heads % (tp_size * ulysses_degree):
+            raise ValueError("Ovis-Image TP × Ulysses must divide DiT attention heads")
+        if encoder_heads % tp_size:
+            raise ValueError("Ovis-Image TP must divide Qwen attention heads")
         model_path = str(server_args.model_path)
         if (
             server_args.comfyui_mode

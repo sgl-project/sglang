@@ -20,7 +20,7 @@ EOF
 all_cases=(
     components reference single no-cfg batch2 prompt-batch component layerwise
     tiny-tp2 tiny-ulysses2 tiny-ring2 tiny-tp2-sp2
-    tp2 ulysses2 ring2 cfg2 tp2-sp2 vae-tiled vae-spatial encoder-tp2 http
+    tp2 ulysses2 ring2 cfg2 tp2-sp2 vae-tiled vae-spatial http
 )
 quick=false
 dry_run=false
@@ -201,7 +201,6 @@ for name in "${selected[@]}"; do
         tiny-ring2|ring2) required=2; topology=(--ring 2) ;;
         tiny-tp2-sp2|tp2-sp2) required=4; topology=(--tp 2 --ulysses 2) ;;
         cfg2) required=2; topology=(--cfg 2) ;;
-        encoder-tp2) required=2; topology=(--tp 2 --encoder-tp 2) ;;
         component) extra=(--offload component) ;;
         layerwise) extra=(--offload layerwise) ;;
         no-cfg) profile=no-cfg; extra=(--guidance 1) ;;

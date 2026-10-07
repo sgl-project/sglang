@@ -50,7 +50,7 @@ export const config = {
         const cfg = s.cfg === "on" ? 2 : 1;
         const errors = [];
         if (Number(s.nodes) !== 1 || Number(s.gpus_per_node) !== cfg * t.tp_size * t.ulysses_degree * t.ring_degree) errors.push("GPU count must equal CFG × TP × Ulysses × Ring on one node.");
-        if (!Number.isInteger(t.tp_size) || t.tp_size < 1 || 24 % (t.tp_size * t.ulysses_degree)) errors.push("TP × Ulysses must divide 24 attention heads.");
+        if (!Number.isInteger(t.tp_size) || t.tp_size < 1 || 16 % t.tp_size || 24 % (t.tp_size * t.ulysses_degree)) errors.push("TP must divide 16 Qwen heads; TP × Ulysses must divide 24 DiT heads.");
         if (t.ring_degree > 1 && s.attention !== "fa") errors.push("Ring requires FlashAttention.");
         if (s.vae === "spatial" && Number(s.gpus_per_node) < 2) errors.push("Spatial parallel decode requires at least two GPUs.");
         return errors;
@@ -60,7 +60,7 @@ export const config = {
       const r = config.commandBuilder.resource;
       const t = s.topology_mode === "manual" ? { tp_size: Number(s.tp_size), ulysses_degree: Number(s.ulysses_degree), ring_degree: Number(s.ring_degree) } : r.autoTopology(s);
       const errors = r.validateTopology(s, t);
-      const recipe = r.verifiedRecipes.find((v) => v.hw === s.hw && v.gpus_per_node === Number(s.gpus_per_node) && v.tp_size === t.tp_size && v.ulysses_degree === t.ulysses_degree && v.ring_degree === t.ring_degree && v.placement === s.placement && v.attention === s.attention && v.cfg === s.cfg && v.vae === s.vae);
+      const recipe = r.verifiedRecipes.find((v) => v.hw === s.hw && v.gpus_per_node === Number(s.gpus_per_node) && v.tp_size === t.tp_size && v.ulysses_degree === t.ulysses_degree && v.ring_degree === t.ring_degree && v.placement === s.placement && v.attention === s.attention && v.cfg === s.cfg && v.vae === s.vae && v.outputs === Number(s.outputs));
       const flags = ["--model-path {{MODEL_NAME}}", `--num-gpus ${s.gpus_per_node}`, `--tp-size ${t.tp_size}`, `--ulysses-degree ${t.ulysses_degree}`, `--ring-degree ${t.ring_degree}`];
       if (s.cfg === "on") flags.push("--enable-cfg-parallel");
       flags.push("--host {{HOST_IP}}", "--port {{PORT}}");

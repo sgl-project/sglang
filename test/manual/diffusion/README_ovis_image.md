@@ -203,7 +203,7 @@ bash test/manual/diffusion/run_ovis_image_matrix.sh reference single
 
 # Selected full-checkpoint parallelism cases, still executed serially.
 bash test/manual/diffusion/run_ovis_image_matrix.sh --quick \
-  single tp2 ulysses2 ring2 cfg2 tp2-sp2 encoder-tp2 prompt-batch
+  single tp2 ulysses2 ring2 cfg2 tp2-sp2 prompt-batch
 ```
 
 | Case | GPUs | Settings and evidence |
@@ -218,21 +218,35 @@ bash test/manual/diffusion/run_ovis_image_matrix.sh --quick \
 | `tiny-tp2`, `tiny-ulysses2` | 2 | Checkpoint-free production DiT against a tiny oracle, including odd text/image lengths. |
 | `tiny-ring2` | 2 | Tiny BF16 DiT with FlashAttention ring rotation. |
 | `tiny-tp2-sp2` | 4 | Tiny DiT with TP2 × Ulysses2. |
-| `tp2` | 2 | Full checkpoint, TP2. |
+| `tp2` | 2 | Full checkpoint, DiT TP2 and native Qwen encoder TP2; inspect the actual loaded encoder group and conditioning errors. |
 | `ulysses2` | 2 | Full checkpoint, Ulysses2 sequence parallelism. |
 | `ring2` | 2 | Full checkpoint, Ring2 with `--attention fa`. |
 | `cfg2` | 2 | Positive/negative CFG ranks; Ovis preserves the serial BF16 combination order. |
-| `tp2-sp2` | 4 | Full checkpoint, TP2 × Ulysses2; four GPUs are required. |
+| `tp2-sp2` | 4 | Full checkpoint, DiT TP2 × Ulysses2 and native Qwen encoder TP2; four GPUs are required. |
 | `vae-tiled` | 1 | Native and reference both enable VAE tiling at 1024 × 1536, above the native threshold. |
 | `vae-spatial` | 2 | Ulysses2 plus `--vae-tiling --vae-sp` at 1024 × 1536; compared with the same-size tiled reference. |
-| `encoder-tp2` | 2 | Transformer TP2 and requested encoder TP2; inspect the saved resolved encoder topology. |
 | `http` | 1 | Real server: repeated request, changed prompt/size then restore, and two distinct outputs. Always 512/4 with SDPA and CPU RNG. |
 
 The `vae_sp` control requires `vae_tiling=True`; native defaults disable both
 and synchronize `vae_config.use_parallel_decode=False`. VAE spatial and tiled
-results must be reported separately from ordinary decode. Encoder topology can
-depend on the loader's folding/group selection; confirm the saved resolved
-configuration before describing an `encoder-tp2` run as validated.
+results must be reported separately from ordinary decode. The monolithic native
+encoder inherits the DiT TP group when the loader does not fold it. `tp2` and
+`tp2-sp2` therefore cover the actual Qwen encoder TP2 path. The serving
+`--encoder-tp` option belongs to disaggregated/pool serving and does not control
+this monolithic runner; there is no separate encoder-TP case here.
+Each native rank records `resolved_encoder_tp_group` from the loaded encoder's
+bound group and first layer: group ranks, actual QKV/row/MLP TP sizes, local head
+counts, and weight shapes/dtypes. Rank 0's group is also saved under
+`resolved_config`; inspect these records rather than a requested ServerArgs field.
+
+Ovis opts into HF-compatible Qwen numerics. In low-precision TP, each row
+projection temporarily gathers its input and weight before executing the full
+GEMM. Stored parameters remain sharded, and gathered weights are released after
+the projection; no additional weight cache is introduced. This trades extra
+communication and repeated row-projection computation for the original
+conditioning tolerances. FP32 split-K accumulation alone did not meet those
+tolerances on the full 28-layer encoder. Report actual latency and peak memory
+rather than assuming that TP accelerates the text encoder.
 
 ## Record actual results
 
@@ -247,10 +261,9 @@ do not infer a quality or performance baseline from a four-step smoke image.
 | Component numerical oracles | To fill | Log and tolerances | Pending |
 | Full default-profile native vs pinned reference | To fill | Conditioning/prediction/trajectory/image errors, PSNR/SSIM, images | Pending |
 | Offload matrix | To fill | Resolved residency, tensors, peak memory | Pending |
-| TP2 / Ulysses2 / Ring2 / CFG2 | To fill | Resolved groups and per-case comparison | Pending |
+| TP2 / Ulysses2 / Ring2 / CFG2 | To fill | Actual encoder groups, conditioning errors and per-case comparison | Pending |
 | TP2 × SP2 | To fill | Four-GPU tiny and full-model logs | Pending |
 | Tiled / spatial VAE | To fill | Decode mode, outputs, memory, reference comparison | Pending |
-| Encoder TP2 | To fill | Resolved encoder topology and conditioning errors | Pending |
 | Repeated HTTP requests | To fill | Server lifecycle log and same-seed comparisons | Pending |
 
 No GPU results, throughput baseline, or measured quality threshold are claimed

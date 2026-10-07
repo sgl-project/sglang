@@ -61,8 +61,9 @@ The pipeline uses native Qwen3, DiT, and AutoencoderKL components and the shared
 conditioning cache, denoising loop, and residency management. Request-specific
 RoPE and sequence padding are rebuilt when prompts or dimensions change.
 
-Single-node topology obeys `GPUs = CFG × TP × Ulysses × Ring`; TP times Ulysses
-must divide the transformer's 24 attention heads. Ring uses FlashAttention.
+Single-node topology obeys `GPUs = CFG × TP × Ulysses × Ring`; TP must divide
+the Qwen encoder's 16 attention heads, and TP times Ulysses must divide the
+transformer's 24 attention heads. Ring uses FlashAttention.
 CFG parallelism requires guidance greater than one. Component and layerwise
 offload apply to the transformer, text encoder, and VAE. Tiled decode and
 `spatial_shard` VAE decode use the existing VAE controls.

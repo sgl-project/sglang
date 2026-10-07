@@ -7,7 +7,10 @@ from torch.nn import functional as F
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
-from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_world_size,
+    tensor_model_parallel_all_gather,
+)
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm as MMGenRMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -27,6 +30,38 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
+
+
+class Qwen3HfRowParallelLinear(RowParallelLinear):
+    """Preserve HF's full GEMM while retaining checkpoint-backed TP shards."""
+
+    def forward(self, input_) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if (
+            self.tp_size == 1
+            or self.quant_config is not None
+            or not self.reduce_results
+            or input_.dtype not in (torch.float16, torch.bfloat16)
+        ):
+            return super().forward(input_)
+
+        if self.input_is_parallel:
+            full_input = tensor_model_parallel_all_gather(
+                input_.contiguous(), dim=-1, tp_group=self.tp_group
+            )
+        else:
+            full_input = input_
+        full_weight = tensor_model_parallel_all_gather(
+            self.weight, dim=1, tp_group=self.tp_group
+        )
+
+        # Even FP32 split-K partials change the reduction order enough to
+        # accumulate beyond Ovis conditioning tolerances. Reconstruct only
+        # this projection for the exact full GEMM, then release its gathered
+        # weight. Do not cache it: offload and weight updates own the shards.
+        bias = None if self.skip_bias_add else self.bias
+        with torch.autocast(device_type=input_.device.type, enabled=False):
+            output = F.linear(full_input, full_weight, bias)
+        return output, self.bias if self.skip_bias_add else None
 
 
 class Qwen3MLP(nn.Module):
@@ -51,7 +86,10 @@ class Qwen3MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
         )
-        self.down_proj = RowParallelLinear(
+        row_parallel_cls = (
+            Qwen3HfRowParallelLinear if preserve_hf_numerics else RowParallelLinear
+        )
+        self.down_proj = row_parallel_cls(
             input_size=intermediate_size,
             output_size=hidden_size,
             bias=bias,
@@ -116,6 +154,12 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
+        self.rope_scaling_factor = (
+            float(rope_scaling.get("factor", 1.0))
+            if rope_scaling
+            and rope_scaling.get("rope_type", rope_scaling.get("type")) == "linear"
+            else 1.0
+        )
         self.max_position_embeddings = max_position_embeddings
 
         # QKV projection with tensor parallelism
@@ -130,7 +174,10 @@ class Qwen3Attention(nn.Module):
         )
 
         # Output projection
-        self.o_proj = RowParallelLinear(
+        row_parallel_cls = (
+            Qwen3HfRowParallelLinear if self.preserve_hf_numerics else RowParallelLinear
+        )
+        self.o_proj = row_parallel_cls(
             input_size=self.total_num_heads * self.head_dim,
             output_size=hidden_size,
             bias=bias,
@@ -236,6 +283,8 @@ class Qwen3Attention(nn.Module):
                 / self.rotary_dim
             )
         )
+        if self.rope_scaling_factor != 1.0:
+            inv_freq = inv_freq / self.rope_scaling_factor
         frequencies = positions.float().unsqueeze(-1) * inv_freq
         cos = torch.cat([frequencies.cos()] * 2, dim=-1).to(query.dtype).unsqueeze(-2)
         sin = torch.cat([frequencies.sin()] * 2, dim=-1).to(query.dtype).unsqueeze(-2)
