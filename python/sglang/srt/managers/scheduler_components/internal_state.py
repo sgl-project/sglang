@@ -218,14 +218,22 @@ class SchedulerInternalStateController:
         if value is not None and not (0.0 < float(value) <= 1.0):
             raise UpdateRejected(f"{key} must be in (0, 1] or null, got {value}.")
         simulate_acc_len = envs.SGLANG_SIMULATE_ACC_LEN.get()
-        if value is not None and simulate_acc_len > 0 and simulate_acc_len != 1.0:
+        simulate_acc_method = envs.SGLANG_SIMULATE_ACC_METHOD.get()
+        if (
+            value is not None
+            and simulate_acc_len > 0
+            and (simulate_acc_len != 1.0 or simulate_acc_method != "match-expected")
+        ):
             # A trimmed verify budget breaks the cap-accept accounting of a
-            # constant simulated accept length, as the DSpark worker checks at
-            # startup for profiled SPS tables.
+            # simulated accept length above 1, as the DSpark worker checks at
+            # startup for profiled SPS tables. Only match-expected sampling of
+            # 1.0 always yields 1; multinomial draws around the mean.
             raise UpdateRejected(
                 f"{key} cannot be pinned with SGLANG_SIMULATE_ACC_LEN="
-                f"{simulate_acc_len}; only SGLANG_SIMULATE_ACC_LEN=1.0 stays "
-                "within every verify budget."
+                f"{simulate_acc_len} and SGLANG_SIMULATE_ACC_METHOD="
+                f"{simulate_acc_method}; only SGLANG_SIMULATE_ACC_LEN=1.0 with "
+                "SGLANG_SIMULATE_ACC_METHOD=match-expected stays within every "
+                "verify budget."
             )
 
     def _apply_dspark_budget_frac(self, key: str, value: Any) -> None:
