@@ -163,7 +163,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             max_seqlen_pad = triton.cdiv(eager_max_k, PAGE_SIZE)
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
-            if self.kv_index_translator.is_translating:
+            if self.kv_index_translator.reads_are_translated:
                 assert self.page_size == PAGE_SIZE
                 self.kv_index_translator.fill_read_table(
                     out=block_kv_indices,
@@ -198,7 +198,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             max_seqlen_pad = triton.cdiv(eager_max_k + self.num_draft_tokens, PAGE_SIZE)
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
-            if self.kv_index_translator.is_translating:
+            if self.kv_index_translator.reads_are_translated:
                 assert self.page_size == PAGE_SIZE
                 self.kv_index_translator.fill_read_table(
                     out=block_kv_indices,
@@ -238,7 +238,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             max_seqlen_pad = triton.cdiv(eager_max_k + window, PAGE_SIZE)
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
-            if self.kv_index_translator.is_translating:
+            if self.kv_index_translator.reads_are_translated:
                 assert self.page_size == PAGE_SIZE
                 self.kv_index_translator.fill_read_table(
                     out=block_kv_indices,
@@ -353,7 +353,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             else:
                 max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
 
-            if self.kv_index_translator.is_translating:
+            if self.kv_index_translator.reads_are_translated:
                 assert self.page_size == PAGE_SIZE
                 self.kv_index_translator.fill_read_table(
                     out=self.cuda_graph_kv_indices,
