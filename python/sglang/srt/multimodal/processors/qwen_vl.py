@@ -896,6 +896,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         else:
             padded_input_ids = list(padded_input_ids)
 
+        video_data = request_obj.video_data
         image_grid_thw = self._get_grid_from_output_or_items(
             ret, mm_items, "image_grid_thw", Modality.IMAGE, image_data
         )
@@ -904,7 +905,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             mm_items,
             "video_grid_thw",
             Modality.VIDEO,
-            request_obj.video_data,
+            video_data,
         )
 
         mrope_result = self._get_precomputed_mrope_from_output(ret)
