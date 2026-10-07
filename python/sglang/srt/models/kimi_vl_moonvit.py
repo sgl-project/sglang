@@ -59,7 +59,7 @@ from sglang.srt.layers.attention.vision import (
     prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.conv import Conv2dLayer
-from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled, reject_attn_tp_shard_with_tp_reduce
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -383,6 +383,7 @@ class MLP2(nn.Module):
                 prefix=add_prefix("fc1", prefix),
                 tp_rank=tp_rank,
                 tp_size=tp_size,
+                use_dp_attention_reduce=is_dp_attention_enabled(),
             )
         else:
             self.fc0 = nn.Linear(dims[0], dims[1], bias=bias)
@@ -448,6 +449,7 @@ class MoonVitEncoderLayer(nn.Module):
             prefix=add_prefix("attn", prefix),
             use_data_parallel=use_data_parallel,
             customized_position_embedding_applier=apply_rope,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
         )
 
     def forward(
