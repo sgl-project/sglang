@@ -95,7 +95,7 @@ for the baseline; the B200/B300 quantization measurements and H200 Cache-DiT
 quality audit do not establish coverage on Grace Blackwell.
 
 GB300 end-to-end coverage currently includes single-host FL2VA text-to-video
-with audio, native precision, eager execution, and `quality="lossless"`.
+with audio, native precision, eager execution, and `quality="exact"`.
 Ref2VA and multi-host commands remain **Unverified**. See the
 [GB300 measurements](#gb300-single-host) for the tested workload.
 
@@ -348,7 +348,7 @@ their [usual meanings](#4-generate-video-and-audio), including `conditions: []`
 for `t2va` and keyframes for `fl2va`.
 
 Start with `quality: "lossless"` and the standard 50-point schedule. Here
-`lossless` disables additional request-time approximations; it does not undo
+`exact` disables additional request-time approximations; it does not undo
 INT8 quantization, pruning, or fine-tuning. The author's recommended Ref2V
 Turbo LoRA is a separate optional adapter, not an automatically inferred
 4-step schedule. Reference fidelity can differ from the official model; see
@@ -1008,18 +1008,18 @@ done
 `quality` is a cumulative request-scoped optimization parameter with three
 levels:
 
-- `"lossless"` (default): the exact reference path. Output is bit-exact
+- `"exact"` (default): the exact reference path. Output is bit-exact
   against the reference implementation and the CI ground truth.
-- `"extra-high"`: includes the global fusion-only tier but does not enable
+- `"lossless"`: includes the global fusion-only tier but does not enable
   Cache-DiT or another approximate optimization. MiniMax-H3 currently has no
-  request-gated fusion site, so its denoise path is the same as `lossless`.
+  request-gated fusion site, so its denoise path is the same as `exact`.
 - `"high"`: the audited accelerated path. Quality is guaranteed (the audited
   Cache-DiT configuration measures SSIM 0.931 / PSNR 28.16 dB against
   `lossless`), but output is no longer bit-identical to the reference.
 
 One resident server serves all three levels; a `quality: "high"` request
 mounts its audited Cache-DiT policy at the batch boundary, and a later
-`quality: "lossless"` or `quality: "extra-high"` request removes the hooks
+`quality: "lossless"` or `quality: "lossless"` request removes the hooks
 before denoising.
 
 Start the validated server once:
@@ -1057,14 +1057,14 @@ omitting the field is equivalent.
 
 </Tab>
 
-<Tab title="extra-high">
+<Tab title="lossless">
 
 The global fusion-only tier. It does not enable MiniMax-H3 Cache-DiT and
-currently follows the same H3 denoise path as `lossless`.
+currently follows the same H3 denoise path as `exact`.
 
 ```json Request field
 {
-  "quality": "extra-high"
+  "quality": "lossless"
 }
 ```
 
@@ -1089,8 +1089,8 @@ The measured trade-off is:
 
 | `quality` | Mean <br />inference <br />latency | Speedup | SSIM vs <br />lossless | PSNR vs <br />lossless | Expected <br />trade-off |
 | --- | ---: | ---: | ---: | ---: | --- |
-| `lossless` | 75.10 s | 1.00× | 1.000 | exact | Native reference path |
-| `extra-high` | Not separately measured | — | Same H3 denoise path | Same H3 denoise path | Fusion-only tier; no H3-specific request-gated site yet |
+| `exact` | 75.10 s | 1.00× | 1.000 | exact | Native reference path |
+| `lossless` | Not separately measured | — | Same H3 denoise path | Same H3 denoise path | Fusion-only tier; no H3-specific request-gated site yet |
 | `high` | 53.70 s | 1.40× | 0.931 | 28.16 dB | Smallest same-seed visual change |
 
 These numbers use 1344×768, 124-frame, 24 fps T2VA with 50 inference steps,
@@ -1099,7 +1099,7 @@ video flow shift 12, audio flow shift 3, and three fixed prompt/seed pairs on
 and a moving close-up portrait. `inference_time_s` is averaged across the three
 prompts; the quiet-scene point is itself the mean of two repeats.
 
-SSIM and PSNR compare decoded, frame-aligned output with the `lossless`
+SSIM and PSNR compare decoded, frame-aligned output with the `exact`
 result for the same prompt and seed. They measure trajectory deviation, not
 absolute perceptual quality: the `high` path can produce a different but
 still plausible realization. It also changes the joint audio-video denoise
@@ -1118,7 +1118,7 @@ name, for example `sglang generate --quality high`.
 For manually tuned Cache-DiT experiments outside that validated path, omit
 the request `quality` field and set `--enable-cache-dit` or the
 process-wide `SGLANG_CACHE_DIT_*` defaults. Any explicit `quality`, including
-`"lossless"` and `"extra-high"`, takes H3 off the generic Cache-DiT path. The
+`"exact"` and `"lossless"`, takes H3 off the generic Cache-DiT path. The
 24 GB layerwise recipe above can use the same switch; skipped blocks are
 not streamed.
 
@@ -1503,7 +1503,7 @@ Dynamic cuDNN/FA attention, and eager execution. The model was downloaded by
 `sglang serve` from `MiniMaxAI/MiniMax-H3`.
 
 The workload uses the builder's cat-band prompt, FL2VA T2VA, a 5-second request
-at a 768-pixel short edge, 50 inference steps, `quality="lossless"`, one output,
+at a 768-pixel short edge, 50 inference steps, `quality="exact"`, one output,
 and seed 1101. Every MP4 contained video and audio and passed a full decode check.
 
 | First full request after server warmup | Following three requests | Warm median |

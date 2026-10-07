@@ -98,6 +98,7 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Glm5NextMLP
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE as Glm5NextMoE
+from sglang.srt.models.glm4v import glm4v_vision_reduces_over_attn_tp
 from sglang.srt.models.glm_ocr import (
     GlmOcrRMSNorm,
     GlmOcrVisionBlock,
@@ -240,6 +241,9 @@ class Glm5NextVisionBlock(GlmOcrVisionBlock):
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.mlp = Glm5NextVisionMLP(
             dim,

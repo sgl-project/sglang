@@ -454,7 +454,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             scheduler=None,
             pipeline=pipeline,
         )
-        self._minimax_h3_quality = "lossless"
+        self._minimax_h3_quality = "exact"
         self._minimax_h3_cache_mode: str | None = None
 
     def _owns_compile_warmup_lifecycle(self) -> bool:
@@ -462,7 +462,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
     def _cache_dit_requested(self) -> bool:
         return (
-            getattr(self, "_minimax_h3_quality", "lossless") == "high"
+            getattr(self, "_minimax_h3_quality", "exact") == "high"
             or super()._cache_dit_requested()
         )
 
@@ -591,7 +591,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
     def _cache_dit_scm_masks(
         self, primary_num_steps: int, secondary_num_steps: int | None = None
     ) -> tuple[str, str, list[int] | None, list[int] | None]:
-        if getattr(self, "_minimax_h3_quality", "lossless") == "high":
+        if getattr(self, "_minimax_h3_quality", "exact") == "high":
             return "none", "dynamic", None, None
         return super()._cache_dit_scm_masks(primary_num_steps, secondary_num_steps)
 
@@ -603,7 +603,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         *,
         secondary: bool = False,
     ) -> CacheDitConfig:
-        if secondary or getattr(self, "_minimax_h3_quality", "lossless") != "high":
+        if secondary or getattr(self, "_minimax_h3_quality", "exact") != "high":
             return super()._build_cache_dit_config(
                 num_inference_steps,
                 steps_computation_mask,
