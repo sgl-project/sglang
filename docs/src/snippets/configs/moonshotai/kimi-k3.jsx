@@ -1286,7 +1286,7 @@ export const config = {
       verificationStatus: "in-progress",
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_AITER_K3_OPT=1",
+        "SGLANG_ROCM_K3_AITER_OPT=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
       ],
@@ -1316,7 +1316,7 @@ export const config = {
       verificationStatus: "in-progress",
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_AITER_K3_OPT=1",
+        "SGLANG_ROCM_K3_AITER_OPT=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
       ],
@@ -2068,7 +2068,7 @@ export const config = {
       verificationStatus: "in-progress",
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_AITER_K3_OPT=1",
+        "SGLANG_ROCM_K3_AITER_OPT=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
       ],
@@ -2096,7 +2096,7 @@ export const config = {
       verificationStatus: "in-progress",
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_AITER_K3_OPT=1",
+        "SGLANG_ROCM_K3_AITER_OPT=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
       ],
@@ -2572,7 +2572,8 @@ export const config = {
         "--enable-dense-mlp-attn-tp",
         "--disable-radix-cache",
         "--disable-custom-all-reduce",
-        "--disable-cuda-graph",
+        "--cuda-graph-backend-decode disabled",
+        "--cuda-graph-backend-prefill disabled",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 4096",
         "--max-running-requests 16",
