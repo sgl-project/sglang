@@ -119,7 +119,7 @@ Selecting weights:
 | Target | Recommended server flags | Notes |
 | --- | --- | --- |
 | 1 high-VRAM GPU | *(no extra flags)* | 960×544 fits comfortably on an H200. |
-| 1 tight-VRAM GPU | `--quantization fp8` | Halves the DiT and cuts peak memory ~18 GB at unchanged speed. See [section 3.4](#3-4-fp8-quantization). |
+| 1 tight-VRAM GPU | `--quantization fp8` | Halves the DiT and cuts peak memory ~18 GB at unchanged speed. See [section 3.5](#3-5-fp8-quantization). |
 | 1 very tight GPU | `--dit-layerwise-offload` | Cuts peak memory by roughly 10 GB, at about 4x the wall clock. |
 | 2 GPUs, long sequences | `--num-gpus 2 --ulysses-degree 2` | Sequence parallel; the memory/long-sequence tool. |
 | 2 GPUs, large DiT | `--num-gpus 2 --tp-size 2` | Tensor parallel across attention heads. |
@@ -134,7 +134,29 @@ LTX-2 / LTX-2.3 page do not carry over. It *is* worth using with
 `--model-variant dev`, which runs with guidance.
 </Warning>
 
-### 3.4 fp8 quantization
+### 3.4 Breakable CUDA graphs
+
+`--enable-breakable-cuda-graph` replays each step's DiT forward as captured
+graph segments, with bit-identical output. Warm up at the served shape so the
+graphs match the requests, and keep the DiT resident, since graphs hold its
+weight addresses:
+
+```bash
+sglang serve \
+  --model-path Lightricks/LTX-2.5-Diffusers \
+  --num-gpus 2 \
+  --ulysses-degree 2 \
+  --enable-breakable-cuda-graph \
+  --warmup-resolutions 768x448 \
+  --warmup-num-frames 49
+```
+
+With Ulysses sequence parallelism the attention and its all-to-all stay eager
+between graph segments, so the gain is smaller than on the CFG-parallel LTX-2.3
+presets. See the LTX-2 / LTX-2.3 page for the warmup rules (input image,
+quality level).
+
+### 3.5 fp8 quantization
 
 `--quantization fp8` quantizes the DiT's linear layers as it loads them, so it
 needs no pre-quantized checkpoint:
