@@ -964,6 +964,10 @@ class Envs:
     # Requantize Quark per-channel FP8 kv_b to per-tensor FP8 so the MLA absorb
     # BMMs run the AITER a8w8 kernel (~2.3% weight error vs dequant to bf16).
     SGLANG_ROCM_K3_MLA_ABSORB_FP8 = EnvBool(True)
+    # gfx95 KDA extend via AITER FlashKDA. The model keeps beta as logits and
+    # the kernel sigmoids them. Off by default: tracked interior snapshots and
+    # speculative draft-extend stay on Triton either way.
+    SGLANG_AITER_KDA_FLASH_PREFILL = EnvBool(False)
     # Activation precision for MXFP4-weight dense linears, independent of the
     # MoE: "fp4" is the checkpoint's own W4A4, "bf16" dequantizes the weights
     # at load. bf16 by default: K3 GSM8K scores 0.947 vs fp4's 0.908, for

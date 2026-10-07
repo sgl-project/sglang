@@ -76,6 +76,9 @@ class RadixLinearAttention(nn.Module):
         self.A_log = A_log
         self.dt_bias = dt_bias
         self.lower_bound = lower_bound
+        # Set by models that hand extend raw beta logits; prefill kernels then
+        # apply the sigmoid themselves.
+        self.extend_beta_is_raw = False
 
     def forward(
         self,

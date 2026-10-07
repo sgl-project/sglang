@@ -200,6 +200,15 @@ class KDAKernelDispatcher:
                 "SM100, ptx_kda SM100 or SM103)."
             )
 
+        if is_hip() and prefill_backend.is_triton():
+            from sglang.srt.layers.attention.linear.kernels.kda_aiter_flash import (
+                maybe_create_aiter_flash_kda_kernel,
+            )
+
+            self.extend_kernel = (
+                maybe_create_aiter_flash_kda_kernel() or self.extend_kernel
+            )
+
         self.supports_packed_decode = getattr(
             self.decode_kernel, "supports_packed_decode", False
         )
@@ -917,7 +926,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
-            beta_is_raw=gate_was_flat,
+            beta_is_raw=gate_was_flat or layer.extend_beta_is_raw,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             layer_id=layer.layer_id,
