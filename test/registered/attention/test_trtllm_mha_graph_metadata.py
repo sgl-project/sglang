@@ -295,6 +295,141 @@ def test_cuda_graph_metadata_launch_runs_in_graph_hook(monkeypatch):
     assert backend.forward_metadata is backend.decode_cuda_graph_metadata[2]
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("in_capture", [False, True])
+@pytest.mark.parametrize("prefix_lens", [(127, 255), (32768, 32896)])
+@pytest.mark.parametrize(
+    "mode",
+    ["decode", "idle", "draft_decode", "verify", "draft_extend", "ragged_verify"],
+)
+def test_unified_graph_tables_use_current_lengths(
+    device, in_capture, prefix_lens, mode
+):
+    """Refresh every live page before replay, despite stale captured lengths."""
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if mode == "ragged_verify" and device == "cpu":
+        pytest.skip("Ragged metadata eagerly launches a Triton page-table kernel")
+
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=8)
+    backend.device = torch.device(device)
+    backend.is_xqa_impl = False
+    backend.max_context_len = 33024
+    backend.max_num_pages = backend.max_context_len // PAGE_SIZE
+    backend.req_to_token = torch.arange(
+        4 * backend.max_context_len, dtype=torch.int32, device=device
+    ).reshape(4, -1)
+    backend.speculative_step_id = 2
+    backend.init_cuda_graph_state(max_bs=4, max_num_tokens=16)
+    translator = backend.kv_index_translator
+    translator.req_to_token = backend.req_to_token
+    translator.device = device
+    translator.is_translating = True
+    translator._rows = torch.arange(4, dtype=torch.int64, device=device)
+    num_virtual_pages = backend.req_to_token.numel() // PAGE_SIZE
+    translator._full_v2p_table = torch.arange(
+        num_virtual_pages, 0, -1, dtype=torch.int64, device=device
+    )
+    translator._swa_v2p_table = torch.arange(
+        1, num_virtual_pages + 1, dtype=torch.int64, device=device
+    )
+    translator._full_page_multiplier = 4
+    translator._swa_page_multiplier = 6
+    # Bind real, capture-stable full and SWA destinations without allocating K/V.
+    for source in (
+        backend.decode_cuda_graph_metadata,
+        backend.target_verify_metadata,
+        backend.draft_extend_metadata,
+    ):
+        for key in list(source):
+            if key.startswith("swa_page_table"):
+                source[key] = torch.zeros(
+                    4, backend.max_num_pages, dtype=torch.int32, device=device
+                )
+
+    forward_mode = {
+        "decode": ForwardMode.DECODE,
+        "idle": ForwardMode.IDLE,
+        "draft_decode": ForwardMode.DECODE,
+        "verify": ForwardMode.TARGET_VERIFY,
+        "draft_extend": ForwardMode.DRAFT_EXTEND_V2,
+        "ragged_verify": ForwardMode.TARGET_VERIFY,
+    }[mode]
+    spec_info = (
+        None
+        if mode in ("decode", "idle")
+        else SimpleNamespace(num_tokens_per_req=8, ragged_verify_layout=None)
+    )
+    offsets = (0, 0)
+    if mode == "draft_decode":
+        offsets = (3, 3)
+    elif mode == "verify":
+        offsets = (8, 8)
+    elif mode == "ragged_verify":
+        offsets = (3, 7)
+        spec_info.ragged_verify_layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=offsets, device=backend.device, grid=[10]
+        )
+    num_tokens = 10 if mode == "ragged_verify" else 16
+    fb = SimpleNamespace(
+        batch_size=2,
+        req_pool_indices=torch.tensor([1, 0], dtype=torch.int64, device=device),
+        seq_lens=torch.tensor(prefix_lens, dtype=torch.int32, device=device),
+        forward_mode=forward_mode,
+        spec_info=spec_info,
+        positions=torch.arange(num_tokens, dtype=torch.int64, device=device),
+        out_cache_loc=None,
+    )
+    original_lens = fb.seq_lens.clone()
+    backend.init_forward_metadata_out_graph(fb, in_capture=True)
+    metadata = backend.forward_metadata
+    full_ptr, swa_ptr = (
+        metadata.page_table.data_ptr(),
+        metadata.swa_page_table.data_ptr(),
+    )
+    graph = None
+    if device == "cuda" and not in_capture and mode != "ragged_verify":
+        backend.init_forward_metadata_in_graph(fb)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            backend.init_forward_metadata_in_graph(fb)
+
+    # Reproduce first decode after capture (or a previous shorter replay).
+    metadata.cache_seqlens_int32.fill_(1)
+    metadata.page_table.fill_(-7)
+    metadata.swa_page_table.fill_(-7)
+    backend.init_forward_metadata_out_graph(fb, in_capture=in_capture)
+    if graph is not None:
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            backend.forward_metadata.cache_seqlens_int32,
+            original_lens + original_lens.new_tensor(offsets),
+        )
+    metadata = backend.forward_metadata
+    assert metadata.page_table.data_ptr() == full_ptr
+    assert metadata.swa_page_table.data_ptr() == swa_ptr
+    torch.testing.assert_close(fb.seq_lens, original_lens)
+    for batch_row, request_row in enumerate((1, 0)):
+        n_pages = (
+            prefix_lens[batch_row] + offsets[batch_row] + PAGE_SIZE - 1
+        ) // PAGE_SIZE
+        virtual_pages = request_row * backend.max_num_pages + torch.arange(
+            n_pages, device=device
+        )
+        expected_full = (num_virtual_pages - virtual_pages) * 4
+        expected_swa = (virtual_pages + 1) * 6
+        torch.testing.assert_close(
+            metadata.page_table[batch_row, :n_pages], expected_full.to(torch.int32)
+        )
+        torch.testing.assert_close(
+            metadata.swa_page_table[batch_row, :n_pages], expected_swa.to(torch.int32)
+        )
+
+
 def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
     calls = []
 

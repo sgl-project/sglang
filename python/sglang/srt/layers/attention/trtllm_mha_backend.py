@@ -1101,14 +1101,22 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # fused kernel skips its page-table writes so the graph reads the
             # refreshed content through pointers baked at capture).
             metadata = self.forward_metadata
-            # `cache_seqlens_int32` is what the attention kernels bound their
-            # page-table reads by, and the fused metadata call above wrote it.
-            # A target verify reads `draft_token_num` further than `seq_lens`
-            # goes, so filling to `seq_lens` leaves those columns untranslated.
+            # The captured metadata kernel updates cache_seqlens only during
+            # replay. Its buffer still contains the previous replay's lengths
+            # here, so bound translation by this batch's current lengths.
+            read_seq_lens = forward_batch.seq_lens[:bs]
+            if forward_mode.is_decode_or_idle() and spec_info is not None:
+                read_seq_lens = read_seq_lens + self.speculative_step_id + 1
+            elif forward_mode.is_target_verify():
+                if metadata.is_ragged_verify:
+                    # Ragged lengths are rebuilt eagerly above.
+                    read_seq_lens = metadata.cache_seqlens_int32
+                else:
+                    read_seq_lens = read_seq_lens + metadata.max_seq_len_q
             self.kv_index_translator.fill_read_table(
                 out=metadata.page_table,
                 req_pool_indices=forward_batch.req_pool_indices[:bs],
-                seq_lens=metadata.cache_seqlens_int32,
+                seq_lens=read_seq_lens,
                 sliding_window_out=metadata.swa_page_table,
             )
             # A capture batch carries no prepared write loc; zeros are the
