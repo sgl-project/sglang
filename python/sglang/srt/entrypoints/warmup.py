@@ -303,9 +303,17 @@ def _serving_coverage_phases(
         """Wrap ``body(rank)`` so the phase covers every DP rank."""
 
         async def phase():
+            # Every window runs even if an earlier one failed, so one rank's
+            # failure does not leave the later ranks cold.
             window = _SERVING_COVERAGE_MAX_CONCURRENT_DP_RANKS
+            failure = None
             for start in range(0, len(ranks), window):
-                await _gather_all(body(r) for r in ranks[start : start + window])
+                try:
+                    await _gather_all(body(r) for r in ranks[start : start + window])
+                except Exception as e:
+                    failure = failure or e
+            if failure is not None:
+                raise failure
 
         return phase
 
@@ -386,7 +394,14 @@ def _serving_coverage_phases(
 
     phases.append(("short-prompts", _per_rank(_short_prompts)))
 
-    if _fits(chunk + 64):
+    if disaggregation_mode != "null":
+        # Warmup requests use the fake bootstrap host, which disables radix
+        # cache insertion, so a seed request would never be reused.
+        logger.info(
+            "serving_coverage: skipping cached-prefix phase: disaggregated "
+            "warmup requests do not insert into the prefix cache"
+        )
+    elif _fits(chunk + 64):
 
         async def _cached_prefix(rank):
             # A completed multi-chunk request publishes recurrent checkpoints.
@@ -448,9 +463,28 @@ def _serving_coverage_phases(
             req.sampling_params.update(variants[i % len(variants)])
             return req
 
+        # Some configurations reject some sampling parameters at admission
+        # (UNO speculative decoding rejects min_p and penalties). A rejected
+        # variant is logged and left out of the concurrent cohort; the
+        # supported variants still run.
+        accepted, failure = [], None
         for i in range(len(variants)):
-            await _run(_sampled(i, 48))
-        await _gather(_sampled(i, 40 + 8 * i) for i in range(max_running))
+            try:
+                await _run(_sampled(i, 48))
+                accepted.append(i)
+            except Exception as e:
+                failure = failure or e
+                logger.warning(
+                    "serving_coverage: sampling variant %s was rejected: %s",
+                    variants[i],
+                    e,
+                )
+        if not accepted:
+            raise failure
+        await _gather(
+            _sampled(accepted[i % len(accepted)], 40 + 8 * i)
+            for i in range(max_running)
+        )
 
     phases.append(("sampling", _per_rank(_sampling)))
 
@@ -505,18 +539,24 @@ async def serving_coverage(
     * single prefills at exact chunk multiples,
     * short prompts and one long decode,
     * completed multi-chunk prefixes reused alone and concurrently (recurrent
-      slot copy-on-write otherwise first runs on a real cached request),
+      slot copy-on-write otherwise first runs on a real cached request);
+      skipped under disaggregation, where warmup requests are not cached,
     * natural-text prompts (accepted speculative drafts widen verify batches
       in ways random token ids never do),
     * non-greedy sampling variants (the sampling kernels are otherwise built
-      on the first sampled request),
+      on the first sampled request); a variant the server rejects is skipped,
     * one image request when the model is multimodal.
 
     Prompt and decode lengths are clamped to the engine's input limit; phases
     whose shapes cannot fit are skipped with a log line. With data
     parallelism every phase runs once per DP rank. Each phase is best-effort:
     a failure logs, its requests are still drained, and serving proceeds.
+    Non-generative (embedding or reward) models skip this warmup.
     """
+    if not getattr(tokenizer_manager, "is_generation", True):
+        # Embedding and reward models do not decode or sample.
+        logger.info("serving_coverage: skipping, the model is not generative")
+        return
     for name, fn in _serving_coverage_phases(disaggregation_mode, tokenizer_manager):
         try:
             await fn()

@@ -46,6 +46,7 @@ class FakeTokenizerManager:
             if image_token is not None
             else None
         )
+        self.is_generation = True
         self.requests = []
         self.max_in_flight = 0
         self._in_flight = 0
@@ -242,6 +243,60 @@ class TestServingCoveragePhases(_PublishedConfig):
         self.assertEqual(len(set(rooms)), MAX_RUNNING)
         for req in tm.requests:
             self.assertEqual(req.bootstrap_host, FAKE_BOOTSTRAP_HOST)
+
+    def test_disaggregation_skips_the_cached_prefix_phase(self):
+        # Fake-bootstrap warmup requests are never inserted into the prefix
+        # cache, so the seed request could not be reused.
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                with self.assertLogs(warmup_module.logger, level="INFO") as cm:
+                    phases = _phases(FakeTokenizerManager(), disaggregation_mode=mode)
+                self.assertNotIn("cached-prefix", phases)
+                self.assertIn("cohort", phases)
+                self.assertTrue(any("cached-prefix" in line for line in cm.output))
+
+    async def test_non_generative_models_skip_the_warmup(self):
+        tm = FakeTokenizerManager()
+        tm.is_generation = False
+        await serving_coverage("null", tm)
+        self.assertEqual(tm.requests, [])
+
+    async def test_a_rejected_sampling_variant_does_not_stop_the_others(self):
+        class RejectsMinP(FakeTokenizerManager):
+            async def generate_request(self, req, request):
+                if req.sampling_params.get("min_p", 0.0) > 0.0:
+                    self.requests.append(req)
+                    raise ValueError("min_p is not supported")
+                async for response in super().generate_request(req, request):
+                    yield response
+
+        tm = RejectsMinP()
+        with self.assertLogs(warmup_module.logger, level="WARNING") as cm:
+            await _phases(tm)["sampling"]()
+
+        variants = _SERVING_COVERAGE_SAMPLING_VARIANTS
+        rejected = [v for v in variants if v.get("min_p", 0.0) > 0.0]
+        self.assertTrue(rejected)
+        # Every variant is tried once, then the cohort runs with the
+        # supported variants only.
+        self.assertEqual(len(tm.requests), len(variants) + MAX_RUNNING)
+        cohort = tm.requests[len(variants) :]
+        self.assertTrue(all("min_p" not in r.sampling_params for r in cohort))
+        self.assertEqual(tm.max_in_flight, MAX_RUNNING)
+        self.assertTrue(any("rejected" in line for line in cm.output))
+
+    async def test_sampling_fails_when_every_variant_is_rejected(self):
+        class RejectsAll(FakeTokenizerManager):
+            async def generate_request(self, req, request):
+                self.requests.append(req)
+                raise ValueError("sampling is not supported")
+                yield {}
+
+        tm = RejectsAll()
+        with self.assertLogs(warmup_module.logger, level="WARNING"):
+            with self.assertRaisesRegex(ValueError, "sampling is not supported"):
+                await _phases(tm)["sampling"]()
+        self.assertEqual(len(tm.requests), len(_SERVING_COVERAGE_SAMPLING_VARIANTS))
 
     async def test_token_ids_stay_inside_the_vocabulary(self):
         tm = FakeTokenizerManager()
@@ -496,6 +551,19 @@ class TestWideDataParallelWindows(_PublishedConfig):
         self.assertEqual(len(tm.requests), self.dp_size * MAX_RUNNING)
         self.assertEqual({r.routed_dp_rank for r in tm.requests}, set(range(20)))
         self.assertLessEqual(tm.max_in_flight, WINDOW * MAX_RUNNING)
+
+    async def test_a_failing_rank_does_not_skip_later_windows(self):
+        class RejectsRankZero(FakeTokenizerManager):
+            async def generate_request(self, req, request):
+                if req.routed_dp_rank == 0:
+                    raise RuntimeError("rank 0 failed")
+                async for response in super().generate_request(req, request):
+                    yield response
+
+        tm = RejectsRankZero()
+        with self.assertRaisesRegex(RuntimeError, "rank 0 failed"):
+            await _phases(tm)["cohort"]()
+        self.assertEqual({r.routed_dp_rank for r in tm.requests}, set(range(1, 20)))
 
 
 if __name__ == "__main__":
