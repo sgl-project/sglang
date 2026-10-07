@@ -353,6 +353,9 @@ class AiterAttnBackend(AttentionBackend):
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
 
+    # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
+    use_mla_auto_kv_splits: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -407,7 +410,6 @@ class AiterAttnBackend(AttentionBackend):
                 f"got {self.mla_verify_backend!r}"
             )
         self._cprr_launch_logged = False
-        self.use_mla_auto_kv_splits = False
         # fast_mode / intra_batch_mode for the cp verify schedule. Not the
         # module defaults: those size reduce_partial_map at 65536 entries
         # instead of 1276, and mla_decode_fwd then asks for a 64 GiB logits
