@@ -7,7 +7,7 @@ from typing import Any, List, Optional, Union
 
 import torch
 from PIL import Image
-from transformers import BaseImageProcessor
+from transformers import BaseImageProcessor, BatchFeature
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
@@ -929,56 +929,14 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
 
         base_input_ids = getattr(base_output, "input_ids", None)
         video_data = request_obj.video_data
-        self._mark_cuda_ipc_features_for_deferred_reconstruction(mm_items)
-
-        second_per_grid_ts = self._get_processor_output_value(ret, "second_per_grid_ts")
-        if second_per_grid_ts is None:
-            second_per_grid_ts = self._get_processor_output_value(
-                ret, "video_second_per_grid"
-            )
-
-        input_ids = input_ids.flatten()
-        if (
-            isinstance(base_input_ids, list)
-            and len(base_input_ids) == input_ids.numel()
-        ):
-            # reuse preprocess input if it already carries list of input_ids
-            input_ids_list = base_input_ids
-        else:
-            input_ids_list = input_ids.tolist()
-
-        # look for if padded_input_ids already exists before computing
-        padded_input_ids = self._get_processor_output_value(ret, "padded_input_ids")
-        if padded_input_ids is None:
-            padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(
-                input_ids_list, mm_items
-            )
-        elif isinstance(padded_input_ids, torch.Tensor):
-            # reuse existing padded_input_ids
-            padded_input_ids = padded_input_ids.flatten().tolist()
-        else:
-            padded_input_ids = list(padded_input_ids)
-
-        mrope_positions, mrope_position_delta = self._compute_mrope_positions(
+        output = self._build_mm_output(
             ret,
             mm_items,
             input_ids,
+            base_input_ids=base_input_ids,
             image_data=image_data,
             video_data=video_data,
-            second_per_grid_ts=second_per_grid_ts,
             audio_feature_lengths=audio_feature_lengths,
-        )
-        output = MultimodalProcessorOutput(
-            input_ids=input_ids_list,
-            padded_input_ids=padded_input_ids,
-            mm_items=mm_items,
-            im_start_id=self.vision_start_token_id,
-            im_end_id=self.vision_end_token_id,
-            im_token_id=self.mm_tokens.image_token_id,
-            video_token_id=self.mm_tokens.video_token_id,
-            audio_token_id=self.mm_tokens.audio_token_id,
-            mrope_positions=mrope_positions,
-            mrope_position_delta=mrope_position_delta,
         )
         get_rope_index_time = time.perf_counter()
         logger.debug(
@@ -1046,3 +1004,67 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                 item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
                     True
                 )
+
+    def _build_mm_output(
+        self,
+        ret: BatchFeature,
+        mm_items: list[MultimodalDataItem],
+        input_ids: torch.Tensor,
+        *,
+        base_input_ids: Optional[list[int]] = None,
+        image_data=None,
+        video_data=None,
+        audio_feature_lengths=None,
+    ) -> MultimodalProcessorOutput:
+        self._mark_cuda_ipc_features_for_deferred_reconstruction(mm_items)
+
+        second_per_grid_ts = self._get_processor_output_value(ret, "second_per_grid_ts")
+        if second_per_grid_ts is None:
+            second_per_grid_ts = self._get_processor_output_value(
+                ret, "video_second_per_grid"
+            )
+
+        input_ids = input_ids.flatten()
+        if (
+            isinstance(base_input_ids, list)
+            and len(base_input_ids) == input_ids.numel()
+        ):
+            # reuse preprocess input if it already carries list of input_ids
+            input_ids_list = base_input_ids
+        else:
+            input_ids_list = input_ids.tolist()
+
+        # look for if padded_input_ids already exists before computing
+        padded_input_ids = self._get_processor_output_value(ret, "padded_input_ids")
+        if padded_input_ids is None:
+            padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(
+                input_ids_list, mm_items
+            )
+        elif isinstance(padded_input_ids, torch.Tensor):
+            # reuse existing padded_input_ids
+            padded_input_ids = padded_input_ids.flatten().tolist()
+        else:
+            padded_input_ids = list(padded_input_ids)
+
+        mrope_positions, mrope_position_delta = self._compute_mrope_positions(
+            ret,
+            mm_items,
+            input_ids,
+            image_data=image_data,
+            video_data=video_data,
+            second_per_grid_ts=second_per_grid_ts,
+            audio_feature_lengths=audio_feature_lengths,
+        )
+        output = MultimodalProcessorOutput(
+            input_ids=input_ids_list,
+            padded_input_ids=padded_input_ids,
+            mm_items=mm_items,
+            im_start_id=self.vision_start_token_id,
+            im_end_id=self.vision_end_token_id,
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            audio_token_id=self.mm_tokens.audio_token_id,
+            mrope_positions=mrope_positions,
+            mrope_position_delta=mrope_position_delta,
+        )
+        return output
