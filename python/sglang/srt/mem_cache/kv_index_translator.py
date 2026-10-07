@@ -569,9 +569,12 @@ class KVIndexTranslator:
                     "a translating reader must read through the plan of its "
                     "own req_to_token rows"
                 )
+                # `seq_lens` sizes the batch: a caller may hold a wider
+                # req_pool_indices (a padded graph buffer), whose extra lanes
+                # have no length to bound.
                 build_kv_read_table_packed(
                     req_to_token=self.req_to_token,
-                    req_pool_indices=req_pool_indices,
+                    req_pool_indices=req_pool_indices[:bs],
                     seq_lens=seq_lens,
                     v2p=self.space(kind).read_v2p,
                     indptr=indptr,

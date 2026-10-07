@@ -488,6 +488,20 @@ class TestKVLocPlan(unittest.TestCase):
                 self.assertTrue(torch.equal(got, want))
             self.assertEqual(int(out[5]), -7)  # past the stream: untouched
 
+            # A caller holding a padded graph buffer of request rows: the
+            # lengths size the batch, the extra lanes are left out.
+            padded = torch.cat([self.rpi, torch.zeros(5, dtype=torch.int64)])
+            again = torch.full((6,), -7, dtype=torch.int32)
+            solo.pack_read_stream(
+                self._plan(solo, read_extent=1),
+                req_pool_indices=padded,
+                seq_lens=lens,
+                indptr=indptr,
+                out=again,
+            )
+            self.assertTrue(torch.equal(again, out))
+            calls["packed"] -= 1
+
             # A table read after it still gets one.
             plan.read_table()
             self.assertEqual(calls["table"], 1)
