@@ -4290,8 +4290,8 @@ class HybridLinearKVPool(KVCache):
         return getattr(self.full_kv_pool, "tail_extra_slots", 0)
 
     @property
-    def slots_per_page(self) -> int:
-        return getattr(self.full_kv_pool, "slots_per_page", self.page_size)
+    def index_page_size(self) -> int:
+        return getattr(self.full_kv_pool, "index_page_size", self.page_size)
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
@@ -5142,7 +5142,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
-        index_page_size: Optional[int] = None,
+        index_alloc_page_size: Optional[int] = None,
         alloc_page_size: Optional[int] = None,
         dcp_replicated: bool = False,
     ):
@@ -5175,9 +5175,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
         assert self.page_size % index_kpool == 0, (
             f"page_size {self.page_size} must be a multiple of index_kpool {index_kpool}"
         )
-        self.slots_per_page = self.page_size // index_kpool
+        self.index_page_size = self.page_size // index_kpool
         # Index keys are replicated under DCP and padded by the allocator page.
-        self.index_page_size = page_size if index_page_size is None else index_page_size
+        self.index_alloc_page_size = (
+            page_size if index_alloc_page_size is None else index_alloc_page_size
+        )
         if index_buf_size is None:
             index_buf_size = size
         self.index_buf_size = index_buf_size

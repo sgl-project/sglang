@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -16,6 +17,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
+from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.kv_cache_builder import uses_ssm_state
@@ -28,7 +30,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
-from sglang.srt.observability.metrics_collector import DPCooperationInfo
+from sglang.srt.observability.metrics_collector import (
+    DPBalanceStats,
+    DPCooperationInfo,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
@@ -118,9 +123,13 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     prefill_cuda_graph_max_prefix_len: int = 0
+    # Every request in the local batch is a health-check probe.
+    is_health_check: bool = False
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
+    any_health_check: bool = False
+    sync_wait_seconds: float = 0.0
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
@@ -139,6 +148,7 @@ class MLPSyncBatchInfo:
                 int(self.can_run_prefill_cuda_graph),
                 self.prefill_cuda_graph_max_prefix_len,
                 int(self.can_run_draft_cuda_graph),
+                int(self.is_health_check),
             ],
             device=device,
             dtype=dtype,
@@ -156,6 +166,7 @@ class MLPSyncBatchInfo:
                 0,  # can_run_prefill_cuda_graph
                 0,  # prefill_cuda_graph_max_prefix_len
                 1,  # can_run_draft_cuda_graph
+                0,  # is_health_check
             ],
             device=device,
             dtype=dtype,
@@ -166,6 +177,7 @@ class MLPSyncBatchInfo:
         self.tp0_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
+        self.any_health_check = self.is_health_check
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -177,6 +189,7 @@ class MLPSyncBatchInfo:
         group: torch.distributed.ProcessGroup,
         use_all_reduce: bool = False,
     ):
+        sync_start = time.perf_counter()
         local_info_tensor = self._get_local_tensor(device=device)
         fallback_tensor = self._get_fallback_tensor(device=device)
         info_width = local_info_tensor.numel()
@@ -239,6 +252,8 @@ class MLPSyncBatchInfo:
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
         self.prefill_cuda_graph_max_prefix_len = int(tp0_info_cpu[:, 7].max())
         self.can_run_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
+        self.any_health_check = bool(tp0_info_cpu[:, 9].max())
+        self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -413,6 +428,24 @@ def _local_prefill_cuda_graph_vote(
     )
 
 
+class DPSyncWaitCarry:
+    """MLP-sync wait of batch-less gathers, folded into the next recorded step.
+
+    One scheduler iteration can gather more than once (with speculative
+    decoding, get_next_batch_to_run gathers for the new prefill batch first,
+    then for the running batch); the first gather absorbs the cross-rank
+    arrival skew but yields no batch to record on. Only batch-less gathers carry: an iteration
+    that ends with no batch drops the carry in Scheduler.on_idle, and a step
+    that runs a batch without recording (prebuilt, health check) drops it too,
+    so an idle engine's gathers never pile onto the first busy step.
+    """
+
+    __slots__ = ("seconds",)
+
+    def __init__(self) -> None:
+        self.seconds = 0.0
+
+
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     model_runner: ModelRunner,
@@ -423,6 +456,7 @@ def prepare_mlp_sync_batch_raw(
     offload_tags: set[str],
     draft_require_mlp_tp_gather: Optional[bool] = None,
     dwdp: bool = False,
+    sync_wait_carry: Optional[DPSyncWaitCarry] = None,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -481,6 +515,11 @@ def prepare_mlp_sync_batch_raw(
     )
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
+    is_health_check = bool(
+        local_batch is not None
+        and local_batch.reqs
+        and all(is_health_check_generate_req(req) for req in local_batch.reqs)
+    )
     if local_batch is not None:
         local_batch.is_extend_in_batch = is_extend_in_batch
 
@@ -523,6 +562,7 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
+        is_health_check=is_health_check,
     )
 
     if num_dp_ranks == 1:
@@ -576,6 +616,23 @@ def prepare_mlp_sync_batch_raw(
 
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
+        local_batch.dp_balance_stats = None
+    if _ENABLE_METRICS_DP_ATTENTION and num_dp_ranks > 1 and not skip_all_gather:
+        sync_wait_seconds = mlp_sync_info.sync_wait_seconds
+        if sync_wait_carry is not None:
+            sync_wait_seconds += sync_wait_carry.seconds
+            sync_wait_carry.seconds = 0.0
+        # Health-check probes run on an otherwise idle engine; recording them
+        # would show maximal imbalance where there is no load.
+        if need_idle_batch and not mlp_sync_info.any_health_check:
+            local_batch.dp_balance_stats = DPBalanceStats.create(
+                local_tokens=num_tokens,
+                global_num_tokens=mlp_sync_info.global_num_tokens,
+                sync_wait_seconds=sync_wait_seconds,
+            )
+        elif local_batch is None and sync_wait_carry is not None:
+            # No batch yet: this iteration may gather again, or end in on_idle.
+            sync_wait_carry.seconds = sync_wait_seconds
 
     return local_batch
 
@@ -591,6 +648,11 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
+    sync_wait_carry: DPSyncWaitCarry = field(default_factory=DPSyncWaitCarry)
+
+    def drop_sync_wait_carry(self) -> None:
+        """The iteration produced no batch, so its gather waits have no step to land on."""
+        self.sync_wait_carry.seconds = 0.0
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         draft_require_mlp_tp_gather = None
@@ -612,6 +674,7 @@ class SchedulerDPAttnAdapter:
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
+            sync_wait_carry=self.sync_wait_carry,
         )
 
     def maybe_prepare_mlp_sync_batch(
