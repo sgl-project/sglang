@@ -124,7 +124,6 @@ def _score_shard_packed(
     k_scale,
 ):
     # tile row i is (draft row i // WORLD, head i % WORLD): one K read per request
-    # not folded into _score_shard as PACK=1; its vector row addressing costs decode 3.6%
     group, chunk = tl.program_id(0), tl.program_id(1)
     tile = tl.arange(0, TILE)
     head, sub = tile % WORLD, tile // WORLD

@@ -16,9 +16,7 @@ NDT = 4
 def _inputs(batch, max_len, dtype, device):
     torch.manual_seed(20260928)
     padded_len = (max_len + BLOCK - 1) // BLOCK * BLOCK
-    # Request i owns table row batch + 2 * (batch - 1 - i) + 1: never row i, out of
-    # order, with unused rows between. A kernel that addresses K by batch or group
-    # index instead of through the slot table reads another row's keys.
+    # slots are never the row or group index, so addressing K by index reads the wrong keys
     table_rows = 3 * batch
     nslots = table_rows * padded_len
     # Physical pages shuffled independently of logical block ownership, so a rank
