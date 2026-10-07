@@ -1383,6 +1383,23 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             ).input_ids.flatten()
 
         images = base_output.images
+        all_collected_items = self._bind_and_finalize_mm_items(
+            all_collected_items,
+            input_ids=input_ids,
+            mm_tokens=mm_tokens,
+            images=images,
+        )
+
+        return all_collected_items, input_ids, ret
+
+    def _bind_and_finalize_mm_items(
+        self,
+        all_collected_items: List[MultimodalDataItem],
+        *,
+        input_ids: torch.Tensor,
+        mm_tokens: MultimodalSpecialTokens,
+        images: Optional[List[Any]],
+    ) -> List[MultimodalDataItem]:
         # Add offsets to all items
         for mm_item in all_collected_items:
             if mm_item.offsets is not None:
@@ -1401,8 +1418,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             all_collected_items,
             images=images,
         )
-
-        return all_collected_items, input_ids, ret
+        return all_collected_items
 
     def _finalize_mm_items(
         self,
