@@ -19,6 +19,7 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -72,17 +73,18 @@ class K3DSparkBackbone(nn.Module):
             num_context_features = num_layers
         self.num_context_features = int(num_context_features)
 
-        self.layers = nn.ModuleList(
-            [
-                DeepseekV2DecoderLayer(
-                    config=config,
-                    layer_id=i,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{i}", prefix),
-                )
-                for i in range(num_layers)
-            ]
-        )
+        with layer_stack():
+            self.layers = nn.ModuleList(
+                [
+                    DeepseekV2DecoderLayer(
+                        config=config,
+                        layer_id=i,
+                        quant_config=quant_config,
+                        prefix=add_prefix(f"layers.{i}", prefix),
+                    )
+                    for i in range(num_layers)
+                ]
+            )
         self.context_proj = nn.Linear(
             self.num_context_features * hidden_size,
             hidden_size,
