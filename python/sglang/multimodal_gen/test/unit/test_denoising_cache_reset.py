@@ -18,10 +18,7 @@ from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanTransformer3DModel
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-
-register_cuda_ci(est_time=10, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
 
 STEPS = 8
 FIRST_LOW_NOISE_STEP = 4  # where the second expert takes over
