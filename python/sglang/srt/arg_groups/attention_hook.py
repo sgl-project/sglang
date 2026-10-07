@@ -671,6 +671,8 @@ def handle_deterministic_inference(server_args: Any):
                 # (each GPU reads all data from all GPUs, reduces locally in fixed order)
                 run_post_process_pass(server_args, _deterministic_rocm_rccl_check)
                 logger.info("AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)")
+            elif get_platform().is_xpu:
+                os.environ["CCL_ALLREDUCE"] = "recursive_doubling"
             else:
                 # CUDA: use NCCL tree algorithm
                 os.environ["NCCL_ALGO"] = "allreduce:tree"
