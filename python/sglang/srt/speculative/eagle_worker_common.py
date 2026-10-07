@@ -324,9 +324,6 @@ def prepare_for_draft(
                     write_virtual=batch.out_cache_loc,
                     read_extent=num_draft_tokens,
                 )
-                batch.out_cache_loc = kv_loc_plan.virtual_write_ids(
-                    cols=slice(0, num_steps)
-                )
         else:
             # page_size > 1 + topk > 1: per-branch page-aligned draft pages.
             # Reduce out_cache_loc from the page-aligned tree region down to the
