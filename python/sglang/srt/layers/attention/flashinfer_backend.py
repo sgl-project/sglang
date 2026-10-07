@@ -26,6 +26,7 @@ import torch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
+    spec_kv_index_token_blocks,
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
@@ -45,7 +46,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.speculative.eagle_info import spec_kv_index_token_blocks
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,

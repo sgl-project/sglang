@@ -20,7 +20,7 @@ from sglang.kernels.ops.attention.utils import (
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
-    kv_indices_num_token_blocks,
+    spec_kv_index_token_blocks,
 )
 from sglang.kernels.ops.kvcache.aiter_unified_attention import (
     scatter_ragged_to_page_table_kernel,
@@ -126,7 +126,8 @@ intra_batch_mode = True if _use_mla_ps_kernel else False
 # the speculative-decoding paths (target_verify / draft_extend / draft
 # decode) of long-context servers. Everything else keeps the historical
 # one-program-per-request launch.
-_KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
+# The threshold and the sizing helper live in
+# sglang.kernels.ops.kvcache.kv_indices (spec_kv_index_token_blocks).
 
 
 class WrapperDispatch(Enum):
@@ -1493,9 +1494,15 @@ class AiterAttnBackend(AttentionBackend):
         return output[:, : layer.tp_q_head_num, :] if head_pad else output
 
     def _kv_index_blocks(self, bs: int) -> int:
-        if self.max_context_len < _KV_INDEX_BLOCKS_MIN_CONTEXT:
-            return 1
-        return kv_indices_num_token_blocks(self.req_to_token.shape[1], bs)
+        # Shared helper (sglang.kernels.ops.kvcache.kv_indices) with the
+        # AITER rule unchanged: gate on max_context_len, size from the table
+        # width (no host length sum is passed).
+        return spec_kv_index_token_blocks(
+            self.req_to_token.shape[1],
+            None,
+            bs,
+            context_len=self.max_context_len,
+        )
 
     def init_forward_metadata_out_graph(
         self,
@@ -4294,12 +4301,12 @@ class AiterMultiStepDraftBackend:
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
 
-        num_token_blocks = (
-            kv_indices_num_token_blocks(
-                self.pool_len, self.speculative_num_steps * num_seqs * self.topk
-            )
-            if self.max_context_len >= _KV_INDEX_BLOCKS_MIN_CONTEXT
-            else 1
+        num_token_blocks = spec_kv_index_token_blocks(
+            self.pool_len,
+            None,  # table-width sizing, as before
+            num_seqs,
+            base_programs=self.speculative_num_steps * num_seqs * self.topk,
+            context_len=self.max_context_len,  # gate as before
         )
         self.generate_draft_decode_kv_indices[
             (self.speculative_num_steps * num_token_blocks, num_seqs, self.topk)

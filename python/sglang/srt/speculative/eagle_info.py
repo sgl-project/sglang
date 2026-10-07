@@ -1,53 +1,18 @@
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional
 
 import torch
 
 from sglang.kernels.ops.attention.utils import (
     create_flashinfer_kv_indices_triton,
-    kv_indices_num_token_blocks,
+    spec_kv_index_token_blocks,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
-
-# Token-block parallel KV-index building pays only on long-context servers;
-# below this the spec-decode index launches keep their historical grids.
-_KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
-
-
-def spec_kv_index_token_blocks(
-    table_width: int,
-    kv_lens_sum: Union[int, torch.Tensor, None],
-    batch_size: int,
-    base_programs: Optional[int] = None,
-    length_cap: Optional[int] = None,
-) -> int:
-    """Token blocks per base program for a spec-decode KV-index launch.
-
-    Shared by the EAGLE verify / draft-extend launches in this module (which
-    serve the flashinfer, flashinfer_mla and aiter backends) and by the
-    flashinfer draft-decode launch. Returns 1 below the long-context gate.
-    The block count is sized from the batch's mean live KV length when the
-    length sum is a host int (optionally capped, e.g. by a draft window), so a
-    batch of short prefixes on a long-context server does not fan out into
-    idle programs; a device-side sum falls back to the table width, the
-    sync-free bound. ``base_programs`` is the launch's base grid size
-    (default: ``batch_size``).
-    """
-    if table_width < _KV_INDEX_BLOCKS_MIN_CONTEXT or batch_size <= 0:
-        return 1
-    if isinstance(kv_lens_sum, int):
-        width = (kv_lens_sum + batch_size - 1) // batch_size
-        if length_cap is not None:
-            width = min(width, length_cap)
-    else:
-        width = table_width
-    programs = base_programs if base_programs is not None else batch_size
-    return kv_indices_num_token_blocks(width, programs)
 
 
 @dataclass

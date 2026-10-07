@@ -18,6 +18,49 @@ def kv_indices_num_token_blocks(table_width: int, base_programs: int) -> int:
     return max(1, min(cap, want))
 
 
+# Token-block parallelism pays only on long-context servers; below this the
+# spec-decode index launches keep their historical grids.
+SPEC_KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
+
+
+def spec_kv_index_token_blocks(
+    table_width: int,
+    kv_lens_sum,
+    batch_size: int,
+    base_programs=None,
+    length_cap=None,
+    context_len=None,
+) -> int:
+    """Token blocks per base program for a spec-decode KV-index launch.
+
+    One gate and one sizing rule for every launch site (the EAGLE verify /
+    draft-extend builders shared by the flashinfer, flashinfer_mla and aiter
+    backends, and the flashinfer / aiter draft-decode launches). Returns 1
+    below the long-context gate. When ``kv_lens_sum`` is a host int the
+    block count is sized from the batch's mean live KV length (optionally
+    capped by ``length_cap``, e.g. a draft window), so a batch of short
+    prefixes on a long-context server does not fan out into idle programs;
+    any other value (a device tensor, or None) falls back to the table
+    width, the sync-free bound. ``base_programs`` is the launch's base grid
+    size (default: ``batch_size``). ``context_len`` is the value the
+    long-context gate reads (default: ``table_width``; AITER gates on the
+    server's ``max_context_len`` while sizing from its token table). Any
+    block count is correct for the kernels above (they stride their blocks
+    over the row); it only changes the parallelism.
+    """
+    gate = table_width if context_len is None else context_len
+    if gate < SPEC_KV_INDEX_BLOCKS_MIN_CONTEXT or batch_size <= 0:
+        return 1
+    if isinstance(kv_lens_sum, int):
+        width = (kv_lens_sum + batch_size - 1) // batch_size
+        if length_cap is not None:
+            width = min(width, length_cap)
+    else:
+        width = table_width
+    programs = base_programs if base_programs is not None else batch_size
+    return kv_indices_num_token_blocks(width, programs)
+
+
 @triton.jit
 def create_flashinfer_kv_indices_triton(
     req_to_token_ptr,  # [max_batch, max_context_len] token table; at
