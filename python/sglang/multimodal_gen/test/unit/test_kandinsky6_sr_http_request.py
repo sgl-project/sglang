@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Check SR prompt admission and request fields without running a GPU scheduler.
 
-JSON uses TestClient; multipart tests call the parsed endpoint directly. The
+JSON and multipart use TestClient to exercise FastAPI field parsing. The
 full-checkpoint test_server_kandinsky6_sr.py also exercises actual file uploads.
 """
 
-import asyncio
 import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -22,7 +21,6 @@ from sglang.multimodal_gen.configs.sample.kandinsky6_sr import (
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai import video_api
-from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import VideoResponse
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     resolve_sampling_params_cls,
 )
@@ -202,89 +200,45 @@ def test_build_video_sampling_params_accepts_no_prompt_and_carries_sr_fields():
 
 
 # --------------------------------------------------------------------------- #
-# The full endpoint, called directly (see module docstring for why not TestClient)
+# The full endpoint with real multipart parsing
 # --------------------------------------------------------------------------- #
-class _FakeMultipartRequest:
-    """Duck-types the slice of ``fastapi.Request`` ``create_video`` reads directly."""
-
-    def __init__(self, form: dict):
-        self.headers = {"content-type": "multipart/form-data; boundary=x"}
-        self._form = form
-
-    async def form(self):
-        return self._form
-
-
-def test_multipart_sr_request_without_prompt_is_accepted():
-    """A multipart SR request with no ``prompt`` field must be admitted (no 400), the
-    ``sr_*`` fields must reach the queued request, and it must fail on the pre-fix
-    code: the old unconditional ``if not prompt: raise HTTPException(...)`` gate would
-    reject this before any of the rest of ``create_video`` ran."""
-    server_args = _fake_server_args()
-    request = _FakeMultipartRequest(
-        {"sr_resolution_scale": "4", "sr_tiles_batch_size": "3"}
+@pytest.mark.parametrize(
+    "sampling_params_cls, status",
+    [(Kandinsky6SRSamplingParams, 200), (SamplingParams, 400)],
+)
+def test_multipart_sr_request_without_prompt_is_accepted(
+    tmp_path, sampling_params_cls, status
+):
+    app = FastAPI()
+    app.include_router(video_api.router)
+    server_args = _fake_server_args(
+        input_save_path=str(tmp_path / "uploads"), output_path=str(tmp_path / "outputs")
     )
-    dispatched: list[tuple] = []
-
-    async def _fake_dispatch(job_id, batch, **kwargs):
-        dispatched.append((job_id, batch, kwargs))
-
-    async def run():
-        with (
-            _patched_global_server_args(server_args),
-            patch.object(video_api, "_dispatch_job_async", side_effect=_fake_dispatch),
-        ):
-            response = await video_api.create_video(
-                request,
-                prompt=None,  # <-- the field under test: no prompt supplied
-                enhance_prompt=None,
-                task_type=None,
-                x264_preset=None,
-                perf_dump_path=None,
-                input_reference=None,
-                reference_url=None,
-                video_reference=None,
-                video_url=None,
-                video_path="unused.mp4",
-                model=None,
-                n=1,
-                num_outputs_per_prompt=None,
-                seconds=None,
-                size=None,
-                fps=None,
-                num_frames=None,
-                seed=None,
-                generator_device="cuda",
-                negative_prompt=None,
-                guidance_scale=None,
-                guidance_scale_2=None,
-                true_cfg_scale=None,
-                num_inference_steps=None,
-                max_sequence_length=None,
-                flow_shift=None,
-                enable_teacache=None,
-                enable_frame_interpolation=None,
-                frame_interpolation_exp=None,
-                frame_interpolation_scale=None,
-                frame_interpolation_model_path=None,
-                enable_upscaling=None,
-                upscaling_model_path=None,
-                upscaling_scale=None,
-                output_quality=None,
-                output_compression=None,
-                output_path=None,
-                extra_params=None,
-                extra_body=None,
-            )
-            await asyncio.sleep(0)
-        return response
-
-    response = asyncio.run(run())
-
-    assert isinstance(response, VideoResponse)
-    assert response.status == "queued"
-    assert len(dispatched) == 1
-    _, batch, _ = dispatched[0]
-    assert batch.prompt == ""
-    assert batch.sampling_params.sr_resolution_scale == 4
-    assert batch.sampling_params.sr_tiles_batch_size == 3
+    dispatch = AsyncMock()
+    with (
+        _patched_global_server_args(server_args),
+        patch.object(
+            video_api, "resolve_sampling_params_cls", return_value=sampling_params_cls
+        ),
+        patch.object(video_api, "_dispatch_job_async", dispatch),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            "/v1/videos",
+            files={
+                "video_path": (None, "unused.mp4"),
+                "sr_resolution_scale": (None, "4"),
+                "sr_tiles_batch_size": (None, "3"),
+            },
+        )
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json()["status"] == "queued"
+        dispatch.assert_awaited_once()
+        _, batch = dispatch.call_args.args
+        assert batch.prompt == ""
+        assert batch.sampling_params.video_path == "unused.mp4"
+        assert batch.sampling_params.sr_resolution_scale == 4
+        assert batch.sampling_params.sr_tiles_batch_size == 3
+    else:
+        dispatch.assert_not_called()
