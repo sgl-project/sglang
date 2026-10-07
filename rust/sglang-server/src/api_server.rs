@@ -5,6 +5,7 @@
 //! control handlers serialize typed frontend results such as server metadata.
 pub mod app;
 mod common;
+mod decompression;
 mod disaggregation;
 mod frame;
 mod log;

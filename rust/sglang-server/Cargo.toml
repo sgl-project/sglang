@@ -64,6 +64,7 @@ regex-syntax = "=0.8.11"
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
 sglang-grpc-types = { path = "../../proto" }
+zstd = "0.11"
 # The pure-Rust core of the MM pipeline. `default-features = false` drops the
 # pyo3 bindings so it links as a plain rlib; renamed so `use sglang_mm::…` reads
 # naturally while the crate keeps its own artifact name in the shared target/.

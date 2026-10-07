@@ -108,6 +108,8 @@ pub struct ServerArgs {
     /// `log_level_http or log_level` (see [`Self::http_access_log_enabled`]).
     pub log_level: String,
     pub log_level_http: Option<String>,
+    /// `SGLANG_ENABLE_REQUEST_DECOMPRESSION`: accept `x-body-compressed: zstd`.
+    pub enable_request_decompression: bool,
     /// Optional built-in chat-template name or path to a Jinja/legacy JSON
     /// template file. Without an override, uses the tokenizer config template.
     pub chat_template: Option<String>,
@@ -174,6 +176,7 @@ impl ServerArgs {
         grpc_port,
         log_level,
         log_level_http,
+        enable_request_decompression,
         chat_template,
         tool_call_parser,
         reasoning_parser,
@@ -207,6 +210,7 @@ impl ServerArgs {
         grpc_port: Option<u16>,
         log_level: String,
         log_level_http: Option<String>,
+        enable_request_decompression: bool,
         chat_template: Option<String>,
         tool_call_parser: Option<String>,
         reasoning_parser: Option<String>,
@@ -238,6 +242,7 @@ impl ServerArgs {
             grpc_port,
             log_level,
             log_level_http,
+            enable_request_decompression,
             chat_template,
             tool_call_parser,
             reasoning_parser,
@@ -277,6 +282,7 @@ impl Default for ServerArgs {
             grpc_port: None,
             log_level: "info".into(),
             log_level_http: None,
+            enable_request_decompression: false,
             chat_template: None,
             tool_call_parser: None,
             reasoning_parser: None,
