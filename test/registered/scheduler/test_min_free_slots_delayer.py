@@ -541,7 +541,13 @@ class TestMinFreeSlotsDelayerWithPrefillDelayer(unittest.TestCase):
         delayer.skip_first_delayer = False
         return delayer
 
-    def test_replacement_is_admitted_when_both_delayers_are_enabled(self):
+    def _run_until_admitted(self, waiting_bs_for_pass, num_passes):
+        """Return the first pass that admits a prefill, or None.
+
+        Seven requests stay active after an observed target of 8. Each pass
+        mirrors the scheduler order: replacement batching, then the
+        PrefillAdder gate, then finalize() for the pass.
+        """
         min_free_slots_delayer = MinFreeSlotsDelayer(
             min_free_slots=4, scale_with_observed_target=True
         )
@@ -550,13 +556,9 @@ class TestMinFreeSlotsDelayerWithPrefillDelayer(unittest.TestCase):
         tracker = RecentPrefillBatchSizeTracker()
         tracker.observe_attempt(8)
 
-        # Seven requests stay active and one replacement waits, mirroring the
-        # scheduler order: replacement batching, then the PrefillAdder gate,
-        # then finalize() for the pass.
         running_bs = 7
-        admitted_pass = None
-        num_passes = 2 * (8 + self.PREFILL_DELAYER_MAX_DELAY_PASSES)
         for pass_index in range(num_passes):
+            waiting_bs = waiting_bs_for_pass(pass_index)
             executor = PrefillDelayerSinglePassExecutor(
                 prefill_delayer, token_usage=0.9
             )
@@ -564,21 +566,25 @@ class TestMinFreeSlotsDelayerWithPrefillDelayer(unittest.TestCase):
             if not min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
                 num_allocatable_reqs=self.MAX_RUNNING_REQUESTS - running_bs,
-                waiting_bs=1,
+                waiting_bs=waiting_bs,
             ) and executor.negotiate_should_allow_prefill(
                 local_prefillable=True,
                 running_batch=running_bs,
                 max_prefill_bs=tracker.max_prefill_bs,
                 max_running_requests=self.MAX_RUNNING_REQUESTS,
-                waiting_queue_len=1,
+                waiting_queue_len=waiting_bs,
             ):
-                admitted_bs = 1
+                admitted_bs = waiting_bs
             observed_prefill_bs = executor.finalize(actual_prefill_bs=admitted_bs)
             if observed_prefill_bs > 0:
                 tracker.observe_attempt(observed_prefill_bs)
             if admitted_bs:
-                admitted_pass = pass_index
-                break
+                return pass_index
+        return None
+
+    def test_replacement_is_admitted_when_both_delayers_are_enabled(self):
+        num_passes = 2 * (8 + self.PREFILL_DELAYER_MAX_DELAY_PASSES)
+        admitted_pass = self._run_until_admitted(lambda _: 1, num_passes)
 
         self.assertIsNotNone(
             admitted_pass, f"replacement starved for {num_passes} scheduler passes"
@@ -586,6 +592,34 @@ class TestMinFreeSlotsDelayerWithPrefillDelayer(unittest.TestCase):
         # Replacement batching waits for the observed target of 8 passes, then
         # the adaptive delayer applies its own bounded wait.
         self.assertEqual(admitted_pass, 8 + self.PREFILL_DELAYER_MAX_DELAY_PASSES - 1)
+
+    def test_arrivals_and_cancellations_do_not_restart_the_deadline(self):
+        # A second request repeatedly arrives and is cancelled, so the queue
+        # alternates between two and one requests. Each two-request pass looks
+        # like workload growth and is not delayed here, but the adaptive
+        # delayer still rejects it. Neither the growth bypass nor the following
+        # delay may restart the expired replacement-batching deadline.
+        num_passes = 10 * (8 + self.PREFILL_DELAYER_MAX_DELAY_PASSES)
+        for alternate_from_pass in (0, 8):
+            with self.subTest(alternate_from_pass=alternate_from_pass):
+
+                def waiting_bs_for_pass(pass_index):
+                    if pass_index < alternate_from_pass:
+                        return 1
+                    return 2 if (pass_index - alternate_from_pass) % 2 == 0 else 1
+
+                admitted_pass = self._run_until_admitted(
+                    waiting_bs_for_pass, num_passes
+                )
+                self.assertIsNotNone(
+                    admitted_pass,
+                    f"replacement starved for {num_passes} scheduler passes",
+                )
+                # At most 8 delayed passes in total, plus the adaptive wait.
+                self.assertLessEqual(
+                    admitted_pass,
+                    2 * 8 + self.PREFILL_DELAYER_MAX_DELAY_PASSES,
+                )
 
 
 if __name__ == "__main__":

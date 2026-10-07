@@ -98,12 +98,10 @@ class MinFreeSlotsDelayer:
         active_demand = active_running_bs + refillable_bs
         if active_demand > self._target_running_bs:
             # Do not delay a real increase in workload concurrency.
-            self._delay_passes = 0
             return False
 
         min_free_slots = self._resolve_threshold()
         if min_free_slots is None:
-            self._delay_passes = 0
             return False
 
         # Adapt after a real workload contraction without mistaking a staggered
@@ -115,7 +113,6 @@ class MinFreeSlotsDelayer:
             and self._target_running_bs - active_demand >= min_free_slots
         ):
             self._target_running_bs = active_demand
-            self._delay_passes = 0
             # The waiting work is genuine demand relative to the contracted
             # target. Admit it now instead of immediately delaying against the
             # target that this pass just established.
@@ -127,7 +124,6 @@ class MinFreeSlotsDelayer:
         # requests a chance to accumulate into one prefill batch.
         num_freed_slots = max(0, self._target_running_bs - running_bs)
         if num_freed_slots >= min_free_slots:
-            self._delay_passes = 0
             return False
         max_delay_passes = (
             self._target_running_bs
@@ -135,9 +131,11 @@ class MinFreeSlotsDelayer:
             else self._max_delay_passes
         )
         if self._delay_passes >= max_delay_passes:
-            # Keep the expired deadline latched until an admission resets it.
-            # Another admission gate, such as the adaptive prefill delayer, may
-            # still reject this pass; restarting the budget here would let the
+            # The budget counts delayed passes since the last admission, so
+            # only an admission, an empty queue, or a drained batch restarts
+            # it. Another admission gate, such as the adaptive prefill delayer,
+            # may reject a pass that is not delayed here; restarting the budget
+            # on that pass, including a tentative growth bypass, would let the
             # two delays alternate and hold the refill indefinitely.
             return False
 
