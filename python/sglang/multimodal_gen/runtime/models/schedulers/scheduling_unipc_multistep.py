@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
 from sglang.multimodal_gen.runtime.models.schedulers.unipc import (
     UniPCSchedulerMixin,
     compute_unipc_bh_coefficients,
+    unipc_predictor_step,
 )
 
 if is_scipy_available():
@@ -1026,34 +1027,9 @@ class UniPCMultistepScheduler(
                 order=self.this_order,
             )
 
-        for i in range(self.config.solver_order - 1):
-            self.model_outputs[i] = self.model_outputs[i + 1]
-            self.timestep_list[i] = self.timestep_list[i + 1]
-
-        self.model_outputs[-1] = model_output_convert
-        self.timestep_list[-1] = timestep
-
-        if self.config.lower_order_final:
-            this_order = min(
-                self.config.solver_order, len(self.timesteps) - self.step_index
-            )
-        else:
-            this_order = self.config.solver_order
-
-        self.this_order = min(
-            this_order, self.lower_order_nums + 1
-        )  # warmup for multistep
-        assert self.this_order > 0
-
-        self.last_sample = sample
-        prev_sample = self.multistep_uni_p_bh_update(
-            model_output=model_output,  # pass the original non-converted model output, in case solver-p is used
-            sample=sample,
-            order=self.this_order,
+        prev_sample = unipc_predictor_step(
+            self, model_output, model_output_convert, timestep, sample
         )
-
-        if self.lower_order_nums < self.config.solver_order:
-            self.lower_order_nums += 1
 
         # upon completion increase step index by one
         self._step_index += 1

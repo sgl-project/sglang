@@ -37,6 +37,38 @@ def compute_unipc_bh_coefficients(
     return R, b, h_phi_1, B_h
 
 
+def unipc_predictor_step(
+    scheduler, model_output, model_output_convert, timestep, sample
+):
+    """Update UniPC history and order, then predict; callers own correction and indexing."""
+    for i in range(scheduler.config.solver_order - 1):
+        scheduler.model_outputs[i] = scheduler.model_outputs[i + 1]
+        scheduler.timestep_list[i] = scheduler.timestep_list[i + 1]
+    scheduler.model_outputs[-1] = model_output_convert
+    scheduler.timestep_list[-1] = timestep
+
+    if scheduler.config.lower_order_final:
+        this_order = min(
+            scheduler.config.solver_order,
+            len(scheduler.timesteps) - scheduler.step_index,
+        )
+    else:
+        this_order = scheduler.config.solver_order
+    scheduler.this_order = min(this_order, scheduler.lower_order_nums + 1)
+    assert scheduler.this_order > 0
+
+    scheduler.last_sample = sample
+    # an external solver-p consumes the original, unconverted model output
+    prev_sample = scheduler.multistep_uni_p_bh_update(
+        model_output=model_output,
+        sample=sample,
+        order=scheduler.this_order,
+    )
+    if scheduler.lower_order_nums < scheduler.config.solver_order:
+        scheduler.lower_order_nums += 1
+    return prev_sample
+
+
 class UniPCSchedulerMixin:
     """Shared sample transforms and step state; subclasses own schedules and solvers."""
 
