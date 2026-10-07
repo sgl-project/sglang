@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Immutable delta transport validation; never reads or mutates weights."""
+"""Miles payload bounds and parallel CPU decoding into rank-owned host arenas."""
 
 import os
 import threading
@@ -32,179 +32,75 @@ def validate_codec(manifest):
         )
 
 
-def raw_payload_range(entry, files):
-    """Validate one complete, uncompressed scalar/vector target."""
-    raw = entry.get("raw")
-    size, changed = entry.get("nbytes"), entry.get("changed_bytes")
-    if (
-        entry.get("encoding") != "raw_bytes"
-        or entry.get("frames") != []
-        or "outer" in entry
-        or type(size) is not int
-        or type(changed) is not int
-        or not 0 <= changed <= size
-    ):
-        raise ValueError("invalid direct tensor payload")
-    if changed == 0:
-        if "raw" in entry:
-            raise ValueError("unchanged direct tensor must omit its payload")
-        return None
-    if not isinstance(raw, dict) or set(raw) != {
-        "file",
-        "encoded_offset",
-        "encoded_bytes",
-    }:
-        raise ValueError("invalid direct tensor payload")
-    name, start, count = raw["file"], raw["encoded_offset"], raw["encoded_bytes"]
-    if (
-        name not in files
-        or any(type(v) is not int for v in (start, count))
-        or start < 0
-        or count != size
-        or start + count > files[name]
-    ):
-        raise ValueError("direct tensor exceeds immutable payload or is incomplete")
-    return name, start, start + count
+def validate_payload_ranges(entries, files, frame_bytes, codec):
+    """Bound Miles payload spans before allocation and native decoding.
 
-
-def _reject_overlapping_ranges(ranges):
-    for intervals in ranges.values():
-        end = 0
-        for start, stop in sorted(intervals):
-            if start < end:
-                raise ValueError("overlapping immutable tensor payloads")
-            end = stop
-
-
-def validate_outer_entries(entries, files, frame_bytes, codec):
-    """Bound reconstructed spans before allocation, including foreign EP tensors."""
-    ranges = {name: [] for name in files}
+    Miles owns the schema, packing and frame construction. Check the memory
+    extents here; nvCOMP validates device geometry and decode status later.
+    Immutable source ranges may overlap because they are only read.
+    """
     for entry in entries:
         if entry["encoding"] == "raw_bytes":
-            payload_range = raw_payload_range(entry, files)
-            if payload_range is not None:
-                name, start, stop = payload_range
-                ranges[name].append((start, stop))
+            if entry["changed_bytes"]:
+                raw = entry["raw"]
+                start, count = raw["encoded_offset"], raw["encoded_bytes"]
+                if (
+                    count != entry["nbytes"]
+                    or not 0 <= start <= files[raw["file"]] - count
+                ):
+                    raise ValueError(
+                        "direct tensor exceeds immutable payload or is incomplete"
+                    )
             continue
-        if entry["encoding"] != "xor_bytes" or "raw" in entry:
-            raise ValueError("compressed tensor has an unexpected raw descriptor")
-        frames, outer = entry["frames"], entry.get("outer")
-        if not frames:
-            if "outer" in entry:
-                raise ValueError("empty tensor must omit the outer envelope")
+        if not entry["frames"]:
             continue
-        name = outer["file"]
-        start = outer["encoded_offset"]
-        count = outer["encoded_bytes"]
-        size = outer["decoded_bytes"]
-        if (
-            name not in files
-            or type(start) is not int
-            or type(count) is not int
-            or type(size) is not int
-            or start < 0
-            or count <= 0
-            or size <= 0
-            or start + count > files[name]
-        ):
+        outer = entry["outer"]
+        start, count, size = (
+            outer["encoded_offset"],
+            outer["encoded_bytes"],
+            outer["decoded_bytes"],
+        )
+        if count <= 0 or size <= 0 or not 0 <= start <= files[outer["file"]] - count:
             raise ValueError("outer descriptor exceeds immutable payload")
         if codec == "lz4":
-            if outer["frames"] != [] or count != size:
+            if count != size:
                 raise ValueError("plain LZ4 requires an exact unwrapped inner arena")
         else:
             _validate_outer_frames(outer)
-        end = decoded_end = 0
-        for frame in frames:
-            offset = frame["encoded_offset"]
-            encoded = frame["encoded_bytes"]
-            decoded_offset = frame["decoded_offset"]
-            decoded = frame["decoded_bytes"]
+        decoded_end = 0
+        for frame in entry["frames"]:
+            offset, encoded = frame["encoded_offset"], frame["encoded_bytes"]
+            decoded_offset, decoded = frame["decoded_offset"], frame["decoded_bytes"]
             if (
-                type(offset) is not int
-                or type(encoded) is not int
-                or type(decoded_offset) is not int
-                or type(decoded) is not int
-                or offset != (end + 15) // 16 * 16
+                offset < 0
+                or offset % 16
+                or encoded <= 0
+                or offset + encoded > size
                 or not 0 < decoded <= frame_bytes
-                or not 0 < encoded <= 32 + decoded + decoded // 6
-                or decoded_offset % frame_bytes
-                or decoded != min(frame_bytes, entry["nbytes"] - decoded_offset)
                 or decoded_offset < decoded_end
                 or decoded_offset + decoded > entry["nbytes"]
             ):
                 raise ValueError("invalid relative inner compressed frame")
-            end, decoded_end = offset + encoded, decoded_offset + decoded
-        if end != size:
-            raise ValueError("outer decoded length differs from the inner tensor span")
-        ranges[name].append((start, start + count))
-    _reject_overlapping_ranges(ranges)
+            decoded_end = decoded_offset + decoded
 
 
 def _validate_outer_frames(outer):
-    """GPU Zstd chunks exactly cover one natural tensor's inner compressed arena."""
-    chunks = outer["frames"]
-    if not chunks:
-        raise ValueError("GPU outer Zstd requires independent chunks")
-    encoded_end = decoded_end = 0
-    for chunk in chunks:
-        start = chunk["encoded_offset"]
-        count = chunk["encoded_bytes"]
-        offset = chunk["decoded_offset"]
-        size = chunk["decoded_bytes"]
+    """Bound source reads and fully initialize the inner arena before DE reads it."""
+    decoded_end = 0
+    for chunk in outer["frames"]:
+        start, count = chunk["encoded_offset"], chunk["encoded_bytes"]
+        offset, size = chunk["decoded_offset"], chunk["decoded_bytes"]
         if (
-            type(start) is not int
-            or type(count) is not int
-            or type(offset) is not int
-            or type(size) is not int
-            or start != (encoded_end + 15) // 16 * 16
-            or count <= 0
+            count <= 0
+            or not 0 <= start <= outer["encoded_bytes"] - count
             or offset != decoded_end
-            or offset % (1 << 20)
-            or size != min(1 << 20, outer["decoded_bytes"] - offset)
             or size <= 0
+            or offset + size > outer["decoded_bytes"]
         ):
             raise ValueError("invalid GPU outer Zstd chunk range")
-        encoded_end, decoded_end = start + count, offset + size
-    if (encoded_end, decoded_end) != (outer["encoded_bytes"], outer["decoded_bytes"]):
+        decoded_end = offset + size
+    if decoded_end != outer["decoded_bytes"]:
         raise ValueError("GPU outer Zstd chunks do not exactly cover their tensor")
-
-
-def validate_zstd_frame(payload, expected_size):
-    """Require one complete, bounded frame before streaming into pinned memory.
-
-    Stream readers may return EOF on a truncated frame. The standard Zstd block
-    envelope (3-byte header, raw/compressed size or one RLE byte) independently
-    checks its exact encoded extent, including the optional 4-byte checksum.
-    The decoder validates block contents; no full decoded temporary is created.
-    """
-    import zstandard as zstd
-
-    if len(payload) < 4 or bytes(payload[:4]) != b"\x28\xb5\x2f\xfd":
-        raise ValueError("outer payload must contain one standard Zstd frame")
-    parameters = zstd.get_frame_parameters(payload)
-    if (
-        parameters.content_size not in {expected_size, zstd.CONTENTSIZE_UNKNOWN}
-        or parameters.dict_id != 0
-        or parameters.window_size > (1 << 20)
-    ):
-        raise ValueError("outer Zstd content size/window/dictionary mismatch")
-    position = zstd.frame_header_size(payload)
-    while True:
-        if position + 3 > len(payload):
-            raise ValueError("truncated outer Zstd block header")
-        header = int.from_bytes(payload[position : position + 3], "little")
-        position += 3
-        last, kind, size = header & 1, (header >> 1) & 3, header >> 3
-        if kind == 3:
-            raise ValueError("reserved outer Zstd block type")
-        position += 1 if kind == 1 else size
-        if position > len(payload):
-            raise ValueError("truncated outer Zstd block")
-        if last:
-            break
-    position += 4 if parameters.has_checksum else 0
-    if position != len(payload):
-        raise ValueError("outer Zstd frame has trailing or truncated bytes")
 
 
 def configured_cpu_workers():
@@ -232,13 +128,6 @@ class HostPayloadPool:
         started = time.perf_counter()
         for chunk in chunks:
             offset, length = chunk["encoded_offset"], chunk["encoded_bytes"]
-            validate_zstd_frame(
-                payload[offset : offset + length], chunk["decoded_bytes"]
-            )
-        validation_s = time.perf_counter() - started
-        started = time.perf_counter()
-        for chunk in chunks:
-            offset, length = chunk["encoded_offset"], chunk["encoded_bytes"]
             position, stop = (
                 chunk["decoded_offset"],
                 chunk["decoded_offset"] + chunk["decoded_bytes"],
@@ -255,7 +144,7 @@ class HostPayloadPool:
                     raise ValueError(
                         "outer Zstd output exceeds its declared tensor span"
                     )
-        return validation_s, time.perf_counter() - started
+        return time.perf_counter() - started
 
     def close(self):
         self.executor.shutdown(wait=True)

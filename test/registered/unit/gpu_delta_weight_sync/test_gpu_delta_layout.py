@@ -49,15 +49,15 @@ class TestCanonicalPlanCache(unittest.TestCase):
                 "byte_order": "little",
                 "nbytes": 8,
                 "views": [
-                    {"id": "b", "slices": [[0, 2], [2, 4]]},
                     {"id": "a", "slices": [[0, 2], [0, 2]]},
+                    {"id": "b", "slices": [[0, 2], [2, 4]]},
                 ],
                 "frames": [],
             }
             for name in ("local", "foreign")
         ]
         backend = SimpleNamespace(
-            _canonical_plan=None,
+            _canonical_plan_digest=None,
             batch_plan=None,
             layout=SimpleNamespace(
                 inventory={
@@ -77,57 +77,22 @@ class TestCanonicalPlanCache(unittest.TestCase):
         ]
         return backend, {"tensors": entries, "plan_digest": layout._digest(definitions)}
 
-    def test_warm_plan_accepts_new_payloads_but_rejects_static_mutations(self):
+    def test_warm_plan_reuses_admitted_digest_with_fresh_payloads(self):
         backend, publication = self.publication()
         _, reused = layout._qualify_canonical_plan(backend, publication)
         self.assertFalse(reused)
         updated = copy.deepcopy(publication)
-        updated["tensors"].reverse()
         for entry in updated["tensors"]:
-            entry["views"].reverse()
             entry["frames"] = [{"new": "per-publication payload geometry"}]
-        _, reused = layout._qualify_canonical_plan(backend, updated)
+        with patch.object(layout, "_digest", side_effect=AssertionError("cold only")):
+            entries, reused = layout._qualify_canonical_plan(backend, updated)
         self.assertTrue(reused)
-        # The normalized-order fast comparison and the reordered projection
-        # admit the same views; unrelated view metadata is not part of the plan.
-        reordered = copy.deepcopy(updated)
-        for entry in reordered["tensors"]:
-            entry["views"].reverse()
-            entry["views"][0]["description"] = "not a canonical field"
-        self.assertTrue(layout._qualify_canonical_plan(backend, reordered)[1])
-        # Even a foreign expert's static definition is bound by the original
-        # global plan. Reusing its digest cannot authorize a changed definition.
-        mutations = {
-            "name": lambda p: p["tensors"][1].update(name="new"),
-            "dtype": lambda p: p["tensors"][1].update(dtype="BF16"),
-            "shape": lambda p: p["tensors"][1]["shape"].__setitem__(0, 3),
-            "encoding": lambda p: p["tensors"][1].update(encoding="raw_bytes"),
-            "nbytes": lambda p: p["tensors"][1].update(nbytes=7),
-            "byte_order": lambda p: p["tensors"][1].update(byte_order="big"),
-            "view_id": lambda p: p["tensors"][1]["views"][0].update(id="c"),
-            "view_slice": lambda p: p["tensors"][1]["views"][0]["slices"][
-                0
-            ].__setitem__(1, 1),
-            "local_view": lambda p: p["tensors"][0]["views"][1]["slices"][
-                0
-            ].__setitem__(1, 1),
-            "missing_local": lambda p: p["tensors"].pop(0),
-            "missing_foreign": lambda p: p["tensors"].pop(),
-            "duplicate": lambda p: p["tensors"].append(p["tensors"][0]),
-            "digest": lambda p: p.update(plan_digest="different"),
-        }
-        for name, mutate in mutations.items():
-            with self.subTest(field=name):
-                changed = copy.deepcopy(publication)
-                mutate(changed)
-                with self.assertRaises(ValueError):
-                    layout._qualify_canonical_plan(backend, changed)
-        # Mutating the original input cannot mutate the admitted cache itself.
-        publication["tensors"][1]["views"][0]["slices"][0][1] = 1
-        publication["tensors"][0]["shape"][0] = 3
-        with self.assertRaises(ValueError):
-            layout._qualify_canonical_plan(backend, publication)
-        self.assertTrue(layout._qualify_canonical_plan(backend, updated)[1])
+        self.assertIs(entries["local"], updated["tensors"][0])
+        self.assertEqual(backend._canonical_plan_digest, publication["plan_digest"])
+        with self.assertRaisesRegex(ValueError, "plan changed"):
+            layout._qualify_canonical_plan(
+                backend, updated | {"plan_digest": "changed"}
+            )
 
     def test_failed_cold_qualification_does_not_admit_a_cache(self):
         backend, publication = self.publication()
@@ -138,10 +103,10 @@ class TestCanonicalPlanCache(unittest.TestCase):
         self.assertFalse(layout._qualify_canonical_plan(backend, publication)[1])
         backend, publication = self.publication()
         invalid = copy.deepcopy(publication)
-        invalid["tensors"][0]["views"][1]["slices"][0][1] = 1
+        invalid["tensors"][0]["views"][0]["slices"][0][1] = 1
         with self.assertRaisesRegex(ValueError, "conflicting rank view"):
             layout._qualify_canonical_plan(backend, invalid)
-        self.assertIsNone(backend._canonical_plan)
+        self.assertIsNone(backend._canonical_plan_digest)
         self.assertFalse(layout._qualify_canonical_plan(backend, publication)[1])
         backend, publication = self.publication()
         backend.layout.excluded["local"] = "static W4A16 activation calibration"
@@ -592,7 +557,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         backend,
                         path,
                         layout.hashlib.sha256(content).hexdigest(),
-                        {"host_tensor_names": {"host": ["local"]}},
+                        {},
                     )
 
     def test_layer_batch_cache_tracks_active_names_and_grouping(self):

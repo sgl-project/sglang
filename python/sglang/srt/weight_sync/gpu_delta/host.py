@@ -32,7 +32,7 @@ import numpy as np
 import orjson
 
 from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation
-from sglang.srt.weight_sync.gpu_delta.payload import validate_outer_entries
+from sglang.srt.weight_sync.gpu_delta.payload import validate_payload_ranges
 
 
 def _cache_base():
@@ -62,8 +62,6 @@ def _cache_base():
 
 
 def _cache_root(engine_id):
-    if not isinstance(engine_id, str) or not engine_id:
-        raise ValueError("GPU-delta host cache requires an engine identity")
     root = _cache_base() / hashlib.sha256(engine_id.encode()).hexdigest()
     root.mkdir(mode=0o700, exist_ok=True)
     return root
@@ -165,7 +163,7 @@ def _read_verify_payloads(
 ):
     def validate_frames():
         started = time.perf_counter()
-        validate_outer_entries(
+        validate_payload_ranges(
             manifest["tensors"],
             {name: record["nbytes"] for name, record in definitions.items()},
             manifest["frame_bytes"],
@@ -235,7 +233,6 @@ def _tensor_layout(entries):
 
 
 _PREPARE_METRICS = (
-    "host_rank_outer_zstd_validate_s",
     "host_rank_outer_zstd_worker_decode_sum_s",
     "host_rank_outer_zstd_encoded_bytes",
     "host_rank_outer_zstd_decoded_bytes",
@@ -253,12 +250,11 @@ def _decode_zstd_group(jobs, destination, files, pool):
         outer = entry["outer"]
         offset, length = outer["encoded_offset"], outer["encoded_bytes"]
         start, count = record["offset"], record["nbytes"]
-        validate_s, decode_s = pool.decode_zstd(
+        decode_s = pool.decode_zstd(
             files[outer["file"]][offset : offset + length],
             outer["frames"],
             destination[start : start + count],
         )
-        metrics["host_rank_outer_zstd_validate_s"] += validate_s
         metrics["host_rank_outer_zstd_worker_decode_sum_s"] += decode_s
         metrics["host_rank_outer_zstd_encoded_bytes"] += outer["encoded_bytes"]
         metrics["host_rank_outer_zstd_decoded_bytes"] += outer["decoded_bytes"]
@@ -433,14 +429,8 @@ class HostArena:
         definitions = {}
         for record in manifest["files"]:
             name, size = record["name"], record["nbytes"]
-            if (
-                name in definitions
-                or Path(name).name != name
-                or name in {".", ".."}
-                or type(size) is not int
-                or size < 0
-            ):
-                raise ValueError("invalid or duplicate delta payload path/size")
+            if size < 0:
+                raise ValueError("negative delta payload size")
             if record["sha256"] is None and not self.skip_payload_hash:
                 raise ValueError(
                     "payload checksum omitted; set GPU_DELTA_SKIP_PAYLOAD_HASH=1 "

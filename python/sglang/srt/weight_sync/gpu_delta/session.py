@@ -324,7 +324,6 @@ class GpuDeltaSchedulerControl:
                         "target_version": request.target_version,
                         "plan_digest": request.plan_digest,
                         "participants": request.participants,
-                        "host_tensor_names": request.host_tensor_names,
                     }
                 )
             elif isinstance(request, delta_io.GetWeightsDeltaStatusReqInput):

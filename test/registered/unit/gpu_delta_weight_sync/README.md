@@ -266,13 +266,13 @@ Ranks of one engine on the same physical host must see the same cache directory;
 across containers, explicitly mount the same host tmpfs there. Engine IDs select
 separate subdirectories and advertised `host_cache_id` values. Independent engines
 share no cache locks or release lifecycle. Container hostname does not infer sharing.
-Miles still sends the negotiated `host_tensor_names` union. Each receiver checks
-that it covers its local bindings, then decodes only those local tensor names.
+Each rank selects its own tensors from its admitted local bindings.
 
-Each rank qualifies its local views while admitting the canonical tensor/view
-plan and retains only detached static definitions. Later publications compare
-every static field directly, without repeating local view matching; reordered
-views use the same canonical normalization. Immutable binding and derived-image
+Each rank qualifies the canonical tensor/view plan once, including its local
+views. Miles preserves those definitions for the stream; later authenticated
+publications must carry the same plan digest. The receiver retains only that
+digest instead of copying and comparing the static metadata on every update.
+Immutable binding and derived-image
 storage keys are cached, while each publication remaps its fresh frame offsets
 and omitted-byte ranges in one pass. Frames and payloads remain
 publication-specific. Private arena index/state records use `orjson`; atomic
@@ -378,16 +378,18 @@ returns its snapshot, before the caller releases encoded-file views. These timer
 are nested within preparation; caller-minus-body includes the final mapping
 release and timing bookkeeping.
 
-`host_plan_cache_reused` reports whether the canonical plan's static definitions
-were already qualified. Every publication still authenticates its manifest and
-checks names, shapes, dtypes, encodings, byte counts and rank views against the
-admitted plan, then validates all changing payload/frame extents. The cache holds
-only detached static definitions, not an old manifest or payload.
+`host_plan_cache_reused` reports whether the canonical plan was already admitted.
+Every publication authenticates its manifest and retains the admitted plan digest;
+Miles owns the unchanged static definitions. Changing payload/frame extents are
+bounded before host allocation and native decoding. No old manifest or payload
+is retained in the plan cache.
 
 Each rank reports `host_rank_outer_zstd_decode_s` for CPU task submission/join
-wall time, including raw copies. `host_rank_outer_zstd_validate_s` and
-`host_rank_outer_zstd_worker_decode_sum_s` sum worker durations, not critical-path
-time. The same prefix's `encoded_bytes`, `decoded_bytes`, `tensors` and `frames`
+wall time, including raw copies. `host_rank_outer_zstd_worker_decode_sum_s`
+sums worker durations, not critical-path time. Miles supplies nvCOMP-produced
+Zstd frames; the receiver decodes them directly without a Python header/block
+pre-scan. Native CPU decode errors and exact bounded output lengths still fail
+preparation before GPU application. The same prefix's `encoded_bytes`, `decoded_bytes`, `tensors` and `frames`
 count that rank's local outer decode work. Rank arenas report
 `host_rank_{arena_bytes,capacity_bytes,capacity_generation,mapping_reused}` and
 `host_rank_allocation_{s,calls,bytes}`. Shared encoded storage separately reports

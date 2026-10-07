@@ -239,7 +239,7 @@ class TestHostSnapshot(unittest.TestCase):
         peer_finished = threading.Event()
         validating, validated = threading.Event(), threading.Event()
         original_read = host._read_verify_payload
-        original_validate = host.validate_outer_entries
+        original_validate = host.validate_payload_ranges
 
         def delayed_validation(*args):
             original_validate(*args)
@@ -277,7 +277,7 @@ class TestHostSnapshot(unittest.TestCase):
         with (
             patch.object(host, "_read_verify_payload", side_effect=delayed_read),
             patch.object(
-                host, "validate_outer_entries", side_effect=delayed_validation
+                host, "validate_payload_ranges", side_effect=delayed_validation
             ),
             patch.object(
                 self.pool, "decode_zstd", wraps=self.pool.decode_zstd
@@ -474,7 +474,7 @@ class TestHostSnapshot(unittest.TestCase):
             (self.root / "owner.bin").read_bytes()
         ).hexdigest()
         arena = self.arena("bad-decode")
-        with self.assertRaisesRegex(ValueError, "standard Zstd frame"):
+        with self.assertRaises(zstd.ZstdError):
             prepare_snapshot(
                 arena,
                 path,
@@ -971,7 +971,7 @@ def test_failed_tensor_drains_other_groups_before_releasing_views(codec):
             entered.set()
             assert release.wait(5)
         destination[:] = payload
-        return 0, 0
+        return 0.0
 
     entries = [
         {

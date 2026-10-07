@@ -156,7 +156,7 @@ class GpuDeltaBackend:
             raise ValueError("GPU_DELTA_DECODE_STAGES must be 2, 3 or 4")
         _require_fixed_moe_topology(get_exec().moe)
         self.identity = dict(identity)
-        self._canonical_plan = None
+        self._canonical_plan_digest = None
         self.batch_plan = None
         inventory = read_canonical_checkpoint_inventory(model_runner)
         self.layout = GpuDeltaLayout(model_runner.model, inventory)
@@ -279,42 +279,15 @@ def _plan_decode(plans, entries, records):
     return table.reshape(sum(counts), 4).T.copy(order="C"), counts, gaps
 
 
-def _canonical_views(views):
-    return [
-        {"id": view_id, "slices": [list(pair) for pair in slices]}
-        for view_id, slices in sorted(
-            (view["id"], tuple(tuple(pair) for pair in view["slices"]))
-            for view in views
-        )
-    ]
-
-
 def _qualify_canonical_plan(backend, manifest):
-    """Cache only qualified static definitions; payload geometry stays per-publication."""
-    cached = backend._canonical_plan
-    if cached is not None and manifest["plan_digest"] != cached[0]:
-        raise ValueError("negotiated canonical delta plan changed")
-    entries, signatures, definitions = {}, {}, []
-    for entry in manifest["tensors"]:
-        name = entry["name"]
-        if name in entries:
-            raise ValueError("duplicate canonical delta tensor")
-        entries[name] = entry
-        if cached is not None:
-            definition = cached[1].get(name)
-            if definition is None or (
-                entry["dtype"] != definition[0]
-                or entry["shape"] != definition[1]
-                or entry["encoding"] != definition[2]
-                or entry["nbytes"] != definition[3]
-                or entry.get("byte_order") != definition[4]
-                or (
-                    entry["views"] != definition[5]
-                    and _canonical_views(entry["views"]) != definition[5]
-                )
-            ):
-                raise ValueError(f"canonical delta definition changed: {name}")
-            continue
+    """Admit static bindings once; Miles preserves them for the negotiated digest."""
+    entries = {entry["name"]: entry for entry in manifest["tensors"]}
+    if backend._canonical_plan_digest is not None:
+        if manifest["plan_digest"] != backend._canonical_plan_digest:
+            raise ValueError("negotiated canonical delta plan changed")
+        return entries, True
+    definitions = []
+    for name, entry in entries.items():
         if name not in backend.layout.inventory or backend.layout.excluded.get(
             name
         ) not in {None, "expert owned by another EP rank"}:
@@ -323,7 +296,7 @@ def _qualify_canonical_plan(backend, manifest):
         if (
             entry["shape"] != canonical["shape"]
             or entry["dtype"] != canonical["dtype"]
-            or entry.get("byte_order") != "little"
+            or entry["byte_order"] != "little"
         ):
             raise ValueError(f"canonical tensor metadata mismatch: {name}")
         if entry["nbytes"] != math.prod(entry["shape"]) * _ITEMSIZES[
@@ -332,48 +305,24 @@ def _qualify_canonical_plan(backend, manifest):
             "raw_bytes" if len(entry["shape"]) <= 1 else "xor_bytes"
         ):
             raise ValueError(f"unsupported canonical tensor size/encoding: {name}")
-        signature = (
-            entry["dtype"],
-            list(entry["shape"]),
-            entry["encoding"],
-            entry["nbytes"],
-            entry["byte_order"],
-            _canonical_views(entry["views"]),
-        )
-        signatures[name] = signature
         definitions.append(
-            {
-                "name": name,
-                "dtype": signature[0],
-                "shape": signature[1],
-                "encoding": signature[2],
-                "views": signature[5],
-            }
+            {key: entry[key] for key in ("name", "dtype", "shape", "encoding", "views")}
         )
-    if cached is not None:
-        if entries.keys() != cached[1].keys():
-            raise ValueError("publication omits a negotiated canonical tensor")
-    else:
-        # Warm equality above authenticates these full static view definitions.
-        # Seal local admission only after every binding and digest has passed.
-        for binding in backend.layout.bindings:
-            if binding.name not in entries:
-                raise ValueError("publication omits an admitted mutable tensor")
-            views = entries[binding.name]["views"]
-            matching = [view for view in views if view["id"] == binding.view_id]
-            if len(matching) != 1 or matching[0]["slices"] != binding.slices:
-                raise ValueError(f"missing or conflicting rank view for {binding.name}")
-        if (
-            _digest(sorted(definitions, key=lambda entry: entry["name"]))
-            != manifest["plan_digest"]
-        ):
-            raise ValueError(
-                "publication does not match its negotiated canonical view plan"
-            )
-        # Detached static lists permit direct warm equality without rebuilding
-        # nested signatures. No frames, payloads or manifest objects are retained.
-        backend._canonical_plan = manifest["plan_digest"], signatures
-    return entries, cached is not None
+    for binding in backend.layout.bindings:
+        views = entries[binding.name]["views"]
+        matching = [view for view in views if view["id"] == binding.view_id]
+        if len(matching) != 1 or matching[0]["slices"] != binding.slices:
+            raise ValueError(f"missing or conflicting rank view for {binding.name}")
+    if (
+        _digest(sorted(definitions, key=lambda entry: entry["name"]))
+        != manifest["plan_digest"]
+    ):
+        raise ValueError(
+            "publication does not match its negotiated canonical view plan"
+        )
+    # Do not retain a manifest or repeat static schema checks on fitting updates.
+    backend._canonical_plan_digest = manifest["plan_digest"]
+    return entries, False
 
 
 class PreparedDelta:
@@ -406,24 +355,13 @@ class PreparedDelta:
         plan_started = time.perf_counter()
         validate_codec(manifest)
         self.codec = manifest["codec"]
-        if (
-            type(manifest["base_version"]) is not int
-            or manifest["target_version"] != manifest["base_version"] + 1
-        ):
+        if manifest["target_version"] != manifest["base_version"] + 1:
             raise ValueError("direct deltas require one consecutive version transition")
         self.target_version = manifest["target_version"]
         entries, reused_plan = _qualify_canonical_plan(backend, manifest)
         self.timings["host_plan_validate_s"] = time.perf_counter() - plan_started
         self.timings["host_plan_cache_reused"] = int(reused_plan)
         local_names = [binding.name for binding in backend.layout.bindings]
-        host_names = metadata["host_tensor_names"][backend.identity["host_cache_id"]]
-        if (
-            not set(local_names) <= set(host_names)
-            or not set(host_names) <= entries.keys()
-        ):
-            raise ValueError(
-                "host tensor union does not cover the admitted local tensors"
-            )
         payload_started = time.perf_counter()
         index, files = backend.host_arena.prepare_encoded(
             path,
