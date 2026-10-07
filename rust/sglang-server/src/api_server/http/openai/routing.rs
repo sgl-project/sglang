@@ -72,7 +72,8 @@ impl PDRouting {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::PDRoutingFields;
+    use crate::message::request::GenerateRequest;
     use serde_json::json;
 
     #[test]
