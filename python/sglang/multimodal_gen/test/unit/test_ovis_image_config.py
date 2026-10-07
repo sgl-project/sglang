@@ -20,6 +20,108 @@ from sglang.test.test_utils import CustomTestCase
 # The diffusion lane provides Diffusers and native multimodal dependencies.
 
 class TestOvisImageConfig(CustomTestCase):
+    @torch.no_grad()
+    def test_cfg_text_length_changes_preserve_negative_conditioning(self):
+        """Both CFG branches must honor length changes without stale cached negatives."""
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import WhitespaceSplit
+        from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3Model
+
+        from sglang.multimodal_gen.configs.pipeline_configs.ovis_image import (
+            OVIS_IMAGE_SYSTEM_PROMPT,
+        )
+        from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
+        from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+            TextEncodingStage,
+        )
+        from sglang.multimodal_gen.runtime.server_args import (
+            server_args as server_args_module,
+        )
+
+        # A local HF tokenizer/model keeps this regression independent of checkpoint
+        # downloads while exercising the real tokenization, encoding, and cache paths.
+        words = list(
+            dict.fromkeys(
+                ["[PAD]", "[UNK]", *OVIS_IMAGE_SYSTEM_PROMPT.split(), "red", "blue"]
+            )
+        )
+        tokenizer_backend = Tokenizer(
+            WordLevel({word: i for i, word in enumerate(words)}, unk_token="[UNK]")
+        )
+        tokenizer_backend.pre_tokenizer = WhitespaceSplit()
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer_backend,
+            pad_token="[PAD]",
+            unk_token="[UNK]",
+            chat_template="{{ messages[0]['content'] }}",
+        )
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(23)
+            model_config = Qwen3Config(
+                vocab_size=len(words),
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=8,
+                pad_token_id=0,
+            )
+            model_config._attn_implementation = "sdpa"
+            encoder = Qwen3Model(model_config).eval()
+        target_device = get_local_torch_device()
+        encoder = encoder.to(target_device)
+        encoder.uses_sglang_forward_context = False
+        config = OvisImagePipelineConfig()
+        args = SimpleNamespace(pipeline_config=config, encoder_parallel="replicate")
+        cache = ConditioningCache(max_bytes=1024 * 1024)
+        observed = []
+        # Scope the diffusion configuration boundary and restore any existing value.
+        with patch.object(server_args_module, "_global_server_args", args):
+            stage = TextEncodingStage([encoder], [tokenizer])
+            for length in (64, 256, 64, 1):
+                batch = Req(
+                    sampling_params=OvisImageSamplingParams(
+                        prompt=" ".join(["red"] * 300),
+                        negative_prompt=" ".join(["blue"] * 40),
+                        max_sequence_length=length,
+                    ),
+                    max_sequence_length=length,
+                )
+                with cache.scope():
+                    encoded = stage.forward(batch, args)
+                for branch in ("prompt", "negative_prompt"):
+                    actual = getattr(encoded, f"{branch}_embeds")[0]
+                    self.assertEqual(tuple(actual.shape), (1, length, 16))
+                    self.assertEqual(getattr(encoded, f"{branch}_seq_lens"), [[length]])
+                    self.assertTrue(getattr(encoded, f"{branch}_embeds_mask")[0].all())
+                    prompt = (
+                        batch.prompt if branch == "prompt" else batch.negative_prompt
+                    )
+                    inputs = config.tokenize_prompt(
+                        [prompt], tokenizer, {"max_length": length}
+                    )
+                    inputs = inputs.to(target_device)
+                    reference = encoder(**inputs, use_cache=False).last_hidden_state
+                    expected = (reference * inputs.attention_mask.unsqueeze(-1))[:, 28:]
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                observed.append(encoded)
+            for branch in ("prompt", "negative_prompt"):
+                torch.testing.assert_close(
+                    getattr(observed[0], f"{branch}_embeds")[0],
+                    getattr(observed[2], f"{branch}_embeds")[0],
+                    atol=0,
+                    rtol=0,
+                )
+            # The preferred negative cache contains distinct lengths and actually
+            # reuses the restored request; tensor equality above guards its content.
+            self.assertEqual(cache.stats()["entries"], 3)
+            self.assertGreaterEqual(cache.stats()["hits"], 1)
+        cache.clear()
+
     def test_hf_encoder_numerics_survive_checkpoint_and_json_updates(self):
         from transformers import Qwen3Config
 

@@ -65,6 +65,12 @@ def _is_ovis_image_block(name, module):
 class OvisImageAttention(FluxAttention):
     """Keep distributed FLUX projections with FP32 and small-head RoPE."""
 
+    def __init__(self, *args, **kwargs):
+        # Official nn.RMSNorm rounds the weighted norm to the activation dtype
+        # before its FP32 RoPE. Keep that boundary in the fused CUDA path.
+        kwargs["round_norm_before_rope"] = True
+        super().__init__(*args, **kwargs)
+
     def forward(
         self,
         x,
@@ -128,7 +134,7 @@ class OvisImageAttention(FluxAttention):
 
         if (
             x.dtype != torch.float32
-            and self.head_dim >= 16
+            and self.head_dim % 16 == 0
             and not replicated_text_with_padding
             and not skip_sequence_parallel_override
         ):
@@ -143,8 +149,8 @@ class OvisImageAttention(FluxAttention):
             )
 
         # The shared CUDA RoPE kernel dispatches only FP16/BF16, and its small
-        # head fallback uses 16-element vectors. Complex RoPE keeps FP32
-        # activations and avoids writes beyond a head narrower than a vector.
+        # head fallback uses 16-element vectors without tail guards. Complex
+        # RoPE keeps FP32 activations and handles heads not divisible by 16.
         if complex_freqs is None:
             complex_freqs = _rope_complex_freqs(freqs_cis)
         query, key, value, text_query, text_key, text_value = get_qkv_projections(

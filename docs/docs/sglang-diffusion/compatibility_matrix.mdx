@@ -13,6 +13,18 @@ family detection may also support compatible local directories. Open the linked
 Cookbook recipe for launch commands, optimizations, adapters, and model-specific
 notes.
 
+## Ovis-Image integration scope
+
+`ATH-MaaS/Ovis-Image-7B`, the legacy `AIDC-AI/Ovis-Image-7B` identifier, and
+local Diffusers component directories use the native Ovis-Image text-to-image
+pipeline. The integration includes single-node TP, Ulysses/Ring sequence
+parallelism, CFG parallelism, CPU/layerwise offload, and tiled/spatial VAE decode.
+Image editing, original single-file weights, quantization, LoRA, approximate
+DiT caching, compilation, and breakable CUDA graphs are excluded.
+
+See the [Ovis-Image cookbook](/cookbook/diffusion/Ovis/Ovis-Image) for sampling
+defaults, topology constraints, and reproducible correctness checks.
+
 <Tabs>
   <Tab title="Image and 3D">
     <DiffusionModelCatalog category="image" />

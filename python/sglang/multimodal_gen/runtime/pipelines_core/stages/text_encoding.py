@@ -224,6 +224,7 @@ class TextEncodingStage(ConditionEncodingStage):
                 server_args,
                 encoder_index=all_indices,
                 return_attention_mask=True,
+                max_length=batch.max_sequence_length,
             )
 
     def _append_positive_text_outputs(

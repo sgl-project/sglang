@@ -505,10 +505,12 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         pre_only: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        round_norm_before_rope: bool = False,
     ):
         super().__init__()
 
         self.head_dim = dim_head
+        self.round_norm_before_rope = round_norm_before_rope
         self.inner_dim = out_dim if out_dim is not None else dim_head * num_heads
         self.query_dim = query_dim
         self.use_bias = bias
@@ -728,6 +730,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 freqs_complex=text_freqs_complex,
                 is_neox=False,
                 allow_inplace=True,
+                round_norm_before_rope=self.round_norm_before_rope,
             )
             img_seq_len = query.shape[1]
             img_freqs_complex = (
@@ -746,6 +749,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 is_neox=False,
                 position_offset=text_seq_len,
                 allow_inplace=True,
+                round_norm_before_rope=self.round_norm_before_rope,
             )
 
             # join_seqs relocates any SP text tail-pad behind the image (see
@@ -769,6 +773,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 freqs_complex=joint_freqs_complex,
                 is_neox=False,
                 allow_inplace=True,
+                round_norm_before_rope=self.round_norm_before_rope,
             )
 
         # Offline rotations belong to the MXFP8 FA contract.
