@@ -16,8 +16,8 @@ torch-compat-header = "torch_compat.h"
 name = "mem_cache"
 crate-type = ["cdylib"]
 
-# Keep this crate in its own workspace until its PyO3 version can be aligned
-# with the root workspace without conflicting native `links = "python"` crates.
+# Keep this crate in its own workspace: tch needs libtorch at build time,
+# which the rest of the rust/ workspace does not.
 [workspace]
 
 [dependencies]
