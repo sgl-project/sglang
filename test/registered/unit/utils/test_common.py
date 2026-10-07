@@ -2,6 +2,7 @@ import io
 import sys
 import unittest
 from array import array
+from functools import partial
 from unittest import mock
 
 import torch
@@ -10,7 +11,9 @@ from PIL import Image
 from sglang.srt.utils.common import (
     _get_device_sm_via_nvml,
     _get_normalized_fastapi_request_path_for_metrics,
+    _get_normalized_http_method_for_metrics,
     _load_image,
+    add_prometheus_track_response_middleware,
     flatten_arrays_to_int64_tensor,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
@@ -78,6 +81,180 @@ class TestGetNormalizedFastapiRequestPathForMetrics(CustomTestCase):
 
         self.assertEqual(path, "__unhandled__")
         self.assertFalse(is_handled_path)
+
+    def test_matched_route_without_path_collapses_to_single_metric_label(self):
+        """A matching route without a template must not expose client paths."""
+        from fastapi import FastAPI
+        from starlette.routing import Match
+
+        app = FastAPI()
+        route = mock.Mock(spec=["matches"])
+        route.matches.return_value = (Match.FULL, {})
+        app.router.routes.insert(0, route)
+
+        for request_path in ("/scanner/probe-1", "/scanner/probe-2"):
+            with self.subTest(request_path=request_path):
+                path, is_handled_path = (
+                    _get_normalized_fastapi_request_path_for_metrics(
+                        _make_request(app, request_path)
+                    )
+                )
+                self.assertEqual(path, "__unhandled__")
+                self.assertFalse(is_handled_path)
+
+    def test_partial_match_uses_route_path_for_wrong_method(self):
+        from fastapi import FastAPI
+
+        app = FastAPI()
+
+        @app.get("/v1/models/{model_id}")
+        def get_model(model_id: str):
+            return {"model_id": model_id}
+
+        path, is_handled_path = _get_normalized_fastapi_request_path_for_metrics(
+            _make_request(app, "/v1/models/test-model", method="POST")
+        )
+
+        self.assertEqual(path, "/v1/models/{model_id}")
+        self.assertTrue(is_handled_path)
+
+    def test_full_match_takes_priority_over_earlier_partial_match(self):
+        from fastapi import FastAPI
+
+        app = FastAPI()
+
+        @app.get("/v1/models/{model_id}")
+        def get_model(model_id: str):
+            return {"model_id": model_id}
+
+        @app.post("/v1/models/special")
+        def create_special_model():
+            return {}
+
+        path, is_handled_path = _get_normalized_fastapi_request_path_for_metrics(
+            _make_request(app, "/v1/models/special", method="POST")
+        )
+
+        self.assertEqual(path, "/v1/models/special")
+        self.assertTrue(is_handled_path)
+
+
+class TestGetNormalizedHttpMethodForMetrics(CustomTestCase):
+    def test_standard_methods_keep_their_labels(self):
+        for method in (
+            "GET",
+            "HEAD",
+            "POST",
+            "PUT",
+            "DELETE",
+            "CONNECT",
+            "OPTIONS",
+            "TRACE",
+            "PATCH",
+        ):
+            with self.subTest(method=method):
+                self.assertEqual(
+                    _get_normalized_http_method_for_metrics(method), method
+                )
+
+    def test_arbitrary_methods_share_one_label(self):
+        for method in ("SCAN-probe-1", "SCAN-probe-2", "get", ""):
+            with self.subTest(method=method):
+                self.assertEqual(
+                    _get_normalized_http_method_for_metrics(method), "__unknown__"
+                )
+
+
+class TestPrometheusMiddlewareLabels(CustomTestCase):
+    def test_request_labels_are_bounded_for_unhandled_paths_and_methods(self):
+        from fastapi import FastAPI
+        from fastapi.middleware.cors import CORSMiddleware
+        from fastapi.testclient import TestClient
+        from prometheus_client import CollectorRegistry, Counter, Gauge, make_asgi_app
+
+        registry = CollectorRegistry()
+        app = FastAPI()
+
+        @app.get("/v1/models/{model_id}")
+        def get_model(model_id: str):
+            return {"model_id": model_id}
+
+        app.mount("/metrics", make_asgi_app(registry=registry))
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        with (
+            mock.patch(
+                "prometheus_client.Counter", partial(Counter, registry=registry)
+            ),
+            mock.patch("prometheus_client.Gauge", partial(Gauge, registry=registry)),
+        ):
+            add_prometheus_track_response_middleware(app)
+
+        with TestClient(app) as client:
+            self.assertEqual(client.get("/scanner/probe-1").status_code, 404)
+            self.assertEqual(client.get("/scanner/probe-2").status_code, 404)
+            self.assertEqual(client.post("/v1/models/test-model").status_code, 405)
+            self.assertEqual(
+                client.options(
+                    "/v1/models/test-model",
+                    headers={
+                        "Origin": "https://example.com",
+                        "Access-Control-Request-Method": "GET",
+                    },
+                ).status_code,
+                200,
+            )
+            self.assertEqual(client.request("SCANTOKEN1", "/x").status_code, 404)
+            self.assertEqual(client.request("SCANTOKEN2", "/x").status_code, 404)
+            self.assertEqual(client.get("/metrics/").status_code, 200)
+
+        samples = [sample for metric in registry.collect() for sample in metric.samples]
+        request_labels = {
+            (sample.labels["endpoint"], sample.labels["method"])
+            for sample in samples
+            if sample.name == "sglang:http_requests_total"
+        }
+        self.assertEqual(
+            request_labels,
+            {
+                ("__unhandled__", "GET"),
+                ("/v1/models/{model_id}", "POST"),
+                ("/v1/models/{model_id}", "OPTIONS"),
+                ("__unhandled__", "__unknown__"),
+                ("/metrics", "GET"),
+            },
+        )
+
+        response_labels = {
+            (
+                sample.labels["endpoint"],
+                sample.labels["method"],
+                sample.labels["status_code"],
+            )
+            for sample in samples
+            if sample.name == "sglang:http_responses_total"
+        }
+        self.assertEqual(
+            response_labels,
+            {
+                ("__unhandled__", "GET", "404"),
+                ("/v1/models/{model_id}", "POST", "405"),
+                ("/v1/models/{model_id}", "OPTIONS", "200"),
+                ("__unhandled__", "__unknown__", "404"),
+                ("/metrics", "GET", "200"),
+            },
+        )
+
+        active_labels = {
+            (sample.labels["endpoint"], sample.labels["method"])
+            for sample in samples
+            if sample.name == "sglang:http_requests_active"
+        }
+        self.assertEqual(active_labels, request_labels)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
