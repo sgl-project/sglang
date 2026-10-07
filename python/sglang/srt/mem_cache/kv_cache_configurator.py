@@ -2647,6 +2647,14 @@ def calculate_mla_kv_cache_dim(
     ):
         return kv_cache_dim
 
+    # CUDA TileLang uses raw FP8 rows without per-block scales. Argument
+    # validation requires both consumers to use the same TileLang layout.
+    if (
+        get_exec().kernel.dsa_prefill_backend == "tilelang"
+        and get_exec().kernel.dsa_decode_backend == "tilelang"
+    ):
+        return kv_cache_dim
+
     quant_block_size = DSATokenToKVPool.quant_block_size
     rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
     # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout

@@ -473,6 +473,15 @@ class DeepseekSparseAttnBackend(
         self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
+        if (
+            not _is_hip
+            and self.token_to_kv_pool.dtype == torch.float8_e4m3fn
+            and not self.dsa_kv_cache_store_fp8
+            and "tilelang" in (self.dsa_prefill_impl, self.dsa_decode_impl)
+        ):
+            # The one-shot FP8 dequantizers require scaled KV rows; TileLang
+            # consumes raw FP8 KV without per-block scales.
+            self.supports_mha_one_shot = False
         # Opt-in exact fast path for the Triton sparse-MLA prefill kernel.
         self.dsa_triton_union: int = _resolve_dsa_triton_union(
             union=get_exec().kernel.dsa_triton_union,
