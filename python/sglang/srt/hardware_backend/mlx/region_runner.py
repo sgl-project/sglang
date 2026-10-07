@@ -1,10 +1,11 @@
 """Serve decode steps through the exported whole-model MLX region.
 
 The region executor is a pure function over Torch-owned serving state: it
-reads the KV pool through zero-copy views, returns next-token logits, and
-commits the step's K/V delta back through the Torch-side Metal commit.
-Torch keeps ownership of scheduling, pools, sampling, and LoRA; this runner
-replaces decode, single-request prefill, and fresh uniform packed prefill.
+reads the KV pool through zero-copy views and returns logits through the
+shared processor. It commits the step's K/V delta through the Torch-side
+Metal commit. Torch owns processor semantics, scheduling, pools and sampling;
+this runner replaces decode, single-request prefill and fresh uniform packed
+prefill.
 
 Executors are exported per padded shape bucket -- decode batch sizes and
 prefill token counts -- and reused for every later batch the bucket covers,
@@ -31,7 +32,10 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    should_apply_lm_head_quant_method,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -128,7 +132,7 @@ def _clear_mlx_cache() -> None:
 
 
 def _nontrivial_logits_reason(model: Any) -> Optional[str]:
-    """Why the exported hidden @ lm_head.T shortcut would be wrong, or None.
+    """Why the captured shared logits boundary cannot serve this model, or None.
 
     Model classes vary in shape, so this probes attributes instead of a type.
     """
@@ -136,8 +140,17 @@ def _nontrivial_logits_reason(model: Any) -> Optional[str]:
     processor = getattr(model, "logits_processor", None)
     if lm_head is None or processor is None:
         return "model exposes no lm_head/logits_processor"
-    if getattr(processor, "logit_scale", None) is not None:
-        return "LogitsProcessor applies logit_scale"
+    weight = getattr(lm_head, "weight", None)
+    if weight is None or weight.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ):
+        return "LM head requires an unsupported weight format"
+    if should_apply_lm_head_quant_method(
+        lm_head, getattr(lm_head, "quant_method", None)
+    ):
+        return "quantized LM head is not supported by the region"
     if getattr(processor, "final_logit_softcapping", None) is not None:
         return "LogitsProcessor applies final-logit softcapping"
     return None
@@ -275,8 +288,8 @@ class MlxRegionRunner(BaseRunner):
                 "speculative draft workers are not served by the region"
             )
         else:
-            # The wrapper computes hidden @ lm_head.T directly; any model whose
-            # LogitsProcessor does more than that would silently diverge.
+            # Shared logits processing supports scaling and FP32-head policy;
+            # softcapping still needs an MPS implementation.
             self._model_reject_reason = _nontrivial_logits_reason(model_runner.model)
         if (
             self._model_reject_reason is None
@@ -402,6 +415,7 @@ class MlxRegionRunner(BaseRunner):
             zeros = torch.zeros(size, dtype=torch.int64, device=device)
             return ForwardBatch(
                 forward_mode=ForwardMode.DECODE,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
                 batch_size=size,
                 input_ids=zeros,
                 positions=zeros.clone(),
@@ -416,6 +430,7 @@ class MlxRegionRunner(BaseRunner):
             tokens = size * seq_len
             return ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
                 batch_size=size,
                 input_ids=torch.zeros(tokens, dtype=torch.int64, device=device),
                 positions=torch.arange(
@@ -439,6 +454,7 @@ class MlxRegionRunner(BaseRunner):
             )
         return ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
             batch_size=1,
             input_ids=torch.zeros(size, dtype=torch.int64, device=device),
             positions=torch.arange(size, dtype=torch.int64, device=device),
@@ -550,19 +566,15 @@ class MlxRegionRunner(BaseRunner):
                 forward_batch, key[1], key[2]
             )
             logits = executor.execute(*serving_forward_args(padded, sampling_indices))
-            return LogitsProcessorOutput(
-                next_token_logits=logits[: forward_batch.batch_size]
-            )
-        if key[0] == "extend":
+        elif key[0] == "extend":
             padded = self._pad_extend_batch(forward_batch, key[1])
             logits = executor.execute(*serving_forward_args(padded))
-            # The wrapper projects only the last real token of each request.
-            return LogitsProcessorOutput(next_token_logits=logits)
-        batch_size = forward_batch.batch_size
-        padded = self._pad_decode_batch(forward_batch, key[1])
-        logits = executor.execute(*serving_forward_args(padded))
-        # One logits row per padded request; pad rows carry garbage by design.
-        return LogitsProcessorOutput(next_token_logits=logits[:batch_size])
+        else:
+            padded = self._pad_decode_batch(forward_batch, key[1])
+            logits = executor.execute(*serving_forward_args(padded))
+        return LogitsProcessorOutput(
+            next_token_logits=logits[: forward_batch.batch_size]
+        )
 
     def _pad_decode_batch(
         self, forward_batch: ForwardBatch, bucket: int

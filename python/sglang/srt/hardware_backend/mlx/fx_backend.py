@@ -273,9 +273,15 @@ def _make_mlx_export_executor(
                 f"deltas; got {len(results)}"
             )
         if debug_attention:
-            logits, all_attention, first_query, first_key, first_value, new_k, new_v = (
-                results
-            )
+            (
+                logits,
+                all_attention,
+                first_query,
+                first_key,
+                first_value,
+                new_k,
+                new_v,
+            ) = results
         else:
             logits, new_k, new_v = results
         if envs.SGLANG_DEBUG_MLX_KV_DELTAS.get():

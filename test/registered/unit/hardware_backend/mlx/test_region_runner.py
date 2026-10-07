@@ -38,6 +38,7 @@ from sglang.srt.hardware_backend.mlx.region_runner import (
     _kernel_contract_reject_reason,
     _nontrivial_logits_reason,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -60,9 +61,25 @@ register_mps_ci(est_time=1, suite="stage-a-unit-test-mps")
 def _make_model() -> torch.nn.Module:
     model = torch.nn.Module()
     model.lm_head = torch.nn.Linear(8, 16, bias=False)
-    model.logits_processor = SimpleNamespace(
-        logit_scale=None, final_logit_softcapping=None
-    )
+
+    class Processor:
+        logit_scale = None
+        final_logit_softcapping = None
+
+        def __call__(self, input_ids, hidden_states, lm_head, forward_batch):
+            return LogitsProcessorOutput(
+                next_token_logits=hidden_states
+                if forward_batch.forward_mode.is_decode()
+                else hidden_states[
+                    (
+                        forward_batch.extend_last_token_indices
+                        if forward_batch.extend_last_token_indices is not None
+                        else torch.cumsum(forward_batch.extend_seq_lens, 0) - 1
+                    )
+                ]
+            )
+
+    model.logits_processor = Processor()
     return model
 
 
@@ -792,8 +809,8 @@ class TestDecodeBatchBucketing(CustomTestCase):
         )
 
 
-class TestPrefillLogitsSelection(CustomTestCase):
-    """Only sampling rows should reach the expensive vocabulary projection."""
+class TestRegionCapturedLogitsExport(CustomTestCase):
+    """The region captures shared processor pruning."""
 
     def _wrapper(self, batch):
         class Body(torch.nn.Module):
@@ -807,7 +824,6 @@ class TestPrefillLogitsSelection(CustomTestCase):
 
         model = _make_model()
         model.model = Body()
-        model.logits_processor.vocab_size = 13
         runner = _make_runner().model_runner
         runner.attention_layers = []
         runner.attn_backend = SimpleNamespace(
@@ -815,114 +831,43 @@ class TestPrefillLogitsSelection(CustomTestCase):
         )
         return ServingForwardExportWrapper(model, runner, batch).eval()
 
-    def test_prefill_selects_each_requests_last_hidden_state_before_projection(self):
+    def test_export_captures_shared_processor_pruning(self):
         runner = _make_runner()
         batch = dataclasses.replace(
-            runner._synthetic_batch(("extend", 6)),
-            batch_size=3,
-            input_ids=torch.tensor([1, 2, 3, 4, 5, 6]),
-            req_pool_indices=torch.tensor([1, 2, 3]),
-            seq_lens=torch.tensor([11, 3, 22]),
-            extend_seq_lens=torch.tensor([1, 3, 2], dtype=torch.int32),
-            extend_start_loc=torch.tensor([0, 1, 4], dtype=torch.int32),
-            extend_prefix_lens=torch.tensor([10, 0, 20], dtype=torch.int32),
+            runner._synthetic_batch(("extend", 8)),
+            input_ids=torch.arange(1, 9),
         )
         wrapper = self._wrapper(batch)
-        with torch.no_grad():
-            full = wrapper.model.lm_head(
-                wrapper.model.model.embed_tokens(batch.input_ids)
+        exported = torch.export.export(
+            wrapper, serving_forward_args(batch), strict=False
+        )
+        actual = exported.module()(*serving_forward_args(batch))
+        torch.testing.assert_close(
+            actual, wrapper.model.model.embed_tokens(batch.input_ids)[-1:]
+        )
+        self.assertEqual(actual.shape, (1, 8))
+        self.assertFalse(
+            any(
+                node.op == "call_function"
+                and node.target == torch.ops.aten.matmul.default
+                for node in exported.graph.nodes
             )
-            actual = wrapper(*serving_forward_args(batch))
-        torch.testing.assert_close(actual, full[[0, 3, 5], :13])
-        self.assertEqual(actual.shape, (3, 13))
+        )
 
-    def test_export_reads_real_length_at_runtime_and_never_projects_pad_rows(self):
+    def test_execute_returns_already_pruned_single_prompt_logits(self):
         runner = _make_runner()
-        captured = runner._synthetic_batch(("extend", 8))
-        wrapper = self._wrapper(captured)
-        exported = torch.export.export(
-            wrapper, serving_forward_args(captured), strict=False
-        )
-        # The same export serves shorter cold prompts and cached-prefix
-        # continuations. Total sequence length must not select a packed row.
-        for length, prefix in ((1, 0), (3, 0), (3, 20), (8, 0)):
-            with self.subTest(length=length, prefix=prefix):
-                real = dataclasses.replace(
-                    runner._synthetic_batch(("extend", length)),
-                    input_ids=torch.arange(1, length + 1),
-                    seq_lens=torch.tensor([length + prefix]),
-                    extend_prefix_lens=torch.tensor([prefix], dtype=torch.int32),
-                )
-                padded = runner._pad_extend_batch(real, 8)
-                with torch.no_grad():
-                    full = wrapper.model.lm_head(
-                        wrapper.model.model.embed_tokens(padded.input_ids)
-                    )
-                    actual = exported.module()(*serving_forward_args(padded))
-                torch.testing.assert_close(actual, full[length - 1 : length, :13])
-        projections = [
-            node
-            for node in exported.graph.nodes
-            if node.op == "call_function"
-            and node.target == torch.ops.aten.matmul.default
-        ]
-        self.assertEqual(len(projections), 1)
-        self.assertEqual(tuple(projections[0].meta["val"].shape), (1, 16))
-
-    def test_decode_preserves_all_request_rows(self):
-        batch = dataclasses.replace(
-            _make_runner()._synthetic_batch(("decode", 3)),
-            input_ids=torch.tensor([1, 2, 3]),
-        )
-        wrapper = self._wrapper(batch)
-        with torch.no_grad():
-            expected = wrapper.model.lm_head(
-                wrapper.model.model.embed_tokens(batch.input_ids)
-            )[:, :13]
-            actual = wrapper(*serving_forward_args(batch))
-        torch.testing.assert_close(actual, expected)
-
-    def test_explicit_sampling_rows_survive_export_for_segment_padding(self):
-        runner = _make_runner()
-        packed = dataclasses.replace(
-            runner._synthetic_batch(("extend", 12)),
-            batch_size=3,
-            input_ids=torch.arange(1, 13),
-            req_pool_indices=torch.arange(3),
-            extend_seq_lens=torch.full((3,), 4, dtype=torch.int32),
-            extend_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
-        )
-        wrapper = self._wrapper(packed)
-        indices = torch.tensor([3, 7, 11])
-        exported = torch.export.export(
-            wrapper, serving_forward_args(packed, indices), strict=False
-        )
-        for live in (indices, torch.tensor([1, 5, 9])):
-            with torch.no_grad():
-                full = wrapper.model.lm_head(
-                    wrapper.model.model.embed_tokens(packed.input_ids)
-                )
-                actual = exported.module()(*serving_forward_args(packed, live))
-            torch.testing.assert_close(actual, full[live, :13])
-
-    def test_execute_keeps_the_already_selected_logits_row_for_a_padded_prompt(self):
-        runner = _make_runner()
-        batch = dataclasses.replace(
-            runner._synthetic_batch(("extend", 300)),
-            out_cache_loc=torch.arange(1, 301),
-        )
-        logits = torch.randn(1, 13)
+        batch = runner._synthetic_batch(("extend", 300))
+        hidden = torch.randn(384, 8)
         seen = []
 
         def execute(*args):
             seen.append(args)
-            return logits
+            return hidden
 
         runner._executors[("extend", 384)] = SimpleNamespace(execute=execute)
         actual = runner.execute(batch)
-        self.assertIs(actual.next_token_logits, logits)
+        torch.testing.assert_close(actual.next_token_logits, hidden[:1])
         self.assertEqual(seen[0][ServingForwardArg.INPUT_IDS].shape, (384,))
-        self.assertEqual(seen[0][ServingForwardArg.EXTEND_SEQ_LENS].tolist(), [300])
         self.assertTrue(
             bool(
                 (seen[0][ServingForwardArg.OUT_CACHE_LOC][300:] == _PAD_SINK_SLOT).all()

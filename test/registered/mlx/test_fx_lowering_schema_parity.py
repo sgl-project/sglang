@@ -92,6 +92,19 @@ _RECIPES: dict[str, dict] = {
     "tanh": dict(args=lambda: (_t(4, 4),)),
     "rsqrt": dict(args=lambda: (_positive(4, 4),)),
     "index_select": dict(args=lambda: (_t(5, 6), 1, _indices(3, 6))),
+    "index_first_axis": dict(
+        args=lambda: (_t(5, 6), [_indices(3, 5)]),
+        extra=[lambda: ((_t(5, 6), [torch.tensor([-1, 0, 2])]), {})],
+        rejects=[lambda: ((_t(5, 6), [None, _indices(3, 6)]), {})],
+    ),
+    "cumsum": dict(
+        args=lambda: (_t(3, 4), 1),
+        pools={"dim": [0, -1], "dtype": [torch.float32]},
+        extra=[
+            lambda: ((torch.tensor([5, 8, 8], dtype=torch.int32), 0), {}),
+            lambda: ((torch.tensor([2**30, 2**30], dtype=torch.int32), 0), {}),
+        ],
+    ),
     "layer_norm": dict(
         args=lambda: (_t(4, 8), [8]),
         pools={"weight": [_t(8)], "bias": [_t(8)], "eps": [1e-3]},

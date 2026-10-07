@@ -122,7 +122,7 @@ def _make_wrapper(hidden_states: torch.Tensor, lm_head_weight: torch.Tensor):
 
 
 def _region_logits(hidden_states: torch.Tensor, lm_head_weight: torch.Tensor):
-    """What the region hands the sampler, and the processor it bypassed."""
+    """What the region hands the sampler through the captured processor."""
     wrapper, model = _make_wrapper(hidden_states, lm_head_weight)
     with torch.no_grad():
         logits = wrapper(*_SERVING_ARGS)
@@ -196,12 +196,8 @@ class TestServingBoundaryLogitsParity(CustomTestCase):
             region, _torch_logits(processor, lm_head, hidden_states)
         )
 
-    def test_narrowing_survives_export_and_the_region_can_lower_it(self):
-        # The region serves the *exported* graph, not the eager wrapper, and
-        # a narrowing the MLX lowering did not recognize would push every
-        # padded-vocabulary model onto the eager fallback instead of fixing
-        # it. Assert the exported program narrows, and that every node in it
-        # resolves to a lowering.
+    def test_export_returns_shared_logits_and_the_region_can_lower_it(self):
+        # Vocabulary narrowing belongs to the captured real processor.
         torch.manual_seed(0)
         wrapper, _ = _make_wrapper(
             torch.randn(_NUM_TOKENS, _HIDDEN), torch.randn(_PADDED_VOCAB, _HIDDEN)

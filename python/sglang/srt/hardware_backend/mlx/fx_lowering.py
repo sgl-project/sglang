@@ -87,6 +87,29 @@ class MlxFxLoweringRegistry:
         if node.op in {"placeholder", "get_attr", "output"}:
             return node.op
         if node.op == "call_function":
+            if node.target is torch.ops.aten.mul_.Tensor:
+                # A fresh, exclusively consumed matmul result has no aliases
+                # whose mutation must be reproduced by the functional MLX op.
+                source = node.args[0]
+                if not (
+                    isinstance(source, torch.fx.Node)
+                    and source.op == "call_function"
+                    and source.target
+                    in (
+                        torch.ops.aten.matmul.default,
+                        torch.ops.aten.mm.default,
+                    )
+                    and len(source.users) == 1
+                ):
+                    return None
+                return self._functions.get(torch.ops.aten.mul.Tensor)
+            if node.target is torch.ops.aten.index.Tensor:
+                indices = node.args[1]
+                if len(indices) != 1 or indices[0] is None:
+                    return None
+                value = indices[0].meta.get("val")
+                if value is None or value.dtype not in (torch.int32, torch.int64):
+                    return None
             if node.target is torch.ops.higher_order.auto_functionalized_v2:
                 custom_target = node.args[0]
                 lowering = self._functions.get(custom_target)
@@ -446,6 +469,29 @@ def _lower_flatten(mx, args, kwargs):
 @_lowering("index_select", aten=(torch.ops.aten.index_select.default,))
 def _lower_index_select(mx, args, kwargs):
     return mx.take(args[0], args[2], axis=args[1])
+
+
+@_lowering("index_first_axis", aten=(torch.ops.aten.index.Tensor,))
+def _lower_index_first_axis(mx, args, kwargs):
+    indices = args[1]
+    if len(indices) != 1 or indices[0] is None or indices[0].dtype == mx.bool_:
+        raise UnsupportedMlxFxGraphError(
+            "only integer first-axis indexing is supported"
+        )
+    return mx.take(args[0], indices[0], axis=0)
+
+
+@_lowering("cumsum", aten=(torch.ops.aten.cumsum.default,))
+def _lower_cumsum(mx, args, kwargs):
+    value = args[0]
+    dtype = kwargs.get("dtype")
+    if dtype is not None:
+        value = value.astype(_mlx_dtype(dtype, mx))
+    elif mx.issubdtype(value.dtype, mx.integer) or value.dtype == mx.bool_:
+        # Torch promotes integer scans to int64; retaining int32 can wrap
+        # before the resulting indices reach the gather.
+        value = value.astype(mx.int64)
+    return mx.cumsum(value, axis=args[1])
 
 
 @_lowering("numpy_transpose", aten=(torch.ops.aten.numpy_T.default,))
