@@ -44,6 +44,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
     get_spec,
+    mamba_cache_chunk_size,
     publish,
     spawn_world_rank,
 )
@@ -671,6 +672,7 @@ class Scheduler(
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
         self.init_dsa_kpool_truncation_align()
+        self.init_mamba_truncation_align()
 
         self.init_weight_updater()
 
@@ -1702,6 +1704,25 @@ class Scheduler(
         else:
             self.truncation_align_size = math.lcm(
                 self.truncation_align_size, dsa_index_kpool
+            )
+
+    def init_mamba_truncation_align(self):
+        """A mamba checkpoint may only be donated where the cached prefix sits
+        on the kernel chunk grid, so a chunk that stops anywhere else costs the
+        request every donation it would have made after that, not just one.
+        Use the LCM to preserve any existing alignment."""
+        if not get_exec().mamba.enable_mamba_extra_buffer:
+            return
+
+        chunk_size = mamba_cache_chunk_size()
+        if chunk_size <= 1:
+            return
+
+        if self.truncation_align_size is None:
+            self.truncation_align_size = chunk_size
+        else:
+            self.truncation_align_size = math.lcm(
+                self.truncation_align_size, chunk_size
             )
 
     def init_request_dispatcher(self):
