@@ -3,7 +3,11 @@
 import unittest
 from array import array
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import (
+    FINISH_LENGTH,
+    FINISH_MATCHED_TOKEN,
+    Req,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -24,10 +28,11 @@ class _TerminatedGrammar:
         return True
 
 
-def _make_req(stop_token_ids=None):
+def _make_req(stop_token_ids=None, ignore_eos=False, max_new_tokens=1_000):
     sampling_params = SamplingParams(
-        max_new_tokens=1_000,
+        max_new_tokens=max_new_tokens,
         stop_token_ids=stop_token_ids,
+        ignore_eos=ignore_eos,
     )
     sampling_params.normalize(tokenizer=_FakeTokenizer())
     req = Req(
@@ -63,6 +68,34 @@ class TestGrammarStopSpeculative(unittest.TestCase):
         self.assertEqual(req.finished_reason.matched, STOP_TOKEN_ID)
         self.assertEqual(req.finished_len, 3)
         self.assertEqual(list(req.output_ids_through_stop), [11, 13, STOP_TOKEN_ID])
+
+
+class TestGrammarTerminationIgnoreEos(unittest.TestCase):
+    def test_terminated_grammar_finishes_request(self):
+        req = _make_req()
+        # Grammar stop token that is not an EOS/stop token of the request, so
+        # only the grammar-termination check can finish it.
+        req.output_ids = array("q", [11, 13, 19])
+
+        req.update_finish_state(new_accepted_len=1)
+
+        self.assertIsInstance(req.finished_reason, FINISH_MATCHED_TOKEN)
+        self.assertEqual(req.finished_reason.matched, 19)
+
+    def test_terminated_grammar_does_not_finish_under_ignore_eos(self):
+        req = _make_req(ignore_eos=True, max_new_tokens=6)
+
+        req.update_finish_state(new_accepted_len=1)
+        self.assertFalse(req.finished())
+
+        req.output_ids.append(23)
+        req.update_finish_state(new_accepted_len=1)
+        self.assertFalse(req.finished())
+
+        req.output_ids.append(29)
+        req.update_finish_state(new_accepted_len=1)
+        self.assertIsInstance(req.finished_reason, FINISH_LENGTH)
+        self.assertEqual(req.finished_len, 6)
 
 
 if __name__ == "__main__":

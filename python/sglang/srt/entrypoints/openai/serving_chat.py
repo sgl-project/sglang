@@ -1363,8 +1363,7 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_constraint = None
 
         effective_tools = self._effective_tools(request)
-        # Only tool-bearing requests get the full-assistant EBNF: its terminal
-        # state finishes a request even under ignore_eos.
+        # Only tool-bearing requests get the full-assistant EBNF.
         glm_constraint = (
             self.tool_call_parser == "glm47"
             and bool(effective_tools)

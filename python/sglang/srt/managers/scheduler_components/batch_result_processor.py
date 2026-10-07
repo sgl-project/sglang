@@ -833,12 +833,17 @@ class SchedulerBatchResultProcessor:
         """
         if isinstance(tokens, int):
             tokens = [tokens]
+        # Under ignore_eos grammar termination does not finish the request (see
+        # Req.update_finish_state): keep the whole run and stop feeding tokens to
+        # the terminated grammar.
+        ignore_eos = req.sampling_params.ignore_eos
         retained = []
         try:
             for token_id in tokens:
-                req.grammar.accept_token(token_id)
+                if not (ignore_eos and req.grammar.is_terminated()):
+                    req.grammar.accept_token(token_id)
                 retained.append(token_id)
-                if req.grammar.is_terminated():
+                if not ignore_eos and req.grammar.is_terminated():
                     break
         except ValueError as e:
             # accept_token raises ValueError if the token is not in the grammar
