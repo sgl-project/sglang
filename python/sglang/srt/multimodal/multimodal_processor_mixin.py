@@ -1,6 +1,7 @@
+import asyncio
 import concurrent.futures
 import os
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -302,3 +303,72 @@ class MultimodalProcessorMixin:
         MultimodalProcessorMixin._validate_one_modality(Modality.IMAGE, image_data)
         MultimodalProcessorMixin._validate_one_modality(Modality.VIDEO, video_data)
         MultimodalProcessorMixin._validate_one_modality(Modality.AUDIO, audio_data)
+
+    async def _load_media_lists(
+        self,
+        image_data: Optional[list],
+        video_data: Optional[list],
+        audio_data: Optional[list],
+        *,
+        audio_sample_rate: Optional[int],
+        discard_alpha_channel: bool,
+    ) -> Tuple[List[Any], List[Any], List[Any]]:
+        futures: List[Tuple[Modality, int, concurrent.futures.Future]] = []
+
+        modalities_data = [
+            (image_data, Modality.IMAGE),
+            (video_data, Modality.VIDEO),
+            (audio_data, Modality.AUDIO),
+        ]
+
+        for data_list, modality in modalities_data:
+            futures.extend(
+                self._submit_mm_data_loading_tasks_simple(
+                    data_list, modality, audio_sample_rate, discard_alpha_channel
+                )
+            )
+
+        logger.debug("[load_mm_data(simple)] total futures submitted: %d", len(futures))
+
+        images: List[Any] = [None] * len(image_data) if image_data else []
+        videos: List[Any] = [None] * len(video_data) if video_data else []
+        audios: List[Any] = [None] * len(audio_data) if audio_data else []
+
+        for modality, idx, future in futures:
+            try:
+                result = await asyncio.wrap_future(future)
+            except ValueError as e:
+                logger.info(
+                    "[load_mm_data(simple)] invalid %s data at index=%d: %s",
+                    modality.name,
+                    idx,
+                    e,
+                )
+                raise ValueError(
+                    f"An exception occurred while loading {modality.name} data "
+                    f"at index {idx}: {e}"
+                ) from e
+            except Exception as e:
+                logger.exception(
+                    "[load_mm_data(simple)] error loading %s data at index=%d",
+                    modality.name,
+                    idx,
+                )
+                raise RuntimeError(
+                    f"An exception occurred while loading {modality.name} data at index {idx}: {e}"
+                )
+
+            if modality == Modality.IMAGE:
+                images[idx] = result
+            elif modality == Modality.VIDEO:
+                videos[idx] = result
+            elif modality == Modality.AUDIO:
+                audios[idx] = result
+
+        logger.debug(
+            "[load_mm_data(simple)] loaded counts: images=%d, videos=%d, audios=%d",
+            len(images),
+            len(videos),
+            len(audios),
+        )
+        return images, videos, audios
