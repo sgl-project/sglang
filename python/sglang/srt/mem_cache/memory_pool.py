@@ -2782,6 +2782,35 @@ class MHATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    def get_bf16_hnd_write_args(self, layer, loc_info):
+        """Return validated buffers/slots for a fused BF16 HND cache writer."""
+        if (
+            type(self) is not MHATokenToKVPool
+            or not _is_cuda
+            or not self.use_hnd
+            or self.kv_cache_layout != "hnd"
+            or self.page_size != 32
+            or self.head_dim != 128
+            or self.v_head_dim != 128
+            or self.is_quantized_kv_cache
+            or self.dtype != torch.bfloat16
+            or self.store_dtype != torch.bfloat16
+        ):
+            return None
+        self._check_physical_write_loc(loc_info, "fused BF16 HND write")
+        loc, _, _ = unwrap_write_loc(loc_info)
+        if (
+            not loc.is_cuda
+            or loc.dtype != torch.int64
+            or loc.ndim != 1
+            or not loc.is_contiguous()
+        ):
+            return None
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "fused BF16 HND write")
+        # Accessors retain layer-wise cache-transfer synchronization.
+        key, value = self.get_kv_buffer(layer.layer_id)
+        return key.permute(0, 2, 1, 3), value.permute(0, 2, 1, 3), loc
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,

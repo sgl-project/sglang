@@ -18,7 +18,7 @@ from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -29,7 +29,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -187,7 +190,7 @@ class Qwen3Attention(nn.Module):
             self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
-    def forward_prepare_native(self, positions, hidden_states):
+    def forward_prepare_native(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if (
@@ -199,7 +202,48 @@ class Qwen3Attention(nn.Module):
             and positions.ndim == 2
             and positions.dtype == torch.int64
         ):
+            cache_args = None
+            if (
+                forward_batch.forward_mode.is_decode()
+                and forward_batch.spec_info is None
+                and get_exec().deterministic.rl_on_policy_target is None
+                and not torch.compiler.is_compiling()
+                and get_parallel().attn_cp_size == 1
+                and get_parallel().attn_dcp_size == 1
+                and self.attn.attn_type == AttentionType.DECODER
+                and not self.attn.is_cross_attention
+                and forward_batch.out_cache_loc.numel() == q.shape[0]
+            ):
+                from sglang.srt.layers.attention.trtllm_mha_backend import (
+                    TRTLLMHAAttnBackend,
+                )
+                from sglang.srt.mem_cache.memory_pool import (
+                    KVWriteLoc,
+                    MHATokenToKVPool,
+                )
+
+                pool = get_token_to_kv_pool()
+                backend = get_attn_backend()
+                if (
+                    type(backend) is TRTLLMHAAttnBackend
+                    and backend.token_to_kv_pool is pool
+                    and backend.data_type == torch.bfloat16
+                    and type(pool) is MHATokenToKVPool
+                ):
+                    cache_args = pool.get_bf16_hnd_write_args(
+                        self.attn, KVWriteLoc.for_batch(forward_batch)
+                    )
             self.rotary_emb._match_cos_sin_cache_dtype(q)
+            cache_kwargs = (
+                dict(
+                    value=v,
+                    key_cache=cache_args[0],
+                    value_cache=cache_args[1],
+                    slots=cache_args[2],
+                )
+                if cache_args is not None
+                else {}
+            )
             fused_qk_norm_mrope(
                 q,
                 k,
@@ -209,8 +253,9 @@ class Qwen3Attention(nn.Module):
                 positions,
                 self.rotary_emb.axis_map,
                 self.q_norm.variance_epsilon,
+                **cache_kwargs,
             )
-            return q, k, v
+            return q, k, v, cache_args is None
         q, k = apply_qk_norm(
             q=q,
             k=k,
@@ -220,7 +265,7 @@ class Qwen3Attention(nn.Module):
             alt_stream=self.alt_stream,
         )
         q, k = self.rotary_emb(positions, q, k)
-        return q, k, v
+        return q, k, v, True
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -326,9 +371,10 @@ class Qwen3Attention(nn.Module):
             )
             save_kv_cache = False
         elif not _is_npu:
-            q, k, v = self.forward_prepare_native(
+            q, k, v, save_kv_cache = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
+                forward_batch=forward_batch,
             )
         else:
             q, k, v = self.forward_prepare_npu(

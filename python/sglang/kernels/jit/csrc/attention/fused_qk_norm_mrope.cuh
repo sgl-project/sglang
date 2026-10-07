@@ -25,10 +25,19 @@ struct QKNormMRoPEParams {
   uint32_t k_heads;
   uint32_t tokens;
   float eps;
+  const void* v;
+  void* key_cache;
+  void* value_cache;
+  const int64_t* slots;
+  int64_t v_stride;
+  int64_t block_stride;
+  int64_t token_stride;
+  int64_t head_stride;
+  int64_t page_size;
 };
 
 /// Normalize each Q/K head, then apply full-width NeoX multimodal RoPE in place.
-template <bool kUsePDL>
+template <bool kUsePDL, bool kWriteCache = false>
 __global__ void fused_qk_norm_mrope_kernel(const QKNormMRoPEParams __grid_constant__ p) {
   using namespace device;
   using Storage = norm::StorageType<bf16_t, 128>;
@@ -66,6 +75,19 @@ __global__ void fused_qk_norm_mrope_kernel(const QKNormMRoPEParams __grid_consta
     out[j] = __halves2bfloat162(values[0], values[1]);
   }
   gmem.store(ptr, out);
+  if constexpr (kWriteCache) {
+    if (!is_q) {
+      const auto slot = p.slots[token];
+      if (slot >= 0) {
+        const auto kv_head = head - p.q_heads;
+        const auto offset =
+            (slot / p.page_size) * p.block_stride + (slot % p.page_size) * p.token_stride + kv_head * p.head_stride;
+        gmem.store(pointer::offset(p.key_cache, 2 * offset), out);
+        const auto value = gmem.load(pointer::offset(p.v, 2 * (token * p.v_stride + kv_head * 128)));
+        gmem.store(pointer::offset(p.value_cache, 2 * offset), value);
+      }
+    }
+  }
   PDLTriggerSecondary<kUsePDL>();
 }
 
@@ -117,6 +139,85 @@ struct FusedQKNormMRoPE {
         eps};
     LaunchKernel(div_ceil((p.q_heads + p.k_heads) * p.tokens, 4u), 128, device.unwrap())
         .enable_pdl(kUsePDL)(fused_qk_norm_mrope_kernel<kUsePDL>, p);
+  }
+
+  /// Normalize/rotate Q/K and write BF16 K/V to matching paged cache views.
+  static void run_with_cache(
+      tvm::ffi::TensorView q,
+      tvm::ffi::TensorView k,
+      tvm::ffi::TensorView v,
+      tvm::ffi::TensorView q_weight,
+      tvm::ffi::TensorView k_weight,
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView positions,
+      tvm::ffi::TensorView axis_map,
+      tvm::ffi::TensorView key_cache,
+      tvm::ffi::TensorView value_cache,
+      tvm::ffi::TensorView slots,
+      float eps) {
+    using namespace host;
+    auto N = SymbolicSize{"tokens"};
+    auto Q = SymbolicSize{"q_width"};
+    auto K = SymbolicSize{"k_width"};
+    auto Sq = SymbolicSize{"q_stride"};
+    auto Sk = SymbolicSize{"k_stride"};
+    auto Sp = SymbolicSize{"position_stride"};
+    auto C = SymbolicSize{"cache_length"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({N, Q}).with_strides({Sq, 1}).with_dtype<bf16_t>().with_device(device).ensure_alignment(8).verify(q);
+    TensorMatcher({N, K}).with_strides({Sk, 1}).with_dtype<bf16_t>().with_device(device).ensure_alignment(8).verify(k);
+    TensorMatcher({128}).with_dtype<bf16_t>().with_device(device).ensure_alignment(8).verify(q_weight).verify(k_weight);
+    TensorMatcher({C, 128}).with_dtype<bf16_t>().with_device(device).verify(cache);
+    TensorMatcher({3, N}).with_strides({Sp, 1}).with_dtype<int64_t>().with_device(device).verify(positions);
+    TensorMatcher({64}).with_dtype<int64_t>().with_device(device).verify(axis_map);
+    CHECK_HOST(Q.unwrap() > 0 && K.unwrap() > 0);
+    CHECK_HOST(Q.unwrap() % 128 == 0 && K.unwrap() % 128 == 0);
+    auto Sv = SymbolicSize{"v_stride"};
+    auto Pages = SymbolicSize{"pages"};
+    auto PageSize = SymbolicSize{"page_size"};
+    auto Heads = SymbolicSize{"cache_heads"};
+    Heads.set_value(K.unwrap() / 128);
+    auto Sb = SymbolicSize{"block_stride"};
+    auto St = SymbolicSize{"token_stride"};
+    auto Sh = SymbolicSize{"head_stride"};
+    TensorMatcher({N, K}).with_strides({Sv, 1}).with_dtype<bf16_t>().with_device(device).ensure_alignment(8).verify(v);
+    TensorMatcher({Pages, PageSize, Heads, 128})
+        .with_strides({Sb, St, Sh, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .ensure_alignment(8)
+        .verify(key_cache)
+        .verify(value_cache);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(slots);
+    CHECK_HOST(PageSize.unwrap() > 0);
+    if (N.unwrap() == 0) return;
+    const auto p = QKNormMRoPEParams{
+        q.data_ptr(),
+        k.data_ptr(),
+        q_weight.data_ptr(),
+        k_weight.data_ptr(),
+        static_cast<const bf16_t*>(cache.data_ptr()),
+        static_cast<const int64_t*>(positions.data_ptr()),
+        static_cast<const int64_t*>(axis_map.data_ptr()),
+        Sq.unwrap(),
+        Sk.unwrap(),
+        Sp.unwrap(),
+        static_cast<uint32_t>(Q.unwrap() / 128),
+        static_cast<uint32_t>(K.unwrap() / 128),
+        static_cast<uint32_t>(N.unwrap()),
+        eps,
+        v.data_ptr(),
+        key_cache.data_ptr(),
+        value_cache.data_ptr(),
+        static_cast<const int64_t*>(slots.data_ptr()),
+        Sv.unwrap(),
+        Sb.unwrap(),
+        St.unwrap(),
+        Sh.unwrap(),
+        PageSize.unwrap()};
+    LaunchKernel(div_ceil((p.q_heads + p.k_heads) * p.tokens, 4u), 128, device.unwrap())
+        .enable_pdl(kUsePDL)(fused_qk_norm_mrope_kernel<kUsePDL, true>, p);
   }
 };
 }  // namespace sglang

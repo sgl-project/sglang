@@ -417,7 +417,7 @@ register_kernel(
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
             in_place=True,
-            description="Q/K RMSNorm and full-width NeoX MRoPE with 128-element heads.",
+            description="Q/K RMSNorm and NeoX MRoPE with optional BF16 paged KV write.",
         ),
     )
 )
