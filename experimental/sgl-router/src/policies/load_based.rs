@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::policies::admission::FreshLoadLookup;
+use crate::policies::admission::CandidateLoads;
 use crate::policies::scoring::ScoringPolicy;
 use crate::policies::SelectionContext;
 use crate::workers::Worker;
@@ -34,7 +34,7 @@ impl ScoringPolicy for LoadBasedPolicy {
     /// Purely a preference: "everybody is busy" is not a reason to refuse to
     /// route, so this term never constrains. Capacity is `--filter`'s job.
     fn scores(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<f32> {
-        let lookup = FreshLoadLookup::new(ctx.load_snapshot(), workers.iter());
+        let lookup = CandidateLoads::new(ctx.load_snapshot(), workers.iter());
         let loads: Vec<usize> = workers.iter().map(|w| lookup.score_load(w)).collect();
         let lo = loads.iter().min().copied().unwrap_or(0);
         let span = (loads.iter().max().copied().unwrap_or(0) - lo) as f32;

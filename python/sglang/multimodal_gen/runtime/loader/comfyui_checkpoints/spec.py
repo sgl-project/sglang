@@ -22,6 +22,12 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
+from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
+    comfy_quant_key_filter,
+    inspect_minimax_h3_safetensors,
+    resolve_minimax_h3_checkpoint_quantization,
+)
+from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
@@ -241,15 +247,45 @@ def load_comfyui_transformer(
                 safetensors_weights_iterator([model_path]), dit_config
             )
 
+        quant_config = None
+        checkpoint_key_filter = None
+        weight_load_plan = None
         # GGUF already sets AdaLN curve from tensor meta. Pruned BF16
         # safetensors keep the same adaln_t_table; without this the DiT is
         # built as the unpruned MLP and load fails on that extra parameter.
         if spec.dit_cls_name == "MiniMaxH3DiTModel":
-            from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
-                inspect_minimax_h3_safetensors,
+            adaln_curve_shape, layer_markers = inspect_minimax_h3_safetensors(
+                [model_path]
             )
-
-            adaln_curve_shape, _ = inspect_minimax_h3_safetensors([model_path])
+            if layer_markers:
+                if any(
+                    marker.get("format") != "int8_tensorwise"
+                    for marker in layer_markers.values()
+                ):
+                    raise ValueError(
+                        "ComfyUI H3 integrated mode currently supports serialized INT8 ConvRot quantization"
+                    )
+                if (
+                    server_args.quantization is not None
+                    or server_args.nunchaku_config is not None
+                ):
+                    raise ValueError(
+                        "Checkpoint quantization is encoded in per-layer metadata; do not also set quantization or Nunchaku"
+                    )
+                if server_args.should_use_fsdp_for_component("transformer"):
+                    raise ValueError(
+                        "Comfy quantized checkpoints do not support FSDP inference; use TP and/or sequence parallelism instead"
+                    )
+                quant_config = resolve_minimax_h3_checkpoint_quantization(layer_markers)
+                checkpoint_key_filter = comfy_quant_key_filter
+                checkpoint_device = (
+                    torch.device("cpu")
+                    if server_args.should_start_component_on_cpu("transformer")
+                    else get_local_torch_device()
+                )
+                weight_load_plan = WeightLoadPlan(
+                    checkpoint_load_device=checkpoint_device
+                )
             if adaln_curve_shape is not None:
                 (
                     dit_config.arch_config.adaln_curve_grid,
@@ -269,12 +305,15 @@ def load_comfyui_transformer(
 
         # Weight loading reads param_names_mapping off the model, which inherits it
         # from the class, so the ComfyUI names have to be visible for the whole load.
+        init_params = {"config": dit_config, "hf_config": {}}
+        if quant_config is not None:
+            init_params["quant_config"] = quant_config
         original_mapping = model_cls.param_names_mapping
         model_cls.param_names_mapping = mapping
         try:
             model = maybe_load_fsdp_model(
                 model_cls=model_cls,
-                init_params={"config": dit_config, "hf_config": {}},
+                init_params=init_params,
                 weight_dir_list=[model_path],
                 device=get_local_torch_device(),
                 hsdp_replicate_dim=server_args.hsdp_replicate_dim,
@@ -289,6 +328,8 @@ def load_comfyui_transformer(
                 output_dtype=None,
                 strict=spec.strict,
                 weights_iterator=weights_iterator,
+                checkpoint_key_filter=checkpoint_key_filter,
+                weight_load_plan=weight_load_plan,
             )
         finally:
             model_cls.param_names_mapping = original_mapping
