@@ -1,4 +1,5 @@
 import logging
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -24,6 +25,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -95,6 +97,25 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _draft_config_is_k3_dspark(server_args: ServerArgs) -> bool:
+    del server_args
+    draft_path = get_spec().speculative_draft_model_path
+    if not draft_path:
+        return False
+    import json
+
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    cfg = get_config(
+        draft_path,
+        trust_remote_code=get_model().trust_remote_code,
+        revision=get_spec().speculative_draft_model_revision,
+        model_override_args=json.loads(get_model().json_model_override_args),
+        model_config_parser=get_model().model_config_parser,
+    )
+    return "K3DSparkModel" in (getattr(cfg, "architectures", None) or [])
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -188,6 +209,11 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
+        # K3DSpark is absorbed MLA, but its KV pool is replicated like the GQA
+        # DSpark draft. Attention and graph capture must not take the target's
+        # DCP-reduce kernel. Pool sizing stays outside this scope: the draft
+        # allocator still widens locs by attn_dcp_size.
+        self._draft_mla_no_dcp = _draft_config_is_k3_dspark(server_args)
         with draft_pp_context(), self._draft_context():
             bundle = build_draft_tp_worker(
                 server_args=server_args,
@@ -438,8 +464,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @contextmanager
     def _draft_context(self):
-        return draft_tp_context(self._draft_dp_context_enabled)
+        with draft_tp_context(self._draft_dp_context_enabled):
+            if getattr(self, "_draft_mla_no_dcp", False):
+                with get_parallel().override(dcp_enabled=False, attn_dcp_size=1):
+                    yield
+            else:
+                yield
 
     def alloc_memory_pool(
         self,

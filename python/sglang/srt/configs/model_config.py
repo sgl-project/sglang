@@ -252,7 +252,7 @@ def uses_kda_attention(config) -> bool:
 
 
 def is_dspark_draft(config) -> bool:
-    return _hf_arch(config) == "DSparkDraftModel"
+    return _hf_arch(config) in ("DSparkDraftModel", "K3DSparkModel")
 
 
 @lru_cache
@@ -1358,6 +1358,20 @@ class ModelConfig:
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
             self._init_mla_scaling(self.hf_config.rope_scaling)
+        elif "K3DSparkModel" in self.hf_config.architectures:
+            # Absorbed MLA: cache width is kv_lora_rank + qk_rope_head_dim (576),
+            # not the Kimi-K3 target's hardcoded head_dim 72 and not GQA.
+            tc = self.hf_text_config
+            self.qk_nope_head_dim = tc.qk_nope_head_dim
+            self.qk_rope_head_dim = tc.qk_rope_head_dim
+            self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+            self.v_head_dim = tc.v_head_dim
+            self.kv_lora_rank = tc.kv_lora_rank
+            self.attention_arch = AttentionArch.MLA
+            rope_scaling = getattr(tc, "rope_parameters", None) or getattr(
+                tc, "rope_scaling", None
+            )
+            self._init_mla_scaling(rope_scaling)
         else:
             if (
                 "MistralModel" in self.hf_config.architectures

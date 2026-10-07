@@ -41,6 +41,7 @@ from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.configs.jet_vlm import JetVLMConfig
 from sglang.srt.configs.k2_horizon import K2HorizonConfig, XllmConfig
+from sglang.srt.configs.k3_dspark import K3DSparkConfig
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_k25 import KimiK25Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
@@ -118,6 +119,7 @@ __all__ = [
     "Glm5NextConfig",
     "Glm5NextTextConfig",
     "KimiLinearConfig",
+    "K3DSparkConfig",
     "KimiK3Config",
     "KimiK25Config",
     "LagunaConfig",
