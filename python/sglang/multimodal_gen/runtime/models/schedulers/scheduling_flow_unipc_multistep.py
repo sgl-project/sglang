@@ -19,9 +19,12 @@ from diffusers.schedulers.scheduling_utils import (
 from diffusers.utils import deprecate
 
 from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
+from sglang.multimodal_gen.runtime.models.schedulers.unipc import UniPCSchedulerMixin
 
 
-class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
+class FlowUniPCMultistepScheduler(
+    UniPCSchedulerMixin, SchedulerMixin, ConfigMixin, BaseScheduler
+):
     """
     `UniPCMultistepScheduler` is a training-free framework designed for the fast sampling of diffusion models.
 
@@ -139,33 +142,8 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
 
         BaseScheduler.__init__(self)
 
-    @property
-    def step_index(self):
-        """
-        The index counter for current timestep. It will increase 1 after each scheduler step.
-        """
-        return self._step_index
-
-    @property
-    def begin_index(self):
-        """
-        The index for the first timestep. It should be set from pipeline with `set_begin_index` method.
-        """
-        return self._begin_index
-
     def set_shift(self, shift: float) -> None:
         self.config.shift = shift
-
-    # Copied from diffusers.schedulers.scheduling_dpmsolver_multistep.DPMSolverMultistepScheduler.set_begin_index
-    def set_begin_index(self, begin_index: int = 0):
-        """
-        Sets the begin index for the scheduler. This function should be run from pipeline before the inference.
-
-        Args:
-            begin_index (`int`):
-                The begin index for the scheduler.
-        """
-        self._begin_index = begin_index
 
     # Modified from diffusers.schedulers.scheduling_flow_match_euler_discrete.FlowMatchEulerDiscreteScheduler.set_timesteps
     def set_timesteps(
@@ -235,44 +213,6 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         # add an index counter for schedulers that allow duplicated timesteps
         self._step_index = None
         self._begin_index = None
-
-    # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler._threshold_sample
-    def _threshold_sample(self, sample: torch.Tensor) -> torch.Tensor:
-        """
-        "Dynamic thresholding: At each sampling step we set s to a certain percentile absolute pixel value in xt0 (the
-        prediction of x_0 at timestep t), and if s > 1, then we threshold xt0 to the range [-s, s] and then divide by
-        s. Dynamic thresholding pushes saturated pixels (those near -1 and 1) inwards, thereby actively preventing
-        pixels from saturation at each step. We find that dynamic thresholding results in significantly better
-        photorealism as well as better image-text alignment, especially when using very large guidance weights."
-
-        https://arxiv.org/abs/2205.11487
-        """
-        dtype = sample.dtype
-        batch_size, channels, *remaining_dims = sample.shape
-
-        if dtype not in (torch.float32, torch.float64):
-            sample = (
-                sample.float()
-            )  # upcast for quantile calculation, and clamp not implemented for cpu half
-
-        # Flatten sample for doing quantile calculation along each image
-        sample = sample.reshape(batch_size, channels * np.prod(remaining_dims))
-
-        abs_sample = sample.abs()  # "a certain percentile absolute pixel value"
-
-        s = torch.quantile(abs_sample, self.config.dynamic_thresholding_ratio, dim=1)
-        s = torch.clamp(
-            s, min=1, max=self.config.sample_max_value
-        )  # When clamped to min=1, equivalent to standard clipping to [-1, 1]
-        s = s.unsqueeze(1)  # (batch_size, 1) because clamp will broadcast along dim=0
-        sample = (
-            torch.clamp(sample, -s, s) / s
-        )  # "we threshold xt0 to the range [-s, s] and then divide by s"
-
-        sample = sample.reshape(batch_size, channels, *remaining_dims)
-        sample = sample.to(dtype)
-
-        return sample
 
     def _sigma_to_alpha_sigma_t(self, sigma) -> tuple[Any, Any]:
         return 1 - sigma, sigma
@@ -671,19 +611,6 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
 
         return step_index
 
-    # Copied from diffusers.schedulers.scheduling_dpmsolver_multistep.DPMSolverMultistepScheduler._init_step_index
-    def _init_step_index(self, timestep) -> None:
-        """
-        Initialize the step_index counter for the scheduler.
-        """
-
-        if self.begin_index is None:
-            if isinstance(timestep, torch.Tensor):
-                timestep = timestep.to(self.timesteps.device)
-            self._step_index = self.index_for_timestep(timestep)
-        else:
-            self._step_index = self._begin_index
-
     def step(
         self,
         model_output: torch.Tensor,
@@ -774,62 +701,6 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             return (prev_sample,)
 
         return SchedulerOutput(prev_sample=prev_sample)
-
-    def scale_model_input(self, sample: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        """
-        Ensures interchangeability with schedulers that need to scale the denoising model input depending on the
-        current timestep.
-
-        Args:
-            sample (`torch.Tensor`):
-                The input sample.
-
-        Returns:
-            `torch.Tensor`:
-                A scaled input sample.
-        """
-        return sample
-
-    # Copied from diffusers.schedulers.scheduling_dpmsolver_multistep.DPMSolverMultistepScheduler.add_noise
-    def add_noise(
-        self,
-        original_samples: torch.Tensor,
-        noise: torch.Tensor,
-        timesteps: torch.IntTensor,
-    ) -> torch.Tensor:
-        # Make sure sigmas and timesteps have the same device and dtype as original_samples
-        sigmas = self.sigmas.to(
-            device=original_samples.device, dtype=original_samples.dtype
-        )
-        if original_samples.device.type == "mps" and torch.is_floating_point(timesteps):
-            # mps does not support float64
-            schedule_timesteps = self.timesteps.to(
-                original_samples.device, dtype=torch.float32
-            )
-            timesteps = timesteps.to(original_samples.device, dtype=torch.float32)
-        else:
-            schedule_timesteps = self.timesteps.to(original_samples.device)
-            timesteps = timesteps.to(original_samples.device)
-
-        # begin_index is None when the scheduler is used for training or pipeline does not implement set_begin_index
-        if self.begin_index is None:
-            step_indices = [
-                self.index_for_timestep(t, schedule_timesteps) for t in timesteps
-            ]
-        elif self.step_index is not None:
-            # add_noise is called after first denoising step (for inpainting)
-            step_indices = [self.step_index] * timesteps.shape[0]
-        else:
-            # add noise is called before first denoising step to create initial latent(img2img)
-            step_indices = [self.begin_index] * timesteps.shape[0]
-
-        sigma = sigmas[step_indices].flatten()
-        while len(sigma.shape) < len(original_samples.shape):
-            sigma = sigma.unsqueeze(-1)
-
-        alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma)
-        noisy_samples = alpha_t * original_samples + sigma_t * noise
-        return noisy_samples
 
 
 EntryClass = FlowUniPCMultistepScheduler
