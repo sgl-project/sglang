@@ -32,7 +32,7 @@ from sglang.srt.runtime_context import get_observability, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -81,6 +81,8 @@ class InsertParams:
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
+    # The ping-pong slot prepare picked; cleanup keeps that same slot.
+    mamba_keep_idx: Optional[int] = None
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
     c128_value: Optional[torch.Tensor] = None
@@ -93,7 +95,9 @@ class InsertParams:
     component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(
         default_factory=dict, kw_only=True
     )
-    chunked: bool = False
+    # The inserting request already inserted [0, here) (req.kv.cache_inserted_len);
+    # only the nodes past it count a hit, so a request counts each node once.
+    inserted_len: int = 0
     priority: int = 0
     session_id: Optional[str] = None
     track_adopted_ranges: bool = False
@@ -237,6 +241,16 @@ class DecLockRefParams:
 
 
 @dataclasses.dataclass
+class TreeLock:
+    """``receipt`` replays the acquire on release; ``swa_released`` marks the
+    SWA part released early, so neither release takes it twice."""
+
+    node: Any
+    receipt: DecLockRefParams
+    swa_released: bool = False
+
+
+@dataclasses.dataclass
 class DecLockRefResult:
     """Result of an dec_lock_ref operation."""
 
@@ -303,8 +317,8 @@ class MatchResult(NamedTuple):
 def zero_match_result(
     tree_cache, match_result: MatchResult, extra_key: Optional[str] = None
 ) -> MatchResult:
-    if tree_cache.is_chunk_cache():
-        # Chunk caches' match_prefix already returns a miss; no root_node to walk back to.
+    if not tree_cache.supports_prefix_sharing():
+        # match_prefix already returns a miss; no root_node to walk back to.
         return match_result
     root = tree_cache.root_node_handle(extra_key=extra_key)
     return match_result._replace(
@@ -455,15 +469,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return None
 
     @abstractmethod
-    def insert_req(self, req: Req, *, up_to: int, **kwargs):
-        """Hand a finished request's KV up to row position ``up_to`` to the
-        tree: insert what can be keyed and advance ``cache_protected_len``
-        past it. The caller then frees ``[cache_protected_len, up_to)`` and
-        everything after, and unpins; nothing here releases a slot."""
-
-    @abstractmethod
-    def cache_unfinished_req(self, req: Req, **kwargs):
-        pass
+    def checkpoint(self, req: Req, *, up_to: int, **kwargs):
+        """Insert the request's KV up to row position ``up_to`` into the tree,
+        repoint the row onto the tree's copy, re-anchor ``req.last_node`` on
+        the node the insert ended on and advance ``cache_protected_len``.
+        Called at every checkpoint of a running request and once more when
+        it finishes (``req.finished()``), when the tree also takes over the
+        component state the request no longer needs. Nothing here frees a
+        slot: ``release_kv_cache`` frees ``[cache_protected_len, up_to)`` and
+        everything after, and unpins."""
 
     def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
         """Give back ascending, disjoint, half-open row-position ranges
@@ -506,20 +520,26 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     ) -> DecLockRefResult:
         pass
 
-    def unpin(self, req: Req) -> None:
-        """Drop the tree lock the request holds on ``req.last_node``; a cache
-        whose acquire returned a receipt releases with it here."""
-        if req.last_node is not None:
-            self.dec_lock_ref(req.last_node)
+    def lock(self, node: Any) -> Optional[TreeLock]:
+        """Take a tree lock on ``node`` for one holder; ``unlock`` releases it."""
+        return TreeLock(node, self.inc_lock_ref(node).to_dec_params())
+
+    def unlock(self, lock: Optional[TreeLock]) -> None:
+        if lock is not None:
+            self.dec_lock_ref(lock.node, lock.receipt)
+
+    def maybe_hand_to_session(self, req: Req) -> None:
+        """A cache that keeps records across requests (a streaming session) takes
+        the just-allocated row and the request's tree lock; the request borrows it."""
 
     def claim_kv_row(self, req: Req) -> bool:
         """A streaming session keeps the request's kv row for the next turn.
         Return True after taking the row; the caller then releases nothing."""
         return False
 
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        """The row is freed and the lock dropped; ``inserted`` says whether the
-        KV went into the tree first. Drop per-request state kept outside the tree."""
+    def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        """The row is freed and the lock dropped; ``checkpointed`` says whether
+        the KV went into the tree first. Drop per-request state kept outside the tree."""
 
     def evictable_size(self):
         return 0
@@ -620,7 +640,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             page_size=self.page_size,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            is_chunk_cache=self.is_chunk_cache(),
+            supports_prefix_sharing=self.supports_prefix_sharing(),
             retain_floor=self.swa_retain_floor(req),
             eviction_interval=eviction_interval,
         )
@@ -641,35 +661,21 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_mamba(self) -> bool:
         return False
 
-    def supports_streaming_session(self) -> bool:
-        return False
-
     def release_session(self, session_id: str) -> None:
         pass
 
     def release_radix_session(self, session_id: str) -> None:
         pass
 
-    def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
+    def session_records(self) -> dict[str, ReqKvInfo]:
+        """The KV records sessions own, by session id. Pool accounting counts them
+        as session-held, including while a request runs on one."""
+        return {}
 
-    def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def is_chunk_cache(self) -> bool:
-        return False
-
-    def is_tree_cache(self) -> bool:
-        return not self.is_chunk_cache()
+    def supports_prefix_sharing(self) -> bool:
+        """Whether a request's prefix stays in the cache for other requests to
+        share, including after the request finishes."""
+        return True
 
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()

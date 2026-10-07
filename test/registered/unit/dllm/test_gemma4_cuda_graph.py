@@ -35,6 +35,7 @@ class _ReadStream:
         out,
         kv_start_idx=None,
         sliding_window=False,
+        token_mapping=None,
     ):
         for i, (req, length) in enumerate(zip(req_pool_indices, seq_lens)):
             start = 0 if kv_start_idx is None else int(kv_start_idx[i])
@@ -186,7 +187,8 @@ class TestGemma4VocabularyShards(unittest.TestCase):
         weight = torch.randn(73, 4)
         probabilities = torch.randn(6, 73).softmax(dim=-1)
         expected = probabilities @ weight * 2.0
-        for tp_size in (1, 2, 4):
+        # TP3 does not divide the 64-padded vocab (128), so padding scales with TP.
+        for tp_size in (1, 2, 3, 4):
             with self.subTest(tp_size=tp_size):
                 partials = []
                 for rank in range(tp_size):
