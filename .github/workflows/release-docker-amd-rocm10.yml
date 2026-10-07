@@ -11,6 +11,7 @@ on:
           - 'all'
           - publish
           - publish-gfx1250
+          - publish-gfx1250-rocm101
       gpu_arch:
         description: 'Select which ROCm 10 GPU arch to build'
         required: false
@@ -118,6 +119,81 @@ jobs:
           docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
           docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
 
+  # ROCm 10.1 for gfx1250, published alongside the 10.0 image below rather than
+  # replacing it. MoRI is off because it still includes the legacy rocm_smi
+  # headers, which ROCm 10.1 drops.
+  publish-gfx1250-rocm101:
+    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish-gfx1250-rocm101')
+    runs-on: amd-docker-scale
+    environment: 'prod'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Set date
+        run: echo "DATE=$(date +%Y%m%d)" >> "$GITHUB_ENV"
+
+      - name: Get version from latest tag
+        id: version
+        run: |
+          VERSION=$(python3 scripts/release/get_version_tag.py --tag-only | sed 's/^v//')
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version from git tags"
+            exit 1
+          fi
+
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          PRETEND_VERSION="${VERSION}.dev${DATE}+g${COMMIT_HASH}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "pretend_version=${PRETEND_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Docker Hub (AMD)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+      - name: Build and push to rocm/sgl-dev
+        env:
+          PRETEND_VERSION: ${{ steps.version.outputs.pretend_version }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          image_tag="v${VERSION}-rocm101-mi45x-${DATE}"
+          echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
+
+          docker build . \
+            -f docker/rocm.Dockerfile \
+            --build-arg "SGL_BRANCH=${GITHUB_SHA}" \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GPU_ARCH=gfx1250-rocm1010 \
+            --build-arg ENABLE_MORI=0 \
+            --build-arg ENABLE_NIXL=1 \
+            --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
+            --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
+            -t "rocm/sgl-dev:${image_tag}" \
+            --no-cache
+          docker push "rocm/sgl-dev:${image_tag}"
+
+      - name: Login to Docker Hub (lmsys)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push to lmsysorg/sglang-rocm
+        run: |
+          docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
+          docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
+
   # gfx1250 (MI45x) runs on the same schedule as the pair above but stays a
   # separate job: no MI450 runner pool consumes the image, so a bring-up build
   # failure must not gate the released gfx942/gfx950 images.
@@ -161,42 +237,12 @@ jobs:
           username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
           password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
-      # ROCm 10.1.0 sits on the same stable index the Dockerfile already
-      # defaults to, so only the versions move and ROCM_INDEX_URL stays put.
-      # They are passed here rather than changed in the Dockerfile because
-      # gfx942 and gfx950 share the rocm1000-base stage and stay on 10.0.
-      #
-      # ENABLE_MORI=0: ROCm 10.1 drops the legacy rocm_smi library and headers,
-      # and MoRI still does #include "rocm_smi/rocm_smi.h" on its main branch,
-      # so it cannot compile here. Restore ENABLE_MORI=1 once MoRI moves to
-      # amd_smi; until then this image has no MoRI expert-parallel all-to-all.
       - name: Build and push to rocm/sgl-dev
         env:
           PRETEND_VERSION: ${{ steps.version.outputs.pretend_version }}
           VERSION: ${{ steps.version.outputs.version }}
-          ROCM_SDK_VERSION: 10.1.0
-          ROCM_TORCH_VERSION: 2.12.0
-          ROCM_TORCHVISION_VERSION: 0.27.0
-          ROCM_TORCHAUDIO_VERSION: 2.11.0
-          ROCM_TRITON_VERSION: 3.8.0+git669b31ac
         run: |
-          # Which Triton the image ends up with is the thing that varies most
-          # between these dev images, so put it in the tag. With BUILD_TRITON=0
-          # that is the SDK build named by ROCM_TRITON_VERSION; the gfx1250
-          # stage is the one that decides, and three stages declare the ARG.
-          build_triton=$(awk '/AS gfx1250-rocm1000/,0' docker/rocm.Dockerfile \
-            | grep -oP 'ENV BUILD_TRITON="\K[01]' | head -1)
-          if [ "${build_triton}" = "1" ]; then
-            triton_tag=src$(awk '/AS gfx1250-rocm1000/,0' docker/rocm.Dockerfile \
-              | grep -oP 'ENV TRITON_COMMIT_DEFAULT="\K[0-9a-f]{8}' | head -1)
-          else
-            triton_tag=sdk$(echo "${ROCM_TRITON_VERSION}" | grep -oP 'git\K[0-9a-f]{8}')
-          fi
-          if [ "${triton_tag}" = "src" ] || [ "${triton_tag}" = "sdk" ]; then
-            echo "::error::could not determine the Triton revision for the tag"
-            exit 1
-          fi
-          image_tag="v${VERSION}-dev-rocm1010-mi45x-triton${triton_tag}-${DATE}"
+          image_tag="v${VERSION}-rocm10-mi45x-${DATE}"
           echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
 
           docker build . \
@@ -204,18 +250,21 @@ jobs:
             --build-arg "SGL_BRANCH=${GITHUB_SHA}" \
             --build-arg BUILD_TYPE=all \
             --build-arg GPU_ARCH=gfx1250-rocm1000 \
-            --build-arg ENABLE_MORI=0 \
+            --build-arg ENABLE_MORI=1 \
             --build-arg ENABLE_NIXL=1 \
             --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
             --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
-            --build-arg "ROCM_SDK_VERSION=${ROCM_SDK_VERSION}" \
-            --build-arg "ROCM_TORCH_VERSION=${ROCM_TORCH_VERSION}" \
-            --build-arg "ROCM_TORCHVISION_VERSION=${ROCM_TORCHVISION_VERSION}" \
-            --build-arg "ROCM_TORCHAUDIO_VERSION=${ROCM_TORCHAUDIO_VERSION}" \
-            --build-arg "ROCM_TRITON_VERSION=${ROCM_TRITON_VERSION}" \
             -t "rocm/sgl-dev:${image_tag}" \
             --no-cache
           docker push "rocm/sgl-dev:${image_tag}"
 
-      # Not mirrored to lmsysorg/sglang-rocm while this flavor ships without
-      # MoRI and on the SDK Triton.
+      - name: Login to Docker Hub (lmsys)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push to lmsysorg/sglang-rocm
+        run: |
+          docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
+          docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"

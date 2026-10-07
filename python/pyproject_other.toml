@@ -131,8 +131,8 @@ srt_hip_rocm724 = [
   "wave-lang==3.8.2",
 ]
 
-# Kept in step with srt_hip_rocm724 above by hand; only the torch pin differs.
-# ROCm 10.1 publishes no torch 2.11 wheel, so that flavor cannot stay on 2.11.
+# Same as srt_hip_rocm724 above except for the torch pin; keep them in step by
+# hand. ROCm 10.1 publishes no torch 2.11 wheel, so it has to be 2.12.
 srt_hip_rocm101 = [
   "compressed-tensors==0.16.0",
   "petit_kernel==0.0.2",
