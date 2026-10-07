@@ -28,7 +28,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 )
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     _TREE_CORE_REGISTRY,
-    create_tree_components,
+    create_python_tree_components,
     create_tree_core,
     register_tree_core_backend,
     registered_tree_core_backends,
@@ -105,8 +105,8 @@ class NamedComponentRegistryTest(CustomTestCase):
     def setUp(self):
         for registry in (
             python_components._PYTHON_TREE_COMPONENT_REGISTRY,
-            rust_components._RUST_TREE_COMPONENT_REGISTRY,
-            rust_components._RUST_PYTHON_COMPONENT_FACTORIES,
+            rust_components._TREE_COMPONENT_REGISTRY,
+            rust_components._PAIRED_PYTHON_COMPONENT_FACTORIES,
         ):
             patcher = mock.patch.dict(registry)
             patcher.start()
@@ -117,18 +117,16 @@ class NamedComponentRegistryTest(CustomTestCase):
         python_components.register_python_tree_component(
             "test_full", _StubFullComponent
         )
-        self.assertIsNone(rust_components.get_rust_tree_component("test_full"))
-        rust_components.register_rust_tree_component("test_full", native_factory)
+        self.assertIsNone(rust_components.get_tree_component("test_full"))
+        rust_components.register_tree_component("test_full", native_factory)
         self.assertIs(
             python_components.get_python_tree_component("test_full"), _StubFullComponent
         )
-        self.assertIs(
-            rust_components.get_rust_tree_component("test_full"), native_factory
-        )
+        self.assertIs(rust_components.get_tree_component("test_full"), native_factory)
         python_components.registered_python_tree_components().clear()
-        rust_components.registered_rust_tree_components().clear()
+        rust_components.registered_tree_components().clear()
         self.assertIsNotNone(python_components.get_python_tree_component("full"))
-        self.assertTrue(callable(rust_components.get_rust_tree_component("full")))
+        self.assertTrue(callable(rust_components.get_tree_component("full")))
 
     def test_registration_is_idempotent_but_rejects_conflicting_names(self):
         native_factory = mock.Mock()
@@ -137,19 +135,17 @@ class NamedComponentRegistryTest(CustomTestCase):
             python_components.register_python_tree_component(
                 "test_full", _StubFullComponent
             )
-            rust_components.register_rust_tree_component("test_full", native_factory)
+            rust_components.register_tree_component("test_full", native_factory)
         with self.assertRaisesRegex(ValueError, "already registered"):
             python_components.register_python_tree_component(
                 "test_full", _StubMambaComponent
             )
         with self.assertRaisesRegex(ValueError, "already registered"):
-            rust_components.register_rust_tree_component(
-                "test_full", replacement_factory
-            )
+            rust_components.register_tree_component("test_full", replacement_factory)
         python_components.register_python_tree_component(
             "test_full", _StubMambaComponent, replace=True
         )
-        rust_components.register_rust_tree_component(
+        rust_components.register_tree_component(
             "test_full", replacement_factory, replace=True
         )
         self.assertIs(
@@ -157,19 +153,19 @@ class NamedComponentRegistryTest(CustomTestCase):
             _StubMambaComponent,
         )
         self.assertIs(
-            rust_components.get_rust_tree_component("test_full"), replacement_factory
+            rust_components.get_tree_component("test_full"), replacement_factory
         )
 
     def test_registration_rejects_invalid_definitions(self):
         for register, component in (
             (python_components.register_python_tree_component, _StubFullComponent),
-            (rust_components.register_rust_tree_component, mock.Mock()),
+            (rust_components.register_tree_component, mock.Mock()),
         ):
             with self.subTest(register=register), self.assertRaises(ValueError):
                 register("  ", component)
         for register in (
             python_components.register_python_tree_component,
-            rust_components.register_rust_tree_component,
+            rust_components.register_tree_component,
         ):
             with self.subTest(register=register), self.assertRaises(TypeError):
                 register("invalid", 42)
@@ -186,7 +182,7 @@ class NamedComponentRegistryTest(CustomTestCase):
         params = _cache_init_params(
             component_registry_override={ComponentType.FULL: "test_callable"}
         )
-        components = create_tree_components(cache, params)
+        components = create_python_tree_components(cache, params)
         self.assertIsInstance(components[ComponentType.FULL], _StubFullComponent)
         self.assertEqual(len(calls), 1)
         self.assertIsInstance(calls[0], PythonTreeComponentArgument)
@@ -201,7 +197,7 @@ class NamedComponentRegistryTest(CustomTestCase):
         factory = mock.Mock(side_effect=TypeError("factory failed"))
         python_components.register_python_tree_component("test_failure", factory)
         with self.assertRaisesRegex(TypeError, "factory failed"):
-            create_tree_components(
+            create_python_tree_components(
                 mock.Mock(),
                 _cache_init_params(
                     component_registry_override={ComponentType.FULL: "test_failure"}
@@ -214,7 +210,7 @@ class NamedComponentRegistryTest(CustomTestCase):
             "test_invalid", lambda args: object()
         )
         with self.assertRaises(TypeError):
-            create_tree_components(
+            create_python_tree_components(
                 mock.Mock(),
                 _cache_init_params(
                     component_registry_override={ComponentType.FULL: "test_invalid"}
@@ -223,7 +219,7 @@ class NamedComponentRegistryTest(CustomTestCase):
 
     def test_unknown_native_factory_is_rejected_before_loading_extension(self):
         with self.assertRaisesRegex(ValueError, "component_registry_override"):
-            rust_components.resolve_rust_component_factories(
+            rust_components.resolve_component_factories(
                 _cache_init_params(
                     component_registry_override={ComponentType.FULL: "missing"}
                 )
@@ -235,7 +231,7 @@ class NamedComponentRegistryTest(CustomTestCase):
         )
         for name in ("missing", "test_wrong_kind"):
             with self.subTest(name=name), self.assertRaises(ValueError):
-                create_tree_components(
+                create_python_tree_components(
                     mock.Mock(),
                     _cache_init_params(
                         component_registry_override={ComponentType.FULL: name}
@@ -244,7 +240,7 @@ class NamedComponentRegistryTest(CustomTestCase):
 
     def test_python_resolution_rejects_inactive_named_overrides(self):
         with self.assertRaisesRegex(ValueError, "inactive"):
-            create_tree_components(
+            create_python_tree_components(
                 mock.Mock(),
                 _cache_init_params(
                     component_registry_override={ComponentType.SWA: "swa"}
@@ -271,7 +267,7 @@ class NamedComponentRegistryTest(CustomTestCase):
         self.assertEqual(
             resolve_component_factory_keys(params), {ComponentType.FULL: "full"}
         )
-        components = create_tree_components(mock.Mock(), params)
+        components = create_python_tree_components(mock.Mock(), params)
         self.assertIs(
             type(components[ComponentType.FULL]),
             python_components.get_python_tree_component(
@@ -335,8 +331,8 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
         self._registry_snapshot = dict(_TREE_CORE_REGISTRY)
         for registry in (
             python_components._PYTHON_TREE_COMPONENT_REGISTRY,
-            rust_components._RUST_TREE_COMPONENT_REGISTRY,
-            rust_components._RUST_PYTHON_COMPONENT_FACTORIES,
+            rust_components._TREE_COMPONENT_REGISTRY,
+            rust_components._PAIRED_PYTHON_COMPONENT_FACTORIES,
         ):
             patcher = mock.patch.dict(registry)
             patcher.start()
@@ -437,8 +433,8 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
 
     def test_replacing_python_factory_invalidates_native_pairing(self):
         native_factory = mock.Mock()
-        rust_components.register_rust_tree_component("test_full", native_factory)
-        self.assertTrue(rust_components.supports_rust_tree_component("test_full"))
+        rust_components.register_tree_component("test_full", native_factory)
+        self.assertTrue(rust_components.supports_tree_component("test_full"))
         python_components.register_python_tree_component(
             "test_full",
             lambda args: _StubFullComponent(args.cache, args.params),
@@ -453,8 +449,8 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
             self.assertEqual(resolve_tree_core_backend("rust", params), "python")
         find_spec.assert_not_called()
         native_factory.assert_not_called()
-        rust_components.register_rust_tree_component("test_full", native_factory)
-        self.assertTrue(rust_components.supports_rust_tree_component("test_full"))
+        rust_components.register_tree_component("test_full", native_factory)
+        self.assertTrue(rust_components.supports_tree_component("test_full"))
 
     def test_replacing_factory_affects_only_new_cache_instances(self):
         first = UnifiedRadixCache(self._cache_params(tree_core_backend="python"))

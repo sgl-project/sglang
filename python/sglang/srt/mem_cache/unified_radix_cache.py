@@ -83,7 +83,7 @@ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
-    create_tree_components,
+    create_python_tree_components,
     create_tree_core,
     select_tree_core_backend,
 )
@@ -183,7 +183,7 @@ class UnifiedRadixCache(BasePrefixCache):
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
         self.enable_session_radix_cache = params.enable_session_radix_cache
-        self.components = create_tree_components(self, params)
+        self.components = create_python_tree_components(self, params)
         self._components_tuple: tuple[TreeComponent, ...] = tuple(
             self.components.values()
         )

@@ -88,7 +88,7 @@ Three separate registries connect backend selection and component construction:
 
 - `register_tree_core_backend(name, factory)` selects a tree-core implementation.
 - `register_python_tree_component(name, factory)` registers a callable that receives `PythonTreeComponentArgument` and returns a Python `TreeComponent`; existing component classes with `(cache, params)` constructors are also accepted.
-- `register_rust_tree_component(name, factory)` registers a callable that receives `TreeComponentArgument` and returns a native `TreeComponentBinding` handle.
+- `register_tree_component(name, factory)` registers a callable that receives `TreeComponentArgument` and returns a native `TreeComponentBinding` handle.
 
 Python's `PythonTreeComponentArgument`, defined in `unified_cache/components/base.py`, requires `component_type`, `params`, and `cache`. The independent `TreeComponentArgument`, defined in `rust_tree_core/component_registry.py`, requires `component_type`, `params`, `native_init_params`, `native_bindings`, and `is_bigram`.
 
@@ -99,7 +99,7 @@ For example, these factories select the existing Full implementations under a sh
 ```python
 from sglang.srt.mem_cache.rust_tree_core.component_registry import (
     TreeComponentArgument,
-    register_rust_tree_component,
+    register_tree_component,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import PythonTreeComponentArgument
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
@@ -117,7 +117,7 @@ def native_full(args: TreeComponentArgument):
 
 
 register_python_tree_component("custom_full", python_full)
-register_rust_tree_component("custom_full", native_full)
+register_tree_component("custom_full", native_full)
 ```
 
 Register the Python counterpart first: a full cache always needs Python cache orchestration hooks, including with a Rust tree core. A Python-only name selects Python before the native extension is loaded. Direct `RustUnifiedTreeCore` construction does not require Python cache hooks.

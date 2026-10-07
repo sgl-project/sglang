@@ -19,12 +19,19 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.rust_tree_core.component_registry import (
+    supports_tree_component,
+)
 from sglang.srt.mem_cache.unified_cache.component_factory import (
     resolve_component_factory_keys,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
     PythonTreeComponentArgument,
+)
+from sglang.srt.mem_cache.unified_cache.components.registry import (
+    create_python_tree_component,
+    get_python_tree_component,
 )
 
 if TYPE_CHECKING:
@@ -62,12 +69,8 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
         for selector in (params.component_registry_override or {}).values()
     ):
         return "custom components require the Python TreeCore"
-    from sglang.srt.mem_cache.rust_tree_core.component_registry import (
-        supports_rust_tree_component,
-    )
-
     for key in resolve_component_factory_keys(params).values():
-        if not isinstance(key, str) or not supports_rust_tree_component(key):
+        if not isinstance(key, str) or not supports_tree_component(key):
             return "custom components require the Python TreeCore"
     if sys.platform != "linux":
         return "the Rust TreeCore supports Linux only"
@@ -167,15 +170,10 @@ def registered_tree_core_backends() -> list[str]:
     return list(_TREE_CORE_REGISTRY.keys())
 
 
-def create_tree_components(
+def create_python_tree_components(
     cache: UnifiedRadixCache, params: CacheInitParams
 ) -> dict[ComponentType, TreeComponent]:
     """Resolve component names to the Python implementations of cache hooks."""
-    from sglang.srt.mem_cache.unified_cache.components.registry import (
-        create_python_tree_component,
-        get_python_tree_component,
-    )
-
     factories = {}
     for component_type, key in resolve_component_factory_keys(params).items():
         factory = get_python_tree_component(key) if isinstance(key, str) else key

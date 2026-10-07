@@ -142,8 +142,8 @@ def test_match_on_the_empty_tree_returns_no_indices():
 def component_factories(monkeypatch):
     for module, attribute in (
         (python_components, "_PYTHON_TREE_COMPONENT_REGISTRY"),
-        (rust_components, "_RUST_TREE_COMPONENT_REGISTRY"),
-        (rust_components, "_RUST_PYTHON_COMPONENT_FACTORIES"),
+        (rust_components, "_TREE_COMPONENT_REGISTRY"),
+        (rust_components, "_PAIRED_PYTHON_COMPONENT_FACTORIES"),
     ):
         monkeypatch.setattr(module, attribute, dict(getattr(module, attribute)))
     return python_components, rust_components
@@ -192,7 +192,7 @@ def test_native_callable_constructs_components_for_each_cache(
         return handle
 
     python_components.register_python_tree_component("test_native_full", FullComponent)
-    rust_components.register_rust_tree_component("test_native_full", factory)
+    rust_components.register_tree_component("test_native_full", factory)
     caches = [
         UnifiedRadixCache(
             CacheInitParams(
@@ -250,7 +250,7 @@ def test_direct_native_core_factory_does_not_require_python_registration(
             args.native_init_params, args.is_bigram
         )
 
-    rust_components.register_rust_tree_component("test_native_only", factory)
+    rust_components.register_tree_component("test_native_only", factory)
     assert python_components.get_python_tree_component("test_native_only") is None
     core = _tree_core(
         component_registry_override={ComponentType.FULL: "test_native_only"}
@@ -283,7 +283,7 @@ def test_native_factory_rejects_incompatible_results(
             not args.is_bigram if invalid == "mode" else args.is_bigram,
         )
 
-    rust_components.register_rust_tree_component("test_invalid", factory)
+    rust_components.register_tree_component("test_invalid", factory)
     error = TypeError if invalid == "object" else ValueError
     with pytest.raises(error):
         _tree_core(

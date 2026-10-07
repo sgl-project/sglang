@@ -30,8 +30,8 @@ from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTr
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.component_registry import (
     TreeComponentArgument,
-    create_rust_tree_component,
-    resolve_rust_component_factories,
+    create_tree_component,
+    resolve_component_factories,
 )
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -344,7 +344,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 sorted(component.name for component in unsupported_components)
             )
             raise ValueError(f"Rust TreeCore does not support components: {names}")
-        component_factories = resolve_rust_component_factories(params)
+        component_factories = resolve_component_factories(params)
         # Validate the same constructor options as Python before passing the
         # configured eviction parameters to the native strategy.
         eviction_strategy = get_eviction_strategy(
@@ -430,7 +430,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         binding_class = self._binding_class()
         component_types = [int(component) for component in self.tree_components]
         components = [
-            create_rust_tree_component(
+            create_tree_component(
                 factory,
                 TreeComponentArgument(
                     component_type,
