@@ -82,15 +82,28 @@ _SM120_FP8_EINSUM_MIN_SGL_DEEP_GEMM = "0.1.5"
 
 
 def _sm120_fp8_einsum_build_verified() -> bool:
-    from importlib.metadata import PackageNotFoundError, version
+    """Whether the importable ``deep_gemm`` is a verified sgl-deep-gemm release."""
+    import importlib.util
+    from importlib.metadata import PackageNotFoundError, distribution
+    from pathlib import Path
 
     from packaging.version import InvalidVersion, Version
 
     try:
-        installed = Version(version("sgl-deep-gemm"))
-    except (PackageNotFoundError, InvalidVersion):
+        dist = distribution("sgl-deep-gemm")
+        installed = Version(dist.version)
+        spec = importlib.util.find_spec("deep_gemm")
+    except (PackageNotFoundError, InvalidVersion, ImportError, ValueError):
         return False
-    return installed >= Version(_SM120_FP8_EINSUM_MIN_SGL_DEEP_GEMM)
+    if installed < Version(_SM120_FP8_EINSUM_MIN_SGL_DEEP_GEMM):
+        return False
+    # Another DeepGEMM build earlier on sys.path can shadow the release.
+    if spec is None or spec.origin is None:
+        return False
+    package_init = Path("deep_gemm", "__init__.py")
+    if not any(Path(file) == package_init for file in dist.files or ()):
+        return False
+    return Path(dist.locate_file(package_init)).resolve() == Path(spec.origin).resolve()
 
 
 def _apply_sm120_fp8_wo_a_gemm_default() -> None:

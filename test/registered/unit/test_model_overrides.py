@@ -2237,20 +2237,45 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         _run(capable=True, verified=True, explicit=False).assert_not_called()
 
     def test_sm120_fp8_einsum_build_verification(self):
-        """Only sgl-deep-gemm releases with SM120 fp8_einsum are verified."""
+        """Only an imported sgl-deep-gemm release with SM120 fp8_einsum counts."""
+        import importlib.util
+        import pathlib
         from importlib.metadata import PackageNotFoundError
+        from types import SimpleNamespace
 
         from sglang.srt.arg_groups import model_hook
 
-        def _verified(installed):
-            def _version(name):
-                self.assertEqual(name, "sgl-deep-gemm")
-                if installed is None:
-                    raise PackageNotFoundError(name)
-                return installed
+        def _verified(installed, *, shadowed=False):
+            with tempfile.TemporaryDirectory() as root:
+                site = pathlib.Path(root, "site-packages")
+                checkout = pathlib.Path(root, "DeepGEMM")
+                for base in (site, checkout):
+                    (base / "deep_gemm").mkdir(parents=True)
+                    (base / "deep_gemm" / "__init__.py").touch()
+                dist = SimpleNamespace(
+                    version=installed,
+                    files=[pathlib.PurePosixPath("deep_gemm/__init__.py")],
+                    locate_file=lambda path: site / path,
+                )
+                imported = (checkout if shadowed else site) / "deep_gemm"
 
-            with patch("importlib.metadata.version", _version):
-                return model_hook._sm120_fp8_einsum_build_verified()
+                def _distribution(name):
+                    self.assertEqual(name, "sgl-deep-gemm")
+                    if installed is None:
+                        raise PackageNotFoundError(name)
+                    return dist
+
+                with (
+                    patch("importlib.metadata.distribution", _distribution),
+                    patch.object(
+                        importlib.util,
+                        "find_spec",
+                        return_value=SimpleNamespace(
+                            origin=str(imported / "__init__.py")
+                        ),
+                    ),
+                ):
+                    return model_hook._sm120_fp8_einsum_build_verified()
 
         # Other DeepGEMM builds export the same APIs without SM120 fp8_einsum.
         self.assertFalse(_verified(None))
@@ -2258,6 +2283,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertFalse(_verified("unknown"))
         self.assertTrue(_verified("0.1.5"))
         self.assertTrue(_verified("0.2.1.post1"))
+        # A verified wheel does not vouch for a different imported checkout.
+        self.assertFalse(_verified("0.2.1.post1", shadowed=True))
 
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
