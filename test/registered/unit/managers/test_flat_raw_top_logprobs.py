@@ -383,6 +383,24 @@ class TestFlatOutputTopLogprobs(CustomTestCase):
         # The prompt side keeps its own format.
         self.assertIn("input_top_logprobs", meta_info)
 
+    def test_plain_json_flattens_the_original_rows(self):
+        """Plain JSON must not round-trip the candidates through NumPy arrays."""
+        val_rows = [None, [-0.5, -2.5], [-0.25, -1.5]]
+        state = _make_state(
+            return_logprob=True,
+            top_logprobs_num=2,
+            return_flat_raw_output_top_logprobs=True,
+        )
+        state.output_top_logprobs_val.extend(val_rows)
+        state.output_top_logprobs_idx.extend([None, [11, 22], [33, 44]])
+
+        meta_info = self._meta_info(state, finished=True)
+
+        self.assertEqual(meta_info["output_top_logprobs_shape"], [2, 2])
+        self.assertEqual(meta_info["output_top_logprobs_null_prefix"], 1)
+        self.assertEqual(meta_info["output_top_logprobs_idx_flat"], [11, 22, 33, 44])
+        self.assertIs(meta_info["output_top_logprobs_val_flat"][0], val_rows[1][0])
+
     def test_b64_roundtrip_keeps_non_finite_logprobs(self):
         val_rows = [[-0.5, float("-inf")], [-0.25, -1.5], [-0.125, -4.0]]
         state = self._state(val_rows, return_flat_raw_top_logprobs_b64=True)

@@ -100,6 +100,7 @@ from sglang.srt.managers.io_struct import (
     async_sock_recv,
     async_sock_send,
     build_flat_input_top_logprobs_arrays,
+    flat_top_logprobs_layout,
     sock_send,
     unwrap_from_pickle,
 )
@@ -420,15 +421,28 @@ def _build_flat_output_top_logprobs_fields(
     """Build the flat raw output top logprob response fields.
 
     Same layout as the prompt fields (see `_build_flat_input_top_logprobs_fields`),
-    under `output_top_logprobs_*` keys.
+    under `output_top_logprobs_*` keys. Only base64 packs arrays; plain JSON
+    flattens the original rows.
     """
-    val_arr, idx_arr, null_prefix = build_flat_input_top_logprobs_arrays(
-        output_top_logprobs_val, output_top_logprobs_idx, top_logprobs_num
-    )
-    fields = _build_flat_input_top_logprobs_fields_from_arrays(
-        val_arr, idx_arr, null_prefix, return_b64=return_b64
-    )
-    return {"output" + key[len("input") :]: value for key, value in fields.items()}
+    if return_b64:
+        val_arr, idx_arr, null_prefix = build_flat_input_top_logprobs_arrays(
+            output_top_logprobs_val, output_top_logprobs_idx, top_logprobs_num
+        )
+        fields = _build_flat_input_top_logprobs_fields_from_arrays(
+            val_arr, idx_arr, null_prefix, return_b64=True
+        )
+        return {"output" + key[len("input") :]: value for key, value in fields.items()}
+    null_prefix, k = flat_top_logprobs_layout(output_top_logprobs_val, top_logprobs_num)
+    return {
+        "output_top_logprobs_val_flat": [
+            v for row in output_top_logprobs_val[null_prefix:] for v in row
+        ],
+        "output_top_logprobs_idx_flat": [
+            i for row in output_top_logprobs_idx[null_prefix:] for i in row
+        ],
+        "output_top_logprobs_shape": [len(output_top_logprobs_val) - null_prefix, k],
+        "output_top_logprobs_null_prefix": null_prefix,
+    }
 
 
 class InputFormat(Enum):
