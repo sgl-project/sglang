@@ -10,6 +10,7 @@ mod frame;
 mod log;
 mod native_api;
 mod openai;
+mod transport;
 
 use axum::http::StatusCode;
 

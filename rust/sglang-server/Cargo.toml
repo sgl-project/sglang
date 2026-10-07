@@ -51,6 +51,7 @@ dynamo-renderer = "5.1.2"
 minijinja = "2.24"
 flume = "0.12.0"
 hf-hub = { version = "0.4", default-features = false }
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 itertools = "0.14"
 # POSIX shm (`shm_open` family) for the MM feature fan-out (`utils::shm`).
 rustix = { version = "1", features = ["fs", "mm", "shm"] }
@@ -72,5 +73,6 @@ tonic = { workspace = true }
 tokio-stream = { workspace = true }
 
 [dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["http2"] }
 # `Router::oneshot` for handler-level router tests.
 tower = { version = "0.5", features = ["util"] }

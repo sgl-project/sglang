@@ -298,6 +298,9 @@ pub(crate) struct ServerInfo {
     pub(crate) max_context_length: u64,
     pub(crate) max_total_num_tokens: u64,
     pub(crate) version: String,
+    pub(crate) enable_http2: bool,
+    pub(crate) http2_max_concurrent_streams: u32,
+    pub(crate) http2_initial_connection_window_size: u32,
     pub(crate) frontend: &'static str,
     pub(crate) internal_states: Vec<InternalState>,
 }

@@ -32,6 +32,21 @@ logger = logging.getLogger(__name__)
 def handle_ssl_validation(server_args: Any):
     """Ensure SSL arguments are consistent and referenced files exist."""
     cfg = resolving_view(server_args)
+    if envs.SGLANG_RUST_SERVER.get():
+        # The Rust listener has no TLS; refuse rather than serve cleartext.
+        for flag, value in (
+            ("--ssl-keyfile", cfg.ssl_keyfile),
+            ("--ssl-certfile", cfg.ssl_certfile),
+            ("--ssl-ca-certs", cfg.ssl_ca_certs),
+            ("--ssl-keyfile-password", cfg.ssl_keyfile_password),
+            ("--enable-ssl-refresh", cfg.enable_ssl_refresh),
+        ):
+            if value:
+                raise ValueError(
+                    f"{flag} is not supported by the Rust frontend "
+                    "(SGLANG_RUST_SERVER=1); terminate TLS in front of the "
+                    "server or unset SGLANG_RUST_SERVER."
+                )
     if cfg.ssl_keyfile and not cfg.ssl_certfile:
         raise ValueError(
             "--ssl-keyfile requires --ssl-certfile to be specified as well."
@@ -82,13 +97,14 @@ def handle_ssl_validation(server_args: Any):
                 "1024 and 2147483647."
             )
 
-        try:
-            import granian  # noqa: F401
-        except ImportError:
-            raise ValueError(
-                "--enable-http2 requires the 'granian' package. "
-                'Install it with: pip install "sglang[http2]"'
-            )
+        if not envs.SGLANG_RUST_SERVER.get():
+            try:
+                import granian  # noqa: F401
+            except ImportError:
+                raise ValueError(
+                    "--enable-http2 requires the 'granian' package. "
+                    'Install it with: pip install "sglang[http2]"'
+                )
 
         if cfg.enable_ssl_refresh:
             raise ValueError(
