@@ -277,6 +277,7 @@ class DeepseekMHAForwardMixin:
                         forward_batch.extend_seq_lens,
                         kv_a,
                         k_pe,
+                        extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
                     )
                 else:
                     kv_a, k_pe = self._get_mla_kv_buffer(
