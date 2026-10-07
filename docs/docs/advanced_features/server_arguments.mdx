@@ -488,7 +488,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--schedule-policy`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The scheduling policy of the requests.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`fcfs`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>lpm</code>, <code>random</code>, <code>fcfs</code>, <code>dfs-weight</code>, <code>lof</code>, <code>priority</code>, <code>routing-key</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>lpm</code>, <code>random</code>, <code>fcfs</code>, <code>dfs-weight</code>, <code>lof</code>, <code>priority</code>, <code>routing-key</code>, <code>hrrn</code>, <code>shortest-prefill-first</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-priority-scheduling`</td>
@@ -618,6 +618,29 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
 </tbody>
 </table>
+
+### Shortest-prefill-first scheduling
+
+Select `--schedule-policy shortest-prefill-first` to enable the experimental,
+cache-aware policy introduced in [#40024](https://github.com/sgl-project/sglang/pull/40024).
+It prioritizes requests by remaining uncached prefill tokens rather than total
+prompt length. Equal-work requests use queue entry time; duplicate prefixes can
+be temporarily deprioritized to preserve in-batch prefix caching.
+
+Keep prefix caching enabled: this policy does not support `--disable-radix-cache`.
+The default scheduling policy remains `fcfs`.
+
+With chunked prefill enabled, the scheduler can reduce an active request's
+continuation chunk to reserve page-aligned token budget for shorter waiting
+requests that can complete prefill in the same batch. Reservation leaves at least
+one page for continuation, and requests must still pass memory admission checks.
+While that continuation remains unfinished, a waiting request cannot become a
+second unfinished chunked request.
+
+`--chunked-prefill-size` controls the budget available for this reservation.
+A request whose entire remaining prefill cannot fit is not interleaved this way,
+but it can still be prioritized in the waiting queue. A larger chunk size does
+not guarantee lower time to first token (TTFT).
 
 ## Runtime options
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
