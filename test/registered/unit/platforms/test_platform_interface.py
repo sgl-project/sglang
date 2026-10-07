@@ -187,6 +187,17 @@ class TestSRTPlatform(CustomTestCase):
             )
         )
 
+    def test_mamba_cache_extra_buffer_capability(self):
+        self.assertFalse(SRTPlatform().support_mamba_cache_extra_buffer())
+
+        class OutOfTreePlatform(SRTPlatform):
+            _enum = PlatformEnum.OOT
+
+            def support_mamba_cache_extra_buffer(self) -> bool:
+                return True
+
+        self.assertTrue(OutOfTreePlatform().support_mamba_cache_extra_buffer())
+
 
 class TestCudaDeviceMixin(CustomTestCase):
     """Tests for CUDA device operation defaults."""

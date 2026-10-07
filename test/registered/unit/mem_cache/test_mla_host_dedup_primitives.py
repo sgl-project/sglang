@@ -84,7 +84,7 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             index_head_dim=8,
             quant_block_size=4,
             page_size=2,
-            slots_per_page=2,
+            index_page_size=2,
             skip_topk_layers=[False] * 2,
         )
         indexer_host = DSAIndexerPoolHost(
