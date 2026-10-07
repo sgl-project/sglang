@@ -143,6 +143,7 @@ class TestReceiverConnectionPool(CustomTestCase):
         receiver = _receiver({}, {})
         receiver.bootstrap_room = 1
         receiver.init_time = None
+        receiver.prealloc_start_time = None
         receiver.abort_notified = True
         receiver.kv_mgr.waiting_timeout = 5.0
         receiver.kv_mgr.record_failure = Mock()
@@ -150,10 +151,11 @@ class TestReceiverConnectionPool(CustomTestCase):
 
         clock.return_value = 100.0
         self.assertIsNone(receiver._check_waiting_timeout())
-        self.assertEqual(receiver.init_time, 100.0)
+        self.assertEqual(receiver.prealloc_start_time, 100.0)
         clock.return_value = 104.0
         self.assertIsNone(receiver._check_waiting_timeout())
-        self.assertEqual(receiver.init_time, 100.0)
+        self.assertEqual(receiver.prealloc_start_time, 100.0)
+        self.assertIsNone(receiver.init_time)
         clock.return_value = 105.0
         self.assertEqual(receiver._check_waiting_timeout(), KVPoll.Failed)
         receiver.kv_mgr.update_status.assert_called_once_with(1, KVPoll.Failed)
@@ -162,6 +164,7 @@ class TestReceiverConnectionPool(CustomTestCase):
     def test_metadata_phase_uses_its_new_deadline(self, clock):
         receiver = _receiver({}, {})
         receiver.init_time = 104.0
+        receiver.prealloc_start_time = 90.0
         receiver.kv_mgr.waiting_timeout = 5.0
         self.assertIsNone(receiver._check_waiting_timeout())
         self.assertEqual(receiver.init_time, 104.0)

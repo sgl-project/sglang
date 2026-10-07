@@ -41,6 +41,7 @@ def _check_two_rank_timeout(rank, rendezvous):
         receiver.bootstrap_room = 1
         receiver.started_transfer = False
         receiver.init_time = None
+        receiver.prealloc_start_time = None
         receiver.conclude_state = None
         receiver.abort_notified = True
         receiver._connection_pool_entries = {}

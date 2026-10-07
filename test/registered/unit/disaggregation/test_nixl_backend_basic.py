@@ -954,6 +954,7 @@ class TestNixlReceiverPoll(CustomTestCase):
         receiver.bootstrap_addr = "prefill:8998"
         receiver.started_transfer = False
         receiver.init_time = None
+        receiver.prealloc_start_time = None
         receiver.conclude_state = None
         receiver.abort_notified = False
         receiver._connection_pool_entries = {}
@@ -978,7 +979,8 @@ class TestNixlReceiverPoll(CustomTestCase):
         receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
         clock.return_value = 10.0
         self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
-        self.assertEqual(receiver.init_time, 10.0)
+        self.assertEqual(receiver.prealloc_start_time, 10.0)
+        self.assertIsNone(receiver.init_time)
         clock.return_value = 15.0
         self.assertEqual(receiver.poll(), KVPoll.Failed)
         self.assertFalse(receiver.started_transfer)
