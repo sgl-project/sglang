@@ -16,65 +16,40 @@
         "status": 200,
         "body": {
           "text": " Paris. The capital of Spain is Madrid. The capital of Italy is Rome.\\",
-          "output_ids": [11111, 16, 455, 6102, 294, 16603, 344, 29168, 16, 455, 6102, 294, 14251, 344, 16235, 10276],
+          "output_ids": [
+            11111,
+            16,
+            455,
+            6102,
+            294,
+            16603,
+            344,
+            29168,
+            16,
+            455,
+            6102,
+            294,
+            14251,
+            344,
+            16235,
+            10276
+          ],
           "meta_info": {
             "id": "171d64668b8f40ebb6c30242cb4b2038",
-            "finish_reason": {
-              "type": "length",
-              "length": 16
-            },
+            "finish_reason": {"type": "length", "length": 16},
             "prompt_tokens": 5,
             "weight_version": "default",
-            "num_retractions": 0,
             "reasoning_tokens": 0,
             "completion_tokens": 16,
             "cached_tokens": 0,
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 16
-              }
-            ],
-            "cached_tokens_details": null,
-            "dp_rank": null,
-            "e2e_latency": 0.1186871281825006,
-            "spec_accept_rate": 0.4,
-            "spec_accept_length": 3.2,
-            "spec_num_correct_drafts": 10,
-            "spec_num_proposed_drafts": 25,
-            "spec_verify_ct": 5,
-            "spec_correct_drafts_histogram": [1, 0, 3, 0, 1],
-            "response_sent_to_client_ts": 1791354946.103837
+            "weight_versions": [{"version": "default", "start": 0, "end": 16}],
+            "cached_tokens_details": null
           }
         }
       },
       "generate": {
         "text": "The capital of France is",
-        "sampling_params": {
-          "temperature": 0.0,
-          "max_new_tokens": 16,
-          "min_new_tokens": 0,
-          "stop": null,
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 1,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "sampling_params": {"temperature": 0.0},
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -85,7 +60,7 @@
         "body": {
           "id": "171d64668b8f40ebb6c30242cb4b2038",
           "object": "text_completion",
-          "created": 1791354946,
+          "created": 1791414128,
           "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
           "choices": [
             {
@@ -105,13 +80,7 @@
           },
           "metadata": {
             "weight_version": "default",
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 16
-              }
-            ]
+            "weight_versions": [{"version": "default", "start": 0, "end": 16}]
           }
         }
       }
@@ -137,13 +106,10 @@
               "finish_reason": null,
               "prompt_tokens": 5,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 1,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "response_sent_to_client_ts": 1791354946.187366
+              "cached_tokens_details": null
             }
           },
           {
@@ -154,12 +120,10 @@
               "finish_reason": null,
               "prompt_tokens": 5,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 2,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             }
           },
           {
@@ -170,12 +134,10 @@
               "finish_reason": null,
               "prompt_tokens": 5,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 5,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             }
           },
           {
@@ -186,12 +148,10 @@
               "finish_reason": null,
               "prompt_tokens": 5,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 6,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             }
           },
           {
@@ -202,12 +162,10 @@
               "finish_reason": null,
               "prompt_tokens": 5,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 9,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             }
           },
           {
@@ -218,75 +176,49 @@
               "finish_reason": null,
               "prompt_tokens": 5,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 13,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             }
           },
           {
             "text": " Paris. The capital of Italy is Rome. The capital of Spain is Madrid.",
-            "output_ids": [11111, 16, 455, 6102, 294, 14251, 344, 16235, 16, 455, 6102, 294, 16603, 344, 29168, 16],
+            "output_ids": [
+              11111,
+              16,
+              455,
+              6102,
+              294,
+              14251,
+              344,
+              16235,
+              16,
+              455,
+              6102,
+              294,
+              16603,
+              344,
+              29168,
+              16
+            ],
             "meta_info": {
               "id": "d8c41a43c1e7416d9a921e6978a04bd9",
-              "finish_reason": {
-                "type": "length",
-                "length": 16
-              },
+              "finish_reason": {"type": "length", "length": 16},
               "prompt_tokens": 5,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 16,
               "cached_tokens": 0,
-              "weight_versions": [
-                {
-                  "version": "default",
-                  "start": 0,
-                  "end": 16
-                }
-              ],
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "e2e_latency": 0.11553453328087926,
-              "spec_accept_rate": 0.3,
-              "spec_accept_length": 2.6666666666666665,
-              "spec_num_correct_drafts": 9,
-              "spec_num_proposed_drafts": 30,
-              "spec_verify_ct": 6,
-              "spec_correct_drafts_histogram": [2, 0, 3, 1]
+              "weight_versions": [{"version": "default", "start": 0, "end": 16}],
+              "cached_tokens_details": null
             }
           }
         ]
       },
       "generate": {
         "text": "The capital of France is",
-        "sampling_params": {
-          "temperature": 0.0,
-          "max_new_tokens": 16,
-          "min_new_tokens": 0,
-          "stop": null,
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 1,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "sampling_params": {"temperature": 0.0},
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -295,13 +227,13 @@
       },
       "openai": {
         "events": [
-          "data: {\"id\":\"d8c41a43c1e7416d9a921e6978a04bd9\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" Paris\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"d8c41a43c1e7416d9a921e6978a04bd9\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\".\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"d8c41a43c1e7416d9a921e6978a04bd9\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" The capital of\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"d8c41a43c1e7416d9a921e6978a04bd9\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" Italy\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"d8c41a43c1e7416d9a921e6978a04bd9\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" is Rome.\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"d8c41a43c1e7416d9a921e6978a04bd9\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" The capital of Spain\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"d8c41a43c1e7416d9a921e6978a04bd9\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" is Madrid.\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"d8c41a43c1e7416d9a921e6978a04bd9\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" Paris\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"d8c41a43c1e7416d9a921e6978a04bd9\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\".\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"d8c41a43c1e7416d9a921e6978a04bd9\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" The capital of\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"d8c41a43c1e7416d9a921e6978a04bd9\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" Italy\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"d8c41a43c1e7416d9a921e6978a04bd9\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" is Rome.\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"d8c41a43c1e7416d9a921e6978a04bd9\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" The capital of Spain\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"d8c41a43c1e7416d9a921e6978a04bd9\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" is Madrid.\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
           "data: [DONE]\n\n"
         ]
       }
@@ -315,9 +247,7 @@
         "max_tokens": 12,
         "temperature": 0,
         "stream": true,
-        "stream_options": {
-          "include_usage": true
-        }
+        "stream_options": {"include_usage": true}
       },
       "engine": {
         "status": 200,
@@ -330,13 +260,10 @@
               "finish_reason": null,
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 1,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "response_sent_to_client_ts": 1791354946.3077078
+              "cached_tokens_details": null
             }
           },
           {
@@ -347,12 +274,10 @@
               "finish_reason": null,
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 3,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             }
           },
           {
@@ -363,12 +288,10 @@
               "finish_reason": null,
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 9,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             }
           },
           {
@@ -376,62 +299,21 @@
             "output_ids": [223, 19, 14, 223, 20, 14, 223, 21, 14, 223, 22, 14],
             "meta_info": {
               "id": "92997359d66b4beb91c1080d92a2e463",
-              "finish_reason": {
-                "type": "length",
-                "length": 12
-              },
+              "finish_reason": {"type": "length", "length": 12},
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 12,
               "cached_tokens": 0,
-              "weight_versions": [
-                {
-                  "version": "default",
-                  "start": 0,
-                  "end": 12
-                }
-              ],
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "e2e_latency": 0.09861546428874135,
-              "spec_accept_rate": 0.7333333333333333,
-              "spec_accept_length": 4.0,
-              "spec_num_correct_drafts": 11,
-              "spec_num_proposed_drafts": 15,
-              "spec_verify_ct": 3,
-              "spec_correct_drafts_histogram": [0, 1, 0, 0, 0, 2]
+              "weight_versions": [{"version": "default", "start": 0, "end": 12}],
+              "cached_tokens_details": null
             }
           }
         ]
       },
       "generate": {
         "text": "Count to five:",
-        "sampling_params": {
-          "temperature": 0.0,
-          "max_new_tokens": 12,
-          "min_new_tokens": 0,
-          "stop": null,
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 1,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 12},
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -440,11 +322,11 @@
       },
       "openai": {
         "events": [
-          "data: {\"id\":\"92997359d66b4beb91c1080d92a2e463\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" \",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"92997359d66b4beb91c1080d92a2e463\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"1,\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"92997359d66b4beb91c1080d92a2e463\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" 2, 3,\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"92997359d66b4beb91c1080d92a2e463\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" 4,\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"92997359d66b4beb91c1080d92a2e463\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"total_tokens\":16,\"completion_tokens\":12,\"reasoning_tokens\":0}}\n\n",
+          "data: {\"id\":\"92997359d66b4beb91c1080d92a2e463\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" \",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"92997359d66b4beb91c1080d92a2e463\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"1,\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"92997359d66b4beb91c1080d92a2e463\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" 2, 3,\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"92997359d66b4beb91c1080d92a2e463\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" 4,\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"92997359d66b4beb91c1080d92a2e463\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"total_tokens\":16,\"completion_tokens\":12,\"reasoning_tokens\":0}}\n\n",
           "data: [DONE]\n\n"
         ]
       }
@@ -458,10 +340,7 @@
         "max_tokens": 6,
         "temperature": 0,
         "stream": true,
-        "stream_options": {
-          "include_usage": true,
-          "continuous_usage_stats": true
-        }
+        "stream_options": {"include_usage": true, "continuous_usage_stats": true}
       },
       "engine": {
         "status": 200,
@@ -474,13 +353,10 @@
               "finish_reason": null,
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 1,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "response_sent_to_client_ts": 1791354946.4073699
+              "cached_tokens_details": null
             }
           },
           {
@@ -491,12 +367,10 @@
               "finish_reason": null,
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 3,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             }
           },
           {
@@ -504,62 +378,21 @@
             "output_ids": [223, 19, 14, 223, 20, 14],
             "meta_info": {
               "id": "3d44dde390a446aab3968ad1a6f74790",
-              "finish_reason": {
-                "type": "length",
-                "length": 6
-              },
+              "finish_reason": {"type": "length", "length": 6},
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 6,
               "cached_tokens": 0,
-              "weight_versions": [
-                {
-                  "version": "default",
-                  "start": 0,
-                  "end": 6
-                }
-              ],
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "e2e_latency": 0.09078551968559623,
-              "spec_accept_rate": 0.6,
-              "spec_accept_length": 3.0,
-              "spec_num_correct_drafts": 6,
-              "spec_num_proposed_drafts": 10,
-              "spec_verify_ct": 2,
-              "spec_correct_drafts_histogram": [0, 1, 0, 0, 0, 1]
+              "weight_versions": [{"version": "default", "start": 0, "end": 6}],
+              "cached_tokens_details": null
             }
           }
         ]
       },
       "generate": {
         "text": "Count to five:",
-        "sampling_params": {
-          "temperature": 0.0,
-          "max_new_tokens": 6,
-          "min_new_tokens": 0,
-          "stop": null,
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 1,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 6},
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -568,10 +401,10 @@
       },
       "openai": {
         "events": [
-          "data: {\"id\":\"3d44dde390a446aab3968ad1a6f74790\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" \",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":{\"prompt_tokens\":4,\"total_tokens\":5,\"completion_tokens\":1,\"prompt_tokens_details\":null,\"reasoning_tokens\":0}}\n\n",
-          "data: {\"id\":\"3d44dde390a446aab3968ad1a6f74790\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"1,\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":{\"prompt_tokens\":4,\"total_tokens\":7,\"completion_tokens\":3,\"prompt_tokens_details\":null,\"reasoning_tokens\":0}}\n\n",
-          "data: {\"id\":\"3d44dde390a446aab3968ad1a6f74790\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" 2,\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":{\"prompt_tokens\":4,\"total_tokens\":10,\"completion_tokens\":6,\"prompt_tokens_details\":null,\"reasoning_tokens\":0}}\n\n",
-          "data: {\"id\":\"3d44dde390a446aab3968ad1a6f74790\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"total_tokens\":10,\"completion_tokens\":6,\"reasoning_tokens\":0}}\n\n",
+          "data: {\"id\":\"3d44dde390a446aab3968ad1a6f74790\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" \",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":{\"prompt_tokens\":4,\"total_tokens\":5,\"completion_tokens\":1,\"prompt_tokens_details\":null,\"reasoning_tokens\":0}}\n\n",
+          "data: {\"id\":\"3d44dde390a446aab3968ad1a6f74790\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"1,\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":{\"prompt_tokens\":4,\"total_tokens\":7,\"completion_tokens\":3,\"prompt_tokens_details\":null,\"reasoning_tokens\":0}}\n\n",
+          "data: {\"id\":\"3d44dde390a446aab3968ad1a6f74790\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" 2,\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":{\"prompt_tokens\":4,\"total_tokens\":10,\"completion_tokens\":6,\"prompt_tokens_details\":null,\"reasoning_tokens\":0}}\n\n",
+          "data: {\"id\":\"3d44dde390a446aab3968ad1a6f74790\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"total_tokens\":10,\"completion_tokens\":6,\"reasoning_tokens\":0}}\n\n",
           "data: [DONE]\n\n"
         ]
       }
@@ -593,62 +426,20 @@
           "output_ids": [11111, 16, 983, 344, 7840, 295, 270, 10463],
           "meta_info": {
             "id": "44dce9f8e5d34952a54b6169e4661e5b",
-            "finish_reason": {
-              "type": "length",
-              "length": 8
-            },
+            "finish_reason": {"type": "length", "length": 8},
             "prompt_tokens": 6,
             "weight_version": "default",
-            "num_retractions": 0,
             "reasoning_tokens": 0,
             "completion_tokens": 8,
             "cached_tokens": 0,
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 8
-              }
-            ],
-            "cached_tokens_details": null,
-            "dp_rank": null,
-            "e2e_latency": 0.0916476221755147,
-            "spec_accept_rate": 0.6,
-            "spec_accept_length": 4.0,
-            "spec_num_correct_drafts": 6,
-            "spec_num_proposed_drafts": 10,
-            "spec_verify_ct": 2,
-            "spec_correct_drafts_histogram": [0, 0, 0, 2],
-            "response_sent_to_client_ts": 1791354946.5127914
+            "weight_versions": [{"version": "default", "start": 0, "end": 8}],
+            "cached_tokens_details": null
           }
         }
       },
       "generate": {
         "input_ids": [0, 671, 6102, 294, 8760, 344],
-        "sampling_params": {
-          "temperature": 0.0,
-          "max_new_tokens": 8,
-          "min_new_tokens": 0,
-          "stop": null,
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 1,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 8},
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -659,7 +450,7 @@
         "body": {
           "id": "44dce9f8e5d34952a54b6169e4661e5b",
           "object": "text_completion",
-          "created": 1791354946,
+          "created": 1791414128,
           "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
           "choices": [
             {
@@ -679,13 +470,7 @@
           },
           "metadata": {
             "weight_version": "default",
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 8
-              }
-            ]
+            "weight_versions": [{"version": "default", "start": 0, "end": 8}]
           }
         }
       }
@@ -695,10 +480,7 @@
       "endpoint": "completions",
       "request": {
         "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
-        "prompt": [
-          [0, 671, 6102],
-          [0, 8760, 344]
-        ],
+        "prompt": [[0, 671, 6102], [0, 8760, 344]],
         "max_tokens": 4,
         "temperature": 0,
         "echo": true,
@@ -715,13 +497,10 @@
               "finish_reason": null,
               "prompt_tokens": 3,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 1,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "response_sent_to_client_ts": 1791354946.5961585
+              "cached_tokens_details": null
             },
             "index": 1
           },
@@ -733,13 +512,10 @@
               "finish_reason": null,
               "prompt_tokens": 3,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 1,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "response_sent_to_client_ts": 1791354946.5961545
+              "cached_tokens_details": null
             },
             "index": 0
           },
@@ -751,12 +527,10 @@
               "finish_reason": null,
               "prompt_tokens": 3,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 3,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             },
             "index": 0
           },
@@ -768,12 +542,10 @@
               "finish_reason": null,
               "prompt_tokens": 3,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 3,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             },
             "index": 1
           },
@@ -782,32 +554,14 @@
             "output_ids": [260, 3924, 396, 4086],
             "meta_info": {
               "id": "b3738c5f6c55443c9f8f04d911a4db9c",
-              "finish_reason": {
-                "type": "length",
-                "length": 4
-              },
+              "finish_reason": {"type": "length", "length": 4},
               "prompt_tokens": 3,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 4,
               "cached_tokens": 0,
-              "weight_versions": [
-                {
-                  "version": "default",
-                  "start": 0,
-                  "end": 4
-                }
-              ],
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "e2e_latency": 0.09240478603169322,
-              "spec_accept_rate": 0.1,
-              "spec_accept_length": 2.0,
-              "spec_num_correct_drafts": 1,
-              "spec_num_proposed_drafts": 10,
-              "spec_verify_ct": 2,
-              "spec_correct_drafts_histogram": [1, 1]
+              "weight_versions": [{"version": "default", "start": 0, "end": 4}],
+              "cached_tokens_details": null
             },
             "index": 1
           },
@@ -816,66 +570,22 @@
             "output_ids": [294, 270, 9375, 294],
             "meta_info": {
               "id": "538f052504d64100a4b9ef1cd4818623",
-              "finish_reason": {
-                "type": "length",
-                "length": 4
-              },
+              "finish_reason": {"type": "length", "length": 4},
               "prompt_tokens": 3,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 4,
               "cached_tokens": 0,
-              "weight_versions": [
-                {
-                  "version": "default",
-                  "start": 0,
-                  "end": 4
-                }
-              ],
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "e2e_latency": 0.09239747514948249,
-              "spec_accept_rate": 0.2,
-              "spec_accept_length": 2.0,
-              "spec_num_correct_drafts": 2,
-              "spec_num_proposed_drafts": 10,
-              "spec_verify_ct": 2,
-              "spec_correct_drafts_histogram": [0, 2]
+              "weight_versions": [{"version": "default", "start": 0, "end": 4}],
+              "cached_tokens_details": null
             },
             "index": 0
           }
         ]
       },
       "generate": {
-        "input_ids": [
-          [0, 671, 6102],
-          [0, 8760, 344]
-        ],
-        "sampling_params": {
-          "temperature": 0.0,
-          "max_new_tokens": 4,
-          "min_new_tokens": 0,
-          "stop": null,
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 1,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "input_ids": [[0, 671, 6102], [0, 8760, 344]],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 4},
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -884,12 +594,12 @@
       },
       "openai": {
         "events": [
-          "data: {\"id\":\"b3738c5f6c55443c9f8f04d911a4db9c\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":1,\"text\":\" France is a\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"538f052504d64100a4b9ef1cd4818623\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"The capital of\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"538f052504d64100a4b9ef1cd4818623\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" the Republic\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"b3738c5f6c55443c9f8f04d911a4db9c\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":1,\"text\":\" country that\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"b3738c5f6c55443c9f8f04d911a4db9c\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":1,\"text\":\" needs\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"538f052504d64100a4b9ef1cd4818623\",\"object\":\"text_completion\",\"created\":1791354946,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" of\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"b3738c5f6c55443c9f8f04d911a4db9c\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":1,\"text\":\" France is a\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"538f052504d64100a4b9ef1cd4818623\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"The capital of\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"538f052504d64100a4b9ef1cd4818623\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" the Republic\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"b3738c5f6c55443c9f8f04d911a4db9c\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":1,\"text\":\" country that\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"b3738c5f6c55443c9f8f04d911a4db9c\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":1,\"text\":\" needs\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"538f052504d64100a4b9ef1cd4818623\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" of\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
           "data: [DONE]\n\n"
         ]
       }
@@ -899,10 +609,7 @@
       "endpoint": "completions",
       "request": {
         "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
-        "prompt": [
-          "One plus one is",
-          "The sky is"
-        ],
+        "prompt": ["One plus one is", "The sky is"],
         "n": 2,
         "max_tokens": 6,
         "temperature": 0
@@ -915,33 +622,14 @@
             "output_ids": [1234, 3955, 361, 582, 23315, 5582],
             "meta_info": {
               "id": "920e5447a15f496a894317e0036e00fb",
-              "finish_reason": {
-                "type": "length",
-                "length": 6
-              },
+              "finish_reason": {"type": "length", "length": 6},
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 6,
               "cached_tokens": 0,
-              "weight_versions": [
-                {
-                  "version": "default",
-                  "start": 0,
-                  "end": 6
-                }
-              ],
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "e2e_latency": 0.11395414499565959,
-              "spec_accept_rate": 0.15,
-              "spec_accept_length": 1.5,
-              "spec_num_correct_drafts": 3,
-              "spec_num_proposed_drafts": 20,
-              "spec_verify_ct": 4,
-              "spec_correct_drafts_histogram": [2, 1, 1],
-              "response_sent_to_client_ts": 1791354946.9014862
+              "weight_versions": [{"version": "default", "start": 0, "end": 6}],
+              "cached_tokens_details": null
             }
           },
           {
@@ -949,33 +637,14 @@
             "output_ids": [1234, 3955, 361, 582, 23315, 5582],
             "meta_info": {
               "id": "2426e1e146104e9086fcdd781ce34d4f",
-              "finish_reason": {
-                "type": "length",
-                "length": 6
-              },
+              "finish_reason": {"type": "length", "length": 6},
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 6,
               "cached_tokens": 0,
-              "weight_versions": [
-                {
-                  "version": "default",
-                  "start": 0,
-                  "end": 6
-                }
-              ],
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "e2e_latency": 0.11390953045338392,
-              "spec_accept_rate": 0.15,
-              "spec_accept_length": 1.5,
-              "spec_num_correct_drafts": 3,
-              "spec_num_proposed_drafts": 20,
-              "spec_verify_ct": 4,
-              "spec_correct_drafts_histogram": [2, 1, 1],
-              "response_sent_to_client_ts": 1791354946.9015706
+              "weight_versions": [{"version": "default", "start": 0, "end": 6}],
+              "cached_tokens_details": null
             }
           },
           {
@@ -983,33 +652,14 @@
             "output_ids": [270, 6461, 16, 455, 12709, 344],
             "meta_info": {
               "id": "f6c22c56887f47d89a6ae88694307eff",
-              "finish_reason": {
-                "type": "length",
-                "length": 6
-              },
+              "finish_reason": {"type": "length", "length": 6},
               "prompt_tokens": 3,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 6,
               "cached_tokens": 0,
-              "weight_versions": [
-                {
-                  "version": "default",
-                  "start": 0,
-                  "end": 6
-                }
-              ],
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "e2e_latency": 0.10652603581547737,
-              "spec_accept_rate": 0.2,
-              "spec_accept_length": 2.0,
-              "spec_num_correct_drafts": 3,
-              "spec_num_proposed_drafts": 15,
-              "spec_verify_ct": 3,
-              "spec_correct_drafts_histogram": [1, 1, 1],
-              "response_sent_to_client_ts": 1791354946.8941615
+              "weight_versions": [{"version": "default", "start": 0, "end": 6}],
+              "cached_tokens_details": null
             }
           },
           {
@@ -1017,66 +667,21 @@
             "output_ids": [270, 6461, 16, 455, 12709, 344],
             "meta_info": {
               "id": "93026367584f43a4ba41411c294389ab",
-              "finish_reason": {
-                "type": "length",
-                "length": 6
-              },
+              "finish_reason": {"type": "length", "length": 6},
               "prompt_tokens": 3,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 6,
               "cached_tokens": 0,
-              "weight_versions": [
-                {
-                  "version": "default",
-                  "start": 0,
-                  "end": 6
-                }
-              ],
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "e2e_latency": 0.10649997694417834,
-              "spec_accept_rate": 0.2,
-              "spec_accept_length": 2.0,
-              "spec_num_correct_drafts": 3,
-              "spec_num_proposed_drafts": 15,
-              "spec_verify_ct": 3,
-              "spec_correct_drafts_histogram": [1, 1, 1],
-              "response_sent_to_client_ts": 1791354946.8942761
+              "weight_versions": [{"version": "default", "start": 0, "end": 6}],
+              "cached_tokens_details": null
             }
           }
         ]
       },
       "generate": {
-        "text": [
-          "One plus one is",
-          "The sky is"
-        ],
-        "sampling_params": {
-          "temperature": 0.0,
-          "max_new_tokens": 6,
-          "min_new_tokens": 0,
-          "stop": null,
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 2,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "text": ["One plus one is", "The sky is"],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 6, "n": 2},
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -1087,7 +692,7 @@
         "body": {
           "id": "920e5447a15f496a894317e0036e00fb",
           "object": "text_completion",
-          "created": 1791354946,
+          "created": 1791414128,
           "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
           "choices": [
             {
@@ -1128,13 +733,7 @@
           },
           "metadata": {
             "weight_version": "default",
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 6
-              }
-            ]
+            "weight_versions": [{"version": "default", "start": 0, "end": 6}]
           }
         }
       }
@@ -1144,17 +743,12 @@
       "endpoint": "completions",
       "request": {
         "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
-        "prompt": [
-          "One plus one is",
-          "The sky is"
-        ],
+        "prompt": ["One plus one is", "The sky is"],
         "n": 2,
         "max_tokens": 6,
         "temperature": 0,
         "stream": true,
-        "stream_options": {
-          "include_usage": true
-        }
+        "stream_options": {"include_usage": true}
       },
       "engine": {
         "status": 200,
@@ -1167,13 +761,10 @@
               "finish_reason": null,
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 1,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "response_sent_to_client_ts": 1791354947.1555333
+              "cached_tokens_details": null
             },
             "index": 1
           },
@@ -1185,13 +776,10 @@
               "finish_reason": null,
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 1,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "response_sent_to_client_ts": 1791354947.1555305
+              "cached_tokens_details": null
             },
             "index": 0
           },
@@ -1203,13 +791,10 @@
               "finish_reason": null,
               "prompt_tokens": 3,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 1,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "response_sent_to_client_ts": 1791354947.1555367
+              "cached_tokens_details": null
             },
             "index": 3
           },
@@ -1221,13 +806,10 @@
               "finish_reason": null,
               "prompt_tokens": 3,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 1,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "response_sent_to_client_ts": 1791354947.155535
+              "cached_tokens_details": null
             },
             "index": 2
           },
@@ -1239,12 +821,10 @@
               "finish_reason": null,
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 2,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             },
             "index": 1
           },
@@ -1256,12 +836,10 @@
               "finish_reason": null,
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 2,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             },
             "index": 0
           },
@@ -1273,12 +851,10 @@
               "finish_reason": null,
               "prompt_tokens": 3,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 2,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             },
             "index": 2
           },
@@ -1290,12 +866,10 @@
               "finish_reason": null,
               "prompt_tokens": 3,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 2,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             },
             "index": 3
           },
@@ -1307,12 +881,10 @@
               "finish_reason": null,
               "prompt_tokens": 3,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 4,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             },
             "index": 3
           },
@@ -1324,12 +896,10 @@
               "finish_reason": null,
               "prompt_tokens": 3,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 4,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             },
             "index": 2
           },
@@ -1341,12 +911,10 @@
               "finish_reason": null,
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 3,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             },
             "index": 0
           },
@@ -1358,12 +926,10 @@
               "finish_reason": null,
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 3,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             },
             "index": 1
           },
@@ -1372,32 +938,14 @@
             "output_ids": [270, 6461, 16, 455, 12709, 344],
             "meta_info": {
               "id": "f4a1183c6bee4735ba7ddaccc1ba0355",
-              "finish_reason": {
-                "type": "length",
-                "length": 6
-              },
+              "finish_reason": {"type": "length", "length": 6},
               "prompt_tokens": 3,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 6,
               "cached_tokens": 0,
-              "weight_versions": [
-                {
-                  "version": "default",
-                  "start": 0,
-                  "end": 6
-                }
-              ],
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "e2e_latency": 0.10951293120160699,
-              "spec_accept_rate": 0.2,
-              "spec_accept_length": 2.0,
-              "spec_num_correct_drafts": 3,
-              "spec_num_proposed_drafts": 15,
-              "spec_verify_ct": 3,
-              "spec_correct_drafts_histogram": [1, 1, 1]
+              "weight_versions": [{"version": "default", "start": 0, "end": 6}],
+              "cached_tokens_details": null
             },
             "index": 3
           },
@@ -1406,32 +954,14 @@
             "output_ids": [270, 6461, 16, 455, 12709, 344],
             "meta_info": {
               "id": "554a5aeb41684db1b038e7b2b0341ef2",
-              "finish_reason": {
-                "type": "length",
-                "length": 6
-              },
+              "finish_reason": {"type": "length", "length": 6},
               "prompt_tokens": 3,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 6,
               "cached_tokens": 0,
-              "weight_versions": [
-                {
-                  "version": "default",
-                  "start": 0,
-                  "end": 6
-                }
-              ],
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "e2e_latency": 0.10953751765191555,
-              "spec_accept_rate": 0.2,
-              "spec_accept_length": 2.0,
-              "spec_num_correct_drafts": 3,
-              "spec_num_proposed_drafts": 15,
-              "spec_verify_ct": 3,
-              "spec_correct_drafts_histogram": [1, 1, 1]
+              "weight_versions": [{"version": "default", "start": 0, "end": 6}],
+              "cached_tokens_details": null
             },
             "index": 2
           },
@@ -1443,12 +973,10 @@
               "finish_reason": null,
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 5,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             },
             "index": 1
           },
@@ -1460,12 +988,10 @@
               "finish_reason": null,
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 5,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             },
             "index": 0
           },
@@ -1474,32 +1000,14 @@
             "output_ids": [1234, 3955, 361, 582, 23315, 5582],
             "meta_info": {
               "id": "c21c994b73994b25890bd6acf09c6831",
-              "finish_reason": {
-                "type": "length",
-                "length": 6
-              },
+              "finish_reason": {"type": "length", "length": 6},
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 6,
               "cached_tokens": 0,
-              "weight_versions": [
-                {
-                  "version": "default",
-                  "start": 0,
-                  "end": 6
-                }
-              ],
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "e2e_latency": 0.11698652897030115,
-              "spec_accept_rate": 0.15,
-              "spec_accept_length": 1.5,
-              "spec_num_correct_drafts": 3,
-              "spec_num_proposed_drafts": 20,
-              "spec_verify_ct": 4,
-              "spec_correct_drafts_histogram": [2, 1, 1]
+              "weight_versions": [{"version": "default", "start": 0, "end": 6}],
+              "cached_tokens_details": null
             },
             "index": 0
           },
@@ -1508,66 +1016,22 @@
             "output_ids": [1234, 3955, 361, 582, 23315, 5582],
             "meta_info": {
               "id": "3c5f740592984cf98d497a6d052c532e",
-              "finish_reason": {
-                "type": "length",
-                "length": 6
-              },
+              "finish_reason": {"type": "length", "length": 6},
               "prompt_tokens": 4,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 6,
               "cached_tokens": 0,
-              "weight_versions": [
-                {
-                  "version": "default",
-                  "start": 0,
-                  "end": 6
-                }
-              ],
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "e2e_latency": 0.11693752510473132,
-              "spec_accept_rate": 0.15,
-              "spec_accept_length": 1.5,
-              "spec_num_correct_drafts": 3,
-              "spec_num_proposed_drafts": 20,
-              "spec_verify_ct": 4,
-              "spec_correct_drafts_histogram": [2, 1, 1]
+              "weight_versions": [{"version": "default", "start": 0, "end": 6}],
+              "cached_tokens_details": null
             },
             "index": 1
           }
         ]
       },
       "generate": {
-        "text": [
-          "One plus one is",
-          "The sky is"
-        ],
-        "sampling_params": {
-          "temperature": 0.0,
-          "max_new_tokens": 6,
-          "min_new_tokens": 0,
-          "stop": null,
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 2,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "text": ["One plus one is", "The sky is"],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 6, "n": 2},
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -1576,25 +1040,25 @@
       },
       "openai": {
         "events": [
-          "data: {\"id\":\"3c5f740592984cf98d497a6d052c532e\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":1,\"text\":\" two\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"c21c994b73994b25890bd6acf09c6831\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" two\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"f4a1183c6bee4735ba7ddaccc1ba0355\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":3,\"text\":\" the\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"554a5aeb41684db1b038e7b2b0341ef2\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":2,\"text\":\" the\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"3c5f740592984cf98d497a6d052c532e\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":1,\"text\":\"\\\",\\n\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"c21c994b73994b25890bd6acf09c6831\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"\\\",\\n\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"554a5aeb41684db1b038e7b2b0341ef2\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":2,\"text\":\" limit\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"f4a1183c6bee4735ba7ddaccc1ba0355\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":3,\"text\":\" limit\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"f4a1183c6bee4735ba7ddaccc1ba0355\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":3,\"text\":\". The\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"554a5aeb41684db1b038e7b2b0341ef2\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":2,\"text\":\". The\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"c21c994b73994b25890bd6acf09c6831\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"   \",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"3c5f740592984cf98d497a6d052c532e\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":1,\"text\":\"   \",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"f4a1183c6bee4735ba7ddaccc1ba0355\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":3,\"text\":\" sky is\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"554a5aeb41684db1b038e7b2b0341ef2\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":2,\"text\":\" sky is\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"3c5f740592984cf98d497a6d052c532e\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":1,\"text\":\" \\\"two\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"c21c994b73994b25890bd6acf09c6831\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" \\\"two\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"c21c994b73994b25890bd6acf09c6831\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" plus\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"3c5f740592984cf98d497a6d052c532e\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":1,\"text\":\" plus\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"3c5f740592984cf98d497a6d052c532e\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"total_tokens\":31,\"completion_tokens\":24,\"reasoning_tokens\":0}}\n\n",
+          "data: {\"id\":\"3c5f740592984cf98d497a6d052c532e\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":1,\"text\":\" two\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"c21c994b73994b25890bd6acf09c6831\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" two\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"f4a1183c6bee4735ba7ddaccc1ba0355\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":3,\"text\":\" the\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"554a5aeb41684db1b038e7b2b0341ef2\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":2,\"text\":\" the\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"3c5f740592984cf98d497a6d052c532e\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":1,\"text\":\"\\\",\\n\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"c21c994b73994b25890bd6acf09c6831\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"\\\",\\n\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"554a5aeb41684db1b038e7b2b0341ef2\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":2,\"text\":\" limit\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"f4a1183c6bee4735ba7ddaccc1ba0355\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":3,\"text\":\" limit\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"f4a1183c6bee4735ba7ddaccc1ba0355\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":3,\"text\":\". The\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"554a5aeb41684db1b038e7b2b0341ef2\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":2,\"text\":\". The\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"c21c994b73994b25890bd6acf09c6831\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"   \",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"3c5f740592984cf98d497a6d052c532e\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":1,\"text\":\"   \",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"f4a1183c6bee4735ba7ddaccc1ba0355\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":3,\"text\":\" sky is\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"554a5aeb41684db1b038e7b2b0341ef2\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":2,\"text\":\" sky is\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"3c5f740592984cf98d497a6d052c532e\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":1,\"text\":\" \\\"two\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"c21c994b73994b25890bd6acf09c6831\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" \\\"two\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"c21c994b73994b25890bd6acf09c6831\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" plus\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"3c5f740592984cf98d497a6d052c532e\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":1,\"text\":\" plus\",\"logprobs\":null,\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"3c5f740592984cf98d497a6d052c532e\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"total_tokens\":31,\"completion_tokens\":24,\"reasoning_tokens\":0}}\n\n",
           "data: [DONE]\n\n"
         ]
       }
@@ -1617,341 +1081,103 @@
           "output_ids": [3170, 2069, 5842, 410, 2708, 410, 3415, 4279],
           "meta_info": {
             "id": "348f17f05a2d4537a2f1ca0ff66e34f6",
-            "finish_reason": {
-              "type": "length",
-              "length": 8
-            },
+            "finish_reason": {"type": "length", "length": 8},
             "prompt_tokens": 5,
             "weight_version": "default",
-            "num_retractions": 0,
             "input_token_logprobs": [
-              [
-                null,
-                6127,
-                "北京"
-              ],
-              [
-                -12.28870964050293,
-                389,
-                "是"
-              ],
-              [
-                -3.073186159133911,
-                17607,
-                "中国的"
-              ],
-              [
-                -0.18120935559272766,
-                41175,
-                "首都"
-              ],
-              [
-                -0.22865630686283112,
-                303,
-                "，"
-              ]
+              [null, 6127, "北京"],
+              [-12.28870964050293, 389, "是"],
+              [-3.073186159133911, 17607, "中国的"],
+              [-0.18120935559272766, 41175, "首都"],
+              [-0.22865630686283112, 303, "，"]
             ],
             "output_token_logprobs": [
-              [
-                -2.384744882583618,
-                3170,
-                "也是"
-              ],
-              [
-                -1.8134658336639404,
-                2069,
-                "中国"
-              ],
-              [
-                -1.1421160697937012,
-                5842,
-                "政治"
-              ],
-              [
-                -0.30180591344833374,
-                410,
-                "、"
-              ],
-              [
-                -0.8156290650367737,
-                2708,
-                "经济"
-              ],
-              [
-                -0.056502435356378555,
-                410,
-                "、"
-              ],
-              [
-                -0.6090319752693176,
-                3415,
-                "文化"
-              ],
-              [
-                -0.4660833775997162,
-                4279,
-                "中心"
-              ]
+              [-2.384744882583618, 3170, "也是"],
+              [-1.8134658336639404, 2069, "中国"],
+              [-1.1421160697937012, 5842, "政治"],
+              [-0.30180591344833374, 410, "、"],
+              [-0.8156290650367737, 2708, "经济"],
+              [-0.056502435356378555, 410, "、"],
+              [-0.6090319752693176, 3415, "文化"],
+              [-0.4660833775997162, 4279, "中心"]
             ],
             "output_token_logprobs_length": 8,
             "input_top_logprobs": [
               null,
               [
-                [
-                  -0.10120955854654312,
-                  201,
-                  "\n"
-                ],
-                [
-                  -3.8512096405029297,
-                  271,
-                  "\n\n"
-                ],
-                [
-                  -5.03870964050293,
-                  539,
-                  " \n"
-                ]
+                [-0.10120955854654312, 201, "\n"],
+                [-3.8512096405029297, 271, "\n\n"],
+                [-5.03870964050293, 539, " \n"]
               ],
               [
-                [
-                  -2.698186159133911,
-                  41175,
-                  "首都"
-                ],
-                [
-                  -3.073186159133911,
-                  17607,
-                  "中国的"
-                ],
-                [
-                  -3.510686159133911,
-                  121077,
-                  "中华人民共和"
-                ]
+                [-2.698186159133911, 41175, "首都"],
+                [-3.073186159133911, 17607, "中国的"],
+                [-3.510686159133911, 121077, "中华人民共和"]
               ],
               [
-                [
-                  -0.18120935559272766,
-                  41175,
-                  "首都"
-                ],
-                [
-                  -2.4312093257904053,
-                  5842,
-                  "政治"
-                ],
-                [
-                  -4.306209564208984,
-                  2793,
-                  "首"
-                ]
+                [-0.18120935559272766, 41175, "首都"],
+                [-2.4312093257904053, 5842, "政治"],
+                [-4.306209564208984, 2793, "首"]
               ],
               [
-                [
-                  -0.22865630686283112,
-                  303,
-                  "，"
-                ],
-                [
-                  -2.35365629196167,
-                  320,
-                  "。"
-                ],
-                [
-                  -3.97865629196167,
-                  14,
-                  ","
-                ]
+                [-0.22865630686283112, 303, "，"],
+                [-2.35365629196167, 320, "。"],
+                [-3.97865629196167, 14, ","]
               ]
             ],
             "output_top_logprobs": [
               [
-                [
-                  -2.384744882583618,
-                  3170,
-                  "也是"
-                ],
-                [
-                  -3.009744882583618,
-                  389,
-                  "是"
-                ],
-                [
-                  -3.509744882583618,
-                  5842,
-                  "政治"
-                ]
+                [-2.384744882583618, 3170, "也是"],
+                [-3.009744882583618, 389, "是"],
+                [-3.509744882583618, 5842, "政治"]
               ],
               [
-                [
-                  -1.8134658336639404,
-                  2069,
-                  "中国"
-                ],
-                [
-                  -1.9384658336639404,
-                  17607,
-                  "中国的"
-                ],
-                [
-                  -1.9384658336639404,
-                  6227,
-                  "全国"
-                ]
+                [-1.8134658336639404, 2069, "中国"],
+                [-1.9384658336639404, 17607, "中国的"],
+                [-1.9384658336639404, 6227, "全国"]
               ],
               [
-                [
-                  -1.1421160697937012,
-                  5842,
-                  "政治"
-                ],
-                [
-                  -2.017116069793701,
-                  1103,
-                  "最"
-                ],
-                [
-                  -2.767116069793701,
-                  12945,
-                  "最大的"
-                ]
+                [-1.1421160697937012, 5842, "政治"],
+                [-2.017116069793701, 1103, "最"],
+                [-2.767116069793701, 12945, "最大的"]
               ],
               [
-                [
-                  -0.30180591344833374,
-                  410,
-                  "、"
-                ],
-                [
-                  -2.3018059730529785,
-                  3415,
-                  "文化"
-                ],
-                [
-                  -3.3018059730529785,
-                  22124,
-                  "文化的"
-                ]
+                [-0.30180591344833374, 410, "、"],
+                [-2.3018059730529785, 3415, "文化"],
+                [-3.3018059730529785, 22124, "文化的"]
               ],
               [
-                [
-                  -0.8156290650367737,
-                  2708,
-                  "经济"
-                ],
-                [
-                  -0.9406290650367737,
-                  3415,
-                  "文化"
-                ],
-                [
-                  -2.190629005432129,
-                  54508,
-                  "文化和"
-                ]
+                [-0.8156290650367737, 2708, "经济"],
+                [-0.9406290650367737, 3415, "文化"],
+                [-2.190629005432129, 54508, "文化和"]
               ],
               [
-                [
-                  -0.056502435356378555,
-                  410,
-                  "、"
-                ],
-                [
-                  -3.181502342224121,
-                  56010,
-                  "和文化"
-                ],
-                [
-                  -5.806502342224121,
-                  3415,
-                  "文化"
-                ]
+                [-0.056502435356378555, 410, "、"],
+                [-3.181502342224121, 56010, "和文化"],
+                [-5.806502342224121, 3415, "文化"]
               ],
               [
-                [
-                  -0.6090319752693176,
-                  3415,
-                  "文化"
-                ],
-                [
-                  -1.2340319156646729,
-                  22124,
-                  "文化的"
-                ],
-                [
-                  -1.9840319156646729,
-                  54508,
-                  "文化和"
-                ]
+                [-0.6090319752693176, 3415, "文化"],
+                [-1.2340319156646729, 22124, "文化的"],
+                [-1.9840319156646729, 54508, "文化和"]
               ],
               [
-                [
-                  -0.4660833775997162,
-                  4279,
-                  "中心"
-                ],
-                [
-                  -1.2160834074020386,
-                  410,
-                  "、"
-                ],
-                [
-                  -4.216083526611328,
-                  955,
-                  "等"
-                ]
+                [-0.4660833775997162, 4279, "中心"],
+                [-1.2160834074020386, 410, "、"],
+                [-4.216083526611328, 955, "等"]
               ]
             ],
             "reasoning_tokens": 0,
             "completion_tokens": 8,
             "cached_tokens": 0,
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 8
-              }
-            ],
-            "cached_tokens_details": null,
-            "dp_rank": null,
-            "e2e_latency": 0.10901072900742292,
-            "spec_accept_rate": 0.15,
-            "spec_accept_length": 2.0,
-            "spec_num_correct_drafts": 3,
-            "spec_num_proposed_drafts": 20,
-            "spec_verify_ct": 4,
-            "spec_correct_drafts_histogram": [2, 1, 1],
-            "response_sent_to_client_ts": 1791354947.2998347
+            "weight_versions": [{"version": "default", "start": 0, "end": 8}],
+            "cached_tokens_details": null
           }
         }
       },
       "generate": {
         "text": "北京是中国的首都，",
-        "sampling_params": {
-          "temperature": 0.0,
-          "max_new_tokens": 8,
-          "min_new_tokens": 0,
-          "stop": null,
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 1,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 8},
         "return_logprob": true,
         "logprob_start_len": 0,
         "top_logprobs_num": 3,
@@ -1962,7 +1188,7 @@
         "body": {
           "id": "348f17f05a2d4537a2f1ca0ff66e34f6",
           "object": "text_completion",
-          "created": 1791354947,
+          "created": 1791414128,
           "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
           "choices": [
             {
@@ -1970,22 +1196,22 @@
               "text": "北京是中国的首都，也是中国政治、经济、文化中心",
               "logprobs": {
                 "text_offset": [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
-                "token_logprobs": [null, -12.28870964050293, -3.073186159133911, -0.18120935559272766, -0.22865630686283112, -2.384744882583618, -1.8134658336639404, -1.1421160697937012, -0.30180591344833374, -0.8156290650367737, -0.056502435356378555, -0.6090319752693176, -0.4660833775997162],
-                "tokens": [
-                  "北京",
-                  "是",
-                  "中国的",
-                  "首都",
-                  "，",
-                  "也是",
-                  "中国",
-                  "政治",
-                  "、",
-                  "经济",
-                  "、",
-                  "文化",
-                  "中心"
+                "token_logprobs": [
+                  null,
+                  -12.28870964050293,
+                  -3.073186159133911,
+                  -0.18120935559272766,
+                  -0.22865630686283112,
+                  -2.384744882583618,
+                  -1.8134658336639404,
+                  -1.1421160697937012,
+                  -0.30180591344833374,
+                  -0.8156290650367737,
+                  -0.056502435356378555,
+                  -0.6090319752693176,
+                  -0.4660833775997162
                 ],
+                "tokens": ["北京", "是", "中国的", "首都", "，", "也是", "中国", "政治", "、", "经济", "、", "文化", "中心"],
                 "top_logprobs": [
                   null,
                   {
@@ -1998,56 +1224,20 @@
                     "中国的": -3.073186159133911,
                     "中华人民共和": -3.510686159133911
                   },
-                  {
-                    "首都": -0.18120935559272766,
-                    "政治": -2.4312093257904053,
-                    "首": -4.306209564208984
-                  },
-                  {
-                    "，": -0.22865630686283112,
-                    "。": -2.35365629196167,
-                    ",": -3.97865629196167
-                  },
-                  {
-                    "也是": -2.384744882583618,
-                    "是": -3.009744882583618,
-                    "政治": -3.509744882583618
-                  },
-                  {
-                    "中国": -1.8134658336639404,
-                    "中国的": -1.9384658336639404,
-                    "全国": -1.9384658336639404
-                  },
-                  {
-                    "政治": -1.1421160697937012,
-                    "最": -2.017116069793701,
-                    "最大的": -2.767116069793701
-                  },
-                  {
-                    "、": -0.30180591344833374,
-                    "文化": -2.3018059730529785,
-                    "文化的": -3.3018059730529785
-                  },
-                  {
-                    "经济": -0.8156290650367737,
-                    "文化": -0.9406290650367737,
-                    "文化和": -2.190629005432129
-                  },
-                  {
-                    "、": -0.056502435356378555,
-                    "和文化": -3.181502342224121,
-                    "文化": -5.806502342224121
-                  },
+                  {"首都": -0.18120935559272766, "政治": -2.4312093257904053, "首": -4.306209564208984},
+                  {"，": -0.22865630686283112, "。": -2.35365629196167, ",": -3.97865629196167},
+                  {"也是": -2.384744882583618, "是": -3.009744882583618, "政治": -3.509744882583618},
+                  {"中国": -1.8134658336639404, "中国的": -1.9384658336639404, "全国": -1.9384658336639404},
+                  {"政治": -1.1421160697937012, "最": -2.017116069793701, "最大的": -2.767116069793701},
+                  {"、": -0.30180591344833374, "文化": -2.3018059730529785, "文化的": -3.3018059730529785},
+                  {"经济": -0.8156290650367737, "文化": -0.9406290650367737, "文化和": -2.190629005432129},
+                  {"、": -0.056502435356378555, "和文化": -3.181502342224121, "文化": -5.806502342224121},
                   {
                     "文化": -0.6090319752693176,
                     "文化的": -1.2340319156646729,
                     "文化和": -1.9840319156646729
                   },
-                  {
-                    "中心": -0.4660833775997162,
-                    "、": -1.2160834074020386,
-                    "等": -4.216083526611328
-                  }
+                  {"中心": -0.4660833775997162, "、": -1.2160834074020386, "等": -4.216083526611328}
                 ]
               },
               "finish_reason": "length",
@@ -2063,13 +1253,7 @@
           },
           "metadata": {
             "weight_version": "default",
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 8
-              }
-            ]
+            "weight_versions": [{"version": "default", "start": 0, "end": 8}]
           }
         }
       }
@@ -2096,37 +1280,15 @@
               "finish_reason": null,
               "prompt_tokens": 7,
               "weight_version": "default",
-              "num_retractions": 0,
               "input_token_logprobs": [],
-              "output_token_logprobs": [
-                [
-                  -1.395471215248108,
-                  53153,
-                  "�"
-                ]
-              ],
+              "output_token_logprobs": [[-1.395471215248108, 53153, "�"]],
               "output_token_logprobs_length": 1,
               "input_top_logprobs": [],
-              "output_top_logprobs": [
-                [
-                  [
-                    -1.395471215248108,
-                    53153,
-                    "�"
-                  ],
-                  [
-                    -2.3954710960388184,
-                    201,
-                    "\n"
-                  ]
-                ]
-              ],
+              "output_top_logprobs": [[[-1.395471215248108, 53153, "�"], [-2.3954710960388184, 201, "\n"]]],
               "reasoning_tokens": 0,
               "completion_tokens": 1,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "response_sent_to_client_ts": 1791354947.3826897
+              "cached_tokens_details": null
             }
           },
           {
@@ -2137,53 +1299,18 @@
               "finish_reason": null,
               "prompt_tokens": 7,
               "weight_version": "default",
-              "num_retractions": 0,
               "input_token_logprobs": [],
-              "output_token_logprobs": [
-                [
-                  -1.395471215248108,
-                  53153,
-                  "�"
-                ],
-                [
-                  -0.5367563366889954,
-                  235,
-                  "�"
-                ]
-              ],
+              "output_token_logprobs": [[-1.395471215248108, 53153, "�"], [-0.5367563366889954, 235, "�"]],
               "output_token_logprobs_length": 2,
               "input_top_logprobs": [],
               "output_top_logprobs": [
-                [
-                  [
-                    -1.395471215248108,
-                    53153,
-                    "�"
-                  ],
-                  [
-                    -2.3954710960388184,
-                    201,
-                    "\n"
-                  ]
-                ],
-                [
-                  [
-                    -0.5367563366889954,
-                    235,
-                    "�"
-                  ],
-                  [
-                    -1.6617562770843506,
-                    227,
-                    "�"
-                  ]
-                ]
+                [[-1.395471215248108, 53153, "�"], [-2.3954710960388184, 201, "\n"]],
+                [[-0.5367563366889954, 235, "�"], [-1.6617562770843506, 227, "�"]]
               ],
               "reasoning_tokens": 0,
               "completion_tokens": 2,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             }
           },
           {
@@ -2194,70 +1321,23 @@
               "finish_reason": null,
               "prompt_tokens": 7,
               "weight_version": "default",
-              "num_retractions": 0,
               "input_token_logprobs": [],
               "output_token_logprobs": [
-                [
-                  -1.395471215248108,
-                  53153,
-                  "�"
-                ],
-                [
-                  -0.5367563366889954,
-                  235,
-                  "�"
-                ],
-                [
-                  -1.4774495363235474,
-                  57398,
-                  "✨"
-                ]
+                [-1.395471215248108, 53153, "�"],
+                [-0.5367563366889954, 235, "�"],
+                [-1.4774495363235474, 57398, "✨"]
               ],
               "output_token_logprobs_length": 3,
               "input_top_logprobs": [],
               "output_top_logprobs": [
-                [
-                  [
-                    -1.395471215248108,
-                    53153,
-                    "�"
-                  ],
-                  [
-                    -2.3954710960388184,
-                    201,
-                    "\n"
-                  ]
-                ],
-                [
-                  [
-                    -0.5367563366889954,
-                    235,
-                    "�"
-                  ],
-                  [
-                    -1.6617562770843506,
-                    227,
-                    "�"
-                  ]
-                ],
-                [
-                  [
-                    -1.4774495363235474,
-                    57398,
-                    "✨"
-                  ],
-                  [
-                    -1.8524495363235474,
-                    53153,
-                    "�"
-                  ]
-                ]
+                [[-1.395471215248108, 53153, "�"], [-2.3954710960388184, 201, "\n"]],
+                [[-0.5367563366889954, 235, "�"], [-1.6617562770843506, 227, "�"]],
+                [[-1.4774495363235474, 57398, "✨"], [-1.8524495363235474, 53153, "�"]]
               ],
               "reasoning_tokens": 0,
               "completion_tokens": 3,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             }
           },
           {
@@ -2268,104 +1348,27 @@
               "finish_reason": null,
               "prompt_tokens": 7,
               "weight_version": "default",
-              "num_retractions": 0,
               "input_token_logprobs": [],
               "output_token_logprobs": [
-                [
-                  -1.395471215248108,
-                  53153,
-                  "�"
-                ],
-                [
-                  -0.5367563366889954,
-                  235,
-                  "�"
-                ],
-                [
-                  -1.4774495363235474,
-                  57398,
-                  "✨"
-                ],
-                [
-                  -1.7589141130447388,
-                  53153,
-                  "�"
-                ],
-                [
-                  -0.3059544265270233,
-                  233,
-                  "�"
-                ]
+                [-1.395471215248108, 53153, "�"],
+                [-0.5367563366889954, 235, "�"],
+                [-1.4774495363235474, 57398, "✨"],
+                [-1.7589141130447388, 53153, "�"],
+                [-0.3059544265270233, 233, "�"]
               ],
               "output_token_logprobs_length": 5,
               "input_top_logprobs": [],
               "output_top_logprobs": [
-                [
-                  [
-                    -1.395471215248108,
-                    53153,
-                    "�"
-                  ],
-                  [
-                    -2.3954710960388184,
-                    201,
-                    "\n"
-                  ]
-                ],
-                [
-                  [
-                    -0.5367563366889954,
-                    235,
-                    "�"
-                  ],
-                  [
-                    -1.6617562770843506,
-                    227,
-                    "�"
-                  ]
-                ],
-                [
-                  [
-                    -1.4774495363235474,
-                    57398,
-                    "✨"
-                  ],
-                  [
-                    -1.8524495363235474,
-                    53153,
-                    "�"
-                  ]
-                ],
-                [
-                  [
-                    -1.7589141130447388,
-                    53153,
-                    "�"
-                  ],
-                  [
-                    -2.133913993835449,
-                    201,
-                    "\n"
-                  ]
-                ],
-                [
-                  [
-                    -0.3059544265270233,
-                    233,
-                    "�"
-                  ],
-                  [
-                    -1.6809544563293457,
-                    226,
-                    "�"
-                  ]
-                ]
+                [[-1.395471215248108, 53153, "�"], [-2.3954710960388184, 201, "\n"]],
+                [[-0.5367563366889954, 235, "�"], [-1.6617562770843506, 227, "�"]],
+                [[-1.4774495363235474, 57398, "✨"], [-1.8524495363235474, 53153, "�"]],
+                [[-1.7589141130447388, 53153, "�"], [-2.133913993835449, 201, "\n"]],
+                [[-0.3059544265270233, 233, "�"], [-1.6809544563293457, 226, "�"]]
               ],
               "reasoning_tokens": 0,
               "completion_tokens": 5,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             }
           },
           {
@@ -2376,138 +1379,31 @@
               "finish_reason": null,
               "prompt_tokens": 7,
               "weight_version": "default",
-              "num_retractions": 0,
               "input_token_logprobs": [],
               "output_token_logprobs": [
-                [
-                  -1.395471215248108,
-                  53153,
-                  "�"
-                ],
-                [
-                  -0.5367563366889954,
-                  235,
-                  "�"
-                ],
-                [
-                  -1.4774495363235474,
-                  57398,
-                  "✨"
-                ],
-                [
-                  -1.7589141130447388,
-                  53153,
-                  "�"
-                ],
-                [
-                  -0.3059544265270233,
-                  233,
-                  "�"
-                ],
-                [
-                  -0.4871026873588562,
-                  53153,
-                  "�"
-                ],
-                [
-                  -0.014002769254148006,
-                  226,
-                  "�"
-                ]
+                [-1.395471215248108, 53153, "�"],
+                [-0.5367563366889954, 235, "�"],
+                [-1.4774495363235474, 57398, "✨"],
+                [-1.7589141130447388, 53153, "�"],
+                [-0.3059544265270233, 233, "�"],
+                [-0.4871026873588562, 53153, "�"],
+                [-0.014002769254148006, 226, "�"]
               ],
               "output_token_logprobs_length": 7,
               "input_top_logprobs": [],
               "output_top_logprobs": [
-                [
-                  [
-                    -1.395471215248108,
-                    53153,
-                    "�"
-                  ],
-                  [
-                    -2.3954710960388184,
-                    201,
-                    "\n"
-                  ]
-                ],
-                [
-                  [
-                    -0.5367563366889954,
-                    235,
-                    "�"
-                  ],
-                  [
-                    -1.6617562770843506,
-                    227,
-                    "�"
-                  ]
-                ],
-                [
-                  [
-                    -1.4774495363235474,
-                    57398,
-                    "✨"
-                  ],
-                  [
-                    -1.8524495363235474,
-                    53153,
-                    "�"
-                  ]
-                ],
-                [
-                  [
-                    -1.7589141130447388,
-                    53153,
-                    "�"
-                  ],
-                  [
-                    -2.133913993835449,
-                    201,
-                    "\n"
-                  ]
-                ],
-                [
-                  [
-                    -0.3059544265270233,
-                    233,
-                    "�"
-                  ],
-                  [
-                    -1.6809544563293457,
-                    226,
-                    "�"
-                  ]
-                ],
-                [
-                  [
-                    -0.4871026873588562,
-                    53153,
-                    "�"
-                  ],
-                  [
-                    -2.487102746963501,
-                    57522,
-                    "�"
-                  ]
-                ],
-                [
-                  [
-                    -0.014002769254148006,
-                    226,
-                    "�"
-                  ],
-                  [
-                    -4.514002799987793,
-                    227,
-                    "�"
-                  ]
-                ]
+                [[-1.395471215248108, 53153, "�"], [-2.3954710960388184, 201, "\n"]],
+                [[-0.5367563366889954, 235, "�"], [-1.6617562770843506, 227, "�"]],
+                [[-1.4774495363235474, 57398, "✨"], [-1.8524495363235474, 53153, "�"]],
+                [[-1.7589141130447388, 53153, "�"], [-2.133913993835449, 201, "\n"]],
+                [[-0.3059544265270233, 233, "�"], [-1.6809544563293457, 226, "�"]],
+                [[-0.4871026873588562, 53153, "�"], [-2.487102746963501, 57522, "�"]],
+                [[-0.014002769254148006, 226, "�"], [-4.514002799987793, 227, "�"]]
               ],
               "reasoning_tokens": 0,
               "completion_tokens": 7,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             }
           },
           {
@@ -2515,205 +1411,44 @@
             "output_ids": [53153, 235, 57398, 53153, 233, 53153, 226, 4757],
             "meta_info": {
               "id": "9858948f02a14b80a940edd3c4948e8c",
-              "finish_reason": {
-                "type": "length",
-                "length": 8
-              },
+              "finish_reason": {"type": "length", "length": 8},
               "prompt_tokens": 7,
               "weight_version": "default",
-              "num_retractions": 0,
               "input_token_logprobs": [],
               "output_token_logprobs": [
-                [
-                  -1.395471215248108,
-                  53153,
-                  "�"
-                ],
-                [
-                  -0.5367563366889954,
-                  235,
-                  "�"
-                ],
-                [
-                  -1.4774495363235474,
-                  57398,
-                  "✨"
-                ],
-                [
-                  -1.7589141130447388,
-                  53153,
-                  "�"
-                ],
-                [
-                  -0.3059544265270233,
-                  233,
-                  "�"
-                ],
-                [
-                  -0.4871026873588562,
-                  53153,
-                  "�"
-                ],
-                [
-                  -0.014002769254148006,
-                  226,
-                  "�"
-                ],
-                [
-                  -1.4592108726501465,
-                  4757,
-                  "',\n"
-                ]
+                [-1.395471215248108, 53153, "�"],
+                [-0.5367563366889954, 235, "�"],
+                [-1.4774495363235474, 57398, "✨"],
+                [-1.7589141130447388, 53153, "�"],
+                [-0.3059544265270233, 233, "�"],
+                [-0.4871026873588562, 53153, "�"],
+                [-0.014002769254148006, 226, "�"],
+                [-1.4592108726501465, 4757, "',\n"]
               ],
               "output_token_logprobs_length": 8,
               "input_top_logprobs": [],
               "output_top_logprobs": [
-                [
-                  [
-                    -1.395471215248108,
-                    53153,
-                    "�"
-                  ],
-                  [
-                    -2.3954710960388184,
-                    201,
-                    "\n"
-                  ]
-                ],
-                [
-                  [
-                    -0.5367563366889954,
-                    235,
-                    "�"
-                  ],
-                  [
-                    -1.6617562770843506,
-                    227,
-                    "�"
-                  ]
-                ],
-                [
-                  [
-                    -1.4774495363235474,
-                    57398,
-                    "✨"
-                  ],
-                  [
-                    -1.8524495363235474,
-                    53153,
-                    "�"
-                  ]
-                ],
-                [
-                  [
-                    -1.7589141130447388,
-                    53153,
-                    "�"
-                  ],
-                  [
-                    -2.133913993835449,
-                    201,
-                    "\n"
-                  ]
-                ],
-                [
-                  [
-                    -0.3059544265270233,
-                    233,
-                    "�"
-                  ],
-                  [
-                    -1.6809544563293457,
-                    226,
-                    "�"
-                  ]
-                ],
-                [
-                  [
-                    -0.4871026873588562,
-                    53153,
-                    "�"
-                  ],
-                  [
-                    -2.487102746963501,
-                    57522,
-                    "�"
-                  ]
-                ],
-                [
-                  [
-                    -0.014002769254148006,
-                    226,
-                    "�"
-                  ],
-                  [
-                    -4.514002799987793,
-                    227,
-                    "�"
-                  ]
-                ],
-                [
-                  [
-                    -1.4592108726501465,
-                    4757,
-                    "',\n"
-                  ],
-                  [
-                    -1.9592108726501465,
-                    3955,
-                    "\",\n"
-                  ]
-                ]
+                [[-1.395471215248108, 53153, "�"], [-2.3954710960388184, 201, "\n"]],
+                [[-0.5367563366889954, 235, "�"], [-1.6617562770843506, 227, "�"]],
+                [[-1.4774495363235474, 57398, "✨"], [-1.8524495363235474, 53153, "�"]],
+                [[-1.7589141130447388, 53153, "�"], [-2.133913993835449, 201, "\n"]],
+                [[-0.3059544265270233, 233, "�"], [-1.6809544563293457, 226, "�"]],
+                [[-0.4871026873588562, 53153, "�"], [-2.487102746963501, 57522, "�"]],
+                [[-0.014002769254148006, 226, "�"], [-4.514002799987793, 227, "�"]],
+                [[-1.4592108726501465, 4757, "',\n"], [-1.9592108726501465, 3955, "\",\n"]]
               ],
               "reasoning_tokens": 0,
               "completion_tokens": 8,
               "cached_tokens": 0,
-              "weight_versions": [
-                {
-                  "version": "default",
-                  "start": 0,
-                  "end": 8
-                }
-              ],
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "e2e_latency": 0.11300827795639634,
-              "spec_accept_rate": 0.08,
-              "spec_accept_length": 1.6,
-              "spec_num_correct_drafts": 2,
-              "spec_num_proposed_drafts": 25,
-              "spec_verify_ct": 5,
-              "spec_correct_drafts_histogram": [3, 2]
+              "weight_versions": [{"version": "default", "start": 0, "end": 8}],
+              "cached_tokens_details": null
             }
           }
         ]
       },
       "generate": {
         "text": "Emoji party: 🎉",
-        "sampling_params": {
-          "temperature": 0.0,
-          "max_new_tokens": 8,
-          "min_new_tokens": 0,
-          "stop": null,
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 1,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 8},
         "return_logprob": true,
         "logprob_start_len": -1,
         "top_logprobs_num": 2,
@@ -2722,12 +1457,12 @@
       },
       "openai": {
         "events": [
-          "data: {\"id\":\"9858948f02a14b80a940edd3c4948e8c\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"\",\"logprobs\":{\"text_offset\":[-1],\"token_logprobs\":[-1.395471215248108],\"tokens\":[\"�\"],\"top_logprobs\":[{\"�\":-1.395471215248108,\"\\n\":-2.3954710960388184}]},\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"9858948f02a14b80a940edd3c4948e8c\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"🎊\",\"logprobs\":{\"text_offset\":[-1],\"token_logprobs\":[-0.5367563366889954],\"tokens\":[\"�\"],\"top_logprobs\":[{\"�\":-1.6617562770843506}]},\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"9858948f02a14b80a940edd3c4948e8c\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"✨\",\"logprobs\":{\"text_offset\":[-1],\"token_logprobs\":[-1.4774495363235474],\"tokens\":[\"✨\"],\"top_logprobs\":[{\"✨\":-1.4774495363235474,\"�\":-1.8524495363235474}]},\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"9858948f02a14b80a940edd3c4948e8c\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"🎈\",\"logprobs\":{\"text_offset\":[-1,-1],\"token_logprobs\":[-1.7589141130447388,-0.3059544265270233],\"tokens\":[\"�\",\"�\"],\"top_logprobs\":[{\"�\":-1.7589141130447388,\"\\n\":-2.133913993835449},{\"�\":-1.6809544563293457}]},\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"9858948f02a14b80a940edd3c4948e8c\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"🎁\",\"logprobs\":{\"text_offset\":[-1,-1],\"token_logprobs\":[-0.4871026873588562,-0.014002769254148006],\"tokens\":[\"�\",\"�\"],\"top_logprobs\":[{\"�\":-2.487102746963501},{\"�\":-4.514002799987793}]},\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
-          "data: {\"id\":\"9858948f02a14b80a940edd3c4948e8c\",\"object\":\"text_completion\",\"created\":1791354947,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"',\\n\",\"logprobs\":{\"text_offset\":[-1],\"token_logprobs\":[-1.4592108726501465],\"tokens\":[\"',\\n\"],\"top_logprobs\":[{\"',\\n\":-1.4592108726501465,\"\\\",\\n\":-1.9592108726501465}]},\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"9858948f02a14b80a940edd3c4948e8c\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"\",\"logprobs\":{\"text_offset\":[-1],\"token_logprobs\":[-1.395471215248108],\"tokens\":[\"�\"],\"top_logprobs\":[{\"�\":-1.395471215248108,\"\\n\":-2.3954710960388184}]},\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"9858948f02a14b80a940edd3c4948e8c\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"🎊\",\"logprobs\":{\"text_offset\":[-1],\"token_logprobs\":[-0.5367563366889954],\"tokens\":[\"�\"],\"top_logprobs\":[{\"�\":-1.6617562770843506}]},\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"9858948f02a14b80a940edd3c4948e8c\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"✨\",\"logprobs\":{\"text_offset\":[-1],\"token_logprobs\":[-1.4774495363235474],\"tokens\":[\"✨\"],\"top_logprobs\":[{\"✨\":-1.4774495363235474,\"�\":-1.8524495363235474}]},\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"9858948f02a14b80a940edd3c4948e8c\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"🎈\",\"logprobs\":{\"text_offset\":[-1,-1],\"token_logprobs\":[-1.7589141130447388,-0.3059544265270233],\"tokens\":[\"�\",\"�\"],\"top_logprobs\":[{\"�\":-1.7589141130447388,\"\\n\":-2.133913993835449},{\"�\":-1.6809544563293457}]},\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"9858948f02a14b80a940edd3c4948e8c\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"🎁\",\"logprobs\":{\"text_offset\":[-1,-1],\"token_logprobs\":[-0.4871026873588562,-0.014002769254148006],\"tokens\":[\"�\",\"�\"],\"top_logprobs\":[{\"�\":-2.487102746963501},{\"�\":-4.514002799987793}]},\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"id\":\"9858948f02a14b80a940edd3c4948e8c\",\"object\":\"text_completion\",\"created\":1791414128,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"',\\n\",\"logprobs\":{\"text_offset\":[-1],\"token_logprobs\":[-1.4592108726501465],\"tokens\":[\"',\\n\"],\"top_logprobs\":[{\"',\\n\":-1.4592108726501465,\"\\\",\\n\":-1.9592108726501465}]},\"finish_reason\":\"length\",\"matched_stop\":null}],\"usage\":null}\n\n",
           "data: [DONE]\n\n"
         ]
       }
@@ -2740,9 +1475,7 @@
         "prompt": "List three colors, one per line:\n1.",
         "max_tokens": 32,
         "temperature": 0,
-        "stop": [
-          "3."
-        ],
+        "stop": ["3."],
         "return_token_ids": true
       },
       "engine": {
@@ -2752,65 +1485,21 @@
           "output_ids": [6247, 201, 20, 16, 9214, 201, 21, 16],
           "meta_info": {
             "id": "a2f760ba1611440399ee9d67c654036d",
-            "finish_reason": {
-              "type": "stop",
-              "matched": "3."
-            },
+            "finish_reason": {"type": "stop", "matched": "3."},
             "prompt_tokens": 10,
             "weight_version": "default",
-            "num_retractions": 0,
             "reasoning_tokens": 0,
             "completion_tokens": 8,
             "cached_tokens": 0,
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 8
-              }
-            ],
-            "cached_tokens_details": null,
-            "dp_rank": null,
-            "e2e_latency": 0.09981930674985051,
-            "spec_accept_rate": 0.8,
-            "spec_accept_length": 4.0,
-            "spec_num_correct_drafts": 8,
-            "spec_num_proposed_drafts": 10,
-            "spec_verify_ct": 2,
-            "spec_correct_drafts_histogram": [0, 0, 0, 1, 0, 1],
-            "response_sent_to_client_ts": 1791354948.3093507
+            "weight_versions": [{"version": "default", "start": 0, "end": 8}],
+            "cached_tokens_details": null
           },
           "prompt_token_ids": [3536, 2038, 11273, 14, 834, 716, 2562, 1137, 19, 16]
         }
       },
       "generate": {
         "text": "List three colors, one per line:\n1.",
-        "sampling_params": {
-          "temperature": 0.0,
-          "max_new_tokens": 32,
-          "min_new_tokens": 0,
-          "stop": [
-            "3."
-          ],
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 1,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 32, "stop": ["3."]},
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -2822,7 +1511,7 @@
         "body": {
           "id": "a2f760ba1611440399ee9d67c654036d",
           "object": "text_completion",
-          "created": 1791354948,
+          "created": 1791414129,
           "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
           "choices": [
             {
@@ -2844,13 +1533,7 @@
           },
           "metadata": {
             "weight_version": "default",
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 8
-              }
-            ]
+            "weight_versions": [{"version": "default", "start": 0, "end": 8}]
           }
         }
       }
@@ -2878,13 +1561,10 @@
               "finish_reason": null,
               "prompt_tokens": 10,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 1,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "response_sent_to_client_ts": 1791354948.3947697
+              "cached_tokens_details": null
             },
             "prompt_token_ids": [3536, 2038, 11273, 14, 834, 716, 2562, 1137, 19, 16]
           },
@@ -2896,12 +1576,10 @@
               "finish_reason": null,
               "prompt_tokens": 10,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 5,
               "cached_tokens": 0,
-              "cached_tokens_details": null,
-              "dp_rank": null
+              "cached_tokens_details": null
             },
             "prompt_token_ids": [3536, 2038, 11273, 14, 834, 716, 2562, 1137, 19, 16]
           },
@@ -2910,32 +1588,14 @@
             "output_ids": [6247, 201, 20, 16, 9214, 201, 21, 16],
             "meta_info": {
               "id": "69bf6ae9c34a4076b74e5590f832dea0",
-              "finish_reason": {
-                "type": "stop",
-                "matched": "3."
-              },
+              "finish_reason": {"type": "stop", "matched": "3."},
               "prompt_tokens": 10,
               "weight_version": "default",
-              "num_retractions": 0,
               "reasoning_tokens": 0,
               "completion_tokens": 8,
               "cached_tokens": 0,
-              "weight_versions": [
-                {
-                  "version": "default",
-                  "start": 0,
-                  "end": 8
-                }
-              ],
-              "cached_tokens_details": null,
-              "dp_rank": null,
-              "e2e_latency": 0.09279150608927011,
-              "spec_accept_rate": 0.8,
-              "spec_accept_length": 4.0,
-              "spec_num_correct_drafts": 8,
-              "spec_num_proposed_drafts": 10,
-              "spec_verify_ct": 2,
-              "spec_correct_drafts_histogram": [0, 0, 0, 1, 0, 1]
+              "weight_versions": [{"version": "default", "start": 0, "end": 8}],
+              "cached_tokens_details": null
             },
             "prompt_token_ids": [3536, 2038, 11273, 14, 834, 716, 2562, 1137, 19, 16]
           }
@@ -2943,30 +1603,7 @@
       },
       "generate": {
         "text": "List three colors, one per line:\n1.",
-        "sampling_params": {
-          "temperature": 0.0,
-          "max_new_tokens": 32,
-          "min_new_tokens": 0,
-          "stop": "3.",
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 1,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 32, "stop": "3."},
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -2976,9 +1613,9 @@
       },
       "openai": {
         "events": [
-          "data: {\"id\":\"69bf6ae9c34a4076b74e5590f832dea0\",\"object\":\"text_completion\",\"created\":1791354948,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" Red\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null,\"token_ids\":[6247],\"prompt_token_ids\":[3536,2038,11273,14,834,716,2562,1137,19,16]}],\"usage\":null}\n\n",
-          "data: {\"id\":\"69bf6ae9c34a4076b74e5590f832dea0\",\"object\":\"text_completion\",\"created\":1791354948,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"\\n2. Green\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null,\"token_ids\":[201,20,16,9214]}],\"usage\":null}\n\n",
-          "data: {\"id\":\"69bf6ae9c34a4076b74e5590f832dea0\",\"object\":\"text_completion\",\"created\":1791354948,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"\\n\",\"logprobs\":null,\"finish_reason\":\"stop\",\"matched_stop\":\"3.\",\"token_ids\":[201,21,16]}],\"usage\":null}\n\n",
+          "data: {\"id\":\"69bf6ae9c34a4076b74e5590f832dea0\",\"object\":\"text_completion\",\"created\":1791414129,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" Red\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null,\"token_ids\":[6247],\"prompt_token_ids\":[3536,2038,11273,14,834,716,2562,1137,19,16]}],\"usage\":null}\n\n",
+          "data: {\"id\":\"69bf6ae9c34a4076b74e5590f832dea0\",\"object\":\"text_completion\",\"created\":1791414129,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"\\n2. Green\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null,\"token_ids\":[201,20,16,9214]}],\"usage\":null}\n\n",
+          "data: {\"id\":\"69bf6ae9c34a4076b74e5590f832dea0\",\"object\":\"text_completion\",\"created\":1791414129,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\"\\n\",\"logprobs\":null,\"finish_reason\":\"stop\",\"matched_stop\":\"3.\",\"token_ids\":[201,21,16]}],\"usage\":null}\n\n",
           "data: [DONE]\n\n"
         ]
       }
@@ -2991,73 +1628,51 @@
         "prompt": "A JSON object describing a cat:",
         "max_tokens": 32,
         "temperature": 0,
-        "response_format": {
-          "type": "json_object"
-        }
+        "response_format": {"type": "json_object"}
       },
       "engine": {
         "status": 200,
         "body": {
           "text": "{\"name\": \"Whiskers\", \"age\": 3, \"color\": \"orange\"}",
-          "output_ids": [24313, 2852, 3362, 582, 4291, 8089, 387, 1760, 582, 615, 3362, 223, 21, 14, 582, 10323, 3362, 582, 83471, 62773, 1],
+          "output_ids": [
+            24313,
+            2852,
+            3362,
+            582,
+            4291,
+            8089,
+            387,
+            1760,
+            582,
+            615,
+            3362,
+            223,
+            21,
+            14,
+            582,
+            10323,
+            3362,
+            582,
+            83471,
+            62773,
+            1
+          ],
           "meta_info": {
             "id": "f892dc8ca74541e8bf30238c98afc903",
-            "finish_reason": {
-              "type": "stop",
-              "matched": 1
-            },
+            "finish_reason": {"type": "stop", "matched": 1},
             "prompt_tokens": 7,
             "weight_version": "default",
-            "num_retractions": 0,
             "reasoning_tokens": 0,
             "completion_tokens": 21,
             "cached_tokens": 0,
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 21
-              }
-            ],
-            "cached_tokens_details": null,
-            "dp_rank": null,
-            "e2e_latency": 0.1281989300623536,
-            "spec_accept_rate": 0.37142857142857144,
-            "spec_accept_length": 3.0,
-            "spec_num_correct_drafts": 13,
-            "spec_num_proposed_drafts": 35,
-            "spec_verify_ct": 7,
-            "spec_correct_drafts_histogram": [2, 2, 1, 0, 1, 1],
-            "response_sent_to_client_ts": 1791354948.5367787
+            "weight_versions": [{"version": "default", "start": 0, "end": 21}],
+            "cached_tokens_details": null
           }
         }
       },
       "generate": {
         "text": "A JSON object describing a cat:",
-        "sampling_params": {
-          "temperature": 0.0,
-          "max_new_tokens": 32,
-          "min_new_tokens": 0,
-          "stop": null,
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": "{\"type\": \"object\"}",
-          "ebnf": null,
-          "n": 1,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 32, "json_schema": "{\"type\": \"object\"}"},
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -3068,7 +1683,7 @@
         "body": {
           "id": "f892dc8ca74541e8bf30238c98afc903",
           "object": "text_completion",
-          "created": 1791354948,
+          "created": 1791414129,
           "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
           "choices": [
             {
@@ -3088,13 +1703,7 @@
           },
           "metadata": {
             "weight_version": "default",
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 21
-              }
-            ]
+            "weight_versions": [{"version": "default", "start": 0, "end": 21}]
           }
         }
       }
@@ -3114,22 +1723,11 @@
             "schema": {
               "type": "object",
               "properties": {
-                "name": {
-                  "type": "string"
-                },
-                "population": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "density": {
-                  "type": "number",
-                  "minimum": 0.5
-                }
+                "name": {"type": "string"},
+                "population": {"type": "integer", "minimum": 0},
+                "density": {"type": "number", "minimum": 0.5}
               },
-              "required": [
-                "name",
-                "population"
-              ]
+              "required": ["name", "population"]
             }
           }
         }
@@ -3138,36 +1736,40 @@
         "status": 200,
         "body": {
           "text": "{\"name\": \"Paris\", \"population\": 2,  \"density\": 21000}",
-          "output_ids": [24313, 2852, 3362, 582, 51119, 1760, 582, 64054, 3362, 223, 20, 14, 223, 582, 70, 5811, 3362, 223, 10036, 504, 95, 1],
+          "output_ids": [
+            24313,
+            2852,
+            3362,
+            582,
+            51119,
+            1760,
+            582,
+            64054,
+            3362,
+            223,
+            20,
+            14,
+            223,
+            582,
+            70,
+            5811,
+            3362,
+            223,
+            10036,
+            504,
+            95,
+            1
+          ],
           "meta_info": {
             "id": "9cfb736835d64f4ba23b7bf38c2e0e7d",
-            "finish_reason": {
-              "type": "stop",
-              "matched": 1
-            },
+            "finish_reason": {"type": "stop", "matched": 1},
             "prompt_tokens": 9,
             "weight_version": "default",
-            "num_retractions": 0,
             "reasoning_tokens": 0,
             "completion_tokens": 22,
             "cached_tokens": 0,
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 22
-              }
-            ],
-            "cached_tokens_details": null,
-            "dp_rank": null,
-            "e2e_latency": 0.15317304013296962,
-            "spec_accept_rate": 0.22,
-            "spec_accept_length": 2.2,
-            "spec_num_correct_drafts": 11,
-            "spec_num_proposed_drafts": 50,
-            "spec_verify_ct": 10,
-            "spec_correct_drafts_histogram": [6, 1, 1, 1, 0, 1],
-            "response_sent_to_client_ts": 1791354948.6927805
+            "weight_versions": [{"version": "default", "start": 0, "end": 22}],
+            "cached_tokens_details": null
           }
         }
       },
@@ -3176,26 +1778,7 @@
         "sampling_params": {
           "temperature": 0.0,
           "max_new_tokens": 48,
-          "min_new_tokens": 0,
-          "stop": null,
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": "{\"type\": \"object\", \"properties\": {\"name\": {\"type\": \"string\"}, \"population\": {\"type\": \"integer\", \"minimum\": 0}, \"density\": {\"type\": \"number\", \"minimum\": 0.5}}, \"required\": [\"name\", \"population\"]}",
-          "ebnf": null,
-          "n": 1,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
+          "json_schema": "{\"type\": \"object\", \"properties\": {\"name\": {\"type\": \"string\"}, \"population\": {\"type\": \"integer\", \"minimum\": 0}, \"density\": {\"type\": \"number\", \"minimum\": 0.5}}, \"required\": [\"name\", \"population\"]}"
         },
         "return_logprob": false,
         "logprob_start_len": -1,
@@ -3207,7 +1790,7 @@
         "body": {
           "id": "9cfb736835d64f4ba23b7bf38c2e0e7d",
           "object": "text_completion",
-          "created": 1791354948,
+          "created": 1791414129,
           "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
           "choices": [
             {
@@ -3227,13 +1810,7 @@
           },
           "metadata": {
             "weight_version": "default",
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 22
-              }
-            ]
+            "weight_versions": [{"version": "default", "start": 0, "end": 22}]
           }
         }
       }
@@ -3253,9 +1830,7 @@
         "presence_penalty": 0.1,
         "frequency_penalty": 0.2,
         "repetition_penalty": 1.1,
-        "logit_bias": {
-          "671": 1
-        },
+        "logit_bias": {"671": 1},
         "min_tokens": 2,
         "stop_token_ids": [1],
         "ignore_eos": false,
@@ -3272,33 +1847,14 @@
           "output_ids": [295, 270, 12955, 67576, 3702, 4106, 94, 21757],
           "meta_info": {
             "id": "cfa340beb29a4116b9218be072f02690",
-            "finish_reason": {
-              "type": "length",
-              "length": 8
-            },
+            "finish_reason": {"type": "length", "length": 8},
             "prompt_tokens": 4,
             "weight_version": "default",
-            "num_retractions": 0,
             "reasoning_tokens": 0,
             "completion_tokens": 8,
             "cached_tokens": 0,
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 8
-              }
-            ],
-            "cached_tokens_details": null,
-            "dp_rank": null,
-            "e2e_latency": 0.12165453378111124,
-            "spec_accept_rate": 0.03333333333333333,
-            "spec_accept_length": 1.3333333333333333,
-            "spec_num_correct_drafts": 1,
-            "spec_num_proposed_drafts": 30,
-            "spec_verify_ct": 6,
-            "spec_correct_drafts_histogram": [5, 1],
-            "response_sent_to_client_ts": 1791354948.8175442
+            "weight_versions": [{"version": "default", "start": 0, "end": 8}],
+            "cached_tokens_details": null
           }
         }
       },
@@ -3308,26 +1864,16 @@
           "temperature": 0.7,
           "max_new_tokens": 8,
           "min_new_tokens": 2,
-          "stop": null,
           "stop_token_ids": [1],
-          "stop_regex": null,
           "top_p": 0.9,
           "top_k": 20,
           "min_p": 0.05,
           "presence_penalty": 0.1,
           "frequency_penalty": 0.2,
           "repetition_penalty": 1.1,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 1,
           "no_stop_trim": true,
-          "ignore_eos": false,
           "skip_special_tokens": false,
-          "logit_bias": {
-            "671": 1.0
-          },
-          "custom_params": null,
+          "logit_bias": {"671": 1.0},
           "sampling_seed": 7
         },
         "return_logprob": false,
@@ -3343,7 +1889,7 @@
         "body": {
           "id": "cfa340beb29a4116b9218be072f02690",
           "object": "text_completion",
-          "created": 1791354948,
+          "created": 1791414129,
           "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
           "choices": [
             {
@@ -3363,13 +1909,7 @@
           },
           "metadata": {
             "weight_version": "default",
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 8
-              }
-            ]
+            "weight_versions": [{"version": "default", "start": 0, "end": 8}]
           }
         }
       }
@@ -3377,9 +1917,7 @@
     {
       "name": "headers",
       "endpoint": "completions",
-      "headers": {
-        "x-smg-routing-key": "user-7"
-      },
+      "headers": {"x-smg-routing-key": "user-7"},
       "request": {
         "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
         "prompt": "Hello",
@@ -3393,62 +1931,20 @@
           "output_ids": [201, 1718, 3548, 1018],
           "meta_info": {
             "id": "308f53624d6846cc9ae6eeffb85a54ca",
-            "finish_reason": {
-              "type": "length",
-              "length": 4
-            },
+            "finish_reason": {"type": "length", "length": 4},
             "prompt_tokens": 1,
             "weight_version": "default",
-            "num_retractions": 0,
             "reasoning_tokens": 0,
             "completion_tokens": 4,
             "cached_tokens": 0,
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 4
-              }
-            ],
-            "cached_tokens_details": null,
-            "dp_rank": null,
-            "e2e_latency": 0.10072414111346006,
-            "spec_accept_rate": 0.13333333333333333,
-            "spec_accept_length": 1.3333333333333333,
-            "spec_num_correct_drafts": 2,
-            "spec_num_proposed_drafts": 15,
-            "spec_verify_ct": 3,
-            "spec_correct_drafts_histogram": [2, 0, 1],
-            "response_sent_to_client_ts": 1791354948.9213428
+            "weight_versions": [{"version": "default", "start": 0, "end": 4}],
+            "cached_tokens_details": null
           }
         }
       },
       "generate": {
         "text": "Hello",
-        "sampling_params": {
-          "temperature": 0.0,
-          "max_new_tokens": 4,
-          "min_new_tokens": 0,
-          "stop": null,
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 1,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 4},
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -3460,7 +1956,7 @@
         "body": {
           "id": "308f53624d6846cc9ae6eeffb85a54ca",
           "object": "text_completion",
-          "created": 1791354948,
+          "created": 1791414129,
           "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
           "choices": [
             {
@@ -3480,13 +1976,7 @@
           },
           "metadata": {
             "weight_version": "default",
-            "weight_versions": [
-              {
-                "version": "default",
-                "start": 0,
-                "end": 4
-              }
-            ]
+            "weight_versions": [{"version": "default", "start": 0, "end": 4}]
           }
         }
       }
@@ -3502,30 +1992,7 @@
       },
       "generate": {
         "text": "Hello",
-        "sampling_params": {
-          "temperature": 1.0,
-          "max_new_tokens": 16,
-          "min_new_tokens": 0,
-          "stop": null,
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 1,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "sampling_params": {},
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -3552,30 +2019,7 @@
       },
       "generate": {
         "input_ids": [1000],
-        "sampling_params": {
-          "temperature": 0.0,
-          "max_new_tokens": 2000000,
-          "min_new_tokens": 0,
-          "stop": null,
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 1,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 2000000},
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -3617,30 +2061,7 @@
       },
       "generate": {
         "input_ids": [1000],
-        "sampling_params": {
-          "temperature": 0.0,
-          "max_new_tokens": 2000000,
-          "min_new_tokens": 0,
-          "stop": null,
-          "stop_token_ids": null,
-          "stop_regex": null,
-          "top_p": 1.0,
-          "top_k": -1,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "frequency_penalty": 0.0,
-          "repetition_penalty": 1.0,
-          "regex": null,
-          "json_schema": null,
-          "ebnf": null,
-          "n": 1,
-          "no_stop_trim": false,
-          "ignore_eos": false,
-          "skip_special_tokens": true,
-          "logit_bias": null,
-          "custom_params": null,
-          "sampling_seed": null
-        },
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 2000000},
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -3659,34 +2080,116 @@
       }
     },
     {
-      "name": "zero_max_tokens",
+      "name": "abort_stream_n2",
       "endpoint": "completions",
-      "unsupported": true,
+      "synthetic": true,
       "request": {
         "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
         "prompt": "Hi",
-        "max_tokens": 0
+        "n": 2,
+        "max_tokens": 4,
+        "temperature": 0,
+        "stream": true,
+        "stream_options": {"include_usage": true}
+      },
+      "engine": {
+        "status": 200,
+        "frames": [
+          {
+            "index": 0,
+            "text": " there",
+            "output_ids": [1],
+            "meta_info": {
+              "id": "r",
+              "finish_reason": null,
+              "prompt_tokens": 2,
+              "weight_version": "default",
+              "reasoning_tokens": 0,
+              "completion_tokens": 1,
+              "cached_tokens": 0
+            }
+          },
+          {
+            "index": 1,
+            "text": "",
+            "output_ids": [],
+            "meta_info": {
+              "id": "r",
+              "finish_reason": {"type": "abort", "message": "Out of memory.", "status_code": 503},
+              "prompt_tokens": 2,
+              "weight_version": "default",
+              "reasoning_tokens": 0,
+              "completion_tokens": 0,
+              "cached_tokens": 0
+            }
+          },
+          {
+            "index": 0,
+            "text": " there!",
+            "output_ids": [1, 2],
+            "meta_info": {
+              "id": "r",
+              "finish_reason": {"type": "length", "length": 4},
+              "prompt_tokens": 2,
+              "weight_version": "default",
+              "reasoning_tokens": 0,
+              "completion_tokens": 2,
+              "cached_tokens": 0
+            }
+          }
+        ]
+      },
+      "generate": {
+        "text": "Hi",
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 4, "n": 2},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_text_in_logprobs": true,
+        "stream": true
+      },
+      "openai": {
+        "events": [
+          "data: {\"id\":\"r\",\"object\":\"text_completion\",\"created\":1791414129,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[{\"index\":0,\"text\":\" there\",\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}\n\n",
+          "data: {\"error\": {\"object\": \"error\", \"message\": \"Out of memory.\", \"type\": \"SERVICE_UNAVAILABLE\", \"param\": null, \"code\": 503}}\n\n",
+          "data: {\"id\":\"r\",\"object\":\"text_completion\",\"created\":1791414129,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"total_tokens\":3,\"completion_tokens\":1,\"reasoning_tokens\":0}}\n\n",
+          "data: [DONE]\n\n"
+        ]
       }
+    },
+    {
+      "name": "zero_max_tokens",
+      "endpoint": "completions",
+      "unsupported": true,
+      "request": {"model": "deepseek-ai/DeepSeek-V4-Flash-0731", "prompt": "Hi", "max_tokens": 0}
     },
     {
       "name": "hidden_states",
       "endpoint": "completions",
       "unsupported": true,
-      "request": {
-        "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
-        "prompt": "Hi",
-        "return_hidden_states": true
-      }
+      "request": {"model": "deepseek-ai/DeepSeek-V4-Flash-0731", "prompt": "Hi", "return_hidden_states": true}
     },
     {
       "name": "string_number",
       "endpoint": "completions",
       "unsupported": true,
+      "request": {"model": "deepseek-ai/DeepSeek-V4-Flash-0731", "prompt": "Hi", "max_tokens": "8"}
+    },
+    {
+      "name": "json_schema_not_a_format",
+      "endpoint": "completions",
+      "unsupported": true,
       "request": {
         "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
         "prompt": "Hi",
-        "max_tokens": "8"
+        "response_format": {"type": "json_object", "json_schema": 123}
       }
+    },
+    {
+      "name": "null_hidden_states",
+      "endpoint": "completions",
+      "unsupported": true,
+      "request": {"model": "deepseek-ai/DeepSeek-V4-Flash-0731", "prompt": "Hi", "return_hidden_states": null}
     }
   ],
   "generate_defaults": {
@@ -3758,5 +2261,29 @@
     "token_indices_to_pool": null,
     "cache_salt": null,
     "kv_hints": null
+  },
+  "sampling_defaults": {
+    "temperature": 1.0,
+    "max_new_tokens": 16,
+    "min_new_tokens": 0,
+    "stop": null,
+    "stop_token_ids": null,
+    "stop_regex": null,
+    "top_p": 1.0,
+    "top_k": -1,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "repetition_penalty": 1.0,
+    "regex": null,
+    "json_schema": null,
+    "ebnf": null,
+    "n": 1,
+    "no_stop_trim": false,
+    "ignore_eos": false,
+    "skip_special_tokens": true,
+    "logit_bias": null,
+    "custom_params": null,
+    "sampling_seed": null
   }
 }

@@ -130,7 +130,8 @@ impl PreparedRequest {
             body,
             tokens,
             caller_set_rid: fields.caller_set_rid,
-            fans_out: requests_multiple_samples(&fields, &sampling_defaults),
+            fans_out: requests_multiple_samples(&fields, &sampling_defaults)
+                || (path == COMPLETIONS_PATH && fields.prompt_batch),
             input_ids_forwarding: forwarding,
             forwarding_booked: false,
             parsed_body,
@@ -585,6 +586,8 @@ pub(super) struct RoutingFields {
     sampling: [SamplingValue; SamplingField::ALL.len()],
     // Preserve both string and list IDs without retaining their contents.
     caller_set_rid: bool,
+    /// A completions `prompt` listing several prompts, as strings or id lists.
+    prompt_batch: bool,
 }
 
 /// Null is absent; unrepresentable values are rejected only under a sampling contract.
@@ -718,6 +721,7 @@ enum RequestKey {
     Routing(RoutingKey),
     Sampling(SamplingField),
     Rid,
+    Prompt,
     Other,
 }
 
@@ -738,6 +742,7 @@ impl<'de> Deserialize<'de> for RequestKey {
                     "max_tokens" => RequestKey::Routing(RoutingKey::MaxTokens),
                     "max_completion_tokens" => RequestKey::Routing(RoutingKey::MaxCompletionTokens),
                     "rid" => RequestKey::Rid,
+                    "prompt" => RequestKey::Prompt,
                     other => match SamplingField::from_wire_name(other) {
                         Some(field) => RequestKey::Sampling(field),
                         None => RequestKey::Other,
@@ -797,6 +802,11 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                 }
                 RequestKey::Rid => {
                     fields.caller_set_rid = map.next_value::<Option<IgnoredAny>>()?.is_some();
+                }
+                RequestKey::Prompt => {
+                    let prompt = map.next_value::<Value>()?;
+                    fields.prompt_batch =
+                        prompt.get(0).is_some_and(|p| p.is_string() || p.is_array());
                 }
                 RequestKey::Other => {
                     // Validate unrelated JSON without retaining its contents.

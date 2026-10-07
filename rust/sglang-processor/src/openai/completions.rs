@@ -47,7 +47,9 @@ struct CompletionRequest {
     top_p: f64,
     #[allow(dead_code)]
     user: Option<String>,
-    return_hidden_states: Option<Value>,
+    // A default rather than `Option`, so an explicit `null`, which Python rejects, is not `false`.
+    #[serde(default = "false_value")]
+    return_hidden_states: Value,
     #[serde(default)]
     return_routed_experts: bool,
     #[serde(default)]
@@ -117,6 +119,9 @@ fn minus_one() -> i64 {
 fn yes() -> bool {
     true
 }
+fn false_value() -> Value {
+    Value::Bool(false)
+}
 
 #[derive(Deserialize, serde::Serialize)]
 #[serde(untagged)]
@@ -140,12 +145,20 @@ struct StreamOptions {
     continuous_usage_stats: Option<bool>,
 }
 
+/// Python validates `json_schema` whatever the `type`.
 #[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ResponseFormat {
+struct ResponseFormat {
+    #[serde(rename = "type")]
+    kind: FormatKind,
+    json_schema: Option<JsonSchemaFormat>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FormatKind {
     Text,
     JsonObject,
-    JsonSchema { json_schema: JsonSchemaFormat },
+    JsonSchema,
 }
 
 #[derive(Deserialize)]
@@ -180,10 +193,7 @@ pub fn lower_completion(
     {
         return Err(Unsupported("invalid_request"));
     }
-    if request
-        .return_hidden_states
-        .as_ref()
-        .is_some_and(|v| v != false)
+    if request.return_hidden_states != false
         || request.return_routed_experts
         || request.return_cached_tokens_details
         || request.return_spec_tokens_details
@@ -198,17 +208,23 @@ pub fn lower_completion(
     }
     // A `structural_tag` format fails to parse above, so it goes to the engine.
     match &request.response_format {
-        Some(ResponseFormat::JsonSchema { json_schema }) => {
+        Some(ResponseFormat {
+            kind: FormatKind::JsonSchema,
+            json_schema,
+        }) => {
             let schema = json_schema
-                .schema
-                .clone()
+                .as_ref()
+                .and_then(|format| format.schema.clone())
                 .ok_or(Unsupported("invalid_request"))?;
             request.json_schema = Some(python_json(&Value::Object(schema)));
         }
-        Some(ResponseFormat::JsonObject) => {
+        Some(ResponseFormat {
+            kind: FormatKind::JsonObject,
+            ..
+        }) => {
             request.json_schema = Some(r#"{"type": "object"}"#.into());
         }
-        Some(ResponseFormat::Text) | None => {}
+        Some(_) | None => {}
     }
     if request.routed_dp_rank.is_none() {
         request.routed_dp_rank = request.data_parallel_rank;
@@ -403,6 +419,7 @@ struct StreamState {
     started: bool,
     stopped: bool,
     failed: bool,
+    done: bool,
     last_id: Value,
     text_offsets: HashMap<u64, usize>,
     logprob_counts: HashMap<u64, usize>,
@@ -473,24 +490,36 @@ impl CompletionResponder {
     /// One `/generate` SSE `data:` payload, as `_generate_completion_stream`
     /// handles it. `Err` replaces the whole stream, before anything was sent.
     pub fn stream_data(&mut self, data: &[u8]) -> Result<Vec<String>, Reply> {
+        if self.stream.done {
+            return Ok(Vec::new());
+        }
         if data == b"[DONE]" {
             return Ok(self.stream_end());
-        }
-        if self.stream.stopped || self.stream.failed {
-            return Ok(Vec::new());
         }
         let Ok(content) = serde_json::from_slice::<Value>(data) else {
             return Ok(Vec::new());
         };
+        let mut events = Vec::new();
         if let Some(message) = content.pointer("/error/message").and_then(Value::as_str) {
             if !self.stream.started {
                 return Err(error_reply(message, "BadRequestError", 400));
             }
             self.stream.failed = true;
-            return Ok(vec![stream_error_event(message, "BadRequestError", 400)]);
+            events.push(stream_error_event(message, "BadRequestError", 400));
+        } else {
+            self.stream.started = true;
+            events.extend(self.stream_chunk(&content));
         }
-        self.stream.started = true;
-        Ok(self.stream_chunk(&content).into_iter().collect())
+        // Python ends the stream here, without waiting for the other choices.
+        if self.stream.stopped || self.stream.failed {
+            events.extend(self.stream_end());
+        }
+        Ok(events)
+    }
+
+    /// Whether the stream has ended; later `/generate` frames are ignored.
+    pub fn done(&self) -> bool {
+        self.stream.done
     }
 
     fn stream_chunk(&mut self, content: &Value) -> Option<String> {
@@ -631,6 +660,7 @@ impl CompletionResponder {
     }
 
     fn stream_end(&mut self) -> Vec<String> {
+        self.stream.done = true;
         let mut events = Vec::new();
         let state = &self.stream;
         if self.include_usage && !state.failed && state.started {

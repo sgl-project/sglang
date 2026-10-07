@@ -52,18 +52,24 @@ pub(super) async fn respond(
         }
     }
     // The pump's terminal error still ends the converted stream as an error.
-    let rest = frames.flat_map(move |frame| {
-        let events = match frame {
-            Ok(data) => responder.stream_data(&data).unwrap_or_default(),
-            Err(error) => return stream::iter(vec![Err(error)]),
-        };
-        stream::iter(
-            events
+    // Once the OpenAI stream ends, dropping `frames` closes the upstream, which
+    // aborts the engine's other choices as Python does.
+    let pending = (!responder.done()).then_some((frames, responder));
+    let rest = stream::unfold(pending, |pending| async move {
+        let (mut frames, mut responder) = pending?;
+        let events = match frames.next().await? {
+            Ok(data) => responder
+                .stream_data(&data)
+                .unwrap_or_default()
                 .into_iter()
                 .map(|e| Ok(Bytes::from(e)))
-                .collect::<Vec<_>>(),
-        )
-    });
+                .collect(),
+            Err(error) => vec![Err(error)],
+        };
+        let pending = (!responder.done()).then_some((frames, responder));
+        Some((stream::iter(events), pending))
+    })
+    .flatten();
     let events = stream::iter(first.into_iter().map(|e| Ok(Bytes::from(e))))
         .chain(stream::iter(failed.map(Err)))
         .chain(rest);

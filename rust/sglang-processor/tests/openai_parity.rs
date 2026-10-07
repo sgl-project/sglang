@@ -56,8 +56,7 @@ fn fixtures_match_sglang() {
         let settings: OpenAiSettings = serde_json::from_value(fixture["settings"].clone()).unwrap();
         let mut skipped = 0;
         for case in fixture["cases"].as_array().unwrap() {
-            let defaults = &fixture["generate_defaults"];
-            match check_case(case, defaults, &settings, tokenizer.clone()) {
+            match check_case(case, &fixture, &settings, tokenizer.clone()) {
                 Ok(true) => {}
                 Ok(false) => skipped += 1,
                 Err(error) => panic!("{model} {}: {error}", case["name"]),
@@ -71,7 +70,7 @@ fn fixtures_match_sglang() {
 
 fn check_case(
     case: &Value,
-    defaults: &Value,
+    fixture: &Value,
     settings: &OpenAiSettings,
     tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
 ) -> Result<bool, String> {
@@ -93,7 +92,7 @@ fn check_case(
         (Err(reason), _) => return Err(format!("unsupported: {reason:?}")),
         (Ok(lowered), _) => lowered,
     };
-    let generate = without_defaults(generate, defaults);
+    let generate = without_defaults(generate, fixture);
     if generate != case["generate"] {
         return Err(format!("/generate body differs:\n{generate:#}"));
     }
@@ -154,17 +153,16 @@ fn check_case(
     Ok(true)
 }
 
-/// The fields Python set away from `GenerateReqInput`'s defaults.
-fn without_defaults(body: Value, defaults: &Value) -> Value {
-    let Value::Object(fields) = body else {
+/// The fields Python set away from `GenerateReqInput`'s and a bare request's sampling defaults.
+fn without_defaults(body: Value, fixture: &Value) -> Value {
+    let Value::Object(mut fields) = body else {
         unreachable!()
     };
-    Value::Object(
-        fields
-            .into_iter()
-            .filter(|(name, value)| defaults.get(name) != Some(value))
-            .collect(),
-    )
+    fields.retain(|name, value| fixture["generate_defaults"].get(name) != Some(value));
+    if let Some(Value::Object(params)) = fields.get_mut("sampling_params") {
+        params.retain(|name, value| fixture["sampling_defaults"].get(name) != Some(value));
+    }
+    Value::Object(fields)
 }
 
 fn reply_json(status: u16, body: &str) -> Value {
