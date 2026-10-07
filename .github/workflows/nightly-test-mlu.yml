@@ -10,20 +10,13 @@ on:
         required: false
         type: string
         default: ""
-  workflow_call:
-    inputs:
-      ref:
-        description: "Git ref (branch, tag, or SHA) to test. If not provided, uses the current ref."
-        required: false
-        type: string
-        default: ""
 
 permissions:
   contents: read
 
 concurrency:
   group: nightly-test-mlu-${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  cancel-in-progress: true
 
 jobs:
   nightly-test-mlu:
@@ -38,31 +31,23 @@ jobs:
       labels: mlu-nightly
     timeout-minutes: 480
     steps:
+      # Fetch the helper from the trusted workflow commit, never the PR/test ref.
+      - name: Checkout MLU CI helper
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          path: mlu-ci-workflow
+          persist-credentials: false
+          sparse-checkout: scripts/ci/utils/resolve_mlu_ci_ref.sh
+          sparse-checkout-cone-mode: false
       - name: Resolve MLU CI ref to commit SHA
         id: resolve-ref
         env:
           INPUT_REF: ${{ inputs.ref }}
           DEFAULT_SHA: ${{ github.sha }}
           REPO_URL: ${{ format('{0}/{1}.git', github.server_url, github.repository) }}
-        run: |
-          if [[ -z "${INPUT_REF}" ]]; then
-            resolved_sha="${DEFAULT_SHA}"
-          elif [[ "${INPUT_REF}" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            resolved_sha="${INPUT_REF}"
-          else
-            resolved_sha="$(git ls-remote "${REPO_URL}" "refs/heads/${INPUT_REF}" | cut -f1)"
-            if [[ -z "${resolved_sha}" ]]; then
-              resolved_sha="$(git ls-remote "${REPO_URL}" "refs/tags/${INPUT_REF}^{}" | cut -f1)"
-            fi
-            if [[ -z "${resolved_sha}" ]]; then
-              resolved_sha="$(git ls-remote "${REPO_URL}" "refs/tags/${INPUT_REF}" | cut -f1)"
-            fi
-            if [[ -z "${resolved_sha}" ]]; then
-              echo "::error::Could not resolve Git ref '${INPUT_REF}' in ${REPO_URL}"; exit 1
-            fi
-          fi
-          echo "Resolved ${INPUT_REF} to ${resolved_sha}"
-          echo "commit_sha=${resolved_sha}" >> "${GITHUB_OUTPUT}"
+        run: bash mlu-ci-workflow/scripts/ci/utils/resolve_mlu_ci_ref.sh
       - name: Submit nightly MLU CI task to Cambricon Runner
         env:
           SGLANG_MLU_CI_REPO_NAME: sglang
