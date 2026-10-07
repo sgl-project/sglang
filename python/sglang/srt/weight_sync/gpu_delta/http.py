@@ -10,8 +10,10 @@ from fastapi.responses import ORJSONResponse
 from sglang.srt.utils.auth import AuthLevel, auth_level
 from sglang.srt.weight_sync.gpu_delta.io import (
     AbortWeightsFromDeltaReqInput,
+    ClearWeightsDeltaStateReqInput,
     GetWeightsDeltaInfoReqInput,
     GetWeightsDeltaStatusReqInput,
+    LoadWeightsFromDeltaReqInput,
     PrepareWeightsFromDeltaReqInput,
     ResumeWeightsFromDeltaReqInput,
     UpdateWeightsFromDeltaReqInput,
@@ -27,6 +29,20 @@ def register_gpu_delta_routes(app: FastAPI, get_global_state: Callable):
             content,
             status_code=HTTPStatus.OK if content["success"] else HTTPStatus.CONFLICT,
         )
+
+    @app.post("/load_weights_from_delta")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
+    async def load_weights_from_delta(
+        obj: Annotated[LoadWeightsFromDeltaReqInput, Body()],
+    ):
+        return await dispatch(obj)
+
+    @app.post("/clear_weights_delta_state")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
+    async def clear_weights_delta_state(
+        obj: Annotated[ClearWeightsDeltaStateReqInput, Body()],
+    ):
+        return await dispatch(obj)
 
     @app.post("/get_weights_delta_info")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)

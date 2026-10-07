@@ -5,6 +5,20 @@ from typing import Any, Dict, List
 from sglang.srt.managers.io_struct import BaseReq, hook_custom_types
 
 
+class LoadWeightsFromDeltaReqInput(BaseReq, kw_only=True):
+    manifest_path: str
+    release_state: bool = True
+
+
+class ClearWeightsDeltaStateReqInput(BaseReq, kw_only=True):
+    pass
+
+
+class ReleaseWeightsDeltaCacheReqInput(BaseReq, kw_only=True):
+    # Internal second phase, sent only after every rank has closed its resources.
+    owner_rank_ids: List[str]
+
+
 class GetWeightsDeltaInfoReqInput(BaseReq, kw_only=True):
     engine_id: str
 
@@ -44,6 +58,9 @@ class DeltaWeightsReqOutput(BaseReq, kw_only=True):
 
 # Register before tokenizer/scheduler/DP-controller receive loops start.
 hook_custom_types(
+    LoadWeightsFromDeltaReqInput,
+    ClearWeightsDeltaStateReqInput,
+    ReleaseWeightsDeltaCacheReqInput,
     GetWeightsDeltaInfoReqInput,
     PrepareWeightsFromDeltaReqInput,
     GetWeightsDeltaStatusReqInput,

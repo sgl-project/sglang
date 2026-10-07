@@ -51,7 +51,11 @@ def test_describe_binds_published_scheduler_ranks(monkeypatch):
         def make_backend(model_runner, identity):
             assert model_runner is runner
             backends.append(identity.copy())
-            return SimpleNamespace(describe=lambda: plan)
+            return SimpleNamespace(
+                describe=lambda: plan,
+                host_arena=SimpleNamespace(directory=None),
+                close=lambda: None,
+            )
 
         monkeypatch.setitem(
             sys.modules,
@@ -102,6 +106,12 @@ def test_describe_binds_published_scheduler_ranks(monkeypatch):
         assert control._describe("engine-0") == receipt
         assert len(backends) == 1
         assert cache_engines == ["engine-0"]
+        control.session.version = 7
+        assert control.session.clear()["version"] == 7
+        control.session.release_cache(owner=True)
+        fresh = control._describe("unused-new-engine-name")
+        assert fresh["identity"] == receipt["identity"] and fresh["version"] == 7
+        assert len(backends) == 2 and cache_engines == ["engine-0"]
         control.session._executor.shutdown(wait=True)
     finally:
         reset_context()

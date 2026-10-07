@@ -357,8 +357,6 @@ class PreparedDelta:
         plan_started = time.perf_counter()
         validate_codec(manifest)
         self.codec = manifest["codec"]
-        if manifest["target_version"] != manifest["base_version"] + 1:
-            raise ValueError("direct deltas require one consecutive version transition")
         self.target_version = manifest["target_version"]
         entries, reused_plan = _qualify_canonical_plan(backend, manifest)
         self.timings["host_plan_validate_s"] = time.perf_counter() - plan_started

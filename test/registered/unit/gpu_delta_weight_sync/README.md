@@ -35,7 +35,7 @@ The rank layout digest binds these contracts and the canonical tensor views.
 The artificial independent mapping in the CPU suite tests the extension boundary,
 not a newly qualified model.
 
-One Miles coordinator exclusively owns these engines' model updates, pause/resume,
+One coordinator exclusively owns these engines' model updates, pause/resume,
 memory residency and topology for the stream's lifetime. Mixing another weight
 updater or administrative mutation into the same engine is unsupported. Ordinary
 APIs retain their existing behavior; this feature does not intercept them to
@@ -55,6 +55,41 @@ python -m pytest -q test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_la
 python -m pytest -q test/manual/gpu_delta/test_codec.py
 python -m pytest -q test/manual/gpu_delta/test_host_cuda.py
 ```
+
+For a standalone deployment, start the engine from the same immutable HF base
+and compatible canonical layout used by the saved base-relative publication.
+Keep it out of routing until the load succeeds. The path must be visible to every
+rank; the loader reads the manifest's codec, plan, stream and target version and
+uses fresh participant identities, not trainer-era process IDs.
+
+```bash
+curl -f -X POST http://localhost:30000/load_weights_from_delta \
+  -H 'Content-Type: application/json' \
+  -d '{"manifest_path":"/checkpoints/step-100/gpu-delta/manifest.json"}'
+curl -f -X POST http://localhost:30000/clear_weights_delta_state \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+`load_weights_from_delta` requires `manifest_path` and committed base
+version 0. It supports a direct HF-base 0→V jump using existing describe, prepare,
+status, apply and resume controls internally. Successful load clears delta
+resources by default. Miles recovery passes `release_state=false` to retain the
+backend for following normal updates; the standalone path-only request keeps the
+default. The second endpoint also clears a separately managed update session.
+Neither endpoint changes model weights during cleanup. An uncertain
+apply/resume remains paused and requires restart; the loader never retries XOR or
+aborts after dispatching apply. A deployment must supply the actual HF base:
+matching names/shapes or dummy weights do not establish base-byte correctness.
+
+Clear is allowed only while idle or after successful resume. It joins each rank's
+FIFO host-release work, closes payload workers/private DE host allocations, and
+drops decoder, stream and planning objects. Only after every rank acknowledges
+closure does one process per engine-host remove its shared encoded-cache cohort
+directory. Source publications and inference weights remain; committed version,
+process identity and small publication provenance survive. A later describe
+lazily recreates the backend at that version, so clearing cannot turn updated
+weights into version 0. Framework allocator/JIT caches are left alone. These
+endpoints use the same exclusive-controller contract as ordinary GPU-delta updates.
 
 Layout algebra, allocator admission, protocol and session tests run in the
 existing `base-a-test-cpu` suite. The CUDA layout test runs in

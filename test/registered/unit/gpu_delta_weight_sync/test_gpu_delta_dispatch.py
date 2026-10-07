@@ -52,8 +52,12 @@ def test_update_owns_pause_fence_retract_and_resume_order(monkeypatch):
         who,
         SimpleNamespace(
             prepare=lambda *args: SimpleNamespace(
-                apply=apply, close=lambda: None, release_and_close=lambda: None
-            )
+                apply=apply,
+                close=lambda: None,
+                release_and_close=lambda: events.append("release"),
+            ),
+            host_arena=SimpleNamespace(directory=None),
+            close=lambda: events.append("close"),
         ),
     )
     try:
@@ -79,7 +83,15 @@ def test_update_owns_pause_fence_retract_and_resume_order(monkeypatch):
         assert result.success and events == ["fence", "retract", "flush", "apply"]
         result = wrapped(io.ResumeWeightsFromDeltaReqInput(session_id="p"))
         assert result.success and result.participant["state"] == "RESUMED"
-        assert events[-2:] == [("version", "1"), "resume"]
+        assert events[4:6] == [("version", "1"), "resume"]
+        assert not scheduler._engine_paused
+        cleared = wrapped(io.ClearWeightsDeltaStateReqInput())
+        assert cleared.success and cleared.participant["version"] == 1
+        assert events[6:] == ["release", "close"]
+        released = wrapped(
+            io.ReleaseWeightsDeltaCacheReqInput(owner_rank_ids=["original"])
+        )
+        assert released.success and released.participant["state"] == "CLEARED"
         assert not scheduler._engine_paused
     finally:
         session._executor.shutdown(wait=True)

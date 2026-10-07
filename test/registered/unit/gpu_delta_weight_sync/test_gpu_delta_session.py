@@ -47,6 +47,11 @@ class Backend:
         self.started = threading.Event()
         self.ready = threading.Event()
         self.error = None
+        self.host_arena = SimpleNamespace(directory=None)
+        self.closed = False
+
+    def close(self):
+        self.closed = True
 
     def prepare(self, *args):
         self.started.set()
@@ -96,12 +101,12 @@ def make_session():
     def make(who=None, backend=None):
         backend = backend or Backend()
         session = DeltaSession(who or identity(), backend)
-        instances.append(session)
+        instances.append((session, backend))
         return session, backend
 
     yield make
-    for session in instances:
-        session.backend.ready.set()
+    for session, backend in instances:
+        backend.ready.set()
         session._executor.shutdown(wait=True)
 
 
@@ -355,3 +360,80 @@ def test_late_reply_after_cancellation_cannot_acknowledge_resume():
         assert (await resume)[0].state == "RESUMED"
 
     asyncio.run(scenario())
+
+
+def test_clear_drains_release_before_private_close_and_shared_unlink(
+    make_session, tmp_path
+):
+    session, backend = make_session()
+    directory = tmp_path / "own-stream-cache"
+    directory.mkdir()
+    (directory / "state.json").write_text("READY")
+    source = tmp_path / "immutable-publication"
+    source.write_bytes(b"retained")
+    backend.host_arena.directory = directory
+    req = request([session.identity]) | dict(target_version=7)
+    applied(session, backend, req)
+    entered, release = threading.Event(), threading.Event()
+
+    def cleanup():
+        entered.set()
+        assert release.wait(5)
+        assert not backend.closed
+        assert (directory / "state.json").read_text() == "READY"
+        backend.payload.release_and_close_original()
+
+    backend.payload.release_and_close_original = backend.payload.release_and_close
+    backend.payload.release_and_close = cleanup
+    session.resume(lambda version: None)
+    assert entered.wait(2)
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(1) as pool:
+        clearing = pool.submit(session.clear)
+        try:
+            assert not clearing.done()
+            assert not backend.closed and directory.exists()
+        finally:
+            release.set()
+        receipt = clearing.result(timeout=2)
+    assert receipt["state"] == "CLEARED" and receipt["version"] == 7
+    assert receipt["target_version"] == 7 and receipt["identity"] == session.identity
+    assert backend.closed and backend.payload.closed.is_set()
+    assert session.backend is None and session._session is None
+    # Closing all rank-local resources does not itself unlink the shared cache.
+    assert directory.exists()
+    session.release_cache(owner=True)
+    assert not directory.exists() and source.read_bytes() == b"retained"
+    assert session.clear()["version"] == 7
+    session.release_cache(owner=True)
+    with pytest.raises(ValueError, match="base version"):
+        session.prepare(request([session.identity]))
+
+
+@pytest.mark.parametrize(
+    "state", ["PREPARING", "PREPARED", "APPLYING", "APPLIED", "POISONED", "RESUMING"]
+)
+def test_clear_cannot_discard_an_unsettled_update(make_session, state):
+    session, backend = make_session()
+    prepare_ready(session, backend)
+    session._session.state = state
+    with pytest.raises(ValueError, match="idle or resumed"):
+        session.clear()
+    assert not backend.closed and session.backend is backend
+    assert not backend.payload.closed.is_set()
+
+
+def test_clear_surfaces_failed_async_release_before_backend_close(make_session):
+    session, backend = make_session()
+    applied(session, backend)
+
+    def fail_release():
+        raise OSError("state release failed")
+
+    backend.payload.release_and_close = fail_release
+    session.resume(lambda _: None)
+    with pytest.raises(OSError, match="state release failed"):
+        session.clear()
+    assert session.version == 1 and not backend.closed
+    assert session.backend is backend

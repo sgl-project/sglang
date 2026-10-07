@@ -530,8 +530,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             codec="lz4-zstd",
             frame_bytes=1 << 20,
             base_version=0,
-            target_version=1,
+            target_version=7,
         )
+        # A saved HF-base delta may jump directly to a later committed version.
         refs = []
         parse = layout.orjson.loads
 

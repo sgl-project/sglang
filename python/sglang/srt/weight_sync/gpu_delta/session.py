@@ -1,6 +1,6 @@
-"""Ordered control plane for the Miles-owned GPU delta receiver.
+"""Ordered control plane for an exclusively owned GPU delta receiver.
 
-Miles owns these engines from startup through disposal and sends ordered controls.
+A Miles coordinator or standalone loader sends ordered controls.
 Concurrent administration, retries, and arbitrary API sequences are unsupported.
 Preparation owns immutable buffers; update pauses, fences readers, retracts, then mutates on the
 scheduler thread. Failed or ambiguous updates require restart, never XOR retry.
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import socket
 import threading
 import time
@@ -69,7 +70,7 @@ class _Session:
 
 
 class DeltaSession:
-    """One original process following the Miles prepare/apply/resume sequence.
+    """One original process following the prepare/apply/resume sequence.
 
     ``prepare`` owns immutable host inputs, small GPU metadata/workspace and CPU
     plans. ``apply`` allocates large decoded slots after the reader fence, joins
@@ -82,6 +83,9 @@ class DeltaSession:
         self.backend = backend
         self.version = initial_version
         self._session: _Session | None = None
+        self._provenance = {}
+        self._release_future = None
+        self._closed_cache = None
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="gpu-delta"
@@ -90,6 +94,13 @@ class DeltaSession:
     def status(self) -> dict:
         with self._lock:
             session = self._session
+            if session is None:
+                return {
+                    "identity": self.identity,
+                    "state": "CLEARED" if self.backend is None else "IDLE",
+                    "version": self.version,
+                    **self._provenance,
+                }
             request = session.request
             return {
                 "identity": self.identity,
@@ -198,7 +209,7 @@ class DeltaSession:
             prepared, session.prepared = session.prepared, None
             # Keep host release I/O off the scheduler; this FIFO executor runs
             # it before the next prepare. Miles sends resume after every rank applied.
-            self._executor.submit(prepared.release_and_close)
+            self._release_future = self._executor.submit(prepared.release_and_close)
             return self.status()
 
     def abort(self, session_id: str) -> dict:
@@ -216,6 +227,54 @@ class DeltaSession:
                 self._executor.submit(prepared.close)
             return self.status()
 
+    def clear(self) -> dict:
+        with self._lock:
+            if self._session is not None and self._session.state != "RESUMED":
+                raise ValueError("delta state can only be cleared when idle or resumed")
+        # Do not hold the session lock while joining its background worker. The
+        # queued resume release must finish before closing the arena or unlinking
+        # the shared READY state that other ranks' releases still need.
+        self._executor.shutdown(wait=True)
+        if self._release_future is not None:
+            self._release_future.result()
+        if self.backend is not None:
+            self._closed_cache = self.backend.host_arena.directory
+            self.backend.close()
+            self.backend = None
+        with self._lock:
+            if self._session is not None:
+                self._provenance = {
+                    key: self._session.request[key]
+                    for key in (
+                        "session_id",
+                        "manifest_sha256",
+                        "stream_id",
+                        "base_version",
+                        "target_version",
+                        "plan_digest",
+                    )
+                }
+            self._session = None
+            self._release_future = None
+            return self.status()
+
+    def release_cache(self, owner: bool) -> dict:
+        # The tokenizer sends this only after the all-rank clear barrier. One
+        # process per engine-host removes the shared cohort directory, never the
+        # source publication or another engine's cache.
+        if self.backend is not None:
+            raise ValueError("delta resources must be closed before cache removal")
+        if owner and self._closed_cache is not None:
+            shutil.rmtree(self._closed_cache)
+        self._closed_cache = None
+        return self.status()
+
+    def attach_backend(self, backend) -> None:
+        self.backend = backend
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="gpu-delta"
+        )
+
 
 def with_gpu_delta_controls(scheduler, dispatcher):
     """Register only delta requests; ordinary handlers remain unchanged."""
@@ -225,6 +284,8 @@ def with_gpu_delta_controls(scheduler, dispatcher):
     dispatcher += TypeBasedDispatcher(
         [
             (delta_io.GetWeightsDeltaInfoReqInput, control.handle),
+            (delta_io.ClearWeightsDeltaStateReqInput, control.handle),
+            (delta_io.ReleaseWeightsDeltaCacheReqInput, control.handle),
             (delta_io.PrepareWeightsFromDeltaReqInput, control.handle),
             (delta_io.GetWeightsDeltaStatusReqInput, control.handle),
             (delta_io.UpdateWeightsFromDeltaReqInput, control.handle),
@@ -299,9 +360,15 @@ class GpuDeltaSchedulerControl:
             }
             backend = GpuDeltaBackend(runner, identity)
             self.session = DeltaSession(identity, backend)
+        elif self.session.backend is None:
+            from sglang.srt.weight_sync.gpu_delta.layout import GpuDeltaBackend
+
+            if self.session._closed_cache is not None:
+                raise ValueError("delta cache removal has not completed")
+            self.session.attach_backend(GpuDeltaBackend(runner, self.session.identity))
         return {
             "identity": self.session.identity,
-            "state": "IDLE",
+            "state": self.session.status()["state"],
             "version": self.session.version,
             "plan": self.session.backend.describe(),
         }
@@ -312,6 +379,20 @@ class GpuDeltaSchedulerControl:
         try:
             if isinstance(request, delta_io.GetWeightsDeltaInfoReqInput):
                 receipt = self._describe(request.engine_id)
+            elif isinstance(request, delta_io.ClearWeightsDeltaStateReqInput):
+                receipt = (
+                    self.session.clear()
+                    if self.session is not None
+                    else {"identity": None, "state": "CLEARED"}
+                )
+            elif isinstance(request, delta_io.ReleaseWeightsDeltaCacheReqInput):
+                receipt = (
+                    self.session.release_cache(
+                        self.session.identity["rank_id"] in request.owner_rank_ids
+                    )
+                    if self.session is not None
+                    else {"identity": None, "state": "CLEARED"}
+                )
             elif isinstance(request, delta_io.PrepareWeightsFromDeltaReqInput):
                 receipt = self.session.prepare(
                     {

@@ -16,9 +16,11 @@ from sglang.srt.utils.auth import AuthLevel, add_api_key_middleware
 from sglang.srt.weight_sync.gpu_delta.http import register_gpu_delta_routes
 from sglang.srt.weight_sync.gpu_delta.io import (
     AbortWeightsFromDeltaReqInput,
+    ClearWeightsDeltaStateReqInput,
     DeltaWeightsReqOutput,
     GetWeightsDeltaInfoReqInput,
     GetWeightsDeltaStatusReqInput,
+    LoadWeightsFromDeltaReqInput,
     PrepareWeightsFromDeltaReqInput,
     ResumeWeightsFromDeltaReqInput,
     UpdateWeightsFromDeltaReqInput,
@@ -65,6 +67,12 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
         }
     ]
     cases = [
+        (
+            "load_weights_from_delta",
+            LoadWeightsFromDeltaReqInput,
+            {"manifest_path": "/immutable/manifest.json"},
+        ),
+        ("clear_weights_delta_state", ClearWeightsDeltaStateReqInput, {}),
         ("get_weights_delta_info", GetWeightsDeltaInfoReqInput, {"engine_id": "e0"}),
         (
             "prepare_weights_from_delta",
