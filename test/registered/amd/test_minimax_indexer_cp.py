@@ -16,19 +16,23 @@ NDT = 4
 def _inputs(batch, max_len, dtype, device):
     torch.manual_seed(20260928)
     padded_len = (max_len + BLOCK - 1) // BLOCK * BLOCK
-    nslots = batch * padded_len
+    # Request i owns table row batch + 2 * (batch - 1 - i) + 1: never row i, out of
+    # order, with unused rows between. A kernel that addresses K by batch or group
+    # index instead of through the slot table reads another row's keys.
+    table_rows = 3 * batch
+    nslots = table_rows * padded_len
     # Physical pages shuffled independently of logical block ownership, so a rank
     # reading blocks r, r+4, ... cannot accidentally read contiguous memory.
     pages = torch.randperm(nslots // 16, device=device, dtype=torch.int32)
     table = (
         (pages[:, None] * 16 + torch.arange(16, device=device))
-        .reshape(batch, padded_len)
+        .reshape(table_rows, padded_len)
         .to(torch.int32)
     )
     cache = torch.randn((nslots, 1, DIM), device=device, dtype=torch.bfloat16).to(dtype)
     q = torch.randn((batch, HEADS, DIM), device=device, dtype=torch.bfloat16)
     lengths = torch.full((batch,), max_len, dtype=torch.int64, device=device)
-    slots = torch.arange(batch, dtype=torch.int64, device=device)
+    slots = (batch + 1 + 2 * torch.arange(batch, device=device)).flip(0)
     return q, cache, table, slots, lengths
 
 
