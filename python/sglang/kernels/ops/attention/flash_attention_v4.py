@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from functools import cache
+from functools import cache, lru_cache
 from typing import Callable, Optional, Tuple, Union
 
 import torch
@@ -27,6 +27,102 @@ else:
 
 def is_flash_attention_v4_available() -> bool:
     return _flash_attn_varlen_func is not None
+
+
+@lru_cache(maxsize=1)
+def _get_gqa_512_jit_cache():
+    from sglang.kernels.ops.attention.flash_attn.cute.interface import _get_jit_cache
+
+    return _get_jit_cache("fwd_gqa_512")
+
+
+def flash_attn_gqa_512(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale: float = 1.0,
+    lse: Optional[torch.Tensor] = None,
+    pack_gqa: bool = True,
+    causal: bool = False,
+) -> torch.Tensor:
+    """GQA with 512-dimensional keys and separate values."""
+    import cutlass.cute as cute
+
+    from sglang.kernels.ops.attention.flash_attn.cute.cute_dsl_utils import (
+        to_cute_tensor,
+    )
+    from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_mla_sm100 import (
+        FlashAttentionMLAForwardSm100,
+    )
+
+    if cu_seqlens_q is not None:
+        cu_seqlens_q = cu_seqlens_q.to(dtype=torch.int32)
+    args = (
+        q,
+        k,
+        v,
+        out,
+        lse,
+        softmax_scale,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_k,
+        page_table,
+    )
+    use_cpasync = page_table is not None and k.shape[1] != 128
+    key = (
+        pack_gqa,
+        causal,
+        q.device,
+        q.shape[-2] // k.shape[-2],
+        k.shape[-2],
+        q.shape[-1],
+        v.shape[-1],
+        use_cpasync,
+        tuple(
+            (t.ndim, t.dtype, tuple(s if s in (0, 1) else 2 for s in t.stride()))
+            if isinstance(t, torch.Tensor)
+            else t
+            for t in args
+        ),
+    )
+    cache = _get_gqa_512_jit_cache()
+    if key not in cache:
+        compile_args = [
+            to_cute_tensor(
+                t,
+                assumed_align=4
+                if t.dtype in (torch.int32, torch.int64, torch.float32)
+                else 16,
+            )
+            if isinstance(t, torch.Tensor)
+            else t
+            for t in args
+        ]
+        kernel = FlashAttentionMLAForwardSm100(
+            is_causal=causal,
+            use_cpasync_load_KV=use_cpasync,
+            is_topk_gather=False,
+            pack_gqa=pack_gqa,
+            qhead_per_kvhead=q.shape[-2] // k.shape[-2],
+            nheads_kv=k.shape[-2],
+            is_varlen_q=cu_seqlens_q is not None,
+            has_qk=False,
+        )
+        cache[key] = cute.compile(
+            kernel.forward_gqa,
+            *compile_args,
+            stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    cache[key](*args)
+    return out
 
 
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
