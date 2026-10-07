@@ -363,9 +363,9 @@ class LlamaFlashInferAgmmTrueSP:
         import torch.distributed as dist
         import torch.distributed._symmetric_memory as symm_mem
 
-        from sglang.srt.distributed import get_tp_group
+        from sglang.srt.runtime_context import get_parallel
 
-        coordinator = get_tp_group()
+        coordinator = get_parallel().tp_group
         group = coordinator.device_group
         rank = int(coordinator.rank_in_group)
         topology = self._topology
