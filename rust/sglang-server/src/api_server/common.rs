@@ -158,7 +158,14 @@ mod tests {
         let (state, _, _) = test_state(ServerArgs {
             model_path: "/model".into(),
             served_model_name: "served".into(),
-            tokenizer_path: "/tokenizer".into(),
+            tokenizer_path: "/local-tokenizer".into(),
+            public_tokenizer_path: "/tokenizer".into(),
+            model_config: ModelConfig {
+                has_image_understanding: true,
+                model_type: Some("llava".into()),
+                architectures: Some(vec!["LlavaForConditionalGeneration".into()]),
+                ..Default::default()
+            },
             weight_version: Some("weights-v1".into()),
             load_format: Some("safetensors".into()),
             reasoning_parser: Some("reasoner".into()),
@@ -184,6 +191,13 @@ mod tests {
             assert_eq!(body["served_model_name"], "served");
             assert_eq!(body["tokenizer_path"], "/tokenizer");
             assert_eq!(body["is_generation"], true);
+            assert_eq!(body["has_image_understanding"], true);
+            assert_eq!(body["has_audio_understanding"], false);
+            assert_eq!(body["model_type"], "llava");
+            assert_eq!(
+                body["architectures"],
+                serde_json::json!(["LlavaForConditionalGeneration"])
+            );
             assert_eq!(body["weight_version"], "weights-v1");
             assert_eq!(body["load_format"], "safetensors");
             assert_eq!(body["reasoning_parser"], "reasoner");
@@ -208,7 +222,8 @@ mod tests {
         let (state, intake_rx, abort_rx) = test_state(ServerArgs {
             model_path: "/model".into(),
             served_model_name: "served".into(),
-            tokenizer_path: "/tokenizer".into(),
+            tokenizer_path: "/local-tokenizer".into(),
+            public_tokenizer_path: "/tokenizer".into(),
             model_config: ModelConfig {
                 context_len: 4096,
                 ..Default::default()
@@ -247,6 +262,57 @@ mod tests {
             (
                 rmpv::Value::from("api_key"),
                 rmpv::Value::from("must-not-leak"),
+            ),
+            (
+                rmpv::Value::from("hicache_storage_backend_extra_config"),
+                rmpv::Value::Map(vec![(
+                    rmpv::Value::from("credential"),
+                    rmpv::Value::from("storage-must-not-leak"),
+                )]),
+            ),
+            (
+                rmpv::Value::from("dspark_info_record"),
+                rmpv::Value::Map(vec![(
+                    rmpv::Value::from("rid"),
+                    rmpv::Value::from("request-must-not-leak"),
+                )]),
+            ),
+            (rmpv::Value::from("tp_size"), rmpv::Value::from(4)),
+            (rmpv::Value::from("dp_size"), rmpv::Value::from(1)),
+            (rmpv::Value::from("attn_dp_size"), rmpv::Value::from(2)),
+            (
+                rmpv::Value::from("chunked_prefill_size"),
+                rmpv::Value::from(-1),
+            ),
+            (
+                rmpv::Value::from("speculative_eagle_topk"),
+                rmpv::Value::from(1),
+            ),
+            (
+                rmpv::Value::from("disable_radix_cache"),
+                rmpv::Value::from(false),
+            ),
+            (rmpv::Value::from("hicache_ratio"), rmpv::Value::from(2)),
+            // Python sizes the host pool from the ratio when this is <= 0.
+            (rmpv::Value::from("hicache_size"), rmpv::Value::from(-1)),
+            (rmpv::Value::from("quantization"), rmpv::Value::Nil),
+            (
+                rmpv::Value::from("startup_time"),
+                rmpv::Value::Map(vec![
+                    (rmpv::Value::from("load_weight"), rmpv::Value::from(12.5)),
+                    (
+                        rmpv::Value::from("kv_cache_allocation"),
+                        rmpv::Value::from(0.5),
+                    ),
+                    (rmpv::Value::from("scheduler_e2e"), rmpv::Value::from(30.0)),
+                    (
+                        rmpv::Value::from("cuda_graph"),
+                        rmpv::Value::Map(vec![
+                            (rmpv::Value::from("prefill"), rmpv::Value::from(0.0)),
+                            (rmpv::Value::from("decode"), rmpv::Value::from(4.0)),
+                        ]),
+                    ),
+                ]),
             ),
             (
                 rmpv::Value::from("last_gen_throughput"),
@@ -290,6 +356,28 @@ mod tests {
         assert_eq!(body["max_total_num_tokens"], 8192);
         assert_eq!(body["version"], "1.2.3");
         assert_eq!(body["frontend"], "rust");
+        let startup_time = serde_json::json!({
+            "load_weight": 12.5,
+            "kv_cache_allocation": 0.5,
+            "scheduler_e2e": 30.0,
+            "cuda_graph": {"decode": 4.0, "prefill": 0.0},
+        });
+        // Python's server-level timing adds the tokenizer manager's phase,
+        // which the Rust server has no counterpart for.
+        assert!(body.get("startup_time").is_none());
+        for config in [&body, &body["internal_states"][0]] {
+            assert_eq!(config["tp_size"], 4);
+            // This listener serves a single DP rank.
+            assert!(config.get("dp_size").is_none());
+            assert!(config.get("attn_dp_size").is_none());
+            assert_eq!(config["chunked_prefill_size"], -1);
+            assert_eq!(config["speculative_eagle_topk"], 1);
+            assert_eq!(config["disable_radix_cache"], false);
+            assert_eq!(config["hicache_ratio"], 2.0);
+            assert_eq!(config["hicache_size"], -1);
+            assert_eq!(config.get("quantization"), Some(&serde_json::Value::Null));
+        }
+        assert_eq!(body["internal_states"][0]["startup_time"], startup_time);
         assert_eq!(
             body["internal_states"][0]["rust_mm_transport"]["inline_features"],
             3
@@ -312,6 +400,7 @@ mod tests {
             serde_json::json!([0.01])
         );
         assert!(!body.to_string().contains("must-not-leak"));
+        assert!(body.get("hicache_storage_backend_extra_config").is_none());
         assert!(
             body["internal_states"][0]["memory_usage"]
                 .get("future_uncontracted_metric")

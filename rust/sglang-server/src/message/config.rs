@@ -86,6 +86,8 @@ pub struct ServerArgs {
     /// Tokenizer source (model dir / `tokenizer.json` / HF repo id). Empty only
     /// in standalone (test) configs — then boot requires `skip_tokenizer_init`.
     pub tokenizer_path: String,
+    /// Public tokenizer identity, before exporting a temporary Rust tokenizer.
+    pub public_tokenizer_path: String,
     /// HF revision, used only when `tokenizer_path` is a repo id. `None` → main.
     pub revision: Option<String>,
     /// Weight format selected by `--load-format`, reported by `/get_model_info`.
@@ -166,6 +168,7 @@ impl ServerArgs {
         model_path,
         served_model_name,
         tokenizer_path,
+        public_tokenizer_path,
         revision,
         load_format,
         weight_version,
@@ -199,6 +202,7 @@ impl ServerArgs {
         model_path: String,
         served_model_name: String,
         tokenizer_path: String,
+        public_tokenizer_path: String,
         revision: Option<String>,
         load_format: Option<String>,
         weight_version: Option<String>,
@@ -230,6 +234,7 @@ impl ServerArgs {
             model_path,
             served_model_name,
             tokenizer_path,
+            public_tokenizer_path,
             revision,
             load_format,
             weight_version,
@@ -269,6 +274,7 @@ impl Default for ServerArgs {
             model_path: String::new(),
             served_model_name: String::new(),
             tokenizer_path: String::new(),
+            public_tokenizer_path: String::new(),
             revision: None,
             load_format: None,
             weight_version: None,
@@ -354,6 +360,10 @@ pub struct ModelConfig {
     /// in to-scheduler; `false` silently ignores mm fields, as the Python
     /// `TokenizerManager` does with `mm_processor is None`.
     pub is_multimodal: bool,
+    pub is_generation: bool,
+    pub has_image_understanding: bool,
+    pub has_audio_understanding: bool,
+    pub architectures: Option<Vec<String>>,
     /// Resolved default sampling parameters, from Python's
     /// `ModelConfig.get_default_sampling_params()`. Already gated on
     /// `--sampling-defaults`: holds the model's generation_config.json values
@@ -366,20 +376,29 @@ pub struct ModelConfig {
 #[pyo3::pymethods]
 impl ModelConfig {
     #[new]
-    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params, model_type))]
+    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, is_generation, has_image_understanding, has_audio_understanding, default_sampling_params, model_type, architectures))]
+    #[allow(clippy::too_many_arguments)]
     fn py_new(
         context_len: u64,
         vocab_size: u64,
         is_multimodal: bool,
+        is_generation: bool,
+        has_image_understanding: bool,
+        has_audio_understanding: bool,
         default_sampling_params: DefaultSamplingParams,
         model_type: Option<String>,
+        architectures: Option<Vec<String>>,
     ) -> Self {
         Self {
             context_len,
             vocab_size,
             is_multimodal,
+            is_generation,
+            has_image_understanding,
+            has_audio_understanding,
             default_sampling_params,
             model_type,
+            architectures,
         }
     }
 }
@@ -392,6 +411,10 @@ impl Default for ModelConfig {
             model_type: None,
             vocab_size: 1000,
             is_multimodal: false,
+            is_generation: true,
+            has_image_understanding: false,
+            has_audio_understanding: false,
+            architectures: None,
             default_sampling_params: DefaultSamplingParams::default(),
         }
     }

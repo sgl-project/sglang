@@ -56,6 +56,11 @@ pub(crate) struct FrontendMetadata {
     model_path: String,
     served_model_name: String,
     tokenizer_path: String,
+    is_generation: bool,
+    has_image_understanding: bool,
+    has_audio_understanding: bool,
+    model_type: Option<String>,
+    architectures: Option<Vec<String>>,
     preferred_sampling_params: Option<crate::message::config::PreferredSamplingParams>,
     weight_version: Option<String>,
     load_format: Option<String>,
@@ -72,7 +77,14 @@ impl From<&ServerArgs> for FrontendMetadata {
         Self {
             model_path: args.model_path.clone(),
             served_model_name: args.served_model_name.clone(),
-            tokenizer_path: args.tokenizer_path.clone(),
+            // The path the server was launched with, not the local copy the
+            // Rust tokenizer loads from.
+            tokenizer_path: args.public_tokenizer_path.clone(),
+            is_generation: args.model_config.is_generation,
+            has_image_understanding: args.model_config.has_image_understanding,
+            has_audio_understanding: args.model_config.has_audio_understanding,
+            model_type: args.model_config.model_type.clone(),
+            architectures: args.model_config.architectures.clone(),
             preferred_sampling_params: args.preferred_sampling_params.clone(),
             weight_version: args.weight_version.clone(),
             load_format: args.load_format.clone(),
@@ -189,7 +201,11 @@ impl FrontendHandle {
             model_path: metadata.model_path.clone(),
             served_model_name: metadata.served_model_name.clone(),
             tokenizer_path: metadata.tokenizer_path.clone(),
-            is_generation: true,
+            is_generation: metadata.is_generation,
+            has_image_understanding: metadata.has_image_understanding,
+            has_audio_understanding: metadata.has_audio_understanding,
+            model_type: metadata.model_type.clone(),
+            architectures: metadata.architectures.clone(),
             preferred_sampling_params: metadata.preferred_sampling_params.clone(),
             weight_version: metadata.weight_version.clone(),
             load_format: metadata.load_format.clone(),
@@ -213,6 +229,7 @@ impl FrontendHandle {
             max_total_num_tokens: metadata.max_total_num_tokens,
             version: metadata.version.clone(),
             frontend: "rust",
+            config: internal_state.config.clone(),
             internal_states: vec![internal_state],
         })
     }

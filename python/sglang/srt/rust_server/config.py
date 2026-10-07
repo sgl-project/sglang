@@ -56,6 +56,7 @@ def _build_server_args(
         model_path=get_model().model_path,
         served_model_name=get_serving().served_model_name,
         tokenizer_path=scheduler.rust_server_tokenizer_path(),
+        public_tokenizer_path=get_serving().tokenizer_path,
         revision=get_model().revision,
         load_format=get_model().load_format,
         weight_version=get_serving().weight_version,
@@ -80,7 +81,11 @@ def _build_server_args(
             context_len=mc.context_len,
             vocab_size=mc.vocab_size,
             is_multimodal=mc.is_multimodal,
+            is_generation=mc.is_generation,
+            has_image_understanding=mc.is_image_understandable_model,
+            has_audio_understanding=mc.is_audio_understandable_model,
             model_type=getattr(mc.hf_config, "model_type", None),
+            architectures=getattr(mc.hf_config, "architectures", None),
             # Resolved default sampling params (generation_config.json when
             # `--sampling-defaults model`, {} otherwise). The rust server
             # consumes these for omitted temperature/top_p in chat
