@@ -153,11 +153,8 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
 def _kv_scale_divides(
     scale: Optional[Union[float, torch.Tensor]],
 ) -> TypeGuard[Union[float, torch.Tensor]]:
-    """Whether dividing by ``scale`` would change any value.
-
-    Host scalars only: reading a device tensor would sync, illegal under graph capture,
-    so a tensor scale always divides.
-    """
+    """Host scalars only: reading a device tensor would sync, illegal under graph
+    capture, so a tensor scale always divides."""
     if scale is None:
         return False
     if isinstance(scale, torch.Tensor):
@@ -6051,8 +6048,8 @@ class MiniMaxSparseKVPool(KVCache):
     ) -> None:
         """Write main K/V at `loc`. Works for any layer (dense or sparse).
 
-        Scale semantics follow MHATokenToKVPool: None means unit scale;
-        a non-None scale is applied with an in-place div_ before the fp8 cast.
+        Scale semantics follow MHATokenToKVPool: None or a host 1.0 means unit
+        scale; any other scale is applied with an in-place div_ before the fp8 cast.
         """
         self._pool_for(layer.layer_id).set_kv_buffer(
             layer,
@@ -6187,12 +6184,8 @@ class MiniMaxSparseKVPool(KVCache):
         ):
             self.main_pool.store_kv_fused_cast(layer.layer_id, loc, cache_k, cache_v)
         else:
-            # Fallback: separate stores (identical semantics; quantizes for fp8
-            # pools — the fused raw-byte path is disqualified there by
-            # _can_fuse_kv_index_store's dtype-equality checks). Scales use the
-            # None-means-unit convention throughout: MHATokenToKVPool.set_kv_buffer
-            # applies any non-None scale with an IN-PLACE div_ (extra kernel +
-            # caller-tensor mutation), which must not fire for unit scale.
+            # Before the fp8 cast, set_kv_buffer divides cache_k/cache_v in place
+            # by any scale other than None or a host 1.0.
             self.set_kv_buffer(layer, loc, cache_k, cache_v, k_scale, v_scale)
         if disable_value:
             self.set_index_k_buffer(layer, loc, cache_idx_k, idx_k_scale)

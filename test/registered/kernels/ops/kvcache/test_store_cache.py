@@ -404,7 +404,7 @@ def test_store_k_slots_rejects_non_dense_rows() -> None:
         (SMALL_CACHE, head_num, head_dim), dtype=DTYPE, device=DEVICE
     )
     # Sliced along head_dim: the trailing block is no longer a flat run, which the
-    # kernel cannot express. The caller must fall back to advanced indexing.
+    # kernel cannot express. set_k_buffer makes such a source contiguous first.
     src = torch.randn((8, head_num, head_dim * 2), dtype=DTYPE, device=DEVICE)[
         :, :, :head_dim
     ]
