@@ -1,6 +1,7 @@
 """Numeric unit tests for the XPU int4 *dense* linear kernels (GPTQ / AWQ)."""
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -239,9 +240,9 @@ class TestXPUInt4DenseKernel(CustomTestCase):
             (2, r"tp_size=2.*--tp-size 1"),
         ):
             with self.subTest(tp_size=tp_size):
-                with get_parallel().override(tp_size=tp_size):
-                    with self.assertRaisesRegex(NotImplementedError, pattern):
-                        kernel.process_weights_after_loading(layer)
+                layer.tp_group = SimpleNamespace(world_size=tp_size)
+                with self.assertRaisesRegex(NotImplementedError, pattern):
+                    kernel.process_weights_after_loading(layer)
 
     def test_gptq_group_aligned_shard_allows_tensor_parallel(self):
         # Whole-group shards stay representable, so TP is only rejected when a
