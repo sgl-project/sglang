@@ -2861,6 +2861,25 @@ class MHATokenToKVPool(KVCache):
             # A slot is [page, :, off, :] (not a contiguous row), so scatter by (page, off).
             k_buf = self.k_buffer[layer_id - self.start_layer]
             v_buf = self.v_buffer[layer_id - self.start_layer]
+            # Lazy kernel resolution is not traceable by torch.compile.
+            if (
+                _is_cuda
+                and cache_k.is_cuda
+                and not torch.compiler.is_compiling()
+                and self.head_dim == self.v_head_dim
+                and self.store_dtype == self.dtype
+                and cache_k.dtype == cache_v.dtype == self.dtype == torch.bfloat16
+            ):
+                from sglang.kernels.ops.kvcache import reshape_and_cache_flash
+
+                reshape_and_cache_flash(
+                    cache_k,
+                    cache_v,
+                    k_buf.permute(0, 2, 1, 3),
+                    v_buf.permute(0, 2, 1, 3),
+                    loc,
+                )
+                return
             pages = loc // self.page_size
             offs = loc % self.page_size
             k_buf[pages, :, offs, :] = cache_k
