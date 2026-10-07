@@ -4,10 +4,8 @@
 Inference-only implementation of the Multiview-AV visibility rules on top of
 the public PyTorch FlexAttention API, with an optional FlashAttention-4 CuTe
 backend (see ``cosmos3_multiview_fa4``). Ported from the vLLM-Omni reference
-implementation; the training code is a behavioral oracle, not a source. This
-is the attention of exports whose ``multiview.backend`` is ``triton`` or
-``fa4``: one mask that counts every permitted key once. Exports marked
-``maskless`` are served by ``cosmos3_multiview_maskless`` instead.
+implementation; the training code is a behavioral oracle, not a source. One
+mask that counts every permitted key once, on either kernel.
 
 Every GEN token carries six fields: sample, frame, view, control-or-RGB,
 text-or-vision, timestamp. Under the ``decomposed`` scope this checkpoint
@@ -148,7 +146,7 @@ def layout_sparse_block_sizes(
     if layout.backend != "fa4":
         raise ValueError(
             f"Cosmos3 multiview backend {layout.backend!r} has no sparse block map; "
-            "the masked kernels are 'triton' and 'fa4'."
+            "the kernels are 'triton' and 'fa4'."
         )
     if layout.fa4_block_sizes is not None:
         return layout.fa4_block_sizes

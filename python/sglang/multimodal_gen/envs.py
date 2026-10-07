@@ -242,17 +242,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Cosmos3 Multiview-AV attention backend for masked exports: "auto" (default;
     # FA4 block-sparse on Hopper and Blackwell, FlexAttention Triton elsewhere), "triton" or
-    # "fa4". Wins over the checkpoint's multiview.backend within its family; an
-    # explicit pipeline-config multiview_attention_backend wins over both. The
-    # masked and maskless families cannot be swapped: they are different attention.
+    # "fa4". An explicit pipeline-config multiview_attention_backend wins over it.
+    # Both kernels compute the same attention.
     "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND"
     ),
-    # Varlen kernel behind the maskless backend's three passes: "auto" (default;
-    # FA4 on Blackwell, FA3 on Hopper, torch FA2 elsewhere), "fa4", "fa3", "fa2".
-    # A/B knob only: every kernel computes the same attention.
-    "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_MASKLESS_KERNEL": _lazy_str(
-        "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_MASKLESS_KERNEL"
+    # Debug: under Ulysses, recompute each layer's attention on the gathered
+    # full sequence and log the difference to the sharded result (exactness
+    # check of the collectives; slow, first denoising step only).
+    "SGLANG_DIFFUSION_DEBUG_COSMOS3_MULTIVIEW_SP_CHECK": _lazy_bool(
+        "SGLANG_DIFFUSION_DEBUG_COSMOS3_MULTIVIEW_SP_CHECK"
     ),
     # MXFP8 Attention quantization
     # Applies to both online ``MXFP8Config`` and offline ``ModelSlimConfig`` (W8A8_MXFP8)

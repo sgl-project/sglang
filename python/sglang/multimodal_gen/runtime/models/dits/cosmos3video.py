@@ -892,11 +892,8 @@ class Cosmos3CrossAttention(nn.Module):
             )
         if multiview_layout is not None:
             # Sparse cross-camera attention (Cosmos3 Multiview-AV): the mask
-            # replaces the dense [UND | GEN] key layout. No SP support.
-            if get_sp_world_size() > 1:
-                raise ValueError(
-                    "Cosmos3 multiview attention does not support sequence parallelism."
-                )
+            # replaces the dense [UND | GEN] key layout; the subclass applies
+            # the Ulysses collectives itself.
             out = self._forward_multiview(q, k, v, k_und, v_und, multiview_layout)
         elif not use_fused_kv_pack:
             # K/V = [UND prefix (replicated on SP ranks) | GEN suffix].

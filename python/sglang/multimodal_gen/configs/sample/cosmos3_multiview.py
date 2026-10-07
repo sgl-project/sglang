@@ -24,10 +24,8 @@ input JSON::
 
 Every view needs a pre-computed WSM ``control_path``. ``vision_path`` (an RGB
 still or clip) is optional but must be given for every camera or none; with it
-the request is image-to-video, without it text-to-video. Checkpoints that
-tokenize one caption per camera (``per_view_captions``) take the
-caption in ``views[].prompt``; unversioned v1 exports read the top-level
-prompt. ``lidar`` selects joint camera/LiDAR generation on exports that ship
+the request is image-to-video, without it text-to-video. Every camera takes its
+caption in ``views[].prompt``. ``lidar`` selects joint camera/LiDAR generation on exports that ship
 the LiDAR encoder. As a CLI convenience, a ``control_path`` list in checkpoint
 camera order selects text-to-video without the ``multiview`` object.
 """
@@ -52,15 +50,12 @@ logger = init_logger(__name__)
 
 COSMOS3_MULTIVIEW_WIDTH = 832
 COSMOS3_MULTIVIEW_HEIGHT = 480
-# Per-camera frame defaults: the v1 WSM artifacts shipped with 93, schema-2
-# exports generate 201 frames unless the request says otherwise.
-COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES = 93
-COSMOS3_MULTIVIEW_SCHEMA2_DEFAULT_NUM_FRAMES = 201
+# Per-camera frame default: the training window (200 camera frames, 67 LiDAR
+# sweeps) unless the request says otherwise.
+COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES = 201
 # Training rate: the MADS WSM transfer recipes read clips at native 30 FPS.
 COSMOS3_MULTIVIEW_DEFAULT_FPS = 30
 COSMOS3_MULTIVIEW_DEFAULT_GUIDANCE_SCALE = 6.0
-# Unversioned v1 artifacts clamp guidance into [0, 7]; schema-2 exports do not.
-COSMOS3_MULTIVIEW_MAX_GUIDANCE_SCALE = 7.0
 COSMOS3_MULTIVIEW_DEFAULT_NUM_INFERENCE_STEPS = 35
 COSMOS3_MULTIVIEW_DEFAULT_FLOW_SHIFT = 10.0
 # Prompt cap per caption, the reference tokenizer's truncation limit; the two
@@ -111,11 +106,6 @@ class MultiviewViewInput(msgspec.Struct, frozen=True):
     control: str
     vision: str | None
     prompt: str | None = None
-
-
-def clamp_multiview_guidance_scale(value: float) -> float:
-    """The v1 reference clamps guidance into ``[0, 7]`` rather than rejecting it."""
-    return min(COSMOS3_MULTIVIEW_MAX_GUIDANCE_SCALE, max(0.0, float(value)))
 
 
 def normalize_multiview_aspect_ratio(value: Any) -> str:
@@ -401,8 +391,7 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
 
     @classmethod
     def video_prompt_optional(cls) -> bool:
-        # Schema-2 exports read one caption per camera from multiview.views[].prompt;
-        # the top-level prompt is only used by legacy single-caption exports.
+        # Captions are read per camera from multiview.views[].prompt.
         return True
 
     @classmethod
@@ -614,12 +603,8 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
         )
         if nested_num_frames is not None and not self.is_explicit("num_frames"):
             self.num_frames = int(nested_num_frames)
-        if deployment is None or deployment.is_legacy:
+        if deployment is None:
             return
-        if nested_num_frames is None and self._is_unset(
-            "num_frames", COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES
-        ):
-            self.num_frames = COSMOS3_MULTIVIEW_SCHEMA2_DEFAULT_NUM_FRAMES
         if self._is_unset("fps", COSMOS3_MULTIVIEW_DEFAULT_FPS):
             self.fps = int(round(float(deployment.inference_default("fps", self.fps))))
         if self._is_unset(
@@ -660,18 +645,6 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
         )
         resolution = self.resolved_resolution(str(default_resolution))
         aspect_ratio = self.resolved_aspect_ratio()
-        if (
-            deployment is not None
-            and deployment.is_legacy
-            and (
-                resolution != "480"
-                or aspect_ratio not in ("auto", COSMOS3_MULTIVIEW_DEFAULT_ASPECT_RATIO)
-            )
-        ):
-            raise ValueError(
-                "Cosmos3 multiview v1 artifacts are fixed at 480p 16:9; "
-                f"got resolution={resolution!r}, aspect_ratio={aspect_ratio!r}."
-            )
         bucket = (
             COSMOS3_MULTIVIEW_DEFAULT_ASPECT_RATIO
             if aspect_ratio == "auto"
@@ -747,17 +720,7 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
         self._apply_guidance_policy(deployment)
 
     def _apply_guidance_policy(self, deployment: Any) -> None:
-        """v1 artifacts clamp guidance into [0, 7] and never use control-CFG."""
-        if deployment is None or deployment.is_legacy:
-            clamped = clamp_multiview_guidance_scale(self.guidance_scale)
-            if clamped != float(self.guidance_scale):
-                logger.info(
-                    "Clamped Cosmos3 multiview guidance_scale from %s to %s",
-                    self.guidance_scale,
-                    clamped,
-                )
-            self.guidance_scale = clamped
-            self.control_guidance = 1.0
+        del deployment  # The export's defaults were applied; guidance is not clamped.
         if self.control_guidance is None:
             self.control_guidance = 1.0
         # No chunked long-video transfer in multiview.

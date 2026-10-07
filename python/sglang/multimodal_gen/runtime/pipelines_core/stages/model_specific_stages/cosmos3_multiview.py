@@ -5,7 +5,7 @@ One request carries every camera of the rig. The stages pack all cameras
 camera-major along time (all frames of camera 0, then camera 1, ...), encode
 and decode each camera separately through the temporally causal Wan VAE, and
 hand the transformer a ``MultiviewLayout`` plus the temporal wrap period that
-drive the maskless cross-camera attention. Joint checkpoints add an
+drive the masked cross-camera attention. Joint checkpoints add an
 HD-map range-map control and a LiDAR target of their own geometry; the
 denoised state is one flat packing of every target so the shared scheduler
 steps cameras and LiDAR together. Denoising reuses ``Cosmos3DenoisingStage``:
@@ -103,35 +103,12 @@ EXTRA_LIDAR_CONDITION_FRAMES = "multiview_lidar_condition_frames"
 EXTRA_LIDAR_LATENTS = "multiview_lidar_latents"
 EXTRA_PACKED_SHAPES = "multiview_packed_shapes"
 EXTRA_CAPTION_LENGTHS = "multiview_caption_lengths_by_cache_key"
-EXTRA_SEPARATE_CAPTIONS = "multiview_separate_captions"
 # Consumed by Cosmos3DenoisingStage and forwarded to every transformer call.
 EXTRA_TRANSFORMER_KWARGS = "transformer_extra_kwargs"
 
-# System prompts, verbatim from the training text tokenizer augmentors.
-COSMOS3_TRANSFER_SYSTEM_PROMPT = (
-    "You are a helpful assistant that generates images or videos following the "
-    "user's instructions and control signals (edge maps, blur, depth, or segmentation)."
-)
-COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT = (
-    "You are a helpful assistant that generates temporally synchronized, geometrically "
-    "consistent autonomous-driving videos from per-camera scene descriptions and provided "
-    "control signals. Treat all camera views as simultaneous observations of the same "
-    "driving scene, preserving each camera's viewpoint, shared ego motion, road layout, "
-    "object identity and motion, weather, lighting, and cross-view consistency."
-)
-COSMOS3_AV_JOINT_TRANSFER_SYSTEM_PROMPT = (
-    "You are a helpful assistant that jointly generates temporally synchronized, "
-    "geometrically consistent autonomous-driving camera videos and LiDAR range-view "
-    "sequences from per-camera scene descriptions and provided control signals, including "
-    "camera controls and an HD-map control for LiDAR. Treat all camera views and LiDAR "
-    "sweeps as synchronized observations of the same driving scene, preserving each "
-    "camera's viewpoint, shared ego motion, road layout, object identity and motion, "
-    "weather, lighting, cross-view consistency, and camera-LiDAR alignment."
-)
-# The training text tokenizer changed the AV system prompts on Sep 15 2026
-# (imaginaire4 86041fb1b52): WSM is named explicitly and a control-adherence
-# paragraph follows. Exports trained after that (the maskless phase-2.2 run)
-# read these; earlier exports read the two above. See ``system_prompt_variant``.
+# System prompts, verbatim from the training text tokenizer augmentors (the
+# Sep-15-2026 wording, imaginaire4 86041fb1b52: WSM named explicitly plus a
+# control-adherence paragraph), which every servable export trained under.
 COSMOS3_AV_WSM_CONTROL_INSTRUCTION = (
     "Follow WSM controls for vehicles (including trucks), cyclists, pedestrians, "
     "traffic lights, traffic signs, road markings, lane boundaries, and road boundaries. "
@@ -159,17 +136,6 @@ COSMOS3_AV_JOINT_TRANSFER_SYSTEM_PROMPT_WSM = (
     "weather, lighting, cross-view consistency, and camera-LiDAR alignment.\n\n"
     f"{COSMOS3_AV_WSM_CONTROL_INSTRUCTION}"
 )
-AV_SYSTEM_PROMPTS_BY_VARIANT: dict[str, tuple[str, str]] = {
-    # variant -> (camera-only transfer, joint camera+LiDAR transfer)
-    "provided_controls": (
-        COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT,
-        COSMOS3_AV_JOINT_TRANSFER_SYSTEM_PROMPT,
-    ),
-    "wsm_controls": (
-        COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT_WSM,
-        COSMOS3_AV_JOINT_TRANSFER_SYSTEM_PROMPT_WSM,
-    ),
-}
 # Control-adherence sentences appended to every caption after the metadata.
 COSMOS3_MULTIVIEW_EMPHASIS = (
     "Follow the wsm control videos precisely for every camera view: shape, contour, "
@@ -187,7 +153,6 @@ INVERSE_DURATION_TEMPLATE = (
     "The video is not {duration:.1f} seconds long and is not of {fps:.0f} FPS."
 )
 INVERSE_RESOLUTION_TEMPLATE = "This video is not of {height}x{width} resolution."
-COSMOS3_MULTIVIEW_ASPECT_RATIO = "16,9"
 
 # Rates and frame counts outside these bounds are allowed with a warning.
 COSMOS3_MULTIVIEW_RECOMMENDED_FPS_RANGE = (10.0, 30.0)
@@ -414,74 +379,6 @@ def format_json_caption(
     return json.dumps(caption)
 
 
-def format_multiview_prompts(
-    prompt: str,
-    negative_prompt: str,
-    *,
-    num_frames: int,
-    fps: float,
-    height: int,
-    width: int,
-    negative_metadata_mode: str = "same",
-    aspect_ratio: str = COSMOS3_MULTIVIEW_ASPECT_RATIO,
-    emphasis: str | None = COSMOS3_MULTIVIEW_EMPHASIS,
-) -> tuple[str, str]:
-    """Positive caption with metadata plus the WSM emphasis, and the negative caption.
-
-    ``num_frames`` is the per-camera frame count. JSON-object captions receive
-    the metadata as fields; prose captions receive the duration and resolution
-    sentences. ``negative_metadata_mode`` selects no metadata, the same
-    metadata, or the inverse sentences for the negative prompt.
-    """
-    mode = negative_metadata_mode.strip().lower()
-    if mode not in {"none", "same", "inverse"}:
-        raise ValueError(
-            "Cosmos3 negative_metadata_mode must be one of 'none', 'same', or "
-            f"'inverse'; got {negative_metadata_mode!r}."
-        )
-    json_prompt = format_json_caption(
-        prompt,
-        num_frames=num_frames,
-        fps=fps,
-        height=height,
-        width=width,
-        aspect_ratio=aspect_ratio,
-    )
-    if json_prompt is not None:
-        positive = json_prompt
-    else:
-        positive = apply_metadata_templates(
-            prompt,
-            num_frames=num_frames,
-            fps=fps,
-            height=height,
-            width=width,
-            duration_template=DURATION_TEMPLATE,
-            resolution_template=RESOLUTION_TEMPLATE,
-        )
-    if emphasis:
-        positive = f"{positive.rstrip()} {emphasis}".strip()
-
-    if mode == "none":
-        negative_duration, negative_resolution = None, None
-    elif mode == "same":
-        negative_duration, negative_resolution = DURATION_TEMPLATE, RESOLUTION_TEMPLATE
-    else:
-        negative_duration = INVERSE_DURATION_TEMPLATE
-        negative_resolution = INVERSE_RESOLUTION_TEMPLATE
-    negative = apply_metadata_templates(
-        negative_prompt,
-        num_frames=num_frames,
-        fps=fps,
-        height=height,
-        width=width,
-        duration_template=negative_duration,
-        resolution_template=negative_resolution,
-        force_duration_template=mode == "inverse",
-    )
-    return positive, negative
-
-
 def _camera_identity(camera: str) -> str:
     attributes = COSMOS3_MADS_CAMERA_ATTRIBUTES[camera]
     role = str(attributes["camera_role"]).replace("_", "-")
@@ -626,11 +523,6 @@ class Cosmos3MultiviewInputStage(PipelineStage):
                     "Cosmos3 multiview cameras must be exported checkpoint cameras: "
                     f"unknown={unknown}, exported={list(cameras)}."
                 )
-            if not deployment.variable_view_count and tuple(camera_keys) != cameras:
-                raise ValueError(
-                    "Cosmos3 multiview camera order must exactly match the exported "
-                    f"checkpoint order: expected={list(cameras)}, got={camera_keys}."
-                )
         else:
             if len(views) != len(cameras):
                 raise ValueError(
@@ -646,9 +538,7 @@ class Cosmos3MultiviewInputStage(PipelineStage):
                 )
                 for camera, view in zip(cameras, views, strict=True)
             ]
-        if deployment.per_view_captions and any(
-            view.prompt is None or not view.prompt.strip() for view in views
-        ):
+        if any(view.prompt is None or not view.prompt.strip() for view in views):
             raise ValueError(
                 "This checkpoint tokenizes one caption per camera; supply a non-empty "
                 "multiview.views[*].prompt for every camera."
@@ -960,98 +850,58 @@ class Cosmos3MultiviewTokenizationStage(Cosmos3TokenizationStage):
             bool(self.deployment.inference_default("emphasize_control_in_prompt", True))
         )
 
-        if self.deployment.per_view_captions:
-            cameras = list(batch.extra[EXTRA_CAMERAS])
-            captions = list(batch.extra[EXTRA_VIEW_PROMPTS])
-            emphasis = None
-            if emphasize:
-                emphasis = (
-                    COSMOS3_JOINT_EMPHASIS if joint else COSMOS3_MULTIVIEW_EMPHASIS
-                )
-            prompts = format_per_view_prompts(
-                captions,
-                cameras,
+        cameras = list(batch.extra[EXTRA_CAMERAS])
+        captions = list(batch.extra[EXTRA_VIEW_PROMPTS])
+        emphasis = None
+        if emphasize:
+            emphasis = COSMOS3_JOINT_EMPHASIS if joint else COSMOS3_MULTIVIEW_EMPHASIS
+        prompts = format_per_view_prompts(
+            captions,
+            cameras,
+            num_frames=num_frames,
+            fps=fps,
+            height=height,
+            width=width,
+            emphasis=emphasis,
+        )
+        system_prompt = (
+            COSMOS3_AV_JOINT_TRANSFER_SYSTEM_PROMPT_WSM
+            if joint
+            else COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT_WSM
+        )
+        cond_ids, cond_lengths = self._tokenize_compact(
+            prompts, cap, device, system_prompt
+        )
+        per_view_negative = batch.sampling_params.per_view_negative_prompt
+        if per_view_negative is not None and per_view_negative.strip():
+            # The reference formats one shared negative caption with each
+            # clip's duration/resolution metadata (no rig header, no
+            # emphasis) and tokenizes it for every camera.
+            negative_caption = format_per_view_negative_prompt(
+                per_view_negative,
                 num_frames=num_frames,
                 fps=fps,
                 height=height,
                 width=width,
-                emphasis=emphasis,
             )
-            camera_prompt, joint_prompt = AV_SYSTEM_PROMPTS_BY_VARIANT[
-                self.deployment.system_prompt_variant
-            ]
-            system_prompt = joint_prompt if joint else camera_prompt
-            cond_ids, cond_lengths = self._tokenize_compact(
-                prompts, cap, device, system_prompt
-            )
-            per_view_negative = batch.sampling_params.per_view_negative_prompt
-            if per_view_negative is not None and per_view_negative.strip():
-                # The reference formats one shared negative caption with each
-                # clip's duration/resolution metadata (no rig header, no
-                # emphasis) and tokenizes it for every camera.
-                negative_caption = format_per_view_negative_prompt(
-                    per_view_negative,
-                    num_frames=num_frames,
-                    fps=fps,
-                    height=height,
-                    width=width,
+            uncond_captions = [negative_caption] * len(prompts)
+            if not batch.is_warmup:
+                self.log_info(
+                    f"Using an explicit negative caption for each of {len(prompts)} camera views."
                 )
-                uncond_captions = [negative_caption] * len(prompts)
-                if not batch.is_warmup:
-                    self.log_info(
-                        f"Using an explicit negative caption for each of {len(prompts)} camera views."
-                    )
-            else:
-                uncond_captions = [""] * len(prompts)
-                if batch.negative_prompt and not batch.is_warmup:
-                    self.log_warning(
-                        "Ignoring negative_prompt: this checkpoint tokenizes one caption per "
-                        "camera and its unconditional branch is an empty caption per camera, "
-                        "as training's caption dropout produced; set per_view_negative_prompt "
-                        "to opt into a shared negative caption."
-                    )
-            uncond_ids, uncond_lengths = self._tokenize_compact(
-                uncond_captions, cap, device, system_prompt
-            )
-            separate = True
-            preview = prompts[0]
         else:
-            prompt = batch.prompt
-            if isinstance(prompt, (list, tuple)):
-                if len(prompt) != 1:
-                    raise ValueError(
-                        "Cosmos3 multiview supports exactly one prompt per request."
-                    )
-                prompt = prompt[0]
-            prompt = str(prompt or "")
-            negative_prompt = batch.negative_prompt
-            if isinstance(negative_prompt, (list, tuple)):
-                negative_prompt = negative_prompt[0] if negative_prompt else ""
-            negative_prompt = str(negative_prompt or "")
-            aspect_ratio = str(
-                getattr(batch.sampling_params, "aspect_ratio", None)
-                or COSMOS3_MULTIVIEW_ASPECT_RATIO
-            )
-            prompt, negative_prompt = format_multiview_prompts(
-                prompt,
-                negative_prompt,
-                num_frames=num_frames,
-                fps=fps,
-                height=height,
-                width=width,
-                negative_metadata_mode=batch.sampling_params.negative_metadata_mode,
-                aspect_ratio=aspect_ratio,
-                emphasis=COSMOS3_MULTIVIEW_EMPHASIS if emphasize else None,
-            )
-            system_prompt = COSMOS3_TRANSFER_SYSTEM_PROMPT
-            cond_ids, cond_lengths = self._tokenize_compact(
-                [prompt], cap, device, system_prompt
-            )
-            uncond_ids, uncond_lengths = self._tokenize_compact(
-                [negative_prompt], cap, device, system_prompt
-            )
-            separate = False
-            preview = prompt
+            uncond_captions = [""] * len(prompts)
+            if batch.negative_prompt and not batch.is_warmup:
+                self.log_warning(
+                    "Ignoring negative_prompt: this checkpoint tokenizes one caption per "
+                    "camera and its unconditional branch is an empty caption per camera, "
+                    "as training's caption dropout produced; set per_view_negative_prompt "
+                    "to opt into a shared negative caption."
+                )
+        uncond_ids, uncond_lengths = self._tokenize_compact(
+            uncond_captions, cap, device, system_prompt
+        )
+        preview = prompts[0]
 
         batch.extra["cond_text_ids"] = cond_ids
         batch.extra["cond_text_mask"] = torch.ones_like(cond_ids)
@@ -1063,7 +913,6 @@ class Cosmos3MultiviewTokenizationStage(Cosmos3TokenizationStage):
             "cond": cond_lengths,
             "uncond": uncond_lengths,
         }
-        batch.extra[EXTRA_SEPARATE_CAPTIONS] = separate
         batch.extra["fps"] = fps
         batch.is_prompt_processed = True
         if not batch.is_warmup:
@@ -1084,8 +933,8 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
         vae,
         transformer,
         deployment: Cosmos3MultiviewDeploymentConfig,
-        lidar_encoder: Cosmos3LidarEncoder | None = None,
-        attention_backend: str = "maskless",
+        lidar_encoder: Cosmos3LidarEncoder | None,
+        attention_backend: str,
     ) -> None:
         super().__init__()
         self.vae = vae
@@ -1119,7 +968,9 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
             frames = torch.cat(
                 [
                     frames,
-                    frames.new_zeros(frames.shape[0], padded - count, *frames.shape[2:]),
+                    frames.new_zeros(
+                        frames.shape[0], padded - count, *frames.shape[2:]
+                    ),
                 ],
                 dim=1,
             )
@@ -1348,36 +1199,34 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
                     )
                 )
 
-        separate = bool(batch.extra.get(EXTRA_SEPARATE_CAPTIONS, False))
         layout = MultiviewLayout(
             num_views=num_views,
             latent_frames=latent_t,
             patch_height=patch_h,
             patch_width=patch_w,
-            attention_scope=deployment.attention_scope,  # type: ignore[arg-type]
-            decomposed_temporal_window_seconds=deployment.decomposed_temporal_window_seconds,
-            control_attends_sensor=deployment.control_attends_sensor,
+            # The architecture this model has: decomposed scope with a past-only
+            # cross-view window, controls reading their own view's targets, LiDAR
+            # reading every caption.
+            attention_scope="decomposed",
+            decomposed_temporal_window_seconds=deployment.cross_view_past_window_seconds,
+            control_attends_sensor=True,
             seconds_per_frame=camera_rate,
             backend=self.attention_backend,
-            # The masked kernels pad the text stream to one fixed capacity per
-            # caption so prompts of every length share one compiled kernel.
-            max_und_tokens=DEFAULT_MAX_UND_TOKENS * (num_views if separate else 1),
+            # The kernels pad the text stream to one fixed capacity per caption
+            # so prompts of every length share one compiled kernel.
+            max_und_tokens=DEFAULT_MAX_UND_TOKENS * num_views,
             items=tuple(items),
-            lidar_attends_captions=deployment.lidar_attends_captions,
+            lidar_attends_captions=True,
         )
-        # Physical rig ids of the request's cameras (schema-3 exports); subsets
-        # and reordered views keep each camera's trained row.
-        rig_rows = deployment.rig_view_ids(batch.extra[EXTRA_CAMERAS])
-        rig_view_ids = (
-            torch.tensor(rig_rows, dtype=torch.long, device=device)
-            if rig_rows is not None
-            else None
+        # Physical rig ids of the request's cameras; subsets and reordered views
+        # keep each camera's trained row.
+        rig_view_ids = torch.tensor(
+            deployment.rig_view_ids(batch.extra[EXTRA_CAMERAS]),
+            dtype=torch.long,
+            device=device,
         )
-        temporal_position_period = (
-            latent_frames_per_view
-            if deployment.align_temporal_positions_across_views
-            else None
-        )
+        # Temporal positions wrap per view so every camera shares one time axis.
+        temporal_position_period = latent_frames_per_view
         packed_shapes = tuple(
             tuple(int(d) for d in tensor.shape[1:]) for tensor in targets
         )
@@ -1398,7 +1247,6 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
             "multiview_layout": layout,
             "packed_shapes": packed_shapes,
             "caption_lengths_by_cache_key": batch.extra.get(EXTRA_CAPTION_LENGTHS),
-            "separate_captions": separate,
             "lidar_control_latents": lidar_control_latents,
             "lidar_fps": lidar_fps,
             "lidar_temporal_compression_factor": lidar_tcf,

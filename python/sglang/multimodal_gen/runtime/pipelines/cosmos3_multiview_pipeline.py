@@ -7,9 +7,9 @@ camera, and one caption per rig or per camera. Joint exports also take an
 HD-map range-map control and denoise a LiDAR target alongside the cameras.
 Same Nano weights, VAE, tokenizer, and FlowUniPC schedule as
 ``Cosmos3Pipeline``; the difference is camera-major packing, per-camera VAE
-calls, wrapped temporal positions, and the cross-camera attention installed by
-``Cosmos3MultiviewTransformer`` (masked FlexAttention / FA4 for ``triton``/``fa4``
-exports, the maskless folds for ``maskless`` exports).
+calls, wrapped temporal positions, and the masked cross-camera attention
+installed by ``Cosmos3MultiviewTransformer`` (FlexAttention Triton or
+FlashAttention-4 block-sparse kernels).
 """
 
 import importlib.util
@@ -96,13 +96,18 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
             )
         vae = self.get_module("vae")
         scheduler = self.get_module("scheduler")
-        backend = pipeline_config.resolved_multiview_backend()
-        if backend == COSMOS3_MULTIVIEW_AUTO_BACKEND:
-            backend = resolve_masked_backend(get_local_torch_device())
+        requested = pipeline_config.resolved_multiview_backend()
+        backend = (
+            resolve_masked_backend(get_local_torch_device())
+            if requested == COSMOS3_MULTIVIEW_AUTO_BACKEND
+            else requested
+        )
         logger.info(
-            "Cosmos3 multiview attention backend: %s (export declares %s)",
+            "Cosmos3 multiview attention backend: %s (%s)",
             backend,
-            deployment.backend,
+            "device default"
+            if requested == COSMOS3_MULTIVIEW_AUTO_BACKEND
+            else "pinned",
         )
         lidar_encoder = None
         lidar_decoder = None
@@ -154,17 +159,12 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
             )
         )
         logger.info(
-            "Cosmos3 multiview pipeline stages created (%d cameras, scope=%s, "
-            "control_attends_sensor=%s, backend=%s, schema=%s, per-camera captions=%s, "
-            "lidar=%s, system prompt=%s)",
+            "Cosmos3 multiview pipeline stages created (%d cameras, backend=%s, "
+            "cross-view window=%.2f s, lidar=%s)",
             deployment.num_views,
-            deployment.attention_scope,
-            deployment.control_attends_sensor,
             backend,
-            deployment.schema_version,
-            deployment.per_view_captions,
+            deployment.cross_view_past_window_seconds,
             deployment.supports_lidar,
-            deployment.system_prompt_variant,
         )
 
 
