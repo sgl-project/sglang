@@ -138,8 +138,6 @@ _enable_bf16_splitk_gemm = False
 # GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
 # Unlisted shapes, including M=64, retain the existing TGV/cuBLAS path.
 _BF16_SPLITK_TUNED_TACTICS = {
-    # Qwen3-VL-4B TP1 decode: B300 CUDA graphs with weights rotated beyond L2.
-    # Keep larger batches and gate/up projections on their existing paths.
     (1, 6144, 2560): (128, 8, 2, 6),
     (2, 6144, 2560): (128, 8, 2, 6),
     (4, 6144, 2560): (128, 8, 2, 6),

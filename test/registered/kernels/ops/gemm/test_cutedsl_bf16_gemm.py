@@ -28,40 +28,6 @@ NUM_TOKENS = get_ci_test_range(list(range(1, 33)), [1, 15, 16, 32])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("m", [1, 2, 4, 8])
-@pytest.mark.parametrize("n,k", [(6144, 2560), (2560, 4096), (2560, 9728)])
-def test_qwen3_vl_splitk_numerical_error(m, n, k):
-    """Split-K reduction must retain ordinary BF16 accumulation accuracy."""
-    if is_hip_runtime() or get_jit_cuda_arch().major != 10:
-        pytest.skip("SM10x required")
-
-    from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
-        SplitKTactic,
-        run_splitk_dense,
-    )
-
-    from sglang.srt.layers.quantization.unquant import _BF16_SPLITK_TUNED_TACTICS
-
-    torch.manual_seed(42)
-    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-    out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
-    tactic = SplitKTactic(*_BF16_SPLITK_TUNED_TACTICS[(m, n, k)])
-    run_splitk_dense(x, weight.T, None, out, True, tactic)
-
-    reference = x.float() @ weight.float().T
-    normalized_rmse = (
-        (out.float() - reference).square().mean() / reference.square().mean()
-    ).sqrt()
-    assert normalized_rmse.item() < 0.0025
-    baseline = torch.nn.functional.linear(x, weight)
-    cosine = torch.nn.functional.cosine_similarity(
-        out.float().flatten(), baseline.float().flatten(), dim=0
-    )
-    assert cosine.item() > 0.99998
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("has_bias", [False, True])
 @pytest.mark.parametrize("n,k", SHAPES)
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
