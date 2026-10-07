@@ -1,7 +1,7 @@
 """Which eager forwards the extend memory profiler records.
 
 Covers the mode/token predicate (``extend_mem_profile_tokens``) against
-ForwardBatch-like objects shaped the way ``prepare_mlp_sync_batch`` leaves
+ForwardBatch objects shaped the way ``prepare_mlp_sync_batch`` leaves
 them, and the ModelRunner eager call site: ``record`` must be entered only for
 a genuine prefill extend with enough real tokens, and nothing profiler-related
 may run when the profiler is disabled.
@@ -13,7 +13,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import (
     ModelRunner,
     extend_mem_profile_tokens,
@@ -32,13 +32,19 @@ def _batch(
     non_padded=None,
     input_ids=0,
 ):
-    """ForwardBatch-like object with the fields the predicate reads."""
-    return SimpleNamespace(
+    """A real ForwardBatch with the fields the predicate reads set."""
+    empty = torch.zeros(0, dtype=torch.int64)
+    return ForwardBatch(
         forward_mode=mode,
+        batch_size=0,
+        input_ids=torch.zeros(input_ids, dtype=torch.int64),
+        req_pool_indices=empty,
+        seq_lens=empty,
+        out_cache_loc=empty,
+        seq_lens_sum=0,
         _original_forward_mode=original_mode,
         _original_num_tokens=original_num_tokens,
-        num_token_non_padded_cpu=non_padded,
-        input_ids=torch.zeros(input_ids, dtype=torch.int64),
+        global_num_token_non_padded_cpu=non_padded,
     )
 
 
@@ -60,8 +66,8 @@ def padded_extend(real=3000, padded=4096):
 
 def idle_hybrid_converted(peer_tokens=4096):
     # Idle hybrid-SSM rank converted to EXTEND with a fabricated request:
-    # forward_batch_info overwrites num_token_non_padded_cpu with the peer's
-    # padded length and pads input_ids to it; positions had 0 rows.
+    # forward_batch_info rewrites global_num_token_non_padded_cpu and pads
+    # input_ids to the peer's length; positions had 0 rows.
     return _batch(
         ForwardMode.EXTEND,
         original_mode=ForwardMode.IDLE,
@@ -126,6 +132,13 @@ class ExtendMemProfileTokensTest(unittest.TestCase):
     def test_decode_and_idle_are_excluded(self):
         self.assertEqual(extend_mem_profile_tokens(decode()), 0)
         self.assertEqual(extend_mem_profile_tokens(idle()), 0)
+
+    def test_unpadded_extend_without_original_count_reads_the_real_field(self):
+        # Single-rank eager EXTEND: no padding ran, so _original_num_tokens is
+        # None and the count comes from the batch's real non-padded field.
+        batch = _batch(ForwardMode.EXTEND, non_padded=1500, input_ids=1500)
+        self.assertIsNone(batch._original_num_tokens)
+        self.assertEqual(extend_mem_profile_tokens(batch), 1500)
 
     def test_falls_back_to_input_ids_without_any_count(self):
         batch = _batch(ForwardMode.EXTEND, input_ids=2048)

@@ -289,14 +289,15 @@ def extend_mem_profile_tokens(forward_batch: ForwardBatch) -> int:
     0, and so does a batch that ``prepare_mlp_sync_batch`` converted to
     EXTEND for DP MAX_LEN padding (an idle hybrid-SSM rank running a
     fabricated request, or decode rows padded to 1-token extends): those
-    keep their original mode in ``_original_forward_mode``, and the idle
-    conversion deliberately overwrites ``num_token_non_padded_cpu`` with the
-    peer's padded length, so neither the converted mode nor that count can
-    be trusted on its own.
+    keep their original mode in ``_original_forward_mode``, and the
+    conversion rewrites ``global_num_token_non_padded_cpu`` for the
+    fabricated rows, so neither the converted mode nor that count can be
+    trusted on its own.
 
     The count comes from before padding: ``_original_num_tokens`` is the
     pre-padding token count recorded by ``_pad_inputs_to_size``; when no
-    padding ran, ``num_token_non_padded_cpu`` is the batch's own count.
+    padding ran, ``global_num_token_non_padded_cpu`` is the batch's own
+    count.
     """
     mode = forward_batch._original_forward_mode
     if mode is None:
@@ -305,7 +306,7 @@ def extend_mem_profile_tokens(forward_batch: ForwardBatch) -> int:
         return 0
     num_tokens = forward_batch._original_num_tokens
     if num_tokens is None:
-        num_tokens = forward_batch.num_token_non_padded_cpu
+        num_tokens = forward_batch.global_num_token_non_padded_cpu
     if num_tokens is None:
         num_tokens = forward_batch.input_ids.numel()
     return int(num_tokens)
