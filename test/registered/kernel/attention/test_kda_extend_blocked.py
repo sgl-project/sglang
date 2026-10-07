@@ -13,14 +13,15 @@ sentinel without a GPU.
 Numerical contract: the single call and the blocked calls run the same
 per-chunk math on the same chunks (blocks are chunk-aligned), the state is
 accumulated in fp32 in both and chained between blocks through an fp32 scratch
-slot (cast back once, like the single call's final store). When every call
-dispatches the same intra-chunk kernel variant (B * num_chunks * H <= 256 on
-both sides, fla/kda.py) the results are bitwise equal and the tests assert
-that. When blocking moves a call across that threshold the two variants round
-differently and the test asserts a tight tolerance instead.
+slot (cast back once, like the single call's final store). chunk_kda picks
+its intra-chunk kernel variant from the call's grid (B * num_chunks * H <= 256,
+fla/kda.py), and the blocked calls are given the decision for the whole extend,
+so they run the same variant as the single call. The results are bitwise equal
+and the tests assert that.
 """
 
 import contextlib
+import math
 import os
 import unittest
 from unittest import mock
@@ -147,6 +148,7 @@ def _run(
     seq_lens=_TRUE_LENS,
     track_state=None,
     track_chunk_idx=None,
+    lower_bound=-5.0,
 ):
     """Run extend with SGLANG_KDA_EXTEND_BLOCK_TOKENS=block on a fresh pool
     copy. ``kernel`` replaces kda_triton.chunk_kda for the call; ``seq_lens``
@@ -171,7 +173,7 @@ def _run(
             query_start_loc=inputs["cu_seqlens"],
             A_log=inputs["A_log"],
             dt_bias=inputs["dt_bias"],
-            lower_bound=-5.0,
+            lower_bound=lower_bound,
             extend_seq_lens_cpu=seq_lens,
             return_intermediate_states=return_intermediate_states,
             track_state=track_state,
@@ -233,17 +235,6 @@ class _Checks:
             diff = (got.float() - want.float()).abs().max().item()
             self.fail(f"{what}: max |diff| = {diff}")
 
-    def assertClose(self, got, want, what, *, atol, rtol):
-        self.assertEqual(tuple(got.shape), tuple(want.shape), what)
-        self.assertEqual(got.dtype, want.dtype, what)
-        torch.testing.assert_close(
-            got.float(),
-            want.float(),
-            atol=atol,
-            rtol=rtol,
-            msg=lambda m: f"{what}: {m}",
-        )
-
     def assertUntouched(self, pool, inputs):
         untouched = [
             i for i in range(pool.shape[0]) if i not in inputs["cache_indices"].tolist()
@@ -260,12 +251,19 @@ class TestKdaExtendBlocked(CustomTestCase, _Checks):
 
     @torch.inference_mode()
     def _compare(
-        self, inputs, block, calls, *, return_intermediate_states=False, close=None
+        self,
+        inputs,
+        block,
+        calls,
+        *,
+        return_intermediate_states=False,
+        lower_bound=-5.0,
     ):
-        """``close=(atol, rtol)`` compares with a tolerance instead of exactly
-        (only for cases whose calls dispatch different kernel variants)."""
         o_ref, h_ref, pool_ref = _run(
-            0, inputs, return_intermediate_states=return_intermediate_states
+            0,
+            inputs,
+            return_intermediate_states=return_intermediate_states,
+            lower_bound=lower_bound,
         )
         spy = _ChunkKdaSpy(kda_triton.chunk_kda)
         o_blk, h_blk, pool_blk = _run(
@@ -273,18 +271,12 @@ class TestKdaExtendBlocked(CustomTestCase, _Checks):
             inputs,
             return_intermediate_states=return_intermediate_states,
             kernel=spy,
+            lower_bound=lower_bound,
         )
         # Blocking happened: the exact plan, and every call within the block.
         self.assertEqual(spy.tokens, calls)
         self.assertTrue(all(t <= block for t in spy.tokens))
-        if close is None:
-            check = self.assertSame
-        else:
-            atol, rtol = close
-
-            def check(got, want, what):
-                self.assertClose(got, want, what, atol=atol, rtol=rtol)
-
+        check = self.assertSame
         check(o_blk, o_ref, "output")
         check(pool_blk, pool_ref, "pool")
         self.assertUntouched(pool_blk, inputs)
@@ -296,7 +288,7 @@ class TestKdaExtendBlocked(CustomTestCase, _Checks):
             check(h_blk, h_ref, "intermediate states")
         else:
             self.assertIsNone(h_blk)
-        return spy
+        return spy, o_blk
 
     def test_blocked_matches_unblocked(self):
         self._compare(_inputs(SEQ_LENS, SLOT_INDICES), BLOCK, CALLS)
@@ -362,33 +354,69 @@ class TestKdaExtendBlocked(CustomTestCase, _Checks):
         short = 64
         seq_lens = [CHUNK] * short + [4096 + CHUNK]
         slots = list(range(short + 1))
-        spy = self._compare(_inputs(seq_lens, slots), 4096, [4096, 4096, CHUNK])
+        spy, _ = self._compare(_inputs(seq_lens, slots), 4096, [4096, 4096, CHUNK])
         tokens, cu = spy.calls[0]
         self.assertEqual(len(cu), short + 1)
         self.assertEqual(cu, [CHUNK * i for i in range(short + 1)])
 
-    def test_multi_head_across_intra_kernel_threshold(self):
+    def test_multi_head_keeps_full_extend_intra_variant(self):
         # chunk_kda picks the intra-chunk kernel variant per call from
         # B * num_chunks * H <= 256 (fla/kda.py). With 8 heads, the single call
         # over 2112 tokens has 33 * 8 = 264 (non-fused variant) while the 2048-
-        # and 64-token blocks have 256 and 8 (fused variant): different kernels
-        # with different rounding of the bf16 intermediates, so exact equality
-        # is not the contract here. The tolerance is a few bf16 ulps of the
-        # values involved; it has not been calibrated on a GPU in this revision.
+        # and 64-token blocks alone would have 256 and 8 (fused variant). The
+        # blocks must run the single call's variant, with identical results.
         from sglang.kernels.ops.attention.fla import kda as fla_kda
 
-        intra = _IntraSpy(fla_kda.chunk_kda_fwd_intra)
-        with mock.patch.object(fla_kda, "chunk_kda_fwd_intra", intra):
-            self._compare(
-                _inputs([BLOCK + 64], [1], num_heads=8),
-                BLOCK,
-                [BLOCK, 64],
-                return_intermediate_states=True,
-                close=(1e-2, 1e-2),
-            )
-        # The single call ran the non-fused variant, both blocks the fused one:
-        # the threshold really was crossed.
-        self.assertEqual(intra.fused, [False, True, True])
+        for lower_bound in (-5.0, None):
+            with self.subTest(lower_bound=lower_bound):
+                intra = _IntraSpy(fla_kda.chunk_kda_fwd_intra)
+                with mock.patch.object(fla_kda, "chunk_kda_fwd_intra", intra):
+                    self._compare(
+                        _inputs([BLOCK + 64], [1], num_heads=8),
+                        BLOCK,
+                        [BLOCK, 64],
+                        return_intermediate_states=True,
+                        lower_bound=lower_bound,
+                    )
+                self.assertEqual(intra.fused, [False, False, False])
+
+    def test_standard_gate_large_decay_matches_unblocked(self):
+        # Without lower_bound the gate decay is unbounded. Here every token
+        # decays the state by 2**-20 (raw gate 0, A_log = log(20), no bias:
+        # 20 * ln(2) nats), q = k = e0 and v is zero except at token 7, so the
+        # exact output at token 8 is scale * beta * (1 - beta) * 2**-20, about
+        # 3e-8. The fused intra-chunk variant clamps each token's gate offset
+        # within a 16-token sub-chunk to +-126 (log2), which turns that decay
+        # into 1 and gives 0.03125. The 2048-token block alone would pick the
+        # fused variant (32 * 8 = 256); it must run the single call's.
+        seq_len, heads = BLOCK + 64, 8
+        shape = (1, seq_len, heads, HEAD_DIM)
+        q = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
+        q[..., 0] = 1
+        v = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
+        v[0, 7] = 1
+        inputs = dict(
+            q=q,
+            k=q.clone(),
+            v=v,
+            g=torch.zeros(shape, dtype=torch.bfloat16, device="cuda"),
+            beta=torch.full(shape[:-1], 0.5, dtype=torch.bfloat16, device="cuda"),
+            A_log=torch.full((heads,), math.log(20.0), device="cuda"),
+            dt_bias=torch.zeros(heads * HEAD_DIM, device="cuda"),
+            pool=torch.zeros(3, heads, HEAD_DIM, HEAD_DIM, device="cuda"),
+            cache_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+            cu_seqlens=torch.tensor([0, seq_len], dtype=torch.int32, device="cuda"),
+            seq_lens=[seq_len],
+        )
+        _, o_blk = self._compare(
+            inputs,
+            BLOCK,
+            [BLOCK, 64],
+            return_intermediate_states=True,
+            lower_bound=None,
+        )
+        self.assertLess(o_blk[0, 8:].float().abs().max().item(), 1e-6)
+        self.assertGreater(o_blk[0, 7].float().abs().min().item(), 1e-2)
 
 
 class _FakeChunkKda:
@@ -428,6 +456,7 @@ class _FakeChunkKda:
             dict(
                 tokens=q.shape[1],
                 cu=cu,
+                fuse_intra=kwargs.get("fuse_intra"),
                 indices=indices,
                 state=initial_state,
                 cu_seqlens=cu_seqlens,
@@ -456,18 +485,20 @@ class _FakeChunkKda:
         return v
 
 
-def _int_inputs(seq_lens, slot_indices, *, pool_dtype=torch.float32):
-    inputs = _inputs(seq_lens, slot_indices, device="cpu")
+def _int_inputs(
+    seq_lens, slot_indices, *, pool_dtype=torch.float32, num_heads=NUM_HEADS
+):
+    inputs = _inputs(seq_lens, slot_indices, device="cpu", num_heads=num_heads)
     total = sum(seq_lens)
     generator = torch.Generator().manual_seed(1)
     v_wide = torch.randint(
-        -2, 3, (1, total, NUM_HEADS, 2 * HEAD_DIM), generator=generator
+        -2, 3, (1, total, num_heads, 2 * HEAD_DIM), generator=generator
     ).to(torch.bfloat16)
     inputs["v"] = v_wide[..., :HEAD_DIM]
     inputs["pool"] = torch.randint(
         -2,
         3,
-        (inputs["pool"].shape[0], NUM_HEADS, HEAD_DIM, HEAD_DIM),
+        (inputs["pool"].shape[0], num_heads, HEAD_DIM, HEAD_DIM),
         generator=generator,
     ).to(pool_dtype)
     return inputs
@@ -635,6 +666,28 @@ class TestKdaExtendBlockedPlan(CustomTestCase, _Checks):
         fake = _FakeChunkKda()
         _run(BLOCK, inputs, kernel=fake, seq_lens=torch.tensor(SEQ_LENS))
         self.assertEqual([c["tokens"] for c in fake.calls], CALLS)
+
+    def test_blocks_get_full_extend_intra_variant(self):
+        # chunk_kda would pick the intra-chunk variant from each block's own
+        # grid (B * num_chunks * H <= 256); every block must instead get the
+        # decision for the whole extend. The single call decides for itself.
+        cases = [
+            # 8 heads: 33 chunks * 8 = 264, while a 2048-token block is 256.
+            ([BLOCK + 64], [1], 8, [BLOCK, 64], False),
+            # 1 head: 1 + 32 + 33 + 65 = 131 chunks.
+            (SEQ_LENS, SLOT_INDICES, 1, CALLS, True),
+        ]
+        for lens, slots, heads, calls, fused in cases:
+            with self.subTest(lens=lens, heads=heads):
+                inputs = _int_inputs(lens, slots, num_heads=heads)
+                fake = self._plan(inputs, BLOCK)
+                self.assertEqual([c["tokens"] for c in fake.calls], calls)
+                self.assertEqual(
+                    [c["fuse_intra"] for c in fake.calls], [fused] * len(calls)
+                )
+                single = _FakeChunkKda()
+                _run(0, inputs, kernel=single)
+                self.assertEqual([c["fuse_intra"] for c in single.calls], [None])
 
     def test_within_block_is_single_call(self):
         inputs = _int_inputs([64, 128], [1, 2])

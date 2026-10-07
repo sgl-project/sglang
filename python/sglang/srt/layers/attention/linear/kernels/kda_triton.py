@@ -400,11 +400,13 @@ def _extend_blocked(
     - ``block`` is a multiple of the 64-token chunk (``_extend_block_tokens``),
       so split points inside a sequence are chunk boundaries: the chunk-local
       gate cumsum and the per-chunk ``h`` entries are the same as in the
-      single call. The intra-chunk kernel variant is chosen per call from
-      ``B * num_chunks * H <= 256`` (fla/kda.py), so a block whose grid falls
-      on the other side of that threshold than the single call runs the other
-      variant, with rounding-level differences; otherwise results are
-      identical.
+      single call. chunk_kda picks its intra-chunk kernel variant from the
+      call's grid (``B * num_chunks * H <= 256``, fla/kda.py). The variants
+      are not interchangeable: without ``lower_bound`` the fused diagonal
+      clamps per-token gate offsets, so a large gate decay gives a different
+      result, not just different rounding. Every block is therefore given
+      the decision for the whole extend (``fuse_intra``), and the results are
+      identical to the single call's.
     - The fwd_h kernel loads a sequence's initial state from
       ``initial_state[index]`` and stores its final state to the same slot
       (INPLACE_UPDATE), skipping both for the padded-row sentinel ``-1``.
@@ -433,6 +435,7 @@ def _extend_blocked(
     h_out = None
     h_pos = 0
     num_chunks = sum(-(-n // _KDA_CHUNK_TOKENS) for n in seq_lens)
+    common = dict(common, fuse_intra=q.shape[0] * num_chunks * q.shape[-2] <= 256)
 
     def run(s, e, cu_list, initial_state, indices, seq_start, seq_end, chunk_offset=0):
         nonlocal h_out, h_pos
