@@ -261,13 +261,6 @@ def compute_target_verify_graph_key(
 ) -> Tuple[int, int]:
     num_tokens_full_block = num_draft_tokens * bs
     if ragged_layout is None:
-        if (
-            ragged_verify_compact_enabled()
-            and envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get()
-        ):
-            # Forced-uniform compact captures carry no layout, but replays do
-            # and key by token count; key the capture the same way.
-            return num_tokens_full_block, num_tokens_full_block
         return bs, num_tokens_full_block
     graph_num_tokens = ragged_layout.graph_num_tokens
     assert graph_num_tokens <= num_tokens_full_block, (

@@ -651,8 +651,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _capture_ragged_verify_layout(self, num_tokens: int):
         if not self.ragged_verify_mode:
             return None
-        if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
-            return None
+        # Forced-uniform capture still carries a layout, of full-width rows
+        # (_ragged_capture_slots): a capture without one would record uniform
+        # attention geometry that a packed replay cannot refresh.
         from sglang.srt.speculative.ragged_verify import (
             RaggedVerifyLayout,
             build_capture_verify_lens,
