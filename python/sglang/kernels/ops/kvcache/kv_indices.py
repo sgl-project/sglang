@@ -1,3 +1,5 @@
+from typing import Optional
+
 import triton
 import triton.language as tl
 
@@ -25,39 +27,29 @@ SPEC_KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
 
 def spec_kv_index_token_blocks(
     table_width: int,
-    kv_lens_sum,
+    kv_lens_sum: Optional[int],
     batch_size: int,
-    base_programs=None,
-    length_cap=None,
-    context_len=None,
+    base_programs: Optional[int] = None,
+    length_cap: Optional[int] = None,
+    context_len: Optional[int] = None,
 ) -> int:
     """Token blocks per base program for a spec-decode KV-index launch.
 
-    One gate and one sizing rule for every launch site (the EAGLE verify /
-    draft-extend builders shared by the flashinfer, flashinfer_mla and aiter
-    backends, and the flashinfer / aiter draft-decode launches). Returns 1
-    below the long-context gate. When ``kv_lens_sum`` is a host int the
-    block count is sized from the batch's mean live KV length (optionally
-    capped by ``length_cap``, e.g. a draft window), so a batch of short
-    prefixes on a long-context server does not fan out into idle programs;
-    any other value (a device tensor, or None) falls back to the table
-    width, the sync-free bound. ``base_programs`` is the launch's base grid
-    size (default: ``batch_size``). ``context_len`` is the value the
-    long-context gate reads (default: ``table_width``; AITER gates on the
-    server's ``max_context_len`` while sizing from its token table). Any
-    block count is correct for the kernels above (they stride their blocks
-    over the row); it only changes the parallelism.
+    1 below the long-context gate (``context_len``, default ``table_width``).
+    Otherwise sized from the batch's mean live KV length when ``kv_lens_sum``
+    is given (capped by ``length_cap``), else from ``table_width``. Any block
+    count is correct; it only changes the parallelism.
     """
     gate = table_width if context_len is None else context_len
     if gate < SPEC_KV_INDEX_BLOCKS_MIN_CONTEXT or batch_size <= 0:
         return 1
-    if isinstance(kv_lens_sum, int):
+    if kv_lens_sum is None:
+        width = table_width
+    else:
         width = (kv_lens_sum + batch_size - 1) // batch_size
         if length_cap is not None:
             width = min(width, length_cap)
-    else:
-        width = table_width
-    programs = base_programs if base_programs is not None else batch_size
+    programs = batch_size if base_programs is None else base_programs
     return kv_indices_num_token_blocks(width, programs)
 
 

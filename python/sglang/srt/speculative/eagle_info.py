@@ -421,17 +421,18 @@ class EagleDraftExtendInput(SpecInput):
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
+        # Sized while the length sum is still a host int (None -> table width).
+        num_token_blocks = spec_kv_index_token_blocks(
+            table_width=req_to_token.size(1),
+            kv_lens_sum=paged_kernel_lens_sum,
+            batch_size=bs,
+        )
+
         if paged_kernel_lens_sum is None:
             paged_kernel_lens_sum = cum_kv_seq_len[-1]
 
         kv_indices = torch.empty(
             paged_kernel_lens_sum, dtype=torch.int32, device=device
-        )
-
-        num_token_blocks = spec_kv_index_token_blocks(
-            table_width=req_to_token.size(1),
-            kv_lens_sum=paged_kernel_lens_sum,
-            batch_size=bs,
         )
         create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
             req_to_token,

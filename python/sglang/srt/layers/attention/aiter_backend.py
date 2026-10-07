@@ -122,14 +122,6 @@ fast_mode = False
 intra_batch_mode = True if _use_mla_ps_kernel else False
 
 
-# Token-block parallel KV-index building is enabled only where it pays:
-# the speculative-decoding paths (target_verify / draft_extend / draft
-# decode) of long-context servers. Everything else keeps the historical
-# one-program-per-request launch.
-# The threshold and the sizing helper live in
-# sglang.kernels.ops.kvcache.kv_indices (spec_kv_index_token_blocks).
-
-
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
@@ -1494,13 +1486,10 @@ class AiterAttnBackend(AttentionBackend):
         return output[:, : layer.tp_q_head_num, :] if head_pad else output
 
     def _kv_index_blocks(self, bs: int) -> int:
-        # Shared helper (sglang.kernels.ops.kvcache.kv_indices) with the
-        # AITER rule unchanged: gate on max_context_len, size from the table
-        # width (no host length sum is passed).
         return spec_kv_index_token_blocks(
             self.req_to_token.shape[1],
-            None,
-            bs,
+            kv_lens_sum=None,
+            batch_size=bs,
             context_len=self.max_context_len,
         )
 
@@ -4303,10 +4292,10 @@ class AiterMultiStepDraftBackend:
 
         num_token_blocks = spec_kv_index_token_blocks(
             self.pool_len,
-            None,  # table-width sizing, as before
-            num_seqs,
+            kv_lens_sum=None,
+            batch_size=num_seqs,
             base_programs=self.speculative_num_steps * num_seqs * self.topk,
-            context_len=self.max_context_len,  # gate as before
+            context_len=self.max_context_len,
         )
         self.generate_draft_decode_kv_indices[
             (self.speculative_num_steps * num_token_blocks, num_seqs, self.topk)

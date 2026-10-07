@@ -2391,12 +2391,7 @@ class FlashInferMultiStepDraftBackend:
             seq_lens_sum=seq_lens_sum,
         )
 
-        # Token blocks from the batch's mean live length (seq_lens_sum is a
-        # host int here), capped by the draft window when one is set: the
-        # table width would fan a few short requests out into idle programs.
-        # This launch runs outside the captured draft graph, so the grid may
-        # change from step to step; any block count is correct (the kernel
-        # strides its blocks over the row), it only changes the parallelism.
+        # Blocks from the mean live length (capped by the draft window), not the table width.
         num_token_blocks = spec_kv_index_token_blocks(
             table_width=self.max_context_len,
             kv_lens_sum=seq_lens_sum,
