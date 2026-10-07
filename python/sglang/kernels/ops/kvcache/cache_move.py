@@ -58,6 +58,18 @@ def set_kv_buffer_prefix_valid_tiled(
 
 
 @triton.jit
+def _saturate_to_fp8_range(val, FP8_MAX: tl.constexpr):
+    """Clamp into the FP8 range, leaving NaN untouched.
+
+    Mirrors ``saturate_to_fp8_range`` on the eager side. Comparisons against
+    NaN are false, so a NaN input falls through both ``tl.where`` arms and
+    still converts to the FP8 NaN encoding.
+    """
+    val = tl.where(val > FP8_MAX, FP8_MAX, val)
+    return tl.where(val < -FP8_MAX, -FP8_MAX, val)
+
+
+@triton.jit
 def set_kv_buffer_prefix_valid_tiled_fp8(
     src_k_ptr,
     src_v_ptr,
@@ -74,6 +86,7 @@ def set_kv_buffer_prefix_valid_tiled_fp8(
     block_size,
     ROW_ELEMS: tl.constexpr,
     ELEMS_PER_TILE: tl.constexpr,
+    FP8_MAX: tl.constexpr,
     K_SCALE_IS_TENSOR: tl.constexpr = False,
     V_SCALE_IS_TENSOR: tl.constexpr = False,
 ):
@@ -104,7 +117,9 @@ def set_kv_buffer_prefix_valid_tiled_fp8(
     else:
         # Eager host-scalar division multiplies by a rounded FP32 reciprocal.
         k_val = k_val * tl.div_rn(1.0, k_scale)
-    k_val = k_val.to(src_k_ptr.dtype.element_ty).to(dst_k_ptr.dtype.element_ty)
+    k_val = k_val.to(src_k_ptr.dtype.element_ty).to(tl.float32)
+    k_val = _saturate_to_fp8_range(k_val, FP8_MAX)
+    k_val = k_val.to(dst_k_ptr.dtype.element_ty)
 
     v_val = tl.load(src_v_row_ptr, mask=mask_elem, other=0).to(tl.float32)
     if V_SCALE_IS_TENSOR:
@@ -112,7 +127,9 @@ def set_kv_buffer_prefix_valid_tiled_fp8(
         v_val = tl.div_rn(v_val, v_scale)
     else:
         v_val = v_val * tl.div_rn(1.0, v_scale)
-    v_val = v_val.to(src_v_ptr.dtype.element_ty).to(dst_v_ptr.dtype.element_ty)
+    v_val = v_val.to(src_v_ptr.dtype.element_ty).to(tl.float32)
+    v_val = _saturate_to_fp8_range(v_val, FP8_MAX)
+    v_val = v_val.to(dst_v_ptr.dtype.element_ty)
 
     tl.store(dst_k_row_ptr, k_val, mask=mask_elem)
     tl.store(dst_v_row_ptr, v_val, mask=mask_elem)
