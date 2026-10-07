@@ -44,7 +44,10 @@ def test_modelopt_checkpoint_conversion(tmp_path, kind, keep_bf16, index_name):
     weights = torch.arange(32).reshape(4, 8).to(torch.bfloat16)
     serialized = weights if kind == "fp8" else weights.to(torch.uint8)
     shards = [
-        {f"{name}.weight": serialized, f"{name}.weight_scale": torch.tensor(1.0)}
+        {
+            f"{name}.weight": serialized.clone(),
+            f"{name}.weight_scale": torch.tensor(1.0),
+        }
         for name in ("quantized", "fallback")
     ]
     shards[0]["quantized.weight_quantizer._amax"] = torch.tensor(448.0)
