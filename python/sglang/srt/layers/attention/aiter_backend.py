@@ -407,6 +407,7 @@ class AiterAttnBackend(AttentionBackend):
                 f"got {self.mla_verify_backend!r}"
             )
         self._cprr_launch_logged = False
+        self.use_mla_auto_kv_splits = False
         # fast_mode / intra_batch_mode for the cp verify schedule. Not the
         # module defaults: those size reduce_partial_map at 65536 entries
         # instead of 1276, and mla_decode_fwd then asks for a 64 GiB logits
@@ -669,11 +670,14 @@ class AiterAttnBackend(AttentionBackend):
                 self.max_split_per_batch = 64
 
             # When the env var is on, aiter plans the KV splits. The default
-            # scheduler clamps every request to ceil(num_cu / batch_size)
-            # splits regardless of how long the KV is, and that clamp is
-            # inside the kernel, so no host value lifts it. The v1_2
-            # scheduler sizes the count from the workload, and -1 selects its
-            # auto branch.
+            # scheduler gives every request ceil(num_cu / batch_size) splits.
+            # It ignores the KV length. That clamp is inside the kernel, so no
+            # host value lifts it. The v1_2 scheduler sizes the count from the
+            # workload. A max_split_per_batch of -1 selects its auto branch.
+            #
+            # Under DCP the cp verify route already runs the v1_2 scheduler:
+            # make_mla_decode_meta_data_buffer takes cprr_fast_mode and
+            # cprr_intra_batch_mode instead. There only the -1 has an effect.
             self.use_mla_auto_kv_splits = (
                 use_any_mla_persist and envs.SGLANG_AITER_MLA_AUTO_KV_SPLITS.get()
             )
@@ -776,7 +780,7 @@ class AiterAttnBackend(AttentionBackend):
         dtype = self.kv_cache_dtype
 
         # The auto count is -1, which this min() would turn into a real cap.
-        if self.attn_dp_enabled and not getattr(self, "use_mla_auto_kv_splits", False):
+        if self.attn_dp_enabled and not self.use_mla_auto_kv_splits:
             gpu = torch.cuda.current_device()
             device_properties = torch.cuda.get_device_properties(gpu)
             cu_num = device_properties.multi_processor_count
@@ -1529,6 +1533,17 @@ class AiterAttnBackend(AttentionBackend):
             return 1
         return int(seq_lens.max().item())
 
+    def _kernel_num_kv_splits(self) -> Optional[int]:
+        """The split count for a decode kernel call, None to let aiter pick.
+
+        The metadata call takes an int and gets -1 for the auto branch. The
+        kernel takes None instead. mla.py re-decides persistent mode only on
+        None. It would read -1 as a real count.
+        """
+        if self.use_mla_auto_kv_splits:
+            return None
+        return self.forward_metadata.num_kv_splits
+
     def _forward_mla_decode(
         self,
         q: torch.Tensor,
@@ -1567,12 +1582,7 @@ class AiterAttnBackend(AttentionBackend):
         reduce_indptr = self.forward_metadata.reduce_indptr
         reduce_final_map = self.forward_metadata.reduce_final_map
         reduce_partial_map = self.forward_metadata.reduce_partial_map
-        num_kv_splits = self.forward_metadata.num_kv_splits
-        # None lets mla.py re-decide persistent mode for this shape. An
-        # explicit count keeps whatever _use_mla_ps_kernel chose. The metadata
-        # still takes an int, so only the kernel argument changes.
-        if getattr(self, "use_mla_auto_kv_splits", False):
-            num_kv_splits = None
+        num_kv_splits = self._kernel_num_kv_splits()
 
         return self._mla_decode_fwd_with_head_pad(
             q,
@@ -1647,7 +1657,7 @@ class AiterAttnBackend(AttentionBackend):
                 fm.max_q_len or 1,
                 sm_scale=layer.scaling,
                 logit_cap=layer.logit_cap,
-                num_kv_splits=fm.num_kv_splits,
+                num_kv_splits=self._kernel_num_kv_splits(),
                 work_meta_data=fm.work_metadata,
                 work_indptr=fm.work_indptr,
                 work_info_set=fm.work_info_set,
@@ -1734,7 +1744,7 @@ class AiterAttnBackend(AttentionBackend):
             q_scale=q_scale,
             kv_scale=kv_scale,
             intra_batch_mode=self.cprr_intra_batch_mode,
-            num_kv_splits=fm.num_kv_splits,
+            num_kv_splits=self._kernel_num_kv_splits(),
             return_lse=True,
             g_kv_indptr=fm.global_kv_indptr,
             cp_world_size=self.dcp_world_size,

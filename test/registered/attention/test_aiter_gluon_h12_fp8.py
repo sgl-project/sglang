@@ -241,6 +241,8 @@ class TestForwardMlaDecodeDispatch(CustomTestCase):
         # per-rank count, so 16 here. _asm_ps_supports_qlen reads it.
         be.mla_kernel_num_head_padded = 16
         be.mla_decode_backend = "asm"
+        # __new__ skips __init__, so set what _kernel_num_kv_splits reads.
+        be.use_mla_auto_kv_splits = False
         be.forward_metadata = mock.Mock(
             max_q_len=max_q_len,
             kv_indices=torch.zeros(4, dtype=torch.int32),
@@ -375,6 +377,8 @@ class TestMlaDcpAsmDecode(CustomTestCase):
         be.dcp_world_size = 8
         be.input_dtype = torch.bfloat16
         be.max_split_per_batch = 64
+        # __new__ skips __init__, so set what _kernel_num_kv_splits reads.
+        be.use_mla_auto_kv_splits = False
         be.forward_metadata = mock.Mock(
             kv_indptr=torch.tensor([0, 2, 4], dtype=torch.int32),
             kv_indices=torch.arange(4, dtype=torch.int32),
