@@ -431,6 +431,27 @@ def test_cpu_runner_does_not_query_cuda_metadata(override):
     assert runner.architecture == ("default" if override is None else override)
 
 
+def test_explicit_experimental_mla_selection_precedes_v2():
+    tree = _tree("models/deepseek_common/attention_forward_methods/forward_mla.py")
+    # Explicit experimental selection still takes precedence over V2.
+    experimental_fallbacks = {
+        id(child)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "_SGLANG_EXPERIMENTAL_LORA_OPTI"
+        for branch in node.orelse
+        for child in ast.walk(branch)
+    }
+    dense_imports = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "sglang.srt.lora.dense"
+    ]
+    assert len(dense_imports) == 2
+    assert all(id(node) in experimental_fallbacks for node in dense_imports)
+
+
 def _geometry_host_function(name, **scope):
     path = ROOT.parent / "kernels/ops/lora/common/lora_b.py"
     node = next(

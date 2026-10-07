@@ -25,15 +25,7 @@ from sglang.srt.layers.dcp import (
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.radix_attention import unified_attention_with_output
-from sglang.srt.lora.deepseek_mla_correction import (
-    apply_q_correction as apply_kv_b_lora_q_correction,
-)
-from sglang.srt.lora.deepseek_mla_correction import (
-    apply_v_correction as apply_kv_b_lora_v_correction,
-)
-from sglang.srt.lora.deepseek_mla_correction import (
-    is_kv_b_lora_active,
-)
+from sglang.srt.lora.utils import kv_b_lora_correction
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -71,6 +63,10 @@ _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+
+def is_kv_b_lora_active(attn_module: DeepseekV2AttentionMLA) -> bool:
+    return getattr(getattr(attn_module, "kv_b_proj", None), "set_lora", False)
 
 
 @dataclass(frozen=True)
@@ -512,6 +508,8 @@ class DeepseekMLAForwardMixin:
             # fp8 q directly into the q8kv8 backend buffer.
             q_nope_out = None
         else:
+            _kvb_q = None
+            kv_b_lora = kv_b_lora_correction(self)
             if _SGLANG_EXPERIMENTAL_LORA_OPTI:
                 # Fork the kv_b q-correction A-step onto the LoRA side stream to overlap the bmm.
                 from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
@@ -519,6 +517,10 @@ class DeepseekMLAForwardMixin:
                 )
 
                 _kvb_q = kv_b_lora_q_prepare(self, q_nope)
+            elif kv_b_lora == "v2":
+                from sglang.srt.lora.dense import mla_correction
+
+                _kvb_q = mla_correction.prepare_q_correction(self, q_nope)
 
             if self.use_deep_gemm_bmm:
                 (
@@ -574,8 +576,16 @@ class DeepseekMLAForwardMixin:
                 )
 
                 q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
-            elif is_kv_b_lora_active(self):
-                q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
+            elif kv_b_lora == "v2":
+                q_nope_out = mla_correction.apply_q_correction(
+                    self, q_nope, q_nope_out, _kvb_q
+                )
+            elif kv_b_lora == "legacy":
+                from sglang.srt.lora import deepseek_mla_correction
+
+                q_nope_out = deepseek_mla_correction.apply_q_correction(
+                    self, q_nope, q_nope_out
+                )
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
         if (
@@ -806,6 +816,7 @@ class DeepseekMLAForwardMixin:
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None
+        kv_b_lora = kv_b_lora_correction(self)
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             # Fork the kv_b v-correction A-step onto the LoRA side stream to overlap the bmm.
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
@@ -813,6 +824,10 @@ class DeepseekMLAForwardMixin:
             )
 
             _kvb_v = kv_b_lora_v_prepare(self, attn_output)
+        elif kv_b_lora == "v2":
+            from sglang.srt.lora.dense import mla_correction
+
+            _kvb_v = mla_correction.prepare_v_correction(self, attn_output)
 
         if getattr(self, "_kimi_split_gguf_kv_b", False):
             from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
@@ -910,8 +925,14 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = kv_b_lora_v_apply(
                 self, attn_output, attn_bmm_output, _kvb_v
             )
-        elif is_kv_b_lora_active(self):
-            attn_bmm_output = apply_kv_b_lora_v_correction(
+        elif kv_b_lora == "v2":
+            attn_bmm_output = mla_correction.apply_v_correction(
+                self, attn_output, attn_bmm_output, _kvb_v
+            )
+        elif kv_b_lora == "legacy":
+            from sglang.srt.lora import deepseek_mla_correction
+
+            attn_bmm_output = deepseek_mla_correction.apply_v_correction(
                 self, attn_output, attn_bmm_output
             )
         if attention_output_gate is not None:
