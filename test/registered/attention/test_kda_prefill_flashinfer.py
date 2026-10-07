@@ -241,12 +241,9 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(extend_lens):
 
         cache.conv[0].copy_(initial_conv)
         cache.temporal.copy_(initial_ssm)
-        fixture.b = fixture.b_raw.unsqueeze(0)
         dispatcher = flashinfer_dispatcher()
         backend = fixture.backend.linear_attn_backend
         backend.kernel_dispatcher = dispatcher
-        fixture.runner.model = fixture.actual_module
-        backend._init_flashinfer_prefill(fixture.runner)
         kernel = dispatcher.extend_kernel
         with (
             patch.object(kernel, "plan", wraps=kernel.plan) as plan,

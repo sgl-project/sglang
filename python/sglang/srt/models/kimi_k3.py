@@ -2110,11 +2110,6 @@ class KimiK3DeltaAttention(nn.Module):
 
         if not forward_batch.forward_mode.is_decode():
             forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
-            if (
-                not forward_batch.forward_mode.is_target_verify()
-                and not self.attn.prefill_beta_is_raw
-            ):
-                beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 

@@ -17,7 +17,6 @@ backend).
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
@@ -160,44 +159,28 @@ class TestLinearAttnBackends(CustomTestCase):
 
 class TestFlashInferKDAPrefillPolicy(CustomTestCase):
     def test_fixed_restrictions_are_rejected_before_forward(self):
-        import torch
+        from sglang.srt.layers.attention.linear.kda_backend import (
+            _validate_flashinfer_kda_prefill,
+        )
 
-        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
-        from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-
-        layer = RadixLinearAttention(0, 1, 1, 1, 128, 128, 128, lower_bound=-5.0)
-        runner = SimpleNamespace(model=torch.nn.Sequential(layer))
-        backend = KDAAttnBackend.__new__(KDAAttnBackend)
-        backend.kernel_dispatcher = SimpleNamespace(prefill_beta_is_raw=True)
-        for chunk, bound, tbo, graph, error in [
-            (0, -5.0, False, "disabled", "checkpoint interval"),
-            (33, -5.0, False, "disabled", "checkpoint interval"),
-            (64, None, False, "disabled", "safe-gate lower bound"),
-            (64, -5.0, True, "disabled", "two-batch overlap"),
-            (64, -5.0, False, "full", "eager linear attention"),
-            (64, -5.0, False, "breakable", None),
+        for chunk, tbo, graph, error in [
+            (0, False, "disabled", "checkpoint interval"),
+            (33, False, "disabled", "checkpoint interval"),
+            (64, True, "disabled", "two-batch overlap"),
+            (64, False, "full", "eager linear attention"),
+            (64, False, "breakable", None),
         ]:
-            with self.subTest(chunk=chunk, bound=bound, tbo=tbo, graph=graph):
-                backend._mamba_chunk_size = chunk
-                layer.lower_bound = bound
-                config = SimpleNamespace(
-                    overlap=SimpleNamespace(enable_two_batch_overlap=tbo),
-                    graph=SimpleNamespace(
-                        cuda_graph_config=SimpleNamespace(
-                            prefill=SimpleNamespace(backend=graph)
-                        )
-                    ),
+            with self.subTest(chunk=chunk, tbo=tbo, graph=graph):
+                kwargs = dict(
+                    chunk_size=chunk,
+                    enable_two_batch_overlap=tbo,
+                    prefill_cuda_graph_backend=graph,
                 )
-                with patch(
-                    "sglang.srt.layers.attention.linear.kda_backend.get_exec",
-                    return_value=config,
-                ):
-                    if error is not None:
-                        with self.assertRaisesRegex(ValueError, error):
-                            backend._init_flashinfer_prefill(runner)
-                    else:
-                        backend._init_flashinfer_prefill(runner)
-                        self.assertTrue(layer.prefill_beta_is_raw)
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        _validate_flashinfer_kda_prefill(**kwargs)
+                else:
+                    _validate_flashinfer_kda_prefill(**kwargs)
 
     def test_invalid_checkpoint_metadata_fails_instead_of_falling_back(self):
         import torch

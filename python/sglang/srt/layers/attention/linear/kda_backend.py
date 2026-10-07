@@ -46,6 +46,24 @@ from sglang.srt.runtime_context import (
 )
 
 
+def _validate_flashinfer_kda_prefill(
+    *,
+    chunk_size: int,
+    enable_two_batch_overlap: bool,
+    prefill_cuda_graph_backend: CudaGraphBackend,
+) -> None:
+    if chunk_size <= 0 or chunk_size % 32:
+        raise ValueError(
+            "FlashInfer KDA checkpoint interval must be positive and divisible by 32"
+        )
+    if enable_two_batch_overlap:
+        raise ValueError("FlashInfer KDA prefill does not support two-batch overlap")
+    if prefill_cuda_graph_backend == CudaGraphBackend.FULL:
+        raise ValueError(
+            "FlashInfer KDA prefill requires eager linear attention; use disabled or breakable prefill CUDA graphs"
+        )
+
+
 class KDAKernelDispatcher:
     """Dispatches KDA kernel calls to the appropriate backend per mode."""
 
@@ -208,8 +226,6 @@ class KDAKernelDispatcher:
                 "'nvidia_kda', or 'ptx_kda' (cutedsl/nvidia_kda prefill need "
                 "SM100, ptx_kda SM100 or SM103)."
             )
-
-        self.prefill_beta_is_raw = self.extend_kernel.expects_beta_logits
 
         self.supports_packed_decode = getattr(
             self.decode_kernel, "supports_packed_decode", False
@@ -442,7 +458,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             decode_backend, prefill_backend, verify_backend
         )
         if prefill_backend.is_flashinfer():
-            self._init_flashinfer_prefill(model_runner)
+            _validate_flashinfer_kda_prefill(
+                chunk_size=self.mamba_chunk_size,
+                enable_two_batch_overlap=get_exec().overlap.enable_two_batch_overlap,
+                prefill_cuda_graph_backend=get_exec().graph.cuda_graph_config.prefill.backend,
+            )
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
             "K3 fused KDA decode engaged: --linear-attn-decode-backend "
@@ -544,28 +564,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
             metadata.fused_accept_state_indices,
             metadata.fused_accept_num_accepted,
         )
-
-    def _init_flashinfer_prefill(self, model_runner: ModelRunner):
-        """Validate fixed restrictions and stamp the model's beta input format."""
-        if self.mamba_chunk_size <= 0 or self.mamba_chunk_size % 32:
-            raise ValueError(
-                "FlashInfer KDA checkpoint interval must be positive and divisible by 32"
-            )
-        if get_exec().overlap.enable_two_batch_overlap:
-            raise ValueError(
-                "FlashInfer KDA prefill does not support two-batch overlap"
-            )
-        if get_exec().graph.cuda_graph_config.prefill.backend == CudaGraphBackend.FULL:
-            raise ValueError(
-                "FlashInfer KDA prefill requires eager linear attention; use disabled or breakable prefill CUDA graphs"
-            )
-        for layer in model_runner.model.modules():
-            if isinstance(layer, RadixLinearAttention):
-                if layer.lower_bound is None:
-                    raise ValueError(
-                        "FlashInfer KDA prefill requires a safe-gate lower bound; use --linear-attn-prefill-backend triton for unbounded gates"
-                    )
-                layer.prefill_beta_is_raw = self.kernel_dispatcher.prefill_beta_is_raw
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -938,8 +936,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
-        gate_was_flat = a.ndim == 3
-        if gate_was_flat:
+        if a.ndim == 3:
             a = a.unflatten(-1, (-1, layer.head_k_dim))
 
         track_ssm = self.forward_metadata.has_mamba_track_mask
@@ -983,7 +980,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
-            beta_is_raw=(gate_was_flat or self.kernel_dispatcher.prefill_beta_is_raw),
+            beta_is_raw=True,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             layer_id=layer.layer_id,
