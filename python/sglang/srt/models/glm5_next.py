@@ -1378,11 +1378,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
         Without this, the first image whose token count differs from the
         warmup image's triggers that autotune during serving with the memory
         pools already allocated, which fails with CUDA OOM at a high
-        ``mem_fraction_static``. Running the block MLP and the patch merger
-        (the two callers, with different gate_up widths) at two token counts
-        here settles dynamo on the dynamic kernels while memory is free; the
-        inductor cache then serves later boots. Failures are logged at WARNING
-        and swallowed, as for the attention precompile.
+        ``mem_fraction_static``. Running the activation at the gate_up widths
+        of its two callers, the block MLP and the patch merger, at two token
+        counts here settles dynamo on the dynamic kernels while memory is
+        free; the inductor cache then serves later boots. Failures are logged
+        at WARNING and swallowed, as for the attention precompile.
+
+        Only the activation runs, not the modules: their ``down_proj``
+        all-reduces across tensor-parallel ranks, and a rank that failed
+        before that collective and swallowed the error would leave its peers
+        waiting in it. The activation is purely local and reads no weights.
 
         Dynamo guards on tensor rank and on inference mode, so the warmup
         mirrors the serving calls: the block MLP receives ``(S, 1, H)`` from
@@ -1394,16 +1399,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
         if self.visual is None or not self.pp_group.is_first_rank:
             return
         targets = []
-        for cls, first_linear, batch_dims in (
-            (Glm5NextVisionMLP, "gate_up_proj", (1,)),
-            (Glm5NextVisionPatchMerger, "proj", ()),
+        for cls, batch_dims in (
+            (Glm5NextVisionMLP, (1,)),
+            (Glm5NextVisionPatchMerger, ()),
         ):
             module = next(
                 (m for m in self.visual.modules() if isinstance(m, cls)), None
             )
             if module is not None:
-                in_features = getattr(module, first_linear).input_size
-                targets.append((module, (*batch_dims, in_features)))
+                width = module.gate_up_proj.output_size_per_partition
+                targets.append((module.swiglu_limit, (*batch_dims, width)))
         if not targets:
             return
         try:
@@ -1413,12 +1418,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 torch.inference_mode() if self.encoder_only else DynamicGradMode()
             )
             with grad_mode:
-                for module, feature_shape in targets:
+                for limit, gate_up_shape in targets:
                     for tokens in (64, 4096):
-                        module(
+                        swiglu_clamped(
                             torch.zeros(
-                                (tokens, *feature_shape), dtype=dtype, device=device
-                            )
+                                (tokens, *gate_up_shape), dtype=dtype, device=device
+                            ),
+                            limit,
                         )
             if device.type == "cuda":
                 torch.cuda.synchronize(device)

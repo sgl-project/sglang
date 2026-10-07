@@ -12,10 +12,11 @@ vision tower is a fake, so nothing here shows that the hook's call and a real
 vision call share one compiled kernel. That is the GPU test's job
 (``test_glm5_next_vision_precompile_gpu.py``).
 
-The vision-MLP tests check the warmup's input ranks and grad mode, and
-``TestGlm5NextVisionPrecompileReuse`` runs the real ``torch.compile``d
-activation on CPU to show that serving-shaped calls in each serving grad mode
-reuse the warmed graphs instead of compiling again.
+The vision-MLP tests check that the warmup runs only the activation, never
+the modules or their tensor-parallel ``down_proj`` all-reduce, at the serving
+input ranks and grad mode. ``TestGlm5NextVisionPrecompileReuse`` runs the real
+``torch.compile``d activation on CPU to show that serving-shaped calls in each
+serving grad mode reuse the warmed graphs instead of compiling again.
 """
 
 import sys
@@ -31,7 +32,7 @@ from sglang.srt.utils.common import DynamicGradMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeVisionAttention(nn.Module):
@@ -57,33 +58,35 @@ class _FakeVisionTower(nn.Module):
         return self.proj.weight.device
 
 
-class _RecordingActivationModule(nn.Module):
-    """Stands in for the block MLP or the patch merger: records the token
-    counts it is run at and exposes the first linear's input width."""
+class _ActivationCaller(nn.Module):
+    """Stands in for the block MLP or the patch merger. Exposes what the warmup
+    reads (the per-rank gate_up width and ``swiglu_limit``) and records any
+    call into the module itself: ``down_proj`` all-reduces across
+    tensor-parallel ranks, so the warmup must reach neither it nor ``forward``."""
 
-    def __init__(self, first_linear: str, in_features: int, calls: list):
+    def __init__(self, gate_up_width: int, swiglu_limit: float = 7.0):
         nn.Module.__init__(self)
-        setattr(self, first_linear, SimpleNamespace(input_size=in_features))
-        self.calls = calls
-        self.grad_modes = []
-        self.in_features = in_features
+        # Input widths too, so a warmup that ran the whole module would reach
+        # forward here and be caught rather than fail on a missing attribute.
+        self.gate_up_proj = SimpleNamespace(
+            input_size=gate_up_width // 2, output_size_per_partition=gate_up_width
+        )
+        self.proj = SimpleNamespace(input_size=gate_up_width // 2)
+        self.swiglu_limit = swiglu_limit
+        self.module_calls = []
+        self.down_proj = lambda *a, **k: self.module_calls.append("down_proj")
 
     def forward(self, x):
-        self.calls.append((tuple(x.shape), x.dtype, x.device))
-        self.grad_modes.append(
-            (torch.is_grad_enabled(), torch.is_inference_mode_enabled())
-        )
+        self.module_calls.append("forward")
         return x
 
 
-class _RecordingMLP(_RecordingActivationModule, glm5_next.Glm5NextVisionMLP):
-    def __init__(self, in_features, calls):
-        _RecordingActivationModule.__init__(self, "gate_up_proj", in_features, calls)
+class _FakeMLP(_ActivationCaller, glm5_next.Glm5NextVisionMLP):
+    pass
 
 
-class _RecordingMerger(_RecordingActivationModule, glm5_next.Glm5NextVisionPatchMerger):
-    def __init__(self, in_features, calls):
-        _RecordingActivationModule.__init__(self, "proj", in_features, calls)
+class _FakeMerger(_ActivationCaller, glm5_next.Glm5NextVisionPatchMerger):
+    pass
 
 
 def _make_model(visual, is_first_rank: bool = True):
@@ -98,7 +101,7 @@ def _make_model(visual, is_first_rank: bool = True):
 
 
 class TestGlm5NextVisionPrecompile(CustomTestCase):
-    def _run_hook(self, model, stub):
+    def _run_hook(self, model, stub, activation=lambda y, limit: y):
         prefill_attention = ModuleType("sglang.kernels.ops.attention.prefill_attention")
         prefill_attention.context_attention_fwd = stub
         with (
@@ -107,8 +110,28 @@ class TestGlm5NextVisionPrecompile(CustomTestCase):
                 {"sglang.kernels.ops.attention.prefill_attention": prefill_attention},
             ),
             patch.object(glm5_next, "VisionAttention", _FakeVisionAttention),
+            patch.object(glm5_next, "swiglu_clamped", activation),
         ):
             model.precompile_kernels_after_loading()
+
+    def _run_hook_recording_activation(self, model):
+        calls = []
+
+        def activation(y, limit):
+            calls.append(
+                (
+                    tuple(y.shape),
+                    y.dtype,
+                    y.device,
+                    limit,
+                    torch.is_grad_enabled(),
+                    torch.is_inference_mode_enabled(),
+                )
+            )
+            return y
+
+        self._run_hook(model, lambda *a, **k: None, activation)
+        return calls
 
     def test_triton_backend_precompiles_with_vision_head_dim(self):
         calls = []
@@ -154,67 +177,93 @@ class TestGlm5NextVisionPrecompile(CustomTestCase):
         )
         self.assertEqual(calls, [])
 
-    def test_mlp_and_merger_run_at_two_token_counts(self):
+    def test_mlp_and_merger_activations_run_at_two_token_counts(self):
         # Two distinct token counts make dynamo compile the static kernel and
         # then settle on the dynamic one before the pools exist.
-        mlp_calls, merger_calls = [], []
         visual = _FakeVisionTower(hidden_size=1536, num_heads=12, backend="fa3")
-        visual.mlp = _RecordingMLP(3072, mlp_calls)
-        visual.merger = _RecordingMerger(1536, merger_calls)
-        self._run_hook(_make_model(visual), lambda *a, **k: None)
-        # The block MLP is served (S, 1, H) by GlmOcrVisionBlock.forward and
-        # the merger (S, H); dynamo guards on rank, so the warmup matches both.
+        visual.mlp = _FakeMLP(6144, swiglu_limit=7.0)
+        visual.merger = _FakeMerger(3072, swiglu_limit=5.0)
+        calls = self._run_hook_recording_activation(_make_model(visual))
+        # gate_up_proj keeps its input's leading dims: the block MLP is served
+        # (S, 1, H) by GlmOcrVisionBlock.forward and the merger (S, H), and
+        # dynamo guards on rank, so the warmup matches both.
         self.assertEqual(
-            [shape for shape, _, _ in mlp_calls], [(64, 1, 3072), (4096, 1, 3072)]
+            [(shape, limit) for shape, _, _, limit, _, _ in calls],
+            [
+                ((64, 1, 6144), 7.0),
+                ((4096, 1, 6144), 7.0),
+                ((64, 3072), 5.0),
+                ((4096, 3072), 5.0),
+            ],
         )
-        self.assertEqual(
-            [shape for shape, _, _ in merger_calls], [(64, 1536), (4096, 1536)]
-        )
-        for _, dtype, device in mlp_calls + merger_calls:
+        for _, dtype, device, _, _, _ in calls:
             self.assertEqual(dtype, torch.bfloat16)
             self.assertEqual(device, visual.device)
+        self.assertEqual(visual.mlp.module_calls + visual.merger.module_calls, [])
 
     def _warmup_grad_modes(self, encoder_only: bool):
         visual = _FakeVisionTower(hidden_size=1536, num_heads=12, backend="fa3")
-        visual.mlp = _RecordingMLP(3072, [])
-        visual.merger = _RecordingMerger(1536, [])
+        visual.mlp = _FakeMLP(6144)
+        visual.merger = _FakeMerger(3072)
         model = _make_model(visual)
         model.encoder_only = encoder_only
-        self._run_hook(model, lambda *a, **k: None)
-        return visual.mlp.grad_modes + visual.merger.grad_modes
+        calls = self._run_hook_recording_activation(model)
+        self.assertEqual(len(calls), 4)
+        return {(grad, inference) for *_, grad, inference in calls}
 
     def test_mlp_warmup_uses_the_scheduler_grad_mode(self):
         # (grad_enabled, inference_mode) as DynamicGradMode applies it.
-        self.assertEqual(set(self._warmup_grad_modes(False)), {(False, False)})
+        self.assertEqual(self._warmup_grad_modes(False), {(False, False)})
         DynamicGradMode.set_inference_mode(True)
         try:
-            self.assertEqual(set(self._warmup_grad_modes(False)), {(False, True)})
+            self.assertEqual(self._warmup_grad_modes(False), {(False, True)})
         finally:
             DynamicGradMode.set_inference_mode(False)
 
     def test_mlp_warmup_uses_inference_mode_in_the_encoder_server(self):
-        self.assertEqual(set(self._warmup_grad_modes(True)), {(False, True)})
+        self.assertEqual(self._warmup_grad_modes(True), {(False, True)})
 
     def test_mlp_precompile_skips_without_the_modules_or_off_first_rank(self):
-        calls = []
         visual = _FakeVisionTower(hidden_size=1536, num_heads=12, backend="fa3")
-        self._run_hook(_make_model(visual), lambda *a, **k: None)  # no modules
-        visual.mlp = _RecordingMLP(3072, calls)
-        self._run_hook(_make_model(visual, is_first_rank=False), lambda *a, **k: None)
-        self.assertEqual(calls, [])
-
-    def test_mlp_failure_is_logged_not_raised(self):
-        class _Failing(_RecordingMLP):
-            def forward(self, x):
-                raise RuntimeError("mlp compile failed")
-
-        visual = _FakeVisionTower(hidden_size=1536, num_heads=12, backend="fa3")
-        visual.mlp = _Failing(3072, [])
-        with self.assertLogs(glm5_next.logger, level="WARNING") as logs:
-            self._run_hook(_make_model(visual), lambda *a, **k: None)
-        self.assertTrue(
-            any("MLP precompile failed" in line for line in logs.output), logs.output
+        calls = self._run_hook_recording_activation(_make_model(visual))
+        visual.mlp = _FakeMLP(6144)
+        calls += self._run_hook_recording_activation(
+            _make_model(visual, is_first_rank=False)
         )
+        self.assertEqual(calls, [])
+        self.assertEqual(visual.mlp.module_calls, [])
+
+    def test_failure_on_one_tp_rank_enters_no_collective(self):
+        # A rank whose warmup fails logs and returns. Its peers must not be
+        # left waiting in a collective it never reaches, so the warmup itself
+        # must issue none: neither the modules nor the all-reduce run.
+        def failing_activation(y, limit):
+            raise RuntimeError("activation compile failed")
+
+        visual = _FakeVisionTower(hidden_size=1536, num_heads=12, backend="fa3")
+        visual.mlp = _FakeMLP(6144)
+        visual.merger = _FakeMerger(3072)
+        all_reduces = []
+        with (
+            patch(
+                "sglang.srt.layers.linear.tensor_model_parallel_all_reduce",
+                side_effect=lambda t: all_reduces.append(t) or t,
+            ),
+            self.assertLogs(glm5_next.logger, level="WARNING") as logs,
+        ):
+            self._run_hook(
+                _make_model(visual), lambda *a, **k: None, failing_activation
+            )
+        self.assertTrue(
+            any(
+                "MLP precompile failed" in line
+                and "RuntimeError: activation compile failed" in line
+                for line in logs.output
+            ),
+            logs.output,
+        )
+        self.assertEqual(all_reduces, [])
+        self.assertEqual(visual.mlp.module_calls + visual.merger.module_calls, [])
 
     def test_kernel_failure_is_logged_not_raised(self):
         def stub(*args, **kwargs):
@@ -235,34 +284,9 @@ class TestGlm5NextVisionPrecompile(CustomTestCase):
         )
 
 
-class _CompiledActivation(nn.Module):
-    """Runs the real ``torch.compile``d ``swiglu_clamped`` on a gate_up-shaped
-    input that keeps the caller's leading dimensions, as the real modules do."""
-
-    def __init__(self, first_linear: str, in_features: int):
-        nn.Module.__init__(self)
-        setattr(self, first_linear, SimpleNamespace(input_size=in_features))
-
-    def forward(self, x):
-        return glm5_next.swiglu_clamped(torch.cat([x, x], dim=-1), 7.0)
-
-
-class _CompiledMLP(_CompiledActivation, glm5_next.Glm5NextVisionMLP):
-    def __init__(self, in_features):
-        _CompiledActivation.__init__(self, "gate_up_proj", in_features)
-
-
-class _CompiledMerger(_CompiledActivation, glm5_next.Glm5NextVisionPatchMerger):
-    def __init__(self, in_features):
-        _CompiledActivation.__init__(self, "proj", in_features)
-
-
 class TestGlm5NextVisionPrecompileReuse(CustomTestCase):
     """Runs the real compiled activation: after the hook, serving-shaped calls
     in the serving grad mode at a new token count must not compile again."""
-
-    def setUp(self):
-        torch._dynamo.reset()
 
     def tearDown(self):
         DynamicGradMode.set_inference_mode(False)
@@ -271,23 +295,33 @@ class TestGlm5NextVisionPrecompileReuse(CustomTestCase):
     def _assert_serving_calls_reuse(self, encoder_only, serving_mode):
         from torch._dynamo.utils import counters
 
+        # CustomTestCase retries the test method in CI without rerunning
+        # setUp, so start every attempt from an empty dynamo cache; otherwise
+        # a retry would reuse graphs the failed attempt compiled while serving.
+        torch._dynamo.reset()
+        baseline = counters["stats"]["unique_graphs"]
+
         visual = _FakeVisionTower(hidden_size=32, num_heads=2, backend="fa3")
-        visual.mlp = _CompiledMLP(32)
-        visual.merger = _CompiledMerger(16)
+        visual.mlp = _FakeMLP(64)
+        visual.merger = _FakeMerger(32)
         model = _make_model(visual)
         model.encoder_only = encoder_only
         with self.assertNoLogs(glm5_next.logger, level="WARNING"):
             model.precompile_kernels_after_loading()
-        graphs = counters["stats"]["unique_graphs"]
-        self.assertGreater(graphs, 0)
+        warmed = counters["stats"]["unique_graphs"]
+        self.assertGreater(warmed, baseline)
 
         with serving_mode():
             for tokens in (1000, 1500):
-                # GlmOcrVisionBlock.forward hands its MLP (S, 1, H); the
-                # vision model hands the merger (S, H).
-                visual.mlp(torch.zeros((tokens, 1, 32), dtype=torch.bfloat16))
-                visual.merger(torch.zeros((tokens // 4, 16), dtype=torch.bfloat16))
-        self.assertEqual(counters["stats"]["unique_graphs"], graphs)
+                # gate_up_proj keeps the leading dims of what it is handed:
+                # (S, 1, H) in GlmOcrVisionBlock.forward, (S, H) in the merger.
+                glm5_next.swiglu_clamped(
+                    torch.zeros((tokens, 1, 64), dtype=torch.bfloat16), 7.0
+                )
+                glm5_next.swiglu_clamped(
+                    torch.zeros((tokens // 4, 32), dtype=torch.bfloat16), 7.0
+                )
+        self.assertEqual(counters["stats"]["unique_graphs"], warmed)
 
     def test_scheduler_no_grad_serving_reuses_the_warmup(self):
         self._assert_serving_calls_reuse(False, DynamicGradMode)
