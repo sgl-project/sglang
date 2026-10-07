@@ -1295,15 +1295,9 @@ class HiCacheController:
                     )
                     hash_value, storage_hit_count = [], 0
 
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
+                storage_hit_count = self._sync_prefetch_hit_query(
+                    operation, storage_hit_count
                 )
-                self._all_reduce(
-                    storage_hit_count_tensor,
-                    torch.distributed.ReduceOp.MIN,
-                    self.prefetch_hits_sync_groups,
-                )
-                storage_hit_count = storage_hit_count_tensor.item()
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.
@@ -1315,6 +1309,17 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+    def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
+        """Rank-reduce a hit query (MIN) so every rank agrees on the usable
+        prefix. Runs for every operation, hit or miss."""
+        hit_count = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce(
+            hit_count,
+            torch.distributed.ReduceOp.MIN,
+            self.prefetch_hits_sync_groups,
+        )
+        return int(hit_count.item())
 
     def write_storage(
         self,

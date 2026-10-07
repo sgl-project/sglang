@@ -46,7 +46,9 @@ the source soundtrack rather than generating audio. Audio is converted to mono
 Use `kandinskylab/Kandinsky-6.0-VSR-distilled2steps-5s-Diffusers` for x2, x4 or
 x2.25 upscaling of up to 121 frames. Its checkpoint-selected PiFlow scheduler
 uses two DiT calls per tile; changing `num_inference_steps` does not increase
-quality or the number of evaluations. The native path uses dense attention,
+quality or the number of evaluations. The scheduler and transformer must come
+from the same Diffusers checkpoint; sampler settings are read from `scheduler/`.
+The native path uses dense attention,
 not the checkpoint's requested NABLA sparse attention, so this is not a claim
 of numerical parity with the sparse reference.
 
