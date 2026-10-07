@@ -860,8 +860,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
         q = torch.empty((8, 2, 512), dtype=torch.float8_e4m3fn)
 
-        # The semaphore-capacity guard reads a module global that only the
-        # real backend __init__ installs; this backend is hand-built.
+        # The semaphore-capacity guard reads a module global set only by the real __init__;
+        # this backend is hand-built.
         with (
             mock.patch(
                 "sglang.srt.layers.attention.deepseek_v4_trtllm_backend._trtllm_semaphore_rows",
@@ -1011,8 +1011,8 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         # Same parent every step (kernel-visible address never moves), stride == width.
         self.assertEqual(small.data_ptr(), big.data_ptr())
         self.assertEqual(small.stride(0), 4)
-        # Rows past `rows` up to the 64-row tile are re-inerted; [:rows] is left
-        # to the caller when it promises to write them.
+        # Rows past `rows` up to the 64-row tile are re-inerted;
+        # [:rows] is left to a caller that promises to write them.
         self.assertTrue(torch.all(big[10:64] == -1))
         self.assertTrue(torch.all(small == 7))
         src = torch.arange(5, **self.kw)
@@ -1060,8 +1060,9 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         core.c4_sparse_topk_lengths = (
             torch.full((n,), 125, **self.kw) if 4 in present_ratios else None
         )
-        for r in core.low_ratios:
-            setattr(core, f"c{r}_sparse_topk_lengths", torch.full((n,), 300, **self.kw))
+        for r in core.low_ratios:  # as the producers clamp them: [1, index_topk]
+            lens = (core.seq_lens_casual // r).clamp(min=1, max=core.index_topk)
+            setattr(core, f"c{r}_sparse_topk_lengths", lens)
             setattr(
                 core, f"c{r}_sparse_page_indices", torch.full((n, 512), 7, **self.kw)
             )
@@ -1129,7 +1130,7 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         self.assertIsNone(core.c4_sparse_page_indices)  # no in-place top-k writer
         # trtllm needs the true zero length for an empty compressed history.
         self.assertEqual(core.c2_sparse_topk_lengths[:2].tolist(), [0, 250])
-        self.assertEqual(core.c1_sparse_topk_lengths[0].item(), 1)
+        self.assertEqual(core.c1_sparse_topk_lengths[:2].tolist(), [1, 500])
         if self.dev != "cuda":
             return  # pack_sparse_tail is a Triton kernel
         from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
@@ -1144,7 +1145,6 @@ class TestTrtllmSparseTablePool(CustomTestCase):
                 core.sparse_page_indices(ratio),
                 core.trtllm_c4_indices,
                 core.trtllm_c4_lens,
-                64,
             )
             self.assertTrue(torch.all(core.trtllm_c4_indices[:, SWA_WINDOW:] == ratio))
             expected = core.sparse_topk_lengths(ratio) + SWA_WINDOW

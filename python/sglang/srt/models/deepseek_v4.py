@@ -1512,8 +1512,8 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
 
-        # qkv_a is read on stream_kv: freeing it before the join above lets the
-        # allocator reuse its block and race the side-stream KV store on replay.
+        # qkv_a is read on stream_kv; freeing it before the join above lets the allocator
+        # reuse its block and race the side-stream KV store on replay.
         del qkv_a
 
         return q

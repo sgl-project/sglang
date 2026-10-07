@@ -477,8 +477,8 @@ def compress_norm_rope_store(
     if use_fp4:
         assert kv.shape[-1] == 128
     if uniform_fp8_store:
-        # Uniform 512-byte-per-token e4m3 pool (trtllm backend): plain cast at
-        # per-tensor scale 1.0, rope tail included; no packed scales.
+        # Uniform 512-byte-per-token e4m3 pool (trtllm backend);
+        # plain cast at scale 1.0, rope tail included, no packed scales.
         assert kv.shape[-1] == 512 and not use_fp4 and not bf16_store
     if is_hip() and use_fp4:
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (

@@ -398,7 +398,7 @@ class DSV4AttnMetadata:
     c2_sparse_page_indices: Optional[torch.Tensor] = field(init=False, default=None)
     c2_sparse_raw_indices: Optional[torch.Tensor] = field(init=False, default=None)
 
-    # Combined decode tables. Only the c4 tail and lens vary by layer.
+    # Combined decode tables; trtllm_c4_* is shared by ratios 1, 2 and 4.
     trtllm_swa_lens: Optional[torch.Tensor] = None
     trtllm_c4_indices: Optional[torch.Tensor] = None
     trtllm_c4_lens: Optional[torch.Tensor] = None
@@ -530,10 +530,8 @@ class DSV4AttnMetadata:
         return ceil_align(self.index_topk, PAGE_INDEX_ALIGNED_SIZE)
 
     def _c4_topk_writes_table(self) -> bool:
-        # The indexer's topk_v2 writes straight into the combined table's
-        # tail whenever it is the sole writer: the raw-indices channel
-        # (FlashMLA prefill / indexer capture) reroutes the indexer to the
-        # stride-unaware v1 kernel, so never alias when it exists.
+        # topk_v2 aliases the table tail unless a raw-indices channel exists;
+        # that reroutes the indexer to the stride-unaware v1 kernel.
         return self.trtllm_topk_writes_table and self.c4_sparse_raw_indices is None
 
     def _has_trtllm_indexed_table(self) -> bool:
@@ -541,9 +539,11 @@ class DSV4AttnMetadata:
         return self.has_c4 or bool(self.low_ratios)
 
     def _zero_empty_low_ratio_lengths(self) -> None:
-        # FlashMLA metadata clamps empty compressed histories to one; trtllm needs
-        # the true zero, since a -1 entry still adds to the softmax denominator.
+        # FlashMLA clamps empty compressed histories to one length;
+        # trtllm needs zero, since a -1 entry still adds to the softmax denominator.
         for ratio in self.low_ratios:
+            if ratio == 1:
+                continue  # seq_lens_casual >= 1, so a ratio-1 history is never empty
             lengths = self.sparse_topk_lengths(ratio)
             if lengths is not None:
                 torch.minimum(lengths, self.seq_lens_casual // ratio, out=lengths)
@@ -576,18 +576,17 @@ class DSV4AttnMetadata:
             self.swa_page_indices = _tile_padded_step(
                 -1, self.swa_page_indices, width=swa_width
             )
-        if swa_width > SWA_WINDOW:
-            self.trtllm_swa_lens = pool.view(
-                "d_swa_lens", num_tokens, fill=SWA_WINDOW, rows_written_by_caller=True
-            )
+        wide_swa = swa_width > SWA_WINDOW
+        self.trtllm_swa_lens = pool.view(
+            "d_swa_lens", num_tokens, fill=SWA_WINDOW, rows_written_by_caller=wide_swa
+        )
+        if wide_swa:
             torch.clamp(self.swa_topk_lengths, min=SWA_WINDOW, out=self.trtllm_swa_lens)
-        else:
-            self.trtllm_swa_lens = pool.view("d_swa_lens", num_tokens, fill=SWA_WINDOW)
         self._zero_empty_low_ratio_lengths()
         if self._has_trtllm_indexed_table():
             assert swa_width == SWA_WINDOW
-            # The indexed tail and lens are refreshed per layer, except when topk_v2
-            # writes the c4 tail itself; then the lens are set once per step.
+            # The tail and lens are refreshed per layer;
+            # when topk_v2 writes the c4 tail itself, the lens are set once per step.
             self.trtllm_c4_indices = pool.view(
                 "d_c4", num_tokens, fill=-1, width=SWA_WINDOW + self._c4_table_width()
             )
@@ -695,9 +694,8 @@ class DSV4AttnMetadata:
             f"{num_tokens=} {q_len=}"
         )
         num_reqs = num_tokens // q_len
-        # Per-request KV total = the causal length of the request's last token.
-        # Padded requests carry the graph fill length (1) for q_len tokens; the
-        # kernel requires seq_len >= q_len, so floor at q_len (outputs discarded).
+        # Per-request KV length is its last token's causal length;
+        # floored at q_len, as the kernel requires (padded outputs are discarded).
         self.trtllm_seq_lens_req = (
             self.seq_lens_casual[q_len - 1 :: q_len].clamp(min=q_len).contiguous()
         )
@@ -770,8 +768,7 @@ class DSV4AttnMetadata:
                 "trtllm_prefill_c128",
                 "trtllm_prefill_swa_indices",
                 "trtllm_prefill_c4_lens",
-                # Shared backend-owned pool object; same reference on both
-                # sides, never content-copied.
+                # Backend-owned pool shared by reference; never content-copied.
                 "trtllm_table_pool",
                 # Plain config flag (same value on both sides).
                 "trtllm_topk_writes_table",

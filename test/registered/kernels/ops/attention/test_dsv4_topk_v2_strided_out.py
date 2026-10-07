@@ -1,6 +1,5 @@
-"""topk_v2 with a strided output (combined-table tail) must match the dense
-output bit-for-bit: same inputs, out aimed at a column slice of a wider
-table, non-slice columns untouched."""
+"""topk_v2 writing a column slice of a wider table must match the dense output;
+other columns stay untouched."""
 
 import pytest
 import torch
@@ -19,8 +18,8 @@ PAGE_SIZE = 64
 
 
 @pytest.mark.parametrize("bs", [1, 4, 33, 256])
-# 12000 / 20000 / 40000 cross the kernel's kLevel dispatch thresholds (8192,
-# 16384, cluster floor) so every specialization writes through out_stride.
+# 12000, 20000 and 40000 cross the kLevel dispatch thresholds;
+# so every specialization writes through out_stride.
 @pytest.mark.parametrize("max_seq", [96, 700, 5000, 12000, 20000, 40000])
 def test_topk_v2_strided_out_matches_dense(bs, max_seq):
     torch.manual_seed(bs * 7 + max_seq)
@@ -34,8 +33,8 @@ def test_topk_v2_strided_out_matches_dense(bs, max_seq):
         bs, n_pages
     )
     plan = plan_topk_v2(seq_lens)
-    # The transform kernel prefetches plan metadata before its PDL wait, so plan
-    # and transform must not be stream-adjacent (see test_topk_v2._plan).
+    # The transform prefetches plan metadata before its PDL wait;
+    # plan and transform must not be stream-adjacent (see test_topk_v2._plan).
     torch.cuda.synchronize()
 
     dense = torch.full((bs, TOPK), -7, dtype=torch.int32, device=dev)
