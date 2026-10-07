@@ -427,7 +427,11 @@ class TestKVLocPlan(unittest.TestCase):
         # A runner of rows no other translator here reads.
         self.req_to_token = self.req_to_token.clone()
         solo = self._translator(self.allocator.get_kvcache())
-        solo.bind_and_verify_backends([stream_only_backend()])
+        # A multi-step draft container is bound with its step backends and
+        # reads nothing itself.
+        container = SimpleNamespace(kv_index_translator=None)
+        solo.bind_and_verify_backends([container, stream_only_backend()])
+        self.assertIs(container.kv_index_translator, solo)
         bs = int(self.rpi.numel())
         lens = torch.tensor([3, 2], dtype=torch.int64)
         indptr = torch.tensor([0, 3, 5], dtype=torch.int32)

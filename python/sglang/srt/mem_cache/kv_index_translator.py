@@ -632,8 +632,11 @@ class KVIndexTranslator:
         Model-layer producers read it off `get_attn_backend()`, so an unset
         attribute is an unreachable hook, not "no translation needed".
         """
+        # Every `AttentionBackend` declares `reads_kv_index_table`; what lacks
+        # it is a multi-step draft container, which reads nothing itself: its
+        # step backends are bound alongside it.
         reads_table = any(
-            getattr(backend, "reads_kv_index_table", True)
+            getattr(backend, "reads_kv_index_table", False)
             for backend in backends
             if backend is not None
         )
