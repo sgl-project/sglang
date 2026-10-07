@@ -231,7 +231,7 @@ def _serving_coverage_phases(
     """
     import itertools
 
-    from sglang.srt.runtime_context import get_parallel, get_schedule
+    from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 
     schedule = get_schedule()
     cap = _SERVING_COVERAGE_MAX_COHORT
@@ -534,6 +534,18 @@ def _serving_coverage_phases(
     image_token = getattr(mm_tokens, "image_token", None)
     if isinstance(image_token, list):
         image_token = image_token[0] if image_token else None
+    if (
+        image_token
+        and text_ok
+        and get_exec().features.enable_encoder_swa_bounded_replay
+    ):
+        # The tokenizer manager rejects every multimodal request under
+        # encoder SWA bounded replay, so an image request would only fail.
+        logger.info(
+            "serving_coverage: skipping image phase: encoder SWA bounded "
+            "replay accepts only text requests"
+        )
+        image_token = None
     if image_token and text_ok:
 
         async def _image(rank):
@@ -587,7 +599,8 @@ async def serving_coverage(
       on the first sampled request); a variant the server rejects is skipped,
     * concurrent decodes at every power-of-two batch size up to the
       running-request limit, half greedy and half sampled,
-    * one image request when the model is multimodal.
+    * one image request when the model is multimodal, skipped under encoder
+      SWA bounded replay, which accepts only text requests.
 
     Prompt and decode lengths are clamped to the engine's input limit; phases
     whose shapes cannot fit are skipped with a log line. With data

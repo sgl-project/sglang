@@ -260,6 +260,24 @@ class TestServingCoveragePhases(_PublishedConfig):
         self.assertEqual(len(req.image_data), 1)
         self.assertTrue(req.image_data[0].startswith("data:image/png;base64,"))
 
+    async def test_encoder_swa_bounded_replay_skips_the_image_phase(self):
+        # The tokenizer manager rejects image requests under this mode.
+        override = get_context().override_server_args(
+            max_running_requests=self.max_running_requests,
+            chunked_prefill_size=self.chunked_prefill_size,
+            dp_size=self.dp_size,
+            enable_encoder_swa_bounded_replay=True,
+        )
+        tm = FakeTokenizerManager(image_token="<image>")
+        with override, self.assertLogs(warmup_module.logger, level="INFO") as cm:
+            phases = _phases(tm)
+            self.assertNotIn("image", phases)
+            self.assertIn("natural-text", phases)
+            await serving_coverage("null", tm)
+        self.assertTrue(any("skipping image phase" in line for line in cm.output))
+        self.assertTrue(tm.requests)
+        self.assertFalse(any(r.image_data for r in tm.requests))
+
     async def test_image_token_list_uses_its_first_entry(self):
         tm = FakeTokenizerManager(image_token=["<img>", "<img_end>"])
         await _phases(tm)["image"]()
