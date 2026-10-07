@@ -100,6 +100,11 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         frames_np = vdw.get_frames_at(indices)  # (N, H, W, C)
         return torch.from_numpy(frames_np).permute(0, 3, 1, 2).contiguous()
 
+    def _mm_preprocessing_device_choice(self) -> Optional[str]:
+        # process_mm_data below delegates to the base call, which uses the base
+        # placement, so report it for worker sizing and JPEG decode.
+        return super()._mm_preprocessing_device_choice()
+
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
     ):

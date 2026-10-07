@@ -403,6 +403,37 @@ class TestProcessMmDataDevice(CustomTestCase):
         self.assertNotIn("device", kwargs)
         self.assertFalse(mem_pool.called)
 
+    def test_gemma4_delegated_call_follows_the_setting(self):
+        """Gemma4 overrides ``process_mm_data`` only to prepare its inputs and
+        then delegates to the base call, so the setting reaches that call and
+        the worker count and the ignored-setting warning follow it."""
+        from sglang.srt.multimodal.processors.gemma4 import Gemma4SGLangProcessor
+
+        for setting, device, competes in (
+            ("auto", "cuda:0", True),
+            ("cpu", "cpu", False),
+        ):
+            with self.subTest(setting=setting):
+                processor, events = self._harness(
+                    Gemma4SGLangProcessor, mm_preprocessing_device=setting
+                )
+                with self._cuda_pool_spy():
+                    processor.process_mm_data("t", images=["image"])
+                    self.assertFalse(processor._places_preprocessing_itself())
+                    self.assertEqual(
+                        processor._preprocessing_competes_with_the_scheduler(),
+                        competes,
+                    )
+                self.assertEqual(self._call_device(events)[0], device)
+
+    def test_a_class_that_places_its_own_call_is_still_detected(self):
+        from sglang.srt.multimodal.processors.ernie45_vl import (
+            Ernie4_5_VLImageProcessor,
+        )
+
+        processor = _make(Ernie4_5_VLImageProcessor, mm_preprocessing_device="cpu")
+        self.assertTrue(processor._places_preprocessing_itself())
+
 
 class TestGpuImageDecodeFollowsThePlacement(CustomTestCase):
     def _decode(self, processor):
