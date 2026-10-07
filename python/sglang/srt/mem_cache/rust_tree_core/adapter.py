@@ -28,6 +28,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.rust_tree_core.component_registry import (
+    create_rust_tree_component,
+    resolve_rust_component_factories,
+)
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
@@ -40,6 +44,9 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     RecoverSWAWithLockedFull,
     ReplaceWriteThroughOnNodeSplit,
     SWARebuild,
+)
+from sglang.srt.mem_cache.unified_cache.component_factory import (
+    TreeComponentArgument,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
@@ -339,14 +346,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 sorted(component.name for component in unsupported_components)
             )
             raise ValueError(f"Rust TreeCore does not support components: {names}")
-        from sglang.srt.mem_cache.rust_tree_core.component_registry import (
-            create_rust_tree_component,
-            resolve_rust_component_factories,
-        )
-        from sglang.srt.mem_cache.unified_cache.component_factory import (
-            TreeComponentArgument,
-        )
-
         component_factories = resolve_rust_component_factories(params)
         # Validate the same constructor options as Python before passing the
         # configured eviction parameters to the native strategy.
