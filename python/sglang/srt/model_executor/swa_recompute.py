@@ -3,7 +3,7 @@ its last ``swa_recompute_len`` tokens. The replay reads compressed and indexer
 entries from the cache and writes only SWA rows and the 4x compressor state."""
 
 from copy import copy
-from typing import List, Optional
+from typing import List
 
 import msgspec
 import torch
@@ -66,12 +66,9 @@ def run_swa_recompute(
         ForwardBatch,
     )
 
-    starts: List[Optional[int]] = batch.swa_recompute_starts
-    # The batch object outlives its prefill; the replay is owed once.
-    batch.swa_recompute_starts = None
     runner = worker.model_runner
     outputs = []
-    for i, start in enumerate(starts):
+    for i, start in enumerate(batch.swa_recompute_starts):
         if start is None:
             continue
         replay = _replay_batch(batch, i, start, runner)

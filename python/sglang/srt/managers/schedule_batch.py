@@ -3603,6 +3603,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
+        # The replay belongs to the prefill this batch just ran.
+        self.swa_recompute_starts = None
 
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
