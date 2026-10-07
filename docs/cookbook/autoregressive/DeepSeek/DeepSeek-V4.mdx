@@ -75,6 +75,12 @@ docker run \
 
 </Accordion>
 
+For **MI355X → Pro / Pro Official → FP4 → Multi-Nodes**, the panel generates a **1P1D deployment**: one prefill node and one decode node, each running an independent worker. Select **Router**, **Prefill**, or **Decode** to copy its command. Start the [UMBP tier](#3-9-unified-cache-external-linker-umbp) on the prefill node, then both workers, then the router. Send client requests to the router on port `8000`.
+
+The MI355X multi-node strategies follow the [InferenceX AgentX submission](https://github.com/SemiAnalysisAI/InferenceX/pull/3664): **Low-Latency**, **Balanced**, and **High-Throughput** use fixed concurrency presets of **16**, **48**, and **256**, respectively. **Pro** uses EAGLE/MTP; **Pro Official (0813)** uses DSpark, matching the InferenceX checkpoint. Both enable UMBP on prefill by default. The Playground inherits the selected worker, including its speculative decoder and cache settings.
+
+Run these recipes' **Python** commands inside the ROCm image shown in the **Docker** tab, where Aiter is already enabled. Add explicit parser and network-device settings through the Playground's **Parsers** and **PD Disagg → IB Device** controls.
+
 Pick your hardware + recipe to generate the launch command. The three serving strategies cover the common operating points:
 
 - **Low-Latency** — fastest reply for a single user. Pick for chat.
@@ -1045,7 +1051,7 @@ This command adds expert parallelism on top of the DP8 one. [§3.8](#3-8-pd-disa
 
 The prefill and decode roles can use any transport the **PD Disagg** card in the [Playground above](#playground) offers. On MI300X / MI355X that is **MORI-IO**, **Mooncake** and **NiXL**, and all three stay selectable. This section covers MORI-IO only, because it is the transport every AMD recipe in this cookbook was measured with. It is also what the card selects by default on those two platforms, and it is the one transport that is ROCm-only, so the card hides it on the CUDA platforms.
 
-The IB device list works the other way around. ROCm nodes enumerate their NICs as `rdmaN`, so on MI300X / MI355X the card defaults to the node's `rdmaN` list and hides the ConnectX `mlx5_*` names. On the CUDA platforms it hides the `rdmaN` list instead.
+The MI355X multi-node recipes start with **IB Device → Auto**. Select the `rdma0-7 (all NICs)` option in the Playground to add the explicit NIC list. ROCm nodes enumerate their NICs as `rdmaN`, so the card hides the ConnectX `mlx5_*` names on AMD platforms. On CUDA platforms it hides the `rdmaN` list instead.
 
 Both roles need the RDMA NICs passed into the container, so the **Docker** output adds the fabric flags below on top of the usual ROCm device access from the [Install panel](#install). `/dev/infiniband` covers `rdma_cm` and the per-NIC `uverbs0`…`uverbs7` nodes, and the memlock/`IPC_LOCK` pair is what lets MORI-IO pin the buffers it registers with the NICs:
 
@@ -1062,35 +1068,36 @@ docker run \
     python3 -m sglang.launch_server <role args below>
 ```
 
-The Playground's Docker output uses this `v0.5.21` build for Pro Official. It is the build the PD roles ran on, and the first one carrying the Aiter MegaMoEv2 kernels the high-throughput prefill role needs. `--network host` replaces the single-node `-p` mapping because the two roles run on different hosts.
+The Deployment and Playground Docker outputs use this `v0.5.21` build for the MI355X Pro and Pro Official FP4 multi-node recipes. It is the build the PD roles ran on, and the first one carrying the Aiter MegaMoEv2 kernels the high-throughput prefill role needs. `--network host` replaces the single-node `-p` mapping because the two roles run on different hosts.
 
-Selecting a role with **MORI** emits the MORI-IO transport env — `MORI_IO_SQ_BACKOFF_TIMEOUT_US` and `MORI_IO_QP_MAX_SEND_WR` — together with that role's sizing.
+For the **MI355X Pro / Pro Official FP4** presets, **High-Throughput** sets `MORI_IO_QP_MAX_SEND_WR=32767` and `MORI_IO_QP_MAX_CQE=32768` on both MORI roles. Low-Latency and Balanced use the transport's default queue sizes. The send-queue backoff timeout uses MORI's default of 5 seconds.
 
 #### Role-based configuration
 
-Pro Official (0813) has its own pair for each strategy, because it carries a DSpark head:
+Select **MI355X → Pro Official → FP4 → Multi-Nodes**, then a strategy and role. The commands use the [submitted recipe at `df5e433239d7`](https://github.com/SemiAnalysisAI/InferenceX/blob/df5e433239d72106529ece4dd97cc36e4c3adf4c/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv4/sglang/mi355x-fp4/agentx/disagg-umbp-dspark.yaml), with cluster-specific paths replaced by local placeholders and benchmark acceptance simulation removed.
 
-| | Low-Latency | Balanced | High-Throughput |
-|---|---|---|---|
-| Prefill → Decode | TP8 → TP8 | TP4 → TP8 | TP8+DP8 → TP8+DP8 |
-| `--max-running-requests` | 32 | 96 | 384–1024 |
-| `--speculative-dspark-block-size` | 6 | 3 | 3 |
-| KV offload | linker(UMBP) | linker(UMBP) | linker(UMBP) |
+| Strategy | Concurrency | Prefill → Decode | `--max-running-requests` | DSpark block size |
+|---|---|---|---|---|
+| Low-Latency | 16 | TP4 → TP8 | 32 | 6 |
+| Balanced | 48 | TP4 → TP8 | 96 | 3 |
+| High-Throughput | 256 | TP8+DP8+EP8 → TP8+DP8 | 512 | 3 |
 
-`--cuda-graph-bs-decode` on the decode role covers 1 to `--max-running-requests / attn_dp_size`: the full value on the TP-only rows, an eighth of it on the DP8 rows.
+These are two separate workers: neither receives `--nnodes 2` or a cross-node TP rendezvous address. Prefill listens on `30000`, decode on `30100`, and the router on `8000`. Other hardware's Multi-Nodes recipes can still represent a model sharded across nodes.
 
-All three Pro Official prefill roles add `--optimistic-prefill-attempts 2` and `--enable-cache-report`, and turn on the [unified cache external linker](#3-9-unified-cache-external-linker-umbp) by default. "Linker" and HiCache are alternatives; SGLang rejects both at once. Every role drops the base cell's `--prefill-decode-interval`, which applies to aggregated serving only.
+`--cuda-graph-bs-decode` covers 1 to `--max-running-requests / attn_dp_size`: the full value on the TP-only rows and an eighth on the DP8 rows. Each strategy sets both workers' admission limit and decode's graph sizes together. The TP-only points use `--mem-fraction-static 0.86` and SWA ratio `0.1`; the DP8 points use `0.92` and `0.15`.
 
-The high-throughput pair is the one exception to the table above: its prefill role runs **EP8** MoE while decode stays TP8, and it serves a range of concurrencies rather than one. In the Playground, its **Target Concurrency** select moves `--max-running-requests` and `--cuda-graph-bs-decode` together between 192 and 512. The two commands further down are that pair at concurrency 256.
+All prefill roles enable [UMBP](#3-9-unified-cache-external-linker-umbp), `--optimistic-prefill-attempts 2`, and cache reporting. Decode does not use an offload tier. The high-throughput prefill worker uses Aiter MegaMoEv2 with EP8; decode keeps TP MoE. Both high-throughput workers enable the FP8 unified KV layout. The commands below show concurrency 256.
+
+Select **Pro** to use the original checkpoint's **EAGLE/MTP 3-1-4** head with the same topology and admission limits. Its commands contain no DSpark parameters. In the Playground, **Off (greedy)** removes speculative decoding. Enabling **HiCache** automatically turns off **Unified Cache External Linker** and removes UMBP's socket configuration and optimistic prefill. Enabling the linker turns HiCache off.
 
 <Note>
 Selecting a TP-only role forces **DP-Attention** off and greys the control. `--max-running-requests` is server-wide and floor-divided by `attn_dp_size`, so turning DP on would cut the per-rank batch below the captured `--cuda-graph-bs-decode` values without changing either flag in the command.
 </Note>
 
 <Warning>
-**Speculative decoding changes how you size `--max-running-requests`.** For a target concurrency of N, set it to `N*2` on **both** roles; at N the served batch stays below the concurrency you are aiming for. This holds for DSpark and EAGLE/MTP alike. The table above follows it: 32 serves a concurrency of 16, 96 serves 48, and the high-throughput Pro Official range serves 192 to 512.
+**Speculative decoding changes how you size `--max-running-requests`.** For a target concurrency of N, set it to `N*2` on **both** roles; at N the served batch stays below the concurrency you are aiming for. This holds for DSpark and EAGLE/MTP alike. The table above follows it: 32 serves a concurrency of 16, 96 serves 48, and 512 serves the high-throughput concurrency of 256.
 
-The decode role's `--cuda-graph-bs-decode` then has to cover `N*2 / attn_dp_size`, the per-rank batch. On the Pro Official high-throughput pair the **Target Concurrency** select applies both rules for you.
+The decode role's `--cuda-graph-bs-decode` then has to cover `N*2 / attn_dp_size`, the per-rank batch. The strategy presets apply both rules: decode graphs cover 1–32, 1–96, and 1–64, respectively.
 </Warning>
 
 Two things then differ between the two roles regardless of strategy:
@@ -1107,15 +1114,11 @@ The two commands below are that pair at concurrency 256, on one prefill node and
 ```bash Command
 GPU_MAX_HW_QUEUES=5 \
 SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 \
-SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=8192 \
 SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4 \
 MORI_SHMEM_HEAP_SIZE=8G \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
-SGLANG_SHARED_EXPERT_TP1=0 \
-SGLANG_DP_SHARED_EXPERT_LOCAL=0 \
-SGLANG_DP_USE_GATHERV=0 \
 SGLANG_DP_USE_REDUCE_SCATTER=0 \
-UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp_sa/sa.grpc.sock \
+UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp/standalone.grpc.sock \
 python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
   --trust-remote-code \
@@ -1148,7 +1151,6 @@ python3 -m sglang.launch_server \
   --speculative-num-draft-tokens 4 \
   --enable-unified-cache-external-linker \
   --unified-cache-external-linker-backend mori \
-  --hicache-storage-backend-extra-config '{"standalone_startup_timeout_ms":120000}' \
   --optimistic-prefill-attempts 2 \
   --enable-cache-report \
   --load-balance-method round_robin \
@@ -1168,7 +1170,6 @@ SGLANG_DSV4_UNIFIED_KV_FP8=1 \
 SGLANG_SHARED_EXPERT_TP1=1 \
 SGLANG_DP_SHARED_EXPERT_LOCAL=1 \
 SGLANG_DP_USE_GATHERV=1 \
-SGLANG_DP_USE_REDUCE_SCATTER=1 \
 MORI_MAX_DISPATCH_TOKENS_DECODE=256 \
 python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
@@ -1207,18 +1208,18 @@ python3 -m sglang.launch_server \
 
 Decode sets neither `--ep-size` nor `--moe-a2a-backend`. `--moe-a2a-backend` names the dispatch path for expert parallelism, so at `ep_size` 1 there is nothing for it to name, and the MoE runs replicated across TP.
 
-The four `SGLANG_*` variables that flip between the two commands drive the `all_gatherv` / `reduce_scatterv` path. That is what decode's TP MoE uses and what prefill's all-to-all replaces, so leaving them on under EP8 would run both over the same tokens.
+The shared-expert, `SGLANG_DP_USE_GATHERV`, and `SGLANG_DP_USE_REDUCE_SCATTER` settings control the `all_gatherv` / `reduce_scatterv` path. Shared-expert locality and gatherv default to off; reduce-scatter defaults to on for ROCm. The commands only set the values that differ from those defaults. That is what decode's TP MoE uses and what prefill's all-to-all replaces, so leaving them on under EP8 would run both over the same tokens.
 
 The rest of the difference is the prefill-only set already described above: `--chunked-prefill-size`, `--disable-cuda-graph`, and the linker flags with `--optimistic-prefill-attempts` / `--enable-cache-report`. Decode replaces the first two with `--cuda-graph-bs-decode`.
 
 On the prefill env:
 
 - `SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1` is required. `--moe-a2a-backend megamoe` alone runs the DeepGEMM MegaMoE path, which has no ROCm kernel. Do not set this variable on decode: the scheduler reads it too, so it also changes how decode schedules batches.
-- `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` must be at least `--chunked-prefill-size / attn_dp_size`, here 65536 / 8. Below that SGLang reports no error and runs fused MoE for the extra tokens. 8192 is also the default; the command sets it so the dependency stays visible.
+- `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` must be at least `--chunked-prefill-size / attn_dp_size`, here 65536 / 8. Below that SGLang reports no error and runs fused MoE for the extra tokens. 8192 is the default, so the command omits this variable. Set it explicitly if you increase the per-rank chunk size.
 - `MORI_SHMEM_HEAP_SIZE` sizes the MORI symmetric heap, where MegaMoEv2 allocates its dispatch and combine buffers. It needs about 0.51 GiB per 1024 tokens of MTPR — about 4.2 GiB at 8192 — and the 4 GiB default fails during CUDA graph capture. SGLang allocates the whole heap at the first MegaMoE forward pass, after the KV cache pool, so it consumes the GPU memory `--mem-fraction-static` left free whether MegaMoE fills it or not. 8 GiB fits next to `0.92`; [§3.7](#3-7-agentic-long-context-with-hicache-dram-offload-mi355x-fp4-dspark) runs at `0.85` and can afford more.
 
 <Note>
-`MORI_SHMEM_MODE=STATIC_HEAP` creates the heap and is already the default. Set it only if your launch script exports `MORI_SHMEM_MODE=ISOLATION`, which creates no heap: every rank then prints `Pointer ... is not in symmetric heap [0x0, 0x0)` and the worker fails.
+These recipes leave `MORI_SHMEM_MODE` unset and use MORI's default `STATIC_HEAP`. The pinned Aiter MegaMoEV2 implementation allocates its buffers through `mori_shmem_create_tensor()` / `shmem_malloc()` after SGLang initializes MORI shmem. This requires the symmetric heap; the separate MORI CCO allocator is not used by this implementation. If your launch script exports `MORI_SHMEM_MODE=ISOLATION`, unset it before launching MegaMoE: its peer-pointer lookup requires the heap mapping. Keep `MORI_SHMEM_HEAP_SIZE=8G` for the prefill recipe above.
 </Note>
 
 **Both roles set `SGLANG_DSV4_UNIFIED_KV_FP8=1`**, which splits the unified KV cache pool into an FP8 nope pool and a BF16 rope pool. It requires the `unified_kv_triton` kernels, which the base cell already selects through `SGLANG_HACK_FLASHMLA_BACKEND`. The value must match on both roles — the PD handshake compares KV cache layouts and fails if they differ. The DSpark draft worker stays BF16 either way.
@@ -1227,10 +1228,10 @@ On the prefill env:
 
 Run the two roles on separate nodes with the same transport and IB device, then front them with the router the card prints. On MI355X it is cache-aware: `--policy consistent_hashing` keeps a conversation on the prefill worker that already holds its prefix, and `--balance-abs-threshold 2` / `--balance-rel-threshold 1.1` stop that affinity from starving the peer. Decode holds no reusable prefix, so `--decode-policy round_robin` spreads it evenly. `--dp-aware` takes effect only when the workers run DP attention.
 
-The **Pro Official high-throughput** pair, and only that pair, adds `--request-timeout-secs 14400`. At high concurrency the prefill role queues many requests. When the default 1800 s passes the router aborts the request, and an abort that lands while MORI is writing KV cache over RDMA leaves the transfer neither finished nor failed: that prefill worker can no longer send KV cache to decode, and you have to restart it.
+The multi-node router presets retain the default request timeout. The standalone high-throughput Playground preset uses `--request-timeout-secs 14400`. At high concurrency the prefill role queues many requests. When the default 1800 s passes the router aborts the request, and an abort that lands while MORI is writing KV cache over RDMA leaves the transfer neither finished nor failed: that prefill worker can no longer send KV cache to decode, and you have to restart it.
 
 <Warning>
-`--request-timeout-secs` is the timeout of the HTTP request from the router to the worker, not a limit on queue time. At 14400 the router also waits four hours before giving up on a worker that has stopped responding. That is acceptable where prefill queues are long, which is why the low-latency and balanced pairs keep the default. Lower it again if you lower the concurrency.
+`--request-timeout-secs` is the timeout of the HTTP request from the router to the worker, not a limit on queue time. At 14400 the router also waits four hours before giving up on a worker that has stopped responding. That is acceptable where prefill queues are long, which is why the lower-concurrency recipes keep the default. Lower it again if you lower the concurrency.
 </Warning>
 
 ### 3.9 Unified Cache External Linker (UMBP)
@@ -1244,6 +1245,8 @@ The linker is an **alternative to [HiCache](#3-3-hicache-hierarchical-kv-caching
 --unified-cache-external-linker-backend mori
 ```
 
+For **MI355X Pro / Pro Official FP4**, the Playground keeps the two Enable controls mutually exclusive: turning either on automatically turns the other off. You can also leave both off.
+
 The **Backend** knob picks the linker backend. `mori` is the UMBP pool; `mooncake` drives the same direct-linker path against a Mooncake store instead.
 
 **The linker does not need PD disaggregation.** It works in aggregated serving as well, with the **PD Disagg** card set to Off. The §3.8 pairs use it on their prefill role because that is where the KV is produced, but that is a property of those recipes, not a requirement of the linker. Turn the card on next to any command whose selection satisfies the condition below.
@@ -1252,23 +1255,30 @@ The **Backend** knob picks the linker backend. `mori` is the UMBP pool; `mooncak
 
 DP Attention does change how much the tier holds, so it is worth understanding before you size one. The linker keys its objects by rank, and MLA KV is replicated across TP. Under pure TP, a TP8 worker therefore opens eight separate keyspaces, and all eight hold copies of the same tokens: the tier stores an eighth of the distinct tokens that its byte budget suggests. At TP4 it stores a quarter. DP Attention collapses the keys onto one shared keyspace, so the whole budget counts. Size the pool for the copies you will actually get, and do not read the byte budget as a distinct-token figure.
 
-Every Pro Official prefill role (low-latency, balanced, and the DP8 high-throughput one) uses a **standalone** UMBP tier: a separate `umbp_standalone_server` process on the prefill node owns the DRAM pool, and the prefill server attaches to it over a Unix socket. Start the tier server first; the 1500 GB DRAM budget below is what the verified runs used:
+Every MI355X Pro / Pro Official multi-node prefill role uses a **standalone** UMBP tier: a separate `umbp_standalone_server` process on the prefill node owns the DRAM pool, and the prefill server attaches to it over a Unix socket. Start the tier server first; the 1500 GB DRAM budget below is what the verified runs used:
 
 ```bash Command
-mkdir -p /tmp/umbp_sa
+mkdir -p /tmp/umbp
 UMBP_DRAM_CAPACITY=1500000000000 \
 UMBP_DRAM_USE_HUGEPAGES=1 \
 UMBP_SSD_ENABLED=0 \
 MORI_UMBP_LOG_LEVEL=info \
-<mori>/umbp_standalone_server unix:///tmp/umbp_sa/sa.grpc.sock
+<mori>/umbp_standalone_server unix:///tmp/umbp/standalone.grpc.sock
 ```
 
-Then launch the prefill role with the socket in its environment. The Playground adds both lines: the address has to come from the environment, and the extra-config gives the tier server up to two minutes to bind the socket before prefill gives up.
+Reserve enough hugepages for the 1.5 TB tier on a host with at least 3 TB DRAM, leaving memory for model loading and the worker. Wait for `host memory registered for GPU access` before starting prefill. For the pinned ROCm image, the tier binary is `/sgl-workspace/mori/python/mori/umbp_standalone_server`; include `/sgl-workspace/mori/python/mori` in `LD_LIBRARY_PATH`.
+
+If the tier also runs in Docker, pass the ROCm and RDMA devices and hugepage access through to that container and mount `-v /tmp/umbp:/tmp/umbp` in **both** containers. The generated Prefill Docker command already includes that socket-directory mount.
+
+The standalone server defaults to `unix:///run/umbp/standalone/node0.grpc.sock` when neither an address argument nor `UMBP_STANDALONE_ADDRESS` is supplied (`UMBP_NODE_ID` replaces `node0` when set). SGLang's client has no default standalone address: set `UMBP_STANDALONE_ADDRESS` to enable this mode. These commands use an explicit socket under `/tmp/umbp` so the server and worker share the same path.
+
+UMBP defaults to a 4 GiB DRAM capacity, hugepages disabled, and a 30-second startup wait. This recipe uses 1.5 TB with hugepages enabled and keeps the default startup wait. It also sets `UMBP_SSD_ENABLED=0` to disable the SSD tier (whose config default is enabled), and `MORI_UMBP_LOG_LEVEL=info` to expose the readiness log (the default log level is error).
+
+Then launch the prefill role with the socket in its environment. The Deployment panel and Playground include this address and use the default 30-second startup wait.
 
 ```bash Command
-UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp_sa/sa.grpc.sock \
-sglang serve ... \
-  --hicache-storage-backend-extra-config '{"standalone_startup_timeout_ms":120000}'
+UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp/standalone.grpc.sock \
+sglang serve ...
 ```
 
 Two further limits are worth knowing before you size a run. The pool is a per-node process, so a worker that spans nodes would shard its keyspace by node. And under PD disaggregation the §3.8 pairs run the linker on the prefill role only, so the decode worker offloads nothing; in aggregated serving the single worker offloads its own KV.
