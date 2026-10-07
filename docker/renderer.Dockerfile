@@ -17,12 +17,15 @@ RUN apt-get update \
 WORKDIR /build
 COPY rust/Cargo.toml rust/Cargo.lock rust/rust-toolchain.toml rust/
 # Cargo loads every workspace member even when building only the renderer.
+COPY proto/ proto/
 COPY rust/sglang-grpc/Cargo.toml rust/sglang-grpc/
 COPY rust/sglang-grpc/src/ rust/sglang-grpc/src/
 COPY rust/sglang-mm/Cargo.toml rust/sglang-mm/
 COPY rust/sglang-mm/src/ rust/sglang-mm/src/
 COPY rust/sglang-server/Cargo.toml rust/sglang-server/
 COPY rust/sglang-server/src/ rust/sglang-server/src/
+COPY rust/sglang-processor/Cargo.toml rust/sglang-processor/
+COPY rust/sglang-processor/src/ rust/sglang-processor/src/
 COPY rust/sglang-renderer/Cargo.toml rust/sglang-renderer/
 COPY rust/sglang-renderer/src/ rust/sglang-renderer/src/
 
@@ -35,7 +38,7 @@ RUN --mount=type=cache,id=renderer-registry-${TARGETARCH},target=/usr/local/carg
     --mount=type=cache,id=renderer-git-${TARGETARCH},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=renderer-target-${TARGETARCH},target=/build/rust/target,sharing=locked \
     cargo build --manifest-path rust/Cargo.toml -p sglang-renderer \
-        --bin sglang-renderer --release --features http --locked \
+        --bin sglang-renderer --release --locked \
     && install -D rust/target/release/sglang-renderer /out/sglang-renderer
 
 # Run the existing unit suite in the same Linux toolchain used for the image.
@@ -46,7 +49,9 @@ COPY experimental/sgl-router/tests/fixtures/tiny_tokenizer.json experimental/sgl
 RUN --mount=type=cache,id=renderer-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=renderer-git-${TARGETARCH},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=renderer-target-${TARGETARCH},target=/build/rust/target,sharing=locked \
-    cargo test --manifest-path rust/Cargo.toml -p sglang-renderer --features http --locked
+    cargo test --manifest-path rust/Cargo.toml -p sglang-processor -p sglang-renderer --locked \
+    && cargo check --manifest-path rust/Cargo.toml -p sglang-processor --locked \
+        --no-default-features --features render,tokenizer
 
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
 
