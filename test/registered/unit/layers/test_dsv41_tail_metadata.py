@@ -33,6 +33,47 @@ def metadata(rows):
 
 
 class TestTailMetadata(CustomTestCase):
+    def test_tail_graph_selection_does_not_depend_on_capture_order(self):
+        from sglang.srt.models.deepseek_common.tail_graph import select_tail_graph
+
+        graphs = {128: object(), 64: object(), 1: object()}
+        for rows, capacity in ((1, 1), (44, 64), (80, 128), (128, 128)):
+            self.assertIs(select_tail_graph(graphs=graphs, rows=rows), graphs[capacity])
+        self.assertIsNone(select_tail_graph(graphs=graphs, rows=129))
+        self.assertIsNone(select_tail_graph(graphs=graphs, rows=0))
+
+    def test_tail_capture_batches_fit_every_bucket(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            late_layer_tail_layout,
+        )
+        from sglang.srt.models.deepseek_common.tail_graph import (
+            make_capture_batch,
+            tail_graph_sizes,
+        )
+
+        prototype = SimpleNamespace(
+            input_ids=torch.zeros(16384, dtype=torch.int64),
+            out_cache_loc=torch.zeros(16384, dtype=torch.int64),
+            num_token_non_padded=torch.tensor(16384),
+            extend_seq_lens_cpu=[4096] * 4,
+        )
+        for capacity in (1, 44, 128, 384, 512, 2048, 2176):
+            for rows in tail_graph_sizes(capacity):
+                with self.subTest(capacity=capacity, rows=rows):
+                    batch = make_capture_batch(prototype, rows=rows, window=128)
+                    indices, lengths, _ = late_layer_tail_layout(
+                        extend_lens_cpu=batch.extend_seq_lens_cpu,
+                        seq_lens_cpu=batch.seq_lens_cpu.tolist(),
+                        tail_len=128,
+                        device="cpu",
+                    )
+                    self.assertEqual(sum(lengths), rows)
+                    self.assertEqual(indices.tolist(), list(range(rows)))
+                    self.assertLessEqual(rows, capacity)
+                    self.assertTrue(all(n <= 128 for n in lengths))
+        self.assertEqual(prototype.extend_seq_lens_cpu, [4096] * 4)
+        self.assertEqual(prototype.num_token_non_padded.item(), 16384)
+
     def test_contiguous_tail_excludes_graph_padding(self):
         source = torch.arange(128)
         result = _tail_rows(source, token_indices=torch.arange(44), contiguous_start=0)

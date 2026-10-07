@@ -24,6 +24,111 @@ register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestTailMetadataReplay(CustomTestCase):
+    def test_tail_graph_refreshes_inputs_and_live_metadata(self):
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            eager_on_graph,
+        )
+        from sglang.srt.models.deepseek_common.tail_graph import (
+            TailInputs,
+            capture_tail_graph,
+        )
+        from sglang.srt.models.deepseek_v4 import _prefill_live_rows
+        from sglang.srt.runtime_context import get_context
+
+        case = DSV4AttentionCase(
+            name="tail_graph",
+            backend="dsv4",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(0, 0),
+            extend_lens=(128, 128),
+        )
+        fixture = build_dsv4_attention_fixture(
+            self, case, max_context_len=1024, swa_size=2048
+        )
+        self.addCleanup(fixture.runner._server_args_override.restore)
+        backend = fixture.backend
+        backend.enable_decoder_swa_bounded_replay = True
+        batch = fixture.forward_batch
+
+        @eager_on_graph(True)
+        def read_metadata(value):
+            rows = _prefill_live_rows(batch, value.shape[0])
+            output = torch.zeros_like(value)
+            positions = backend.forward_metadata.late_layer_tail.positions
+            output[:rows] = value[:rows] + positions[:, None]
+            return output
+
+        def forward(inputs):
+            value = read_metadata(inputs.residual + inputs.positions[:, None])
+            output = value + inputs.swa_out_cache_loc[:, None]
+            return (output, value), [output * 2]
+
+        with (
+            torch.no_grad(),
+            forward_context(ForwardContext(attn_backend=backend)),
+            get_context().override_server_args(enable_decoder_swa_bounded_replay=True),
+        ):
+            backend.init_forward_metadata(batch)
+            backend.enter_late_layer_tail(batch)
+
+            def inputs():
+                tail = backend.forward_metadata.late_layer_tail
+                rows = tail.token_indices.numel()
+                return TailInputs(
+                    residual=torch.arange(rows, device="cuda", dtype=torch.float32)[
+                        :, None
+                    ],
+                    pre=torch.ones(rows, 1, device="cuda"),
+                    positions=tail.positions,
+                    input_ids=torch.arange(rows, device="cuda"),
+                    input_ids_global=torch.arange(rows, device="cuda"),
+                    hash_ids=None,
+                    swa_out_cache_loc=tail.swa_out_cache_loc,
+                )
+
+            graph = capture_tail_graph(
+                inputs=inputs().with_capacity(256),
+                forward=forward,
+                barrier=lambda: None,
+                stream=torch.cuda.Stream(),
+            )
+            address = graph.inputs.positions.data_ptr()
+            for lengths, prefixes in [
+                ((44,), (512,)),
+                ((24, 24), (256, 512)),
+                ((128,), (128,)),
+                ((1,), (0,)),
+                ((80,), (256,)),
+                ((160, 1), (128, 256)),
+                ((200, 127), (256, 128)),
+            ] * 3:
+                with self.subTest(lengths=lengths, prefixes=prefixes):
+                    batch = _make_forward_batch(
+                        replace(case, prefix_lens=prefixes, extend_lens=lengths),
+                        fixture.runner,
+                        max_context_len=1024,
+                        device="cuda",
+                    )
+                    backend.init_forward_metadata(batch)
+                    backend.enter_late_layer_tail(batch)
+                    live = inputs()
+                    expected, expected_aux = forward(live)
+                    actual, actual_aux = graph.replay(live)
+                    for got, want in zip(
+                        (*actual, *actual_aux), (*expected, *expected_aux)
+                    ):
+                        torch.testing.assert_close(got, want)
+                    self.assertEqual(graph.inputs.positions.data_ptr(), address)
+                    rows = live.residual.shape[0]
+                    self.assertEqual(
+                        graph.inputs.swa_out_cache_loc[rows:].count_nonzero().item(), 0
+                    )
+                    self.assertEqual(
+                        graph.inputs.residual[rows:].count_nonzero().item(), 0
+                    )
+
     def test_eager_tail_then_short_graph_replay(self):
         case = DSV4AttentionCase(
             name="tail_then_graph",

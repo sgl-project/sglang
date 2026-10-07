@@ -6,6 +6,7 @@ import logging
 import time
 from array import array
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import (
     TYPE_CHECKING,
@@ -20,6 +21,7 @@ from typing import (
     Union,
 )
 
+import msgspec
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -162,6 +164,14 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
     is_cross_layer_mhc_fusion_enabled,
+)
+from sglang.srt.models.deepseek_common.tail_graph import (
+    TailGraph,
+    TailInputs,
+    capture_tail_graph,
+    make_capture_batch,
+    select_tail_graph,
+    tail_graph_sizes,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
@@ -720,7 +730,7 @@ def deepseek_v4_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_num_tokens = min(forward_batch.global_num_token_non_padded_cpu, query.shape[0])
+    real_num_tokens = _prefill_live_rows(forward_batch, query.shape[0])
 
     if real_num_tokens == 0:
         output.zero_()
@@ -761,12 +771,19 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 )
 
 
+def _prefill_live_rows(forward_batch: ForwardBatch, capacity: int) -> int:
+    rows = forward_batch.global_num_token_non_padded_cpu
+    if get_exec().features.enable_decoder_swa_bounded_replay:
+        tail = get_attn_backend().forward_metadata.late_layer_tail
+        if tail is not None:
+            rows = tail.token_indices.numel()
+    return min(rows, capacity)
+
+
 def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     # The compressor and prefill indexer sync with the host, like the attention.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    real_num_tokens = min(
-        forward_batch.global_num_token_non_padded_cpu, positions.shape[0]
-    )
+    real_num_tokens = _prefill_live_rows(forward_batch, positions.shape[0])
     if real_num_tokens == 0:
         return
     get_attn_backend().forward_low_ratio_sources(
@@ -3928,6 +3945,7 @@ class DeepseekV4Model(nn.Module):
         )
 
         self.dspark_layers_to_capture: Optional[List[int]] = None
+        self.tail_graphs: dict[int, TailGraph] = {}
 
         # Decoder SWA bounded replay: layers past the last kv_source layer run over
         # each request's last SWA_WINDOW extend tokens only.
@@ -4123,18 +4141,30 @@ class DeepseekV4Model(nn.Module):
     ):
         backend = get_attn_backend()
         tail = backend.tail_forward_metadata.late_layer_tail
+        inputs = TailInputs(
+            residual=tail.rows(residual),
+            pre=tail.rows(pre),
+            positions=tail.positions,
+            input_ids=tail.rows(input_ids),
+            input_ids_global=tail.rows(input_ids_global),
+            hash_ids=None if hash_ids is None else tail.rows(hash_ids),
+            swa_out_cache_loc=tail.swa_out_cache_loc,
+        )
         saved = backend.enter_late_layer_tail(forward_batch)
         try:
-            state, aux = self._forward_hc_layers(
-                layer_range=range(self.late_layer_start, self.end_layer),
-                state=mhc.HcState(residual, pre).take_rows(tail.rows),
-                positions=tail.positions,
-                input_ids=tail.rows(input_ids),
-                input_ids_global=tail.rows(input_ids_global),
-                hash_ids=None if hash_ids is None else tail.rows(hash_ids),
-                forward_batch=forward_batch,
+            graph = (
+                select_tail_graph(
+                    graphs=self.tail_graphs, rows=inputs.residual.shape[0]
+                )
+                if is_in_breakable_cuda_graph()
+                and not forward_batch.contains_mm_inputs()
+                else None
             )
-            output = self._finish_hc(state.residual, state.pre)
+            output, aux = (
+                graph.replay(inputs)
+                if graph is not None
+                else self._forward_bounded_tail(inputs, forward_batch=forward_batch)
+            )
         finally:
             backend.exit_late_layer_tail(saved, forward_batch)
         if self.dspark_layers_to_capture is not None:
@@ -4143,6 +4173,80 @@ class DeepseekV4Model(nn.Module):
             _scatter_tail_rows(tail=tail, rows=t, num_tokens=input_ids.shape[0])
             for t in output
         )
+
+    def _forward_bounded_tail(self, inputs: TailInputs, *, forward_batch: ForwardBatch):
+        state, aux = self._forward_hc_layers(
+            layer_range=range(self.late_layer_start, self.end_layer),
+            state=mhc.HcState(inputs.residual, inputs.pre),
+            positions=inputs.positions,
+            input_ids=inputs.input_ids,
+            input_ids_global=inputs.input_ids_global,
+            hash_ids=inputs.hash_ids,
+            forward_batch=forward_batch,
+        )
+        return self._finish_hc(state.residual, state.pre), aux
+
+    @torch.no_grad()
+    def capture_prefill_tail(
+        self, *, forward_batch: ForwardBatch, max_num_tokens: int, max_context_len: int
+    ) -> None:
+        self.tail_graphs = {}
+        if self.late_layer_start is None or forward_batch.lora_ids is not None:
+            return
+        from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
+
+        backend = get_attn_backend()
+        saved_metadata = backend.forward_metadata
+        context = get_tc_piecewise_forward_context()
+        saved_batch = context.forward_batch
+        window = min(SWA_WINDOW, max_context_len)
+        max_rows = min(max_num_tokens, backend.req_to_token_pool.size * window)
+        graphs = {}
+        try:
+            for rows in reversed(tail_graph_sizes(max_rows)):
+                batch = make_capture_batch(forward_batch, rows=rows, window=window)
+                context.forward_batch = batch
+                backend.init_forward_metadata(batch)
+                residual, pre, input_ids, input_ids_global, hash_ids, _ = self.forward(
+                    input_ids=batch.input_ids,
+                    positions=batch.positions,
+                    forward_batch=batch,
+                    input_embeds=None,
+                )
+                backend.enter_late_layer_tail(batch)
+                tail = backend.forward_metadata.late_layer_tail
+                inputs = TailInputs(
+                    residual=residual,
+                    pre=pre,
+                    positions=tail.positions,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    hash_ids=hash_ids,
+                    swa_out_cache_loc=tail.swa_out_cache_loc,
+                ).with_capacity(rows)
+                backend.forward_metadata = replace(
+                    backend.forward_metadata,
+                    late_layer_tail=msgspec.structs.replace(
+                        tail, swa_out_cache_loc=inputs.swa_out_cache_loc
+                    ),
+                )
+                graph = capture_tail_graph(
+                    inputs=inputs,
+                    barrier=get_parallel().tp_group.barrier,
+                    stream=torch.cuda.current_stream(),
+                    forward=lambda value: self._forward_bounded_tail(
+                        value, forward_batch=batch
+                    ),
+                )
+                graphs[rows] = msgspec.structs.replace(
+                    graph,
+                    capture_batch=batch,
+                    q_pad_buffer=backend.forward_metadata.q_pad_buffer,
+                )
+            self.tail_graphs = graphs
+        finally:
+            backend.forward_metadata = saved_metadata
+            context.forward_batch = saved_batch
 
     def _finish_hc(
         self, hidden_states: torch.Tensor, pre: torch.Tensor
