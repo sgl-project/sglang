@@ -76,6 +76,9 @@ _CACHE_DIT_CONFIG_DIR = Path(__file__).parent / "configs"
 def _ltx_bcg_args(resolution: str, num_frames: int, **warmup_overrides):
     # BCG replays only signatures captured at warmup: warm up at the request shape,
     # input image, and quality (consistency requests pin quality=exact).
+    # resolution / num_frames restate the shape the case's request already resolves
+    # to (model default size, 1 s of video unless the case sets them); they only
+    # configure warmup and leave the request unchanged.
     warmup_params = {"quality": "exact", **warmup_overrides}
     return (
         f"--enable-breakable-cuda-graph --warmup-resolutions {resolution} "
