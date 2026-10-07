@@ -233,16 +233,20 @@ def server(monkeypatch, tmp_path):
     assert app.state.prompt_enhancer.client.is_closed
 
 
+@pytest.mark.parametrize("explicit_task", [False, True])
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("endpoint", ["image", "edit", "video_json", "video_form"])
 def test_http_routes_enhance_once_before_sampling_and_preserve_options(
-    server, endpoint, enabled
+    server, endpoint, enabled, explicit_task
 ):
     original = "A red teapot"
+    task = {"image": "t2i", "edit": "i2i"}.get(endpoint, "t2v")
+    task_fields = {"task_type": task} if explicit_task else {}
     if endpoint == "image":
         response = server.client.post(
             "/v1/images/generations",
             json={
+                **task_fields,
                 "prompt": original,
                 "enhance_prompt": enabled,
                 "seed": 123,
@@ -259,6 +263,7 @@ def test_http_routes_enhance_once_before_sampling_and_preserve_options(
         response = server.client.post(
             "/v1/images/edits",
             data={
+                **task_fields,
                 "prompt": original,
                 "enhance_prompt": str(enabled).lower(),
                 "seed": "123",
@@ -271,6 +276,7 @@ def test_http_routes_enhance_once_before_sampling_and_preserve_options(
         server.args.pipeline_config = WanT2V480PConfig()
         server.model_info.sampling_param_cls = WanT2V_1_3B_SamplingParams
         payload = {
+            **task_fields,
             "prompt": original,
             "seed": 123,
             "negative_prompt": "blur",
@@ -307,6 +313,8 @@ def test_http_routes_enhance_once_before_sampling_and_preserve_options(
     assert len(server.batches) == 1
     batch = server.batches[0]
     assert batch.prompt == expected
+    assert batch.task_type.name.lower() == task
+    assert server.args.pipeline_config.task_type.name.lower() == task
     assert batch.seed == 123
     assert batch.negative_prompt == "blur"
     assert batch.num_outputs_per_prompt == 2

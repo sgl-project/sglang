@@ -410,7 +410,7 @@ def test_registration_constructor_claim_is_final_local_step(
     monkeypatch.setattr(
         runtime_context,
         "get_parallel",
-        lambda: SimpleNamespace(world_rank=0, world_size=1),
+        lambda: SimpleNamespace(launch_world_rank=0, launch_world_size=1),
     )
 
     def claim(options: object, *, owner: TensorcastStore) -> _FakeSession:
