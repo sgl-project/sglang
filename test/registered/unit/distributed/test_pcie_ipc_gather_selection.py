@@ -41,7 +41,8 @@ WIDTH = 64
 def _group(world_size=4, pcie_ipc=True):
     group = MagicMock()
     group.world_size = world_size
-    group.pcie_ipc_comm = MagicMock(disabled=not pcie_ipc) if pcie_ipc else None
+    group.pcie_ipc_eligible = pcie_ipc
+    group.pcie_ipc_comm = MagicMock(disabled=False) if pcie_ipc else None
     return group
 
 
@@ -55,6 +56,7 @@ class _FakeWorkspace:
         self.dtype = dtype
         self.rebinds = 0
         self.configs = []
+        self.destroyed = False
 
     def supports(self, x):
         return x.dtype == self.dtype and x.numel() <= self.max_numel
@@ -62,32 +64,45 @@ class _FakeWorkspace:
     def rebind_stream(self):
         self.rebinds += 1
 
+    def destroy(self):
+        self.destroyed = True
+
     def all_gather(self, x, *, config):
         self.configs.append(config)
         return torch.cat([x * (r + 1) for r in range(self.world_size)])
 
 
 @contextlib.contextmanager
-def _fake_flashinfer(workspace_cls=_FakeWorkspace, free_bytes=1 << 40, one_rank=True):
+def _fake_flashinfer(
+    workspace_cls=_FakeWorkspace, free_bytes=1 << 40, one_rank=True, missing=()
+):
     """FlashInfer, free GPU memory and (with ``one_rank``) the cross-rank
-    agreement, stubbed for a CPU process."""
+    agreement, stubbed for a CPU process. ``free_bytes`` may be an exception
+    for ``torch.cuda.mem_get_info`` to raise; ``missing`` names API symbols
+    this FlashInfer lacks."""
     module = types.ModuleType("flashinfer.comm")
     module.PcieIpcAllGatherWorkspace = workspace_cls
     module.PcieIpcAllGatherLaunchConfig = lambda *a: ("config",) + a
     module.PcieIpcAllGatherVariant = MagicMock()
+    for name in missing:
+        delattr(module, name)
+    if isinstance(free_bytes, Exception):
+        mem_get_info = dict(side_effect=free_bytes)
+    else:
+        mem_get_info = dict(return_value=(free_bytes, 1 << 40))
     package = types.ModuleType("flashinfer")
     package.comm = module
     with contextlib.ExitStack() as stack:
         stack.enter_context(
             patch.dict(sys.modules, {"flashinfer": package, "flashinfer.comm": module})
         )
-        stack.enter_context(
-            patch.object(torch.cuda, "mem_get_info", return_value=(free_bytes, 1 << 40))
-        )
+        stack.enter_context(patch.object(torch.cuda, "mem_get_info", **mem_get_info))
         if one_rank:
             stack.enter_context(
                 patch.object(
-                    vocab_gather, "_all_ranks_agree", side_effect=lambda g, ok: ok
+                    vocab_gather,
+                    "_count_ranks",
+                    side_effect=lambda g, ok: int(ok) * g.world_size,
                 )
             )
         yield
@@ -154,6 +169,37 @@ class TestMakeVocabGather(CustomTestCase):
         group.pcie_ipc_comm.disabled = True
         self.assertIsInstance(self._make(group), NcclVocabGather)
 
+    def test_communicator_missing_on_this_rank_stays_on_nccl(self):
+        """GroupCoordinator leaves pcie_ipc_comm None when its setup raised on
+        this rank; the rank still answers the agreement, as not ready."""
+        group = _group()
+        group.pcie_ipc_comm = None
+        with patch.object(vocab_gather, "PcieIpcVocabGather") as build:
+            self.assertIsInstance(self._make(group), NcclVocabGather)
+        build.assert_not_called()
+
+    def test_local_probe_failures_stay_on_nccl(self):
+        """Any failure of this rank's checks is its answer to the agreement;
+        an exception escaping them would leave the other ranks waiting."""
+        cases = {
+            "no workspace": dict(missing=("PcieIpcAllGatherWorkspace",)),
+            "no launch config": dict(missing=("PcieIpcAllGatherLaunchConfig",)),
+            "no variant": dict(missing=("PcieIpcAllGatherVariant",)),
+            "mem_get_info raises": dict(free_bytes=RuntimeError("CUDA error")),
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                group = _group()
+                with _fake_flashinfer(**kwargs):
+                    with self.assertLogs(vocab_gather.logger, level="WARNING"):
+                        ready = vocab_gather._can_build_pcie_ipc_gather(group, 1)
+                    self.assertFalse(ready)
+                    gather = make_vocab_gather(
+                        group, local_width=WIDTH, prefer_pcie_ipc=True, symm_rows=16
+                    )
+                self.assertIsInstance(gather, NcclVocabGather)
+                group.pcie_ipc_comm.adopt.assert_not_called()
+
     def test_nvlink_multicast_wins_over_pcie_ipc(self):
         with patch.object(vocab_gather, "_nvlink_ca_comm", return_value=MagicMock()):
             with patch.object(vocab_gather, "NVLinkVocabGather") as nvlink:
@@ -161,7 +207,8 @@ class TestMakeVocabGather(CustomTestCase):
         self.assertIs(gather, nvlink.return_value)
 
     def test_workspace_failure_falls_back_to_nccl(self):
-        """FlashInfer raises the same error on every rank; the server keeps NCCL."""
+        """FlashInfer raises the same error on every rank (its construction
+        checks are joint); the server keeps NCCL."""
 
         def broken(**kwargs):
             raise RuntimeError("cudaIpcOpenMemHandle failed")
@@ -185,7 +232,8 @@ class TestMakeVocabGather(CustomTestCase):
 
 
 def _agreement_rank(rank: int, init_file: str, failing: str) -> None:
-    """One of four gloo ranks; rank 1 fails at ``failing``, the others succeed."""
+    """One of four gloo ranks; rank 1 fails at ``failing``, the others succeed
+    (with ``build_all``, every rank fails the build)."""
     dist.init_process_group(
         backend="gloo", init_method=Path(init_file).as_uri(), rank=rank, world_size=4
     )
@@ -194,24 +242,43 @@ def _agreement_rank(rank: int, init_file: str, failing: str) -> None:
             world_size=4,
             cpu_group=dist.group.WORLD,
             device_group=None,
+            pcie_ipc_eligible=True,
             pcie_ipc_comm=MagicMock(disabled=False),
         )
+        if failing == "no_comm" and rank == 1:
+            group.pcie_ipc_comm = None
         built = []
 
         def workspace(**kwargs):
-            if failing == "build" and rank == 1:
+            if failing == "build_all" or (failing == "build_one" and rank == 1):
                 raise RuntimeError("cudaIpcOpenMemHandle failed")
-            built.append(rank)
-            return _FakeWorkspace(**kwargs)
+            built.append(_FakeWorkspace(**kwargs))
+            return built[-1]
 
-        free_bytes = 0 if failing == "memory" and rank == 1 else 1 << 40
+        free_bytes = 1 << 40
+        if rank == 1 and failing == "memory":
+            free_bytes = 0
+        if rank == 1 and failing == "probe":
+            free_bytes = RuntimeError("CUDA error")
         with _fake_flashinfer(workspace, free_bytes=free_bytes, one_rank=False):
-            gather = make_vocab_gather(
-                group, local_width=WIDTH, prefer_pcie_ipc=True, symm_rows=16
-            )
-        assert isinstance(gather, NcclVocabGather), (rank, type(gather))
-        group.pcie_ipc_comm.adopt.assert_not_called()
-        if failing == "memory":
+            try:
+                gather = make_vocab_gather(
+                    group, local_width=WIDTH, prefer_pcie_ipc=True, symm_rows=16
+                )
+            except RuntimeError as e:
+                gather = e
+        if failing == "build_one":
+            # The three workspaces cannot be released without rank 1, so every
+            # rank stops instead of serving with them.
+            assert isinstance(gather, RuntimeError), (rank, gather)
+            assert "built on 3 of 4 ranks" in str(gather), (rank, gather)
+            assert len(built) == (0 if rank == 1 else 1), (rank, built)
+            assert not any(ws.destroyed for ws in built), rank
+        else:
+            assert isinstance(gather, NcclVocabGather), (rank, type(gather))
+        if group.pcie_ipc_comm is not None:
+            group.pcie_ipc_comm.adopt.assert_not_called()
+        if failing in ("memory", "no_comm", "probe"):
             # no rank may start the collective build
             assert not built, rank
     finally:
@@ -234,8 +301,17 @@ class TestRanksAgree(CustomTestCase):
     def test_one_rank_without_memory_keeps_every_rank_off_the_build(self):
         self._spawn("memory")
 
-    def test_one_rank_failing_the_build_takes_every_rank_to_nccl(self):
-        self._spawn("build")
+    def test_one_rank_without_a_communicator_keeps_every_rank_off_the_build(self):
+        self._spawn("no_comm")
+
+    def test_one_rank_probe_exception_keeps_every_rank_off_the_build(self):
+        self._spawn("probe")
+
+    def test_build_failing_on_every_rank_takes_every_rank_to_nccl(self):
+        self._spawn("build_all")
+
+    def test_build_failing_on_one_rank_stops_every_rank(self):
+        self._spawn("build_one")
 
 
 class TestPcieIpcVocabGather(CustomTestCase):
@@ -280,6 +356,8 @@ class TestPcieIpcVocabGather(CustomTestCase):
         for x in (
             torch.randn(5, WIDTH),  # past max_rows
             torch.randn(2, WIDTH, dtype=torch.float16),  # other dtype
+            # within the element bound but past max_rows
+            torch.randn(8, WIDTH // 2),
         ):
             with self.subTest(shape=tuple(x.shape), dtype=x.dtype):
                 self.assertIs(self.gather(x), self.fallback.return_value)
@@ -314,6 +392,9 @@ class TestPcieIpcVocabGather(CustomTestCase):
         self.assertEqual(self.gather.workspace.rebinds, 3)
 
 
+_REAL = object()
+
+
 class TestMultimemAllGathererPcieIpc(CustomTestCase):
     """Only an opted-in gatherer (the logits processor's) on a group with
     PCIe-IPC enabled moves to PCIe-IPC, and only where multimem is unavailable;
@@ -329,6 +410,7 @@ class TestMultimemAllGathererPcieIpc(CustomTestCase):
         capturing=False,
         multicast=False,
     ):
+        """``gather`` is what make_pcie_ipc_gather returns; ``_REAL`` runs it."""
         gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             128, enabled=False, pcie_ipc=pcie_ipc
         )
@@ -341,7 +423,13 @@ class TestMultimemAllGathererPcieIpc(CustomTestCase):
         nccl_out = torch.zeros(1)
         with (
             patch.object(
-                triton_symm_mem_ag, "make_pcie_ipc_gather", return_value=gather
+                triton_symm_mem_ag,
+                "make_pcie_ipc_gather",
+                **(
+                    dict(wraps=vocab_gather.make_pcie_ipc_gather)
+                    if gather is _REAL
+                    else dict(return_value=gather)
+                ),
             ) as make,
             patch.object(
                 triton_symm_mem_ag, "create_state", return_value=multimem
@@ -412,15 +500,18 @@ class TestMultimemAllGathererPcieIpc(CustomTestCase):
     def test_other_users_keep_the_multimem_path(self):
         """e.g. Kimi-K2.5 EAGLE3's fc gather, which does not opt in."""
         x = torch.randn(2, WIDTH, dtype=torch.bfloat16)
-        for name, kwargs in {
-            "not opted in": dict(pcie_ipc=False),
-            "PCIe-IPC not enabled": dict(comm=False),
-        }.items():
-            with self.subTest(name):
-                r = self._call(x, gather=MagicMock(spec=PcieIpcVocabGather), **kwargs)
-                self.assertIs(r.out, r.nccl_out)
-                r.make.assert_not_called()
-                r.create_state.assert_called_once()
+        r = self._call(x, gather=MagicMock(spec=PcieIpcVocabGather), pcie_ipc=False)
+        self.assertIs(r.out, r.nccl_out)
+        r.make.assert_not_called()
+        r.create_state.assert_called_once()
+
+    def test_group_without_pcie_ipc_keeps_nccl_without_an_agreement(self):
+        x = torch.randn(2, WIDTH, dtype=torch.bfloat16)
+        with patch.object(vocab_gather, "_count_ranks") as count:
+            r = self._call(x, gather=_REAL, comm=False)
+        self.assertIs(r.out, r.nccl_out)
+        self.assertIsNone(r.gatherer._state)
+        count.assert_not_called()
 
 
 if __name__ == "__main__":

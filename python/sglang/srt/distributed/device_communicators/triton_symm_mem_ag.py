@@ -541,12 +541,11 @@ class MultimemAllGatherer:
         state = self._build_multimem(x)
         if state is None and self._pcie_ipc:
             # Multimem is unavailable (e.g. no multicast on a PCIe-only host);
-            # take PCIe-IPC if the operator enabled it for this group.
+            # take PCIe-IPC if the operator enabled it for this group, which
+            # make_pcie_ipc_gather decides.
             from sglang.srt.distributed.parallel_state import get_tp_group
 
-            tp_group = get_tp_group()
-            if getattr(tp_group, "pcie_ipc_comm", None) is not None:
-                return self._build_pcie_ipc(x, tp_group)
+            return self._build_pcie_ipc(x, get_tp_group())
         return state
 
     def _build_multimem(self, x: torch.Tensor):

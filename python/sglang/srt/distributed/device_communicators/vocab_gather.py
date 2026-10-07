@@ -175,10 +175,12 @@ class PcieIpcVocabGather(VocabGather):
 
     The kernel copies opaque 16-byte packs, so the result is bit-identical to
     NCCL's. Slices the workspace cannot take (another dtype, more than
-    ``max_rows`` rows) go to ``fallback``.
-    Construction is collective. The workspace serves one ordered stream and is
-    rebound when the caller's stream changes (graph capture, then replay), as
-    the PCIe-IPC all-reduce adapter does.
+    ``max_rows`` rows, more elements than ``max_rows * local_width``) go to
+    ``fallback``.
+    Construction is collective, and the workspace is built last, so a rank
+    whose constructor raised holds none. The workspace serves one ordered
+    stream and is rebound when the caller's stream changes (graph capture, then
+    replay), as the PCIe-IPC all-reduce adapter does.
     """
 
     def __init__(
@@ -190,31 +192,17 @@ class PcieIpcVocabGather(VocabGather):
         max_rows: int,
         fallback: VocabGather,
     ) -> None:
-        from flashinfer.comm import (
-            PcieIpcAllGatherLaunchConfig,
-            PcieIpcAllGatherVariant,
-            PcieIpcAllGatherWorkspace,
-        )
+        from flashinfer.comm import PcieIpcAllGatherWorkspace
 
         self.world_size = int(group.world_size)
+        self.max_rows = int(max_rows)
         self.fallback = fallback
         self._stream: Optional[torch.cuda.Stream] = None
+        self.config = _pcie_ipc_launch_config()
         self.workspace = PcieIpcAllGatherWorkspace(
             group=group.device_group,
-            max_numel=max_rows * local_width,
+            max_numel=self.max_rows * local_width,
             dtype=dtype,
-        )
-        # One fixed launch config: the same on every rank, nothing to tune at
-        # startup, and it avoids FlashInfer's seed policy for untuned row counts,
-        # which can be slower than NCCL.
-        self.config = PcieIpcAllGatherLaunchConfig(
-            24, 512, PcieIpcAllGatherVariant.RECURSIVE_DOUBLING
-        )
-        logger.info(
-            "PCIe-IPC vocab gather: up to %d rows x %d (%s)",
-            max_rows,
-            local_width,
-            dtype,
         )
 
     def __call__(self, local: torch.Tensor) -> torch.Tensor:
@@ -230,6 +218,10 @@ class PcieIpcVocabGather(VocabGather):
         return gathered
 
     def _gather(self, local: torch.Tensor) -> Optional[torch.Tensor]:
+        # FlashInfer bounds only the element count; the row bound keeps a
+        # narrow slice with more rows than the workspace was sized for on NCCL.
+        if local.dim() != 2 or local.shape[0] > self.max_rows:
+            return None
         # The kernel needs a contiguous, 16-byte aligned input. Copying one that
         # is not keeps the choice of path a function of dtype and shape, which
         # every rank shares, rather than of a rank's own pointer.
@@ -242,6 +234,17 @@ class PcieIpcVocabGather(VocabGather):
             self.workspace.rebind_stream()
             self._stream = stream
         return self.workspace.all_gather(local, config=self.config)
+
+
+def _pcie_ipc_launch_config():
+    """One fixed launch config: the same on every rank, nothing to tune at
+    startup, and it avoids FlashInfer's seed policy for untuned row counts,
+    which can be slower than NCCL."""
+    from flashinfer.comm import PcieIpcAllGatherLaunchConfig, PcieIpcAllGatherVariant
+
+    return PcieIpcAllGatherLaunchConfig(
+        24, 512, PcieIpcAllGatherVariant.RECURSIVE_DOUBLING
+    )
 
 
 def make_pcie_ipc_gather(
@@ -259,16 +262,21 @@ def make_pcie_ipc_gather(
     Collective: every rank of the group must call this, in the same order,
     outside CUDA-graph capture.
     """
-    # Settings shared by every rank; the per-rank state is in the agreement below.
-    comm = getattr(group, "pcie_ipc_comm", None)
-    if comm is None or group.world_size != 4 or max_rows <= 0:
+    # Whether to take part is decided from settings every rank shares, so all
+    # ranks enter the agreements below or none does. Per-rank state, including
+    # a PCIe-IPC communicator whose setup failed on this rank, is in the agreement.
+    if (
+        not getattr(group, "pcie_ipc_eligible", False)
+        or group.world_size != 4
+        or max_rows <= 0
+    ):
         return None
     # FlashInfer allocates and maps the IPC buffer without telling the other
     # ranks when that fails on one of them, which leaves them waiting. So the
-    # ranks first agree that each can build it, and then that each did.
+    # ranks first agree that each can build it, and then check that each did.
     workspace_bytes = 2 * group.world_size * max_rows * local_width * dtype.itemsize
-    ready = not comm.disabled and _can_build_pcie_ipc_gather(workspace_bytes)
-    if not _all_ranks_agree(group, ready):
+    ready = _can_build_pcie_ipc_gather(group, workspace_bytes)
+    if _count_ranks(group, ready) < group.world_size:
         return None
     gather = None
     try:
@@ -281,40 +289,66 @@ def make_pcie_ipc_gather(
         )
     except Exception as e:
         logger.warning("PCIe-IPC vocab gather unavailable (%s); using NCCL", e)
-    if not _all_ranks_agree(group, gather is not None):
-        # Releasing a workspace is collective, so one that only some ranks
-        # built is left unused rather than destroyed. FlashInfer raises on
-        # every rank alike after its buffer exchange, so this is a safeguard.
+    built = _count_ranks(group, gather is not None)
+    if built == 0:
         return None
-    comm.adopt(gather.workspace)
+    if built < group.world_size:
+        # Releasing the workspace is collective over the whole group, so the
+        # ranks that built one cannot release it without the others. Stop
+        # rather than serve with its IPC buffers still mapped. FlashInfer
+        # checks its own construction across ranks, so this is a safeguard.
+        raise RuntimeError(
+            f"PCIe-IPC vocab gather was built on {built} of {group.world_size} "
+            "ranks and cannot be released on only those; unset "
+            "SGLANG_ENABLE_PCIE_IPC_ALLREDUCE to keep the gathers on NCCL"
+        )
+    group.pcie_ipc_comm.adopt(gather.workspace)
+    logger.info(
+        "PCIe-IPC vocab gather: up to %d rows x %d (%s)",
+        max_rows,
+        local_width,
+        dtype,
+    )
     return gather
 
 
-def _can_build_pcie_ipc_gather(workspace_bytes: int) -> bool:
-    """This rank's part of the agreement: the API exists and the buffer fits."""
+def _can_build_pcie_ipc_gather(group, workspace_bytes: int) -> bool:
+    """This rank's part of the agreement: its PCIe-IPC all-reduce is enabled,
+    FlashInfer has the all-gather API, and the buffer fits. Never raises, since
+    the other ranks are waiting for the answer."""
     try:
+        comm = group.pcie_ipc_comm
+        if comm is None or comm.disabled:
+            logger.warning(
+                "PCIe-IPC all-reduce is not enabled on this rank; vocab gathers "
+                "use NCCL"
+            )
+            return False
         from flashinfer.comm import PcieIpcAllGatherWorkspace  # noqa: F401
-    except ImportError as e:
-        logger.warning("FlashInfer has no PCIe-IPC all-gather (%s); using NCCL", e)
+
+        _pcie_ipc_launch_config()
+        free_bytes, _ = torch.cuda.mem_get_info()
+        # headroom for the signal words and allocation granularity
+        if free_bytes < workspace_bytes + (64 << 20):
+            logger.warning(
+                "PCIe-IPC vocab gather needs %d MB, %d MB free; using NCCL",
+                workspace_bytes >> 20,
+                free_bytes >> 20,
+            )
+            return False
+        return True
+    except Exception as e:
+        logger.warning("PCIe-IPC vocab gather unavailable (%s); using NCCL", e)
         return False
-    free_bytes, _ = torch.cuda.mem_get_info()
-    # headroom for the signal words and allocation granularity
-    if free_bytes < workspace_bytes + (64 << 20):
-        logger.warning(
-            "PCIe-IPC vocab gather needs %d MB, %d MB free; using NCCL",
-            workspace_bytes >> 20,
-            free_bytes >> 20,
-        )
-        return False
-    return True
 
 
-def _all_ranks_agree(group, ok: bool) -> bool:
-    flag = torch.tensor([int(ok)], dtype=torch.int32)
+def _count_ranks(group, ok: bool) -> int:
+    """How many ranks of ``group`` report ``ok``."""
+    count = torch.tensor([int(ok)], dtype=torch.int32)
     torch.distributed.all_reduce(
-        flag, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+        count, op=torch.distributed.ReduceOp.SUM, group=group.cpu_group
     )
-    return bool(flag.item())
+    return int(count.item())
 
 
 def _nvlink_ca_comm(group, *, local_width: int, dtype: torch.dtype):
