@@ -709,8 +709,30 @@ class Glm5NextLinearAttention(nn.Module):
             num_tokens
         )
 
-    def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
-        shared_input = self._maybe_quantize_ptpc_input(self.qkv_proj, hidden_states)
+    def can_consume_mhc_prequant(self, num_tokens: int) -> bool:
+        if self.do_fuse_qkvbfg:
+            return self._ptpc_linear_active(self.fused_qkvbfg_a_proj, num_tokens)
+        modules = (
+            (self.qkv_proj, self.fused_bfg_a_proj)
+            if self.fuse_bfg
+            else (self.qkv_proj, self.f_a_proj, self.g_a_proj)
+        )
+        return all(self._ptpc_linear_active(module, num_tokens) for module in modules)
+
+    @staticmethod
+    def _split_mhc_prequant(hidden_states):
+        if isinstance(hidden_states, tuple) and len(hidden_states) == 3:
+            bf16, fp8, scale = hidden_states
+            return bf16, (fp8, scale)
+        return hidden_states, None
+
+    def forward_qkvbfg(self, hidden_states, forward_batch: ForwardBatch):
+        hidden_states, prequant = self._split_mhc_prequant(hidden_states)
+        shared_input = (
+            prequant
+            if prequant is not None
+            else self._maybe_quantize_ptpc_input(self.qkv_proj, hidden_states)
+        )
         qkv, _ = self.qkv_proj(shared_input)
 
         if self.fuse_bfg:
@@ -787,9 +809,8 @@ class Glm5NextLinearAttention(nn.Module):
             self.o_norm.weight,
         )
 
-    def forward_qkvbfg_fused(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
-    ):
+    def forward_qkvbfg_fused(self, hidden_states, forward_batch: ForwardBatch):
+        hidden_states, prequant = self._split_mhc_prequant(hidden_states)
         method = self.fused_qkvbfg_a_proj.quant_method
         num_tokens = hidden_states.numel() // hidden_states.shape[-1]
         if isinstance(method, Glm53KdaPackedPtpcLinearMethod) and method.is_active(
@@ -798,6 +819,7 @@ class Glm5NextLinearAttention(nn.Module):
             qkv, beta, fg_a_states = method.apply_ptpc_prefill(
                 self.fused_qkvbfg_a_proj,
                 hidden_states,
+                q_input=prequant,
             )
             fg_a_states = fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
         else:

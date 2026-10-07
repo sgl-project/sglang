@@ -818,6 +818,7 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
+        q_input: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self.is_active(x.numel() // x.shape[-1]), (
             "GLM-5.3 KDA packed PTPC prefill requires an active token shape"
@@ -826,7 +827,8 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
 
         from sglang.srt.layers.quantization.fp8_utils import apply_fp8_ptpc_linear
 
-        q_input = aiter.per_token_quant_hip(x, quant_dtype=aiter.dtypes.fp8)
+        if q_input is None:
+            q_input = aiter.per_token_quant_hip(x, quant_dtype=aiter.dtypes.fp8)
         packed_output = apply_fp8_ptpc_linear(
             q_input,
             layer._fp8_ptpc_weight,

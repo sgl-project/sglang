@@ -350,6 +350,42 @@ class TestGLM53KDAPTPC(CustomTestCase):
         apply_ptpc.assert_called_once_with(
             attention.fused_qkvbfg_a_proj,
             prefill_input,
+            q_input=None,
+        )
+
+    def test_fused_first_stage_consumes_mhc_prequant(self):
+        attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+        torch.nn.Module.__init__(attention)
+        attention.head_dim = 4
+        attention.split_sizes = [12, 2, 8]
+        attention.fused_qkvbfg_a_proj = _RecordingFusedLinear(22)
+        attention.fused_fg_b_proj = _RecordingBatchedLinear()
+        method = Glm53KdaPackedPtpcLinearMethod(
+            bf16_max_m=3,
+            fp8_max_m=8,
+            qkv_size=12,
+            beta_size=2,
+            fg_size=8,
+        )
+        method._fp8_ptpc_ready = True
+        attention.fused_qkvbfg_a_proj.quant_method = method
+        bf16 = torch.empty(4, 8)
+        prequant = (torch.empty(4, 8), torch.ones(4, 1))
+        packed_outputs = (
+            torch.empty(4, 12),
+            torch.empty(4, 2),
+            torch.empty(4, 8),
+        )
+        with patch.object(
+            method, "apply_ptpc_prefill", return_value=packed_outputs
+        ) as apply_ptpc:
+            attention.forward_qkvbfg_fused(
+                (bf16, prequant[0], prequant[1]), forward_batch=None
+            )
+        apply_ptpc.assert_called_once_with(
+            attention.fused_qkvbfg_a_proj,
+            bf16,
+            q_input=prequant,
         )
 
     def test_fused_o_norm_dispatch_uses_local_k_and_token_boundaries(self):
@@ -514,6 +550,59 @@ class TestGLM53KDAPTPC(CustomTestCase):
         self.assertIs(attention.f_a_proj.inputs[0], quantized)
         self.assertIs(attention.g_a_proj.inputs[0], quantized)
         self.assertIs(attention.b_proj.inputs[0], hidden_states)
+
+    def test_forward_reuses_mhc_prequant_without_requantizing(self):
+        attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+        torch.nn.Module.__init__(attention)
+        attention.fuse_bfg = False
+        hidden_states = torch.randn(3, 8)
+        quantized = (torch.empty(3, 8), torch.ones(3, 1))
+        attention.qkv_proj = _RecordingLinear(torch.empty(3, 12))
+        attention.b_proj = _RecordingLinear(torch.empty(3, 2))
+        attention.f_a_proj = _RecordingLinear(torch.empty(3, 4))
+        attention.f_b_proj = _RecordingLinear(torch.empty(3, 6))
+        attention.g_a_proj = _RecordingLinear(torch.empty(3, 4))
+        attention.g_b_proj = _RecordingLinear(torch.empty(3, 6))
+        with (
+            patch.object(
+                Glm5NextLinearAttention,
+                "_maybe_quantize_ptpc_input",
+            ) as quantize,
+            patch.object(
+                Glm5NextLinearAttention,
+                "_ptpc_linear_active",
+                return_value=True,
+            ),
+        ):
+            attention.forward_qkvbfg(
+                (hidden_states, quantized[0], quantized[1]), forward_batch=None
+            )
+        quantize.assert_not_called()
+        for layer in (attention.qkv_proj, attention.f_a_proj, attention.g_a_proj):
+            self.assertIs(layer.inputs[0][0], quantized[0])
+            self.assertIs(layer.inputs[0][1], quantized[1])
+        self.assertIs(attention.b_proj.inputs[0], hidden_states)
+
+    def test_mhc_prequant_capability_requires_every_shared_input_consumer(self):
+        attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+        torch.nn.Module.__init__(attention)
+        attention.do_fuse_qkvbfg = False
+        attention.fuse_bfg = False
+        attention.qkv_proj = object()
+        attention.f_a_proj = object()
+        attention.g_a_proj = object()
+        with patch.object(
+            Glm5NextLinearAttention,
+            "_ptpc_linear_active",
+            side_effect=lambda layer, _: layer is not attention.g_a_proj,
+        ):
+            self.assertFalse(attention.can_consume_mhc_prequant(4096))
+        with patch.object(
+            Glm5NextLinearAttention,
+            "_ptpc_linear_active",
+            return_value=True,
+        ):
+            self.assertTrue(attention.can_consume_mhc_prequant(4096))
 
     def test_model_quantization_boundary_and_zero_tokens(self):
         threshold = GLM53_KDA_PTPC_BF16_MAX_M["qkv_proj"]
