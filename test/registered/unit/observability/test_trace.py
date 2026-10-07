@@ -491,7 +491,8 @@ class TestTraceReqContextEnabled(CustomTestCase):
         from sglang.srt.observability import trace_async
 
         exporter = InMemorySpanExporter()
-        self.provider.add_span_processor(SimpleSpanProcessor(exporter))
+        provider = TracerProvider(id_generator=mod.TraceCustomIdGenerator())
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
         process = trace_async._TraceExporterProcess("unused", "test", "unused")
         contexts = {}
 
@@ -507,6 +508,7 @@ class TestTraceReqContextEnabled(CustomTestCase):
             )
 
         with (
+            patch.object(mod, "tracer", provider.get_tracer("test-async")),
             patch.object(trace_async, "is_async_tracing_available", return_value=True),
             patch.object(trace_async, "_get_zmq_socket") as get_socket,
         ):
@@ -517,6 +519,7 @@ class TestTraceReqContextEnabled(CustomTestCase):
             finally:
                 for ctx, _ in contexts.values():
                     ctx.abort()
+                provider.shutdown()
 
     def test_async_filtered_slice_still_finishes_thread(self):
         set_global_trace_level(1)
@@ -599,6 +602,9 @@ class TestTraceReqContextEnabled(CustomTestCase):
             thread = contexts[ctx._context_id][0].thread_context
             self.assertTrue(thread.thread_span.is_recording())
             self.assertTrue(thread.cur_slice_stack[-1].span.is_recording())
+            self.assertEqual(
+                thread.cur_slice_stack[-1].span.get_span_context().span_id, span_ids[-1]
+            )
             ctx.trace_slice_end("outer", level=1, ts=2500)
             ctx.trace_req_finish(ts=3000)
 
