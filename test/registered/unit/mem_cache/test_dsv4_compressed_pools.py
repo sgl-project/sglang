@@ -433,5 +433,47 @@ class TestPagedDSparkWithEncoderReplay(CustomTestCase):
         )
 
 
+class TestEncoderReplayWithoutSpeculation(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        override = get_context().override_server_args(
+            enable_encoder_swa_bounded_replay=True,
+            page_size=256,
+            max_running_requests=2,
+            chunked_prefill_size=256,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    def test_pool_without_a_paged_swa_allocator_has_no_swa_mapping(self):
+        """Request windows hold every SWA row here, so no allocator registers a
+        mapping. Prefill reads the pool's mapping on every batch and must find
+        none, not a missing attribute."""
+        pool = DeepSeekV4TokenToKVPool(
+            max_num_reqs=2,
+            num_req_slots=3,
+            swa_size=1024,
+            c4_size=0,
+            c128_size=0,
+            c4_state_pool_size=0,
+            c128_state_pool_size=0,
+            page_size=256,
+            swa_page_size=256,
+            dtype=torch.float8_e4m3fn,
+            c4_state_dtype=torch.float32,
+            c128_state_dtype=torch.bfloat16,
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            indexer_head_dim=128,
+            layer_num=3,
+            device="cpu",
+            enable_memory_saver=False,
+            compression_ratios=[0, 0, 0],
+            full_size=2048,
+        )
+        self.assertFalse(pool.needs_paged_swa_allocator)
+        self.assertIsNone(pool.full_to_swa_index_mapping)
+
+
 if __name__ == "__main__":
     unittest.main()
