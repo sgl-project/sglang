@@ -1176,14 +1176,9 @@ class Req(ReqDllmMixin):
         self.mm_video_tokens: int = 0
 
         # Prefix info
-        # Tokens [0, prefix_len) are already in the row or come from a match;
-        # the next extend starts at prefix_len.
+        # Tokens [0, prefix_len) are already in the row, or, before allocation,
+        # on the path to last_node; the next extend starts at prefix_len.
         self.prefix_len: int = 0
-        # The matched prefix's KV indices, consumed when the next allocation
-        # writes them into the row; None once written.
-        self.prefix_indices: Optional[torch.Tensor] = torch.empty(
-            (0,), dtype=torch.int64
-        )
         # TODO(ispobock): rename to last_device_node
         self.last_node: Any = None
         self.last_host_node: Any = None
@@ -1571,10 +1566,6 @@ class Req(ReqDllmMixin):
     def set_extend_range(self, start: int, end: int) -> None:
         self.extend_range = Range(start, end)
 
-    def set_prefix_indices(self, prefix_indices: torch.Tensor) -> None:
-        self.prefix_indices = prefix_indices
-        self.prefix_len = len(prefix_indices)
-
     def get_fill_ids(self) -> array:
         return self.full_untruncated_fill_ids[: self.extend_range.end]
 
@@ -1934,7 +1925,7 @@ class Req(ReqDllmMixin):
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
 
-        self.set_prefix_indices(torch.empty((0,), dtype=torch.int64))
+        self.prefix_len = 0
         self.routed_experts = None
         self.indexer_topk = None
         self.last_node = None

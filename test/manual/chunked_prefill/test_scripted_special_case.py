@@ -23,7 +23,7 @@ def _load_inquirer_pending_for_rid(t: ScriptedContext, rid: str) -> int:
     s = t.scheduler
     chunked = s.chunked_req
     if chunked is not None and chunked.rid == rid:
-        return chunked.seqlen - len(chunked.prefix_indices)
+        return chunked.seqlen - chunked.prefix_len
     for req in s.waiting_queue:
         if req.rid == rid:
             return req.seqlen
@@ -226,9 +226,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         )
         for _ in range(DEFAULT_MAX_STEPS):
             if r.is_chunking:
-                assert len(r.req.prefix_indices) <= r.req.kv.kv_committed_len, (
+                assert r.req.prefix_len <= r.req.kv.kv_committed_len, (
                     f"streaming-session chunked stash must stay bounded by "
-                    f"kv_committed_len; prefix_indices_len={len(r.req.prefix_indices)}, "
+                    f"kv_committed_len; prefix_indices_len={r.req.prefix_len}, "
                     f"kv_committed_len={r.req.kv.kv_committed_len}"
                 )
             if r.finished:
@@ -329,7 +329,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             if r.is_chunking and chunked is not None and chunked.rid == r.rid:
                 saw_chunking = True
                 pending = _load_inquirer_pending_for_rid(t, r.rid)
-                expected = chunked.seqlen - len(chunked.prefix_indices)
+                expected = chunked.seqlen - chunked.prefix_len
                 assert pending == expected, (
                     f"load_inquirer chunked contribution must equal the prefix-"
                     f"subtracting formula seqlen - len(prefix_indices) = {expected}; "
@@ -339,7 +339,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                     f"chunked contribution must never exceed its full seqlen "
                     f"{chunked.seqlen}; got {pending} — dual-queue dedup violated"
                 )
-                if len(chunked.prefix_indices) > 0:
+                if chunked.prefix_len > 0:
                     saw_dedup = pending < chunked.seqlen
             if r.finished:
                 break
@@ -373,7 +373,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                     "test requires an empty waiting_queue so the chunked req is "
                     f"the sole pending-token contributor; got {len(s.waiting_queue)}"
                 )
-                expected = chunked.seqlen - len(chunked.prefix_indices)
+                expected = chunked.seqlen - chunked.prefix_len
                 observed = s.load_inquirer._get_num_pending_tokens()
                 assert observed == expected, (
                     f"chunked contribution must equal remainder "
@@ -478,13 +478,12 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             ):
                 saw_mid_chunk = True
                 assert (
-                    req.extend_range.end
-                    == len(req.prefix_indices) + req.extend_range.length
+                    req.extend_range.end == req.prefix_len + req.extend_range.length
                 ), (
                     f"init_next_round_input must rebuild fill_ids to the committed "
                     f"prefix plus the in-flight chunk; "
                     f"fill_ids_len={req.extend_range.end}, "
-                    f"prefix_indices_len={len(req.prefix_indices)}, "
+                    f"prefix_indices_len={req.prefix_len}, "
                     f"extend_input_len={req.extend_range.length}, "
                     f"chunks_done={r.chunks_done}"
                 )

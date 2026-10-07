@@ -16,7 +16,6 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
@@ -33,7 +32,6 @@ class _StubReq:
         self.output_ids = array("q")
         self.extra_key = None
         self.cache_salt = None
-        self.prefix_indices = None
         self.prefix_len = 0
         self.last_node = None
         self.last_host_node = None
@@ -42,8 +40,6 @@ class _StubReq:
         self.num_matched_prefix_tokens = 0
         self.swa_branching_seqlen = None
         self.kv = SimpleNamespace(cache_protected_len=None)
-
-    set_prefix_indices = Req.set_prefix_indices
 
     def _compute_max_prefix_len(self, input_len):
         return max(input_len - 1, 0)
@@ -117,14 +113,14 @@ class TestMatchKvCacheForceMiss(unittest.TestCase):
         baseline_req = _StubReq([10, 11, 12, 13, 99, 100])
         with envs.SGLANG_RADIX_FORCE_MISS.override(False):
             match_kv_cache(baseline_req, tree)
-        self.assertGreater(int(baseline_req.prefix_indices.numel()), 0)
+        self.assertGreater(baseline_req.prefix_len, 0)
         self.assertIsNot(baseline_req.last_node, tree.root_node)
 
         # With the flag, the same lookup is forced to miss.
         forced_req = _StubReq([10, 11, 12, 13, 99, 100])
         with envs.SGLANG_RADIX_FORCE_MISS.override(True):
             match_kv_cache(forced_req, tree)
-        self.assertEqual(int(forced_req.prefix_indices.numel()), 0)
+        self.assertEqual(forced_req.prefix_len, 0)
         self.assertIs(forced_req.last_node, tree.root_node)
         self.assertIs(forced_req.last_host_node, tree.root_node)
         self.assertEqual(forced_req.host_hit_length, 0)

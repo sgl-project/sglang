@@ -208,7 +208,6 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 req_pool_idx=1,
                 cache_protected_len=2,
             ),
-            prefix_indices=torch.tensor([8, 9], dtype=torch.int64),
             prefix_len=2,
             priority=3,
             extra_key=None,

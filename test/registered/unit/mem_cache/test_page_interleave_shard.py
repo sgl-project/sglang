@@ -784,8 +784,7 @@ class _GraftReq:
         self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         self.extra_key = None
         self.cache_salt = None
-        self.prefix_indices = torch.empty(0, dtype=torch.int64)
-        self.prefix_len = len(self.prefix_indices)
+        self.prefix_len = 0
         self.last_node = None
         self.priority = 0
         self.kv_rotation_base = None

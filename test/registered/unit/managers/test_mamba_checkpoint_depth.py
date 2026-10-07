@@ -53,8 +53,7 @@ def _track_seqlen(
         sampling_params=sampling_params,
         vocab_size=128,
     )
-    req.prefix_indices = torch.arange(prefix_len, dtype=torch.int64)
-    req.prefix_len = len(req.prefix_indices)
+    req.prefix_len = prefix_len
     req.set_extend_range(prefix_len, prefix_len + extend_len)
     req.kv.mamba_ping_pong_track_buffer = torch.tensor([0, 1], dtype=torch.int64)
     req.kv.mamba_next_track_idx = 0

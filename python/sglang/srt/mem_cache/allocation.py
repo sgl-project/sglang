@@ -48,6 +48,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_EMPTY_PREFIX = torch.empty((0,), dtype=torch.int64)
+
 
 def write_cache_indices(
     out_cache_loc: torch.Tensor,
@@ -348,6 +350,17 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     return batch.tree_cache.page_size
 
 
+def _prefix_kv_indices(batch: ScheduleBatch, req: Req) -> torch.Tensor:
+    # A request holding its row (a later chunk, a borrowed session record)
+    # already has its prefix there; a new one reads its match off the tree.
+    if req.kv.holds_kv:
+        row = batch.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
+        return row[: req.prefix_len].to(torch.int64)
+    if req.prefix_len == 0:
+        return _EMPTY_PREFIX
+    return batch.tree_cache.prefix_device_indices(req)
+
+
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -361,17 +374,7 @@ def alloc_for_extend(
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
-    # A request holding its row (a later chunk, a borrowed session record)
-    # already has its prefix there; a new one writes its matched prefix.
-    req_to_token = batch.req_to_token_pool.req_to_token
-    prefix_tensors = [
-        (
-            req_to_token[r.kv.req_pool_idx, : r.prefix_len].to(torch.int64)
-            if r.kv.holds_kv
-            else r.prefix_indices
-        )
-        for r in batch.reqs
-    ]
+    prefix_tensors = [_prefix_kv_indices(batch, r) for r in batch.reqs]
 
     reuse_kv = None
     if batch.is_dllm():
@@ -465,7 +468,6 @@ def alloc_for_extend(
     for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
         req.kv.kv_allocated_len = seq_len
         req.kv.kv_committed_len = seq_len
-        req.prefix_indices = None
         batch.tree_cache.maybe_hand_to_session(req)
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu

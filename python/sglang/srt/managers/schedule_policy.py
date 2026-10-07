@@ -1412,7 +1412,7 @@ class PrefillAdder:
                     )
                     if isinstance(admission, AddReqResult):
                         return admission
-                req.set_prefix_indices(torch.cat([req.prefix_indices, new_indices]))
+                req.prefix_len += len(new_indices)
                 req.kv.cache_protected_len = req.prefix_len
 
             # Sharded pools cannot load host KV; reserve scratch after all other gates.

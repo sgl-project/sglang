@@ -25,7 +25,7 @@ def _make_req(
     *,
     req_pool_idx: int,
     fill_ids: list,
-    prefix_indices: torch.Tensor,
+    prefix_len: int,
     extend_input_len: int,
     fill_len: int,
 ) -> Req:
@@ -34,8 +34,7 @@ def _make_req(
     req.origin_input_ids = array("q", fill_ids)
     req.output_ids = array("q")
     req.full_untruncated_fill_ids = array("q", fill_ids)
-    req.prefix_indices = prefix_indices
-    req.prefix_len = len(req.prefix_indices)
+    req.prefix_len = prefix_len
     req.extend_range = Range(fill_len - extend_input_len, fill_len)
     req.inflight_middle_chunks = 0
     req.host_hit_length = 0
@@ -56,8 +55,6 @@ def _make_req(
 
 
 def _make_req_to_token_pool(num_slots: int, max_context: int) -> SimpleNamespace:
-    # Slot s contains a recognizable fingerprint [s*1000, s*1000+1, ...]
-    # so we can tell a corrupted prefix_indices from a healthy one by content.
     pool = SimpleNamespace()
     pool.req_to_token = (
         torch.arange(max_context, dtype=torch.int32).unsqueeze(0).repeat(num_slots, 1)
@@ -119,11 +116,8 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
 
 
 class TestStashGatePreservesPrefix(CustomTestCase):
-    """Consumer side: real ChunkCache.checkpoint mutates
-    req.prefix_indices iff stash actually runs, so prefix_indices content
-    is the bug-detection signal. The stash gate is content-based:
-    `fill_len > len(prefix_indices)` means there is freshly computed KV to
-    cache; otherwise the chunk was parked and stashing must be skipped."""
+    """The stash gate advances prefix_len iff `fill_len > prefix_len`, i.e. the
+    chunk computed new KV; a parked chunk must be left untouched."""
 
     POOL_IDX = 4
     INITIAL_PREFIX_LEN = 8  # what was really cached last iter
@@ -134,35 +128,31 @@ class TestStashGatePreservesPrefix(CustomTestCase):
     def _build(self, *, fill_len: int):
         pool = _make_req_to_token_pool(self.NUM_SLOTS, self.MAX_CONTEXT)
         cache = _make_chunk_cache(pool)
-        initial_prefix = pool.req_to_token[self.POOL_IDX, : self.INITIAL_PREFIX_LEN].to(
-            dtype=torch.int64, copy=True
-        )
         req = _make_req(
             req_pool_idx=self.POOL_IDX,
             fill_ids=list(range(self.POST_RESET_FILL_LEN)),
-            prefix_indices=initial_prefix,
+            prefix_len=self.INITIAL_PREFIX_LEN,
             extend_input_len=fill_len - self.INITIAL_PREFIX_LEN,
             fill_len=fill_len,
         )
         s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=req)
-        return s, req, initial_prefix, pool
+        return s, req, pool
 
     def test_parked_chunked_req_keeps_its_prefix(self):
         # A parked chunk has fill_len == prefix_len: no new KV was computed,
         # so the gate must skip stash and leave the prefix intact.
-        s, req, initial_prefix, _ = self._build(fill_len=self.INITIAL_PREFIX_LEN)
+        s, req, _ = self._build(fill_len=self.INITIAL_PREFIX_LEN)
 
         Scheduler.get_next_batch_to_run(
             s, running_batch=s.running_batch, last_batch=s.last_batch
         )
 
         self.assertEqual(req.prefix_len, self.INITIAL_PREFIX_LEN)
-        self.assertTrue(torch.equal(req.prefix_indices, initial_prefix))
 
     def test_scheduled_chunked_req_advances_prefix_via_real_stash(self):
         # Symmetric guard against over-gating: when fill_len has advanced past
         # the cached prefix, stash must run and advance prefix_len.
-        s, req, _, pool = self._build(fill_len=self.POST_RESET_FILL_LEN)
+        s, req, _ = self._build(fill_len=self.POST_RESET_FILL_LEN)
 
         Scheduler.get_next_batch_to_run(
             s, running_batch=s.running_batch, last_batch=s.last_batch
