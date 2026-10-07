@@ -1920,6 +1920,13 @@ class Envs:
     SGLANG_ROCM_K3_PREROUTE_COOP_WPE = EnvInt(3)
     SGLANG_ROCM_K3_PREROUTE_COOP_WCM = EnvInt(3)
 
+    # Feature-owned ROCm controls.
+    SGLANG_ROCM_K3_FUSED_AR_RMSNORM = EnvBool(True)
+    SGLANG_ROCM_K3_FUSED_AR_RMSNORM_MAX_TOKENS = EnvInt(24)
+    SGLANG_ROCM_K3_SPLIT_OVERSIZED_MOE_AR = EnvBool(True)
+    SGLANG_ROCM_K3_AR_RESIDUAL = EnvBool(True)
+    SGLANG_ROCM_K3_AR_RESIDUAL_MAX_TOKENS = EnvInt(8)
+
 
 envs = Envs()
 EnvField._allow_set_name = False
