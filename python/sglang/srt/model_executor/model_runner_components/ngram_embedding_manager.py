@@ -124,7 +124,7 @@ class NgramEmbeddingManager:
             column_starts = []
             request_lengths = []
             for req in batch.reqs:
-                start = len(req.prefix_indices)
+                start = req.prefix_len
                 end = start + req.extend_range.length
                 fill_ids = req.origin_input_ids + req.output_ids
                 if start == 0:

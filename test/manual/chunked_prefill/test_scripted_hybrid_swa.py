@@ -96,9 +96,9 @@ class TestSWABasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(400):
             if r.is_chunking:
-                assert len(r.req.prefix_indices) <= r.req.kv.kv_committed_len, (
+                assert r.req.prefix_len <= r.req.kv.kv_committed_len, (
                     f"prefix_indices must be bounded by kv_committed_len, "
-                    f"got prefix_indices_len={len(r.req.prefix_indices)}, "
+                    f"got prefix_indices_len={r.req.prefix_len}, "
                     f"kv_committed_len={r.req.kv.kv_committed_len}"
                 )
             if r.finished:

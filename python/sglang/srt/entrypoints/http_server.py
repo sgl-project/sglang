@@ -73,6 +73,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicMessagesRequest,
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+from sglang.srt.entrypoints.api_contract import generate_contract_error
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
@@ -911,6 +912,11 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 )
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    # Starlette caches the parsed body, so this is the schema check, not a
+    # second decode.
+    contract_error = generate_contract_error(await request.json())
+    if contract_error is not None:
+        return ORJSONResponse(status_code=400, content={"error": contract_error})
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:

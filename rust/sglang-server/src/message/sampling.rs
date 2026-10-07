@@ -3,12 +3,9 @@
 //! `__post_init__` → `normalize` → `verify` pipeline (run in that order, as
 //! `TokenizerManager._create_tokenized_object` does).
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
+use std::collections::BTreeMap;
 
-use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
-use serde::de::{MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use super::types::OneOrMany;
 use crate::utils::{error::Error, regex::RegexPattern};
@@ -264,90 +261,6 @@ pub struct SamplingParams {
     /// strip that wrapper from its own grammar, so it is a pipeline output only.
     #[serde(skip_deserializing)]
     pub ebnf_full_assistant: bool,
-    /// API fields present in the request object. Serde defaults erase this
-    /// distinction, but preferred sampling parameters must not overwrite an
-    /// explicit request value, including an explicit default or null.
-    #[serde(skip)]
-    pub(crate) explicit_fields: BTreeSet<String>,
-}
-
-/// The `/generate` body's `sampling_params`: one object (broadcast to every
-/// prompt) or a list of them (one per prompt), fanned out by `GenerateBody::into_requests`.
-///
-/// Hand-written `Deserialize` rather than `#[serde(untagged)]`: untagged buffers
-/// the input and, on failure, reports only "data did not match any variant" —
-/// losing the field-level message ("unknown field `temperature`, expected one of
-/// …") that makes a typo actionable. Object-vs-list is unambiguous here, so a
-/// single `deserialize_any` dispatch keeps the inner error verbatim.
-#[derive(Debug, Clone, PartialEq)]
-pub enum SamplingParamsInput {
-    /// Boxed: `SamplingParams` is ~440 bytes, so an inline variant would make
-    /// every `GenerateBody` that big regardless of which form arrived.
-    One(Box<SamplingParams>),
-    Many(Vec<SamplingParams>),
-}
-
-impl<'de> Deserialize<'de> for SamplingParamsInput {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct InputVisitor;
-
-        impl<'de> Visitor<'de> for InputVisitor {
-            type Value = SamplingParamsInput;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a sampling_params object, or a list of them (one per prompt)")
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-                let value = serde_json::Value::deserialize(MapAccessDeserializer::new(map))?;
-                sampling_params_from_value(value)
-                    .map(|p| SamplingParamsInput::One(Box::new(p)))
-                    .map_err(serde::de::Error::custom)
-            }
-
-            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
-                let values =
-                    Vec::<serde_json::Value>::deserialize(SeqAccessDeserializer::new(seq))?;
-                values
-                    .into_iter()
-                    .map(sampling_params_from_value)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(SamplingParamsInput::Many)
-                    .map_err(serde::de::Error::custom)
-            }
-        }
-
-        deserializer.deserialize_any(InputVisitor)
-    }
-}
-
-fn sampling_params_from_value(value: serde_json::Value) -> Result<SamplingParams, String> {
-    let explicit_fields = value
-        .as_object()
-        .ok_or_else(|| "sampling_params must be an object".to_string())?
-        .keys()
-        .cloned()
-        .collect();
-    let mut params: SamplingParams = serde_json::from_value(value).map_err(|e| e.to_string())?;
-    params.explicit_fields = explicit_fields;
-    Ok(params)
-}
-
-impl SamplingParamsInput {
-    /// Merge launch-time preferred params beneath request params. A request key
-    /// wins even when it explicitly carries the type's default or null.
-    pub fn apply_preferred(&mut self, preferred: &serde_json::Value) -> Result<(), String> {
-        match self {
-            Self::One(params) => params.apply_preferred(preferred),
-            Self::Many(params) => params
-                .iter_mut()
-                .try_for_each(|params| params.apply_preferred(preferred)),
-        }
-    }
-
-    pub fn from_preferred(preferred: &serde_json::Value) -> Result<Self, String> {
-        sampling_params_from_value(preferred.clone()).map(|params| Self::One(Box::new(params)))
-    }
 }
 
 impl Default for SamplingParams {
@@ -390,39 +303,11 @@ impl Default for SamplingParams {
             stop_regex_max_len: 0,
             is_normalized: false,
             ebnf_full_assistant: false,
-            explicit_fields: BTreeSet::new(),
         }
     }
 }
 
 impl SamplingParams {
-    /// Record a field supplied by a non-Serde adapter. Preferred launch values
-    /// are merged underneath these fields just as they are underneath keys
-    /// present in an HTTP sampling object.
-    pub(crate) fn mark_explicit(&mut self, field: &'static str) {
-        self.explicit_fields.insert(field.to_owned());
-    }
-
-    /// Merge operator-provided sampling defaults beneath explicitly supplied
-    /// request fields. HTTP and gRPC adapters use the same precedence policy.
-    pub(crate) fn apply_preferred(&mut self, preferred: &serde_json::Value) -> Result<(), String> {
-        let mut merged = preferred
-            .as_object()
-            .ok_or_else(|| "preferred_sampling_params must be a JSON object".to_string())?
-            .clone();
-        let request_value = serde_json::to_value(&*self).map_err(|e| e.to_string())?;
-        let request = request_value
-            .as_object()
-            .ok_or_else(|| "SamplingParams did not serialize as an object".to_string())?;
-        for field in &self.explicit_fields {
-            if let Some(value) = request.get(field) {
-                merged.insert(field.clone(), value.clone());
-            }
-        }
-        *self = sampling_params_from_value(serde_json::Value::Object(merged))?;
-        Ok(())
-    }
-
     /// `__post_init__` → `normalize` → `verify`, the order
     /// `TokenizerManager._create_tokenized_object` runs them in. `Err` is a
     /// request-local 400. `skip_tokenizer_init` stands in for Python's
@@ -1262,36 +1147,5 @@ mod tests {
         let json = serde_json::json!({ "stop": stops }).to_string();
         let err = norm_err(&json).to_string();
         assert!(err.contains("at most"), "{err}");
-    }
-
-    #[test]
-    fn preferred_params_fill_only_omitted_request_fields() {
-        let preferred = serde_json::json!({
-            "temperature": 0.25,
-            "top_p": 0.75,
-            "max_new_tokens": 4096
-        });
-        let mut input: SamplingParamsInput =
-            serde_json::from_str(r#"{"temperature": 1.0, "top_p": null}"#).unwrap();
-        input.apply_preferred(&preferred).unwrap();
-        let SamplingParamsInput::One(params) = input else {
-            panic!("expected scalar params")
-        };
-        assert_eq!(params.temperature, 1.0, "explicit default wins");
-        assert_eq!(params.top_p, 1.0, "explicit null keeps the type default");
-        assert_eq!(params.max_new_tokens, Some(4096), "omitted uses preferred");
-    }
-
-    #[test]
-    fn preferred_params_apply_to_every_batched_object() {
-        let preferred = serde_json::json!({"temperature": 0.25, "top_p": 0.75});
-        let mut input: SamplingParamsInput =
-            serde_json::from_str(r#"[{"temperature": 0.5}, {"top_p": 0.9}]"#).unwrap();
-        input.apply_preferred(&preferred).unwrap();
-        let SamplingParamsInput::Many(params) = input else {
-            panic!("expected batched params")
-        };
-        assert_eq!((params[0].temperature, params[0].top_p), (0.5, 0.75));
-        assert_eq!((params[1].temperature, params[1].top_p), (0.25, 0.9));
     }
 }

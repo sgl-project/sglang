@@ -33,6 +33,7 @@ from sglang.srt.observability import req_time_stats
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
@@ -207,7 +208,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 req_pool_idx=1,
                 cache_protected_len=2,
             ),
-            prefix_indices=torch.tensor([8, 9], dtype=torch.int64),
+            prefix_len=2,
             priority=3,
             extra_key=None,
             cache_salt=None,
@@ -279,7 +280,6 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.advance_unpublished_req(req)
 
-        self.assertTrue(torch.equal(req.prefix_indices, torch.tensor([8, 9, 10, 11])))
         self.assertEqual(req.kv.cache_protected_len, 2)
         self.assertIs(req.last_node, last_node)
         prepare_params = component.prepare_for_caching_req.call_args.kwargs[
@@ -343,12 +343,21 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.cache_controller = SimpleNamespace(write_policy="write_through")
         cache.advance_unpublished_req = MagicMock()
+        cache.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(8, dtype=torch.int32).reshape(1, 8)
+        )
         scheduler.tree_cache = cache
-        req = SimpleNamespace(pending_bootstrap=True)
+        req = SimpleNamespace(
+            pending_bootstrap=True,
+            kv=SimpleNamespace(req_pool_idx=0),
+            extend_range=Range(0, 5),
+        )
 
         SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(scheduler, req)
 
         cache.advance_unpublished_req.assert_called_once_with(req)
+        # The next chunk still resumes after this one.
+        self.assertEqual(req.prefix_len, 5)
 
     def test_bootstrap_success_publishes_once(self):
         scheduler = SimpleNamespace(

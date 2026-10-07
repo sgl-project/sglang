@@ -27,7 +27,7 @@ class _Req:
         self.full_untruncated_fill_ids = self.origin_input_ids + array(
             "q", [0] * block_size
         )
-        self.prefix_indices = torch.arange(context_len, dtype=torch.int64)
+        self.prefix_len = context_len
         self.dllm_block_offset = context_len
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
@@ -201,7 +201,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder._check_prefill_tile_budget = Mock(return_value=None)
         req = _Req(context_len=300, block_size=256, prefill=True)
         req.host_hit_length = req.storage_hit_length = 0
-        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        req.prefix_len = 0
         admission = adder._select_prefill_admission(
             req,
             total_tokens=1024,
@@ -226,7 +226,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder._update_prefill_budget = Mock()
 
         req = _Req(context_len=10, block_size=4, prefill=True)
-        req.prefix_indices = torch.arange(7)
+        req.prefix_len = 7
 
         result = PrefillAdder.add_dllm_staging_req(adder, req)
 
@@ -301,6 +301,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         reused = _alloc_extend_loc_with_kv_reuse(
             alloc_batch,
             [True],
+            [req_to_token[slot, :context_len]],
             torch.tensor([slot]),
             torch.tensor([context_len]),
             torch.tensor([block_size]),

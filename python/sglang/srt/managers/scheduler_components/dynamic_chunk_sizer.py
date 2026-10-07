@@ -170,9 +170,7 @@ class DynamicChunkSizer:
             # request so release_kv_cache can release it symmetrically.
             req.init_next_round_input(self.tree_cache)
             req.lock = self.tree_cache.lock(req.last_node)
-            req.set_extend_range(
-                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-            )
+            req.set_extend_range(req.prefix_len, len(req.full_untruncated_fill_ids))
 
             # Prepare batch
             batch = ScheduleBatch.init_new(

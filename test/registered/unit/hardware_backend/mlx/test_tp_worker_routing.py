@@ -167,7 +167,7 @@ class _FakeRunner:
 class _FakeReq:
     def __init__(self, rid, req_pool_idx=0):
         self.rid = rid
-        self.prefix_indices = torch.empty(0, dtype=torch.long)
+        self.prefix_len = 0
         self.fill_ids = [0]
         self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         # Mirrors Req's chunk-finality contract read by

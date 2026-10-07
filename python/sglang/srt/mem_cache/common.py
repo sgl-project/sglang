@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from array import array
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, cast
 
 import numpy as np
@@ -10,10 +11,18 @@ from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    EvictParams,
+    MatchPrefixParams,
+    MatchResult,
+    zero_match_result,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
@@ -163,20 +172,80 @@ def free_kv_row_segments(
         allocator.free_segments(swa_alive)
 
 
+def match_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    token_ids: Optional[array] = None,
+    *,
+    cow_mamba: bool = False,
+    max_prefix_len: Optional[int] = None,
+) -> MatchResult:
+    """Match token_ids against tree_cache and adopt the hit as req's prefix."""
+    if token_ids is None:
+        token_ids = req.origin_input_ids + req.output_ids
+
+    # unified_kv SWA lives in a per-request ring the tree never stores, so a reused
+    # prefix carries stale SWA; cap the match so the window is re-prefilled.
+    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
+    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+    if max_prefix_len is not None:
+        key_limit = (
+            max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
+        )
+
+    match_result = tree_cache.match_prefix(
+        MatchPrefixParams(
+            key=RadixKey(
+                token_ids=token_ids,
+                extra_key=req.extra_key,
+                limit=key_limit,
+                cache_salt=req.cache_salt,
+            ),
+            cow_mamba=cow_mamba,
+            req=req,
+        )
+    )
+    if envs.SGLANG_RADIX_FORCE_MISS.get():
+        match_result = zero_match_result(
+            tree_cache, match_result, extra_key=req.extra_key
+        )
+    req.prefix_len = len(match_result.device_indices)
+    (
+        req.last_node,
+        req.last_host_node,
+        req.best_match_node,
+        req.host_hit_length,
+        req.swa_host_hit_length,
+        req.mamba_host_hit_length,
+    ) = (
+        match_result.last_device_node,
+        match_result.last_host_node,
+        match_result.best_match_node,
+        match_result.host_hit_length,
+        match_result.swa_host_hit_length,
+        match_result.mamba_host_hit_length,
+    )
+    max_len = req._compute_max_prefix_len(len(token_ids))
+    req.num_matched_prefix_tokens = min(req.prefix_len + req.host_hit_length, max_len)
+    req.swa_branching_seqlen = match_result.swa_branching_seqlen
+    # A probe match keeps what it did not report; a new round resets both.
+    if match_result.mamba_branching_seqlen is not None:
+        req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
+    if match_result.cache_protected_len is not None:
+        req.kv.cache_protected_len = match_result.cache_protected_len
+    return match_result
+
+
 def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     """Publish what the running request has computed so far, unless it is
     barred from the tree."""
     # The tree reads req.finished() to tell a checkpoint from the final
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
-    if req.skip_radix_cache_insert:
-        # Kept out of the tree; the next extend still resumes from prefix_indices.
-        req.prefix_indices = tree_cache.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, : req.extend_range.end
-        ].to(dtype=torch.int64, copy=True)
-        return
-
-    tree_cache.checkpoint(req, up_to=req.extend_range.end)
+    if not req.skip_radix_cache_insert:
+        tree_cache.checkpoint(req, up_to=req.extend_range.end)
+    # The next extend resumes after this one, published or not.
+    req.prefix_len = req.extend_range.end
 
 
 def evict_from_tree_cache(

@@ -215,9 +215,9 @@ class SchedulerDllmMixin:
         elif self.dllm_config.requires_separate_context_encoding:
             self._stash_dllm_context(req)
         else:
+            # The row stays with the request between blocks: a later abort
+            # releases its KV and tree lock through it.
             self.stash_chunked_request(req)
-            if fdfo_mode:
-                self.req_to_token_pool.free(req)
 
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager

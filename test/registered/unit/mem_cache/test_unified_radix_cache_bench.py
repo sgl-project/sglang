@@ -634,9 +634,7 @@ def bench_release(
         req.origin_input_ids = array("q", seq)
         req.output_ids = array("q")
         req.full_untruncated_fill_ids = array("q", seq)
-        req.set_extend_range(
-            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-        )
+        req.set_extend_range(req.prefix_len, len(req.full_untruncated_fill_ids))
         req.last_node = node
         req.kv.cache_protected_len = matched_len
         req.kv.kv_committed_len = len(seq)
