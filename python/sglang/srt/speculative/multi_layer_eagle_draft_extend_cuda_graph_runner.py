@@ -747,8 +747,8 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         req_pool_indices,
         out_cache_loc,
         positions=None,
-        out_cache_loc_virtual=None,
-        kv_loc_plan=None,
+        out_cache_loc_virtual,
+        kv_loc_plan,
     ):
         # Staging runs before `prepare`, so the rail and the plan arrive here
         # rather than off a ForwardBatch; `prepare` overwrites them with the
