@@ -403,7 +403,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
         mock_prepare_abort.assert_called_once()
         mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, is_insert=False
+            req, queue.tree_cache, checkpoint=False
         )
 
         receiver = FakeReceiver()
@@ -422,7 +422,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertIsNone(decode_req.kv_receiver)
         queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
         mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, is_insert=False
+            req, queue.tree_cache, checkpoint=False
         )
 
         receiver = MagicMock()
@@ -505,7 +505,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertFalse(receiver.abort_notified)
         queue._defer_release.assert_not_called()
         mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, is_insert=False
+            req, queue.tree_cache, checkpoint=False
         )
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):

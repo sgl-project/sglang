@@ -42,6 +42,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton_ck,
     sparse_gqa_packed_decode_triton,
 )
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
     cp_materialize_global_token_order,
@@ -51,6 +52,7 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
@@ -253,6 +255,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_counters = {}
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+        self._verify_mask = None
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -796,11 +799,24 @@ class QwenSparseAttnBackend(AttentionBackend):
                 num_padding=num_padding if num_padding is not None else 0,
             )
 
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         if self.device is None:
             raise RuntimeError(
                 "QSA backend requires a ModelRunner to initialize CUDA graph state"
             )
+        self._verify_mask = maybe_create_verify_mask(
+            is_draft_runner=self.runner is not None and self.runner.is_draft_worker,
+            skip_prefill=False,
+            max_bs=max_bs,
+            max_context_len=self.max_context_len,
+            num_draft_tokens=get_spec().speculative_num_draft_tokens,
+            device=self.device,
+            is_read=False,
+        )
         self._cuda_graph_max_tokens = max_num_tokens
         max_blocks = math.ceil(self.max_context_len / self.compress_ratio)
         max_pages = max(

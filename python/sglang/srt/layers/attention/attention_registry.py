@@ -253,6 +253,10 @@ def create_flashattention_v3_backend(runner):
 
 @register_attention_backend("fa4")
 def create_flashattention_v4_backend(runner):
+    if "DiffusionGemmaForBlockDiffusion" in runner.model_config.hf_config.architectures:
+        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+        return TritonAttnBackend(runner, dllm_fa4=True)
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionBackend,
     )
