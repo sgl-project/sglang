@@ -4006,57 +4006,30 @@ class DeepseekV4Model(nn.Module):
                 "set logprob_start_len to the prompt length"
             )
 
-    def _forward_layers_hc_pre_from_prev(
+    def _get_engram_hash_ids(
         self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
         input_ids: torch.Tensor,
-        input_ids_global: torch.Tensor,
-        capture_dspark: bool,
-        dspark_aux_hidden_states: List[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
-        hash_ids = None
-        cp_extend = (
-            is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
-        )
-        if self.engram_hasher is not None:
-            if cp_extend:
-                # n-gram hashing needs each token's predecessors: hash the whole prompt
-                total = int(forward_batch.attn_cp_metadata.total_seq_lens)
-                hash_ids = self.engram_hasher(
-                    forward_batch.input_ids[:total], forward_batch
+        forward_batch: ForwardBatch,
+        num_rows: int,
+    ) -> Optional[torch.Tensor]:
+        if self.engram_hasher is None:
+            return None
+        if is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend():
+            total = int(forward_batch.attn_cp_metadata.total_seq_lens)
+            hash_ids = self.engram_hasher(
+                forward_batch.input_ids[:total], forward_batch
+            )
+            parallel = get_parallel()
+            hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
+            pad_rows = num_rows - hash_ids.shape[0]
+            if pad_rows > 0:
+                hash_ids = torch.cat(
+                    [hash_ids, hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:])]
                 )
-                parallel = get_parallel()
-                hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
-                pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
-                if pad_rows > 0:
-                    hash_ids = torch.cat(
-                        [hash_ids, hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:])]
-                    )
-            elif (
-                forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
-            ):
-                hash_ids = bcg_deepseek_v4_engram_hash_ids(
-                    self.engram_hasher, input_ids
-                )
-            else:
-                hash_ids = self.engram_hasher(input_ids, forward_batch)
-        bounded = self.is_bounded_prefill(forward_batch)
-        stop = self.late_layer_start if bounded else self.end_layer
-        state = self._forward_hc_layers(
-            layer_range=range(self.start_layer, stop),
-            state=mhc.HcState(hidden_states),
-            positions=positions,
-            input_ids=input_ids,
-            input_ids_global=input_ids_global,
-            hash_ids=hash_ids,
-            forward_batch=forward_batch,
-            bounded=bounded,
-            aux=dspark_aux_hidden_states if capture_dspark else None,
-        )
-        return state.residual, state.pre, hash_ids
+            return hash_ids
+        if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            return bcg_deepseek_v4_engram_hash_ids(self.engram_hasher, input_ids)
+        return self.engram_hasher(input_ids, forward_batch)
 
     def is_bounded_prefill(self, forward_batch: ForwardBatch) -> bool:
         return (
@@ -4074,10 +4047,12 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         hash_ids: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
-        bounded: bool,
-        aux: Optional[List[torch.Tensor]],
-    ) -> mhc.HcState:
+    ) -> Tuple[mhc.HcState, List[torch.Tensor]]:
+        assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         assert not get_forward().sp_active
+        capture_dspark = self.dspark_layers_to_capture is not None
+        aux = []
+        seam_open = not self.is_bounded_prefill(forward_batch)
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
@@ -4104,7 +4079,7 @@ class DeepseekV4Model(nn.Module):
                         hidden_states,
                     )
                 state = state.with_residual(hidden_states)
-            if aux is not None and i in self.dspark_layers_to_capture:
+            if capture_dspark and i in self.dspark_layers_to_capture:
                 # The draft head reads the attention input of its target layers.
                 aux.append(state.residual.mean(dim=1))
             ctx = (
@@ -4122,7 +4097,7 @@ class DeepseekV4Model(nn.Module):
                         input_ids=input_ids,
                         forward_batch=forward_batch,
                         input_ids_global=input_ids_global,
-                        capture_dspark=aux is not None,
+                        capture_dspark=capture_dspark,
                     )
                     continue
                 state = self.layers[i].forward_hc_pre_from_prev(
@@ -4131,22 +4106,26 @@ class DeepseekV4Model(nn.Module):
                     input_ids=input_ids,
                     forward_batch=forward_batch,
                     input_ids_global=input_ids_global,
-                    seam_open=not bounded,
+                    seam_open=seam_open,
                 )
-        return state.materialized(self.layers[layer_range.stop - 1].hc_cfg)
+        return state.materialized(self.layers[layer_range.stop - 1].hc_cfg), aux
 
-    def finish_bounded_prefill(self, prefix, forward_batch: ForwardBatch):
-        residual, pre, input_ids, input_ids_global, hash_ids, prefix_aux = prefix
+    def finish_bounded_prefill(
+        self,
+        residual: torch.Tensor,
+        pre: torch.Tensor,
+        input_ids: torch.Tensor,
+        input_ids_global: torch.Tensor,
+        hash_ids: Optional[torch.Tensor],
+        prefix_aux: List[torch.Tensor],
+        *,
+        forward_batch: ForwardBatch,
+    ):
         backend = get_attn_backend()
         tail = backend.tail_forward_metadata.late_layer_tail
-        aux = (
-            [tail.rows(t) for t in prefix_aux]
-            if self.dspark_layers_to_capture is not None
-            else None
-        )
         saved = backend.enter_late_layer_tail(forward_batch)
         try:
-            state = self._forward_hc_layers(
+            state, aux = self._forward_hc_layers(
                 layer_range=range(self.late_layer_start, self.end_layer),
                 state=mhc.HcState(residual, pre).take_rows(tail.rows),
                 positions=tail.positions,
@@ -4154,20 +4133,20 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global=tail.rows(input_ids_global),
                 hash_ids=None if hash_ids is None else tail.rows(hash_ids),
                 forward_batch=forward_batch,
-                bounded=True,
-                aux=aux,
             )
             output = self._finish_hc(state.residual, state.pre)
         finally:
             backend.exit_late_layer_tail(saved, forward_batch)
-        if aux is not None:
-            return output, aux
+        if self.dspark_layers_to_capture is not None:
+            return output, [tail.rows(t) for t in prefix_aux] + aux
         return tuple(
             _scatter_tail_rows(tail=tail, rows=t, num_tokens=input_ids.shape[0])
             for t in output
         )
 
-    def _finish_hc(self, hidden_states: torch.Tensor, pre: torch.Tensor):
+    def _finish_hc(
+        self, hidden_states: torch.Tensor, pre: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         from sglang.kernels.ops.layernorm.mhc import hc_combine
 
         pre_hc_head = hidden_states.flatten(1)
@@ -4371,19 +4350,25 @@ class DeepseekV4Model(nn.Module):
         last_pre = None
         if self.hc_pre_from_prev_sublayer:
             assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
-            hidden_states, last_pre, hash_ids = self._forward_layers_hc_pre_from_prev(
-                positions,
-                hidden_states,
-                forward_batch,
-                input_ids,
-                input_ids_global,
-                capture_dspark,
-                dspark_aux_hidden_states,
+            hash_ids = self._get_engram_hash_ids(
+                input_ids, forward_batch, hidden_states.shape[0]
             )
-            if self.is_bounded_prefill(forward_batch):
+            bounded = self.is_bounded_prefill(forward_batch)
+            stop = self.late_layer_start if bounded else self.end_layer
+            state, dspark_aux_hidden_states = self._forward_hc_layers(
+                layer_range=range(self.start_layer, stop),
+                state=mhc.HcState(hidden_states),
+                positions=positions,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                hash_ids=hash_ids,
+                forward_batch=forward_batch,
+            )
+            hidden_states, last_pre = state.residual, state.pre
+            if bounded:
                 return (
-                    hidden_states,
-                    last_pre,
+                    state.residual,
+                    state.pre,
                     input_ids,
                     input_ids_global,
                     hash_ids,
@@ -4732,7 +4717,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
             if bounded:
                 hidden_states = self.model.finish_bounded_prefill(
-                    hidden_states, forward_batch
+                    *hidden_states, forward_batch=forward_batch
                 )
         if not self.pp_group.is_last_rank:
             return hidden_states
