@@ -42,7 +42,7 @@ def maybe_cache_mxfp8_dispatch(raw_mm):
 class Mxfp8DispatchCache:
     def __init__(self, raw_mm, gemm_module):
         self.raw_mm = raw_mm
-        self.validated = set()
+        self.validated_set = set()
         factory = gemm_module._cute_dsl_gemm_mxfp8_runner
         # This process-wide patch only memoizes the stateless
         # runner factory. The factory arguments include SM, PDL and output dtype.
@@ -71,12 +71,12 @@ class Mxfp8DispatchCache:
                 for t in (a, b, a_scale, b_scale)
             ),
         )
-        validated = key in self.validated
-        result = self.raw_mm(a, b, a_scale, b_scale, skip_check=validated, **kwargs)
-        if not validated:
+        is_validated = key in self.validated_set
+        result = self.raw_mm(a, b, a_scale, b_scale, skip_check=is_validated, **kwargs)
+        if not is_validated:
             # Bound metadata memory for varying workloads. Only successful
             # executions qualify; a failed validation is never cached.
-            if len(self.validated) >= 1024:
-                self.validated.clear()
-            self.validated.add(key)
+            if len(self.validated_set) >= 1024:
+                self.validated_set.clear()
+            self.validated_set.add(key)
         return result
