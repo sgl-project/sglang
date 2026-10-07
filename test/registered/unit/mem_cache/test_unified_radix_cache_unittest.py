@@ -1853,7 +1853,7 @@ class UnifiedRadixCacheSuite:
         req.lock = None
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", input_ids + output_ids)
-        req.set_extend_range(req.prefix_len, len(req.full_untruncated_fill_ids))
+        req.extend_end = len(req.full_untruncated_fill_ids)
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
@@ -1899,8 +1899,8 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = array("q", prompt_ids)
         req.output_ids = array("q", output_ids)
         req.full_untruncated_fill_ids = array("q", prompt_ids + output_ids)
-        req.set_extend_range(req.prefix_len, len(req.full_untruncated_fill_ids))
-        kv_len = req.extend_range.end
+        req.extend_end = len(req.full_untruncated_fill_ids)
+        kv_len = req.extend_end
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv.kv_committed_len = kv_len
@@ -1972,7 +1972,7 @@ class UnifiedRadixCacheSuite:
         req.lock = None
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(req.prefix_len, len(req.full_untruncated_fill_ids))
+        req.extend_end = len(req.full_untruncated_fill_ids)
 
         avail_before = allocator.available_size()
         release_kv_cache(req, cache, checkpoint=False)
@@ -1990,7 +1990,7 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = array("q", tokens)
         req.output_ids = array("q")
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(req.prefix_len, len(req.full_untruncated_fill_ids))
+        req.extend_end = len(req.full_untruncated_fill_ids)
         kv_len = len(tokens)
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
@@ -2002,7 +2002,7 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
-        cache.checkpoint(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_end)
 
         self.assertGreater(req.kv.cache_protected_len, 0)
         self.assertIsNotNone(req.last_node)
@@ -2024,7 +2024,7 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = array("q", tokens)
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        req.extend_end = len(req.full_untruncated_fill_ids)
         kv_indices = self._alloc(allocator, len(tokens))
         req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
@@ -2036,7 +2036,7 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
         req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
 
-        cache.checkpoint(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_end)
 
         (first,) = _node_children(cache, cache.root_node_handle())
         self.assertEqual(_node_key_length(cache, first), evicted_len)
@@ -2134,7 +2134,7 @@ class UnifiedRadixCacheSuite:
         req.lock = None
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", input_ids)
-        req.set_extend_range(req.prefix_len, len(req.full_untruncated_fill_ids))
+        req.extend_end = len(req.full_untruncated_fill_ids)
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
@@ -2245,7 +2245,7 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = array("q", tokens)
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        req.extend_end = len(req.full_untruncated_fill_ids)
         kv_len = len(tokens)
         fresh_value = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), fresh_value)
@@ -2258,7 +2258,7 @@ class UnifiedRadixCacheSuite:
 
         full_available_before_insert = allocator.full_attn_allocator.available_size()
 
-        cache.checkpoint(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_end)
 
         self.assertEqual(
             allocator.full_attn_allocator.available_size(),
@@ -2932,7 +2932,7 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = tokens
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        req.extend_end = len(req.full_untruncated_fill_ids)
         kv_indices = self._alloc(allocator, pre_len)
         req_to_token_pool.write((req.kv.req_pool_idx, slice(0, pre_len)), kv_indices)
         req.kv.kv_committed_len = pre_len
@@ -2944,7 +2944,7 @@ class UnifiedRadixCacheSuite:
         swa_avail_before = allocator.swa_attn_allocator.available_size()
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
-            cache.checkpoint(req, up_to=req.extend_range.end)
+            cache.checkpoint(req, up_to=req.extend_end)
 
         cushion = max(self.cfg.sliding_window_size, self.cfg.page_size)
         expected_evicted = (pre_len - 1) - cushion
@@ -3018,7 +3018,7 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = tokens
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        req.extend_end = len(req.full_untruncated_fill_ids)
         kv_indices = self._alloc(allocator, pre_len)
         req_to_token_pool.write((req.kv.req_pool_idx, slice(0, pre_len)), kv_indices)
         req.kv.kv_committed_len = pre_len
@@ -3028,7 +3028,7 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
-            cache.checkpoint(req, up_to=req.extend_range.end)
+            cache.checkpoint(req, up_to=req.extend_end)
 
         self.assertEqual(
             req.kv.get_evicted_seqlen(ComponentType.SWA),
@@ -7424,7 +7424,7 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = tokens
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(0, forward_len)
+        req.extend_end = forward_len
         req.kv.cache_protected_len = branching_seqlen
 
         kv_indices = self._alloc(allocator, forward_len)
@@ -10850,7 +10850,7 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         req.origin_input_ids = tokens
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        req.extend_end = len(req.full_untruncated_fill_ids)
         kv_indices = self._alloc_paged(allocator, seq_len)
         req_to_token_pool.write((req.kv.req_pool_idx, slice(0, seq_len)), kv_indices)
         req.kv.kv_committed_len = seq_len
@@ -10860,7 +10860,7 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         req.extra_key = None
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
-            cache.checkpoint(req, up_to=req.extend_range.end)
+            cache.checkpoint(req, up_to=req.extend_end)
 
         boundary = (seq_len - 1) // page_size * page_size
         self.assertGreaterEqual(

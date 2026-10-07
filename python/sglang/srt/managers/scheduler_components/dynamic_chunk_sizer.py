@@ -170,7 +170,7 @@ class DynamicChunkSizer:
             # request so release_kv_cache can release it symmetrically.
             req.init_next_round_input(self.tree_cache)
             req.lock = self.tree_cache.lock(req.last_node)
-            req.set_extend_range(req.prefix_len, len(req.full_untruncated_fill_ids))
+            req.extend_end = len(req.full_untruncated_fill_ids)
 
             # Prepare batch
             batch = ScheduleBatch.init_new(
@@ -183,7 +183,7 @@ class DynamicChunkSizer:
                 self.spec_algorithm,
             )
 
-            current_seq_len = req.extend_range.end
+            current_seq_len = req.extend_end
 
             if is_dp_attention_enabled():
                 # Profiling runs one request on this rank; other DP ranks report 0.

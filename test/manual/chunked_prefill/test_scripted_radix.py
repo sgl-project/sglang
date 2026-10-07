@@ -307,7 +307,7 @@ class TestRadixNoTailChunked(ScriptedTestCase):
                 protected_len: int = req.kv.cache_protected_len
                 assert prefix_len == protected_len, (
                     f"page_size=1 must take the no-tail else branch: "
-                    f"len(prefix_indices)={prefix_len} != "
+                    f"prefix_len={prefix_len} != "
                     f"cache_protected_len={protected_len} (a partial-page tail "
                     f"was appended, which only happens for page_size > 1)"
                 )
@@ -462,7 +462,7 @@ class TestRadixPartialPage(ScriptedTestCase):
                 prefix_len: int = req.prefix_len
                 protected_len: int = req.kv.cache_protected_len
                 assert prefix_len >= protected_len, (
-                    f"len(prefix_indices)={prefix_len} dropped below "
+                    f"prefix_len={prefix_len} dropped below "
                     f"cache_protected_len={protected_len}: tail was freed "
                     f"prematurely"
                 )

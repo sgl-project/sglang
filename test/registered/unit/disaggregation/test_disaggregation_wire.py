@@ -666,7 +666,7 @@ class TestDisaggregationWire(unittest.TestCase):
         req = SimpleNamespace(
             kv=ReqKvInfo(req_pool_idx=0),
             prefix_len=2,
-            extend_range=SimpleNamespace(length=3),
+            extend_len=3,
             origin_input_ids=[0, 1, 2, 3, 4],
             output_ids=[],
             retracted_stain=True,

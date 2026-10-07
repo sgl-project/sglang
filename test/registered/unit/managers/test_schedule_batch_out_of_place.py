@@ -17,7 +17,6 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
-from sglang.srt.utils.common import Range  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -130,7 +129,7 @@ class _FakeReq:
         self.origin_input_ids = list(range(origin_len))
         self.output_ids = list(range(output_len))
         self.full_untruncated_fill_ids = list(range(origin_len + output_len))
-        self.extend_range = None
+        self.extend_end = None
 
     def refresh_fill_ids(self):
         self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
@@ -138,9 +137,6 @@ class _FakeReq:
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
-
-    def set_extend_range(self, start, end):
-        self.extend_range = Range(start, end)
 
 
 class TestMergeBatchOutOfPlace(unittest.TestCase):
@@ -243,14 +239,14 @@ class TestPrepareEncoderInfoExtendOutOfPlace(unittest.TestCase):
             rid="img",
             multimodal_inputs=types.SimpleNamespace(num_image_tokens=2),
             prefix_len=0,
-            extend_range=Range(0, 5),
+            extend_len=5,
             logprob_start_len=0,
         )
         req_text_only = types.SimpleNamespace(
             rid="txt",
             multimodal_inputs=None,
             prefix_len=0,
-            extend_range=Range(0, 4),
+            extend_len=4,
             logprob_start_len=0,
         )
         batch = make_schedule_batch(
