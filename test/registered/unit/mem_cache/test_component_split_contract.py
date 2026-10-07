@@ -9,17 +9,11 @@ from unittest import mock
 import torch
 
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.component_factory import (
-    DEFAULT_COMPONENT_FACTORY_KEYS,
-)
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentData,
     ComponentType,
 )
-from sglang.srt.mem_cache.unified_cache.components.registry import (
-    get_python_tree_component,
-)
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
+from sglang.srt.mem_cache.unified_radix_cache import COMPONENT_REGISTRY, UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -85,8 +79,8 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
     def test_policy_covers_every_component_and_field(self):
         self.assertEqual(
             set(self.SPLIT_POLICY),
-            set(DEFAULT_COMPONENT_FACTORY_KEYS),
-            "a default component has no split policy: decide what "
+            set(COMPONENT_REGISTRY),
+            "a component in COMPONENT_REGISTRY has no split policy: decide what "
             "its split does with each ComponentData field and record it here",
         )
         field_names = {f.name for f in dataclasses.fields(ComponentData)}
@@ -116,13 +110,11 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
 
     def _split(self, component_type):
         """Run the real hook over a fresh parent/child pair."""
-        component = object.__new__(
-            get_python_tree_component(DEFAULT_COMPONENT_FACTORY_KEYS[component_type])
-        )
+        component = object.__new__(COMPONENT_REGISTRY[component_type])
         # The hooks only reach the tree core for the host LRU, and the marked
         # child keeps both halves out of it (device value present, host lock held).
         component.tree_core = mock.Mock(
-            host_lru_lists={ct: mock.Mock() for ct in DEFAULT_COMPONENT_FACTORY_KEYS}
+            host_lru_lists={ct: mock.Mock() for ct in COMPONENT_REGISTRY}
         )
         component.cache = SimpleNamespace(tree_core=component.tree_core)
         child = self._marked_child(component_type)

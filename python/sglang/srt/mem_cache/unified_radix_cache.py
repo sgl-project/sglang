@@ -68,7 +68,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 
 # UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
 # because other modules and tests import them from this module.
-from sglang.srt.mem_cache.unified_cache.components import (  # noqa: F401
+from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
@@ -83,7 +83,6 @@ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
-    create_python_tree_components,
     create_tree_core,
     select_tree_core_backend,
 )
@@ -132,6 +131,13 @@ def _c128_transfer_num_pages(transfers: Sequence[PoolTransfer], page_size: int) 
         )
         num_pages += num_slots // page_size
     return num_pages
+
+
+COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
+    ComponentType.FULL: FullComponent,
+    ComponentType.MAMBA: MambaComponent,
+    ComponentType.SWA: SWAComponent,
+}
 
 
 logger = logging.getLogger(__name__)
@@ -183,7 +189,15 @@ class UnifiedRadixCache(BasePrefixCache):
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
         self.enable_session_radix_cache = params.enable_session_radix_cache
-        self.components = create_python_tree_components(self, params)
+        component_registry = COMPONENT_REGISTRY
+        if params.component_registry_override:
+            component_registry = {
+                **COMPONENT_REGISTRY,
+                **params.component_registry_override,
+            }
+        self.components: dict[ComponentType, TreeComponent] = {
+            ct: component_registry[ct](self, params) for ct in self.tree_components
+        }
         self._components_tuple: tuple[TreeComponent, ...] = tuple(
             self.components.values()
         )

@@ -19,19 +19,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.unified_cache.component_factory import (
-    DEFAULT_COMPONENT_FACTORY_KEYS,
-    resolve_component_factory_keys,
-)
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    PythonTreeComponentArgument,
-)
-from sglang.srt.mem_cache.unified_cache.components.registry import (
-    create_python_tree_component,
-    get_python_tree_component,
-    is_default_python_tree_component,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -39,7 +27,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
         UnifiedTreeCoreInterface,
     )
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 TreeCoreFactory = Callable[
     ["CacheInitParams", "dict[ComponentType, TreeComponent]"],
@@ -63,17 +50,8 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
         ComponentType.MAMBA,
     }:
         return "the configured components require the Python TreeCore"
-    if any(
-        isinstance(selector, type)
-        for selector in (params.component_registry_override or {}).values()
-    ):
+    if params.component_registry_override:
         return "custom components require the Python TreeCore"
-    for key in resolve_component_factory_keys(params).values():
-        if (
-            key in DEFAULT_COMPONENT_FACTORY_KEYS.values()
-            and not is_default_python_tree_component(key)
-        ):
-            return "custom components require the Python TreeCore"
     if sys.platform != "linux":
         return "the Rust TreeCore supports Linux only"
     from sglang.srt.rust_extensions.torch_build import (
@@ -128,26 +106,6 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
     return None
 
 
-def _registered_tree_components() -> dict[str, int]:
-    """Load the extension only when component discovery needs its registry."""
-    from sglang.srt.mem_cache.rust_tree_core.extension import bindings
-
-    return bindings.registered_tree_components()
-
-
-def _component_factory_fallback_reason(params: CacheInitParams) -> Optional[str]:
-    factory_keys = resolve_component_factory_keys(params)
-    if all(
-        key in DEFAULT_COMPONENT_FACTORY_KEYS.values() for key in factory_keys.values()
-    ):
-        return None
-    registered = _registered_tree_components()
-    for component_type, key in factory_keys.items():
-        if registered.get(key) != int(component_type):
-            return "the selected component factories require the Python TreeCore"
-    return None
-
-
 def resolve_tree_core_backend(name: str, params: CacheInitParams) -> str:
     """Resolve known Rust capability gaps before loading a backend.
 
@@ -157,8 +115,6 @@ def resolve_tree_core_backend(name: str, params: CacheInitParams) -> str:
     if name != "rust":
         return name
     reason = _rust_fallback_reason(params)
-    if reason is None:
-        reason = _component_factory_fallback_reason(params)
     if reason is not None:
         logger.info("Using the Python TreeCore: %s", reason)
         return "python"
@@ -192,24 +148,6 @@ def get_tree_core_factory(name: str) -> Optional[TreeCoreFactory]:
 
 def registered_tree_core_backends() -> list[str]:
     return list(_TREE_CORE_REGISTRY.keys())
-
-
-def create_python_tree_components(
-    cache: UnifiedRadixCache, params: CacheInitParams
-) -> dict[ComponentType, TreeComponent]:
-    """Resolve component names to the Python implementations of cache hooks."""
-    factories = {}
-    for component_type, key in resolve_component_factory_keys(params).items():
-        factory = get_python_tree_component(key) if isinstance(key, str) else key
-        if factory is None:
-            raise ValueError(f"Python tree component {key!r} is not registered")
-        factories[component_type] = factory
-    return {
-        component_type: create_python_tree_component(
-            factory, PythonTreeComponentArgument(component_type, params, cache=cache)
-        )
-        for component_type, factory in factories.items()
-    }
 
 
 def _python_tree_core_factory(

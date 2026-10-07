@@ -41,9 +41,6 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
     SWARebuild,
 )
-from sglang.srt.mem_cache.unified_cache.component_factory import (
-    resolve_component_factory_keys,
-)
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import StorageBackupSpec
@@ -331,7 +328,8 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 "--enable-session-radix-cache is not supported by the Rust TreeCore"
             )
 
-        # C128 still requires the Python TreeCore.
+        # TODO(Jialin): Port custom component registration from #25754 and
+        # C128 support from #33676.
         unsupported_components = set(self.tree_components) - {
             ComponentType.FULL,
             ComponentType.SWA,
@@ -342,24 +340,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 sorted(component.name for component in unsupported_components)
             )
             raise ValueError(f"Rust TreeCore does not support components: {names}")
-        if any(
-            isinstance(selector, type)
-            for selector in (params.component_registry_override or {}).values()
-        ):
+        if params.component_registry_override:
             raise ValueError(
-                "Rust TreeCore does not support class-valued component_registry_override"
+                "Rust TreeCore does not support component_registry_override"
             )
-        component_factory_keys = resolve_component_factory_keys(params)
-        registered_types = self._bindings.registered_tree_components()
-        for component_type, key in component_factory_keys.items():
-            registered_type = registered_types.get(key)
-            if registered_type is None:
-                raise ValueError(f"unknown component factory {key!r}")
-            if registered_type != int(component_type):
-                raise ValueError(
-                    f"Tree component factory {key!r} has kind {registered_type}, "
-                    f"expected {component_type.name}"
-                )
         # Validate the same constructor options as Python before passing the
         # configured eviction parameters to the native strategy.
         eviction_strategy = get_eviction_strategy(
@@ -422,30 +406,32 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             get_exec().mamba.mamba_max_states_per_path if has_mamba else -1
         )
 
-        binding_params = self._bindings.TreeCoreInitParamsBinding(
-            eviction_policy=params.eviction_policy,
-            slru_protected_threshold=getattr(
-                eviction_strategy, "protected_threshold", 2
+        self._binding = self._binding_class()(
+            self._bindings.TreeCoreInitParamsBinding(
+                eviction_policy=params.eviction_policy,
+                slru_protected_threshold=getattr(
+                    eviction_strategy, "protected_threshold", 2
+                ),
+                tlru_tail_budget=tlru_tail_budget,
+                tlru_float_config=tlru_float_config,
+                page_size=params.page_size,
+                is_write_back=False,
+                enable_hicache=False,
+                write_through_threshold=256,
+                device=str(self.device),
+                swa_sliding_window_size=params.sliding_window_size,
+                swa_req_ring=is_swa_req_ring(self._allocator),
+                enable_kv_cache_events=params.enable_kv_cache_events,
+                mamba_cache_chunk_size=(
+                    mamba_cache_chunk_size() if has_mamba else None
+                ),
+                mamba_max_states_per_path=(
+                    mamba_max_states_per_path
+                    if mamba_max_states_per_path >= 0
+                    else None
+                ),
             ),
-            tlru_tail_budget=tlru_tail_budget,
-            tlru_float_config=tlru_float_config,
-            page_size=params.page_size,
-            is_write_back=False,
-            enable_hicache=False,
-            write_through_threshold=256,
-            device=str(self.device),
-            swa_sliding_window_size=params.sliding_window_size,
-            swa_req_ring=is_swa_req_ring(self._allocator),
-            enable_kv_cache_events=params.enable_kv_cache_events,
-            mamba_cache_chunk_size=(mamba_cache_chunk_size() if has_mamba else None),
-            mamba_max_states_per_path=(
-                mamba_max_states_per_path if mamba_max_states_per_path >= 0 else None
-            ),
-        )
-        binding_class = self._binding_class()
-        self._binding = binding_class.with_component_factories(
-            binding_params,
-            [component_factory_keys[component] for component in self.tree_components],
+            [int(component) for component in self.tree_components],
         )
         self.kv_events = _RustKVCacheEventRecorder(
             self._binding, params.enable_kv_cache_events

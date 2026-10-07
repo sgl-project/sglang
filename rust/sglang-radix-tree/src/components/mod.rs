@@ -2,48 +2,35 @@
 #![allow(unused_variables)]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use tch::Tensor;
 
 use crate::node::{ChildKeyType, NodeArena, NodeIdx_, TreeCoreRuntimeError};
 use crate::unified_tree_core::{
-    CacheAction, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertParams,
-    InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult, PoolTransfer,
-    PoolTransferResult, UnifiedTreeCore,
+    CacheAction, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
+    IncLockRefResult, InsertParams, InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult,
+    PoolTransfer, PoolTransferResult, UnifiedTreeCore,
 };
 
 mod full;
 mod mamba;
-pub mod registry;
 mod swa;
 
 pub use full::FullComponent;
 pub use mamba::MambaComponent;
 pub use swa::SwaComponent;
 
-#[derive(Debug, thiserror::Error)]
-pub enum ComponentInitError {
-    #[error("component factory key must be non-empty")]
-    EmptyFactoryKey,
-    #[error("component factory {0:?} is already registered")]
-    DuplicateFactoryKey(String),
-    #[error("unknown component factory {0:?}")]
-    UnknownFactoryKey(String),
-    #[error("component factory key mode does not match the tree")]
-    KeyModeMismatch,
-    #[error("{0}")]
-    InvalidConfiguration(&'static str),
-    #[error("component {0:?} is not enabled")]
-    InactiveComponent(ComponentType),
-    #[error("duplicate component type {0:?}")]
-    DuplicateComponent(ComponentType),
-    #[error("missing component {0:?}")]
-    MissingComponent(ComponentType),
-    #[error("component has type {actual:?}, expected {expected:?}")]
-    ComponentTypeMismatch {
-        expected: ComponentType,
-        actual: ComponentType,
-    },
+/// Construct the built-in driver for one component kind.
+pub fn create_tree_component<K: ChildKeyType>(
+    component_type: ComponentType,
+    params: &CacheInitParams,
+) -> Arc<dyn TreeComponent<K> + Send + Sync> {
+    match component_type {
+        ComponentType::Full => Arc::new(FullComponent),
+        ComponentType::Swa => Arc::new(SwaComponent::new(params)),
+        ComponentType::Mamba => Arc::new(MambaComponent::new(params)),
+    }
 }
 
 /// Whether `node_id` holds the component's data on `target`, checking its

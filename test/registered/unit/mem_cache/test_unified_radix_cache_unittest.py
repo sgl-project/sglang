@@ -77,9 +77,6 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
     SWARebuild,
 )
-from sglang.srt.mem_cache.unified_cache.component_factory import (
-    DEFAULT_COMPONENT_FACTORY_KEYS,
-)
 from sglang.srt.mem_cache.unified_cache.components.base import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
@@ -88,10 +85,6 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
-from sglang.srt.mem_cache.unified_cache.components.registry import (
-    get_python_tree_component,
-    register_python_tree_component,
-)
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     _TREE_CORE_REGISTRY,
@@ -107,6 +100,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     EvictDeviceNextNodeResult,
 )
 from sglang.srt.mem_cache.unified_radix_cache import (
+    COMPONENT_REGISTRY,
     UnifiedLRUList,
     UnifiedRadixCache,
     UnifiedTreeNode,
@@ -295,7 +289,7 @@ def _drop_hicache_atexit_pin(cache):
 
 
 class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
-    def test_legacy_class_override_is_instance_local(self):
+    def test_component_registry_override_is_instance_local(self):
         params = CacheInitParams(
             req_to_token_pool=ReqToTokenPool(
                 size=2,
@@ -313,12 +307,7 @@ class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
         cache = UnifiedRadixCache(params=params)
 
         self.assertIsInstance(cache.components[ComponentType.FULL], _FakeFullComponent)
-        self.assertIsNot(
-            get_python_tree_component(
-                DEFAULT_COMPONENT_FACTORY_KEYS[ComponentType.FULL]
-            ),
-            _FakeFullComponent,
-        )
+        self.assertIsNot(COMPONENT_REGISTRY[ComponentType.FULL], _FakeFullComponent)
 
 
 class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
@@ -523,7 +512,7 @@ def build_fixture(
     tree_page_size: Optional[int] = None,
     mamba_cache_chunk_size: Optional[int] = None,
     component_registry_override: Optional[
-        dict[ComponentType, str | type[TreeComponent]]
+        dict[ComponentType, type[TreeComponent]]
     ] = None,
     tree_core_backend: Optional[str] = None,
 ):
@@ -4304,19 +4293,11 @@ class UnifiedRadixCacheSuite:
         self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
 
         # Component buffer-mode hooks are Python-core only.
-        with mock.patch.dict(
-            "sglang.srt.mem_cache.unified_cache.components.registry._PYTHON_TREE_COMPONENT_REGISTRY"
-        ):
-            register_python_tree_component(
-                "test_extra_pool_full", _ExtraPoolFullComponent
-            )
-            cache, allocator, req_to_token_pool = build_fixture(
-                self.cfg,
-                component_registry_override={
-                    ComponentType.FULL: "test_extra_pool_full"
-                },
-                tree_core_backend="python",
-            )
+        cache, allocator, req_to_token_pool = build_fixture(
+            self.cfg,
+            component_registry_override={ComponentType.FULL: _ExtraPoolFullComponent},
+            tree_core_backend="python",
+        )
         self._init_buffer_hicache(cache, storage_dir)
         extra = _ExtraPoolFullComponent.EXTRA_POOL
         controller = cache.cache_controller
@@ -9531,9 +9512,7 @@ del _cfg, _name
 
 def _component_with_cache(component_type, cache):
     """A registry component instance bound to a (mock) cache and its tree_core."""
-    component = object.__new__(
-        get_python_tree_component(DEFAULT_COMPONENT_FACTORY_KEYS[component_type])
-    )
+    component = object.__new__(COMPONENT_REGISTRY[component_type])
     component.cache = cache
     component.tree_core = cache.tree_core
     return component

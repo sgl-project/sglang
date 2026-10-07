@@ -56,9 +56,6 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_cache.components import registry as python_components
-from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str, hash_str_to_int64
 from sglang.srt.runtime_context import get_context
 
@@ -134,165 +131,101 @@ def test_match_on_the_empty_tree_returns_no_indices():
     assert result.device_indices.numel() == 0
 
 
-@pytest.mark.parametrize("is_eagle", [False, True])
-@pytest.mark.parametrize("factory_key", [None, "full_default"])
-def test_builtin_component_factory_constructs_native_cache_and_matches(
-    is_eagle, factory_key
-):
-    cache = UnifiedRadixCache(
-        CacheInitParams(
-            disable=False,
-            req_to_token_pool=None,
-            token_to_kv_pool_allocator=None,
-            page_size=1,
-            is_eagle=is_eagle,
-            tree_components=(ComponentType.FULL,),
-            component_registry_override=(
-                {ComponentType.FULL: factory_key} if factory_key is not None else None
-            ),
-            tree_core_backend="rust",
-        )
-    )
-    assert isinstance(cache.tree_core, RustUnifiedTreeCore)
-    assert isinstance(cache.components[ComponentType.FULL], FullComponent)
-    core = cache.tree_core
-    values = list(range(10, 14 - int(is_eagle)))
-    _insert(core, [1, 2, 3, 4], values)
-    result = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4])))
-    assert result.device_indices.tolist() == values
-
-
-def test_native_component_registry_is_read_only_and_independent(monkeypatch):
-    monkeypatch.setattr(
-        python_components,
-        "_PYTHON_TREE_COMPONENT_REGISTRY",
-        dict(python_components._PYTHON_TREE_COMPONENT_REGISTRY),
-    )
-    python_components.register_python_tree_component("test_python_only", FullComponent)
-    expected = {
-        "full_default": int(ComponentType.FULL),
-        "swa_default": int(ComponentType.SWA),
-        "mamba_default": int(ComponentType.MAMBA),
-    }
-    snapshot = mem_cache.registered_tree_components()
-    assert snapshot == expected
-    snapshot["test_python_only"] = int(ComponentType.FULL)
-    snapshot.pop("full_default")
-    assert mem_cache.registered_tree_components() == expected
-    assert not hasattr(mem_cache, "register_tree_component")
-    assert not hasattr(mem_cache, "TreeComponentBinding")
-
-
-@pytest.mark.parametrize("is_eagle", [False, True])
-def test_native_factory_selection_constructs_independent_cores(is_eagle):
-    cores = [
-        _tree_core(
-            is_eagle=is_eagle,
-            component_registry_override={ComponentType.FULL: "full_default"},
-        )
-        for _ in range(2)
-    ]
-    values = list(range(10, 14 - int(is_eagle)))
-    _insert(cores[0], [1, 2, 3, 4], values)
-    assert (
-        cores[0]
-        .match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4])))
-        .device_indices.tolist()
-        == values
-    )
-    assert (
-        cores[1]
-        .match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4])))
-        .device_indices.numel()
-        == 0
-    )
-    cores[0].reset()
-    assert (
-        cores[0]
-        .match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4])))
-        .device_indices.numel()
-        == 0
-    )
-
-
 @pytest.mark.parametrize("is_bigram", [False, True])
-@pytest.mark.parametrize(
-    "factory_keys", [["full_default"], ["full_default", "swa_default"]]
-)
-def test_native_binding_derives_component_kinds_from_factory_keys(
-    is_bigram, factory_keys
-):
-    params = mem_cache.TreeCoreInitParamsBinding(swa_sliding_window_size=4)
-    cls = (
-        mem_cache.RustBigramUnifiedTreeCoreBinding
+@pytest.mark.parametrize("component_types", [[0], [0, 1], [0, 2], [0, 1, 2]])
+def test_native_component_factory_builds_working_bindings(is_bigram, component_types):
+    bindings = load_tree_core_extension(inspection=True)
+    binding_class = (
+        bindings.RustBigramUnifiedTreeCoreBinding
         if is_bigram
-        else mem_cache.RustUnifiedTreeCoreBinding
+        else bindings.RustUnifiedTreeCoreBinding
     )
-    binding = cls.with_component_factories(params, factory_keys)
-    binding.reset()
-    assert binding.empty_match_result().device_indices.numel() == 0
-
-
-@pytest.mark.parametrize("is_bigram", [False, True])
-@pytest.mark.parametrize(
-    "factory_keys, message",
-    [
-        ([], "component sets"),
-        ([""], "must be non-empty"),
-        (["missing"], "unknown component factory"),
-        (["full_default", "full_default"], "duplicate component type Full"),
-        (["swa_default"], "component sets"),
-        (["swa_default", "full_default"], "component sets"),
-    ],
-)
-def test_native_binding_rejects_invalid_factory_selections(
-    is_bigram, factory_keys, message
-):
-    params = mem_cache.TreeCoreInitParamsBinding(swa_sliding_window_size=4)
-    cls = (
-        mem_cache.RustBigramUnifiedTreeCoreBinding
-        if is_bigram
-        else mem_cache.RustUnifiedTreeCoreBinding
-    )
-    with pytest.raises(ValueError, match=message):
-        cls.with_component_factories(params, factory_keys)
-
-
-@pytest.mark.parametrize("is_bigram", [False, True])
-@pytest.mark.parametrize("invalid_key", [int(ComponentType.FULL), FullComponent])
-def test_native_binding_accepts_only_factory_key_strings(is_bigram, invalid_key):
-    cls = (
-        mem_cache.RustBigramUnifiedTreeCoreBinding
-        if is_bigram
-        else mem_cache.RustUnifiedTreeCoreBinding
-    )
-    with pytest.raises(TypeError):
-        cls.with_component_factories(
-            mem_cache.TreeCoreInitParamsBinding(), [invalid_key]
-        )
-
-
-@pytest.mark.parametrize(
-    "tree_components, factory_key, message",
-    [
-        ((ComponentType.FULL,), "missing", "unknown component factory"),
-        ((ComponentType.FULL,), "swa_default", "expected FULL"),
-        (
-            (ComponentType.FULL, ComponentType.FULL),
-            "full_default",
-            "duplicate component type Full",
+    binding, requested_kinds = binding_class.inspect_with_component_factory(
+        bindings.TreeCoreInitParamsBinding(
+            swa_sliding_window_size=8, mamba_cache_chunk_size=4
         ),
+        component_types,
+        False,
+    )
+    assert requested_kinds == component_types
+    tokens = array("q", range(4 + is_bigram))
+    inserted = binding.insert(
+        bindings.InsertParamsBinding(
+            key=tokens,
+            value=torch.arange(10, 14),
+            mamba_value=(
+                torch.tensor([17])
+                if int(ComponentType.MAMBA) in component_types
+                else None
+            ),
+        )
+    )
+    assert inserted.prefix_len == 0
+    # Cache orchestration publishes the SWA slots after insertion.
+    for tag, node_id, source_value in inserted.cache_actions:
+        assert tag == "swa_rebuild"
+        binding.set_component_device_value(
+            node_id, int(ComponentType.SWA), source_value
+        )
+    match_params = bindings.MatchParamsBinding(tokens)
+    assert binding.match_prefix(match_params).device_indices.tolist() == [
+        10,
+        11,
+        12,
+        13,
+    ]
+    binding.reset()
+    assert binding.match_prefix(match_params).device_indices.numel() == 0
+
+
+@pytest.mark.parametrize("is_bigram", [False, True])
+@pytest.mark.parametrize(
+    "component_types,init_overrides,message",
+    [
+        ([], {}, "component sets are supported"),
+        ([0, 0], {}, "component sets are supported"),
+        ([255], {}, "unknown component type"),
+        ([0], {"page_size": 0}, "page_size must be at least 1"),
+        ([0, 1], {}, "requires swa_sliding_window_size"),
+        ([0, 2], {}, "requires mamba_cache_chunk_size"),
     ],
 )
-def test_adapter_rejects_invalid_factory_selections(
-    tree_components, factory_key, message
+def test_native_component_factory_validates_before_invocation(
+    is_bigram, component_types, init_overrides, message
 ):
+    bindings = load_tree_core_extension(inspection=True)
+    binding_class = (
+        bindings.RustBigramUnifiedTreeCoreBinding
+        if is_bigram
+        else bindings.RustUnifiedTreeCoreBinding
+    )
     with pytest.raises(ValueError, match=message):
-        _tree_core(
-            tree_components=tree_components,
-            sliding_window_size=4,
-            component_registry_override={ComponentType.FULL: factory_key},
+        binding_class.inspect_with_component_factory(
+            bindings.TreeCoreInitParamsBinding(**init_overrides), component_types, True
         )
+
+
+@pytest.mark.parametrize("is_bigram", [False, True])
+def test_native_component_factory_panics_become_runtime_errors(is_bigram):
+    bindings = load_tree_core_extension(inspection=True)
+    binding_class = (
+        bindings.RustBigramUnifiedTreeCoreBinding
+        if is_bigram
+        else bindings.RustUnifiedTreeCoreBinding
+    )
+    with pytest.raises(RuntimeError, match="component factory test panic"):
+        binding_class.inspect_with_component_factory(
+            bindings.TreeCoreInitParamsBinding(), [0], True
+        )
+
+
+@pytest.mark.parametrize(
+    "binding_class",
+    [mem_cache.RustUnifiedTreeCoreBinding, mem_cache.RustBigramUnifiedTreeCoreBinding],
+)
+def test_native_component_factories_are_not_exposed_to_python(binding_class):
+    assert not hasattr(binding_class, "with_component_factory")
+    assert not hasattr(binding_class, "inspect_with_component_factory")
 
 
 @pytest.mark.parametrize("instance_backend", [None, "rust"])
@@ -1393,10 +1326,6 @@ def test_session_radix_cache_is_rejected():
         ),
         (
             {"component_registry_override": {ComponentType.FULL: object}},
-            "component_registry_override",
-        ),
-        (
-            {"component_registry_override": {ComponentType.SWA: object}},
             "component_registry_override",
         ),
     ],
@@ -3293,10 +3222,7 @@ def test_python_session_internal_eviction_resumes_in_partition_order(component):
     core.sanity_check([], [])
 
 
-def test_custom_swa_component_keeps_its_inline_backup_contract(monkeypatch):
-    from sglang.srt.mem_cache.unified_cache.components import (
-        registry as python_components,
-    )
+def test_custom_swa_component_keeps_its_inline_backup_contract():
     from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
@@ -3313,14 +3239,6 @@ def test_custom_swa_component_keeps_its_inline_backup_contract(monkeypatch):
             )
 
     reference, allocator = _swa_cache(window=4, backend="python")
-    monkeypatch.setattr(
-        python_components,
-        "_PYTHON_TREE_COMPONENT_REGISTRY",
-        python_components.registered_python_tree_components(),
-    )
-    python_components.register_python_tree_component(
-        "test_auxiliary_swa", AuxiliarySWAComponent
-    )
     cache = UnifiedRadixCache(
         CacheInitParams(
             disable=False,
@@ -3330,7 +3248,7 @@ def test_custom_swa_component_keeps_its_inline_backup_contract(monkeypatch):
             sliding_window_size=4,
             tree_components=(ComponentType.FULL, ComponentType.AUXILIARY_SWA),
             component_registry_override={
-                ComponentType.AUXILIARY_SWA: "test_auxiliary_swa"
+                ComponentType.AUXILIARY_SWA: AuxiliarySWAComponent
             },
             tree_core_backend="python",
         )

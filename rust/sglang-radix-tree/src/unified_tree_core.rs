@@ -8,10 +8,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use tch::{Device, Kind, Tensor};
 
-use crate::components::registry::{
-    TreeComponentFactorySnapshot, TreeComponentKey, default_factory_key, tree_component_registry,
-};
-use crate::components::{self, ComponentInitError, ComponentSet, TreeComponent};
+use crate::components::{self, ComponentSet, TreeComponent};
 use crate::components::{
     BASE_COMPONENT_TYPE, ComponentType, FULL, MAMBA, NUM_COMPONENT_TYPES, SWA,
 };
@@ -803,7 +800,23 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         });
     }
 
-    fn validate_init_params(params: &CacheInitParams, component_types: &[ComponentType]) {
+    pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self {
+        Self::with_component_factory(
+            params,
+            component_types,
+            components::create_tree_component::<K>,
+        )
+    }
+
+    /// Construct this tree's drivers with a factory invoked once per component kind.
+    pub fn with_component_factory(
+        params: CacheInitParams,
+        component_types: Vec<ComponentType>,
+        mut factory: impl FnMut(
+            ComponentType,
+            &CacheInitParams,
+        ) -> Arc<dyn TreeComponent<K> + Send + Sync>,
+    ) -> Self {
         assert!(
             !component_types.is_empty(),
             "at least one component type is required"
@@ -813,92 +826,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             "the base (Full) component is required"
         );
         assert!(params.page_size >= 1, "page_size must be at least 1");
-    }
-
-    pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self
-    where
-        K: TreeComponentKey,
-    {
-        Self::validate_init_params(&params, &component_types);
-        let factory_keys = component_types
-            .iter()
-            .map(|&ct| default_factory_key(ct).to_owned())
-            .collect::<Vec<_>>();
-        let components = tree_component_registry()
-            .snapshot(&factory_keys)
-            .and_then(|snapshot| snapshot.create_components::<K>(&params))
-            .unwrap_or_else(|error| panic!("{error}"));
-        Self::with_components(params, component_types, components)
-            .unwrap_or_else(|error| panic!("{error}"))
-    }
-
-    /// Resolve an ordered list of factory keys entirely within the native registry.
-    pub fn with_component_factories(
-        params: CacheInitParams,
-        factory_keys: Vec<String>,
-    ) -> Result<Self, ComponentInitError>
-    where
-        K: TreeComponentKey,
-    {
-        let snapshot = tree_component_registry().snapshot(&factory_keys)?;
-        snapshot.validate_configuration(&params)?;
-        Self::with_component_factory_snapshot(params, snapshot)
-    }
-
-    pub(crate) fn with_component_factory_snapshot(
-        params: CacheInitParams,
-        snapshot: TreeComponentFactorySnapshot,
-    ) -> Result<Self, ComponentInitError>
-    where
-        K: TreeComponentKey,
-    {
-        let component_types = snapshot.component_types();
-        if component_types != [FULL]
-            && component_types != [FULL, SWA]
-            && component_types != [FULL, MAMBA]
-            && component_types != [FULL, SWA, MAMBA]
-        {
-            return Err(ComponentInitError::InvalidConfiguration(
-                "only the [Full], [Full, Swa], [Full, Mamba], and [Full, Swa, Mamba] component sets are supported",
-            ));
-        }
-        let components = snapshot.create_components::<K>(&params)?;
-        Self::with_components(params, component_types, components)
-    }
-
-    /// Construct a tree from native drivers in component-type order.
-    pub fn with_components(
-        params: CacheInitParams,
-        component_types: Vec<ComponentType>,
-        components: Vec<Arc<dyn TreeComponent<K> + Send + Sync>>,
-    ) -> Result<Self, ComponentInitError> {
-        Self::validate_init_params(&params, &component_types);
-        let mut configured = HashSet::new();
+        let mut configured = ComponentSet::EMPTY;
         for &component_type in &component_types {
-            if !configured.insert(component_type) {
-                return Err(ComponentInitError::DuplicateComponent(component_type));
-            }
-        }
-        let mut supplied = HashSet::new();
-        for component in &components {
-            let component_type = component.component_type();
-            if !component_types.contains(&component_type) {
-                return Err(ComponentInitError::InactiveComponent(component_type));
-            }
-            if !supplied.insert(component_type) {
-                return Err(ComponentInitError::DuplicateComponent(component_type));
-            }
-        }
-        for &component_type in &component_types {
-            if !supplied.contains(&component_type) {
-                return Err(ComponentInitError::MissingComponent(component_type));
-            }
-        }
-        for (&expected, component) in component_types.iter().zip(&components) {
-            let actual = component.component_type();
-            if actual != expected {
-                return Err(ComponentInitError::ComponentTypeMismatch { expected, actual });
-            }
+            assert!(
+                !configured.contains(component_type),
+                "duplicate component type {component_type:?}"
+            );
+            configured.insert(component_type);
         }
         let arena = NodeArena::new(component_types.clone(), params.page_size);
         let mut tree_core = UnifiedTreeCore {
@@ -938,10 +872,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
             ongoing_insert_walk_state: None,
         };
-        for component in components {
+        for ct in &component_types {
+            let component = factory(*ct, &params);
+            assert_eq!(
+                component.component_type(),
+                *ct,
+                "component factory returned the wrong kind for {ct:?}"
+            );
             tree_core.register_component_(component);
         }
-        Ok(tree_core)
+        tree_core
     }
 
     /// Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
