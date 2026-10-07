@@ -1154,11 +1154,12 @@ TWO_GPU_CASES = [
             modality="video",
             ulysses_degree=2,
             # The DiT stays resident: BCG graphs hold its weight addresses, which
-            # an offload round trip would move.
+            # an offload round trip would move. Snapshot-offload drops the text
+            # encoder's device copy without copying it back to the host.
             extras=[
                 "--load-diffusion-decoder",
                 _ltx_bcg_args("768x448", 49, use_diffusion_decoder=True),
-                "--component-residency text_encoder=component-offload",
+                "--component-residency text_encoder=snapshot-offload",
             ],
         ),
         DiffusionSamplingParams(
