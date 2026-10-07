@@ -12,6 +12,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization.gptq.gptq import GPTQConfig
 from sglang.srt.layers.quantization.gptq.schemes.gptq_linear import GPTQXPULinearScheme
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -48,7 +49,9 @@ def loading_scope(changed):
 def build_owner(layout, group, group_size=32, checkpoint_format="", device="cpu"):
     with torch.device(device):
         kwargs = dict(bias=False, params_dtype=torch.bfloat16, parallel_group=group)
-        if layout == "row":
+        if layout == "lm_head":
+            layer = ParallelLMHead(256, 1024, params_dtype=torch.bfloat16)
+        elif layout == "row":
             layer = RowParallelLinear(1024, 256, **kwargs)
         elif layout == "column":
             layer = ColumnParallelLinear(1024, 256, **kwargs)
@@ -61,7 +64,7 @@ def build_owner(layout, group, group_size=32, checkpoint_format="", device="cpu"
             weight_bits=4,
             group_size=group_size,
             desc_act=True,
-            lm_head_quantized=False,
+            lm_head_quantized=layout == "lm_head",
             dynamic={},
             checkpoint_format=checkpoint_format,
         )
@@ -129,6 +132,13 @@ class TestGptqActOrderLayoutDiagnostics(CustomTestCase):
         layer, scheme = build_owner("replicated", "replicated")
         for changed in (False, True):
             self.assertNotIn("--tp-size", diagnostic(layer, scheme, changed))
+
+    def test_quantized_lm_head_keeps_vocab_partition_diagnostic(self):
+        layer, scheme = build_owner("lm_head", "tp")
+        for changed in (False, True):
+            self.assertIn(
+                f"Got tp_size={layer.tp_size}", diagnostic(layer, scheme, changed)
+            )
 
     def test_all_group_sizes_and_checkpoint_zero_formats_keep_guard(self):
         for size in (32, 64, 128, 256):
