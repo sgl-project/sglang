@@ -2,22 +2,24 @@ from typing import Iterable, Optional
 
 import torch
 from torch import nn
-from transformers.models.granitemoeshared import GraniteMoeSharedConfig
 
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
-from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
 )
+from sglang.srt.layers.layer_boundary.output import OutputTransform
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import UNFUSED_NORM_READOUT
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -33,49 +35,32 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import make_layers
+from sglang.srt.utils import make_pp_layers
 
-from .granitemoe import GraniteMoeMoE
+from .granitemoe import GraniteMoeMoE, GraniteMoeSharedMLP
 
 
-# in vLLM this is in a separate file, but keeping it here for decoupling
-class GraniteMoeSharedMLP(nn.Module):
-    def __init__(
-        self,
-        config: GraniteMoeSharedConfig,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-
-        self.input_size = config.hidden_size
-        self.hidden_size = config.shared_intermediate_size
-        self.input_linear = MergedColumnParallelLinear(
-            input_size=self.input_size,
-            output_sizes=[self.hidden_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.input_linear",
-        )
-        self.output_linear = RowParallelLinear(
-            self.hidden_size,
-            self.input_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.output_linear",
-        )
-        if config.hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {config.hidden_act}. "
-                "Only silu is supported for now."
-            )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.input_linear(hidden_states)
-        x = self.act_fn(gate_up)
-        x, _ = self.output_linear(x)
-        return x
+def _make_stages(layer):
+    """Both kinds of layer scale their mixer and FFN outputs by
+    residual_multiplier, add them in the activation dtype and normalize the sum
+    as a separate step."""
+    scale = OutputTransform(layer._scale_output)
+    sparse = layer.block_sparse_moe is not None
+    return append_stages(
+        (
+            declare_attn(read=UNFUSED_NORM_READOUT, output_transform=scale),
+            layer.input_layernorm,
+        ),
+        (
+            declare_ffn(
+                sparse=sparse,
+                next_layer_sparse=sparse,
+                read=UNFUSED_NORM_READOUT,
+                output_transform=scale,
+            ),
+            layer.post_attention_layernorm,
+        ),
+    )
 
 
 class GraniteMoeHybridMambaDecoderLayer(nn.Module):
@@ -101,6 +86,7 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             activation=config.hidden_act,
             quant_config=quant_config,
+            reduce_results=False,
             prefix=f"{prefix}.mixer",
         )
 
@@ -113,15 +99,18 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 layer_id=layer_idx,
                 quant_config=quant_config,
-                tp_size=get_parallel().tp_size,
                 prefix=f"{prefix}.block_sparse_moe",
+                reduce_results=False,
             )
 
         self.shared_mlp = (
             None
             if getattr(config, "shared_intermediate_size", 0) == 0
             else GraniteMoeSharedMLP(
-                config, quant_config=quant_config, prefix=f"{prefix}.shared_mlp"
+                config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.shared_mlp",
+                reduce_results=False,
             )
         )
 
@@ -129,16 +118,21 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.attn_boundary, self.ffn_boundary = _make_stages(self)
+
+    def _scale_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states * self.residual_multiplier
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
         forward_batch: ForwardBatch,
-    ):
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        capture_output=None,
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, capture=capture_output
+        )
 
         output = torch.empty_like(hidden_states)
         attn_backend = get_attn_backend()
@@ -153,10 +147,8 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
             use_triton_causal_conv=True,
         )
 
-        hidden_states = residual + output * self.residual_multiplier
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.attn_boundary.finish(output, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         if self.shared_mlp is None:
             if self.block_sparse_moe is not None:
                 hidden_states = self.block_sparse_moe(hidden_states)
@@ -170,9 +162,7 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
                 del moe_hidden_states
             else:
                 hidden_states = self.shared_mlp(hidden_states)
-        hidden_states = residual + hidden_states * self.residual_multiplier
-
-        return hidden_states, residual
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class GraniteMoeHybridAttention(nn.Module):
@@ -221,11 +211,11 @@ class GraniteMoeHybridAttention(nn.Module):
             self.hidden_size,
             bias=self.attention_bias,
             quant_config=quant_config,
+            reduce_results=False,
             prefix=f"{prefix}.o_proj",
         )
 
         if config.position_embedding_type == "rope":
-
             self.rotary_emb = get_rope(
                 head_size=self.head_dim,
                 rotary_dim=self.head_dim,  # its not in the config
@@ -300,15 +290,18 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 layer_id=layer_idx,
                 quant_config=quant_config,
-                tp_size=get_parallel().tp_size,
                 prefix=f"{prefix}.block_sparse_moe",
+                reduce_results=False,
             )
 
         self.shared_mlp = (
             None
             if getattr(config, "shared_intermediate_size", 0) == 0
             else GraniteMoeSharedMLP(
-                config, quant_config=quant_config, prefix=f"{prefix}.shared_mlp"
+                config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.shared_mlp",
+                reduce_results=False,
             )
         )
 
@@ -316,26 +309,29 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.attn_boundary, self.ffn_boundary = _make_stages(self)
+
+    def _scale_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states * self.residual_multiplier
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
-        forward_batch: ForwardBatch | None = None,
+        forward_batch: ForwardBatch,
+        capture_output=None,
     ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, capture=capture_output
+        )
 
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states = residual + hidden_states * self.residual_multiplier
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         if self.shared_mlp is None:
             if self.block_sparse_moe is not None:
                 hidden_states = self.block_sparse_moe(hidden_states)
@@ -349,9 +345,7 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
                 del moe_hidden_states
             else:
                 hidden_states = self.shared_mlp(hidden_states)
-        hidden_states = residual + hidden_states * self.residual_multiplier
-
-        return hidden_states, residual
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 ALL_DECODER_LAYER_TYPES = {
@@ -374,7 +368,7 @@ class GraniteMoeHybridModel(nn.Module):
 
         self.vocab_size = config.vocab_size
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -397,11 +391,9 @@ class GraniteMoeHybridModel(nn.Module):
                 prefix=prefix,
             )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             get_layer,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 
@@ -429,33 +421,30 @@ class GraniteMoeHybridModel(nn.Module):
             else:
                 hidden_states = self.embed_tokens(input_ids)
                 hidden_states = hidden_states * self.embedding_multiplier
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states + residual)
-            layer = self.layers[i]
-            hidden_states, residual = layer(
+            hidden_states = self.layers[i](
                 positions,
                 hidden_states,
-                residual,
                 forward_batch,
+                capture_output=aux_hidden_states.capture
+                if i in self.layers_to_capture
+                else None,
             )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-        else:
-            hidden_states, _ = self.norm(hidden_states, residual)
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        hidden_states = residual_batch.fold(hidden_states, forward_batch)
+        hidden_states = self.norm(
+            residual_batch.take_output(hidden_states, forward_batch)
+        )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -490,7 +479,7 @@ class GraniteMoeHybridForCausalLM(
         super().__init__()
 
         self.capture_aux_hidden_states = False
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.quant_config = quant_config
         self.config = config

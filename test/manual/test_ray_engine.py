@@ -101,12 +101,8 @@ def _create_engine_on_pg(
                 self.engine.shutdown()
                 self.engine = None
 
-    enable_dp_attention = (extra_kwargs or {}).get("enable_dp_attention", False)
-    if enable_dp_attention:
-        # DP attention folds DP into TP — total GPUs = tp_size * pp_size
-        total_gpus = tp_size * pp_size
-    else:
-        total_gpus = dp_size * tp_size * pp_size
+    # Attention DP runs inside the TP group, so only replicas add GPUs.
+    total_gpus = dp_size * tp_size * pp_size
     pg = placement_group(
         [{"CPU": 1, "GPU": total_gpus}],
         strategy="STRICT_PACK",
@@ -155,7 +151,6 @@ def _cleanup(actor, pg):
 @unittest.skipUnless(_has_ray, "ray is not installed")
 @unittest.skipUnless(_NUM_GPUS >= 1, "requires at least 1 GPU")
 class TestRayEngineOfflineTP1(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         if not ray.is_initialized():
@@ -196,7 +191,6 @@ class TestRayEngineOfflineTP1(unittest.TestCase):
 @unittest.skipUnless(_has_ray, "ray is not installed")
 @unittest.skipUnless(_NUM_GPUS >= 2, "requires at least 2 GPUs")
 class TestRayEngineOfflineTP2(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         if not ray.is_initialized():
@@ -231,7 +225,6 @@ class TestRayEngineOfflineTP2(unittest.TestCase):
 @unittest.skipUnless(_has_ray, "ray is not installed")
 @unittest.skipUnless(_NUM_GPUS >= 2, "requires at least 2 GPUs")
 class TestRayEngineOfflinePP2(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         if not ray.is_initialized():
@@ -295,14 +288,14 @@ class TestRayEngineOfflineDP2(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Tests: Offline DP Attention (dp=2, tp=2)
+# Tests: Offline DP Attention (attn_dp_size=2, tp=2)
 # ---------------------------------------------------------------------------
 
 
 @unittest.skipUnless(_has_ray, "ray is not installed")
 @unittest.skipUnless(_NUM_GPUS >= 2, "requires at least 2 GPUs")
 class TestRayEngineOfflineDPAttention(unittest.TestCase):
-    """Test Ray engine with dp_size=2, tp_size=2, enable_dp_attention=True."""
+    """Test Ray engine with attn_dp_size=2, tp_size=2."""
 
     @classmethod
     def setUpClass(cls):
@@ -310,10 +303,9 @@ class TestRayEngineOfflineDPAttention(unittest.TestCase):
             ray.init(log_to_driver=True, runtime_env=_RAY_RUNTIME_ENV)
         cls.actor, cls.pg = _create_engine_on_pg(
             tp_size=2,
-            dp_size=2,
             model=_DP_ATTN_MODEL,
             extra_kwargs={
-                "enable_dp_attention": True,
+                "attn_dp_size": 2,
                 "disable_cuda_graph": True,
                 "port": 31500,
             },
@@ -347,7 +339,6 @@ class TestRayEngineOfflineDPAttention(unittest.TestCase):
 @unittest.skipUnless(_has_ray, "ray is not installed")
 @unittest.skipUnless(_NUM_GPUS >= 1, "requires at least 1 GPU")
 class TestRayEngineErrors(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         if not ray.is_initialized():
@@ -634,7 +625,7 @@ class TestRayEnginePlacementGroup(unittest.TestCase):
         del os.environ["SGLANG_RAY_BUNDLE_INDICES"]
 
     def test_custom_pg_dp_attention(self):
-        """Test custom placement_group with enable_dp_attention=True."""
+        """Test custom placement_group with tp_size=2 on the DP-attention model."""
         from sglang.srt.ray.engine import RayEngine
 
         pg = placement_group([{"GPU": 1}] * 2, strategy="STRICT_PACK")
@@ -645,7 +636,6 @@ class TestRayEnginePlacementGroup(unittest.TestCase):
             tp_size=2,
             placement_group=pg,
             use_ray=True,
-            enable_dp_attention=True,
         )
 
         result = engine.generate("The capital of France is", _SAMPLING_PARAMS)

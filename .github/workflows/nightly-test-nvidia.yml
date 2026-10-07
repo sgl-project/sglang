@@ -23,7 +23,7 @@ on:
           - '2-gpu-large'
           - '4-gpu-h100'
           - '4-gpu-b200'
-          - '4-gpu-gb300'
+          # - '4-gpu-gb300'  # Temporarily disabled while the GB300 runner is unavailable.
           - '8-gpu-h200'
           - '8-gpu-b200'
           - 'diffusion'
@@ -152,8 +152,6 @@ jobs:
       run_timeout_minutes: '360'
       job_timeout_minutes: '420'
       scheduled: true
-      # aarch64: the rust-ext cache key is x86_64-only, same reason base-c skips it.
-      skip_prebuilt_rust_ext: true
     secrets: inherit
 
   nightly-8-gpu-h200:
@@ -202,7 +200,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Install dependencies
         run: |

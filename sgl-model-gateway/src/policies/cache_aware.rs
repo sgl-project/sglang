@@ -679,7 +679,7 @@ mod tests {
         let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
         for j in 0..num_workers {
             workers.push(Arc::new(
-                BasicWorkerBuilder::new(&format!("http://w{}:8000", j))
+                BasicWorkerBuilder::new(format!("http://w{}:8000", j))
                     .worker_type(WorkerType::Regular)
                     .build(),
             ));
@@ -738,7 +738,7 @@ mod tests {
         let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
         for j in 0..num_workers {
             workers.push(Arc::new(
-                BasicWorkerBuilder::new(&format!("http://w{}:8000", j))
+                BasicWorkerBuilder::new(format!("http://w{}:8000", j))
                     .worker_type(WorkerType::Regular)
                     .build(),
             ));

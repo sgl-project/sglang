@@ -7,7 +7,6 @@ TokenizerManager's event loop.
 """
 
 import asyncio
-import dataclasses
 import json
 import logging
 from types import SimpleNamespace
@@ -15,7 +14,10 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from pydantic import ValidationError
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
+from sglang.srt.runtime_context import get_lora, get_serving
+from sglang.srt.utils.common import build_server_info
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
@@ -78,6 +80,9 @@ class RuntimeHandle:
 
         self.tokenizer_manager.auto_create_handle_loop()
         self._event_loop = self.tokenizer_manager.event_loop
+
+    def set_engine_state_changed_callback(self, callback) -> None:
+        self.tokenizer_manager.set_engine_state_changed_callback(callback)
 
     @property
     def _tm_loop(self):
@@ -230,9 +235,7 @@ class RuntimeHandle:
             return self._openai_serving_classes
 
         from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-        from sglang.srt.entrypoints.openai.serving_classify import (
-            OpenAIServingClassify,
-        )
+        from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
         from sglang.srt.entrypoints.openai.serving_completions import (
             OpenAIServingCompletion,
         )
@@ -299,7 +302,9 @@ class RuntimeHandle:
             gen = self.tokenizer_manager.generate_request(obj, request=request)
             if stream:
                 completed_choices = set()
-                expected_choices = obj.batch_size * obj.parallel_sample_num
+                # generate_request does not normalize obj until iteration begins.
+                sampling_params = obj.sampling_params or {}
+                expected_choices = max(1, int(sampling_params.get("n", 1)))
                 async for chunk in gen:
                     choice_finished = (
                         chunk.get("meta_info", {}).get("finish_reason") is not None
@@ -397,9 +402,16 @@ class RuntimeHandle:
         model_config = self.tokenizer_manager.model_config
         result = {
             "model_path": self.tokenizer_manager.model_path,
-            "tokenizer_path": self.tokenizer_manager.server_args.tokenizer_path,
+            "served_model_name": self.tokenizer_manager.served_model_name,
+            "tokenizer_path": get_serving().tokenizer_path,
             "is_generation": self.tokenizer_manager.is_generation,
             "weight_version": self.tokenizer_manager.config_value("weight_version"),
+            "load_format": self.tokenizer_manager.config_value("load_format"),
+            "reasoning_parser": self.tokenizer_manager.config_value("reasoning_parser"),
+            "tool_call_parser": self.tokenizer_manager.config_value("tool_call_parser"),
+            "disaggregation_mode": self.tokenizer_manager.config_value(
+                "disaggregation_mode"
+            ),
             "model_type": getattr(model_config.hf_config, "model_type", None),
             "architectures": getattr(model_config.hf_config, "architectures", None),
         }
@@ -407,17 +419,20 @@ class RuntimeHandle:
         if embedding_model_spec is not None:
             result["embedding"] = resolved_embedding_plan(
                 embedding_model_spec,
-                server_args=self.server_args,
+                config=resolving_view(self.server_args),
                 model_config=model_config,
             )
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        result: Dict[str, Any] = self.tokenizer_manager.resolved_config_dict(
-            dataclasses.asdict(self.tokenizer_manager.server_args)
+        return json.dumps(
+            msgspec_to_builtins(
+                build_server_info(
+                    self.tokenizer_manager.server_args, self.scheduler_info
+                )
+            ),
+            default=str,
         )
-        result.update(self.scheduler_info)
-        return json.dumps(msgspec_to_builtins(result), default=str)
 
     def health_check(self) -> bool:
         from sglang.srt.managers.tokenizer_manager import ServerStatus
@@ -428,6 +443,10 @@ class RuntimeHandle:
             ServerStatus.Starting,
             ServerStatus.UnHealthy,
         )
+
+    def is_pause(self) -> bool:
+        """Return the tokenizer manager's authoritative generation pause state."""
+        return self.tokenizer_manager.is_pause
 
     def tokenize(self, text: str, add_special_tokens: bool = True) -> str:
         tokenizer = self.tokenizer_manager.tokenizer
@@ -454,9 +473,7 @@ class RuntimeHandle:
                 "max_model_len": self.tokenizer_manager.model_config.context_len,
             }
         ]
-        if self.tokenizer_manager.server_args.enable_lora and hasattr(
-            self.tokenizer_manager, "lora_registry"
-        ):
+        if get_lora().enable_lora and hasattr(self.tokenizer_manager, "lora_registry"):
             lora_registry = self.tokenizer_manager.lora_registry
             for _, lora_ref in lora_registry.get_all_adapters().items():
                 models.append(
@@ -535,9 +552,11 @@ class RuntimeHandle:
             obj = UpdateWeightFromDiskReqInput(
                 model_path=model_path, load_format=load_format
             )
-            success, message, num_paused = (
-                await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
-            )
+            (
+                success,
+                message,
+                num_paused,
+            ) = await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
             return {
                 "success": success,
                 "message": message,

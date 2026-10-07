@@ -1,0 +1,4 @@
+interface:
+  display_name: "Babysit PR CI"
+  short_description: "Monitor a PR and drive selected CI to green"
+  default_prompt: "Use $babysit-pr-to-pass-ci to monitor the current PR until lint.yml and pr-test.yml pass."

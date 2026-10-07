@@ -42,7 +42,7 @@ class TestDiffusionModelDetection(CustomTestCase):
         modelscope_patcher.start()
         self.addCleanup(modelscope_patcher.stop)
 
-    @patch("sglang.cli.utils.HfApi")
+    @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_gated_diffusion_repo_uses_metadata_fallback(
         self, mock_download, mock_hf_api
@@ -57,7 +57,7 @@ class TestDiffusionModelDetection(CustomTestCase):
             "test/gated-diffusion-model"
         )
 
-    @patch("sglang.cli.utils.HfApi")
+    @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_gated_non_diffusion_repo_is_not_detected(self, mock_download, mock_hf_api):
         mock_download.side_effect = _hub_error(GatedRepoError, 401)
@@ -70,7 +70,7 @@ class TestDiffusionModelDetection(CustomTestCase):
             "test/gated-llm-model"
         )
 
-    @patch("sglang.cli.utils.HfApi")
+    @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_non_gated_hub_errors_do_not_use_metadata_fallback(
         self, mock_download, mock_hf_api

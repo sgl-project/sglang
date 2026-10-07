@@ -6,14 +6,17 @@ from functools import cache
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.inkling_rel_proj import rel_proj_small_t
-from sglang.kernels.ops.attention.inkling_row_scale import row_compact_bf16
+from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+    is_batch_invariant,
+)
 from sglang.kernels.ops.attention.log_scaling_tau import (
     apply_log_scaling_tau as _apply_log_scaling_tau,
 )
 from sglang.kernels.ops.attention.score_mod import (
     relative_bias_score_mod as triton_relative_bias_score_mod,
 )
+from sglang.kernels.ops.gemm.inkling_rel_proj import rel_proj_small_t
+from sglang.kernels.ops.memory.row_compact import row_compact_bf16
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -30,9 +33,11 @@ from sglang.srt.models.inkling_common.norm import RMSNorm
 from sglang.srt.models.inkling_common.sconv import SconvType, ShortConvolution
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import (
+    attention_backends,
     get_exec,
     get_model,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils import add_prefix, get_current_device_stream_fast
 
@@ -105,6 +110,30 @@ _REL_PROJ_MATMUL_MAX_T = 48
 _REL_PROJ_TAU_KERNEL_MAX_T = 32
 
 
+def serving_attention_backend(forward_batch: ForwardBatch) -> str:
+    """The pair member serving this forward.
+
+    Mirrors ``HybridAttnBackend._select_backend`` exactly: decode for
+    decode/idle, the ``speculative_attention_mode`` half for target-verify,
+    prefill otherwise -- including draft-extend, which the hybrid dispatcher
+    routes through its prefill branch. The pair the runner stamped on its
+    backend wins over the configured one, so a draft runner answers with its
+    own backend.
+    """
+    from sglang.srt.model_executor.forward_context import get_attn_backend
+
+    backend = get_attn_backend()
+    configured_prefill, configured_decode = attention_backends()
+    prefill = backend.prefill_attention_backend_str or configured_prefill
+    decode = backend.decode_attention_backend_str or configured_decode
+    mode = forward_batch.forward_mode
+    if mode.is_decode_or_idle():
+        return decode
+    if mode.is_target_verify():
+        return decode if get_spec().speculative_attention_mode == "decode" else prefill
+    return prefill
+
+
 def _rel_proj_kernel_eligible(r: torch.Tensor) -> bool:
     """rel_proj_small_t input contract: bf16 CUDA, [t, h, d_rel] with a
     contiguous (h*d_rel) inner block (token rows may be strided), d_rel a
@@ -117,6 +146,34 @@ def _rel_proj_kernel_eligible(r: torch.Tensor) -> bool:
         and r.shape[2] % 8 == 0
         and r.data_ptr() % 16 == 0
         and (r.stride(0) * 2) % 16 == 0
+    )
+
+
+# Slot-stride alignment (elements) of the fused prologue store: kVecElems for
+# bf16, kMXFP8Block for MXFP8.
+_FUSED_KV_STORE_SLOT_ALIGN = {torch.bfloat16: 8, torch.float8_e4m3fn: 32}
+
+
+def _fused_kv_store_eligible(
+    k_buf: torch.Tensor, v_buf: torch.Tensor, head_dim: int, dtype: torch.dtype
+) -> bool:
+    """Whether the fused prologue can store K/V of `dtype` straight into these
+    pool buffers.
+
+    It writes one NHD ``[slot, head, head_dim]`` row per loc, stepping slots by
+    the buffers' shared ``stride(0)``, so a strided per-layer view qualifies as
+    long as each row is contiguous. Other layouts (HND / vectorized_5d) keep the
+    backend store, which owns their quant and layout; conv, windows and qk-norm
+    stay fused either way.
+    """
+    slot_stride = k_buf.stride(0)
+    return slot_stride % _FUSED_KV_STORE_SLOT_ALIGN[dtype] == 0 and all(
+        buf.dtype == dtype
+        and buf.dim() == 3
+        and buf.shape[-1] == head_dim
+        and buf.stride()[1:] == (head_dim, 1)
+        and buf.stride(0) == slot_stride
+        for buf in (k_buf, v_buf)
     )
 
 
@@ -409,16 +466,8 @@ class InklingAttention(nn.Module):
         pool = get_token_to_kv_pool()
         k_buf = pool.get_key_buffer(self.layer_id)
         v_buf = pool.get_value_buffer(self.layer_id)
-        # The fused store writes raw bf16 into an NHD [slot, head, head_dim]
-        # buffer indexed by loc. Take it only for that exact layout: FP8/MXFP8
-        # (non-bf16) and HND/vectorized_5d (4D/5D, paged (page, head) index)
-        # pools keep the backend store, which owns their quant + layout. conv +
-        # windows + qk-norm stay fused regardless.
-        do_bf16_store = (
-            k_buf.dtype == torch.bfloat16
-            and k_buf.dim() == 3
-            and k_buf.shape[-1] == self.head_dim
-            and k_buf.is_contiguous()
+        do_bf16_store = _fused_kv_store_eligible(
+            k_buf, v_buf, self.head_dim, torch.bfloat16
         )
         sfk = sfv = None
         do_mxfp8_store = False
@@ -427,14 +476,9 @@ class InklingAttention(nn.Module):
         ):
             sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
             do_mxfp8_store = (
-                k_buf.dtype == torch.float8_e4m3fn
-                and v_buf.dtype == torch.float8_e4m3fn
-                and k_buf.dim() == 3
-                and v_buf.dim() == 3
-                and k_buf.shape[-1] == self.head_dim
-                and v_buf.shape[-1] == self.head_dim
-                and k_buf.is_contiguous()
-                and v_buf.is_contiguous()
+                _fused_kv_store_eligible(
+                    k_buf, v_buf, self.head_dim, torch.float8_e4m3fn
+                )
                 and sfk.dim() == 5
                 and sfv.dim() == 5
                 and getattr(pool, "page_size", 0) == 128
@@ -524,15 +568,8 @@ class InklingAttention(nn.Module):
         pool = get_token_to_kv_pool()
         k_buf = pool.get_key_buffer(self.layer_id)
         v_buf = pool.get_value_buffer(self.layer_id)
-        do_bf16_store = (
-            k_buf.dtype == torch.bfloat16
-            and v_buf.dtype == torch.bfloat16
-            and k_buf.dim() == 3
-            and v_buf.dim() == 3
-            and k_buf.shape[-1] == self.head_dim
-            and v_buf.shape[-1] == self.head_dim
-            and k_buf.is_contiguous()
-            and v_buf.is_contiguous()
+        do_bf16_store = _fused_kv_store_eligible(
+            k_buf, v_buf, self.head_dim, torch.bfloat16
         )
         sfk = sfv = None
         do_mxfp8_store = False
@@ -541,14 +578,9 @@ class InklingAttention(nn.Module):
         ):
             sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
             do_mxfp8_store = (
-                k_buf.dtype == torch.float8_e4m3fn
-                and v_buf.dtype == torch.float8_e4m3fn
-                and k_buf.dim() == 3
-                and v_buf.dim() == 3
-                and k_buf.shape[-1] == self.head_dim
-                and v_buf.shape[-1] == self.head_dim
-                and k_buf.is_contiguous()
-                and v_buf.is_contiguous()
+                _fused_kv_store_eligible(
+                    k_buf, v_buf, self.head_dim, torch.float8_e4m3fn
+                )
                 and sfk.dim() == 5
                 and sfv.dim() == 5
                 and getattr(pool, "page_size", 0) == 128
@@ -643,15 +675,8 @@ class InklingAttention(nn.Module):
         pool = get_token_to_kv_pool()
         k_buf = pool.get_key_buffer(self.layer_id)
         v_buf = pool.get_value_buffer(self.layer_id)
-        do_bf16_store = (
-            k_buf.dtype == torch.bfloat16
-            and v_buf.dtype == torch.bfloat16
-            and k_buf.dim() == 3
-            and v_buf.dim() == 3
-            and k_buf.shape[-1] == self.head_dim
-            and v_buf.shape[-1] == self.head_dim
-            and k_buf.is_contiguous()
-            and v_buf.is_contiguous()
+        do_bf16_store = _fused_kv_store_eligible(
+            k_buf, v_buf, self.head_dim, torch.bfloat16
         )
         sfk = sfv = None
         do_mxfp8_store = False
@@ -660,14 +685,9 @@ class InklingAttention(nn.Module):
         ):
             sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
             do_mxfp8_store = (
-                k_buf.dtype == torch.float8_e4m3fn
-                and v_buf.dtype == torch.float8_e4m3fn
-                and k_buf.dim() == 3
-                and v_buf.dim() == 3
-                and k_buf.shape[-1] == self.head_dim
-                and v_buf.shape[-1] == self.head_dim
-                and k_buf.is_contiguous()
-                and v_buf.is_contiguous()
+                _fused_kv_store_eligible(
+                    k_buf, v_buf, self.head_dim, torch.float8_e4m3fn
+                )
                 and sfk.dim() == 5
                 and sfv.dim() == 5
                 and getattr(pool, "page_size", 0) == 128
@@ -705,7 +725,7 @@ class InklingAttention(nn.Module):
             activation=self.k_sconv.activation,
             use_residual=self.k_sconv.use_residual,
             track_mask=forward_batch.mamba_track_mask,
-            track_indices=forward_batch.mamba_track_indices,
+            track_indices=self.k_sconv._conv_state(forward_batch).track_cache_indices,
             do_store=do_store,
             mxfp8_quant=do_mxfp8_store,
             sfk=sfk,
@@ -735,7 +755,9 @@ class InklingAttention(nn.Module):
 
         apply_log_scaling = log_scaling_tau is not None and not self.is_local
 
-        attention_backend = get_exec().kernel.attention_backend
+        # The kwargs below must describe the backend `self.attn` dispatches
+        # this forward to.
+        attention_backend = serving_attention_backend(forward_batch)
         assert attention_backend in ("fa4", "triton")
         # The overlap threads a CUDA event into the FA4 sheared-bias kernel, so it
         # is FA4-only for now.
@@ -915,7 +937,15 @@ class InklingAttention(nn.Module):
             # stay bf16 here and the MXFP8 pool's set_kv_buffer quantizes and
             # stores them in one fused kernel (absent descales signal it).
 
-        if envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get() and fa4:
+        # The sheared-bias kernel is not batch invariant: its bias tile geometry
+        # follows the query count, so the same absolute (q, k) pair accumulates in
+        # a different order for a few-query decode step than for a many-query
+        # prefill. Deterministic mode takes the score_mod path instead.
+        if (
+            envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get()
+            and fa4
+            and not is_batch_invariant()
+        ):
             # FA4 sheared-bias kernel: pass rel_logits directly; the kernel shears
             # it into a column-aligned pre-softmax bias.
             attn_output = self.attn(

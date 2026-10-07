@@ -20,7 +20,7 @@ from sglang.test.kits.spec_server_kits import (
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
-register_cuda_ci(est_time=480, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=403, stage="base-b", runner_config="1-gpu-small")
 
 _KITS = (
     SpecCorrectnessKit,
@@ -33,7 +33,10 @@ _KITS = (
 
 
 class _Core(Eagle3Base):
-    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
+    env_overrides = (
+        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),
+        (envs.SGLANG_ENABLE_GRAPH_POOL_BORROW, 1),
+    )
 
 
 class TestEagle3Overlap(_Core, *_KITS):

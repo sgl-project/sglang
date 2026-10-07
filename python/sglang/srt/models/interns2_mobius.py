@@ -10,17 +10,26 @@ from sglang.srt.configs.interns2_mobius import (
     InternS2MobiusConfig,
     InternS2MobiusTextConfig,
 )
-from sglang.srt.distributed import get_pp_group, tensor_model_parallel_all_reduce
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
+)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    Fp8Input,
+    NormQuantReadout,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
-)
-from sglang.srt.layers.moe import (
-    should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK
@@ -41,10 +50,9 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForCausalLM,
     Qwen3_5ForConditionalGeneration,
     Qwen3_5GatedDeltaNet,
-    _enable_qwen35_fused_ar_quant,
     _linear_accepts_fp8_tuple,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -91,6 +99,10 @@ def _normalize_mobius_weight_name(name: str) -> str:
     return name
 
 
+def _is_optional_mobius_parameter(name: str) -> bool:
+    return name.endswith((".attn.k_scale", ".attn.v_scale"))
+
+
 def _load_fused_mobius_expert_weight(
     *,
     name: str,
@@ -99,8 +111,17 @@ def _load_fused_mobius_expert_weight(
     num_experts: int,
     record_slot,
 ) -> None:
-    if name.endswith("experts.gate_up_proj"):
-        parameter_name = name.replace("experts.gate_up_proj", "experts.w13_weight")
+    gate_up_suffixes = {
+        "experts.gate_up_proj": "experts.w13_weight",
+        "experts.gate_up_proj_scale_inv": "experts.w13_weight_scale_inv",
+    }
+    gate_up_suffix = next(
+        (suffix for suffix in gate_up_suffixes if name.endswith(suffix)), None
+    )
+    if gate_up_suffix is not None:
+        parameter_name = (
+            name.removesuffix(gate_up_suffix) + gate_up_suffixes[gate_up_suffix]
+        )
         if parameter_name not in params_dict:
             raise KeyError(
                 f"Mobius fused gate/up destination is missing: {parameter_name}"
@@ -127,8 +148,15 @@ def _load_fused_mobius_expert_weight(
                 )
         return
 
-    if name.endswith("experts.down_proj"):
-        parameter_name = name.replace("experts.down_proj", "experts.w2_weight")
+    down_suffixes = {
+        "experts.down_proj": "experts.w2_weight",
+        "experts.down_proj_scale_inv": "experts.w2_weight_scale_inv",
+    }
+    down_suffix = next(
+        (suffix for suffix in down_suffixes if name.endswith(suffix)), None
+    )
+    if down_suffix is not None:
+        parameter_name = name.removesuffix(down_suffix) + down_suffixes[down_suffix]
         if parameter_name not in params_dict:
             raise KeyError(
                 f"Mobius fused down destination is missing: {parameter_name}"
@@ -166,11 +194,15 @@ def _expected_mobius_load_slots(
         if parameter_id in seen_parameters:
             continue
         seen_parameters.add(parameter_id)
-        if ".meta_mlp." in name and name.endswith("experts.w13_weight"):
+        if ".meta_mlp." in name and name.endswith(
+            ("experts.w13_weight", "experts.w13_weight_scale_inv")
+        ):
             for expert_id in range(num_experts):
                 expected.add((name, "w1", expert_id))
                 expected.add((name, "w3", expert_id))
-        elif ".meta_mlp." in name and name.endswith("experts.w2_weight"):
+        elif ".meta_mlp." in name and name.endswith(
+            ("experts.w2_weight", "experts.w2_weight_scale_inv")
+        ):
             for expert_id in range(num_experts):
                 expected.add((name, "w2", expert_id))
         elif ".qkv_proj." in name and name.startswith("model.layers."):
@@ -185,6 +217,8 @@ def _expected_mobius_load_slots(
         elif ".in_proj_ba." in name:
             expected.add((name, 0, None))
             expected.add((name, 1, None))
+        elif _is_optional_mobius_parameter(name):
+            continue
         else:
             expected.add((name, None, None))
     return expected
@@ -215,7 +249,12 @@ def _load_mobius_weights_strict(
 
         name = _normalize_mobius_weight_name(source_name)
         if ".meta_mlp." in name and name.endswith(
-            ("experts.gate_up_proj", "experts.down_proj")
+            (
+                "experts.gate_up_proj",
+                "experts.down_proj",
+                "experts.gate_up_proj_scale_inv",
+                "experts.down_proj_scale_inv",
+            )
         ):
             _load_fused_mobius_expert_weight(
                 name=name,
@@ -250,6 +289,8 @@ def _load_mobius_weights_strict(
                 )
             parameter = params_dict[name]
             loader = getattr(parameter, "weight_loader", default_weight_loader)
+            if _is_optional_mobius_parameter(name):
+                expected_slots.add((name, None, None))
             record_slot(name)
             loader(parameter, loaded_weight)
 
@@ -279,7 +320,6 @@ class InternS2MobiusRoutedExpertBank(nn.Module):
     ) -> None:
         super().__init__()
         self.bank_id = bank_id
-        self.tp_size = get_parallel().tp_size
         self.num_experts = config.num_experts
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -339,15 +379,6 @@ class InternS2MobiusRoutedExpertBank(nn.Module):
         return output.reshape(original_shape)
 
 
-def _mobius_reduce_combined_output(combined: torch.Tensor) -> torch.Tensor:
-    """Apply the one ordinary TP reduction unless the scoped runtime owns it."""
-    if get_parallel().tp_size > 1 and not should_skip_post_experts_all_reduce(
-        is_tp_path=True
-    ):
-        return tensor_model_parallel_all_reduce(combined)
-    return combined
-
-
 def _get_mobius_routed_bank(meta_mlp: nn.ModuleList, layer_id: int) -> nn.Module:
     if not meta_mlp:
         raise ValueError(
@@ -388,33 +419,19 @@ class _InternS2MobiusDecoderMixin:
         routed = _get_mobius_routed_bank(meta_mlp, self.layer_id).forward_routed(
             hidden_states, forward_batch
         )
-        return _mobius_reduce_combined_output(routed + shared)
+        return routed + shared
 
     def _forward_after_attention(
         self,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
         forward_batch: ForwardBatch,
         meta_mlp: nn.ModuleList,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        # Model-side all-reduce fusion is intentionally disabled for baseline.
-        with get_forward().scoped(
-            fuse_mlp_allreduce=False,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
-            hidden_states = self._forward_mobius_mlp(
-                hidden_states, forward_batch, meta_mlp
-            )
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
-        return hidden_states, residual
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        hidden_states = self._forward_mobius_mlp(hidden_states, forward_batch, meta_mlp)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        return hidden_states
 
 
 class InternS2MobiusLayerMlp(nn.Module):
@@ -462,52 +479,45 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
 
         layer_prefix = prefix.removesuffix(".linear_attn")
         self._init_mobius_mlp(config, quant_config, layer_prefix)
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=True,
-            is_previous_layer_sparse=True,
-            is_next_layer_sparse=True,
-        )
+
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        enable_fused_ar_quant = (
-            _enable_qwen35_fused_ar_quant()
-            and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
-        )
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
-            enable_fused_ar_quant=enable_fused_ar_quant,
-            fused_ar_quant_keep_bf16=enable_fused_ar_quant,
+        accepts_fp8_input = _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (
+                declare_attn(
+                    read=NormQuantReadout(
+                        fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None
+                    )
+                ),
+                self.input_layernorm,
+            ),
+            (
+                declare_ffn(
+                    sparse=True,
+                    next_layer_sparse=True,
+                ),
+                self.post_attention_layernorm,
+            ),
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
         meta_mlp: nn.ModuleList,
         **kwargs,
     ):
         forward_batch = kwargs["forward_batch"]
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=kwargs.get("captured_last_layer_outputs"),
-            )
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            capture_gathered=kwargs.get("captured_last_layer_outputs"),
         )
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.linear_attn(hidden_states, forward_batch)
-        return self._forward_after_attention(
-            hidden_states, residual, forward_batch, meta_mlp
-        )
+        return self._forward_after_attention(hidden_states, forward_batch, meta_mlp)
 
 
 class InternS2MobiusAttentionDecoderLayer(
@@ -595,30 +605,30 @@ class InternS2MobiusAttentionDecoderLayer(
 
         layer_prefix = prefix.removesuffix(".self_attn")
         self._init_mobius_mlp(config, quant_config, layer_prefix)
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=True,
-            is_previous_layer_sparse=True,
-            is_next_layer_sparse=True,
-        )
+
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        enable_fused_ar_quant = (
-            _enable_qwen35_fused_ar_quant() and _linear_accepts_fp8_tuple(self.qkv_proj)
-        )
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
-            enable_fused_ar_quant=enable_fused_ar_quant,
-            fused_ar_quant_keep_bf16=False,
+        accepts_fp8_input = _linear_accepts_fp8_tuple(self.qkv_proj)
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (
+                declare_attn(
+                    read=NormQuantReadout(
+                        fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
+                    )
+                ),
+                self.input_layernorm,
+            ),
+            (
+                declare_ffn(
+                    sparse=True,
+                    next_layer_sparse=True,
+                ),
+                self.post_attention_layernorm,
+            ),
         )
         self.alt_stream = alt_stream
 
@@ -626,20 +636,16 @@ class InternS2MobiusAttentionDecoderLayer(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
         forward_batch: ForwardBatch,
         meta_mlp: nn.ModuleList,
-        captured_last_layer_outputs: list[torch.Tensor] | None = None,
+        captured_last_layer_outputs: AuxHiddenStateAccumulator | None = None,
         **kwargs,
     ):
         del kwargs
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-            )
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            capture_gathered=captured_last_layer_outputs,
         )
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.self_attention(
@@ -647,9 +653,7 @@ class InternS2MobiusAttentionDecoderLayer(
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        return self._forward_after_attention(
-            hidden_states, residual, forward_batch, meta_mlp
-        )
+        return self._forward_after_attention(hidden_states, forward_batch, meta_mlp)
 
 
 class InternS2MobiusForCausalLM(Qwen3_5ForCausalLM):
@@ -662,7 +666,7 @@ class InternS2MobiusForCausalLM(Qwen3_5ForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.hidden_size = config.hidden_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         if self.pp_group.world_size != 1:
             raise ValueError(
                 "Intern-S2-Mobius baseline does not support pipeline parallelism"
@@ -748,20 +752,17 @@ class InternS2MobiusForCausalLM(Qwen3_5ForCausalLM):
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
-        residual = None
-        aux_hidden_states = []
+        residual_batch.start(forward_batch)
+        aux_hidden_states = AuxHiddenStateList()
         for layer_idx, layer in enumerate(self.layers):
-            hidden_states, residual = layer(
+            hidden_states = layer(
                 positions=positions,
                 hidden_states=hidden_states,
-                residual=residual,
                 forward_batch=forward_batch,
                 meta_mlp=self.meta_mlp,
-                captured_last_layer_outputs=(
-                    aux_hidden_states
-                    if getattr(layer, "_is_layer_to_capture", False)
-                    else None
-                ),
+                captured_last_layer_outputs=aux_hidden_states
+                if getattr(layer, "_is_layer_to_capture", False)
+                else None,
             )
             if (
                 input_deepstack_embeds is not None
@@ -769,15 +770,15 @@ class InternS2MobiusForCausalLM(Qwen3_5ForCausalLM):
                 and layer_idx < 3
             ):
                 start = self.hidden_size * layer_idx
-                hidden_states.add_(
-                    input_deepstack_embeds[:, start : start + self.hidden_size]
+                hidden_states = residual_batch.add_to_output(
+                    hidden_states,
+                    forward_batch,
+                    input_deepstack_embeds[:, start : start + self.hidden_size],
                 )
 
-        if hidden_states.shape[0] != 0:
-            if residual is None:
-                hidden_states = self.norm(hidden_states)
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
         return (
             hidden_states
             if not aux_hidden_states
@@ -802,6 +803,16 @@ class InternS2MobiusForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         prefix: str = "",
         language_model_cls=InternS2MobiusForCausalLM,
     ) -> None:
+        ignored_layers = getattr(quant_config, "ignored_layers", None)
+        if (
+            getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+            and ignored_layers
+        ):
+            # HF treats these parent entries as exact names; SGLang prefix matching
+            # would also skip their quantized qkv/z and output projections.
+            quant_config.ignored_layers = [
+                name for name in ignored_layers if not name.endswith(".linear_attn")
+            ]
         super().__init__(config, quant_config, prefix, language_model_cls)
 
     def should_apply_lora(self, module_name: str) -> bool:

@@ -1,35 +1,39 @@
 //! OpenAI-compatible generation endpoints.
 //!
 //! The HTTP adapter stays deliberately thin: Dynamo owns the standard OpenAI
-//! request and response primitives. Native [`ChunkEvent`] values remain the one
-//! backend output type for both unary and streaming responses.
+//! request and response primitives. [`FrontendOutput`] remains the one backend
+//! output type for both unary and streaming responses.
 
 use axum::{Router, http::StatusCode, response::Response};
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use std::sync::Arc;
 
 mod chat;
 mod completions;
 mod models;
 mod reasoning;
 mod template;
+mod template_builtins;
+mod template_legacy;
+mod template_loader;
 mod tools;
 
-pub(super) use template::ChatFormatter;
+pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
 
-use super::AppState;
+use super::app::AppState;
 use super::frame::OutputAccumulator;
-use super::guard::AbortGuard;
-use super::submit::submit;
-use crate::ids::Rid;
-use crate::message::{ChunkEvent, EgressItem, GenerateRequest, RequestKind};
-use crate::runtime::ServerArgs;
+use super::frontend_error_status;
+use crate::frontend::{
+    FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest,
+};
+use crate::message::config::ServerArgs;
+use crate::tokenizer_manager::tokenizer;
 use crate::utils::response::error_response;
 
 const MAX_OPENAI_CHOICES: usize = 4096;
 
 /// The routes this module owns, mounted by `api_server::serve`.
-pub(super) fn routes() -> Router<AppState> {
+pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(models::routes())
         .merge(completions::routes())
@@ -47,7 +51,7 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
     if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
         return None;
     }
-    let config_file = crate::tokenizer::resolve_model_file(
+    let config_file = tokenizer::resolve_model_file(
         &server_args.tokenizer_path,
         server_args.revision.as_deref(),
         "tokenizer_config.json",
@@ -56,6 +60,7 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
     match template::load_chat_formatter(
         config_file.as_deref(),
         (!server_args.model_path.is_empty()).then_some(server_args.model_path.as_str()),
+        server_args.model_config.model_type.as_deref(),
         server_args.chat_template.as_deref(),
     ) {
         Ok(formatter) => {
@@ -110,29 +115,22 @@ pub(super) fn openai_error(code: StatusCode, message: impl Into<String>, stream:
     error_response(code, error_payload(code, message), stream)
 }
 
-/// Drain one submitted request to its terminal output: fold frames, disarm
-/// `guard` on a natural terminal, and map errors / validation aborts /
-/// truncation to `(status, message)` for the OpenAI error shape.
-async fn collect_output(
-    mut rx: mpsc::Receiver<EgressItem>,
-    guard: &mut AbortGuard,
-    rid: &Rid,
-) -> Result<ChunkEvent, (StatusCode, String)> {
+/// Drain one submitted request to its terminal output, fold frames, and map
+/// semantic failures / truncation to `(status, message)` for the OpenAI error
+/// shape. The call owns cancellation and disarms itself.
+async fn collect_output(mut call: FrontendCall) -> Result<FrontendOutput, (StatusCode, String)> {
     let mut accumulator = OutputAccumulator::default();
     let output = loop {
-        match rx.recv().await {
-            Some(EgressItem::Frame(output)) => accumulator.fold(&output),
-            Some(EgressItem::Done(output)) => {
+        match call.recv().await {
+            Some(FrontendEvent::Delta(output)) => accumulator.fold(&output),
+            Some(FrontendEvent::Finished(output)) => {
                 accumulator.fold(&output);
                 break accumulator.into_output();
             }
-            Some(EgressItem::Error(error)) => {
-                guard.disarm(rid);
-                let status = StatusCode::from_u16(error.http_status())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            Some(FrontendEvent::Failed(error)) => {
+                let status = frontend_error_status(&error);
                 return Err((status, error.to_string()));
             }
-            Some(EgressItem::Control(_)) | Some(EgressItem::Data(_)) => {}
             None => {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -141,57 +139,43 @@ async fn collect_output(
             }
         }
     };
-    guard.disarm(rid);
-    if let Some((code, message)) = output
-        .finish_reason
-        .as_ref()
-        .and_then(|reason| reason.abort_status())
-    {
-        return Err((
-            StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            message.to_owned(),
-        ));
-    }
     Ok(output)
 }
 
 async fn submit_generation(
     state: &AppState,
-    request: GenerateRequest,
+    request: FrontendRequest,
     stream: bool,
-    guard: &mut AbortGuard,
-) -> Result<mpsc::Receiver<EgressItem>, Response> {
-    match submit(state, RequestKind::Generate(Box::new(request)), stream).await {
-        Ok((rid, rx)) => {
-            guard.arm(rid);
-            Ok(rx)
-        }
+) -> Result<FrontendCall, Response> {
+    match state.frontend.generate(request).await {
+        Ok(call) => Ok(call),
         // Same `error_response` rule: a committed stream gets 200 plus an
         // SSE error frame + `[DONE]`, not a unary 503 — but with the OpenAI
         // error shape, since this is the OpenAI frontend.
-        Err(_) => Err(openai_error(
+        Err(FrontendError::Unavailable) => Err(openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "service unavailable",
+            stream,
+        )),
+        Err(error) => Err(openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.to_string(),
             stream,
         )),
     }
 }
 
-fn indexed_egress_stream(
+fn indexed_decode_stream(
     index: usize,
-    rx: mpsc::Receiver<EgressItem>,
-) -> futures::stream::BoxStream<'static, (usize, Option<EgressItem>)> {
-    futures::stream::unfold((rx, false), move |(mut rx, finished)| async move {
+    call: FrontendCall,
+) -> futures::stream::BoxStream<'static, (usize, FrontendEvent)> {
+    futures::stream::unfold((call, false), move |(mut call, finished)| async move {
         if finished {
             return None;
         }
-        match rx.recv().await {
-            Some(item) => {
-                let finished = matches!(item, EgressItem::Done(_) | EgressItem::Error(_));
-                Some(((index, Some(item)), (rx, finished)))
-            }
-            None => Some(((index, None), (rx, true))),
-        }
+        let event = call.recv().await?;
+        let finished = event.is_terminal();
+        Some(((index, event), (call, finished)))
     })
     .boxed()
 }

@@ -3,13 +3,24 @@ from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
+from prometheus_client import CollectorRegistry
 
-from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.lora.linear import (
+    BaseLayerWithLoRA,
+    _use_owned_base_snapshot,
+    wrap_with_lora_layer,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
-_RANK_PATCH = "sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline.dist.get_rank"
+_RANK_PATCH = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline.dist.get_rank"
 
 
 class _TestLoRAPipeline(LoRAPipeline):
@@ -24,7 +35,11 @@ def _make_layer() -> BaseLayerWithLoRA:
 def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline = object.__new__(_TestLoRAPipeline)
     pipeline.modules = {"transformer": torch.nn.Module()}
-    pipeline.server_args = SimpleNamespace(lora_merge_mode="dynamic")
+    pipeline.server_args = SimpleNamespace(
+        lora_alpha=None,
+        lora_merge_mode="dynamic",
+        model_path="/model",
+    )
     pipeline.lora_initialized = True
     pipeline.lora_adapters = defaultdict(dict)
     pipeline.loaded_adapter_paths = {"adapter": "/adapter"}
@@ -41,6 +56,134 @@ def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline.lora_adapters["adapter"]["linear.lora_A"] = torch.ones(1, 2)
     pipeline.lora_adapters["adapter"]["linear.lora_B"] = torch.ones(2, 1)
     return pipeline
+
+
+def test_worker_metrics_count_individual_adapters_in_multi_lora():
+    pipeline = _make_pipeline(_make_layer())
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: nullcontext([])
+    pipeline.loaded_adapter_paths["second"] = "/second"
+    pipeline.loaded_adapter_alphas["second"] = None
+    pipeline.lora_adapters["second"] = pipeline.lora_adapters["adapter"]
+    registry = CollectorRegistry()
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.pipeline = pipeline
+    worker.metrics = DiffusionMetrics(role="monolithic", replica="0", registry=registry)
+    with patch(_RANK_PATCH, return_value=0):
+        worker.set_lora(
+            ["adapter", "second"],
+            [None, None],
+            target="transformer",
+            strength=[0.5, 0.5],
+            merge_mode="merge",
+        )
+    assert (
+        registry.get_sample_value(
+            "sglang:diffusion_lora_active_adapters",
+            {"role": "monolithic", "replica": "0"},
+        )
+        == 2
+    )
+    assert pipeline.get_lora_status()["active"]["transformer"][0]["nicknames"] == [
+        "adapter",
+        "second",
+    ]
+
+
+@pytest.mark.parametrize("operation", ["set", "merge", "unmerge", "deactivate"])
+@torch.no_grad()
+def test_lora_mutations_preserve_independent_conditioning(operation):
+    layer = _make_layer()
+    pipeline = _make_pipeline(layer)
+    pipeline.modules["transformer"].add_module("linear", layer)
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: nullcontext([])
+    encoder = torch.nn.Linear(2, 2).eval()
+    cache = ConditioningCache(1024)
+    x = torch.ones(1, 2)
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora("adapter", merge_mode="dynamic")
+        cache.run(encoder, "forward", (x,), {}, lambda: encoder(x))
+        cache.run(layer, "forward", (x,), {}, lambda: x.clone())
+        if operation == "set":
+            pipeline.set_lora("adapter", strength=0.5, merge_mode="dynamic")
+        elif operation == "merge":
+            pipeline.merge_lora_weights()
+        elif operation == "unmerge":
+            pipeline.unmerge_lora_weights()
+        else:
+            pipeline.deactivate_lora_weights()
+        cached = cache.run(encoder, "forward", (x,), {}, lambda: encoder(x))
+        cache.run(layer, "forward", (x,), {}, lambda: x.clone())
+    torch.testing.assert_close(cached, encoder(x), rtol=0, atol=0)
+    assert cache.hits == 1
+    assert cache.misses == 3
+
+
+def test_merge_cache_only_accepts_cpu_backed_weights():
+    pipeline = _make_pipeline(_make_layer())
+    cpu_cache = pipeline._merge_cache_for(
+        "transformer",
+        pipeline.lora_layers,
+        ["/adapter"],
+        [1.0],
+        enabled=True,
+    )
+    assert cpu_cache is not None
+
+    resident_layer = BaseLayerWithLoRA(
+        torch.nn.Linear(2, 2, bias=False, device="meta"), snapshot_base=False
+    )
+    resident_cache = pipeline._merge_cache_for(
+        "transformer",
+        {"linear": resident_layer},
+        ["/adapter"],
+        [1.0],
+        enabled=True,
+    )
+    assert resident_cache is None
+
+
+def test_zero_copy_snapshot_is_limited_to_cpu_backed_layers():
+    assert not _use_owned_base_snapshot(False, "cpu")
+    assert not _use_owned_base_snapshot(False, "meta")
+    assert _use_owned_base_snapshot(False, "cuda")
+    assert not _use_owned_base_snapshot(False, "cuda", numel=1)
+    assert _use_owned_base_snapshot(True, "cpu")
+
+    cpu_layer = wrap_with_lora_layer(
+        torch.nn.Linear(2, 2, bias=False), snapshot_base=False
+    )
+    assert cpu_layer is not None
+    assert cpu_layer._base_is_view
+
+    meta_layer = wrap_with_lora_layer(
+        torch.nn.Linear(2, 2, bias=False, device="meta"), snapshot_base=False
+    )
+    assert meta_layer is not None
+    assert meta_layer._base_is_view
+
+
+def test_quantized_base_uses_dynamic_lora_in_auto_mode():
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.quantization.fp8."
+        "get_tensor_model_parallel_world_size",
+        return_value=1,
+    ):
+        base_layer = ReplicatedLinear(
+            2,
+            2,
+            bias=False,
+            quant_config=Fp8Config(is_checkpoint_fp8_serialized=True),
+        )
+    layer = BaseLayerWithLoRA(base_layer)
+    pipeline = _make_pipeline(layer)
+
+    assert not pipeline._should_merge_lora_for_layers(
+        "transformer", {"linear": layer}, "auto"
+    )
+    with pytest.raises(ValueError, match="use merge mode 'dynamic'"):
+        pipeline._should_merge_lora_for_layers(
+            "transformer", {"linear": layer}, "merge"
+        )
 
 
 def test_dynamic_lora_reactivates_cached_layers_without_weight_update_context():
@@ -142,20 +285,120 @@ def test_lora_alpha_override_updates_cached_adapter_scale():
     assert layer.lora_alpha == 8
 
 
-def test_pinned_lora_weight_limits_snapshot_download(tmp_path):
+def test_lora_tree_url_selects_one_pinned_weight(tmp_path):
     weight_name = "adapter-v4.safetensors"
-    weight_path = tmp_path / weight_name
+    adapter_dir = tmp_path / "adapters"
+    adapter_dir.mkdir()
+    weight_path = adapter_dir / weight_name
     weight_path.touch()
+    model_info = SimpleNamespace(
+        sha="immutable-sha",
+        siblings=[
+            SimpleNamespace(rfilename="adapters/adapter-v3.safetensors"),
+            SimpleNamespace(rfilename="adapters/adapter-v4.safetensors"),
+        ],
+    )
 
     download_target = (
         "sglang.multimodal_gen.runtime.utils.hf_diffusers_utils.maybe_download_model"
     )
-    with patch(download_target, return_value=str(tmp_path)) as download:
-        actual = maybe_download_lora("org/multi-adapter", weight_name=weight_name)
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.weights.source.HfApi.model_info",
+            return_value=model_info,
+        ),
+        patch(download_target, return_value=str(tmp_path)) as download,
+    ):
+        actual = maybe_download_lora(
+            "https://huggingface.co/org/multi-adapter/tree/main/adapters",
+            weight_name=weight_name,
+        )
+
+    assert actual == str(weight_path)
+    assert download.call_args.args[0] == "org/multi-adapter"
+    assert download.call_args.kwargs["revision"] == "immutable-sha"
+    assert download.call_args.kwargs["allow_patterns"] == [
+        "*.json",
+        "adapters/*.json",
+        f"adapters/{weight_name}",
+    ]
+
+
+def test_lora_exact_file_url_needs_no_weight_name(tmp_path):
+    weight_path = tmp_path / "adapter.safetensors"
+    weight_path.touch()
+    model_info = SimpleNamespace(
+        sha="immutable-sha",
+        siblings=[
+            SimpleNamespace(rfilename="adapter.safetensors"),
+            SimpleNamespace(rfilename="other.safetensors"),
+        ],
+    )
+
+    download_target = (
+        "sglang.multimodal_gen.runtime.utils.hf_diffusers_utils.maybe_download_model"
+    )
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.weights.source.HfApi.model_info",
+            return_value=model_info,
+        ),
+        patch(download_target, return_value=str(tmp_path)) as download,
+    ):
+        actual = maybe_download_lora(
+            "https://huggingface.co/org/multi-adapter/resolve/main/adapter.safetensors"
+        )
 
     assert actual == str(weight_path)
     assert download.call_args.kwargs["allow_patterns"] == [
         "*.json",
-        weight_name,
-        f"**/{weight_name}",
+        "adapter.safetensors",
     ]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("offloaded", [False, True])
+def test_view_merge_restores_exact_base_after_strength_changes(dtype, offloaded):
+    torch.manual_seed(0)
+    base = torch.nn.Linear(4, 4, bias=False, dtype=dtype)
+    original = base.weight.detach().clone()
+    layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2, snapshot_base=False)
+    assert layer is not None
+    assert layer._base_is_view
+    stored = base.weight.detach()
+    if offloaded:
+        base._packed_weight_cpu = stored
+        base.weight.data = torch.empty(1, dtype=dtype)
+    A = torch.randn(2, 4)
+    B = torch.randn(4, 2)
+    layer.set_lora_weights(A, B, clear_existing=True, merge_weights=False)
+    assert layer._base_is_view
+    for strength in (1.0, 0.0, 0.5, 1.0):
+        layer.set_lora_weights(
+            A, B, strength=strength, clear_existing=True, merge_weights=True
+        )
+        assert layer.merged
+        assert not layer._base_is_view
+        torch.testing.assert_close(layer.cpu_weight, original, rtol=0, atol=0)
+        if strength == 0:
+            torch.testing.assert_close(stored, original, rtol=0, atol=0)
+        else:
+            assert not torch.equal(stored, original)
+    layer.unmerge_lora_weights()
+    torch.testing.assert_close(stored, original, rtol=0, atol=0)
+    assert not layer.merged
+
+
+def test_cached_merge_restores_untouched_base_view():
+    base = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+    original = base.weight.detach().clone()
+    layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2, snapshot_base=False)
+    layer.set_lora_weights(torch.ones(2, 4), torch.ones(4, 2), merge_weights=False)
+    layer.install_merged_weight(original + 2, base.weight.detach())
+    assert layer._base_is_view
+    torch.testing.assert_close(layer.cpu_weight, original, rtol=0, atol=0)
+    layer.unmerge_lora_weights()
+    torch.testing.assert_close(base.weight, original, rtol=0, atol=0)
+    layer.merge_lora_weights(strength=0.5)
+    layer.unmerge_lora_weights()
+    torch.testing.assert_close(base.weight, original, rtol=0, atol=0)

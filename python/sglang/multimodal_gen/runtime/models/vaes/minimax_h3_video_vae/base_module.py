@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Transformer building blocks for the MiniMax H3 visual VAE ViT decoder.
+import functools
 import math
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -11,9 +13,9 @@ from diffusers.utils.torch_utils import maybe_allow_in_graph
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
-from sglang.kernels.ops.diffusion.triton.scale_shift import (
-    try_fused_scaled_residual_add_exact,
-)
+from sglang.kernels.ops.diffusion import try_fused_scaled_residual_add_exact
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 from .attention import Attention
 from .vit_utils import _env_flag, _vit_torch_compile_kwargs
@@ -30,6 +32,33 @@ def _vit_norm_input(module, hidden_states):
 def _scaled_residual_add(residual, x, scale):
     fused = try_fused_scaled_residual_add_exact(residual, x, scale)
     return residual + x * scale if fused is None else fused
+
+
+@functools.lru_cache(maxsize=1)
+def _is_sm120() -> bool:
+    return bool(current_platform.is_sm120())
+
+
+def _unfused_bias_linear(
+    linear: nn.Linear, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """``linear`` as a plain matmul plus a separate bias add on SM12.x.
+
+    For the decoder's w2 shape ([~1800, 8192] x [8192, 2048], fp16/bf16) the
+    fused ``addmm`` epilogue makes cuBLAS on a GB10 pick a 16x16 wmma kernel
+    that runs at 14 TFLOPS; the same product without the fused bias runs at
+    76-91 TFLOPS (measured: 4.0 ms -> 0.8 ms per call, 3780 calls per decode).
+    """
+    if (
+        linear.bias is None
+        or not hidden_states.is_cuda
+        or hidden_states.dtype != linear.weight.dtype
+        or not _is_sm120()
+    ):
+        return linear(hidden_states)
+    out = torch.matmul(hidden_states, linear.weight.t())
+    out += linear.bias
+    return out
 
 
 class FeedForward(nn.Module):
@@ -63,6 +92,12 @@ class FeedForward(nn.Module):
         else:
             raise ValueError(f"Unsupported activation function: {activation_fn}")
 
+        self.silu_and_mul = (
+            SiluAndMul()
+            if use_gated and activation_fn == "silu" and current_platform.is_npu()
+            else None
+        )
+
         self.w2 = nn.Linear(inner_dim, dim_out, bias=bias)
         self._compile_forward_enabled = _env_flag(
             "MINIMAX_H3_VAE_DECODER_VIT_FF_TORCH_COMPILE", "0"
@@ -84,13 +119,15 @@ class FeedForward(nn.Module):
                 and hidden_states.shape[-1] % 32 == 0
             ):
                 hidden_states = silu_and_mul_with_activation_rounding(hidden_states)
+            elif self.silu_and_mul is not None:
+                hidden_states = self.silu_and_mul(hidden_states)
             else:
                 gate, hidden_states = hidden_states.chunk(2, dim=-1)
                 hidden_states = self.act_fn(gate).mul_(hidden_states)
         else:
             hidden_states = self.act_fn(hidden_states)
 
-        hidden_states = self.w2(hidden_states)
+        hidden_states = _unfused_bias_linear(self.w2, hidden_states)
         return hidden_states
 
     def _get_forward_impl(self):
@@ -173,7 +210,10 @@ class RotaryEmbeddingND(nn.Module):
         if D != self.n_dim:
             raise ValueError(f"Expected {self.n_dim} dimensions, got {D}")
 
-        with torch.autocast("cuda", enabled=False):
+        autocast_context = (
+            torch.autocast("cuda", enabled=False) if img_ids.is_cuda else nullcontext()
+        )
+        with autocast_context:
             angles = (
                 self.angle_scale
                 * img_ids[:, :, :, None]
@@ -256,12 +296,11 @@ class TransformerBlock(nn.Module):
         self,
         hidden_states: torch.FloatTensor,
         rotary_pos_emb: Optional[torch.FloatTensor] = None,
-        pack_info: dict = {},
     ):
         norm_hidden_states = self.norm1(_vit_norm_input(self.norm1, hidden_states)).to(
             hidden_states.dtype
         )
-        attn_output = self.attn(norm_hidden_states, rotary_pos_emb, pack_info)
+        attn_output = self.attn(norm_hidden_states, rotary_pos_emb)
         if self.use_scale:
             hidden_states = _scaled_residual_add(
                 hidden_states, attn_output, self.scale1

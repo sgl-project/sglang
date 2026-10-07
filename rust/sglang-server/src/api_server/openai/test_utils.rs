@@ -3,7 +3,7 @@
 //! Submodule tests live next to the code they cover: `chat`, `completions`,
 //! `tools`, and `reasoning` each carry their own
 //! `#[cfg(test)] mod tests`. This module keeps the fixtures they all share —
-//! channel fixtures (`senders`, `chunk`, `submitted`, `chat_submitted`) and the
+//! frontend/call fixtures (`frontend`, `chunk`, `submitted`, `chat_submitted`) and the
 //! full-router harness (`server_args`, `app_state`,
 //! `oneshot`, `post_json`, `body_json`) — plus the handler-level tests that
 //! exercise [`routes`] end to end. The helpers are `pub(super)` so sibling
@@ -15,25 +15,30 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
+use futures::StreamExt;
 use serde_json::json;
 use tower::util::ServiceExt;
 
-use super::{openai_error, routes};
-use crate::ids::Rid;
-use crate::message::{ChunkEvent, EgressItem};
-use crate::runtime::ServerArgs;
-use crate::tokenizer_manager::Senders;
-
-pub(super) fn senders() -> Senders {
-    Senders {
-        tm: flume::unbounded().0,
-        abort: flume::unbounded().0,
-        tok: flume::unbounded().0,
-        detok: vec![],
-    }
+use super::{indexed_decode_stream, openai_error, routes};
+use crate::frontend::{FrontendCall, FrontendEvent, FrontendHandle};
+use crate::message::config::ServerArgs;
+use crate::message::response::{ChunkEvent, ResponseItem};
+pub(super) fn frontend() -> FrontendHandle {
+    FrontendHandle::new(
+        flume::unbounded().0,
+        flume::unbounded().0,
+        crate::frontend::FrontendConfig {
+            response_capacity: 8,
+            response_activity: Default::default(),
+            startup_ready: false,
+            is_disaggregation: false,
+            mm_limits: Default::default(),
+            metadata: crate::frontend::FrontendMetadata::from(server_args().as_ref()),
+        },
+    )
 }
 
-pub(super) fn chunk(rid: &str, text: &str, done: bool) -> EgressItem {
+pub(super) fn chunk(rid: &str, text: &str, done: bool) -> ResponseItem {
     let output = ChunkEvent {
         rid: rid.into(),
         text: text.into(),
@@ -50,87 +55,85 @@ pub(super) fn chunk(rid: &str, text: &str, done: bool) -> EgressItem {
         ..Default::default()
     };
     if done {
-        EgressItem::Done(output)
+        ResponseItem::Done(output)
     } else {
-        EgressItem::Frame(output)
+        ResponseItem::Frame(output)
     }
 }
 
-/// A submitted legacy completion choice with its egress channel.
+/// A submitted legacy completion choice.
 pub(super) fn submitted(
     index: usize,
     prompt_index: usize,
     rid: &str,
 ) -> (
     super::completions::SubmittedChoice,
-    tokio::sync::mpsc::Sender<EgressItem>,
+    tokio::sync::mpsc::Sender<ResponseItem>,
 ) {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     (
         super::completions::SubmittedChoice {
             index,
             prompt_index,
-            rid: rid.into(),
             echo: String::new(),
-            rx,
+            call: FrontendCall::from_test_generation_parts(rid.into(), rx, flume::unbounded().0),
         },
         tx,
     )
 }
 
-/// A submitted chat choice (the tuple `chat_event_stream` consumes) with its
-/// egress channel.
+/// A submitted chat choice (the tuple `chat_event_stream` consumes).
 pub(super) fn chat_submitted(
     index: usize,
     rid: &str,
 ) -> (
-    (usize, Rid, tokio::sync::mpsc::Receiver<EgressItem>),
-    tokio::sync::mpsc::Sender<EgressItem>,
+    (usize, FrontendCall),
+    tokio::sync::mpsc::Sender<ResponseItem>,
 ) {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
-    ((index, rid.into(), rx), tx)
-}
-
-// ---------------------------------------------------------------------
-// Handler-level tests: full router, real extractors, no scheduler. A
-// request that reaches `submit` with an OPEN tm lane would wait on the
-// egress receiver forever, so submission-reaching cases use `senders_closed`
-// (503) and everything else fails validation before submit.
-// ---------------------------------------------------------------------
-
-pub(super) fn server_args() -> Arc<ServerArgs> {
-    Arc::new(
-        serde_json::from_value(serde_json::json!({ "served_model_name": "model" }))
-            .expect("ServerArgs must deserialize"),
+    (
+        (
+            index,
+            FrontendCall::from_test_generation_parts(rid.into(), rx, flume::unbounded().0),
+        ),
+        tx,
     )
 }
 
-pub(super) fn app_state(senders: Senders) -> super::AppState {
-    super::AppState {
-        senders,
-        egress_buf: 8,
-        server_args: server_args(),
-        chat_formatter: None,
-        egress_activity: Default::default(),
-    }
+pub(super) fn server_args() -> Arc<ServerArgs> {
+    Arc::new(ServerArgs {
+        served_model_name: "model".into(),
+        ..Default::default()
+    })
 }
 
-pub(super) fn senders_closed() -> Senders {
-    // Dropping the receivers disconnects the channels; the senders stay
-    // valid (moveable) but every send reports `Err`, the shutdown state
-    // `submit` surfaces as a 503.
+pub(super) fn app_state(frontend: FrontendHandle) -> Arc<super::AppState> {
+    Arc::new(super::AppState {
+        frontend,
+        server_args: server_args(),
+        chat_formatter: None,
+    })
+}
+
+pub(super) fn frontend_closed() -> FrontendHandle {
+    // Dropping the receivers makes frontend admission report the shutdown
+    // state as a 503.
     let (tm_tx, tm_rx) = flume::unbounded();
     drop(tm_rx);
     let (abort_tx, abort_rx) = flume::unbounded();
     drop(abort_rx);
-    let (tok_tx, tok_rx) = flume::unbounded();
-    drop(tok_rx);
-    Senders {
-        tm: tm_tx,
-        abort: abort_tx,
-        tok: tok_tx,
-        detok: vec![],
-    }
+    FrontendHandle::new(
+        tm_tx,
+        abort_tx,
+        crate::frontend::FrontendConfig {
+            response_capacity: 8,
+            response_activity: Default::default(),
+            startup_ready: false,
+            is_disaggregation: false,
+            mm_limits: Default::default(),
+            metadata: crate::frontend::FrontendMetadata::from(server_args().as_ref()),
+        },
+    )
 }
 
 /// Serve one request through the full router (extractors, auth, routing).
@@ -155,6 +158,29 @@ pub(super) async fn body_json(response: Response) -> serde_json::Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn dropping_indexed_stream_aborts_its_live_call() {
+    use crate::tokenizer_manager::wiring::AbortSource;
+
+    let (response_tx, response_rx) = tokio::sync::mpsc::channel(8);
+    let (abort_tx, abort_rx) = flume::unbounded();
+    let call = FrontendCall::from_test_generation_parts("live".into(), response_rx, abort_tx);
+    let mut stream = indexed_decode_stream(0, call);
+
+    response_tx.send(chunk("live", "x", false)).await.unwrap();
+    assert!(matches!(
+        stream.next().await,
+        Some((0, FrontendEvent::Delta(_)))
+    ));
+
+    drop(stream);
+    assert!(matches!(
+        abort_rx.recv().unwrap(),
+        AbortSource::Guard(rid) if rid.as_str() == "live"
+    ));
+    assert!(abort_rx.try_recv().is_err());
 }
 
 /// The common StatusCode→error helper follows `error_response`'s shape:
@@ -191,7 +217,7 @@ async fn openai_error_response_covers_unary_and_sse() {
 
 #[tokio::test]
 async fn completions_handler_validates_before_submit() {
-    let app = routes().with_state(app_state(senders()));
+    let app = routes().with_state(app_state(frontend()));
     let cases = [
         (json!({"model": "other", "prompt": "hi"}), "unknown model"),
         (json!({"model": "model", "prompt": "hi", "n": 0}), "n=0"),
@@ -227,7 +253,7 @@ async fn completions_handler_validates_before_submit() {
     let response = oneshot(app.clone(), req).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     // A closed tm inbox (shutdown) surfaces as 503.
-    let app = routes().with_state(app_state(senders_closed()));
+    let app = routes().with_state(app_state(frontend_closed()));
     let response = post_json(
         app.clone(),
         "/v1/completions",
@@ -239,7 +265,7 @@ async fn completions_handler_validates_before_submit() {
 
 #[tokio::test]
 async fn chat_handler_validates_before_submit() {
-    let app = routes().with_state(app_state(senders()));
+    let app = routes().with_state(app_state(frontend()));
     let cases = [
         (
             json!({"model": "other", "messages": [{"role": "user", "content": "hi"}]}),
@@ -283,7 +309,7 @@ async fn chat_handler_validates_before_submit() {
 
 #[tokio::test]
 async fn basic_openai_router_excludes_responses_api() {
-    let app = routes().with_state(app_state(senders()));
+    let app = routes().with_state(app_state(frontend()));
     let response = post_json(app, "/v1/responses", json!({"input": "hi"})).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
@@ -293,7 +319,7 @@ async fn basic_openai_router_excludes_responses_api() {
 /// same `error_response` rule the native API applies), not a unary 503.
 #[tokio::test]
 async fn streaming_submit_failure_answers_inside_the_stream() {
-    let app = routes().with_state(app_state(senders_closed()));
+    let app = routes().with_state(app_state(frontend_closed()));
     let response = post_json(
         app,
         "/v1/completions",

@@ -1,6 +1,7 @@
 ---
 paths:
   - "test/**/*.py"
+  - "python/sglang/multimodal_gen/test/**/*.py"
 ---
 
 # Unit Test Admission Criteria
@@ -26,9 +27,8 @@ A new unit test case must fall into one of these categories:
 3. **Critical-path bookkeeping.** Defends conventions that are easy to break by
    forgetting to sync -- registry completeness, field lifecycle, serialization
    compatibility. Enumerating assertions are fine here; the guarded failure
-   mode is "someone extended X without updating Y". Example: the namespace
-   coverage tests (`test/registered/unit/test_server_args_namespaces.py`). Static
-   source ratchets belong in `scripts/lint/` as checkers, not unit tests.
+   mode is "someone extended X without updating Y". Example: the ratchet tests
+   (`test/registered/unit/test_module_state_ratchet.py`).
 
 Not admissible:
 
@@ -68,6 +68,14 @@ change that every dependent test catches anyway.
 One strong case beats several weak ones: each additional case must guard a
 distinct failure mode. Ask "which bug escapes if I delete this case?" -- no
 answer means delete it.
+
+New cases join an existing file in the same subsystem by default. Create a new
+file only when it needs a different fixture, dependency, owner, or CI contract;
+every file pays a separate interpreter-import cost in the CPU gate.
+
+Suite cadence is part of admission: if a failing run cannot be attributed to a
+single PR's diff, the test belongs in a nightly or weekly suite rather than a
+per-commit lane.
 
 Test mechanics (placement, CI registration, fixtures) live in
 [`write-sglang-test`](../skills/write-sglang-test/SKILL.md).

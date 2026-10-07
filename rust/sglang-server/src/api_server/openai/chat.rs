@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
@@ -23,9 +24,8 @@ use dynamo_protocols::types::{
     TopLogprobs,
 };
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use serde::Deserialize;
 
-use super::super::guard::AbortGuard;
 use super::completions::completion_usage;
 use super::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
 use super::tools::{
@@ -33,21 +33,36 @@ use super::tools::{
     parse_chat_tool_calls,
 };
 use super::{
-    AppState, ChatFormatter, collect_output, contains_media, error_payload, indexed_egress_stream,
-    openai_error, submit_generation, unix_seconds_u32,
+    AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
+    indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::ids::Rid;
-use crate::message::{ChunkExtras, EgressItem, GenerateRequest, OneOrMany, SamplingParams};
+use crate::api_server::frontend_error_status;
+use crate::frontend::{FrontendCall, FrontendEvent, FrontendRequest};
+use crate::message::config::{DefaultSamplingParams, ServerArgs};
+use crate::message::ids::Rid;
+use crate::message::response::ChunkExtras;
+use crate::message::sampling::SamplingParams;
+use crate::message::types::OneOrMany;
 
-pub(super) fn routes() -> Router<AppState> {
+pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
 }
 
+#[derive(Deserialize)]
+struct ChatRequest {
+    #[serde(flatten)]
+    request: CreateChatCompletionRequest,
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
 async fn chat_completions(
-    State(state): State<AppState>,
-    body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Response {
-    let request = match body {
+    let ChatRequest {
+        request,
+        chat_template_kwargs,
+    } = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
@@ -136,10 +151,11 @@ async fn chat_completions(
     });
     let tools_slice = tools.as_deref().unwrap_or_default();
 
-    let (request, prompt) = match prepare_chat_request(&state, request).await {
-        Ok(prepared) => prepared,
-        Err(response) => return response,
-    };
+    let (request, prompt) =
+        match prepare_chat_request(&state, request, chat_template_kwargs.as_ref()).await {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
 
     let sampling = match chat_sampling(
         &request,
@@ -170,9 +186,13 @@ async fn chat_completions(
         .stream_options
         .is_some_and(|options| options.include_usage)
         || state.server_args.stream_response_default_include_usage;
-    let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut submitted = Vec::with_capacity(n);
 
+    // V4 prefills <think>, so the generated stream has no opening marker.
+    let starts_in_reasoning = matches!(
+        reasoning_parser.as_deref(),
+        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4")
+    ) && prompt.ends_with("<think>");
     let mut prompt = Some(prompt);
     for index in 0..n {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
@@ -184,7 +204,7 @@ async fn chat_completions(
                 .expect("chat prompt exists until the last choice")
                 .clone()
         };
-        let native = GenerateRequest {
+        let native = FrontendRequest {
             rid: rid.clone(),
             text: Some(choice_prompt),
             // Rendered templates own their special tokens — the pool must not
@@ -198,17 +218,16 @@ async fn chat_completions(
             return_text_in_logprobs: want_logprobs.then_some(true),
             ..Default::default()
         };
-        let rx = match submit_generation(&state, native, stream, &mut guard).await {
-            Ok(rx) => rx,
+        let call = match submit_generation(&state, native, stream).await {
+            Ok(call) => call,
             Err(response) => return response,
         };
-        submitted.push((index, rid, rx));
+        submitted.push((index, call));
     }
 
     if stream {
         let event_stream = chat_event_stream(
             submitted,
-            guard,
             response_id,
             model,
             created,
@@ -216,6 +235,7 @@ async fn chat_completions(
             include_usage,
             parser,
             reasoning_parser,
+            starts_in_reasoning,
             tools,
             stream_tool_choice,
             uses_tool_call_structural_tag,
@@ -227,7 +247,6 @@ async fn chat_completions(
     } else {
         unary_chat(
             submitted,
-            guard,
             response_id,
             model,
             created,
@@ -249,6 +268,7 @@ async fn chat_completions(
 pub(super) async fn prepare_chat_request(
     state: &AppState,
     mut request: CreateChatCompletionRequest,
+    kwargs: Option<&ChatTemplateKwargs>,
 ) -> Result<(CreateChatCompletionRequest, String), Response> {
     let Some(formatter) = state.chat_formatter.clone() else {
         return Err(openai_error(
@@ -262,7 +282,7 @@ pub(super) async fn prepare_chat_request(
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
-    let prompt = formatter.render(&request).map_err(|error| {
+    let prompt = formatter.render(&request, kwargs).map_err(|error| {
         openai_error(
             StatusCode::BAD_REQUEST,
             format!("chat template render failed: {error}"),
@@ -283,7 +303,7 @@ pub(super) fn chat_sampling(
     tool_choice: &DynamoToolChoice,
     tools: &[ToolDefinition],
     parallel_tool_calls: Option<bool>,
-    server_args: &crate::runtime::ServerArgs,
+    server_args: &ServerArgs,
 ) -> Result<SamplingParams, String> {
     let mut sampling = chat_sampling_params(
         request,
@@ -299,7 +319,7 @@ pub(super) fn chat_sampling(
     sampling
         .normalize(
             server_args.skip_tokenizer_init,
-            server_args.model_config.vocab_size.unwrap_or(u64::MAX),
+            server_args.model_config.vocab_size,
         )
         .map_err(|error| error.to_string())?;
     Ok(sampling)
@@ -352,10 +372,7 @@ impl SamplingDefaults {
     };
     /// The resolved model defaults (empty in `--sampling-defaults openai`
     /// mode), which slot between the user's values and the OpenAI terminals.
-    pub(super) fn with_model_defaults(
-        mut self,
-        model: &crate::runtime::DefaultSamplingParams,
-    ) -> SamplingDefaults {
+    pub(super) fn with_model_defaults(mut self, model: &DefaultSamplingParams) -> SamplingDefaults {
         self.temperature = model.temperature;
         self.top_p = model.top_p;
         self
@@ -421,8 +438,7 @@ pub(super) fn chat_sampling_params(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn unary_chat(
-    submitted: Vec<(usize, Rid, mpsc::Receiver<EgressItem>)>,
-    mut guard: AbortGuard,
+    submitted: Vec<(usize, FrontendCall)>,
     response_id: String,
     model: String,
     created: u32,
@@ -437,8 +453,8 @@ pub(super) async fn unary_chat(
     let mut prompt_tokens = 0;
     let mut completion_tokens = 0u64;
 
-    for (index, rid, rx) in submitted {
-        let output = match collect_output(rx, &mut guard, &rid).await {
+    for (index, call) in submitted {
+        let output = match collect_output(call).await {
             Ok(output) => output,
             Err((status, message)) => {
                 return openai_error(status, message, false);
@@ -505,8 +521,7 @@ pub(super) async fn unary_chat(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn chat_event_stream(
-    submitted: Vec<(usize, Rid, mpsc::Receiver<EgressItem>)>,
-    mut guard: AbortGuard,
+    submitted: Vec<(usize, FrontendCall)>,
     response_id: String,
     model: String,
     created: u32,
@@ -514,6 +529,7 @@ pub(super) fn chat_event_stream(
     include_usage: bool,
     parser: Option<String>,
     reasoning_parser: Option<String>,
+    starts_in_reasoning: bool,
     tools: Option<Vec<ToolDefinition>>,
     tool_choice: Option<ChatCompletionToolChoiceOption>,
     uses_tool_call_structural_tag: bool,
@@ -523,7 +539,6 @@ pub(super) fn chat_event_stream(
     let count = submitted.len();
     let raw = async_stream::stream! {
         let count = submitted.len();
-        let mut rids = Vec::with_capacity(count);
         let mut streams = Vec::with_capacity(count);
         let mut prompt_tokens = 0u32;
         let mut completion_tokens = 0u64;
@@ -532,16 +547,15 @@ pub(super) fn chat_event_stream(
         let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
             if reasoning_parser.is_some() {
                 (0..count)
-                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref()))
+                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref(), starts_in_reasoning))
                     .collect()
             } else {
                 vec![]
             };
         let reasoning_enabled = !reasoning_splitters.is_empty();
 
-        for (index, rid, rx) in submitted {
-            rids.push(rid);
-            streams.push(indexed_egress_stream(index, rx));
+        for (index, call) in submitted {
+            streams.push(indexed_decode_stream(index, call));
             yield Annotated {
                 data: Some(CreateChatCompletionStreamResponse {
                     id: response_id.clone(),
@@ -566,51 +580,20 @@ pub(super) fn chat_event_stream(
         }
 
         let mut events = futures::stream::select_all(streams);
-        while let Some((index, item)) = events.next().await {
-            let Some(item) = item else {
-                yield Annotated {
-                    data: None,
-                    id: None,
-                    event: None,
-                    comment: None,
-                    error: Some(error_payload(StatusCode::INTERNAL_SERVER_ERROR, "response truncated before completion").to_string()),
-                };
-                continue;
-            };
-            let output = match item {
-                EgressItem::Frame(output) => output,
-                EgressItem::Done(output) => {
-                    guard.disarm(&rids[index]);
-                    output
-                }
-                EgressItem::Error(error) => {
-                    guard.disarm(&rids[index]);
+        while let Some((index, event)) = events.next().await {
+            let output = match event {
+                FrontendEvent::Delta(output) | FrontendEvent::Finished(output) => output,
+                FrontendEvent::Failed(error) => {
                     yield Annotated {
                         data: None,
                         id: None,
                         event: None,
                         comment: None,
-                        error: Some(error_payload(StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.to_string()).to_string()),
+                        error: Some(error_payload(frontend_error_status(&error), error.to_string()).to_string()),
                     };
                     continue;
                 }
-                EgressItem::Control(_) | EgressItem::Data(_) => continue,
             };
-            if let Some((code, message)) = output
-                .finish_reason
-                .as_ref()
-                .and_then(|reason| reason.abort_status())
-            {
-                yield Annotated {
-                    data: None,
-                    id: None,
-                    event: None,
-                    comment: None,
-                    error: Some(error_payload(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), message).to_string()),
-                };
-                continue;
-            }
-
             if prompt_tokens == 0 {
                 prompt_tokens = output.prompt_tokens;
             }
@@ -836,6 +819,7 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
             bytes: Some(token.as_bytes().to_vec()),
             token,
             logprob,
+            token_id: u32::try_from(token_id).ok(),
             top_logprobs,
         });
     }
@@ -847,14 +831,13 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{chat_submitted, chunk, senders};
+    use super::super::test_utils::{chat_submitted, chunk};
     use super::{
         SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
         merge_template_stops, unary_chat,
     };
-    use crate::api_server::guard::AbortGuard;
-    use crate::message::ChunkExtras;
-    use crate::runtime::DefaultSamplingParams;
+    use crate::message::config::DefaultSamplingParams;
+    use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
     use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
     use futures::StreamExt;
@@ -922,7 +905,7 @@ mod tests {
         ));
         assert_eq!(
             formatter.stop_strs(),
-            Some(crate::message::OneOrMany::Many(vec![
+            Some(crate::message::types::OneOrMany::Many(vec![
                 "<|endoftext|>".into(),
                 "<|im_end|>".into()
             ]))
@@ -1020,6 +1003,7 @@ mod tests {
         let logprobs = chat_logprobs(Some(&extras));
         let token = &logprobs.content.unwrap()[0];
         assert_eq!(token.token, "x");
+        assert_eq!(token.token_id, Some(7));
         assert_eq!(token.top_logprobs.len(), 2);
         assert_eq!(token.top_logprobs[1].token, "y");
     }
@@ -1033,7 +1017,6 @@ mod tests {
 
         let response = unary_chat(
             vec![choice0, choice1],
-            AbortGuard::new_empty(senders()),
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -1070,7 +1053,6 @@ mod tests {
 
         let response = unary_chat(
             vec![choice],
-            AbortGuard::new_empty(senders()),
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -1108,7 +1090,6 @@ mod tests {
 
         let stream = chat_event_stream(
             vec![choice],
-            AbortGuard::new_empty(senders()),
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -1116,6 +1097,7 @@ mod tests {
             true,
             None,
             Some("deepseek-r1".into()),
+            false,
             None,
             None,
             false,
@@ -1154,7 +1136,6 @@ mod tests {
 
         let stream = chat_event_stream(
             vec![choice],
-            AbortGuard::new_empty(senders()),
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -1162,6 +1143,7 @@ mod tests {
             true,
             None,
             None,
+            false,
             None,
             None,
             false,

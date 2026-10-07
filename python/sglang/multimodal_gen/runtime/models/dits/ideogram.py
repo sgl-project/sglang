@@ -7,22 +7,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.diffusion.bitexact_gate import (
+from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    tensors_equal,
-)
-from sglang.kernels.ops.diffusion.fused_gate_rmsnorm import (
     fused_gate_rmsnorm_active,
     fused_rmsnorm_scale,
     fused_rmsnorm_tanh_residual,
-    mark_fused_gate_rmsnorm_site,
-)
-from sglang.kernels.ops.diffusion.triton.rope_rotate_half_bitexact import (
     fused_rope_rotate_half_bitexact,
-)
-from sglang.kernels.ops.diffusion.triton.silu_mul_bitexact import (
-    can_use_fused_silu_mul,
     fused_silu_mul_bitexact,
+    mark_fused_gate_rmsnorm_site,
+    modulate_scale_shift,
+    residual_gate_add,
+    tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_layer
@@ -58,8 +53,13 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+_is_cuda = current_platform.is_cuda()
 
 logger = init_logger(__name__)
 
@@ -68,35 +68,7 @@ LLM_TOKEN_INDICATOR = 3
 
 _IDEOGRAM_ROPE = BitExactFusionGate("Ideogram fused RoPE")
 _IDEOGRAM_SWIGLU = BitExactFusionGate("Ideogram fused SiLU-mul")
-
-
-def _can_use_fused_rope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> bool:
-    # cos/sin are full-span (B, S, 1, D) rows broadcast over heads.
-    expected = (q.shape[0], q.shape[1], 1, q.shape[-1])
-    return (
-        q.dtype is torch.bfloat16
-        and k.dtype is torch.bfloat16
-        and q.is_cuda
-        and q.dim() == 4
-        and q.is_contiguous()
-        and k.shape == q.shape
-        and k.is_contiguous()
-        and k.device == q.device
-        and cos.dtype is torch.bfloat16
-        and sin.dtype is torch.bfloat16
-        and cos.device == q.device
-        and sin.device == q.device
-        and cos.shape == expected
-        and sin.shape == expected
-        and cos.is_contiguous()
-        and sin.is_contiguous()
-        and q.shape[-1] % 2 == 0
-    )
+_IDEOGRAM_ZERO_SHIFTS: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
 
 
 def _ideogram_rope(
@@ -116,14 +88,15 @@ def _ideogram_rope(
     verified = _IDEOGRAM_ROPE.verified
     if (
         not _IDEOGRAM_ROPE.disabled
-        and _can_use_fused_rope(q, k, cos, sin)
+        and q.is_cuda
+        and q.dtype is torch.bfloat16
+        and q.is_contiguous()
+        and k.is_contiguous()
         and (verified or _IDEOGRAM_ROPE.can_attempt_once())
     ):
         try:
-            cos_rows = cos.reshape(-1, cos.shape[-1])
-            sin_rows = sin.reshape(-1, sin.shape[-1])
-            q_fused = fused_rope_rotate_half_bitexact(q, cos_rows, sin_rows)
-            k_fused = fused_rope_rotate_half_bitexact(k, cos_rows, sin_rows)
+            q_fused = fused_rope_rotate_half_bitexact(q, cos, sin)
+            k_fused = fused_rope_rotate_half_bitexact(k, cos, sin)
         except Exception as exc:
             _IDEOGRAM_ROPE.on_exception(exc, logger=logger)
         else:
@@ -147,7 +120,9 @@ def _ideogram_swiglu(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     verified = _IDEOGRAM_SWIGLU.verified
     if (
         not _IDEOGRAM_SWIGLU.disabled
-        and can_use_fused_silu_mul(a, b)
+        and _is_cuda
+        and a.is_cuda
+        and a.dtype is torch.bfloat16
         and (verified or _IDEOGRAM_SWIGLU.can_attempt_once())
     ):
         try:
@@ -424,7 +399,7 @@ def _norm_scale(
     norm: Ideogram4RMSNorm,
     enable_fused: bool,
 ) -> torch.Tensor:
-    """``RMSNorm(x) * (1 + scale)``, fused for ``quality="high"`` batches."""
+    """``RMSNorm(x) * (1 + scale)``, fused at extra-high or high quality."""
     if enable_fused:
         y = fused_rmsnorm_scale(
             x,
@@ -434,6 +409,20 @@ def _norm_scale(
         )
         if y is not None:
             return y
+    if (
+        not torch.compiler.is_compiling()
+        and x.is_cuda
+        and not torch.cuda.is_current_stream_capturing()
+        and x.dim() == 3
+        and scale.shape == (x.shape[0], 1, x.shape[-1])
+        and x.shape[0] == 1
+    ):
+        key = (x.device, x.dtype, x.shape[-1])
+        zero_shift = _IDEOGRAM_ZERO_SHIFTS.get(key)
+        if zero_shift is None:
+            zero_shift = torch.zeros(1, x.shape[-1], device=x.device, dtype=x.dtype)
+            _IDEOGRAM_ZERO_SHIFTS[key] = zero_shift
+        return modulate_scale_shift(norm(x), scale.squeeze(1), zero_shift)
     return norm(x) * (1.0 + scale)
 
 
@@ -444,7 +433,7 @@ def _gate_residual(
     norm: Ideogram4RMSNorm,
     enable_fused: bool,
 ) -> torch.Tensor:
-    """``residual + tanh(gate) * RMSNorm(x)``, fused for ``quality="high"``."""
+    """``residual + tanh(gate) * RMSNorm(x)``, fused at extra-high or high."""
     if enable_fused:
         y = fused_rmsnorm_tanh_residual(
             x,
@@ -455,7 +444,15 @@ def _gate_residual(
         )
         if y is not None:
             return y
-    return residual + torch.tanh(gate) * norm(x)
+    normed = norm(x)
+    tanh_gate = torch.tanh(gate)
+    if (
+        not torch.compiler.is_compiling()
+        and x.is_cuda
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        return residual_gate_add(residual, normed, tanh_gate)
+    return residual + tanh_gate * normed
 
 
 class Ideogram4TransformerBlock(nn.Module):
@@ -492,7 +489,7 @@ class Ideogram4TransformerBlock(nn.Module):
         self.ffn_norm1 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
         self.attention_norm2 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
         self.ffn_norm2 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
-        # quality="high" fusion sites: each RMSNorm modulate/gate chain
+        # extra-high/high fusion sites: each RMSNorm modulate/gate chain
         # collapses into one Triton kernel (Z-Image bf16-native suite). Off by
         # default (bit-exact reference path); mounted per batch by the
         # denoising stage.
