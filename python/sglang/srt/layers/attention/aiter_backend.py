@@ -129,6 +129,12 @@ intra_batch_mode = True if _use_mla_ps_kernel else False
 _KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
 
 
+def _unit_inner_stride(x: torch.Tensor) -> torch.Tensor:
+    if x.dim() == 3 and x.stride(-1) == 1:
+        return x
+    return x.contiguous()
+
+
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
@@ -3781,8 +3787,8 @@ class AiterAttnBackend(AttentionBackend):
 
                 self.extend_attention_fwd(
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    k.contiguous(),
-                    v.contiguous(),
+                    _unit_inner_stride(k),
+                    _unit_inner_stride(v),
                     o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                     self.token_to_kv_pool.get_key_buffer(layer.layer_id),
                     self.token_to_kv_pool.get_value_buffer(layer.layer_id),

@@ -165,7 +165,7 @@ class TestTritonAttention(CustomTestCase):
         # Set seeds before each test method
         self._set_all_seeds(42)
 
-    def _test_extend_attention_once(self, B, N_CTX, H_Q, H_KV, D):
+    def _test_extend_attention_once(self, B, N_CTX, H_Q, H_KV, D, strided_kv=False):
         dtype = torch.bfloat16
         device = get_device()
 
@@ -221,6 +221,14 @@ class TestTritonAttention(CustomTestCase):
             q_extend[extend_start:extend_end] = torch.empty(
                 (b_seq_len_extend[i], H_Q, D), dtype=dtype, device=device
             ).normal_(mean=0.1, std=0.2)
+
+        if strided_kv:
+            # [tokens, heads, dim] with strides (dim, tokens * dim, 1).
+            k_extend = k_extend.transpose(0, 1).contiguous().transpose(0, 1)
+            v_extend = v_extend.transpose(0, 1).contiguous().transpose(0, 1)
+            self.assertFalse(k_extend.is_contiguous())
+            self.assertEqual(k_extend.stride(-1), 1)
+            self.assertEqual(v_extend.stride(-1), 1)
 
         o_extend = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device=device)
         o_extend_mask = torch.empty(
@@ -319,6 +327,10 @@ class TestTritonAttention(CustomTestCase):
         # Loop through the values and call the method
         for value in attention_values:
             self._test_extend_attention_once(19, 12331, 12, 4, value)
+
+    def test_extend_attention_strided_kv(self):
+        # Same GQA shape as test_extend_attention, with non-contiguous K/V.
+        self._test_extend_attention_once(2, 64, 12, 4, 128, strided_kv=True)
 
     def test_extend_attention_block_sizes(self):
         from sglang.kernels.ops.attention import extend_attention as ea
