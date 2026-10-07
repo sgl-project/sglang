@@ -118,6 +118,7 @@ class TargetVerifyExecutor:
         tp_sync: SpecTpSync,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
+        block_verification: bool = False,
     ) -> None:
         self.target_worker = target_worker
         # candidate_max_seq_len_upper_bound only feeds the V4.1 candidate graphs.
@@ -137,6 +138,7 @@ class TargetVerifyExecutor:
         self.verify_epilogue = verify_epilogue
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
+        self._block_verification = block_verification
         self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
 
     def accept_and_finalize(
@@ -178,6 +180,7 @@ class TargetVerifyExecutor:
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             cutoff_layout=layout,
             fused_argmax=self._target_is_dsv41,
+            block_verification=self._block_verification,
         )
         if simulate:
             correct_len = self._simulated_correct_len(
@@ -861,6 +864,7 @@ def accept_draft_tokens(
     verify_num_draft_tokens: int,
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
     fused_argmax: bool = False,
+    block_verification: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
@@ -890,6 +894,7 @@ def accept_draft_tokens(
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            block_verification=block_verification,
         )
     greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
         candidates=candidates,
@@ -907,6 +912,7 @@ def accept_draft_tokens(
         gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
+        block_verification=block_verification,
     )
     selected = SelectMixedAccept.execute(
         greedy_mask=greedy_mask,

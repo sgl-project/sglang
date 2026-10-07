@@ -118,8 +118,8 @@ class Spec(msgspec.Struct):
     ] = False
     speculative_use_block_verification: A[
         bool,
-        "Use block verification for EAGLE/EAGLE3/NEXTN on CUDA or ROCm "
-        "(requires topk=1).",
+        "Use block verification for EAGLE/EAGLE3/NEXTN (requires topk=1) or for "
+        "sampled DFLASH/DSPARK drafts, on CUDA or ROCm.",
     ] = False
     speculative_token_map: A[
         Optional[str],
