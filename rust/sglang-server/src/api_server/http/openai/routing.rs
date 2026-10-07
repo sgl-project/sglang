@@ -3,7 +3,7 @@
 use serde::Deserialize;
 use sglang_api_types::api::v1::{Int64OrList, OptionalInt64OrList, StringOrList};
 
-use crate::message::request::{BootstrapColumns, GenerateRequest, normalize_bootstrap_columns};
+use crate::message::request::{BootstrapColumns, normalize_bootstrap_columns};
 use crate::message::types::OneOrMany;
 use crate::message::wire;
 use crate::utils::error::Error;
@@ -20,10 +20,11 @@ pub(super) struct PDRoutingFields {
 }
 
 /// Validated per-prompt columns, ready for admission.
+/// Each prompt's choices share the same routing metadata.
 pub(super) struct PDRouting {
-    bootstrap: BootstrapColumns,
-    routed_dp_rank: Option<i64>,
-    disagg_prefill_dp_rank: Option<i64>,
+    pub(super) bootstrap: BootstrapColumns,
+    pub(super) routed_dp_rank: Option<i64>,
+    pub(super) disagg_prefill_dp_rank: Option<i64>,
 }
 
 impl PDRoutingFields {
@@ -58,26 +59,13 @@ impl PDRoutingFields {
     }
 }
 
-impl PDRouting {
-    /// Like Python's parallel-sampling dispatch, each prompt's choices share
-    /// its routing metadata; only request IDs and response indices fan out.
-    pub(super) fn apply(&self, request: &mut GenerateRequest, prompt_index: usize) {
-        request.bootstrap_host = self.bootstrap.bootstrap_hosts[prompt_index].clone();
-        request.bootstrap_port = self.bootstrap.bootstrap_ports[prompt_index];
-        request.bootstrap_room = self.bootstrap.bootstrap_rooms[prompt_index];
-        request.routed_dp_rank = self.routed_dp_rank;
-        request.disagg_prefill_dp_rank = self.disagg_prefill_dp_rank;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::PDRoutingFields;
-    use crate::message::request::GenerateRequest;
     use serde_json::json;
 
     #[test]
-    fn list_routing_preserves_pairing_and_dp_hints_across_choices() {
+    fn list_routing_preserves_per_prompt_metadata() {
         // mini_lb injects scalars; the GPU fixture does not cover lists or
         // distinguish nonzero DP hints in its single-rank topology.
         let fields: PDRoutingFields = serde_json::from_value(json!({
@@ -89,35 +77,17 @@ mod tests {
         }))
         .unwrap();
         let routing = fields.into_routing(2, 2).unwrap();
-        let requests = [0, 0, 1, 1].map(|prompt_index| {
-            let mut request = GenerateRequest::default();
-            routing.apply(&mut request, prompt_index);
-            request
-        });
         assert_eq!(
-            requests.each_ref().map(|r| r.bootstrap_host.as_deref()),
-            [
-                Some("prefill-a"),
-                Some("prefill-a"),
-                Some("prefill-b"),
-                Some("prefill-b")
-            ]
+            routing.bootstrap.bootstrap_hosts,
+            vec![Some("prefill-a".to_owned()), Some("prefill-b".to_owned())]
         );
+        assert_eq!(routing.bootstrap.bootstrap_ports, vec![Some(8998), None]);
         assert_eq!(
-            requests.each_ref().map(|r| r.bootstrap_port),
-            [Some(8998), Some(8998), None, None]
+            routing.bootstrap.bootstrap_rooms,
+            vec![Some(9007199254740993), Some(9007199254740995)]
         );
-        assert_eq!(
-            requests.each_ref().map(|r| r.bootstrap_room),
-            [
-                Some(9007199254740993),
-                Some(9007199254740993),
-                Some(9007199254740995),
-                Some(9007199254740995)
-            ]
-        );
-        assert!(requests.iter().all(|r| r.routed_dp_rank == Some(1)));
-        assert!(requests.iter().all(|r| r.disagg_prefill_dp_rank == Some(3)));
+        assert_eq!(routing.routed_dp_rank, Some(1));
+        assert_eq!(routing.disagg_prefill_dp_rank, Some(3));
     }
 
     #[test]

@@ -212,7 +212,7 @@ async fn chat_completions(
                 .expect("chat prompt exists until the last choice")
                 .clone()
         };
-        let mut native = GenerateRequest {
+        let native = GenerateRequest {
             rid: rid.clone(),
             text: Some(choice_prompt),
             // Rendered templates own their special tokens — the pool must not
@@ -224,9 +224,13 @@ async fn chat_completions(
             logprob_start_len: -1,
             top_logprobs_num: request.top_logprobs.unwrap_or(0) as i64,
             return_text_in_logprobs: want_logprobs.then_some(true),
+            bootstrap_host: routing.bootstrap.bootstrap_hosts[0].clone(),
+            bootstrap_port: routing.bootstrap.bootstrap_ports[0],
+            bootstrap_room: routing.bootstrap.bootstrap_rooms[0],
+            routed_dp_rank: routing.routed_dp_rank,
+            disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
             ..Default::default()
         };
-        routing.apply(&mut native, 0);
         let call = match submit_generation(&state, native, stream).await {
             Ok(call) => call,
             Err(response) => return response,

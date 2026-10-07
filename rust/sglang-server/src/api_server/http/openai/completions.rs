@@ -176,7 +176,7 @@ async fn completions(
                     Err(response) => return response,
                 };
             }
-            let mut native = GenerateRequest {
+            let native = GenerateRequest {
                 rid: rid.clone(),
                 text: text.clone(),
                 input_ids: input_ids.clone(),
@@ -190,9 +190,13 @@ async fn completions(
                 },
                 top_logprobs_num: request.logprobs.unwrap_or(0) as i64,
                 return_text_in_logprobs: request.logprobs.map(|_| true),
+                bootstrap_host: routing.bootstrap.bootstrap_hosts[prompt_index].clone(),
+                bootstrap_port: routing.bootstrap.bootstrap_ports[prompt_index],
+                bootstrap_room: routing.bootstrap.bootstrap_rooms[prompt_index],
+                routed_dp_rank: routing.routed_dp_rank,
+                disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
                 ..Default::default()
             };
-            routing.apply(&mut native, prompt_index);
             let call = match submit_generation(&state, native, stream).await {
                 Ok(call) => call,
                 Err(response) => return response,
