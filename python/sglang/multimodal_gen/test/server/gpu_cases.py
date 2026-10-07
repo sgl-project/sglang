@@ -1,3 +1,4 @@
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     SANA_WM_TI2V_CI_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
+    TI2V_sampling_params,
     _make_modelopt_ci_case,
     _with_default_num_gpus,
 )
@@ -69,6 +71,17 @@ from sglang.multimodal_gen.test.test_utils import (
 )
 
 _CACHE_DIT_CONFIG_DIR = Path(__file__).parent / "configs"
+
+
+def _ltx_bcg_args(resolution: str, num_frames: int, **warmup_overrides):
+    # BCG replays only signatures captured at warmup: warm up at the request shape,
+    # input image, and quality (consistency requests pin quality=exact).
+    warmup_params = {"quality": "exact", **warmup_overrides}
+    return (
+        f"--enable-breakable-cuda-graph --warmup-resolutions {resolution} "
+        f"--warmup-num-frames {num_frames} "
+        f"--warmup-sampling-params '{json.dumps(warmup_params)}'"
+    )
 
 
 # All test cases with clean default values
@@ -499,7 +512,10 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
             extras=[
-                "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode original"
+                "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode original",
+                _ltx_bcg_args(
+                    "1920x1088", 24, image_path=TI2V_sampling_params.image_path
+                ),
             ],
             env_vars={
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
@@ -1089,7 +1105,10 @@ TWO_GPU_CASES = [
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2",
             cfg_parallel=True,
-            extras=["--pipeline-class-name LTX2TwoStagePipeline"],
+            extras=[
+                "--pipeline-class-name LTX2TwoStagePipeline",
+                _ltx_bcg_args("768x512", 25),
+            ],
         ),
         T2V_sampling_params,
     ),
@@ -1100,6 +1119,9 @@ TWO_GPU_CASES = [
             cfg_parallel=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original",
+                _ltx_bcg_args(
+                    "768x512", 25, image_path=TI2V_sampling_params.image_path
+                ),
             ],
         ),
         run_component_accuracy_check=False,
@@ -1118,6 +1140,7 @@ TWO_GPU_CASES = [
             cfg_parallel=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
+                _ltx_bcg_args("768x512", 25),
             ],
         ),
         DiffusionSamplingParams(prompt=T2V_PROMPT, extras={"seed": 42}),
@@ -1130,15 +1153,12 @@ TWO_GPU_CASES = [
             model_path="Lightricks/LTX-2.5-Diffusers",
             modality="video",
             ulysses_degree=2,
-            # Offload both the DiT and text encoder between stages to leave
-            # decoder headroom on 80 GB GPUs.
+            # The DiT stays resident: BCG graphs hold its weight addresses, which
+            # an offload round trip would move.
             extras=[
                 "--load-diffusion-decoder",
-                "--warmup-resolutions 768x448",
-                "--warmup-num-frames 49",
-                """--warmup-sampling-params '{"use_diffusion_decoder":true}'""",
-                "--component-residency "
-                "transformer=component-offload,text_encoder=component-offload",
+                _ltx_bcg_args("768x448", 49, use_diffusion_decoder=True),
+                "--component-residency text_encoder=component-offload",
             ],
         ),
         DiffusionSamplingParams(
@@ -1246,6 +1266,9 @@ TWO_GPU_CASES = [
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
             cfg_parallel=True,
+            extras=[
+                _ltx_bcg_args("768x512", 25, image_path=TI2V_sampling_params.image_path)
+            ],
         ),
         run_component_accuracy_check=False,
     ),
