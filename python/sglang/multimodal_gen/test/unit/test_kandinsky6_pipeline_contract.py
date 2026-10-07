@@ -84,15 +84,6 @@ def _make_pipeline() -> Kandinsky6TI2VAPipeline:
     return pipeline
 
 
-def test_pipeline_identity_and_required_modules():
-    assert Kandinsky6TI2VAPipeline.pipeline_name == "Kandinsky6TI2VAPipeline"
-    assert Kandinsky6TI2VAPipeline.is_video_pipeline is True
-    assert Kandinsky6TI2VAPipeline._required_config_modules == EXPECTED_REQUIRED_MODULES
-    # No separate "vocoder" module -- audio_vae bundles the mel-VAE decoder
-    # and the BigVGAN vocoder in one checkpoint component.
-    assert "vocoder" not in Kandinsky6TI2VAPipeline._required_config_modules
-
-
 def test_disagg_role_rejects_non_monolithic_deployment():
     pipeline = object.__new__(Kandinsky6TI2VAPipeline)
 
@@ -107,17 +98,16 @@ def test_disagg_role_rejects_non_monolithic_deployment():
 
 def test_create_pipeline_stages_produces_documented_order():
     pipeline = _make_pipeline()
-    server_args = MagicMock()
-
-    Kandinsky6TI2VAPipeline.create_pipeline_stages(pipeline, server_args)
-
-    actual_types = [type(stage) for stage in pipeline.stages]
-    expected_types = [stage_cls for _, stage_cls in EXPECTED_STAGE_ORDER]
-    assert actual_types == expected_types
-
-    actual_names = list(pipeline._stage_name_mapping.keys())
-    expected_names = [name for name, _ in EXPECTED_STAGE_ORDER]
-    assert actual_names == expected_names
+    assert pipeline.pipeline_name == "Kandinsky6TI2VAPipeline"
+    assert pipeline.is_video_pipeline is True
+    assert pipeline._required_config_modules == EXPECTED_REQUIRED_MODULES
+    pipeline.create_pipeline_stages(MagicMock())
+    assert [type(stage) for stage in pipeline.stages] == [
+        stage_cls for _, stage_cls in EXPECTED_STAGE_ORDER
+    ]
+    assert [
+        (name, type(stage)) for name, stage in pipeline._stage_name_mapping.items()
+    ] == EXPECTED_STAGE_ORDER
 
     # get_module wiring: each stage received the mocked module it asked for.
     denoising_stage = pipeline._stage_name_mapping["denoising_stage"]
@@ -224,7 +214,6 @@ def test_parallel_cfg_uses_serial_arithmetic_for_video_and_audio(monkeypatch):
         t_expand=torch.zeros(1),
         visual_rope_pos=[],
         scale_factor=(1.0, 1.0, 1.0),
-        sparse_params=None,
         visual_token_type_ids=None,
     )
     for result, reference in zip(actual, expected, strict=True):
@@ -237,10 +226,7 @@ def test_parallel_cfg_uses_serial_arithmetic_for_video_and_audio(monkeypatch):
 def test_denoising_rejects_guidance_other_than_one_with_a_piflow_scheduler(
     guidance_scale,
 ):
-    """The distilled checkpoint's ``PiflowScheduler`` has no classifier-free guidance,
-    so the run must not silently ignore a guidance the caller asked for; the
-    Diffusers pipeline raises the same way ("PiflowScheduler requires
-    guidance_weight=1.0")."""
+    """The distilled checkpoint must reject unsupported CFG, not silently ignore it."""
     scheduler = _pro_distill_scheduler()
     batch = SimpleNamespace(
         timesteps=scheduler.timesteps,
@@ -272,11 +258,6 @@ def test_distilled_denoising_calls_the_dit_once_per_step_without_guidance(
     text_lens = []
 
     class _FakeDiT(torch.nn.Module):
-        """A real ``nn.Module`` (not a bare function): ``Kandinsky6DenoisingStage``
-        now subclasses the shared ``DenoisingStage``, whose ``__init__`` walks
-        ``self.transformer.modules()`` to infer the attention backend -- a plain
-        callable has no ``.modules()``."""
-
         def forward(self, **kwargs):
             assert tuple(kwargs["scale_factor"]) == (1.0, 2.0, 2.0)
             text_lens.append(kwargs["encoder_hidden_states"].shape[1])
@@ -309,28 +290,13 @@ def test_distilled_denoising_calls_the_dit_once_per_step_without_guidance(
         is_warmup=True,
         sampling_params=Kandinsky6TI2VASamplingParams(quality="lossless"),
     )
-    arch = SimpleNamespace(
-        attention_engine="auto",
-        in_visual_dim=video_channels,
-        patch_size=(1, 2, 2),
-        scale_factor=(1.0, 2.0, 2.0),
-    )
-    pipeline_config = SimpleNamespace(
-        dit_config=SimpleNamespace(arch_config=arch),
-        dit_precision="fp32",
-        vae_config=SimpleNamespace(
-            arch_config=SimpleNamespace(spatial_compression_ratio=8)
-        ),
-        get_pos_prompt_embeds=lambda batch: batch.prompt_embeds[0],
-        # CFG is disabled in this test (guidance_scale=1.0,
-        # do_classifier_free_guidance=False), so the policy never needs a
-        # negative branch, but Kandinsky6DenoisingStage still reads
-        # `cfg_policy` / `get_classifier_free_guidance_scale` off the config
-        # unconditionally to build the (single-branch) CFGPolicy.
-        cfg_policy=CFGPolicy(),
-        get_classifier_free_guidance_scale=lambda _batch, guidance_scale: (
-            guidance_scale
-        ),
+    pipeline_config = Kandinsky6TI2VAPipelineConfig(dit_precision="fp32")
+    pipeline_config.dit_config.update_model_arch(
+        dict(
+            in_visual_dim=video_channels,
+            patch_size=(1, 2, 2),
+            scale_factor=(1.0, 2.0, 2.0),
+        )
     )
     server_args = SimpleNamespace(
         pipeline_config=pipeline_config, enable_cfg_parallel=False
