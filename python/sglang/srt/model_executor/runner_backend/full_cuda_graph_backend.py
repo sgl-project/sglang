@@ -38,6 +38,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -113,6 +114,19 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         finally:
             self._capture_stream = None
 
+    def _prefill_req_slots(self) -> Optional[int]:
+        """The prefill runner's fixed request-slot count, None under a
+        decode runner."""
+        # Local import: the prefill runner module imports this one.
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+            PrefillCudaGraphRunner,
+        )
+
+        runner = self._cuda_graph_runner
+        if isinstance(runner, PrefillCudaGraphRunner):
+            return runner._capture_req_slots
+        return None
+
     def capture_one(
         self,
         shape_key: ShapeKey,
@@ -120,6 +134,23 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
+        foundry = get_foundry_adapter()
+        if foundry.enabled:
+            # CUDA graph persistence: in its preparation pass SAVE runs the two
+            # warmups in a private pool (no graph, None); in the capture pass
+            # SAVE captures and archives this shape, LOAD restores it.
+            result = foundry.capture_one(
+                shape_key,
+                forward_fn,
+                pool=self._pool,
+                stream=self._capture_stream,
+                prefill_req_slots=self._prefill_req_slots(),
+                post_warmup_hook=post_warmup_hook,
+                tp_group=self._tp_group,
+            )
+            if result is not None:
+                self._graphs[shape_key], self._outputs[shape_key] = result
+            return
         # When per-bs capture traces are enabled (--enable-profile-cuda-graph +
         # SGLANG_GRAPH_BATCH_CAPTURE), the runner created a scheduled
         # torch profiler (wait=2, active=1) and exposed it as _profiler. We step()

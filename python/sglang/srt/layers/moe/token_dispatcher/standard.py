@@ -129,6 +129,34 @@ class StandardDispatcher(BaseDispatcher):
         self.local_expert_mapping = None
         self.expert_mask_gpu = None
 
+    def prepare_local_expert_mapping(self):
+        """Build the EP local expert map once (idempotent). Called by the first
+        dispatch; may be called earlier to create it outside a forward."""
+        if self.local_expert_mapping is None:
+            device = get_device()
+            self.local_expert_mapping = torch.full(
+                (self.num_experts,), -1, dtype=torch.int32, device=device
+            )
+            self.local_expert_mapping[
+                self.moe_ep_rank * self.num_local_routed_experts : (
+                    self.moe_ep_rank + 1
+                )
+                * self.num_local_routed_experts
+            ] = torch.arange(
+                0, self.num_local_routed_experts, dtype=torch.int32, device=device
+            )
+
+            if self.num_local_shared_experts > 0:
+                self.local_expert_mapping[-self.num_local_shared_experts :] = (
+                    torch.arange(
+                        self.num_local_routed_experts,
+                        self.num_local_routed_experts
+                        + self.num_local_shared_experts,
+                        dtype=torch.int32,
+                        device="cpu",
+                    )
+                )
+
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
@@ -186,30 +214,7 @@ class StandardDispatcher(BaseDispatcher):
             and not self.skip_local_expert_mapping
             and TopKOutputChecker.format_is_standard(topk_output)
         ):
-            if self.local_expert_mapping is None:
-                device = get_device()
-                self.local_expert_mapping = torch.full(
-                    (self.num_experts,), -1, dtype=torch.int32, device=device
-                )
-                self.local_expert_mapping[
-                    self.moe_ep_rank * self.num_local_routed_experts : (
-                        self.moe_ep_rank + 1
-                    )
-                    * self.num_local_routed_experts
-                ] = torch.arange(
-                    0, self.num_local_routed_experts, dtype=torch.int32, device=device
-                )
-
-                if self.num_local_shared_experts > 0:
-                    self.local_expert_mapping[-self.num_local_shared_experts :] = (
-                        torch.arange(
-                            self.num_local_routed_experts,
-                            self.num_local_routed_experts
-                            + self.num_local_shared_experts,
-                            dtype=torch.int32,
-                            device="cpu",
-                        )
-                    )
+            self.prepare_local_expert_mapping()
 
         if self.local_expert_mapping is not None and not self.skip_local_expert_mapping:
             if self.use_aiter_moe_runner and self.expert_mask_gpu is None:

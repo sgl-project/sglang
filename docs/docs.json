@@ -965,6 +965,7 @@
               "docs/advanced_features/dp_for_multi_modal_encoder",
               "docs/advanced_features/cuda_graph_for_multi_modal_encoder",
               "docs/advanced_features/breakable_cuda_graph",
+              "docs/advanced_features/cuda_graph_persistence",
               "docs/advanced_features/piecewise_cuda_graph",
               "docs/advanced_features/sgl_model_gateway",
               "docs/advanced_features/llm-d",

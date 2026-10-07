@@ -1090,6 +1090,11 @@ class FlashInferAttnBackend(AttentionBackend):
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
     def _create_decode_wrappers(self, bs: int, num_tokens: int) -> list:
+        # Idempotent per batch size: a capture loop that prepares a shape twice
+        # (CUDA graph persistence) keeps the wrappers and their workspaces.
+        cached = self.decode_cuda_graph_metadata.get(bs)
+        if cached is not None:
+            return cached
         return [
             BatchDecodeWithPagedKVCacheWrapper(
                 self.workspace_buffer,

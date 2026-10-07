@@ -575,6 +575,17 @@ class ExecGraph(msgspec.Struct):
         bool,
         "Enable profiling of cuda graph capture.",
     ] = False
+    cuda_graph_persistence: A[
+        Optional[Literal["save", "load"]],
+        Arg(
+            help="Persist the CUDA graphs across restarts with Foundry (optional dependency sglang[foundry]). 'save' captures as usual and writes the graphs and the memory layout they reference to an archive; 'load' rebuilds the graphs from that archive instead of capturing. SAVE and LOAD must use the same model, flags and GPUs. Decode graphs use the full backend; prefill graphs are 'full' or 'disabled' (default disabled).",
+            choices=["save", "load"],
+        ),
+    ] = None
+    cuda_graph_persistence_config: A[
+        Optional[str],
+        "Foundry TOML for --cuda-graph-persistence (workspace_root, base_addr, region_size, scratch_space_size, ...). Its 'mode' key is ignored: the flag's mode wins. Defaults: archive in ./foundry_archive.",
+    ] = None
     enable_cudagraph_gc: A[
         bool,
         "Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
