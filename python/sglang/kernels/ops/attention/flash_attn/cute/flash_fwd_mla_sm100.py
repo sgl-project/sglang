@@ -396,9 +396,9 @@ class FlashAttentionMLAForwardSm100:
         mPageTable: Optional[cute.Tensor] = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
-        stream: cuda.CUstream = None,
-        *,
         mValue: Optional[cute.Tensor] = None,
+        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+        stream: cuda.CUstream = None,
     ):
         # fmt: on
         self.store_P = mP is not None
