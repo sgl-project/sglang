@@ -1820,6 +1820,7 @@ class FlashInferIndicesUpdaterDecode:
 
 class FlashInferIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
+        self.use_cpu_metadata = envs.SGLANG_ENABLE_FLASHINFER_CPU_PREFILL_METADATA.get()
         # Parse Constants
         # Plan with the max per-layer head count: FlashInfer bakes num_qo_heads
         # into the plan, and layers running more heads than planned are
@@ -1922,6 +1923,7 @@ class FlashInferIndicesUpdaterPrefill:
             multi_item_params=multi_item_params,
             seq_lens_cpu=seq_lens_cpu,
             custom_kv_indices=custom_kv_indices,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
         )
 
     def update_sliding_window(
@@ -2131,6 +2133,34 @@ class FlashInferIndicesUpdaterPrefill:
                 ),
             )
 
+    @staticmethod
+    def _build_cpu_metadata(
+        seq_lens_cpu: torch.Tensor, extend_prefix_lens_cpu: List[int]
+    ):
+        # Fresh pinned tensors keep overlapping batches from overwriting an
+        # in-flight H2D upload. The ordinary wrapper uses token-level pages.
+        bs = len(extend_prefix_lens_cpu)
+        seq_lens_host = torch.empty(
+            bs, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        seq_lens_host.copy_(seq_lens_cpu)
+        query_lens = seq_lens_host - torch.tensor(
+            extend_prefix_lens_cpu, dtype=torch.int32, device="cpu"
+        )
+        qo_indptr_host = torch.empty(
+            bs + 1, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        kv_indptr_host = torch.empty(
+            bs + 1, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        qo_indptr_host[0] = kv_indptr_host[0] = 0
+        torch.cumsum(query_lens, dim=0, out=qo_indptr_host[1:])
+        torch.cumsum(seq_lens_host, dim=0, out=kv_indptr_host[1:])
+        last_page_len_host = torch.ones(
+            bs, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        return qo_indptr_host, kv_indptr_host, last_page_len_host, seq_lens_host
+
     def call_begin_forward(
         self,
         wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
@@ -2152,6 +2182,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_cpu: Optional[torch.Tensor] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
         window_left: int = -1,
+        extend_prefix_lens_cpu: Optional[List[int]] = None,
     ):
         bs = len(seq_lens)
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
@@ -2299,11 +2330,40 @@ class FlashInferIndicesUpdaterPrefill:
             # selects the module with the per-element window mask compiled in
             paged_plan_kwargs["window_left"] = window_left
 
+        plan_qo_indptr = qo_indptr
+        plan_kv_indptr = kv_indptr
+        plan_last_page_len = self.kv_last_page_len[:bs]
+        if (
+            self.use_cpu_metadata
+            and spec_info is None
+            and not use_ragged
+            and not use_sliding_window_kv_pool
+            and kv_start_idx is None
+            and window_left < 0
+            and custom_kv_indices is None
+            and use_custom_mask is None
+            and not (multi_item_params is not None and multi_item_params.is_enabled())
+            and not wrapper_paged.is_cuda_graph_enabled
+            and seq_lens_cpu is not None
+            and seq_lens_cpu.device.type == "cpu"
+            and extend_prefix_lens_cpu is not None
+        ):
+            (
+                plan_qo_indptr,
+                plan_kv_indptr,
+                plan_last_page_len,
+                plan_seq_lens,
+            ) = self._build_cpu_metadata(seq_lens_cpu, extend_prefix_lens_cpu)
+            # plan() needs host scheduling metadata. Passing the CPU snapshot
+            # avoids reading it back from the GPU and draining prior work.
+            # The translator above still consumes the original GPU indptr.
+            paged_plan_kwargs["seq_lens"] = plan_seq_lens
+
         wrapper_paged.begin_forward(
-            qo_indptr,
-            kv_indptr,
+            plan_qo_indptr,
+            plan_kv_indptr,
             kv_indices,
-            self.kv_last_page_len[:bs],
+            plan_last_page_len,
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
