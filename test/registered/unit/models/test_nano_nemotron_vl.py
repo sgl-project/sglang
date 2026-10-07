@@ -1,19 +1,101 @@
 """Unit tests for native Nemotron-H Omni model integration."""
 
+import math
 import unittest
+from array import array
 from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
 
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.models.nano_nemotron_vl import (
     NemotronH_Nano_VL_V2,
     NemotronH_Omni_Reasoning_V3,
 )
+from sglang.srt.multimodal.evs import EVS, EVSEmbeddingResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+TOKENS_PER_TUBELET = 4
+HIDDEN_SIZE = 8
+
+
+def _temporal_video_model(video_pruning_rate: float):
+    model = object.__new__(NemotronH_Omni_Reasoning_V3)
+    config = SimpleNamespace(
+        video_temporal_patch_size=2, video_pruning_rate=video_pruning_rate
+    )
+    EVS.__init__(model, config)
+    model.config = config
+    model.encoded_num_frames = []
+
+    def extract_video_feature_temporal(pixel_values, num_frames):
+        model.encoded_num_frames.append(num_frames)
+        num_tubelets = math.ceil(num_frames / 2)
+        return torch.randn(num_tubelets, TOKENS_PER_TUBELET, HIDDEN_SIZE)
+
+    model.extract_video_feature_temporal = extract_video_feature_temporal
+    return model
+
+
+def _video_item(frames_per_video: list[int], **model_specific_data):
+    return MultimodalDataItem(
+        modality=Modality.VIDEO,
+        feature=torch.zeros(sum(frames_per_video), 3, 4, 4),
+        offsets=[],
+        model_specific_data={"frames_per_video": frames_per_video}
+        | model_specific_data,
+    )
+
+
+class TestNemotronHOmniVideo(CustomTestCase):
+    def test_temporal_tubelets_do_not_span_videos(self):
+        """Two odd-length videos in one request must be grouped into tubelets per video."""
+        model = _temporal_video_model(video_pruning_rate=0.0)
+
+        features = model.get_video_feature([_video_item([3, 1])])
+
+        self.assertEqual(model.encoded_num_frames, [3, 1])
+        self.assertEqual(features.shape[0], 3)
+
+    def test_evs_prunes_temporal_tubelets_per_video(self):
+        """EVS on 2-frame tubelets keeps each video's first tubelet and prunes per video."""
+        model = _temporal_video_model(video_pruning_rate=0.25)
+        rows = cols = int(math.sqrt(TOKENS_PER_TUBELET))
+        item = _video_item([3, 1], thw_grids=[(2, rows, cols), (1, rows, cols)])
+
+        result = model.get_video_feature([item])
+
+        self.assertIsInstance(result, EVSEmbeddingResult)
+        self.assertEqual(result.num_tokens_per_frame, [4, 2, 4])
+        self.assertEqual(result.embedding.shape, (10, HIDDEN_SIZE))
+
+    def test_evs_keeps_image_pad_values_for_redistribution(self):
+        """EVS placeholder redistribution must not restore raw image tokens next to a video."""
+        start, end, image_token = 1, 2, 18
+        image = MultimodalDataItem(modality=Modality.IMAGE, offsets=[], hash=11)
+        video = _video_item([2], pre_chunked_input_ids=[])
+        video.hash = 22
+        for item in (image, video):
+            item.set_pad_value()
+        input_ids = array("q", [7, start, image_token, end, start, image_token, end])
+        video.pre_chunked_input_ids = input_ids.tolist()
+        mm_inputs = MultimodalInputs(
+            mm_items=[image, video], im_start_id=start, im_end_id=end
+        )
+
+        model = object.__new__(NemotronH_Omni_Reasoning_V3)
+        padded = model.pad_input_ids(input_ids, mm_inputs)
+
+        self.assertEqual(list(video.pre_chunked_input_ids), list(padded))
+        self.assertIn(image.pad_value, video.pre_chunked_input_ids)
 
 
 class TestNemotronHOmniModel(CustomTestCase):
