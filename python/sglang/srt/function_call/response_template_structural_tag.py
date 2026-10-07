@@ -21,6 +21,11 @@ from typing import Any, Callable
 
 import regex as re
 
+try:
+    from re import _parser as _sre_parse
+except ImportError:  # Python 3.10
+    import sre_parse as _sre_parse
+
 from sglang.srt.parser.chat_parsing.content_parsers import parse_content
 from sglang.srt.parser.chat_parsing.response_parser import _schema_types
 from sglang.srt.parser.chat_parsing.response_templates import (
@@ -36,9 +41,20 @@ _START = "\0"
 _MAX_LITERALS = 16
 _WHITESPACE = {"type": "regex", "pattern": r"\s*"}
 _ANY_TEXT = {"type": "any_text"}
+# Character classes in XGrammar regexes take whitespace only as escapes.
+_BLANKS = {" ": " ", "\t": r"\t", "\n": r"\n", "\r": r"\r"}
 # Keywords that describe a schema without constraining its values.
 _ANNOTATIONS = frozenset(
-    {"title", "description", "default", "examples", "deprecated", "$comment"}
+    {
+        "title",
+        "description",
+        "default",
+        "examples",
+        "deprecated",
+        "$comment",
+        "$schema",
+        "$id",
+    }
 )
 _OBJECT_KEYWORDS = frozenset(
     {"type", "properties", "required", "additionalProperties", "$defs", "definitions"}
@@ -53,6 +69,50 @@ _JSON_PIECE = (
     r"[\s\S]*[" + "".join(map(re.escape, sorted(_JSON_SYNTAX))) + "]",
     False,
 )
+_REPEATS = tuple(
+    getattr(_sre_parse, name)
+    for name in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT")
+    if hasattr(_sre_parse, name)
+)
+_CATEGORIES = {
+    _sre_parse.CATEGORY_DIGIT: r"\d",
+    _sre_parse.CATEGORY_NOT_DIGIT: r"\D",
+    _sre_parse.CATEGORY_SPACE: r"\s",
+    _sre_parse.CATEGORY_NOT_SPACE: r"\S",
+    _sre_parse.CATEGORY_WORD: r"\w",
+    _sre_parse.CATEGORY_NOT_WORD: r"\W",
+}
+_HOST_LABEL = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+_DATE = r"[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])"
+_TIME = (
+    r"(?:[01][0-9]|2[0-3]):[0-5][0-9]:(?:[0-5][0-9]|60)(?:\.[0-9]+)?"
+    r"(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
+)
+_OCTET = r"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])"
+_ATOM = r"[A-Za-z0-9_!#$%&'*+/=?^`{|}~-]+"
+_URI_CHARS = r"A-Za-z0-9_.~!$&'()*+,;="
+_ESCAPED = r"%[0-9A-Fa-f]{2}"
+_PATH = rf"(?:[{_URI_CHARS}:@-]|{_ESCAPED})"
+_QUERY = rf"(?:[{_URI_CHARS}:@/?-]|{_ESCAPED})*"
+# Raw string forms of the formats XGrammar holds in JSON strings. Emails leave
+# out quoted local parts, whose quotes XGrammar writes as JSON escapes.
+_STRING_FORMATS = {
+    "date": _DATE,
+    "time": _TIME,
+    "date-time": f"{_DATE}T{_TIME}",
+    "email": (
+        rf"{_ATOM}(?:\.{_ATOM})*@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+        r"(?:\.[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9])*"
+    ),
+    "hostname": rf"{_HOST_LABEL}(?:\.{_HOST_LABEL})*",
+    "ipv4": rf"(?:{_OCTET}\.){{3}}{_OCTET}",
+    "uuid": r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}",
+    "uri": (
+        rf"[A-Za-z][A-Za-z+.-]*:(?://(?:(?:[{_URI_CHARS}:-]|{_ESCAPED})*@)?"
+        rf"(?:[{_URI_CHARS}-]|{_ESCAPED})*(?::[0-9]*)?(?:/{_PATH}*)*"
+        rf"|/?(?:{_PATH}+(?:/{_PATH}*)*)?)(?:\?{_QUERY})?(?:#{_QUERY})?"
+    ),
+}
 
 
 def _split_group(pattern: str, name: str) -> tuple[str, str, str] | None:
@@ -194,12 +254,32 @@ def _call_opener(
 
 
 def _thinking_format(
-    thinking: ResponseTemplateField, message_start: list[str] | None
+    thinking: ResponseTemplateField,
+    message_start: list[str] | None,
+    visible: bool = False,
 ) -> dict[str, Any] | None:
+    """The reasoning, which holds `visible` text if asked."""
     openers, closers = _openers(thinking, message_start), _closers(thinking)
     if not openers or not closers:
         return None
-    return _one_of([_tag(opener, _ANY_TEXT, closers) for opener in openers])
+    text = _sequence(_visible_start(closers), _ANY_TEXT) if visible else _ANY_TEXT
+    return _one_of([_tag(opener, text, closers) for opener in openers])
+
+
+def _visible_start(excludes: list[str]) -> dict[str, Any]:
+    """Whitespace, then a visible character. None of them starts one of the
+    `excludes`, which the text after them could no longer see."""
+    starts = {text[0] for text in excludes if text}
+    blank = "".join(escape for char, escape in _BLANKS.items() if char not in starts)
+    visible = "".join(map(_class_escape, sorted(starts)))
+    return {
+        "type": "regex",
+        "pattern": (f"[{blank}]*" if blank else "") + rf"[^\s{visible}]",
+    }
+
+
+def _class_escape(char: str) -> str:
+    return _BLANKS.get(char, "\\" + char if char in "\\]^-[" else char)
 
 
 def message_start_anchors(template: ResponseTemplate) -> list[str]:
@@ -351,10 +431,13 @@ def _typed_by_parser(schema: Any) -> bool:
     )
 
 
-def _text_format(schema: Any) -> dict[str, Any] | None:
-    """Constrain raw text without changing its parsed value."""
+def _text_format(schema: Any, excludes: list[str]) -> dict[str, Any] | None:
+    """Constrain raw text, which the `excludes` end, without changing its
+    parsed value."""
     if schema is True:
         return _ANY_TEXT
+    if isinstance(schema, dict) and {"format", "pattern"} & set(schema):
+        return _string_regex(schema, excludes)
     if not isinstance(schema, dict) or set(schema) - _ANNOTATIONS - {
         "type",
         "nullable",
@@ -370,9 +453,98 @@ def _text_format(schema: Any) -> dict[str, Any] | None:
         if choices is None or branches or set(_schema_types(schema)) - {"string"}:
             return None
         return _const_strings(choices)
-    if any(_text_format(branch) is not _ANY_TEXT for branch in branches):
+    if any(_text_format(branch, excludes) is not _ANY_TEXT for branch in branches):
         return None
     return _ANY_TEXT
+
+
+def _string_regex(schema: dict[str, Any], excludes: list[str]) -> dict[str, Any] | None:
+    """Hold the `format` or `pattern` of a raw string. Like XGrammar, a format
+    overrides a pattern, either one drops length bounds, and the pattern
+    matches the whole string."""
+    if set(schema) - _ANNOTATIONS - {
+        "type",
+        "format",
+        "pattern",
+        "minLength",
+        "maxLength",
+    } or _schema_types(schema) != ("string",):
+        return None
+    pattern = (
+        _STRING_FORMATS.get(schema["format"])
+        if "format" in schema
+        else schema["pattern"]
+    )
+    if (
+        not isinstance(pattern, str)
+        or _may_write(pattern, {text[0] for text in excludes if text})
+        or not _regex_compiles(pattern)
+    ):
+        return None
+    return {"type": "regex", "pattern": pattern}
+
+
+def _may_write(pattern: str, chars: set[str]) -> bool:
+    """Whether a match of `pattern` may hold one of `chars`, as any pattern may
+    that Python cannot parse."""
+    try:
+        parsed = _sre_parse.parse(pattern)
+    except (_sre_parse.error, OverflowError, RecursionError):
+        return True
+    if parsed.state.flags & _sre_parse.SRE_FLAG_IGNORECASE:
+        return True
+
+    def may(items: Any) -> bool:
+        for op, arg in items:
+            if op is _sre_parse.LITERAL:
+                written = {chr(arg)}
+            elif op is _sre_parse.IN:
+                written = {char for char in chars if _in_class(arg, char)}
+            elif op in _REPEATS:
+                written = chars if arg[1] and may(arg[2]) else set()
+            elif op is _sre_parse.SUBPATTERN:
+                if arg[1] & _sre_parse.SRE_FLAG_IGNORECASE:
+                    return True
+                written = chars if may(arg[3]) else set()
+            elif op is _sre_parse.BRANCH:
+                written = chars if any(map(may, arg[1])) else set()
+            elif op is _sre_parse.AT:
+                continue
+            else:
+                # Such as `.`, which XGrammar lets match line breaks.
+                return True
+            if written & chars:
+                return True
+        return False
+
+    return may(parsed)
+
+
+def _in_class(items: list[tuple[Any, Any]], char: str) -> bool:
+    negated = bool(items) and items[0][0] is _sre_parse.NEGATE
+    matched = False
+    for op, arg in items[negated:]:
+        if op is _sre_parse.LITERAL:
+            matched |= ord(char) == arg
+        elif op is _sre_parse.RANGE:
+            matched |= arg[0] <= ord(char) <= arg[1]
+        elif op is _sre_parse.CATEGORY and arg in _CATEGORIES:
+            matched |= bool(re.fullmatch(_CATEGORIES[arg], char))
+        else:
+            return True
+    return matched != negated
+
+
+# Every request derives the tags for its tools anew.
+@lru_cache(maxsize=512)
+def _regex_compiles(pattern: str) -> bool:
+    from xgrammar import Grammar
+
+    try:
+        Grammar.from_regex(pattern)
+    except RuntimeError:
+        return False
+    return True
 
 
 def _value_format(
@@ -384,7 +556,7 @@ def _value_format(
     types = _schema_types(schema)
     if json_values or (types and "string" not in types):
         return _json_format(_json_value_schema(schema, parameters), closers)
-    return _text_format(schema)
+    return _text_format(schema, closers)
 
 
 def _json_format(schema: Any, closers: list[str]) -> dict[str, Any] | None:
@@ -440,7 +612,7 @@ def _xml_arguments_format(
         and (json_values or all(map(_typed_by_parser, properties.values())))
     )
     # Other schema shapes cannot be typed by the XML parser.
-    if set(parameters) - _ANNOTATIONS - _OBJECT_KEYWORDS or not typed:
+    if strict and (set(parameters) - _ANNOTATIONS - _OBJECT_KEYWORDS or not typed):
         return None
     required = parameters.get("required") or []
     names = ()
@@ -578,12 +750,24 @@ def _reply_format(
     openers, closers = _openers(answer, message_start), _closers(answer)
     if not openers or closers is None:
         return None
+    return _sequence(_const_strings(openers), *_answer_text(closers))
+
+
+def _answer_text(closers: list[str]) -> list[dict[str, Any]]:
     # Text cannot close the answer early, so no unconstrained call can follow
     # it. Like a call, the answer may end at a stop token instead of a closer.
-    elements = [_const_strings(openers), {"type": "any_text", "excludes": closers}]
+    elements = [{"type": "any_text", "excludes": closers}]
     if closers:
         elements.append(_optional(_const_strings(closers)))
-    return _sequence(*elements)
+    return elements
+
+
+def answer_rest_structural_tag(answer: ResponseTemplateField) -> dict[str, Any] | None:
+    """The rest of an `answer` that is already open, or `None` if underivable."""
+    closers = _closers(answer)
+    if closers is None:
+        return None
+    return {"type": "structural_tag", "format": _sequence(*_answer_text(closers))}
 
 
 def supports_tool_call_structural_tag(
@@ -607,10 +791,21 @@ def tool_call_structural_tag(
     thinking: ResponseTemplateField | None = None,
     answer: ResponseTemplateField | None = None,
     message_start: list[str] | None = None,
+    grammar_requires_reasoning: bool = False,
 ) -> dict[str, Any] | None:
-    """Derive native calls, respecting strict arguments, count and optional reasoning.
+    """Derive native calls, respecting strict arguments, count and reasoning.
 
-    Raises `ValueError` for names the template cannot encode."""
+    Without tools, derive only the `answer`, if given. Raises `ValueError` for
+    names the template cannot encode."""
+    if not tools and answer is not None:
+
+        def reply(start: list[str] | None) -> list[dict[str, Any]] | None:
+            format = _reply_format(answer, start)
+            return None if format is None else [format]
+
+        return _structural_tag(
+            reply, thinking, message_start, grammar_requires_reasoning
+        )
     if not tools or not _names_function_by_opener(field):
         return None
     opener = _split_group(field.open_re.pattern, "name")
@@ -662,7 +857,7 @@ def tool_call_structural_tag(
             elements = [_one_of([_sequence(*elements), reply])]
         return elements
 
-    return _structural_tag(output, thinking, message_start)
+    return _structural_tag(output, thinking, message_start, grammar_requires_reasoning)
 
 
 def json_answer_structural_tag(
@@ -673,6 +868,7 @@ def json_answer_structural_tag(
     *,
     thinking: ResponseTemplateField | None = None,
     message_start: list[str] | None = None,
+    grammar_requires_reasoning: bool = False,
 ) -> dict[str, Any] | None:
     """Derive a JSON answer with optional calls to declared tools before it.
 
@@ -727,27 +923,32 @@ def json_answer_structural_tag(
 
     if message_start is None:
         thinking = None
-    return _structural_tag(output, thinking, message_start)
+    return _structural_tag(output, thinking, message_start, grammar_requires_reasoning)
 
 
 def _structural_tag(
     output: Callable[[list[str] | None], list[dict[str, Any]] | None],
     thinking: ResponseTemplateField | None,
     message_start: list[str] | None,
+    grammar_requires_reasoning: bool = False,
 ) -> dict[str, Any] | None:
-    """Frame output at the message start or after optional reasoning."""
+    """Frame output at the message start or after reasoning, which is optional
+    unless `grammar_requires_reasoning` makes the message open with visible
+    reasoning."""
     rest = output(None)
     if rest is None:
         return None
     think = None
     if thinking is not None:
-        think = _thinking_format(thinking, message_start)
+        think = _thinking_format(thinking, message_start, grammar_requires_reasoning)
         if think is None:
             return None
     if message_start is None:
         if think is not None:
             rest.insert(0, _optional(think))
         return {"type": "structural_tag", "format": _sequence(*rest)}
+    if think is not None and grammar_requires_reasoning:
+        return {"type": "structural_tag", "format": _sequence(think, *rest)}
     start = output(message_start)
     if start is None:
         return None

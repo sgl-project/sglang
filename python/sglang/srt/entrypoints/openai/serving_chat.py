@@ -475,6 +475,14 @@ class OpenAIServingChat(OpenAIServingBase):
         Returns:
             Updated prompt_ids with assistant prefix appended
         """
+        detector = self._reasoning_detector
+        if isinstance(detector, ResponseTemplateReasoningDetector):
+            prompt = self.tokenizer_manager.tokenizer.decode(
+                prompt_ids,
+                skip_special_tokens=False,
+                spaces_between_special_tokens=False,
+            )
+            assistant_prefix = detector.answer_opener(prompt) + assistant_prefix
         encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
         if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
             encoded = encoded[1:]
@@ -1366,6 +1374,16 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         elif (
             template_tool_call_grammar
+            and request.tool_choice in ("auto", "none")
+            and isinstance(detector, ResponseTemplateReasoningDetector)
+            and (rest := detector.answer_rest_structural_tag(prefix)) is not None
+        ):
+            # A continued answer never reaches the reasoning end the grammar
+            # would wait for, so its grammar covers only the rest of the answer.
+            sampling_params["structural_tag"] = json.dumps(rest)
+            adapted_request.require_reasoning = False
+        elif (
+            template_tool_call_grammar
             and request.tool_choice == "auto"
             and adapted_request.require_reasoning
             and isinstance(detector, ResponseTemplateReasoningDetector)
@@ -1518,6 +1536,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 trim = detector.think_end_token in output
         return text[: -len(closer)] if trim else text
 
+    def _template_turn_grammar(self) -> bool:
+        tool_detector = FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
+        return (
+            envs.SGLANG_RESPONSE_TEMPLATE_TURN_GRAMMAR.get()
+            and tool_detector is not None
+            and issubclass(tool_detector, ResponseTemplateToolDetector)
+            and tool_detector.constrains_every_turn
+            # Other backends cannot compile its structural tag.
+            and self.tokenizer_manager.config_value("grammar_backend") == "xgrammar"
+        )
+
     def _requires_response_template_detokenization(
         self, request: ChatCompletionRequest
     ) -> bool:
@@ -1533,7 +1562,10 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
     def _process_messages(
-        self, request: ChatCompletionRequest, is_multimodal: bool
+        self,
+        request: ChatCompletionRequest,
+        is_multimodal: bool,
+        output_constrained: bool = False,
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
         if self.default_chat_template_kwargs:
@@ -1645,6 +1677,37 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
+
+        if (
+            tool_call_constraint is None
+            and request.tool_choice in ("auto", "none")
+            and not (
+                output_constrained
+                or request.regex
+                or request.ebnf
+                or (
+                    request.response_format is not None
+                    and request.response_format.type != "text"
+                )
+            )
+            and self._template_turn_grammar()
+        ):
+            # Unconstrained turns still take the template's framing: reasoning,
+            # then calls with any arguments or the answer.
+            if template_tool_parser is None:
+                template_tool_parser = FunctionCallParser(
+                    [],
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
+            tag = template_tool_parser.detector.get_structural_tag(
+                tools=template_tool_parser.structural_tag_tools(),
+                tool_choice=request.tool_choice,
+                thinking_mode=xgrammar_reasoning,
+                parallel_tool_calls=request.parallel_tool_calls,
+            )
+            if tag is not None:
+                tool_call_constraint = ("structural_tag", tag)
 
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.

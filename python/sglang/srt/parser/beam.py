@@ -58,3 +58,4 @@ BEAM_RESPONSE_TEMPLATE: dict[str, Any] = {
 class BeamReasoningDetector(ResponseTemplateReasoningDetector):
     response_template = BEAM_RESPONSE_TEMPLATE
     reasoning_default = "always"
+    grammar_requires_reasoning = True

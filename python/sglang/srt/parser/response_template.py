@@ -32,6 +32,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.response_template_structural_tag import (
+    answer_rest_structural_tag,
     json_answer_structural_tag,
     message_start_anchors,
     message_start_openers,
@@ -413,6 +414,7 @@ class ResponseTemplateReasoningDetector:
     _default_think_end = ""
     thinks_internally = False
     reasoning_default = "explicit_enable_thinking"
+    grammar_requires_reasoning = False
 
     def __init__(
         self,
@@ -485,6 +487,27 @@ class ResponseTemplateReasoningDetector:
         may skip the reasoning."""
         return _starts_message(self._template, prefix)
 
+    def answer_opener(self, prefix: str) -> str:
+        """The literal opener of an answer right after `prefix`, or "" unless
+        `prefix` starts the assistant message."""
+        if self._content_field is None or not self.starts_message(prefix):
+            return ""
+        openers = message_start_openers(self._content_field, self._message_start)
+        return openers[0] if openers else ""
+
+    def answer_rest_structural_tag(self, prefix: str) -> dict[str, Any] | None:
+        """A structural tag for the rest of an answer that `prefix` leaves open,
+        or `None` if it leaves none open."""
+        parser = ResponseParser(self.response_template, prefix=prefix)
+        regions = [
+            (event.get("field"), event["type"])
+            for event in parser.initial_events
+            if event["type"] != "region_chunk"
+        ]
+        if regions[-1:] != [(_CONTENT_FIELD, "region_open")]:
+            return None
+        return answer_rest_structural_tag(self._content_field)
+
     def json_answer_structural_tag(
         self,
         json_schema: Any,
@@ -504,6 +527,7 @@ class ResponseTemplateReasoningDetector:
             tool_names,
             thinking=self._thinking_field,
             message_start=self._message_start if message_start else None,
+            grammar_requires_reasoning=self.grammar_requires_reasoning,
         )
 
     def json_output_started(self, text: str) -> bool:
@@ -560,6 +584,8 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
     """Tool-call detector driven by a `response_template` grammar."""
 
     response_template: dict | None = None
+    constrains_every_turn = False
+    grammar_requires_reasoning = False
 
     def __init__(
         self,
@@ -776,6 +802,8 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         message_start: bool = False,
     ):
         tool_dicts = [tool.model_dump() for tool in tools or ()]
+        if tool_choice == "none":
+            tool_dicts, tool_choice = [], "auto"
         named = isinstance(tool_choice, ToolChoice)
         # Named calls still fall back if another tool cannot use this format.
         if named and not supports_tool_call_structural_tag(
@@ -796,6 +824,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
             answer=self._content_field if tool_choice == "auto" else None,
             # The tag then covers the output from its first token.
             message_start=self._message_start if message_start else None,
+            grammar_requires_reasoning=self.grammar_requires_reasoning,
         )
         if tag is None:
             return None

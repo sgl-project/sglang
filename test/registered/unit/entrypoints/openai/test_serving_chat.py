@@ -187,6 +187,7 @@ class _MockTokenizerManager:
             return_input_ids=False,
             return_output_ids=False,
             incremental_streaming_output=False,
+            grammar_backend="xgrammar",
         )
         self.model_path = self.server_args.model_path
         # The manager tracks the served name itself; a weight update rewrites it.
@@ -1073,7 +1074,8 @@ class ServingChatTestCase(CustomTestCase):
                     self.assertIs(_is_grammar_accept_string(grammar, text), expected)
 
         # A forced tool-call array is not an answer; a native call must not
-        # replace it.
+        # replace it. No grammar writes this JSON dialect, so forced calls take
+        # the array.
         fields = _DELIMITED_RESPONSE_TEMPLATE["fields"]
         self._use_delimited_response_template(
             "response_template",
@@ -1083,20 +1085,13 @@ class ServingChatTestCase(CustomTestCase):
                     **fields,
                     "tool_calls": {
                         **fields["tool_calls"],
-                        "content": "xml-inline",
-                        "content_args": {
-                            "tag_pattern": r"<arg:(?P<key>\w+)>(?P<value>.*?)</arg>"
-                        },
+                        "content_args": {"unquoted_keys": True},
                     },
                 },
             },
         )
-        untyped_tool = copy.deepcopy(_WEATHER_TOOL)
-        untyped_tool["function"]["parameters"]["properties"]["days"] = {
-            "$ref": "https://example.com/days.json"
-        }
         adapted, request = self._convert_rendered_as(
-            "<assistant>", tools=[untyped_tool], tool_choice="required"
+            "<assistant>", tools=[_WEATHER_TOOL], tool_choice="required"
         )
 
         self.assertNotIn("structural_tag", adapted.sampling_params)
@@ -1705,7 +1700,8 @@ class ServingChatTestCase(CustomTestCase):
         )
 
     def test_template_tool_call_grammar_covers_skipped_reasoning(self):
-        """Output that may skip the reasoning must not escape the tool-call grammar."""
+        """Output from the message start must open with the reasoning, and calls
+        after it take the tool-call grammar."""
         self.tm._config_overrides.update(
             {"reasoning_parser": "beam", "tool_call_parser": "beam"}
         )
@@ -1720,7 +1716,7 @@ class ServingChatTestCase(CustomTestCase):
             (
                 "<|start|>assistant",
                 True,
-                {call: True, thought + full_call: True, " " + "Paris": False},
+                {call: False, thought + full_call: True, " " + "Paris": False},
             ),
             (
                 "<|start|>assistant<|channel|>analysis<|message|>So",
@@ -1756,9 +1752,6 @@ class ServingChatTestCase(CustomTestCase):
                     params = adapted.sampling_params
 
                     self.assertIs(adapted.require_reasoning, True)
-                    if tool_choice == "auto" and not strict:
-                        self.assertNotIn("structural_tag", params)
-                        continue
                     self.assertIs(
                         get_request_reasoning_in_grammar(params.get("custom_params")),
                         from_start,
@@ -1768,6 +1761,93 @@ class ServingChatTestCase(CustomTestCase):
                         self.assertIs(
                             _is_grammar_accept_string(grammar, text), expected, text
                         )
+
+    def test_template_turn_grammar_frames_unconstrained_turns(self):
+        """Beam holds every turn nothing else constrains to the template's framing,
+        opening with the reasoning; other template parsers leave it unconstrained."""
+        self.tm._config_overrides.update(
+            {"reasoning_parser": "beam", "tool_call_parser": "beam"}
+        )
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        thought = "<|channel|>analysis<|message|>Plan<|end|>"
+        answer = "<|start|>assistant<|channel|>final<|message|>Sunny<|return|>"
+        call = (
+            "<|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml"
+            '<|message|><rfl:parameter name="city">\nParis\n</rfl:parameter><|call|>'
+        )
+        for fields, calls in (
+            ({}, False),
+            ({"tools": [_WEATHER_TOOL], "tool_choice": "none"}, False),
+            ({"tools": [_WEATHER_TOOL]}, True),
+        ):
+            with self.subTest(fields=fields):
+                adapted, _ = self._convert_rendered_as("<|start|>assistant", **fields)
+                grammar = Grammar.from_structural_tag(
+                    adapted.sampling_params["structural_tag"]
+                )
+                self.assertTrue(_is_grammar_accept_string(grammar, thought + answer))
+                self.assertIs(_is_grammar_accept_string(grammar, thought + call), calls)
+                self.assertFalse(_is_grammar_accept_string(grammar, answer))
+                self.assertFalse(_is_grammar_accept_string(grammar, "Sunny"))
+
+        adapted, _ = self._convert_rendered_as(
+            "<|start|>assistant", tools=[_WEATHER_TOOL], regex=".*"
+        )
+        self.assertNotIn("structural_tag", adapted.sampling_params)
+        with envs.SGLANG_RESPONSE_TEMPLATE_TURN_GRAMMAR.override(False):
+            adapted, _ = self._convert_rendered_as("<|start|>assistant")
+        self.assertNotIn("structural_tag", adapted.sampling_params)
+        self.tm._config_overrides["grammar_backend"] = "llguidance"
+        adapted, _ = self._convert_rendered_as("<|start|>assistant")
+        self.assertNotIn("structural_tag", adapted.sampling_params)
+        del self.tm._config_overrides["grammar_backend"]
+
+        self._use_delimited_response_template("response_template")
+        adapted, _ = self._convert_rendered_as("<assistant>", tools=[_WEATHER_TOOL])
+        self.assertNotIn("structural_tag", adapted.sampling_params)
+
+    def test_template_turn_grammar_continues_the_final_answer(self):
+        """A continued final message resumes inside the answer, whose grammar
+        covers only the rest of it."""
+        self.tm._config_overrides.update(
+            {"reasoning_parser": "beam", "tool_call_parser": "beam"}
+        )
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        tokenizer = self.tm.tokenizer
+        tokenizer.encode.side_effect = lambda text: [text]
+        for prompt, resumed in (
+            ("<|start|>assistant", "<|channel|>final<|message|>The capital is "),
+            ("<|start|>assistant<|channel|>analysis<|message|>", "The capital is "),
+        ):
+            with self.subTest(prompt=prompt):
+                tokenizer.decode.return_value = prompt
+                self.assertEqual(
+                    self.chat._append_assistant_prefix_to_prompt_ids(
+                        [0], "The capital is "
+                    ),
+                    [0, resumed],
+                )
+
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Capital?"},
+                {"role": "assistant", "content": "The capital is "},
+            ],
+            continue_final_message=True,
+        )
+        adapted, _ = self._convert_rendered_as(
+            "<|start|>assistant<|channel|>final<|message|>The capital is ",
+            request=request,
+        )
+        grammar = Grammar.from_structural_tag(adapted.sampling_params["structural_tag"])
+        self.assertFalse(adapted.require_reasoning)
+        self.assertTrue(_is_grammar_accept_string(grammar, "Paris.<|return|>"))
+        self.assertFalse(
+            _is_grammar_accept_string(
+                grammar, "Paris.<|end|><|start|>assistant<|channel|>final<|message|>"
+            )
+        )
 
     def test_kimi_tool_call_keeps_template_default_thinking(self):
         self.template_manager.chat_template_name = None
