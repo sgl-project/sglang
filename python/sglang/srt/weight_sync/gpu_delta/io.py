@@ -5,7 +5,7 @@ from typing import Any, Dict, List
 from sglang.srt.managers.io_struct import BaseReq, hook_custom_types
 
 
-class LoadWeightsFromDeltaReqInput(BaseReq, kw_only=True):
+class UpdateWeightsFromDeltaReqInput(BaseReq, kw_only=True):
     manifest_path: str
     release_state: bool = True
 
@@ -23,7 +23,7 @@ class GetWeightsDeltaInfoReqInput(BaseReq, kw_only=True):
     engine_id: str
 
 
-class PrepareWeightsFromDeltaReqInput(BaseReq, kw_only=True):
+class PrepareWeightsDeltaReqInput(BaseReq, kw_only=True):
     session_id: str
     manifest_path: str
     manifest_sha256: str
@@ -38,15 +38,15 @@ class GetWeightsDeltaStatusReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
-class UpdateWeightsFromDeltaReqInput(BaseReq, kw_only=True):
+class ApplyWeightsDeltaReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
-class AbortWeightsFromDeltaReqInput(BaseReq, kw_only=True):
+class AbortWeightsDeltaReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
-class ResumeWeightsFromDeltaReqInput(BaseReq, kw_only=True):
+class ResumeWeightsDeltaReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
@@ -58,14 +58,14 @@ class DeltaWeightsReqOutput(BaseReq, kw_only=True):
 
 # Register before tokenizer/scheduler/DP-controller receive loops start.
 hook_custom_types(
-    LoadWeightsFromDeltaReqInput,
+    UpdateWeightsFromDeltaReqInput,
     ClearWeightsDeltaStateReqInput,
     ReleaseWeightsDeltaCacheReqInput,
     GetWeightsDeltaInfoReqInput,
-    PrepareWeightsFromDeltaReqInput,
+    PrepareWeightsDeltaReqInput,
     GetWeightsDeltaStatusReqInput,
-    UpdateWeightsFromDeltaReqInput,
-    AbortWeightsFromDeltaReqInput,
-    ResumeWeightsFromDeltaReqInput,
+    ApplyWeightsDeltaReqInput,
+    AbortWeightsDeltaReqInput,
+    ResumeWeightsDeltaReqInput,
     DeltaWeightsReqOutput,
 )

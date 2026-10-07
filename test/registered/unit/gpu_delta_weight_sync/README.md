@@ -63,14 +63,14 @@ rank; the loader reads the manifest's codec, plan, stream and target version and
 uses fresh participant identities, not trainer-era process IDs.
 
 ```bash
-curl -f -X POST http://localhost:30000/load_weights_from_delta \
+curl -f -X POST http://localhost:30000/update_weights_from_delta \
   -H 'Content-Type: application/json' \
   -d '{"manifest_path":"/checkpoints/step-100/gpu-delta/manifest.json"}'
 curl -f -X POST http://localhost:30000/clear_weights_delta_state \
   -H 'Content-Type: application/json' -d '{}'
 ```
 
-`load_weights_from_delta` requires `manifest_path` and committed base
+`update_weights_from_delta` requires `manifest_path` and committed base
 version 0. It supports a direct HF-base 0→V jump using existing describe, prepare,
 status, apply and resume controls internally. Successful load clears delta
 resources by default. Miles recovery passes `release_state=false` to retain the
@@ -134,11 +134,11 @@ There is no staging selector or full-publication HBM copy. Every retained change
 matrix frame uses the selected inner codec, including inputs whose
 compressed representation expands; there is no raw-frame fallback. Once an
 engine's original ranks report `PREPARED`, Miles sends that engine
-`update_weights_from_delta`. Each local handler closes generation admission,
+`apply_weights_delta`. Each local handler closes generation admission,
 pauses scheduling, fences existing readers, retracts requests, flushes caches and
 applies the delta. It returns `APPLIED` only after GPU completion and decoder
 checks. Miles waits for each engine's original ranks to apply, then sends that
-engine `resume_weights_from_delta(session_id)`. Independent
+engine `resume_weights_delta(session_id)`. Independent
 engines prepare, apply and resume separately; the trainer waits for all engines
 before advancing its update baseline. Resume records the new version and reopens
 generation after successful local acknowledgments.

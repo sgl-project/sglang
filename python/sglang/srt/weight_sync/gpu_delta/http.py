@@ -9,13 +9,13 @@ from fastapi.responses import ORJSONResponse
 
 from sglang.srt.utils.auth import AuthLevel, auth_level
 from sglang.srt.weight_sync.gpu_delta.io import (
-    AbortWeightsFromDeltaReqInput,
+    AbortWeightsDeltaReqInput,
+    ApplyWeightsDeltaReqInput,
     ClearWeightsDeltaStateReqInput,
     GetWeightsDeltaInfoReqInput,
     GetWeightsDeltaStatusReqInput,
-    LoadWeightsFromDeltaReqInput,
-    PrepareWeightsFromDeltaReqInput,
-    ResumeWeightsFromDeltaReqInput,
+    PrepareWeightsDeltaReqInput,
+    ResumeWeightsDeltaReqInput,
     UpdateWeightsFromDeltaReqInput,
 )
 
@@ -30,10 +30,10 @@ def register_gpu_delta_routes(app: FastAPI, get_global_state: Callable):
             status_code=HTTPStatus.OK if content["success"] else HTTPStatus.CONFLICT,
         )
 
-    @app.post("/load_weights_from_delta")
+    @app.post("/update_weights_from_delta")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def load_weights_from_delta(
-        obj: Annotated[LoadWeightsFromDeltaReqInput, Body()],
+    async def update_weights_from_delta(
+        obj: Annotated[UpdateWeightsFromDeltaReqInput, Body()],
     ):
         return await dispatch(obj)
 
@@ -51,10 +51,10 @@ def register_gpu_delta_routes(app: FastAPI, get_global_state: Callable):
     ):
         return await dispatch(obj)
 
-    @app.post("/prepare_weights_from_delta")
+    @app.post("/prepare_weights_delta")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def prepare_weights_from_delta(
-        obj: Annotated[PrepareWeightsFromDeltaReqInput, Body()],
+    async def prepare_weights_delta(
+        obj: Annotated[PrepareWeightsDeltaReqInput, Body()],
     ):
         return await dispatch(obj)
 
@@ -65,23 +65,23 @@ def register_gpu_delta_routes(app: FastAPI, get_global_state: Callable):
     ):
         return await dispatch(obj)
 
-    @app.post("/update_weights_from_delta")
+    @app.post("/apply_weights_delta")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def update_weights_from_delta(
-        obj: Annotated[UpdateWeightsFromDeltaReqInput, Body()],
+    async def apply_weights_delta(
+        obj: Annotated[ApplyWeightsDeltaReqInput, Body()],
     ):
         return await dispatch(obj)
 
-    @app.post("/resume_weights_from_delta")
+    @app.post("/resume_weights_delta")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def resume_weights_from_delta(
-        obj: Annotated[ResumeWeightsFromDeltaReqInput, Body()],
+    async def resume_weights_delta(
+        obj: Annotated[ResumeWeightsDeltaReqInput, Body()],
     ):
         return await dispatch(obj)
 
-    @app.post("/abort_weights_from_delta")
+    @app.post("/abort_weights_delta")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def abort_weights_from_delta(
-        obj: Annotated[AbortWeightsFromDeltaReqInput, Body()],
+    async def abort_weights_delta(
+        obj: Annotated[AbortWeightsDeltaReqInput, Body()],
     ):
         return await dispatch(obj)

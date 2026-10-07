@@ -62,13 +62,13 @@ def test_only_update_gates_admission_and_successful_resume_releases_it(
         assert not facade.manager.is_pause
         reply(facade, status, "PREPARED")
         assert (await task)["success"]
-        update = io.UpdateWeightsFromDeltaReqInput(session_id="publication-1")
+        update = io.ApplyWeightsDeltaReqInput(session_id="publication-1")
         task = asyncio.create_task(facade.request(update))
         await asyncio.sleep(0)
         assert sent[-1] is update and facade.manager.is_pause
         reply(facade, update, "APPLIED")
         assert (await task)["success"] and facade.manager.is_pause
-        resume = io.ResumeWeightsFromDeltaReqInput(session_id="publication-1")
+        resume = io.ResumeWeightsDeltaReqInput(session_id="publication-1")
         task = asyncio.create_task(facade.request(resume))
         await asyncio.sleep(0)
         reply(
@@ -94,7 +94,7 @@ def test_uncertain_update_keeps_admission_paused(control, failure):
                 raise OSError("transport unavailable")
 
             facade.communicator._send = fail
-        update = io.UpdateWeightsFromDeltaReqInput(session_id="publication-1")
+        update = io.ApplyWeightsDeltaReqInput(session_id="publication-1")
         task = asyncio.create_task(facade.request(update))
         await asyncio.sleep(0)
         if failure == "cancel":
@@ -145,7 +145,7 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
             calls.append(obj)
             if isinstance(obj, io.GetWeightsDeltaInfoReqInput):
                 state, phase = "IDLE", "describe"
-            elif isinstance(obj, io.PrepareWeightsFromDeltaReqInput):
+            elif isinstance(obj, io.PrepareWeightsDeltaReqInput):
                 state, phase = "PREPARING", "prepare"
                 assert obj.participants == identities
                 assert obj.manifest_sha256 == hashlib.sha256(content).hexdigest()
@@ -154,15 +154,15 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
                 assert obj.plan_digest == manifest["plan_digest"]
             elif isinstance(obj, io.GetWeightsDeltaStatusReqInput):
                 state, phase = "PREPARED", "status"
-            elif isinstance(obj, io.UpdateWeightsFromDeltaReqInput):
+            elif isinstance(obj, io.ApplyWeightsDeltaReqInput):
                 assert facade.manager.is_pause
                 if failure == "uncertain_apply":
                     raise OSError("lost apply acknowledgment")
                 state, phase = "APPLIED", "apply"
-            elif isinstance(obj, io.ResumeWeightsFromDeltaReqInput):
+            elif isinstance(obj, io.ResumeWeightsDeltaReqInput):
                 assert facade.manager.is_pause
                 state, phase = "RESUMED", "resume"
-            elif isinstance(obj, io.AbortWeightsFromDeltaReqInput):
+            elif isinstance(obj, io.AbortWeightsDeltaReqInput):
                 state, phase = "ABORTED", "abort"
             else:
                 assert not facade.manager.is_pause
@@ -189,17 +189,17 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
         # Omitting the option preserves the standalone path-only API.
         options = {} if release_state else {"release_state": False}
         result = await facade.request(
-            io.LoadWeightsFromDeltaReqInput(manifest_path=str(path), **options)
+            io.UpdateWeightsFromDeltaReqInput(manifest_path=str(path), **options)
         )
         assert result["success"] is (failure is None)
         assert path.read_bytes() == content
         if failure is None:
             expected = [
                 io.GetWeightsDeltaInfoReqInput,
-                io.PrepareWeightsFromDeltaReqInput,
+                io.PrepareWeightsDeltaReqInput,
                 io.GetWeightsDeltaStatusReqInput,
-                io.UpdateWeightsFromDeltaReqInput,
-                io.ResumeWeightsFromDeltaReqInput,
+                io.ApplyWeightsDeltaReqInput,
+                io.ResumeWeightsDeltaReqInput,
             ]
             if release_state:
                 expected += [
@@ -219,7 +219,7 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
             )
             assert facade.manager.is_pause is (failure != "prepare")
             assert any(
-                isinstance(obj, io.AbortWeightsFromDeltaReqInput) for obj in calls
+                isinstance(obj, io.AbortWeightsDeltaReqInput) for obj in calls
             ) is (failure == "prepare")
 
     asyncio.run(run())
@@ -247,7 +247,7 @@ def test_standalone_load_never_replays_applied_or_ambiguous_base(
 
         facade._request = request
         result = await facade.request(
-            io.LoadWeightsFromDeltaReqInput(manifest_path=str(path))
+            io.UpdateWeightsFromDeltaReqInput(manifest_path=str(path))
         )
         assert not result["success"] and "freshly loaded base" in result["message"]
         assert len(calls) == 1

@@ -15,14 +15,14 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.utils.auth import AuthLevel, add_api_key_middleware
 from sglang.srt.weight_sync.gpu_delta.http import register_gpu_delta_routes
 from sglang.srt.weight_sync.gpu_delta.io import (
-    AbortWeightsFromDeltaReqInput,
+    AbortWeightsDeltaReqInput,
+    ApplyWeightsDeltaReqInput,
     ClearWeightsDeltaStateReqInput,
     DeltaWeightsReqOutput,
     GetWeightsDeltaInfoReqInput,
     GetWeightsDeltaStatusReqInput,
-    LoadWeightsFromDeltaReqInput,
-    PrepareWeightsFromDeltaReqInput,
-    ResumeWeightsFromDeltaReqInput,
+    PrepareWeightsDeltaReqInput,
+    ResumeWeightsDeltaReqInput,
     UpdateWeightsFromDeltaReqInput,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -68,15 +68,15 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
     ]
     cases = [
         (
-            "load_weights_from_delta",
-            LoadWeightsFromDeltaReqInput,
+            "update_weights_from_delta",
+            UpdateWeightsFromDeltaReqInput,
             {"manifest_path": "/immutable/manifest.json"},
         ),
         ("clear_weights_delta_state", ClearWeightsDeltaStateReqInput, {}),
         ("get_weights_delta_info", GetWeightsDeltaInfoReqInput, {"engine_id": "e0"}),
         (
-            "prepare_weights_from_delta",
-            PrepareWeightsFromDeltaReqInput,
+            "prepare_weights_delta",
+            PrepareWeightsDeltaReqInput,
             session
             | {
                 "manifest_path": "/immutable/manifest.json",
@@ -90,16 +90,16 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
         ),
         ("get_weights_delta_status", GetWeightsDeltaStatusReqInput, session),
         (
-            "update_weights_from_delta",
-            UpdateWeightsFromDeltaReqInput,
+            "apply_weights_delta",
+            ApplyWeightsDeltaReqInput,
             session,
         ),
         (
-            "resume_weights_from_delta",
-            ResumeWeightsFromDeltaReqInput,
+            "resume_weights_delta",
+            ResumeWeightsDeltaReqInput,
             session,
         ),
-        ("abort_weights_from_delta", AbortWeightsFromDeltaReqInput, session),
+        ("abort_weights_delta", AbortWeightsDeltaReqInput, session),
     ]
     for name, request_type, payload in cases:
         route = next(route for route in app.routes if route.path == f"/{name}")
