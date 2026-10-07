@@ -1039,6 +1039,31 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             self.indexer_head_dim,
             _is_hip and get_exec().kernel.enable_deepseek_v4_fp4_indexer,
         )
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            arch35 = is_npu_arch35()
+            if self.kv_cache_dtype_str == "bfloat16":
+                # NPU PA_ND rows are BF16 before A5 and 128B-aligned FP8 on A5.
+                self.kv_bytes = (
+                    ceil_align(
+                        self.qk_nope_head_dim
+                        + self.qk_rope_head_dim * 2
+                        + ceil_div(self.qk_nope_head_dim, 64),
+                        128,
+                    )
+                    if arch35
+                    else self.attn_head_dim * torch.bfloat16.itemsize
+                )
+            # NPU retains the packed compatibility buffer and adds K/scales.
+            self.indexer_bytes_per_token = (
+                get_dsv4_indexer_bytes_per_token(
+                    self.indexer_head_dim,
+                    get_exec().kernel.enable_deepseek_v4_fp4_indexer,
+                )
+                + self.indexer_head_dim
+                + (torch.float32.itemsize if arch35 else torch.float16.itemsize)
+            )
         self.context_len = kvc.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         stage = range(kvc.layer_info.start_layer, kvc.layer_info.end_layer)

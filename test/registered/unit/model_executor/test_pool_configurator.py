@@ -1,8 +1,10 @@
 """CPU-only tests for pool_configurator.py: available_bytes -> MemoryPoolConfig."""
 
 import contextlib
+import sys
 import unittest
-from types import SimpleNamespace
+from itertools import product
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.configs.model_config import AttentionArch
@@ -1428,6 +1430,103 @@ class TestSWAPoolFloor(CustomTestCase):
                         check_dsv4_unified_fp8_pd_supported(
                             **{**base, "disaggregation_mode": mode, key: value}
                         )
+
+
+class TestDSV4NpuBudget(CustomTestCase):
+    def test_npu_byte_rates_cover_constructor_growth(self):
+        """Growing NPU KV and indexer capacity must not outrun the planner's rates."""
+        import torch
+
+        from sglang.srt.environ import envs
+        from sglang.srt.hardware_backend.npu import utils as npu_utils
+        from sglang.srt.model_executor import pool_configurator as pc
+
+        model = SimpleNamespace(
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            context_len=4096,
+            compress_ratios=[0, 4, 128],
+            window_size=128,
+            hf_config=SimpleNamespace(kv_source_layer_ids=[]),
+        )
+        kvc = SimpleNamespace(
+            kv_cache_dtype_str="bfloat16",
+            model_config=model,
+            layer_info=SimpleNamespace(start_layer=0, end_layer=3),
+            pp_size=1,
+            attn_dp_size=1,
+            sliding_window_size=128,
+            page_size=128,
+            spec_algorithm=SimpleNamespace(is_dspark=lambda: False),
+        )
+        with (
+            patch.dict(sys.modules, {"torch_npu": ModuleType("torch_npu")}),
+            patch.object(pc, "_is_npu", True),
+            envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.override("float32"),
+        ):
+            from sglang.srt.hardware_backend.npu.dsv4 import dsv4_memory_pool as npu
+
+            for arch35, use_fp4 in product((False, True), repeat=2):
+                _publish_config(
+                    self,
+                    page_size=128,
+                    max_running_requests=1,
+                    kv_cache_dtype="bfloat16",
+                    dsv4_attn_backend="flashmla",
+                    enable_deepseek_v4_fp4_indexer=use_fp4,
+                )
+                with (
+                    patch.object(npu, "is_npu_arch35", return_value=arch35),
+                    patch.object(npu_utils, "is_npu_arch35", return_value=arch35),
+                ):
+                    planner = pc.DSV4PoolConfigurator(kvc)
+                    kv_bytes, indexer_bytes = [], []
+                    for size in (128, 256):
+                        kv = npu.NPUDeepSeekV4SingleKVPool(
+                            size=size,
+                            page_size=128,
+                            kernel_page_size=128,
+                            dtype=torch.bfloat16,
+                            qk_nope_head_dim=448,
+                            qk_rope_head_dim=64,
+                            layer_num=1,
+                            device="cpu",
+                            enable_memory_saver=False,
+                        )
+                        indexer = npu.NPUDeepSeekV4IndexerPool(
+                            size=size,
+                            page_size=32,
+                            kernel_page_size=32,
+                            global_page_size=128,
+                            dtype=torch.bfloat16,
+                            index_head_dim=128,
+                            layer_num=1,
+                            device="cpu",
+                            enable_memory_saver=False,
+                            use_fp4_indexer=use_fp4,
+                        )
+                        kv_bytes.append(sum(buf.nbytes for buf in kv.kv_buffer))
+                        indexer_bytes.append(
+                            sum(
+                                buf.nbytes
+                                for buffers in (
+                                    indexer.index_k_with_scale_buffer,
+                                    indexer.index_k_buffer,
+                                    indexer.index_scale_buffer,
+                                )
+                                for buf in buffers
+                            )
+                        )
+                    # Equal page increments cancel the reserved-page overhead.
+                    for name, allocated, rate in (
+                        ("kv", kv_bytes, planner._get_paged_kv_bytes_per_token()),
+                        ("indexer", indexer_bytes, planner.indexer_bytes_per_token),
+                    ):
+                        with self.subTest(arch35=arch35, use_fp4=use_fp4, buffer=name):
+                            self.assertLessEqual(
+                                allocated[1] - allocated[0], 128 * rate
+                            )
 
 
 if __name__ == "__main__":
