@@ -1279,11 +1279,8 @@ class GptOssForCausalLM(nn.Module):
                             projection = unwrap_lora_layer(
                                 self.get_submodule(name.rsplit(".", 1)[0]).qkv_proj
                             )
-                            start = (
-                                get_group_rank_size(projection.tp_group)[0]
-                                * param.numel()
-                            )
-                            tp_size = get_group_rank_size(projection.tp_group)[1]
+                            tp_rank, tp_size = get_group_rank_size(projection.tp_group)
+                            start = tp_rank * param.numel()
                             full_shard_size = param.numel() * tp_size
                             # This handles TP padding: if the checkpoint dim is not divisible by tp_size,
                             # the last TP shard extends beyond `loaded_weight`, pad with zeros before slicing.
