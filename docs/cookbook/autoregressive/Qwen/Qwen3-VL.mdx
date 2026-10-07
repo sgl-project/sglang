@@ -138,10 +138,9 @@ below counts **output tokens only** on one GPU; TTFT and time per output token
   </tbody>
 </table>
 
-This configuration exceeded the recorded vLLM throughput baseline by
-13.2–46.8%, but high-concurrency TTFT remained worse: at concurrency 128,
-3822 ms versus 588 ms. Choose it for output throughput rather than assuming a
-latency improvement across all concurrency levels.
+This configuration prioritizes output throughput. Median TTFT increased from
+71.09 ms at concurrency 1 to 3821.71 ms at concurrency 128. Evaluate this
+throughput/latency tradeoff against your workload requirements.
 
 Text GSM8K scored 1218/1314 (92.69%) versus 1215/1314 (92.47%) for the BF16
 reference. The evaluation used the first five dataset rows as few-shot examples,
