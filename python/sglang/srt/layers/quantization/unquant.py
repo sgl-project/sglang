@@ -317,6 +317,7 @@ def initialize_bf16_gemm_config() -> None:
         _run_direct_dense = run_direct_dense
         _enable_bf16_splitk_gemm = True
 
+    _CUBLASLT_BF16_READY.clear()
     _BF16_GEMM_BACKEND = backend
 
 
@@ -358,12 +359,61 @@ def _bf16_splitk_gemm(
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
+_CUBLASLT_BF16_SHAPES = frozenset({(19456, 2560), (2560, 9728)})
+_CUBLASLT_BF16_READY: set[tuple[int, int, int]] = set()
+
+
+def _try_tuned_bf16_cublaslt(x, weight, bias, addend=None, out=None):
+    if (
+        not _CUBLASLT_BF16_READY
+        or x.ndim < 2
+        or x.shape[-1] == 0
+        or x.numel() != 128 * x.shape[-1]
+        or (x.device.index, *weight.shape) not in _CUBLASLT_BF16_READY
+    ):
+        return None
+    if (
+        bias is not None
+        or addend is not None
+        or not x.is_cuda
+        or x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or x.device != weight.device
+        or x.requires_grad
+        or weight.requires_grad
+        or weight.ndim != 2
+        or not x.is_contiguous()
+        or not weight.is_contiguous()
+        or x.shape[-1] != weight.shape[1]
+        or not get_bf16_gemm_backend().is_cutedsl()
+        or get_exec().kernel.disable_flashinfer_autotune
+        or get_exec().deterministic.enable_deterministic_inference
+    ):
+        return None
+    if out is not None and (
+        x.ndim != 2
+        or out.requires_grad
+        or out.dtype != torch.bfloat16
+        or out.device != x.device
+        or not out.is_contiguous()
+        or tuple(out.shape) != (128, weight.shape[0])
+    ):
+        return None
+    from flashinfer.gemm import mm_bf16
+
+    result = mm_bf16(x.view(128, x.shape[-1]), weight.T, out=out, backend="cublaslt")
+    return out if out is not None else result.view(*x.shape[:-1], weight.shape[0])
+
+
 def _bf16_gemm_dispatch_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    tuned = _try_tuned_bf16_cublaslt(x, weight, bias, addend)
+    if tuned is not None:
+        return tuned
     m = x.numel() // x.shape[-1]
     if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
         m, weight.shape[0], weight.shape[1]
@@ -574,6 +624,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
+        tuned = _try_tuned_bf16_cublaslt(x, layer.weight, bias, out=output)
+        if tuned is not None:
+            return tuned
         if (
             _enable_bf16_splitk_gemm
             and bias is None

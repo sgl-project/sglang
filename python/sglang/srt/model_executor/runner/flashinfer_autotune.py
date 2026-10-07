@@ -19,6 +19,7 @@ import functools
 import hashlib
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -51,6 +52,76 @@ def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
     skip_ops = set(get_exec().kernel.flashinfer_autotune_skip_ops or ())
     skip_ops.update(FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS)
     return skip_ops
+
+
+def _bf16_cublaslt_weights(
+    model_runner: ModelRunner,
+) -> dict[tuple[int, int], torch.Tensor]:
+    mr = model_runner
+    if (
+        mr.device != "cuda"
+        or getattr(mr, "dtype", None) != torch.bfloat16
+        or mr.model_config.quantization is not None
+        or getattr(mr, "is_draft_worker", False)
+        or (
+            getattr(mr, "spec_algorithm", None) is not None
+            and mr.spec_algorithm.is_speculative()
+        )
+        or get_exec().kernel.disable_flashinfer_autotune
+        or get_exec().deterministic.enable_deterministic_inference
+        or "bf16_gemm" in get_flashinfer_autotune_skip_ops(mr)
+        or torch.cuda.get_device_capability(mr.device) != (10, 3)
+    ):
+        return {}
+    from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
+
+    if not get_bf16_gemm_backend().is_cutedsl():
+        return {}
+    from sglang.srt.layers.quantization.unquant import _CUBLASLT_BF16_SHAPES
+
+    weights = {}
+    for module in mr.model.modules():
+        weight = getattr(module, "weight", None)
+        if (
+            isinstance(weight, torch.Tensor)
+            and weight.ndim == 2
+            and tuple(weight.shape) in _CUBLASLT_BF16_SHAPES
+            and weight.dtype == torch.bfloat16
+            and weight.is_cuda
+            and weight.is_contiguous()
+            and getattr(module, "bias", None) is None
+        ):
+            weights.setdefault(tuple(weight.shape), weight)
+    return weights
+
+
+def _has_bf16_cublaslt_tactic(x, weight, out) -> bool:
+    try:
+        from flashinfer.autotuner import AutoTuner
+        from flashinfer.gemm.gemm_base import (
+            _BF16_GEMM_SM100_TUNING_CONFIG,
+            DEFAULT_WORKSPACE_SIZE,
+            _get_cache_buf,
+            get_mm_bf16_cublaslt_module,
+        )
+
+        runner = get_mm_bf16_cublaslt_module().cublaslt_bf16_gemm_runner()
+        workspace = _get_cache_buf(
+            "mm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, x.device
+        )
+        inputs = [x, weight.T, None, False, out, workspace]
+        shapes = tuple(
+            tuple(t.shape) if isinstance(t, torch.Tensor) else (0,) for t in inputs
+        )
+        hit, runner_id, tactic, _ = AutoTuner.get().search_cache(
+            "bf16_gemm", [runner], shapes, _BF16_GEMM_SM100_TUNING_CONFIG, inputs=inputs
+        )
+        return hit and runner_id == 0 and isinstance(tactic, int) and tactic >= 0
+    except (ImportError, AttributeError, TypeError, ValueError):
+        logger.warning(
+            "BF16 cuBLASLt cache verification unavailable; retaining existing GEMM dispatch."
+        )
+        return False
 
 
 def should_run_flashinfer_autotune(
@@ -122,7 +193,13 @@ def should_run_flashinfer_autotune(
     else:
         fp8_gemm_needs_autotune = False
 
-    if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
+    bf16_gemm_needs_autotune = bool(_bf16_cublaslt_weights(mr))
+    if not (
+        moe_needs_autotune
+        or fp4_gemm_needs_autotune
+        or fp8_gemm_needs_autotune
+        or bf16_gemm_needs_autotune
+    ):
         return False
 
     if torch.cuda.get_device_capability()[0] < 9:
@@ -253,6 +330,9 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
     from flashinfer.autotuner import AutoTuner, _collect_metadata, autotune
 
     mr = model_runner
+    unquant = sys.modules.get("sglang.srt.layers.quantization.unquant")
+    if unquant is not None:
+        unquant._CUBLASLT_BF16_READY.clear()
     cache_path = flashinfer_autotune_cache_path(mr)
     sync_group = _autotune_tactic_sync_group(get_parallel().tp_group)
     reuse_cache = envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get()
@@ -304,8 +384,24 @@ def run_flashinfer_autotune_forward(
     model_runner: ModelRunner, forward_fn: Callable[[], None], *, run_lm_head: bool
 ) -> None:
     """Run flashinfer autotune forward."""
+    weights = _bf16_cublaslt_weights(model_runner)
+    verified = set()
     with flashinfer_autotune_context(model_runner, run_lm_head=run_lm_head):
+        if weights:
+            from flashinfer import autotune
+            from flashinfer.gemm import mm_bf16
+
+            with autotune(tuning_buckets=(128,), round_up=False):
+                for (n, k), weight in weights.items():
+                    x = torch.zeros((128, k), dtype=weight.dtype, device=weight.device)
+                    out = mm_bf16(x, weight.T, backend="cublaslt")
+                    if _has_bf16_cublaslt_tactic(x, weight, out):
+                        verified.add((weight.device.index, n, k))
         forward_fn()
+    if verified:
+        from sglang.srt.layers.quantization.unquant import _CUBLASLT_BF16_READY
+
+        _CUBLASLT_BF16_READY.update(verified)
 
 
 def maybe_flashinfer_autotune_speculative_draft(
