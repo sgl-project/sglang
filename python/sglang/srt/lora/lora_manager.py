@@ -122,6 +122,9 @@ class LoRAManager:
         self._experts_shared_outer_override: Optional[bool] = (
             get_lora().experts_shared_outer_loras
         )
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        self.moe_lora_runner_backend = get_moe_runner_backend()
         self.lora_use_virtual_experts: bool = get_lora().lora_use_virtual_experts
         self.lora_strict_loading: bool = get_lora().lora_strict_loading
         self.speculative_algorithm: Optional[str] = get_spec().speculative_algorithm
@@ -1029,9 +1032,9 @@ class LoRAManager:
         # Initializing memory pool with base model
         self.fetch_new_loras({None})
 
-    def set_lora_module(self, module_name, module):
+    def set_lora_module(self, module_name, module, **kwargs):
         """Wrap any module (standard or MoE) with LoRA support."""
-        lora_module = get_lora_layer(module, self.lora_backend)
+        lora_module = get_lora_layer(module, self.lora_backend, **kwargs)
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
@@ -1171,12 +1174,30 @@ class LoRAManager:
                     )
                     lora_module = module
                 else:
-                    lora_module = self.set_lora_module(module_name, module)
-                    lora_module.experts_shared_outer_loras = (
-                        self.experts_shared_outer_loras
+                    lora_module = self.set_lora_module(
+                        module_name,
+                        module,
+                        experts_shared_outer_loras=self.experts_shared_outer_loras,
+                        max_lora_rank=self.max_lora_rank,
                     )
                     lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
                 self.lora_modules[layer_id][module_name] = lora_module
+
+        # lora_* quant methods leave execution to the LoRA wrapper; reject
+        # target sets that leave every MoE layer without one.
+        backend = getattr(self, "moe_lora_runner_backend", None)
+        modules = list(self.base_model.modules())
+        if (
+            backend is not None
+            and backend.is_lora()
+            and any(isinstance(module, FusedMoE) for module in modules)
+            and not any(isinstance(module, FusedMoEWithLoRA) for module in modules)
+        ):
+            raise ValueError(
+                f"--moe-runner-backend {backend.value} requires "
+                "the LoRA target modules to include gate_up_proj and down_proj; "
+                "this adapter leaves the MoE experts without a runner"
+            )
 
 
 def init_lora_cuda_graph_moe_buffers(
