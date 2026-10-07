@@ -40,7 +40,9 @@ def _verify_rows(reqs, prefix, dtype, device):
     _, cache, table, slots, _ = _inputs(reqs, prefix + DRAFT_TOKENS, dtype, device)
     slots = slots.repeat_interleave(DRAFT_TOKENS)
     lengths = (prefix + torch.arange(1, DRAFT_TOKENS + 1, device=device)).repeat(reqs)
-    q = torch.randn((reqs * DRAFT_TOKENS, HEADS, DIM), device=device, dtype=torch.bfloat16)
+    q = torch.randn(
+        (reqs * DRAFT_TOKENS, HEADS, DIM), device=device, dtype=torch.bfloat16
+    )
     return q, cache, table, slots, lengths
 
 
@@ -137,7 +139,14 @@ class TestMiniMaxIndexerCP(unittest.TestCase):
             with self.subTest(dtype=dtype):
                 q, cache, table, slots, lengths = _verify_rows(4, prefix, dtype, device)
                 packed = _cp_topk(
-                    q, cache, table, slots, lengths, max_len, 1.0, packed_queries=DRAFT_TOKENS
+                    q,
+                    cache,
+                    table,
+                    slots,
+                    lengths,
+                    max_len,
+                    1.0,
+                    packed_queries=DRAFT_TOKENS,
                 )
                 for head in range(HEADS):
                     native = _native_topk(

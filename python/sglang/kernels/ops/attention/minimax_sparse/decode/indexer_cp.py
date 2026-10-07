@@ -302,7 +302,11 @@ def score_local_blocks(
     scores = torch.empty(
         (world, batch, local), dtype=torch.float32, device=gathered_q.device
     )
-    if packed_queries > 1 and batch % packed_queries == 0 and packed_queries * world <= TILE_ROWS:
+    if (
+        packed_queries > 1
+        and batch % packed_queries == 0
+        and packed_queries * world <= TILE_ROWS
+    ):
         groups = batch // packed_queries
         chunks = min(local, max(1, min(256, 4096 // max(groups, 1))))
         _score_shard_packed[(groups, chunks)](
