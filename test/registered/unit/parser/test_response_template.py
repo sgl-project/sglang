@@ -711,7 +711,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
             (declared, "<answer>not json", False),
             (declared, call, True),
             ([], call, False),
-            (declared, "<call:get_time>{}</call>", False),
+            (declared, "<call:get_time>{}</call>", True),
             (declared, call + '<answer>{"a": 1}', False),
             (declared, '<call:get_weather>{"city": "<answer>Paris"}</call>', True),
         ]

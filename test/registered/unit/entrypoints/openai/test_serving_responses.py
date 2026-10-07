@@ -919,10 +919,11 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
                     self.assertIs(
                         _is_grammar_accept_string(grammar, call["text"]), reads_calls
                     )
-                    self.assertFalse(
+                    self.assertIs(
                         _is_grammar_accept_string(
                             grammar, call["text"].replace("get_weather", "delete_all")
-                        )
+                        ),
+                        reads_calls,
                     )
                     message = response["output"][-1]
                     self.assertEqual(

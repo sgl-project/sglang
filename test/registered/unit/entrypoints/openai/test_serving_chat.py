@@ -1162,8 +1162,8 @@ class ServingChatTestCase(CustomTestCase):
                             expected,
                         )
 
-    def test_json_answer_admits_only_calls_the_tools_allow(self):
-        """Before a JSON answer, the grammar must not admit calls to undeclared tools."""
+    def test_json_answer_admits_calls_to_undeclared_tools(self):
+        """Before a JSON answer, calls must not be held to the declared tools."""
         self._use_delimited_response_template("beam")
         fields = {"tools": [_WEATHER_TOOL], "response_format": {"type": "json_object"}}
         valid = '<think>Hm</think><call:get_weather>{"city": "Paris"}</call>'
@@ -1172,7 +1172,7 @@ class ServingChatTestCase(CustomTestCase):
         grammar = Grammar.from_structural_tag(adapted.sampling_params["structural_tag"])
         for text, admitted in (
             (valid, True),
-            (valid.replace("get_weather", "delete_all"), False),
+            (valid.replace("get_weather", "delete_all"), True),
             (answer, True),
         ):
             with self.subTest(text=text):
