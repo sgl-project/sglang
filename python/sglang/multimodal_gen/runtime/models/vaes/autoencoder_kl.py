@@ -2,6 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+from diffusers.models.attention import AttentionMixin
+from diffusers.models.attention_processor import (
+    ADDED_KV_ATTENTION_PROCESSORS,
+    CROSS_ATTENTION_PROCESSORS,
+    AttnAddedKVProcessor,
+    AttnProcessor,
+)
 from diffusers.models.autoencoders.vae import (
     DecoderOutput,
     DiagonalGaussianDistribution,
@@ -15,6 +22,29 @@ from sglang.multimodal_gen.runtime.models.vaes.parallel.diffusers_spatial import
 
 class AutoencoderKLMixin:
     """Shared 2D KL VAE operations; constructors and public return types stay model-specific."""
+
+    # reuse processor traversal without adding Diffusers' QKV fusion controls
+    attn_processors = AttentionMixin.attn_processors
+    set_attn_processor = AttentionMixin.set_attn_processor
+
+    def set_default_attn_processor(self):
+        """Restore a uniform supported processor family without changing weights"""
+        if all(
+            proc.__class__ in ADDED_KV_ATTENTION_PROCESSORS
+            for proc in self.attn_processors.values()
+        ):
+            processor = AttnAddedKVProcessor()
+        elif all(
+            proc.__class__ in CROSS_ATTENTION_PROCESSORS
+            for proc in self.attn_processors.values()
+        ):
+            processor = AttnProcessor()
+        else:
+            raise ValueError(
+                f"Cannot call `set_default_attn_processor` when attention processors are of type {next(iter(self.attn_processors.values()))}"
+            )
+
+        self.set_attn_processor(processor)
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         _, _, height, width = x.shape
