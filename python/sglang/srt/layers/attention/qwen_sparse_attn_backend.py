@@ -77,9 +77,7 @@ def _flatten_qsa_kv_cache(cache: torch.Tensor, name: str) -> torch.Tensor:
         raise ValueError(f"{name} must be rank 4, got shape {tuple(cache.shape)}")
     # [pages, page_size, heads, dim], including FIA's [slots, 1, heads, dim].
     # Unlike flatten/reshape, view cannot silently allocate a copy.
-    return cache.view(
-        cache.shape[0] * cache.shape[1], cache.shape[2], cache.shape[3]
-    )
+    return cache.view(cache.shape[0] * cache.shape[1], cache.shape[2], cache.shape[3])
 
 
 def _npu_sparse_attention(

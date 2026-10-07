@@ -69,7 +69,9 @@ def test_npu_graph_overlaps_update_and_replay_and_reuses_worker(make_backend):
         backend._device_module.set_device.assert_called_once_with(0)
         update_threads.append(threading.get_ident())
         events.append("update")
-        assert replay_started.wait(timeout=5), "replay must not wait for update to finish"
+        assert replay_started.wait(timeout=5), (
+            "replay must not wait for update to finish"
+        )
         events.append("update_done")
 
     def replay():
@@ -83,7 +85,9 @@ def test_npu_graph_overlaps_update_and_replay_and_reuses_worker(make_backend):
         events.clear()
         previous_fence = backend._rebind_fence
         if previous_fence is not None:
-            previous_fence.synchronize.side_effect = lambda: events.append("synchronize")
+            previous_fence.synchronize.side_effect = lambda: events.append(
+                "synchronize"
+            )
         result = backend.replay_with_input_update(1, None, cpu_update_input=[{}, {}])
         assert result is backend._outputs[1]
         assert events.count("update") == events.count("replay") == 1

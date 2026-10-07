@@ -20,9 +20,7 @@ pytestmark = pytest.mark.skipif(not is_npu(), reason="NPU is required")
 
 @pytest.fixture
 def runtime_context():
-    publish(
-        ServerArgs(model_path="dummy", speculative_num_draft_tokens=4), role="test"
-    )
+    publish(ServerArgs(model_path="dummy", speculative_num_draft_tokens=4), role="test")
     try:
         yield
     finally:
@@ -185,7 +183,9 @@ def test_packed_mqa_current_topk_expansion_graph(rows, block_topk):
     "mode", [ForwardMode.DECODE, ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2]
 )
 @pytest.mark.parametrize("batch_size", [2, 32])
-def test_backend_graph_metadata_current_topk_expansion(mode, batch_size, runtime_context):
+def test_backend_graph_metadata_current_topk_expansion(
+    mode, batch_size, runtime_context
+):
     # Real backend methods/persistent buffers; synthetic pool and Q/K.
     # Includes sparse attention; not projection, compression, scheduler or service.
     raw_width = 4096
