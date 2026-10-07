@@ -32,11 +32,6 @@ try:
 except ImportError:  # pragma: no cover
     scipy_wavfile = None
 
-try:
-    import imageio_ffmpeg as _imageio_ffmpeg
-except ImportError:  # pragma: no cover
-    _imageio_ffmpeg = None
-
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
@@ -317,25 +312,9 @@ def _system_ffmpeg_with_libx264() -> Optional[str]:
 
 
 def _resolve_ffmpeg_exe() -> str:
-    # imageio-ffmpeg's bundled 4.2.2 converts rgb24->yuv420p ~20x slower on aarch64
     ffmpeg_exe = _system_ffmpeg_with_libx264()
-    if ffmpeg_exe is not None:
-        return ffmpeg_exe
-    ffmpeg_exe = "ffmpeg"
-    try:
-        if _imageio_ffmpeg is not None:
-            ffmpeg_exe = _imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        pass
-
-    ffmpeg_ok = False
-    if ffmpeg_exe:
-        if os.path.isabs(ffmpeg_exe):
-            ffmpeg_ok = os.path.exists(ffmpeg_exe)
-        else:
-            ffmpeg_ok = shutil.which(ffmpeg_exe) is not None
-    if not ffmpeg_ok:
-        raise RuntimeError("ffmpeg not found")
+    if ffmpeg_exe is None:
+        raise RuntimeError("video output requires ffmpeg with libx264 on PATH")
     return ffmpeg_exe
 
 
@@ -541,7 +520,7 @@ def _try_save_cuda_video_direct(
         return True
     except Exception:
         logger.warning_once(
-            "Direct CUDA video save failed; falling back to imageio. "
+            "Direct CUDA video save failed; falling back to CPU ffmpeg encoding. "
             "Enable debug logging for exception details."
         )
         logger.debug("Direct CUDA video save failure", exc_info=True)
@@ -725,6 +704,83 @@ def _maybe_mux_audio_into_mp4(
         )
 
 
+def _save_video_ffmpeg(
+    save_file_path: str,
+    frames: list,
+    *,
+    fps: int,
+    quality: float,
+    x264_preset: Optional[str] = None,
+    audio_path: Optional[str] = None,
+) -> None:
+    if not frames:
+        raise ValueError("video output requires at least one frame")
+    if not 1 <= quality <= 10:
+        raise ValueError("video quality must be between 1 and 10")
+    first_frame = np.asarray(frames[0])
+    height, width = first_frame.shape[:2]
+    channels = first_frame.shape[2] if first_frame.ndim == 3 else 1
+    pixel_format = {1: "gray", 3: "rgb24", 4: "rgba"}[channels]
+    command = [
+        _resolve_ffmpeg_exe(),
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-s",
+        f"{width}x{height}",
+        "-pix_fmt",
+        pixel_format,
+        "-r",
+        f"{fps:.02f}",
+        "-i",
+        "pipe:0",
+    ]
+    if audio_path is None:
+        command += ["-an"]
+    else:
+        command += ["-i", audio_path, "-acodec", "aac"]
+    command += [
+        "-vcodec",
+        "libx264",
+        "-preset",
+        x264_preset or X264_PRESET,
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        str(int((1 - quality / 10.0) * 51)),
+    ]
+    if width % 16 or height % 16:
+        command += [
+            "-vf",
+            f"scale={(width + 15) // 16 * 16}:{(height + 15) // 16 * 16}",
+        ]
+    command += [save_file_path]
+    with tempfile.TemporaryFile() as stderr:
+        with subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr,
+        ) as process:
+            try:
+                for frame in frames:
+                    frame = np.asarray(frame)
+                    if frame.shape != first_frame.shape or frame.dtype != np.uint8:
+                        raise ValueError(
+                            "video frames must have matching shapes and uint8 dtype"
+                        )
+                    process.stdin.write(memoryview(np.ascontiguousarray(frame)))
+            finally:
+                process.stdin.close()
+            if process.wait() != 0:
+                stderr.seek(0)
+                raise RuntimeError(
+                    f"ffmpeg video encoding failed: {stderr.read().decode(errors='replace')}"
+                )
+
+
 def _try_save_video_with_audio(
     *,
     save_file_path: str,
@@ -732,7 +788,6 @@ def _try_save_video_with_audio(
     fps: int,
     audio: Any,
     audio_sample_rate: Optional[int],
-    output_format: str,
     quality: float,
     x264_preset: Optional[str] = None,
 ) -> bool:
@@ -756,16 +811,13 @@ def _try_save_video_with_audio(
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             tmp_wav_path = f.name
         scipy_wavfile.write(tmp_wav_path, selected_sr, audio_np)
-        imageio.mimsave(
+        _save_video_ffmpeg(
             save_file_path,
             frames,
             fps=fps,
-            format=output_format,
-            codec="libx264",
             quality=quality,
             audio_path=tmp_wav_path,
-            audio_codec="aac",
-            output_params=["-preset", x264_preset or X264_PRESET],
+            x264_preset=x264_preset,
         )
         return True
     except Exception as e:
@@ -982,26 +1034,22 @@ def save_materialized_output(
     os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
     if data_type == DataType.VIDEO:
         quality = output_compression / 10 if output_compression is not None else 5
-        output_format = data_type.get_default_extension()
         saved_with_audio = _try_save_video_with_audio(
             save_file_path=save_file_path,
             frames=materialized.frames,
             fps=materialized.fps,
             audio=materialized.audio,
             audio_sample_rate=audio_sample_rate,
-            output_format=output_format,
             quality=quality,
             x264_preset=x264_preset,
         )
         if not saved_with_audio:
-            imageio.mimsave(
+            _save_video_ffmpeg(
                 save_file_path,
                 materialized.frames,
                 fps=materialized.fps,
-                format=output_format,
-                codec="libx264",
                 quality=quality,
-                output_params=["-preset", x264_preset or X264_PRESET],
+                x264_preset=x264_preset,
             )
 
             _maybe_mux_audio_into_mp4(
