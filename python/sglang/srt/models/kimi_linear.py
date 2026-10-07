@@ -225,12 +225,11 @@ class KimiDeltaAttention(nn.Module):
         self.attn_tp_size = get_parallel().attn_tp_size
         # Group the weights are sharded over. Defaults to the global TP group,
         # which is what plain Kimi-Linear has always used.
+        parallel_group = "attn_tp" if shard_on_attn_tp else "tp"
         if shard_on_attn_tp:
             self.shard_tp_size = self.attn_tp_size
-            self.shard_tp_rank = get_parallel().attn_tp_rank
         else:
             self.shard_tp_size = self.tp_size
-            self.shard_tp_rank = get_parallel().tp_rank
         self.hidden_size = hidden_size
         self.config = config
         self.head_dim = config.linear_attn_config["head_dim"]
@@ -277,8 +276,7 @@ class KimiDeltaAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.fused_qkvbfg_proj",
-                tp_rank=self.shard_tp_rank,
-                tp_size=self.shard_tp_size,
+                parallel_group=parallel_group,
             )
             self.split_sizes = [3 * projection_size // self.shard_tp_size]
             if self.fuse_no_lora_beta:
@@ -295,8 +293,7 @@ class KimiDeltaAttention(nn.Module):
                     self.num_heads,
                     bias=False,
                     prefix=f"{prefix}.b_proj",
-                    tp_rank=self.shard_tp_rank,
-                    tp_size=self.shard_tp_size,
+                    parallel_group=parallel_group,
                 )
         elif self.do_fuse_qkvbfg:
             # Fuse: q, k, v, beta (column parallel) + f_a, g_a (replicated)
@@ -314,8 +311,7 @@ class KimiDeltaAttention(nn.Module):
                 self.fg_sizes,
                 quant_config=quant_config,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
-                tp_rank=self.shard_tp_rank,
-                tp_size=self.shard_tp_size,
+                parallel_group=parallel_group,
             )
             self.split_sizes = [
                 3 * projection_size // self.shard_tp_size,
@@ -327,12 +323,10 @@ class KimiDeltaAttention(nn.Module):
                 self.head_dim,
                 projection_size,
                 dtype=config.dtype,
-                tp_rank=self.shard_tp_rank,
-                tp_size=self.shard_tp_size,
+                parallel_group=parallel_group,
             )
         else:
             # Unfused path: separate QKVParallelLinear
-            attn_tp_rank = get_parallel().attn_tp_rank
             self.qkv_proj = QKVParallelLinear(
                 self.hidden_size,
                 self.head_dim,
@@ -340,8 +334,7 @@ class KimiDeltaAttention(nn.Module):
                 self.num_k_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                parallel_group="attn_tp",
                 v_head_size=self.head_v_dim,
                 prefix=f"{prefix}.qkv_proj",
             )
@@ -360,8 +353,7 @@ class KimiDeltaAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.f_b_proj",
-                tp_rank=self.shard_tp_rank,
-                tp_size=self.shard_tp_size,
+                parallel_group=parallel_group,
             )
 
             self.b_proj = ColumnParallelLinear(
@@ -370,8 +362,7 @@ class KimiDeltaAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.b_proj",
-                tp_rank=self.shard_tp_rank,
-                tp_size=self.shard_tp_size,
+                parallel_group=parallel_group,
             )
 
             self.g_a_proj = ReplicatedLinear(
@@ -387,8 +378,7 @@ class KimiDeltaAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.g_b_proj",
-                tp_rank=self.shard_tp_rank,
-                tp_size=self.shard_tp_size,
+                parallel_group=parallel_group,
             )
 
         self.dt_bias = nn.Parameter(
@@ -405,8 +395,7 @@ class KimiDeltaAttention(nn.Module):
             bias=False,
             params_dtype=torch.float32,
             prefix=f"{prefix}.qkv_conv1d",
-            tp_rank=self.shard_tp_rank,
-            tp_size=self.shard_tp_size,
+            parallel_group=parallel_group,
         )
         # unsqueeze to fit conv1d weights shape into the linear weights shape.
         # Can't do this in `weight_loader` since it already exists in
@@ -428,8 +417,7 @@ class KimiDeltaAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
-            tp_rank=self.shard_tp_rank,
-            tp_size=self.shard_tp_size,
+            parallel_group=parallel_group,
             reduce_results=reduce_results,
         )
 

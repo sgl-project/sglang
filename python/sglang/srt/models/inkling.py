@@ -199,8 +199,7 @@ class InklingDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
                 fused=True,
-                tp_rank=get_parallel().attn_tp_rank,
-                tp_size=get_parallel().attn_tp_size,
+                parallel_group="attn_tp",
                 tp_group=get_parallel().attn_tp_group,
                 use_dp_attention_reduce=True,
             )

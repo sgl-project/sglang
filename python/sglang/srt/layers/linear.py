@@ -8,6 +8,7 @@ import itertools
 import logging
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
 
+import msgspec
 import torch
 from torch import nn
 from torch.nn.parameter import Parameter, UninitializedParameter
@@ -55,15 +56,44 @@ _disable_hip_linear_quant = _is_hip and get_bool_env_var(
 
 logger = logging.getLogger(__name__)
 
-LinearParallelGroup = Literal["tp", "attn_tp", "replicated"]
+
+class ReplicatedParallelGroup(msgspec.Struct, frozen=True):
+    """Share weight partitions across consecutive ranks; collectives stay separate."""
+
+    group: Literal["tp", "attn_tp"]
+    replica_size: int
+
+    def __post_init__(self):
+        if self.group not in ("tp", "attn_tp"):
+            raise ValueError(f"Unknown replicated base group: {self.group!r}")
+        if type(self.replica_size) is not int or self.replica_size < 1:
+            raise ValueError("replica_size must be a positive integer")
+
+
+LinearParallelGroup = (
+    Literal["tp", "attn_tp", "replicated", "shared_experts_tp"]
+    | ReplicatedParallelGroup
+)
 
 
 def resolve_linear_parallel_group(
     parallel_group: LinearParallelGroup,
 ) -> Tuple[int, int]:
     """Freeze a group's weight partition in the current construction scope."""
+    if isinstance(parallel_group, ReplicatedParallelGroup):
+        rank, size = resolve_linear_parallel_group(parallel_group.group)
+        return rank // parallel_group.replica_size, divide(
+            size, parallel_group.replica_size
+        )
     if parallel_group == "replicated":
         return 0, 1
+    if parallel_group == "shared_experts_tp":
+        group = get_parallel().shared_experts_tp_group
+        if group is None:
+            raise ValueError(
+                "The shared-expert TP group must exist before construction"
+            )
+        return group.rank_in_group, group.world_size
     if parallel_group not in ("tp", "attn_tp"):
         raise ValueError(f"Unknown linear parallel_group: {parallel_group!r}")
     parallel = get_parallel()
@@ -1005,6 +1035,9 @@ class QKVParallelLinear(ColumnParallelLinear):
     be replicated while the query heads are partitioned.
 
     Args:
+        parallel_group: Group selecting the query weight partition.
+        kv_parallel_group: Optional independent key/value weight partition;
+            defaults to the query partition, including replicated head layouts.
         hidden_size: input hidden state size of the transformer.
         head_size: size of each attention head.
         total_num_heads: total number of attention query heads.
@@ -1040,6 +1073,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         kv_tp_size: Optional[int] = None,
         *,
         parallel_group: Optional[LinearParallelGroup] = None,
+        kv_parallel_group: Optional[LinearParallelGroup] = None,
     ):
         self.with_bias = bias
         self.hidden_size = hidden_size
@@ -1052,10 +1086,15 @@ class QKVParallelLinear(ColumnParallelLinear):
         # Divide the weight matrix along the last dimension.
         tp_rank, tp_size = _resolve_linear_partition(parallel_group, tp_rank, tp_size)
         self.tp_rank, self.tp_size = tp_rank, tp_size
-        if kv_tp_rank is None:
-            kv_tp_rank = tp_rank
-        if kv_tp_size is None:
-            kv_tp_size = tp_size
+        if kv_parallel_group is not None:
+            kv_tp_rank, kv_tp_size = _resolve_linear_partition(
+                kv_parallel_group, kv_tp_rank, kv_tp_size
+            )
+        else:
+            if kv_tp_rank is None:
+                kv_tp_rank = tp_rank
+            if kv_tp_size is None:
+                kv_tp_size = tp_size
         self.kv_tp_rank, self.kv_tp_size = kv_tp_rank, kv_tp_size
         self.num_heads = divide(self.total_num_heads, tp_size)
         if kv_tp_size >= self.total_num_kv_heads:
@@ -1766,10 +1805,8 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
         skip_bias_add: If true, skip adding bias but instead return it.
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
-        tp_rank: Rank to shard the column-parallel part on. Defaults to the
-            global TP rank; pass the attention-TP rank to shard on attn-TP
-            instead (see KimiDeltaAttention's shard_on_attn_tp).
-        tp_size: World size matching ``tp_rank``. Defaults to global TP size.
+        parallel_group: Select TP, attention TP, or an unsharded partition for
+            the column-parallel part. Repeated weights remain unsharded.
     """
 
     def __init__(
@@ -1783,6 +1820,7 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
         prefix: str = "",
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
+        parallel_group: Optional[LinearParallelGroup] = None,
     ):
         output_size = sum(column_output_sizes) + sum(repeated_output_sizes)
         super().__init__(
@@ -1794,11 +1832,9 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
             prefix=prefix,
         )
         self.num_column_parallel = len(column_output_sizes)
-        if tp_rank is None:
-            tp_rank = get_parallel().tp_rank
-        if tp_size is None:
-            tp_size = get_parallel().tp_size
-        self.tp_rank, self.tp_size = tp_rank, tp_size
+        self.tp_rank, self.tp_size = _resolve_linear_partition(
+            parallel_group, tp_rank, tp_size
+        )
 
         self.output_partition_sizes = [
             divide(x, self.tp_size) for x in column_output_sizes
@@ -1843,10 +1879,8 @@ class ColumnParallelBatchedLinear(nn.Module):
         input_size: input dimension of the linear layer.
         output_size: output dimension of the linear layer.
         dtype: Data type for the parameters.
-        tp_rank: Rank to shard the output dimension on. Defaults to the global
-            TP rank; pass the attention-TP rank to shard on attn-TP instead
-            (see KimiDeltaAttention's shard_on_attn_tp).
-        tp_size: World size matching ``tp_rank``. Defaults to global TP size.
+        parallel_group: Select TP, attention TP, or an unsharded partition for
+            the output dimension. The batch dimension remains unsharded.
     """
 
     def __init__(
@@ -1857,13 +1891,12 @@ class ColumnParallelBatchedLinear(nn.Module):
         dtype: torch.dtype,
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
+        parallel_group: Optional[LinearParallelGroup] = None,
     ):
         super().__init__()
-        if tp_rank is None:
-            tp_rank = get_parallel().tp_rank
-        if tp_size is None:
-            tp_size = get_parallel().tp_size
-        self.tp_rank, self.tp_size = tp_rank, tp_size
+        self.tp_rank, self.tp_size = _resolve_linear_partition(
+            parallel_group, tp_rank, tp_size
+        )
         self.weight = nn.Parameter(
             torch.empty(batch, output_size // self.tp_size, input_size, dtype=dtype),
             requires_grad=False,

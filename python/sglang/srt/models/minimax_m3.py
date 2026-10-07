@@ -52,6 +52,7 @@ from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
+    ReplicatedParallelGroup,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -601,6 +602,9 @@ class MiniMaxM3Attention(nn.Module):
             self.idx_replica_size = attn_tp_size // self.idx_head_tp_size
             self.idx_head_rank = attn_tp_rank // self.idx_replica_size
             self.num_idx_heads = self.total_idx_heads // self.idx_head_tp_size
+            index_parallel_group = ReplicatedParallelGroup(
+                "attn_tp", self.idx_replica_size
+            )
 
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
@@ -609,8 +613,7 @@ class MiniMaxM3Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -620,8 +623,7 @@ class MiniMaxM3Attention(nn.Module):
             bias=False,
             reduce_results=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -642,8 +644,7 @@ class MiniMaxM3Attention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 v_head_size=(0 if self.disable_index_value else self.idx_head_dim),
-                tp_rank=self.idx_head_rank,
-                tp_size=self.idx_head_tp_size,
+                parallel_group=index_parallel_group,
                 prefix=add_prefix("index_qkv_proj", prefix),
             )
 
@@ -658,8 +659,7 @@ class MiniMaxM3Attention(nn.Module):
                     reduce_results=False,
                     quant_config=quant_config,
                     prefix=add_prefix("index_o_proj", prefix),
-                    tp_rank=self.idx_head_rank,
-                    tp_size=self.idx_head_tp_size,
+                    parallel_group=index_parallel_group,
                 )
             self.index_rotary_emb = self.rotary_emb
 
