@@ -42,10 +42,6 @@ class BeamToolAdapter(ResponseToolAdapter):
                         "required": ["command"],
                     },
                 )
-            elif tool["type"] == "local_shell":
-                raise ValueError(
-                    "Legacy local_shell argv/env/cwd/user semantics are not implemented; use shell with environment={type:local}"
-                )
             else:
                 self._add(tool)
 

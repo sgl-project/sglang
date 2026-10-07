@@ -65,7 +65,6 @@ def test_shell_uses_bash_command_schema():
         [{"type": "shell"}],
         [{"type": "shell", "environment": {"type": "container_auto"}}],
         [{"type": "shell", "environment": {"type": "local", "skills": []}}],
-        [{"type": "local_shell"}],
         [SHELL, {"type": "function", "name": "bash"}],
         [{"type": "function", "name": "bash"}, SHELL],
         [SHELL, SHELL],
