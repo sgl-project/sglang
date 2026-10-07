@@ -20,6 +20,7 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
+import itertools
 from typing import Optional
 
 import torch
@@ -210,15 +211,15 @@ def all_gather_kv_cache_for_mha_extend(
     extend_seq_lens,
     kv_a: torch.Tensor,
     k_pe: torch.Tensor,
+    extend_seq_lens_cpu: list[int] | None = None,
 ):
     prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(
         attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype
     )
-    extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
     gathered_kv_cache = all_gather_kv_cache_for_dcp(
         prefix_kv_a,
         prefix_k_pe,
-        extend_prefix_lens_cpu,
+        torch.tensor(extend_prefix_lens_cpu),
     )
     prefix_kv_a, prefix_k_pe = gathered_kv_cache.split(
         [kv_a.shape[-1], k_pe.shape[-1]], dim=-1
@@ -231,14 +232,22 @@ def all_gather_kv_cache_for_mha_extend(
     if prefix_k_pe.dtype != k_pe.dtype:
         prefix_k_pe = prefix_k_pe.to(k_pe.dtype)
     # re-organize kv with query orders
-    prefix_lens_cu = torch.zeros(
-        len(seq_lens) + 1,
-        dtype=torch.int32,
-        device=kv_a.device,
-    )
-    extend_lens_cu = torch.zeros_like(prefix_lens_cu)
-    prefix_lens_cu[1:] = torch.cumsum(extend_prefix_lens, dim=0)
-    extend_lens_cu[1:] = torch.cumsum(extend_seq_lens, dim=0)
+    if extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) == len(
+        extend_prefix_lens_cpu
+    ) == len(seq_lens):
+        # Slicing at device offsets costs one blocking .item() per bound, and
+        # this runs once per MLA layer.
+        prefix_lens_cu = [0, *itertools.accumulate(extend_prefix_lens_cpu)]
+        extend_lens_cu = [0, *itertools.accumulate(extend_seq_lens_cpu)]
+    else:
+        prefix_lens_cu = torch.zeros(
+            len(seq_lens) + 1,
+            dtype=torch.int32,
+            device=kv_a.device,
+        )
+        extend_lens_cu = torch.zeros_like(prefix_lens_cu)
+        prefix_lens_cu[1:] = torch.cumsum(extend_prefix_lens, dim=0)
+        extend_lens_cu[1:] = torch.cumsum(extend_seq_lens, dim=0)
     kv_a_tuple = ()
     k_pe_tuple = ()
     for i in range(len(seq_lens)):
