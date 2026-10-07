@@ -190,6 +190,14 @@ def _model_contract_reason(
             or int(attention.kv_size) != topology.kv_size
         ):
             return f"layer_{layer_index}_attention_split"
+        # The stock layer sums the row-parallel partials either inside
+        # RowParallelLinear (reduce_results) or at its stage boundaries
+        # (attn_boundary / ffn_boundary, reduce_results=False). The route
+        # reduce-scatters the partials itself (skip_all_reduce=True), so it
+        # accepts both layouts but not a layer that reduces nowhere or twice.
+        stage_boundaries = hasattr(layer, "attn_boundary") and hasattr(
+            layer, "ffn_boundary"
+        )
         if (
             int(gate_up.tp_size) != topology.tp_size
             or bool(gate_up.gather_output)
@@ -197,8 +205,8 @@ def _model_contract_reason(
             or int(down.tp_size) != topology.tp_size
             or not bool(o_proj.input_is_parallel)
             or not bool(down.input_is_parallel)
-            or not bool(o_proj.reduce_results)
-            or not bool(down.reduce_results)
+            or bool(o_proj.reduce_results) == stage_boundaries
+            or bool(down.reduce_results) == stage_boundaries
         ):
             return f"layer_{layer_index}_parallel_contract"
     if int(getattr(model.norm, "hidden_size", -1)) != 8192:

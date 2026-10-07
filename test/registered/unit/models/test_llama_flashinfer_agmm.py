@@ -213,6 +213,41 @@ class EligibilityTests(unittest.TestCase):
             "layer_0_weight_shapes",
         )
 
+    def test_model_contract_accepts_the_stage_boundary_layer_layout(self):
+        torch_stub = types.SimpleNamespace(bfloat16="bfloat16")
+        topology = self.module._topology_for_tp_size(8)
+
+        def with_stage_boundaries(model):
+            for layer in model.layers:
+                layer.attn_boundary = named_object("StageBoundary")
+                layer.ffn_boundary = named_object("StageBoundary")
+                layer.self_attn.o_proj.reduce_results = False
+                layer.mlp.down_proj.reduce_results = False
+            return model
+
+        # LlamaDecoderLayer(stage_boundaries=True) sums the row-parallel
+        # partials at its boundaries, so RowParallelLinear.reduce_results is
+        # False; the route reduce-scatters them itself and accepts the layout.
+        model = with_stage_boundaries(make_model(8))
+        self.assertIsNone(
+            self.module._model_contract_reason(model, torch_stub, topology)
+        )
+
+        # A layer that would reduce twice (boundaries and reduce_results) ...
+        model.layers[3].mlp.down_proj.reduce_results = True
+        self.assertEqual(
+            self.module._model_contract_reason(model, torch_stub, topology),
+            "layer_3_parallel_contract",
+        )
+
+        # ... or nowhere (no boundaries, no reduce_results) is rejected.
+        model = make_model(8)
+        model.layers[0].self_attn.o_proj.reduce_results = False
+        self.assertEqual(
+            self.module._model_contract_reason(model, torch_stub, topology),
+            "layer_0_parallel_contract",
+        )
+
     def test_prepared_api_signature_is_exact(self):
         def accepted(inp, w, group, *, backend="auto", max_rows=None, verbose=False):
             return None
