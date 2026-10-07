@@ -795,13 +795,14 @@ def tool_call_structural_tag(
     answer_format: dict[str, Any] | None = None,
     message_start: list[str] | None = None,
     grammar_requires_reasoning: bool = False,
+    undeclared_names: bool = False,
 ) -> dict[str, Any] | None:
     """Derive native calls, respecting strict arguments, count and reasoning.
 
     An `answer` field lets the model answer instead, in `answer_format` if
-    given; without tools, only the answer is derived. When the model may
-    answer and no tool is strict, calls may name any tool the template can
-    spell. Raises `ValueError` for names the template cannot encode."""
+    given; without tools, only the answer is derived. With `undeclared_names`
+    and no strict tool, calls may name any tool the template can spell.
+    Raises `ValueError` for names the template cannot encode."""
     if not tools and answer is not None:
 
         def reply(start: list[str] | None) -> list[dict[str, Any]] | None:
@@ -834,7 +835,7 @@ def tool_call_structural_tag(
         if not re.fullmatch(opener[1], name):
             raise ValueError(f"tool name {name!r} cannot be encoded in tool calls")
         names.append(_escape(name))
-    if answer is not None and not any(tool["function"].get("strict") for tool in tools):
+    if undeclared_names and not any(tool["function"].get("strict") for tool in tools):
         # Calls to tools that are not strict all take the same arguments.
         names, arguments = [f"(?:{opener[1]})"], arguments[:1]
     closers = _const_strings(closer_literals) if closer_literals else None

@@ -54,6 +54,7 @@ class BeamDetector(ResponseTemplateToolDetector):
             # The tag then covers the output from its first token.
             message_start=self._message_start if message_start else None,
             grammar_requires_reasoning=True,
+            undeclared_names=tool_choice == "auto" and self.admits_undeclared_tools(),
         )
         if tag is None:
             return None

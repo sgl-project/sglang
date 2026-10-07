@@ -1427,7 +1427,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_detector = FunctionCallParser.ToolCallParserEnum.get(
                     self.tool_call_parser
                 )
-                tool_dicts = []
+                tool_dicts, undeclared_names = [], False
                 if (
                     tools
                     and tool_detector is not None
@@ -1441,6 +1441,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     tool_dicts = [
                         tool.model_dump() for tool in parser.structural_tag_tools()
                     ]
+                    undeclared_names = parser.detector.admits_undeclared_tools()
                 parallel_tool_calls = request.parallel_tool_calls is not False
                 from_start = detector.starts_message(prefix)
                 tag = detector.json_answer_structural_tag(
@@ -1448,6 +1449,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     tools=tool_dicts,
                     parallel_tool_calls=parallel_tool_calls,
                     message_start=from_start,
+                    undeclared_names=undeclared_names,
                 )
                 if tag is None and from_start:
                     from_start = False
@@ -1455,6 +1457,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         json_schema,
                         tools=tool_dicts,
                         parallel_tool_calls=parallel_tool_calls,
+                        undeclared_names=undeclared_names,
                     )
                 if tag is not None:
                     sampling_params["structural_tag"] = json.dumps(tag)
