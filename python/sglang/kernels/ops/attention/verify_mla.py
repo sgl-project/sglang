@@ -29,7 +29,11 @@ DEFAULT_NUM_WARPS = 8
 _BLOCK_CONFIG = {
     # head_dim: (BLOCK_H, BLOCK_N, num_warps)
     256: (4, 64, 8),  # Qwen3.5 TP2 / TP4 / TP8
-    128: (16, 128, 4),  # MiniMax-M3 dense / EAGLE3 draft TP4: one 16-head block per KV head
+    128: (
+        16,
+        128,
+        4,
+    ),  # MiniMax-M3 dense / EAGLE3 draft TP4: one 16-head block per KV head
     576: (4, 64, 8),  # K3 MLA (kv_lora_rank 512 + qk_rope 64)
     64: (4, 256, 4),  # K3 GQA (dspark draft attention)
 }
