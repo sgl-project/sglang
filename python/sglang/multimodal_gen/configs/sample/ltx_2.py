@@ -91,6 +91,14 @@ class LTX23SamplingParams(LTX2SamplingParams):
             extra["ltx2_skip_v2a_cross_attn_for_video_gt"] = True
         return extra
 
+    def prepare_synthetic_warmup_request_for_queue(
+        self, req: Any, server_args: Any
+    ) -> None:
+        # Warmup must take the serving guider path, else breakable CUDA graphs
+        # capture only the official-CFG signatures that serving never replays.
+        del server_args
+        req.extra.update(self.build_request_extra())
+
 
 @dataclasses.dataclass
 class LTX23HQSamplingParams(LTX23SamplingParams):
