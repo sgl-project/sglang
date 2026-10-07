@@ -882,6 +882,7 @@ class TestPrefillAdder(CustomTestCase):
         extend_len = 1024
         prefix_len = context_len - extend_len
         kvc = SimpleNamespace(
+            is_draft_worker=False,
             page_size=4,
             model_config=SimpleNamespace(context_len=context_len),
         )
