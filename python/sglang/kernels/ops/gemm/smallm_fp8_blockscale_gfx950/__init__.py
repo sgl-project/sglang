@@ -8,7 +8,7 @@ import tempfile
 
 import torch
 
-from sglang.kernels.ops.moe.smallm_moe_gfx950 import _check, _hip_lib, _hipcc
+from sglang.kernels.ops.moe.smallm_moe_gfx950 import _check, _hip_lib, _hipcc, _Kernel
 
 _SRC = os.path.join(os.path.dirname(__file__), "smallm_fp8_blockscale_gemm.hip")
 # (N, K) -> ((max M, n-tiles per block, k steps per wave, waves), ...), first match wins. Qwen3.5-397B-A17B-FP8 TP4:
@@ -72,9 +72,7 @@ def smallm_fp8_bs_linear(x, WQ, w_scale):
     key = ((M + 15) // 16, *_config(M, N, K))
     hip, fn = _hip_lib(), _fns.get(key)
     if fn is None:
-        fn = _fns[key] = ctypes.c_void_p()
-        name = "smallm_fp8_bs_m{}_n{}_s{}_w{}".format(*key)
-        _check(hip.hipModuleGetFunction(ctypes.byref(fn), _mod, name.encode()), name)
+        fn = _fns[key] = _Kernel(_mod, "smallm_fp8_bs_m{}_n{}_s{}_w{}".format(*key)).fn
     out = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
     args = Args(*(t.data_ptr() for t in (x, WQ, w_scale, out)), M, N, x.stride(0))
     params = (ctypes.c_void_p * 1)(ctypes.addressof(args))
