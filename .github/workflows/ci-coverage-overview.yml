@@ -102,8 +102,17 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: 10
+        # Same persistent venv ci_install_dependency.sh creates on this runner.
         run: |
-          pip install -e "python/[test]"
+          venv=/opt/sglang-ci-py3.12
+          if [ ! -x "$venv/bin/python3" ]; then
+            command -v uv >/dev/null 2>&1 || python3 -m pip install uv
+            uv python install 3.12 --python-preference only-managed
+            uv venv "$venv" --python 3.12 --python-preference only-managed --seed
+          fi
+          echo "$venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$venv" >> "$GITHUB_ENV"
+          "$venv/bin/python3" -m pip install -e "python/[test]"
 
       - name: Run unit tests with coverage
         # Non-gating on purpose: running the whole tree in one process
