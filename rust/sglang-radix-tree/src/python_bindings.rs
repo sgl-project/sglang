@@ -1,7 +1,8 @@
 //! Python bindings: the `mem_cache` extension module and its TreeCore adapter.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
 
 use pyo3::buffer::PyBuffer;
@@ -10,9 +11,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tch::{Device, Kind, Tensor};
 
-use crate::components::{ComponentType, FULL, MAMBA, SWA};
+use crate::components::{ComponentSet, ComponentType, FULL, MAMBA, SWA};
 use crate::node::ChildKeyType;
 use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError};
+use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
     BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams, CacheTransferPhase,
@@ -20,6 +22,27 @@ use crate::unified_tree_core::{
     MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, Req,
     UnifiedTreeCore,
 };
+
+/// Translate only Rust panics; ordinary Python errors pass through unchanged.
+/// Keep this boundary outside the whole binding call so its MutexGuard unwinds
+/// and poisons the core before the panic is caught. A poisoned core stays unusable.
+fn catch_native_panic<T>(operation: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
+    match catch_unwind(AssertUnwindSafe(operation)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = if let Some(message) = payload.downcast_ref::<String>() {
+                message.as_str()
+            } else if let Some(message) = payload.downcast_ref::<&str>() {
+                message
+            } else {
+                "unknown native panic"
+            };
+            Err(PyRuntimeError::new_err(format!(
+                "Rust TreeCore panicked: {message}"
+            )))
+        }
+    }
+}
 
 /// Parse a torch-style device string (e.g. "cpu", "cuda", "cuda:1"); a bare
 /// "cuda" means index 0, so callers must resolve the index themselves.
@@ -241,6 +264,14 @@ fn pool_name_str(name: PoolName) -> &'static str {
         PoolName::DeepseekV4C4Indexer => "deepseek_v4_c4_indexer",
         PoolName::DeepseekV4C4IndexerScale => "deepseek_v4_c4_indexer_scale",
         PoolName::DeepseekV4C128 => "deepseek_v4_c128",
+        PoolName::DeepseekV4C1 => "deepseek_v4_c1",
+        PoolName::DeepseekV4C1Indexer => "deepseek_v4_c1_indexer",
+        PoolName::DeepseekV4C1IndexerScale => "deepseek_v4_c1_indexer_scale",
+        PoolName::DeepseekV4C2 => "deepseek_v4_c2",
+        PoolName::DeepseekV4C2Indexer => "deepseek_v4_c2_indexer",
+        PoolName::DeepseekV4C2IndexerScale => "deepseek_v4_c2_indexer_scale",
+        PoolName::DeepseekV4C4Rope => "deepseek_v4_c4_rope",
+        PoolName::DeepseekV4C128Rope => "deepseek_v4_c128_rope",
         PoolName::DeepseekV4C4State => "deepseek_v4_c4_state",
         PoolName::DeepseekV4C4IndexerState => "deepseek_v4_c4_indexer_state",
         PoolName::DeepseekV4C128State => "deepseek_v4_c128_state",
@@ -261,6 +292,14 @@ fn parse_pool_name(name: &str) -> PyResult<PoolName> {
         "deepseek_v4_c4_indexer" => Ok(PoolName::DeepseekV4C4Indexer),
         "deepseek_v4_c4_indexer_scale" => Ok(PoolName::DeepseekV4C4IndexerScale),
         "deepseek_v4_c128" => Ok(PoolName::DeepseekV4C128),
+        "deepseek_v4_c1" => Ok(PoolName::DeepseekV4C1),
+        "deepseek_v4_c1_indexer" => Ok(PoolName::DeepseekV4C1Indexer),
+        "deepseek_v4_c1_indexer_scale" => Ok(PoolName::DeepseekV4C1IndexerScale),
+        "deepseek_v4_c2" => Ok(PoolName::DeepseekV4C2),
+        "deepseek_v4_c2_indexer" => Ok(PoolName::DeepseekV4C2Indexer),
+        "deepseek_v4_c2_indexer_scale" => Ok(PoolName::DeepseekV4C2IndexerScale),
+        "deepseek_v4_c4_rope" => Ok(PoolName::DeepseekV4C4Rope),
+        "deepseek_v4_c128_rope" => Ok(PoolName::DeepseekV4C128Rope),
         "deepseek_v4_c4_state" => Ok(PoolName::DeepseekV4C4State),
         "deepseek_v4_c4_indexer_state" => Ok(PoolName::DeepseekV4C4IndexerState),
         "deepseek_v4_c128_state" => Ok(PoolName::DeepseekV4C128State),
@@ -300,6 +339,8 @@ struct InspectionMatchResultInput {
     host_hit_length: usize,
     #[pyo3(attribute)]
     swa_host_hit_length: usize,
+    #[pyo3(attribute)]
+    swa_branching_seqlen: Option<usize>,
     #[pyo3(attribute)]
     mamba_host_hit_length: usize,
     #[pyo3(attribute)]
@@ -364,6 +405,9 @@ fn comp_xfers_to_py(
     comp_xfers: HashMap<ComponentType, Vec<PoolTransfer>>,
 ) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new_bound(py);
+    // Pool allocation can evict across components, so preserve Python's order.
+    let mut comp_xfers: Vec<_> = comp_xfers.into_iter().collect();
+    comp_xfers.sort_unstable_by_key(|(ct, _)| component_type_to_u8(*ct));
     for (ct, transfers) in comp_xfers {
         let list = PyList::empty_bound(py);
         for transfer in transfers {
@@ -410,17 +454,51 @@ fn frees_to_py(py: Python<'_>, frees: HashMap<ComponentType, Vec<Tensor>>) -> Py
     Ok(dict.unbind())
 }
 
+/// Floating-point T-LRU arithmetic with the estimate's numeric type preserved.
+#[pyclass(name = "TlruFloatConfig")]
+#[derive(Clone)]
+pub struct TlruFloatConfigBinding {
+    config: TlruFloatConfig,
+}
+
+#[pymethods]
+impl TlruFloatConfigBinding {
+    #[new]
+    #[pyo3(signature = (threshold, next_prompt_estimate, integer_estimate = None))]
+    fn new(threshold: f64, next_prompt_estimate: f64, integer_estimate: Option<i128>) -> Self {
+        let estimate = match integer_estimate {
+            Some(value) => TlruPromptEstimate::Integer(value),
+            None => TlruPromptEstimate::Float(next_prompt_estimate),
+        };
+        Self {
+            config: TlruFloatConfig {
+                threshold,
+                next_prompt_estimate: estimate,
+            },
+        }
+    }
+
+    #[cfg(feature = "inspection")]
+    fn inspect_is_tel_safe(&self, history: usize, cached_without_node: usize) -> PyResult<bool> {
+        catch_native_panic(|| Ok(self.config.is_tel_safe(history, cached_without_node)))
+    }
+}
+
 /// Python-visible tree-core init params; converts into CacheInitParams.
 #[pyclass(get_all, set_all)]
 #[derive(Clone)]
 pub struct TreeCoreInitParamsBinding {
     pub eviction_policy: String,
+    pub slru_protected_threshold: i64,
+    pub tlru_tail_budget: usize,
+    pub tlru_float_config: Option<TlruFloatConfigBinding>,
     pub page_size: usize,
     pub is_write_back: bool,
     pub enable_hicache: bool,
     pub write_through_threshold: i64,
     pub device: String,
     pub swa_sliding_window_size: Option<usize>,
+    pub swa_req_ring: bool,
     pub enable_kv_cache_events: bool,
     pub mamba_cache_chunk_size: Option<usize>,
     pub mamba_max_states_per_path: Option<usize>,
@@ -431,12 +509,16 @@ impl TreeCoreInitParamsBinding {
     fn to_cache_init_params(&self) -> PyResult<CacheInitParams> {
         Ok(CacheInitParams {
             eviction_policy: self.eviction_policy.clone(),
+            slru_protected_threshold: self.slru_protected_threshold,
+            tlru_tail_budget: self.tlru_tail_budget,
+            tlru_float_config: self.tlru_float_config.as_ref().map(|value| value.config),
             page_size: self.page_size,
             is_write_back: self.is_write_back,
             enable_hicache: self.enable_hicache,
             write_through_threshold: self.write_through_threshold,
             device: parse_device(&self.device)?,
             swa_sliding_window_size: self.swa_sliding_window_size,
+            swa_req_ring: self.swa_req_ring,
             // Wired post-construction via set_has_swa_host_pool.
             has_swa_host_pool: false,
             enable_kv_cache_events: self.enable_kv_cache_events,
@@ -449,7 +531,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -461,15 +543,23 @@ impl TreeCoreInitParamsBinding {
         enable_kv_cache_events: bool,
         mamba_cache_chunk_size: Option<usize>,
         mamba_max_states_per_path: Option<usize>,
+        slru_protected_threshold: i64,
+        swa_req_ring: bool,
+        tlru_tail_budget: usize,
+        tlru_float_config: Option<TlruFloatConfigBinding>,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
+            slru_protected_threshold,
+            tlru_tail_budget,
+            tlru_float_config,
             page_size,
             is_write_back,
             enable_hicache,
             write_through_threshold,
             device,
             swa_sliding_window_size,
+            swa_req_ring,
             enable_kv_cache_events,
             mamba_cache_chunk_size,
             mamba_max_states_per_path,
@@ -508,14 +598,17 @@ impl MatchParamsBinding {
 /// stays a Python-held reference until the insert call unwraps it.
 #[pyclass(get_all, set_all)]
 pub struct InsertParamsBinding {
+    pub rotation_base: Option<i64>,
     pub key: Vec<i64>,
     pub value: Py<PyAny>,
     pub extra_key: Option<String>,
     pub cache_salt: Option<String>,
+    pub session_id: Option<String>,
     pub mamba_value: Option<Py<PyAny>>,
     pub prev_prefix_len: usize,
     pub swa_evicted_seqlen: usize,
-    pub chunked: bool,
+    pub swa_branching_seqlen: Option<usize>,
+    pub inserted_len: usize,
     pub priority: i64,
     pub track_adopted_ranges: bool,
 }
@@ -523,29 +616,35 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
         value: Py<PyAny>,
         extra_key: Option<String>,
         cache_salt: Option<String>,
+        session_id: Option<String>,
         prev_prefix_len: usize,
         swa_evicted_seqlen: usize,
-        chunked: bool,
+        swa_branching_seqlen: Option<usize>,
+        inserted_len: usize,
         priority: i64,
         mamba_value: Option<Py<PyAny>>,
         track_adopted_ranges: bool,
+        rotation_base: Option<i64>,
     ) -> PyResult<Self> {
         Ok(InsertParamsBinding {
+            rotation_base,
             key: py_array_to_vec_i64(py, key)?,
             value,
             extra_key,
             cache_salt,
+            session_id,
             mamba_value,
             prev_prefix_len,
             swa_evicted_seqlen,
-            chunked,
+            swa_branching_seqlen,
+            inserted_len,
             priority,
             track_adopted_ranges,
         })
@@ -561,6 +660,7 @@ pub struct MatchResultBinding {
     best_match_node_id: NodeId,
     host_hit_length: usize,
     swa_host_hit_length: usize,
+    swa_branching_seqlen: Option<usize>,
     mamba_host_hit_length: usize,
     mamba_branching_seqlen: Option<usize>,
     full_kv_hit_length: usize,
@@ -577,6 +677,7 @@ impl MatchResultBinding {
             best_match_node_id: result.best_match_node_id,
             host_hit_length: result.host_hit_length,
             swa_host_hit_length: result.swa_host_hit_length,
+            swa_branching_seqlen: result.swa_branching_seqlen,
             mamba_host_hit_length: result.mamba_host_hit_length,
             mamba_branching_seqlen: result.mamba_branching_seqlen,
             full_kv_hit_length: result.full_kv_hit_length,
@@ -588,12 +689,14 @@ impl MatchResultBinding {
 /// Python-visible insert result; actions are Python-held.
 #[pyclass(get_all)]
 pub struct InsertResultBinding {
+    rotation_tail_declined: bool,
     prefix_len: usize,
     total_len: usize,
     last_device_node: Option<NodeId>,
     inserted_host_node: Option<NodeId>,
     host_insert_dropped: bool,
     mamba_exist: bool,
+    swa_branch_inserted: bool,
     adopted_ranges: Option<HashMap<u8, Vec<(usize, usize)>>>,
     cache_actions: Py<PyList>,
 }
@@ -627,12 +730,14 @@ impl InsertResultBinding {
     /// Move a core insert result across the boundary.
     fn from_insert_result(py: Python<'_>, result: InsertResult) -> PyResult<Self> {
         Ok(InsertResultBinding {
+            rotation_tail_declined: result.rotation_tail_declined,
             prefix_len: result.prefix_len,
             total_len: result.total_len,
             last_device_node: result.last_device_node_id,
             inserted_host_node: result.inserted_host_node,
             host_insert_dropped: result.host_insert_dropped,
             mamba_exist: result.mamba_exist,
+            swa_branch_inserted: result.swa_branch_inserted,
             adopted_ranges: result.adopted_ranges.map(|ranges| {
                 ranges
                     .into_iter()
@@ -648,24 +753,27 @@ impl InsertResultBinding {
 #[pyclass(get_all, set_all)]
 #[derive(Clone, Default)]
 pub struct DecLockRefParamsBinding {
-    pub swa_uuid_for_lock: Option<i64>,
-    pub swa_uuid_for_host_lock: Option<i64>,
-    pub skip_lock_node_ids: HashMap<u8, HashSet<NodeId>>,
+    pub node_id: Option<NodeId>,
+    pub skipped_lock_components: Vec<u8>,
+    pub component_lock_uuids: HashMap<u8, Option<i64>>,
+    pub component_host_lock_uuids: HashMap<u8, Option<i64>>,
 }
 
 #[pymethods]
 impl DecLockRefParamsBinding {
     #[new]
-    #[pyo3(signature = (swa_uuid_for_lock = None, swa_uuid_for_host_lock = None, skip_lock_node_ids = None))]
+    #[pyo3(signature = (node_id = None, skipped_lock_components = Vec::new(), *, component_lock_uuids = None, component_host_lock_uuids = None))]
     fn new(
-        swa_uuid_for_lock: Option<i64>,
-        swa_uuid_for_host_lock: Option<i64>,
-        skip_lock_node_ids: Option<HashMap<u8, HashSet<NodeId>>>,
+        node_id: Option<NodeId>,
+        skipped_lock_components: Vec<u8>,
+        component_lock_uuids: Option<HashMap<u8, Option<i64>>>,
+        component_host_lock_uuids: Option<HashMap<u8, Option<i64>>>,
     ) -> Self {
         DecLockRefParamsBinding {
-            swa_uuid_for_lock,
-            swa_uuid_for_host_lock,
-            skip_lock_node_ids: skip_lock_node_ids.unwrap_or_default(),
+            node_id,
+            skipped_lock_components,
+            component_lock_uuids: component_lock_uuids.unwrap_or_default(),
+            component_host_lock_uuids: component_host_lock_uuids.unwrap_or_default(),
         }
     }
 }
@@ -674,42 +782,47 @@ impl DecLockRefParamsBinding {
     /// Convert into the tree core's dec-lock params.
     fn to_dec_lock_ref_params(&self) -> PyResult<DecLockRefParams> {
         Ok(DecLockRefParams {
-            swa_uuid_for_lock: self.swa_uuid_for_lock,
-            swa_uuid_for_host_lock: self.swa_uuid_for_host_lock,
-            skip_lock_node_ids: self
-                .skip_lock_node_ids
-                .iter()
-                .map(|(ct, node_ids)| {
-                    Ok::<_, PyErr>((parse_component_type(*ct)?, node_ids.clone()))
-                })
-                .collect::<PyResult<_>>()?,
+            node_id: self.node_id,
+            skipped_lock_components: component_set_from_py(&self.skipped_lock_components)?,
+            component_lock_uuids: self.component_lock_uuids.clone(),
+            component_host_lock_uuids: self.component_host_lock_uuids.clone(),
         })
     }
 }
 
-/// Python-visible inc_lock_ref result; hand skip_lock_node_ids back to the
-/// matching dec_lock_ref.
+/// Python-visible inc_lock_ref result; the receipt (anchor node, boundary
+/// uuids, skipped components) is handed back to the matching dec_lock_ref.
 #[pyclass(get_all)]
 pub struct IncLockRefResultBinding {
     delta: Option<usize>,
-    swa_uuid_for_lock: Option<i64>,
-    swa_uuid_for_host_lock: Option<i64>,
-    skip_lock_node_ids: HashMap<u8, HashSet<NodeId>>,
+    node_id: Option<NodeId>,
+    skipped_lock_components: Vec<u8>,
+    component_lock_uuids: HashMap<u8, Option<i64>>,
+    component_host_lock_uuids: HashMap<u8, Option<i64>>,
 }
 
 impl IncLockRefResultBinding {
     fn from_result(result: crate::unified_tree_core::IncLockRefResult) -> Self {
         Self {
             delta: result.delta,
-            swa_uuid_for_lock: result.swa_uuid_for_lock,
-            swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-            skip_lock_node_ids: result
-                .skip_lock_node_ids
-                .into_iter()
-                .map(|(ct, node_ids)| (component_type_to_u8(ct), node_ids))
+            node_id: result.node_id,
+            component_lock_uuids: result.component_lock_uuids,
+            component_host_lock_uuids: result.component_host_lock_uuids,
+            skipped_lock_components: result
+                .skipped_lock_components
+                .iter()
+                .map(|ct| ct.idx() as u8)
                 .collect(),
         }
     }
+}
+
+/// Parse Python component-type ids into a component set.
+fn component_set_from_py(component_types: &[u8]) -> PyResult<ComponentSet> {
+    component_types
+        .iter()
+        .map(|ct| parse_component_type(*ct))
+        .collect()
 }
 
 /// Convert a Python component-keyed tracker into the core's counts.
@@ -734,7 +847,12 @@ fn tracker_to_py(tracker: HashMap<ComponentType, usize>) -> HashMap<u8, usize> {
 #[pyclass(get_all)]
 pub struct EvictDeviceNextNodeResultBinding {
     node_id: Option<NodeId>,
+    backup_kv: Option<Py<PyAny>>,
+    mamba_backup_node_id: Option<NodeId>,
+    swa_backup_node_id: Option<NodeId>,
+    swa_backup_num_tokens: usize,
     made_progress: bool,
+    unbacked_tokens: usize,
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
@@ -746,6 +864,7 @@ pub struct EvictDeviceNextNodeResultBinding {
 #[pyclass(get_all)]
 pub struct EvictDeviceLeafResultBinding {
     backup_kv: Option<Py<PyAny>>,
+    unbacked_tokens: usize,
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
@@ -905,11 +1024,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let eviction_policy = init_params.eviction_policy.to_lowercase();
         if !matches!(
             eviction_policy.as_str(),
-            "lru" | "lfu" | "fifo" | "mru" | "filo" | "priority" | "slru"
+            "lru" | "lfu" | "fifo" | "mru" | "filo" | "priority" | "slru" | "tlru"
         ) {
             return Err(PyValueError::new_err(format!(
                 "Unknown eviction policy: {eviction_policy}. Supported policies: \
-                 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
+                 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru'."
             )));
         }
         let params = init_params.to_cache_init_params()?;
@@ -979,6 +1098,62 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         MatchResultBinding::from_match_result(py, result)
     }
 
+    /// Read-only FULL-device match, independent of auxiliary components.
+    fn match_full_device_prefix(
+        &self,
+        py: Python<'_>,
+        params: &MatchParamsBinding,
+    ) -> (usize, NodeId, usize) {
+        let key = K::key_from(Cow::Borrowed(&params.key));
+        let key = key.as_ref();
+        let namespace =
+            KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
+        py.allow_threads(|| self.core().match_full_device_prefix(key, namespace))
+    }
+
+    fn swa_tombstone_ranges(
+        &self,
+        py: Python<'_>,
+        params: &MatchParamsBinding,
+        start: usize,
+        end: usize,
+    ) -> PyResult<Vec<(usize, usize)>> {
+        let key = K::key_from(Cow::Borrowed(&params.key));
+        let namespace =
+            KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
+        py.allow_threads(|| {
+            self.core()
+                .swa_tombstone_ranges(key.as_ref(), namespace, start, end)
+        })
+        .map_err(PyAssertionError::new_err)
+    }
+
+    fn attach_swa_window(
+        &self,
+        py: Python<'_>,
+        params: &MatchParamsBinding,
+        window_start: usize,
+        window_end: usize,
+        swa_values: PyTensor,
+    ) -> PyResult<Py<PyList>> {
+        let key = K::key_from(Cow::Borrowed(&params.key));
+        let namespace =
+            KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
+        let swa_values = swa_values.0;
+        let actions = py
+            .allow_threads(move || {
+                self.core().attach_swa_window(
+                    key.as_ref(),
+                    namespace,
+                    window_start,
+                    window_end,
+                    &swa_values,
+                )
+            })
+            .map_err(PyAssertionError::new_err)?;
+        cache_actions_to_py(py, actions)
+    }
+
     /// The empty match result anchored at the root.
     fn empty_match_result(&self, py: Python<'_>) -> PyResult<MatchResultBinding> {
         let result = py.allow_threads(|| self.core().empty_match_result());
@@ -1001,16 +1176,19 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             None => None,
         };
         let params = InsertParams {
+            rotation_base: params.rotation_base,
             key,
             namespace: KeyNamespaceRef::new(
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
+            session_id: params.session_id.as_deref(),
             value: value.0,
             mamba_value,
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
-            chunked: params.chunked,
+            swa_branching_seqlen: params.swa_branching_seqlen,
+            inserted_len: params.inserted_len,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
         };
@@ -1036,16 +1214,19 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             None => None,
         };
         let params = InsertParams {
+            rotation_base: params.rotation_base,
             key,
             namespace: KeyNamespaceRef::new(
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
+            session_id: params.session_id.as_deref(),
             value: value.0,
             mamba_value,
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
-            chunked: params.chunked,
+            swa_branching_seqlen: params.swa_branching_seqlen,
+            inserted_len: params.inserted_len,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
         };
@@ -1074,25 +1255,31 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         cache_actions_to_py(py, actions)
     }
 
-    /// Bump the reference count on a node's component locks.
+    /// Bump the reference count on a node's component locks; the listed
+    /// components are left untaken and recorded in the receipt.
     fn inc_lock_ref(
         &self,
         py: Python<'_>,
         node_id: NodeId,
-        skip_lock_components: Option<Vec<u8>>,
+        skip_lock_components: Vec<u8>,
     ) -> PyResult<IncLockRefResultBinding> {
-        let skip_lock_components = skip_lock_components
-            .unwrap_or_default()
-            .into_iter()
-            .map(parse_component_type)
-            .collect::<PyResult<Vec<_>>>()?;
+        let skip = component_set_from_py(&skip_lock_components)?;
         let result = py
-            .allow_threads(|| {
-                self.core()
-                    .inc_lock_ref_with_skip(node_id, &skip_lock_components)
-            })
+            .allow_threads(|| self.core().inc_lock_ref(node_id, skip))
             .map_err(node_access_error)?;
         Ok(IncLockRefResultBinding::from_result(result))
+    }
+
+    /// Pin only the FULL device values on a node's root path.
+    fn inc_full_pin(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+        py.allow_threads(|| self.core().inc_full_pin(node_id))
+            .map_err(node_access_error)
+    }
+
+    /// Release a FULL-only root-path pin.
+    fn dec_full_pin(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+        py.allow_threads(|| self.core().dec_full_pin(node_id))
+            .map_err(node_access_error)
     }
 
     /// Decrease the reference count on a node's component locks.
@@ -1100,13 +1287,40 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         &self,
         py: Python<'_>,
         node_id: NodeId,
-        params: Option<&DecLockRefParamsBinding>,
+        params: &DecLockRefParamsBinding,
         skip_swa: bool,
     ) -> PyResult<()> {
-        let params = params.map(|p| p.to_dec_lock_ref_params()).transpose()?;
-        py.allow_threads(|| self.core().dec_lock_ref(node_id, params.as_ref(), skip_swa))
+        let params = params.to_dec_lock_ref_params()?;
+        py.allow_threads(|| self.core().dec_lock_ref(node_id, &params, skip_swa))
             .map_err(node_access_error)?;
         Ok(())
+    }
+
+    /// Release one window's lock, retaining other component locks.
+    fn dec_window_lock_only(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+        params: &DecLockRefParamsBinding,
+    ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
+        let component_type = parse_component_type(component_type)?;
+        let params = params.to_dec_lock_ref_params()?;
+        let (device_frees, host_frees) = py
+            .allow_threads(|| {
+                let mut device_frees = HashMap::new();
+                let mut host_frees = HashMap::new();
+                self.core().dec_window_lock_only(
+                    node_id,
+                    component_type,
+                    &params,
+                    &mut device_frees,
+                    &mut host_frees,
+                )?;
+                Ok((device_frees, host_frees))
+            })
+            .map_err(node_access_error)?;
+        Ok((frees_to_py(py, device_frees)?, frees_to_py(py, host_frees)?))
     }
 
     /// Early-release the SWA portion of a request's tree lock; returns this
@@ -1115,22 +1329,16 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         &self,
         py: Python<'_>,
         node_id: NodeId,
-        swa_uuid_for_lock: Option<i64>,
-        skip_lock_node_ids: Option<HashMap<u8, HashSet<NodeId>>>,
+        params: &DecLockRefParamsBinding,
     ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
-        let skip_lock_node_ids = skip_lock_node_ids
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(ct, node_ids)| Ok((parse_component_type(ct)?, node_ids)))
-            .collect::<PyResult<HashMap<_, _>>>()?;
+        let params = params.to_dec_lock_ref_params()?;
         let (device_frees, host_frees) = py
             .allow_threads(|| {
                 let mut device_frees = HashMap::new();
                 let mut host_frees = HashMap::new();
-                self.core().dec_swa_lock_only_with_skip(
+                self.core().dec_swa_lock_only(
                     node_id,
-                    swa_uuid_for_lock,
-                    Some(&skip_lock_node_ids),
+                    &params,
                     &mut device_frees,
                     &mut host_frees,
                 )?;
@@ -1171,13 +1379,19 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         Ok(())
     }
 
+    /// Logical key lengths for the nodes in a load-back transfer.
+    fn get_node_key_lengths(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
+        py.allow_threads(|| self.core().get_node_key_lengths(&node_ids))
+            .map_err(node_access_error)
+    }
+
     /// A component's device value on a node, if set.
     fn get_component_device_value(
         &self,
         py: Python<'_>,
         node_id: NodeId,
         component_type: u8,
-    ) -> PyResult<Option<PyTensor>> {
+    ) -> PyResult<Option<Py<PyAny>>> {
         let component_type = parse_component_type(component_type)?;
         let value = py
             .allow_threads(|| {
@@ -1186,7 +1400,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                     .map(|value| value.map(|tensor| tensor.shallow_clone()))
             })
             .map_err(node_access_error)?;
-        Ok(value.map(PyTensor))
+        value.map(|value| tensor_to_py(py, value)).transpose()
     }
 
     // TODO(jialino): batch a full no-backup eviction round in Rust (one crossing
@@ -1203,9 +1417,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         Ok(())
     }
 
-    /// Advance one component eviction step. A missing node with
-    /// `made_progress` set means an internal tombstone completed the step;
-    /// otherwise a missing node means the walk is exhausted.
+    /// Advance one component eviction step. Progress without a leaf can be
+    /// an internal tombstone or a component backup request awaiting its finish;
+    /// no progress means the walk is exhausted.
     fn evict_device_next_node(
         &self,
         py: Python<'_>,
@@ -1216,10 +1430,63 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let baseline = tracker_from_py(tracker)?;
         let (node_id, result) =
             py.allow_threads(move || self.core().evict_device_next_node(ct, &baseline));
-        let made_progress = node_id.is_some() || !result.tracker.is_empty();
+        let made_progress = node_id.is_some()
+            || result.backup_kv.is_some()
+            || result.mamba_backup_node_id.is_some()
+            || result.swa_backup_node_id.is_some()
+            || !result.tracker.is_empty();
         Ok(EvictDeviceNextNodeResultBinding {
             node_id,
+            backup_kv: result
+                .backup_kv
+                .map(|backup| cache_action_to_py(py, CacheAction::BackupKV(backup)))
+                .transpose()?,
+            mamba_backup_node_id: result.mamba_backup_node_id,
+            swa_backup_node_id: result.swa_backup_node_id,
+            swa_backup_num_tokens: result.swa_backup_num_tokens,
             made_progress,
+            unbacked_tokens: result.unbacked_tokens,
+            tracker: tracker_to_py(result.tracker),
+            new_device_frees: frees_to_py(py, result.device_frees)?,
+            new_host_frees: frees_to_py(py, result.host_frees)?,
+        })
+    }
+
+    /// Resume a pending internal Mamba tombstone after the host backup attempt.
+    fn finish_mamba_state_eviction(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> PyResult<EvictDeviceNextNodeResultBinding> {
+        let result = py.allow_threads(move || self.core().finish_mamba_state_eviction(node_id));
+        self.internal_eviction_finish_to_py(py, result)
+    }
+
+    /// Resume a pending internal SWA tombstone after the host backup attempt.
+    fn finish_swa_state_eviction(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> PyResult<EvictDeviceNextNodeResultBinding> {
+        let result = py.allow_threads(move || self.core().finish_swa_state_eviction(node_id));
+        self.internal_eviction_finish_to_py(py, result)
+    }
+
+    fn internal_eviction_finish_to_py(
+        &self,
+        py: Python<'_>,
+        result: EvictionStepResult,
+    ) -> PyResult<EvictDeviceNextNodeResultBinding> {
+        Ok(EvictDeviceNextNodeResultBinding {
+            node_id: None,
+            backup_kv: None,
+            mamba_backup_node_id: None,
+            swa_backup_node_id: None,
+            swa_backup_num_tokens: 0,
+            // Consuming the pending request advances the finite walk even
+            // when intervening I/O pinned or removed this particular node.
+            made_progress: true,
+            unbacked_tokens: result.unbacked_tokens,
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
             new_host_frees: frees_to_py(py, result.host_frees)?,
@@ -1241,6 +1508,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             })
             .map_err(node_access_error)?;
         Ok(EvictDeviceLeafResultBinding {
+            unbacked_tokens: result.unbacked_tokens,
             backup_kv: backup
                 .map(|backup| cache_action_to_py(py, CacheAction::BackupKV(backup)))
                 .transpose()?,
@@ -1278,24 +1546,26 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         from_node_id: NodeId,
         until_node_id: NodeId,
-    ) -> PyResult<PyTensor> {
+    ) -> PyResult<Py<PyAny>> {
         let value = py
             .allow_threads(|| {
                 self.core()
                     .collect_full_device_indices(from_node_id, until_node_id)
             })
             .map_err(node_access_error)?;
-        Ok(PyTensor(value))
+        tensor_to_py(py, value)
     }
 
     /// Every FULL device value in the tree, concatenated.
-    fn all_values_flatten(&self, py: Python<'_>) -> PyTensor {
-        PyTensor(py.allow_threads(|| self.core().all_values_flatten()))
+    fn all_values_flatten(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = py.allow_threads(|| self.core().all_values_flatten());
+        tensor_to_py(py, value)
     }
 
     /// Every Mamba device value in the tree, concatenated.
-    fn all_mamba_values_flatten(&self, py: Python<'_>) -> PyTensor {
-        PyTensor(py.allow_threads(|| self.core().all_mamba_values_flatten()))
+    fn all_mamba_values_flatten(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = py.allow_threads(|| self.core().all_mamba_values_flatten());
+        tensor_to_py(py, value)
     }
 
     /// Flatten every FULL device slot into (slot, position, prev-slot) rows for the KV-canary sweep.
@@ -1359,6 +1629,16 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             .map_err(node_access_error)
     }
 
+    /// Mark the host tier as buffer-only; wired after the host pools are built.
+    fn set_host_memory_buffer_only(&self, py: Python<'_>) {
+        py.allow_threads(|| self.core().set_host_memory_buffer_only());
+    }
+
+    /// Whether the host tier runs as a storage staging buffer, not a cache.
+    fn is_host_memory_buffer_only(&self, py: Python<'_>) -> bool {
+        py.allow_threads(|| self.core().is_host_memory_buffer_only)
+    }
+
     /// Mark the host tier (HiCache) as wired.
     fn set_hicache_enabled(&self, py: Python<'_>) {
         py.allow_threads(|| self.core().set_hicache_enabled());
@@ -1367,6 +1647,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     /// Whether the host tier (HiCache) is wired.
     fn enable_hicache(&self, py: Python<'_>) -> bool {
         py.allow_threads(|| self.core().enable_hicache)
+    }
+
+    /// Preserve dirty SWA data before cache-mode write-back eviction.
+    fn enable_swa_write_back_eviction_barrier(&self, py: Python<'_>) {
+        py.allow_threads(|| self.core().enable_swa_write_back_eviction_barrier());
     }
 
     /// Mark the SWA host pool as wired (HiCache).
@@ -1417,11 +1702,14 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         &self,
         py: Python<'_>,
         node_id: NodeId,
-    ) -> PyResult<(PyTensor, Py<PyDict>)> {
+    ) -> PyResult<(Py<PyAny>, Py<PyDict>)> {
         let (device_value, comp_xfers) = py
             .allow_threads(|| self.core().build_backup_spec(node_id))
             .map_err(node_access_error)?;
-        Ok((PyTensor(device_value), comp_xfers_to_py(py, comp_xfers)?))
+        Ok((
+            tensor_to_py(py, device_value)?,
+            comp_xfers_to_py(py, comp_xfers)?,
+        ))
     }
 
     /// Gather a node's device->storage backup spec; None if the node is not backuped.
@@ -1464,6 +1752,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         host_indices: Option<PyTensor>,
         token_ids: Option<Vec<i64>>,
         prefetch_tokens: usize,
+        staging_tokens: usize,
         last_hash: Option<String>,
     ) -> PyResult<Option<Vec<Py<PyAny>>>> {
         let component_type = parse_component_type(component_type)?;
@@ -1478,6 +1767,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                     host_indices,
                     token_ids.as_deref(),
                     prefetch_tokens,
+                    staging_tokens,
                     last_hash.as_deref(),
                 )
             })
@@ -1564,6 +1854,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
 
     fn root_node_handle(&self, py: Python<'_>, extra_key: Option<String>) -> NodeId {
         py.allow_threads(|| self.core().root_node_handle(extra_key.as_deref()))
+    }
+
+    fn rotation_base_of(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<i64>> {
+        py.allow_threads(|| self.core().rotation_base_of(node_id))
+            .map_err(node_access_error)
     }
 
     fn dfs_weight_order(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
@@ -1697,9 +1992,16 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         component_type: u8,
         num_tokens: usize,
+        skip_full_duplicate_reclaim: bool,
     ) -> PyResult<HostEvictionResultBinding> {
         let ct = parse_component_type(component_type)?;
-        let result = py.allow_threads(move || self.core().drive_host_eviction(ct, num_tokens));
+        let result = py.allow_threads(move || {
+            self.core().drive_host_eviction_with_options(
+                ct,
+                num_tokens,
+                skip_full_duplicate_reclaim,
+            )
+        });
         Ok(HostEvictionResultBinding {
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
@@ -1733,16 +2035,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let result = py
             .allow_threads(|| self.core().inc_host_lock_ref(node_id))
             .map_err(node_access_error)?;
-        Ok(IncLockRefResultBinding {
-            delta: result.delta,
-            swa_uuid_for_lock: result.swa_uuid_for_lock,
-            swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-            skip_lock_node_ids: result
-                .skip_lock_node_ids
-                .into_iter()
-                .map(|(ct, node_ids)| (component_type_to_u8(ct), node_ids))
-                .collect(),
-        })
+        Ok(IncLockRefResultBinding::from_result(result))
     }
 
     /// Decrease the reference count on a node's host-side component locks.
@@ -1750,12 +2043,16 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         &self,
         py: Python<'_>,
         node_id: NodeId,
-        params: Option<&DecLockRefParamsBinding>,
+        params: &DecLockRefParamsBinding,
     ) -> PyResult<()> {
-        let params = params.map(|p| p.to_dec_lock_ref_params()).transpose()?;
-        py.allow_threads(|| self.core().dec_host_lock_ref(node_id, params.as_ref()))
+        let params = params.to_dec_lock_ref_params()?;
+        py.allow_threads(|| self.core().dec_host_lock_ref(node_id, &params))
             .map_err(node_access_error)?;
         Ok(())
+    }
+
+    fn is_write_through_compatible(&self, py: Python<'_>) -> bool {
+        py.allow_threads(|| self.core().is_write_through_compatible())
     }
 
     /// Set the write-back (vs write-through) policy; decided at HiCache init.
@@ -1788,6 +2085,17 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| self.core().enable_storage)
     }
 
+    /// Enable or disable the direct external-cache linker.
+    fn set_enable_external_cache_linker(&self, py: Python<'_>, value: bool) -> PyResult<()> {
+        py.allow_threads(|| self.core().set_enable_external_cache_linker(value))
+            .map_err(tree_core_assertion_error)
+    }
+
+    /// Whether the direct external-cache linker is wired.
+    fn enable_external_cache_linker(&self, py: Python<'_>) -> bool {
+        py.allow_threads(|| self.core().enable_external_cache_linker)
+    }
+
     /// Queue the all-cleared placement event.
     fn record_all_cleared_event(&self, py: Python<'_>) {
         py.allow_threads(|| self.core().record_all_cleared_event());
@@ -1809,6 +2117,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                     block_size,
                     medium,
                     cache_salt,
+                    session_id,
                 } => {
                     let item: Py<PyAny> = (
                         "block_stored",
@@ -1818,6 +2127,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                         block_size,
                         medium.as_str(),
                         cache_salt.map(|salt| salt.to_string()),
+                        session_id.map(|session_id| session_id.to_string()),
                     )
                         .into_py(py);
                     list.append(item)?;
@@ -1885,6 +2195,64 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             .map_err(node_access_error)
     }
 
+    /// Build transfers for a node with no stored or pending external copy.
+    fn build_external_linker_offload_transfers(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> PyResult<Option<Vec<Py<PyAny>>>> {
+        let transfers = py
+            .allow_threads(|| self.core().build_external_linker_offload_transfers(node_id))
+            .map_err(node_access_error)?;
+        transfers
+            .map(|transfers| {
+                transfers
+                    .into_iter()
+                    .map(|transfer| transfer_to_py(py, transfer))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .transpose()
+    }
+
+    /// Mark an externally restored path, excluding its existing anchor.
+    fn mark_external_cache_stored_path(
+        &self,
+        py: Python<'_>,
+        from_node_id: NodeId,
+        until_node_id: NodeId,
+    ) -> PyResult<()> {
+        py.allow_threads(|| {
+            self.core()
+                .mark_external_cache_stored_path(from_node_id, until_node_id)
+        })
+        .map_err(tree_core_runtime_error)
+    }
+
+    /// Publish an accepted external offload as pending.
+    fn mark_external_linker_offload_pending(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> PyResult<()> {
+        py.allow_threads(|| self.core().mark_external_linker_offload_pending(node_id))
+            .map_err(tree_core_assertion_error)
+    }
+
+    /// Finalize external-store state for an offload and its split fragments.
+    fn finish_external_linker_offload(
+        &self,
+        py: Python<'_>,
+        node_ids: Vec<NodeId>,
+        ack_id: NodeId,
+        success: bool,
+    ) -> PyResult<()> {
+        py.allow_threads(|| {
+            self.core()
+                .finish_external_linker_offload(&node_ids, ack_id, success)
+        })
+        .map_err(tree_core_assertion_error)
+    }
+
     /// Order-sensitive digest of reclaimed coexisting host values.
     fn write_back_coexist_reclaim_digest(&self, py: Python<'_>) -> i64 {
         py.allow_threads(|| self.core().write_back_coexist_reclaim_digest)
@@ -1943,14 +2311,15 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         node_id: NodeId,
         component_type: u8,
-    ) -> PyResult<Option<PyTensor>> {
+    ) -> PyResult<Option<Py<PyAny>>> {
         let component_type = parse_component_type(component_type)?;
-        py.allow_threads(|| {
-            self.core()
-                .inspect_get_component_host_value(node_id, component_type)
-        })
-        .map(|value| value.map(PyTensor))
-        .map_err(node_access_error)
+        let value = py
+            .allow_threads(|| {
+                self.core()
+                    .inspect_get_component_host_value(node_id, component_type)
+            })
+            .map_err(node_access_error)?;
+        value.map(|value| tensor_to_py(py, value)).transpose()
     }
 
     fn inspect_get_component_device_lock_ref(
@@ -1967,6 +2336,20 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         .map_err(node_access_error)
     }
 
+    fn inspect_get_component_host_lock_ref(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+    ) -> PyResult<u32> {
+        let component_type = parse_component_type(component_type)?;
+        py.allow_threads(|| {
+            self.core()
+                .inspect_get_component_host_lock_ref(node_id, component_type)
+        })
+        .map_err(node_access_error)
+    }
+
     fn inspect_get_node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> PyResult<i64> {
         py.allow_threads(|| self.core().inspect_get_node_hit_count(node_id))
             .map_err(node_access_error)
@@ -1978,6 +2361,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         node_id: NodeId,
     ) -> PyResult<Option<usize>> {
         py.allow_threads(|| self.core().inspect_get_write_through_pending_id(node_id))
+            .map_err(node_access_error)
+    }
+
+    fn inspect_is_external_cache_stored(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+        py.allow_threads(|| self.core().inspect_is_external_cache_stored(node_id))
             .map_err(node_access_error)
     }
 
@@ -2239,6 +2627,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             best_match_node: best_match_node_id,
             host_hit_length,
             swa_host_hit_length,
+            swa_branching_seqlen,
             mamba_host_hit_length,
             mamba_branching_seqlen,
             full_kv_hit_length,
@@ -2250,6 +2639,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             best_match_node_id,
             host_hit_length,
             swa_host_hit_length,
+            swa_branching_seqlen,
             mamba_host_hit_length,
             mamba_branching_seqlen,
             full_kv_hit_length,
@@ -2313,14 +2703,19 @@ macro_rules! tree_core_binding {
             /// init params.
             #[new]
             fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self> {
-                Ok($name {
-                    inner: TreeCoreBinding::new(init_params, component_types)?,
+                catch_native_panic(|| {
+                    Ok($name {
+                        inner: TreeCoreBinding::new(init_params, component_types)?,
+                    })
                 })
             }
 
             /// Drop the entire tree and reinitialize empty state.
-            fn reset(&self, py: Python<'_>) {
-                self.inner.reset(py)
+            fn reset(&self, py: Python<'_>) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.reset(py);
+                    Ok(())
+                })
             }
 
             /// Match a key against the tree.
@@ -2329,12 +2724,45 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 params: &MatchParamsBinding,
             ) -> PyResult<MatchResultBinding> {
-                self.inner.match_prefix(py, params)
+                catch_native_panic(|| self.inner.match_prefix(py, params))
+            }
+
+            /// Read-only FULL-device match, independent of auxiliary components.
+            fn match_full_device_prefix(
+                &self,
+                py: Python<'_>,
+                params: &MatchParamsBinding,
+            ) -> PyResult<(usize, NodeId, usize)> {
+                catch_native_panic(|| Ok(self.inner.match_full_device_prefix(py, params)))
+            }
+
+            fn swa_tombstone_ranges(
+                &self,
+                py: Python<'_>,
+                params: &MatchParamsBinding,
+                start: usize,
+                end: usize,
+            ) -> PyResult<Vec<(usize, usize)>> {
+                catch_native_panic(|| self.inner.swa_tombstone_ranges(py, params, start, end))
+            }
+
+            fn attach_swa_window(
+                &self,
+                py: Python<'_>,
+                params: &MatchParamsBinding,
+                window_start: usize,
+                window_end: usize,
+                swa_values: PyTensor,
+            ) -> PyResult<Py<PyList>> {
+                catch_native_panic(|| {
+                    self.inner
+                        .attach_swa_window(py, params, window_start, window_end, swa_values)
+                })
             }
 
             /// The empty match result anchored at the root.
             fn empty_match_result(&self, py: Python<'_>) -> PyResult<MatchResultBinding> {
-                self.inner.empty_match_result(py)
+                catch_native_panic(|| self.inner.empty_match_result(py))
             }
 
             /// Insert device values into the tree per the provided key.
@@ -2343,7 +2771,7 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 params: &InsertParamsBinding,
             ) -> PyResult<InsertResultBinding> {
-                self.inner.insert(py, params)
+                catch_native_panic(|| self.inner.insert(py, params))
             }
 
             /// Start the resumable insert, running to its first barrier or completion.
@@ -2352,63 +2780,82 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 params: &InsertParamsBinding,
             ) -> PyResult<InsertStepResultBinding> {
-                self.inner.begin_insert(py, params)
+                catch_native_panic(|| self.inner.begin_insert(py, params))
             }
 
             /// Continue the suspended insert after its step actions were applied.
             fn resume_insert(&self, py: Python<'_>) -> PyResult<InsertStepResultBinding> {
-                self.inner.resume_insert(py)
+                catch_native_panic(|| self.inner.resume_insert(py))
             }
 
             /// Whether an insert walk is suspended at a barrier.
-            fn has_ongoing_insert(&self, py: Python<'_>) -> bool {
-                self.inner.has_ongoing_insert(py)
+            fn has_ongoing_insert(&self, py: Python<'_>) -> PyResult<bool> {
+                catch_native_panic(|| Ok(self.inner.has_ongoing_insert(py)))
             }
 
             /// Finish the insert (idempotent); returns still-pending actions to drain.
             fn end_insert(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-                self.inner.end_insert(py)
+                catch_native_panic(|| self.inner.end_insert(py))
             }
 
             /// Bump the reference count on a node's component locks.
-            #[pyo3(signature = (node_id, skip_lock_components = None))]
+            #[pyo3(signature = (node_id, skip_lock_components = Vec::new()))]
             fn inc_lock_ref(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
-                skip_lock_components: Option<Vec<u8>>,
+                skip_lock_components: Vec<u8>,
             ) -> PyResult<IncLockRefResultBinding> {
-                self.inner.inc_lock_ref(py, node_id, skip_lock_components)
+                catch_native_panic(|| self.inner.inc_lock_ref(py, node_id, skip_lock_components))
             }
 
-            /// Decrease the reference count on a node's component locks.
-            #[pyo3(signature = (node_id, params = None, skip_swa = false))]
+            /// Pin only the FULL device values on a node's root path.
+            fn inc_full_pin(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+                catch_native_panic(|| self.inner.inc_full_pin(py, node_id))
+            }
+
+            /// Release a FULL-only root-path pin.
+            fn dec_full_pin(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+                catch_native_panic(|| self.inner.dec_full_pin(py, node_id))
+            }
+
+            /// Decrease the reference count on a node's component locks. The
+            /// receipt is required: a release must replay its acquire's evidence.
+            #[pyo3(signature = (node_id, params, skip_swa = false))]
             fn dec_lock_ref(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
-                params: Option<&DecLockRefParamsBinding>,
+                params: &DecLockRefParamsBinding,
                 skip_swa: bool,
             ) -> PyResult<()> {
-                self.inner.dec_lock_ref(py, node_id, params, skip_swa)
+                catch_native_panic(|| self.inner.dec_lock_ref(py, node_id, params, skip_swa))
+            }
+
+            /// Release one window's lock, retaining other component locks.
+            fn dec_window_lock_only(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+                params: &DecLockRefParamsBinding,
+            ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
+                catch_native_panic(|| {
+                    self.inner
+                        .dec_window_lock_only(py, node_id, component_type, params)
+                })
             }
 
             /// Early-release the SWA portion of a request's tree lock; returns this
             /// release's per-component (device_frees, host_frees).
-            #[pyo3(signature = (node_id, swa_uuid_for_lock = None, skip_lock_node_ids = None))]
+            #[pyo3(signature = (node_id, params))]
             fn dec_swa_lock_only(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
-                swa_uuid_for_lock: Option<i64>,
-                skip_lock_node_ids: Option<HashMap<u8, HashSet<NodeId>>>,
+                params: &DecLockRefParamsBinding,
             ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
-                self.inner.dec_swa_lock_only(
-                    py,
-                    node_id,
-                    swa_uuid_for_lock,
-                    skip_lock_node_ids,
-                )
+                catch_native_panic(|| self.inner.dec_swa_lock_only(py, node_id, params))
             }
 
             /// Store a component's device value on a node (the SWA rebuild write-back).
@@ -2419,8 +2866,15 @@ macro_rules! tree_core_binding {
                 component_type: u8,
                 value: PyTensor,
             ) -> PyResult<()> {
-                self.inner
-                    .set_component_device_value(py, node_id, component_type, value)
+                catch_native_panic(|| {
+                    self.inner
+                        .set_component_device_value(py, node_id, component_type, value)
+                })
+            }
+
+            /// Logical key lengths for the nodes in a load-back transfer.
+            fn get_node_key_lengths(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
+                catch_native_panic(|| self.inner.get_node_key_lengths(py, node_ids))
             }
 
             /// A component's device value on a node, if set.
@@ -2429,9 +2883,11 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 node_id: NodeId,
                 component_type: u8,
-            ) -> PyResult<Option<PyTensor>> {
-                self.inner
-                    .get_component_device_value(py, node_id, component_type)
+            ) -> PyResult<Option<Py<PyAny>>> {
+                catch_native_panic(|| {
+                    self.inner
+                        .get_component_device_value(py, node_id, component_type)
+                })
             }
 
             /// Begin a component's device-eviction walk for up to request_cnt tokens.
@@ -2441,8 +2897,10 @@ macro_rules! tree_core_binding {
                 component_type: u8,
                 request_cnt: usize,
             ) -> PyResult<()> {
-                self.inner
-                    .evict_device_start(py, component_type, request_cnt)
+                catch_native_panic(|| {
+                    self.inner
+                        .evict_device_start(py, component_type, request_cnt)
+                })
             }
 
             /// The next device leaf to evict, or None when the walk is done; the
@@ -2454,8 +2912,28 @@ macro_rules! tree_core_binding {
                 component_type: u8,
                 tracker: HashMap<u8, usize>,
             ) -> PyResult<EvictDeviceNextNodeResultBinding> {
-                self.inner
-                    .evict_device_next_node(py, component_type, tracker)
+                catch_native_panic(|| {
+                    self.inner
+                        .evict_device_next_node(py, component_type, tracker)
+                })
+            }
+
+            /// Finish an internal Mamba eviction after its host backup attempt.
+            fn finish_mamba_state_eviction(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<EvictDeviceNextNodeResultBinding> {
+                catch_native_panic(|| self.inner.finish_mamba_state_eviction(py, node_id))
+            }
+
+            /// Finish an internal SWA eviction after its host backup attempt.
+            fn finish_swa_state_eviction(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<EvictDeviceNextNodeResultBinding> {
+                catch_native_panic(|| self.inner.finish_swa_state_eviction(py, node_id))
             }
 
             /// Evict one device leaf; an unbacked write-back leaf returns its backup
@@ -2465,12 +2943,12 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 node_id: NodeId,
             ) -> PyResult<EvictDeviceLeafResultBinding> {
-                self.inner.evict_device_leaf(py, node_id)
+                catch_native_panic(|| self.inner.evict_device_leaf(py, node_id))
             }
 
             /// Finish a component's device-eviction walk.
             fn evict_device_end(&self, py: Python<'_>, component_type: u8) -> PyResult<()> {
-                self.inner.evict_device_end(py, component_type)
+                catch_native_panic(|| self.inner.evict_device_end(py, component_type))
             }
 
             /// Verify tree-structure, leaf-set, LRU, size, and ongoing-op invariants;
@@ -2481,8 +2959,10 @@ macro_rules! tree_core_binding {
                 ongoing_write_through: Vec<(i64, NodeId)>,
                 ongoing_load_back: Vec<(i64, NodeId)>,
             ) -> PyResult<()> {
-                self.inner
-                    .sanity_check(py, ongoing_write_through, ongoing_load_back)
+                catch_native_panic(|| {
+                    self.inner
+                        .sanity_check(py, ongoing_write_through, ongoing_load_back)
+                })
             }
 
             /// Concatenated FULL device values from from_node up to (exclusive) until_node.
@@ -2491,19 +2971,21 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 from_node_id: NodeId,
                 until_node_id: NodeId,
-            ) -> PyResult<PyTensor> {
-                self.inner
-                    .collect_full_device_indices(py, from_node_id, until_node_id)
+            ) -> PyResult<Py<PyAny>> {
+                catch_native_panic(|| {
+                    self.inner
+                        .collect_full_device_indices(py, from_node_id, until_node_id)
+                })
             }
 
             /// Every FULL device value in the tree, concatenated.
-            fn all_values_flatten(&self, py: Python<'_>) -> PyTensor {
-                self.inner.all_values_flatten(py)
+            fn all_values_flatten(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+                catch_native_panic(|| self.inner.all_values_flatten(py))
             }
 
             /// Every Mamba device value in the tree, concatenated.
-            fn all_mamba_values_flatten(&self, py: Python<'_>) -> PyTensor {
-                self.inner.all_mamba_values_flatten(py)
+            fn all_mamba_values_flatten(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+                catch_native_panic(|| self.inner.all_mamba_values_flatten(py))
             }
 
             /// Flatten every FULL device slot into (slot, position, prev-slot) rows for the KV-canary sweep.
@@ -2513,68 +2995,94 @@ macro_rules! tree_core_binding {
                 unlocked_only: bool,
                 swa_resident_only: bool,
             ) -> PyResult<KvCanaryWalkResultBinding> {
-                self.inner
-                    .walk_for_kv_canary(py, unlocked_only, swa_resident_only)
+                catch_native_panic(|| {
+                    self.inner
+                        .walk_for_kv_canary(py, unlocked_only, swa_resident_only)
+                })
             }
 
             /// Evictable token count of the FULL (base) component.
-            fn evictable_size(&self, py: Python<'_>) -> usize {
-                self.inner.evictable_size(py)
+            fn evictable_size(&self, py: Python<'_>) -> PyResult<usize> {
+                catch_native_panic(|| Ok(self.inner.evictable_size(py)))
             }
 
             /// Protected (locked) token count of the FULL (base) component.
-            fn protected_size(&self, py: Python<'_>) -> usize {
-                self.inner.protected_size(py)
+            fn protected_size(&self, py: Python<'_>) -> PyResult<usize> {
+                catch_native_panic(|| Ok(self.inner.protected_size(py)))
             }
 
             /// FULL component evictable token count.
-            fn full_evictable_size(&self, py: Python<'_>) -> usize {
-                self.inner.full_evictable_size(py)
+            fn full_evictable_size(&self, py: Python<'_>) -> PyResult<usize> {
+                catch_native_panic(|| Ok(self.inner.full_evictable_size(py)))
             }
 
             /// FULL component protected token count.
-            fn full_protected_size(&self, py: Python<'_>) -> usize {
-                self.inner.full_protected_size(py)
+            fn full_protected_size(&self, py: Python<'_>) -> PyResult<usize> {
+                catch_native_panic(|| Ok(self.inner.full_protected_size(py)))
             }
 
             /// Evictable token count for one component (0 if the component is absent).
             fn component_evictable_size(&self, py: Python<'_>, component_type: u8) -> PyResult<usize> {
-                self.inner.component_evictable_size(py, component_type)
+                catch_native_panic(|| self.inner.component_evictable_size(py, component_type))
             }
 
             /// Protected token count for one component (0 if the component is absent).
             fn component_protected_size(&self, py: Python<'_>, component_type: u8) -> PyResult<usize> {
-                self.inner.component_protected_size(py, component_type)
+                catch_native_panic(|| self.inner.component_protected_size(py, component_type))
             }
 
             /// (full_tokens, aux_tokens) summed across the whole tree.
-            fn total_size(&self, py: Python<'_>) -> (usize, usize) {
-                self.inner.total_size(py)
+            fn total_size(&self, py: Python<'_>) -> PyResult<(usize, usize)> {
+                catch_native_panic(|| Ok(self.inner.total_size(py)))
             }
 
             /// Whether the node's FULL device value has been evicted.
             fn is_full_device_evicted(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
-                self.inner.is_full_device_evicted(py, node_id)
+                catch_native_panic(|| self.inner.is_full_device_evicted(py, node_id))
+            }
+
+            /// Mark the host tier as buffer-only; wired after the host pools are built.
+            fn set_host_memory_buffer_only(&self, py: Python<'_>) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_host_memory_buffer_only(py);
+                    Ok(())
+                })
+            }
+
+            /// Whether the host tier runs as a storage staging buffer, not a cache.
+            fn is_host_memory_buffer_only(&self, py: Python<'_>) -> PyResult<bool> {
+                catch_native_panic(|| Ok(self.inner.is_host_memory_buffer_only(py)))
             }
 
             /// Mark the host tier (HiCache) as wired.
-            fn set_hicache_enabled(&self, py: Python<'_>) {
-                self.inner.set_hicache_enabled(py)
+            fn set_hicache_enabled(&self, py: Python<'_>) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_hicache_enabled(py);
+                    Ok(())
+                })
             }
 
             /// Whether the host tier (HiCache) is wired.
-            fn enable_hicache(&self, py: Python<'_>) -> bool {
-                self.inner.enable_hicache(py)
+            fn enable_hicache(&self, py: Python<'_>) -> PyResult<bool> {
+                catch_native_panic(|| Ok(self.inner.enable_hicache(py)))
+            }
+
+            /// Preserve dirty SWA data before cache-mode write-back eviction.
+            fn enable_swa_write_back_eviction_barrier(&self, py: Python<'_>) {
+                self.inner.enable_swa_write_back_eviction_barrier(py)
             }
 
             /// Mark the SWA host pool as wired (HiCache).
-            fn set_has_swa_host_pool(&self, py: Python<'_>) {
-                self.inner.set_has_swa_host_pool(py)
+            fn set_has_swa_host_pool(&self, py: Python<'_>) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_has_swa_host_pool(py);
+                    Ok(())
+                })
             }
 
             /// Whether the SWA host pool is wired.
-            fn has_swa_host_pool(&self, py: Python<'_>) -> bool {
-                self.inner.has_swa_host_pool(py)
+            fn has_swa_host_pool(&self, py: Python<'_>) -> PyResult<bool> {
+                catch_native_panic(|| Ok(self.inner.has_swa_host_pool(py)))
             }
 
             /// Insert a host-side (backuped) tree path descending from the given node.
@@ -2589,15 +3097,11 @@ macro_rules! tree_core_binding {
                 hash_value: Vec<String>,
                 cache_salt: Option<String>,
             ) -> PyResult<InsertResultBinding> {
-                self.inner.insert_host(
-                    py,
-                    node_id,
-                    extra_key,
-                    key,
-                    host_value,
-                    hash_value,
-                    cache_salt,
-                )
+                catch_native_panic(|| {
+                    self.inner.insert_host(
+                        py, node_id, extra_key, key, host_value, hash_value, cache_salt,
+                    )
+                })
             }
 
             /// Gather a node's device value plus per-component BACKUP_HOST transfers.
@@ -2605,8 +3109,8 @@ macro_rules! tree_core_binding {
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
-            ) -> PyResult<(PyTensor, Py<PyDict>)> {
-                self.inner.build_backup_spec(py, node_id)
+            ) -> PyResult<(Py<PyAny>, Py<PyDict>)> {
+                catch_native_panic(|| self.inner.build_backup_spec(py, node_id))
             }
 
             /// Gather a node's device->storage backup spec; None if the node is not backuped.
@@ -2616,13 +3120,15 @@ macro_rules! tree_core_binding {
                 node_id: NodeId,
                 pass_prefix_keys: bool,
             ) -> PyResult<Option<StorageBackupSpecBinding>> {
-                self.inner
-                    .build_storage_backup_spec(py, node_id, pass_prefix_keys)
+                catch_native_panic(|| {
+                    self.inner
+                        .build_storage_backup_spec(py, node_id, pass_prefix_keys)
+                })
             }
 
             /// Route a build_hicache_transfers call to the component for the given type.
             #[allow(clippy::too_many_arguments)]
-            #[pyo3(signature = (component_type, node_id, phase, host_indices = None, token_ids = None, prefetch_tokens = 0, last_hash = None))]
+            #[pyo3(signature = (component_type, node_id, phase, host_indices = None, token_ids = None, prefetch_tokens = 0, staging_tokens = 0, last_hash = None))]
             fn build_hicache_transfers(
                 &self,
                 py: Python<'_>,
@@ -2632,18 +3138,22 @@ macro_rules! tree_core_binding {
                 host_indices: Option<PyTensor>,
                 token_ids: Option<Vec<i64>>,
                 prefetch_tokens: usize,
+                staging_tokens: usize,
                 last_hash: Option<String>,
             ) -> PyResult<Option<Vec<Py<PyAny>>>> {
-                self.inner.build_hicache_transfers(
-                    py,
-                    component_type,
-                    node_id,
-                    phase,
-                    host_indices,
-                    token_ids,
-                    prefetch_tokens,
-                    last_hash,
-                )
+                catch_native_panic(|| {
+                    self.inner.build_hicache_transfers(
+                        py,
+                        component_type,
+                        node_id,
+                        phase,
+                        host_indices,
+                        token_ids,
+                        prefetch_tokens,
+                        staging_tokens,
+                        last_hash,
+                    )
+                })
             }
 
             /// The anchor node's caller-defined key and cache salt.
@@ -2652,39 +3162,31 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 node_id: NodeId,
             ) -> PyResult<(Option<String>, Option<String>)> {
-                self.inner.prefetch_anchor_info(py, node_id)
+                catch_native_panic(|| self.inner.prefetch_anchor_info(py, node_id))
             }
 
             /// Whether the node's Full KV is present on host.
             fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
-                self.inner.node_backuped(py, node_id)
+                catch_native_panic(|| self.inner.node_backuped(py, node_id))
             }
 
             /// Whether the node is a (default or named) root.
             fn is_root(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
-                self.inner.is_root(py, node_id)
+                catch_native_panic(|| self.inner.is_root(py, node_id))
             }
 
             /// The node's last page hash, or None when it was never hashed.
-            fn get_last_hash_value(
-                &self,
-                py: Python<'_>,
-                node_id: NodeId,
-            ) -> PyResult<Option<String>> {
-                self.inner.get_last_hash_value(py, node_id)
+            fn get_last_hash_value(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<String>> {
+                catch_native_panic(|| self.inner.get_last_hash_value(py, node_id))
             }
 
             /// The hash chain of the node's ancestors, in root-to-parent order.
-            fn get_prefix_hash_values(
-                &self,
-                py: Python<'_>,
-                node_id: NodeId,
-            ) -> PyResult<Vec<String>> {
-                self.inner.get_prefix_hash_values(py, node_id)
+            fn get_prefix_hash_values(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<String>> {
+                catch_native_panic(|| self.inner.get_prefix_hash_values(py, node_id))
             }
 
             fn get_hash_values(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<String>> {
-                self.inner.get_hash_values(py, node_id)
+                catch_native_panic(|| self.inner.get_hash_values(py, node_id))
             }
 
             fn snapshot_buffer_backup(
@@ -2692,9 +3194,12 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 node_id: NodeId,
                 pass_prefix_keys: bool,
-            ) -> Option<BufferBackupSnapshotBinding> {
-                self.inner
-                    .snapshot_buffer_backup(py, node_id, pass_prefix_keys)
+            ) -> PyResult<Option<BufferBackupSnapshotBinding>> {
+                catch_native_panic(|| {
+                    Ok(self
+                        .inner
+                        .snapshot_buffer_backup(py, node_id, pass_prefix_keys))
+                })
             }
 
             fn validate_buffer_backup(
@@ -2702,27 +3207,30 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 node_id: NodeId,
                 expected_key_length: usize,
-            ) -> Option<BufferBackupStateBinding> {
-                self.inner
-                    .validate_buffer_backup(py, node_id, expected_key_length)
+            ) -> PyResult<Option<BufferBackupStateBinding>> {
+                catch_native_panic(|| {
+                    Ok(self
+                        .inner
+                        .validate_buffer_backup(py, node_id, expected_key_length))
+                })
             }
 
             /// Hash every node built while storage was disabled.
-            fn backfill_missing_hash_values(&self, py: Python<'_>) -> usize {
-                self.inner.backfill_missing_hash_values(py)
+            fn backfill_missing_hash_values(&self, py: Python<'_>) -> PyResult<usize> {
+                catch_native_panic(|| Ok(self.inner.backfill_missing_hash_values(py)))
             }
 
             #[pyo3(signature = (extra_key = None))]
-            fn root_node_handle(&self, py: Python<'_>, extra_key: Option<String>) -> NodeId {
-                self.inner.root_node_handle(py, extra_key)
+            fn root_node_handle(&self, py: Python<'_>, extra_key: Option<String>) -> PyResult<NodeId> {
+                catch_native_panic(|| Ok(self.inner.root_node_handle(py, extra_key)))
             }
 
-            fn dfs_weight_order(
-                &self,
-                py: Python<'_>,
-                node_ids: Vec<NodeId>,
-            ) -> PyResult<Vec<usize>> {
-                self.inner.dfs_weight_order(py, node_ids)
+            fn rotation_base_of(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<i64>> {
+                catch_native_panic(|| self.inner.rotation_base_of(py, node_id))
+            }
+
+            fn dfs_weight_order(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
+                catch_native_panic(|| self.inner.dfs_weight_order(py, node_ids))
             }
 
             /// Commit each component's HiCache transfers; returns the new cache actions.
@@ -2736,14 +3244,16 @@ macro_rules! tree_core_binding {
                 insert_result: Option<(usize, Option<NodeId>, bool)>,
                 pool_storage_result: Option<(usize, HashMap<String, usize>)>,
             ) -> PyResult<(Py<PyList>, Option<bool>)> {
-                self.inner.commit_hicache_transfers(
-                    py,
-                    node_id,
-                    phase,
-                    comp_xfers,
-                    insert_result,
-                    pool_storage_result,
-                )
+                catch_native_panic(|| {
+                    self.inner.commit_hicache_transfers(
+                        py,
+                        node_id,
+                        phase,
+                        comp_xfers,
+                        insert_result,
+                        pool_storage_result,
+                    )
+                })
             }
 
             /// Commit a successful backup to the node.
@@ -2754,8 +3264,10 @@ macro_rules! tree_core_binding {
                 host_indices: PyTensor,
                 comp_xfers: HashMap<u8, Vec<TransferArgs>>,
             ) -> PyResult<()> {
-                self.inner
-                    .commit_backup(py, node_id, host_indices, comp_xfers)
+                catch_native_panic(|| {
+                    self.inner
+                        .commit_backup(py, node_id, host_indices, comp_xfers)
+                })
             }
 
             /// Build the H->D load-back KV transfer plus per-component aux transfers.
@@ -2766,7 +3278,7 @@ macro_rules! tree_core_binding {
                 node_id: NodeId,
                 mamba_pool_idx: Option<PyTensor>,
             ) -> PyResult<(Py<PyAny>, Py<PyDict>)> {
-                self.inner.build_load_back_spec(py, node_id, mamba_pool_idx)
+                catch_native_panic(|| self.inner.build_load_back_spec(py, node_id, mamba_pool_idx))
             }
 
             /// Commit a successful H->D load-back onto the node; returns its actions.
@@ -2778,23 +3290,34 @@ macro_rules! tree_core_binding {
                 kv_xfer: TransferArgs,
                 comp_xfers: HashMap<u8, Vec<TransferArgs>>,
             ) -> PyResult<Py<PyList>> {
-                self.inner
-                    .commit_load_back(py, node_id, device_indices, kv_xfer, comp_xfers)
+                catch_native_panic(|| {
+                    self.inner
+                        .commit_load_back(py, node_id, device_indices, kv_xfer, comp_xfers)
+                })
             }
 
             /// Release a node's device KV once its host copy exists.
             fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
-                self.inner.demote(py, node_id)
+                catch_native_panic(|| self.inner.demote(py, node_id))
             }
 
             /// Evict up to num_tokens of one component's host resources.
+            #[pyo3(signature = (component_type, num_tokens, skip_full_duplicate_reclaim = false))]
             fn drive_host_eviction(
                 &self,
                 py: Python<'_>,
                 component_type: u8,
                 num_tokens: usize,
+                skip_full_duplicate_reclaim: bool,
             ) -> PyResult<HostEvictionResultBinding> {
-                self.inner.drive_host_eviction(py, component_type, num_tokens)
+                catch_native_panic(|| {
+                    self.inner.drive_host_eviction(
+                        py,
+                        component_type,
+                        num_tokens,
+                        skip_full_duplicate_reclaim,
+                    )
+                })
             }
 
             /// Evict shallow Mamba device checkpoints beyond the per-path cap
@@ -2804,7 +3327,7 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 tail_node_id: NodeId,
             ) -> PyResult<HostEvictionResultBinding> {
-                self.inner.evict_excess_path_states(py, tail_node_id)
+                catch_native_panic(|| self.inner.evict_excess_path_states(py, tail_node_id))
             }
 
             /// Bump the reference count on a node's host-side component locks.
@@ -2813,58 +3336,84 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 node_id: NodeId,
             ) -> PyResult<IncLockRefResultBinding> {
-                self.inner.inc_host_lock_ref(py, node_id)
+                catch_native_panic(|| self.inner.inc_host_lock_ref(py, node_id))
             }
 
             /// Decrease the reference count on a node's host-side component locks.
-            #[pyo3(signature = (node_id, params = None))]
+            /// The receipt is required, as for dec_lock_ref.
             fn dec_host_lock_ref(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
-                params: Option<&DecLockRefParamsBinding>,
+                params: &DecLockRefParamsBinding,
             ) -> PyResult<()> {
-                self.inner.dec_host_lock_ref(py, node_id, params)
+                catch_native_panic(|| self.inner.dec_host_lock_ref(py, node_id, params))
+            }
+
+            fn is_write_through_compatible(&self, py: Python<'_>) -> bool {
+                self.inner.is_write_through_compatible(py)
             }
 
             /// Set the write-back (vs write-through) policy; decided at HiCache init.
-            fn set_is_write_back(&self, py: Python<'_>, is_write_back: bool) {
-                self.inner.set_is_write_back(py, is_write_back)
+            fn set_is_write_back(&self, py: Python<'_>, is_write_back: bool) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_is_write_back(py, is_write_back);
+                    Ok(())
+                })
             }
 
             /// The current write-back (vs write-through) policy.
-            fn is_write_back(&self, py: Python<'_>) -> bool {
-                self.inner.is_write_back(py)
+            fn is_write_back(&self, py: Python<'_>) -> PyResult<bool> {
+                catch_native_panic(|| Ok(self.inner.is_write_back(py)))
             }
 
             /// Set the write-through backup hit threshold; decided at HiCache init.
-            fn set_write_through_threshold(&self, py: Python<'_>, threshold: i64) {
-                self.inner.set_write_through_threshold(py, threshold)
+            fn set_write_through_threshold(&self, py: Python<'_>, threshold: i64) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_write_through_threshold(py, threshold);
+                    Ok(())
+                })
             }
 
             /// The current write-through backup hit threshold.
-            fn write_through_threshold(&self, py: Python<'_>) -> i64 {
-                self.inner.write_through_threshold(py)
+            fn write_through_threshold(&self, py: Python<'_>) -> PyResult<i64> {
+                catch_native_panic(|| Ok(self.inner.write_through_threshold(py)))
             }
 
             /// Mark the storage tier (L3) wired; storage attaches after tree construction.
-            fn set_enable_storage(&self, py: Python<'_>, value: bool) {
-                self.inner.set_enable_storage(py, value)
+            fn set_enable_storage(&self, py: Python<'_>, value: bool) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_enable_storage(py, value);
+                    Ok(())
+                })
             }
 
             /// Whether the storage tier (L3) is wired.
-            fn enable_storage(&self, py: Python<'_>) -> bool {
-                self.inner.enable_storage(py)
+            fn enable_storage(&self, py: Python<'_>) -> PyResult<bool> {
+                catch_native_panic(|| Ok(self.inner.enable_storage(py)))
+            }
+
+            /// Enable or disable the direct external-cache linker.
+            fn set_enable_external_cache_linker(&self, py: Python<'_>, value: bool) -> PyResult<()> {
+                catch_native_panic(|| self.inner.set_enable_external_cache_linker(py, value))
+            }
+
+            /// Whether the direct external-cache linker is wired.
+            fn enable_external_cache_linker(&self, py: Python<'_>) -> PyResult<bool> {
+                catch_native_panic(|| Ok(self.inner.enable_external_cache_linker(py)))
             }
 
             /// Queue the all-cleared placement event.
-            fn record_all_cleared_event(&self, py: Python<'_>) {
-                self.inner.record_all_cleared_event(py)
+            fn record_all_cleared_event(&self, py: Python<'_>) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.record_all_cleared_event(py);
+                    Ok(())
+                })
             }
 
             /// Drain the queued placement events as tagged tuples.
             fn take_events(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-                self.inner.take_events(py)
+                catch_native_panic(|| self.inner.take_events(py))
             }
 
             /// Drop the subtree rooted at an unbacked D-leaf; not dropped when a lock
@@ -2874,7 +3423,7 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 node_id: NodeId,
             ) -> PyResult<DropSubtreeResultBinding> {
-                self.inner.drop_subtree_no_host(py, node_id)
+                catch_native_panic(|| self.inner.drop_subtree_no_host(py, node_id))
             }
 
             /// Mark the nodes one write-through backup covers; returns them ancestors first.
@@ -2884,7 +3433,7 @@ macro_rules! tree_core_binding {
                 node_ids: Vec<NodeId>,
                 ack_id: NodeId,
             ) -> PyResult<Vec<NodeId>> {
-                self.inner.mark_write_through_pending(py, node_ids, ack_id)
+                catch_native_panic(|| self.inner.mark_write_through_pending(py, node_ids, ack_id))
             }
 
             /// Clear the write-through-pending mark on the acked nodes.
@@ -2894,18 +3443,66 @@ macro_rules! tree_core_binding {
                 node_ids: Vec<NodeId>,
                 ack_id: NodeId,
             ) -> PyResult<()> {
-                self.inner.finish_write_through(py, node_ids, ack_id)
+                catch_native_panic(|| self.inner.finish_write_through(py, node_ids, ack_id))
             }
 
             /// Clear the in-flight H->D marks on the anchor's root path at ack time.
             fn finish_load_back(&self, py: Python<'_>, anchor_node_id: NodeId) -> PyResult<()> {
-                self.inner.finish_load_back(py, anchor_node_id)
+                catch_native_panic(|| self.inner.finish_load_back(py, anchor_node_id))
+            }
+
+            /// Build transfers for a node with no stored or pending external copy.
+            fn build_external_linker_offload_transfers(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<Option<Vec<Py<PyAny>>>> {
+                catch_native_panic(|| {
+                    self.inner
+                        .build_external_linker_offload_transfers(py, node_id)
+                })
+            }
+
+            /// Mark an externally restored path, excluding its existing anchor.
+            fn mark_external_cache_stored_path(
+                &self,
+                py: Python<'_>,
+                from_node_id: NodeId,
+                until_node_id: NodeId,
+            ) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner
+                        .mark_external_cache_stored_path(py, from_node_id, until_node_id)
+                })
+            }
+
+            /// Publish an accepted external offload as pending.
+            fn mark_external_linker_offload_pending(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<()> {
+                catch_native_panic(|| self.inner.mark_external_linker_offload_pending(py, node_id))
+            }
+
+            /// Finalize external-store state for an offload and its split fragments.
+            fn finish_external_linker_offload(
+                &self,
+                py: Python<'_>,
+                node_ids: Vec<NodeId>,
+                ack_id: NodeId,
+                success: bool,
+            ) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner
+                        .finish_external_linker_offload(py, node_ids, ack_id, success)
+                })
             }
 
             /// Order-sensitive digest of reclaimed coexisting host values.
             #[pyo3(name = "write_back_duplicate_reclaim_digest")]
-            fn write_back_coexist_reclaim_digest(&self, py: Python<'_>) -> i64 {
-                self.inner.write_back_coexist_reclaim_digest(py)
+            fn write_back_coexist_reclaim_digest(&self, py: Python<'_>) -> PyResult<i64> {
+                catch_native_panic(|| Ok(self.inner.write_back_coexist_reclaim_digest(py)))
             }
 
             /// Whether the component's data is device-evicted but host-backed.
@@ -2915,15 +3512,17 @@ macro_rules! tree_core_binding {
                 node_id: NodeId,
                 component_type: u8,
             ) -> PyResult<bool> {
-                self.inner
-                    .component_has_host_value_only(py, node_id, component_type)
+                catch_native_panic(|| {
+                    self.inner
+                        .component_has_host_value_only(py, node_id, component_type)
+                })
             }
 
             // ==== Test-only inspection surface ====
 
             #[cfg(feature = "inspection")]
-            fn inspect_contains_node(&self, py: Python<'_>, node_id: NodeId) -> bool {
-                self.inner.inspect_contains_node(py, node_id)
+            fn inspect_contains_node(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+                catch_native_panic(|| Ok(self.inner.inspect_contains_node(py, node_id)))
             }
 
             #[cfg(feature = "inspection")]
@@ -2932,43 +3531,27 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 node_id: NodeId,
             ) -> PyResult<Option<NodeId>> {
-                self.inner.inspect_get_parent_node_id(py, node_id)
+                catch_native_panic(|| self.inner.inspect_get_parent_node_id(py, node_id))
             }
 
             #[cfg(feature = "inspection")]
-            fn inspect_get_child_node_ids(
-                &self,
-                py: Python<'_>,
-                node_id: NodeId,
-            ) -> PyResult<Vec<NodeId>> {
-                self.inner.inspect_get_child_node_ids(py, node_id)
+            fn inspect_get_child_node_ids(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<NodeId>> {
+                catch_native_panic(|| self.inner.inspect_get_child_node_ids(py, node_id))
             }
 
             #[cfg(feature = "inspection")]
-            fn inspect_get_node_key_length(
-                &self,
-                py: Python<'_>,
-                node_id: NodeId,
-            ) -> PyResult<usize> {
-                self.inner.inspect_get_node_key_length(py, node_id)
+            fn inspect_get_node_key_length(&self, py: Python<'_>, node_id: NodeId) -> PyResult<usize> {
+                catch_native_panic(|| self.inner.inspect_get_node_key_length(py, node_id))
             }
 
             #[cfg(feature = "inspection")]
-            fn inspect_get_node_token_ids(
-                &self,
-                py: Python<'_>,
-                node_id: NodeId,
-            ) -> PyResult<Vec<i64>> {
-                self.inner.inspect_get_node_token_ids(py, node_id)
+            fn inspect_get_node_token_ids(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<i64>> {
+                catch_native_panic(|| self.inner.inspect_get_node_token_ids(py, node_id))
             }
 
             #[cfg(feature = "inspection")]
-            fn inspect_is_node_key_bigram(
-                &self,
-                py: Python<'_>,
-                node_id: NodeId,
-            ) -> PyResult<bool> {
-                self.inner.inspect_is_node_key_bigram(py, node_id)
+            fn inspect_is_node_key_bigram(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+                catch_native_panic(|| self.inner.inspect_is_node_key_bigram(py, node_id))
             }
 
             #[cfg(feature = "inspection")]
@@ -2977,9 +3560,11 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 node_id: NodeId,
                 component_type: u8,
-            ) -> PyResult<Option<PyTensor>> {
-                self.inner
-                    .inspect_get_component_host_value(py, node_id, component_type)
+            ) -> PyResult<Option<Py<PyAny>>> {
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_get_component_host_value(py, node_id, component_type)
+                })
             }
 
             #[cfg(feature = "inspection")]
@@ -2989,17 +3574,28 @@ macro_rules! tree_core_binding {
                 node_id: NodeId,
                 component_type: u8,
             ) -> PyResult<u32> {
-                self.inner
-                    .inspect_get_component_device_lock_ref(py, node_id, component_type)
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_get_component_device_lock_ref(py, node_id, component_type)
+                })
             }
 
             #[cfg(feature = "inspection")]
-            fn inspect_get_node_hit_count(
+            fn inspect_get_component_host_lock_ref(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
-            ) -> PyResult<i64> {
-                self.inner.inspect_get_node_hit_count(py, node_id)
+                component_type: u8,
+            ) -> PyResult<u32> {
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_get_component_host_lock_ref(py, node_id, component_type)
+                })
+            }
+
+            #[cfg(feature = "inspection")]
+            fn inspect_get_node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> PyResult<i64> {
+                catch_native_panic(|| self.inner.inspect_get_node_hit_count(py, node_id))
             }
 
             #[cfg(feature = "inspection")]
@@ -3008,8 +3604,12 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 node_id: NodeId,
             ) -> PyResult<Option<usize>> {
-                self.inner
-                    .inspect_get_write_through_pending_id(py, node_id)
+                catch_native_panic(|| self.inner.inspect_get_write_through_pending_id(py, node_id))
+            }
+
+            #[cfg(feature = "inspection")]
+            fn inspect_is_external_cache_stored(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+                catch_native_panic(|| self.inner.inspect_is_external_cache_stored(py, node_id))
             }
 
             #[cfg(feature = "inspection")]
@@ -3019,8 +3619,10 @@ macro_rules! tree_core_binding {
                 node_id: NodeId,
                 component_type: u8,
             ) -> PyResult<bool> {
-                self.inner
-                    .inspect_is_node_in_device_lru(py, node_id, component_type)
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_is_node_in_device_lru(py, node_id, component_type)
+                })
             }
 
             #[cfg(feature = "inspection")]
@@ -3030,8 +3632,10 @@ macro_rules! tree_core_binding {
                 node_id: NodeId,
                 component_type: u8,
             ) -> PyResult<bool> {
-                self.inner
-                    .inspect_is_node_in_host_lru(py, node_id, component_type)
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_is_node_in_host_lru(py, node_id, component_type)
+                })
             }
 
             #[cfg(feature = "inspection")]
@@ -3040,40 +3644,30 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 component_type: u8,
             ) -> PyResult<Vec<NodeId>> {
-                self.inner
-                    .inspect_get_component_device_lru_node_ids(py, component_type)
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_get_component_device_lru_node_ids(py, component_type)
+                })
             }
 
             #[cfg(feature = "inspection")]
-            fn inspect_is_device_evictable_leaf(
-                &self,
-                py: Python<'_>,
-                node_id: NodeId,
-            ) -> bool {
-                self.inner.inspect_is_device_evictable_leaf(py, node_id)
+            fn inspect_is_device_evictable_leaf(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+                catch_native_panic(|| Ok(self.inner.inspect_is_device_evictable_leaf(py, node_id)))
             }
 
             #[cfg(feature = "inspection")]
-            fn inspect_is_host_evictable_leaf(
-                &self,
-                py: Python<'_>,
-                node_id: NodeId,
-            ) -> bool {
-                self.inner.inspect_is_host_evictable_leaf(py, node_id)
+            fn inspect_is_host_evictable_leaf(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+                catch_native_panic(|| Ok(self.inner.inspect_is_host_evictable_leaf(py, node_id)))
             }
 
             #[cfg(feature = "inspection")]
-            fn inspect_is_device_leaf(
-                &self,
-                py: Python<'_>,
-                node_id: NodeId,
-            ) -> PyResult<bool> {
-                self.inner.inspect_is_device_leaf(py, node_id)
+            fn inspect_is_device_leaf(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+                catch_native_panic(|| self.inner.inspect_is_device_leaf(py, node_id))
             }
 
             #[cfg(feature = "inspection")]
-            fn inspect_get_all_node_ids(&self, py: Python<'_>) -> Vec<NodeId> {
-                self.inner.inspect_get_all_node_ids(py)
+            fn inspect_get_all_node_ids(&self, py: Python<'_>) -> PyResult<Vec<NodeId>> {
+                catch_native_panic(|| Ok(self.inner.inspect_get_all_node_ids(py)))
             }
 
             #[cfg(feature = "inspection")]
@@ -3082,8 +3676,10 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 component_type: u8,
             ) -> PyResult<usize> {
-                self.inner
-                    .inspect_component_protected_size(py, component_type)
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_component_protected_size(py, component_type)
+                })
             }
 
             #[cfg(feature = "inspection")]
@@ -3094,8 +3690,10 @@ macro_rules! tree_core_binding {
                 node_id: NodeId,
                 hash_values: Option<Vec<String>>,
             ) -> PyResult<()> {
-                self.inner
-                    .inspect_set_node_hash_values(py, node_id, hash_values)
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_set_node_hash_values(py, node_id, hash_values)
+                })
             }
 
             #[cfg(feature = "inspection")]
@@ -3107,12 +3705,10 @@ macro_rules! tree_core_binding {
                 component_type: u8,
                 value: Option<PyTensor>,
             ) -> PyResult<()> {
-                self.inner.inspect_set_component_device_value_raw(
-                    py,
-                    node_id,
-                    component_type,
-                    value,
-                )
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_set_component_device_value_raw(py, node_id, component_type, value)
+                })
             }
 
             #[cfg(feature = "inspection")]
@@ -3124,12 +3720,10 @@ macro_rules! tree_core_binding {
                 component_type: u8,
                 value: Option<PyTensor>,
             ) -> PyResult<()> {
-                self.inner.inspect_set_component_host_value_raw(
-                    py,
-                    node_id,
-                    component_type,
-                    value,
-                )
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_set_component_host_value_raw(py, node_id, component_type, value)
+                })
             }
 
             #[cfg(feature = "inspection")]
@@ -3140,12 +3734,10 @@ macro_rules! tree_core_binding {
                 component_type: u8,
                 lock_ref: u32,
             ) -> PyResult<()> {
-                self.inner.inspect_set_component_device_lock_ref(
-                    py,
-                    node_id,
-                    component_type,
-                    lock_ref,
-                )
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_set_component_device_lock_ref(py, node_id, component_type, lock_ref)
+                })
             }
 
             #[cfg(feature = "inspection")]
@@ -3155,8 +3747,10 @@ macro_rules! tree_core_binding {
                 node_id: NodeId,
                 component_type: u8,
             ) -> PyResult<()> {
-                self.inner
-                    .inspect_remove_node_from_device_lru(py, node_id, component_type)
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_remove_node_from_device_lru(py, node_id, component_type)
+                })
             }
 
             #[cfg(feature = "inspection")]
@@ -3166,8 +3760,10 @@ macro_rules! tree_core_binding {
                 node_id: NodeId,
                 component_type: u8,
             ) -> PyResult<()> {
-                self.inner
-                    .inspect_insert_node_into_host_lru(py, node_id, component_type)
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_insert_node_into_host_lru(py, node_id, component_type)
+                })
             }
 
             #[cfg(feature = "inspection")]
@@ -3177,8 +3773,10 @@ macro_rules! tree_core_binding {
                 component_type: u8,
                 value: usize,
             ) -> PyResult<()> {
-                self.inner
-                    .inspect_set_component_evictable_size(py, component_type, value)
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_set_component_evictable_size(py, component_type, value)
+                })
             }
 
             #[cfg(feature = "inspection")]
@@ -3188,22 +3786,20 @@ macro_rules! tree_core_binding {
                 component_type: u8,
                 value: usize,
             ) -> PyResult<()> {
-                self.inner
-                    .inspect_set_component_protected_size(py, component_type, value)
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_set_component_protected_size(py, component_type, value)
+                })
             }
 
             #[cfg(feature = "inspection")]
-            fn inspect_update_duplicate_tracking(
-                &self,
-                py: Python<'_>,
-                node_id: NodeId,
-            ) -> PyResult<()> {
-                self.inner.inspect_update_duplicate_tracking(py, node_id)
+            fn inspect_update_duplicate_tracking(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+                catch_native_panic(|| self.inner.inspect_update_duplicate_tracking(py, node_id))
             }
 
             #[cfg(feature = "inspection")]
             fn inspect_advance_insert_walk_once(&self, py: Python<'_>) -> PyResult<()> {
-                self.inner.inspect_advance_insert_walk_once(py)
+                catch_native_panic(|| self.inner.inspect_advance_insert_walk_once(py))
             }
 
             #[cfg(feature = "inspection")]
@@ -3214,8 +3810,10 @@ macro_rules! tree_core_binding {
                 component_type: u8,
                 target: u8,
             ) -> PyResult<HostEvictionResultBinding> {
-                self.inner
-                    .inspect_evict_component(py, node_id, component_type, target)
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_evict_component(py, node_id, component_type, target)
+                })
             }
 
             #[cfg(feature = "inspection")]
@@ -3226,8 +3824,10 @@ macro_rules! tree_core_binding {
                 component_type: u8,
                 target: u8,
             ) -> PyResult<()> {
-                self.inner
-                    .inspect_validate_cascade_evict(py, node_id, component_type, target)
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_validate_cascade_evict(py, node_id, component_type, target)
+                })
             }
 
             #[cfg(feature = "inspection")]
@@ -3236,8 +3836,7 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 node_id: NodeId,
             ) -> PyResult<HostEvictionResultBinding> {
-                self.inner
-                    .inspect_cleanup_tombstone_ancestors(py, node_id)
+                catch_native_panic(|| self.inner.inspect_cleanup_tombstone_ancestors(py, node_id))
             }
 
             #[cfg(feature = "inspection")]
@@ -3254,16 +3853,18 @@ macro_rules! tree_core_binding {
                 value_chunks: Vec<PyTensor>,
                 best_value_len: usize,
             ) -> PyResult<MatchResultBinding> {
-                self.inner.inspect_finalize_component_match_result(
-                    py,
-                    component_type,
-                    result,
-                    key,
-                    extra_key,
-                    cache_salt,
-                    value_chunks,
-                    best_value_len,
-                )
+                catch_native_panic(|| {
+                    self.inner.inspect_finalize_component_match_result(
+                        py,
+                        component_type,
+                        result,
+                        key,
+                        extra_key,
+                        cache_salt,
+                        value_chunks,
+                        best_value_len,
+                    )
+                })
             }
 
             #[cfg(feature = "inspection")]
@@ -3274,13 +3875,18 @@ macro_rules! tree_core_binding {
                 node_id: NodeId,
                 write_back: bool,
             ) -> PyResult<Vec<NodeId>> {
-                self.inner
-                    .inspect_build_backup_node_ids(py, node_id, write_back)
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_build_backup_node_ids(py, node_id, write_back)
+                })
             }
 
             /// Print the tree structure for debugging.
-            fn pretty_print(&self, py: Python<'_>) {
-                self.inner.pretty_print(py)
+            fn pretty_print(&self, py: Python<'_>) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.pretty_print(py);
+                    Ok(())
+                })
             }
         }
     };
@@ -3309,36 +3915,39 @@ fn get_hash_str(
     page_size: usize,
     is_bigram: bool,
 ) -> PyResult<Vec<String>> {
-    let raw = py_array_to_vec_i64(py, token_ids)?;
-    if page_size == 0 {
-        return Err(PyValueError::new_err("page_size must be positive"));
-    }
-    if let Some(prior_hash) = prior_hash.as_deref().filter(|hash| !hash.is_empty())
-        && (prior_hash.len() != 64 || !prior_hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    {
-        return Err(PyValueError::new_err(
-            "prior_hash must be a 64-character hexadecimal digest",
-        ));
-    }
-    if let Some(token_id) = raw
-        .iter()
-        .find(|token_id| u32::try_from(**token_id).is_err())
-    {
-        return Err(PyValueError::new_err(format!(
-            "token id {token_id} does not fit in uint32"
-        )));
-    }
-    Ok(py.allow_threads(move || {
-        if is_bigram {
-            let key = <Vec<(i64, i64)> as ChildKeyType>::key_from(Cow::Owned(raw)).into_owned();
-            crate::node::get_hash_str::<Vec<(i64, i64)>>(&key, prior_hash.as_deref(), page_size)
-        } else {
-            crate::node::get_hash_str::<Vec<i64>>(&raw, prior_hash.as_deref(), page_size)
+    catch_native_panic(|| {
+        let raw = py_array_to_vec_i64(py, token_ids)?;
+        if page_size == 0 {
+            return Err(PyValueError::new_err("page_size must be positive"));
         }
-    }))
+        if let Some(prior_hash) = prior_hash.as_deref().filter(|hash| !hash.is_empty())
+            && (prior_hash.len() != 64 || !prior_hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(PyValueError::new_err(
+                "prior_hash must be a 64-character hexadecimal digest",
+            ));
+        }
+        if let Some(token_id) = raw
+            .iter()
+            .find(|token_id| u32::try_from(**token_id).is_err())
+        {
+            return Err(PyValueError::new_err(format!(
+                "token id {token_id} does not fit in uint32"
+            )));
+        }
+        Ok(py.allow_threads(move || {
+            if is_bigram {
+                let key = <Vec<(i64, i64)> as ChildKeyType>::key_from(Cow::Owned(raw)).into_owned();
+                crate::node::get_hash_str::<Vec<(i64, i64)>>(&key, prior_hash.as_deref(), page_size)
+            } else {
+                crate::node::get_hash_str::<Vec<i64>>(&raw, prior_hash.as_deref(), page_size)
+            }
+        }))
+    })
 }
 
 fn register_mem_cache_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<TlruFloatConfigBinding>()?;
     m.add_function(wrap_pyfunction!(get_hash_str, m)?)?;
     m.add_class::<TreeCoreInitParamsBinding>()?;
     m.add_class::<MatchParamsBinding>()?;

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -15,25 +16,26 @@ class IndexKeyCache:
     def __init__(self, pool: DSATokenToKVPool, index_buf_size: int):
         self.pool = pool
         num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
-        with (
-            torch.cuda.use_mem_pool(pool.custom_mem_pool)
-            if pool.custom_mem_pool
-            else nullcontext()
-        ):
-            self.buffer = [
-                torch.zeros(
-                    self._buffer_shape(self._layer_num_pages(i, num_pages)),
-                    dtype=pool.index_k_with_scale_buffer_dtype,
-                    device=pool.device,
-                )
-                for i in range(pool.layer_num)
-            ]
+        with pool.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(pool.custom_mem_pool)
+                if pool.custom_mem_pool
+                else nullcontext()
+            ):
+                self.buffer = [
+                    torch.zeros(
+                        self._buffer_shape(self._layer_num_pages(i, num_pages)),
+                        dtype=pool.index_k_with_scale_buffer_dtype,
+                        device=pool.device,
+                    )
+                    for i in range(pool.layer_num)
+                ]
 
     def _buffer_shape(self, num_pages: int) -> tuple[int, int]:
         pool = self.pool
         return (
             num_pages,
-            pool.page_size
+            pool.index_page_size
             * (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
         )
 
@@ -72,20 +74,6 @@ class IndexKeyCache:
 
     def get_buffer(self, layer_id: int) -> torch.Tensor:
         return self.get_local_buffer(layer_id)
-
-    def get_k_continuous(self, layer_id: int, seq_len: int, page_indices: torch.Tensor):
-        buf = self.get_buffer(layer_id)
-        return index_buf_accessor.GetK.execute(
-            self.pool, buf, seq_len=seq_len, page_indices=page_indices
-        )
-
-    def get_k_scale_continuous(
-        self, layer_id: int, seq_len: int, page_indices: torch.Tensor
-    ):
-        buf = self.get_buffer(layer_id)
-        return index_buf_accessor.GetS.execute(
-            self.pool, buf, seq_len=seq_len, page_indices=page_indices
-        )
 
     def get_k_and_scale(
         self,

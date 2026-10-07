@@ -47,6 +47,9 @@ class _FakeFusedMoEWithLoRA(_FakeBaseLayerWithLoRA):
 _LORA_LAYERS_STUB = types.ModuleType("sglang.srt.lora.layers")
 _LORA_LAYERS_STUB.BaseLayerWithLoRA = _FakeBaseLayerWithLoRA
 _LORA_LAYERS_STUB.FusedMoEWithLoRA = _FakeFusedMoEWithLoRA
+_LORA_LAYERS_STUB.unwrap_lora_layer = lambda module: (
+    module.base_layer if isinstance(module, _FakeBaseLayerWithLoRA) else module
+)
 _LORA_ADAPTER_STUB = types.ModuleType("sglang.srt.lora.lora")
 _LORA_ADAPTER_STUB.LoRAAdapter = object
 with mock.patch.dict(
@@ -64,6 +67,8 @@ with mock.patch.dict(
         _get_moe_tp_context,
         _moe_runner_keeps_global_expert_ids,
     )
+
+from sglang.srt.runtime_context import get_parallel
 
 
 class _IdentityMoeSlices:
@@ -374,10 +379,6 @@ def _make_fake_base_model(num_experts: int) -> torch.nn.Module:
 
 class TestNumExpertHelpers(unittest.TestCase):
     """`_get_num_experts` / `_get_num_local_experts` / buffer-dim picker."""
-
-    def test_num_experts_read_from_config(self):
-        model = _make_fake_base_model(num_experts=8)
-        self.assertEqual(LoRAMemoryPool._get_num_experts(model), 8)
 
     def test_num_local_experts_no_ep(self):
         pool = _make_pool(
@@ -906,17 +907,19 @@ class TestModuleLevelHelpers(unittest.TestCase):
         # Without a specific flashinfer backend selected, default is False.
         self.assertFalse(_moe_runner_keeps_global_expert_ids())
 
-    def test_real_backend_predicate_matches_dispatcher_and_pool(self):
+    def test_real_backend_predicates_match_supported_id_contracts(self):
         backends = _load_moe_backend_enum()
-        expected_global = {
+        dispatcher_global_ids = {
             backends.FLASHINFER_TRTLLM,
             backends.EXPERIMENTAL_SGL_TRTLLM,
             backends.FLASHINFER_TRTLLM_ROUTED,
             backends.FLASHINFER_CUTLASS,
             backends.FLASHINFER_MXFP4,
             backends.FLASHINFER_CUTEDSL,
+            backends.FLASHINFER_MEGAMOE,
             backends.HPC_OPS,
         }
+        lora_global_ids = dispatcher_global_ids - {backends.FLASHINFER_MEGAMOE}
         config = types.SimpleNamespace(
             num_experts=8,
             num_local_experts=2,
@@ -938,11 +941,11 @@ class TestModuleLevelHelpers(unittest.TestCase):
                 dispatcher = standard_dispatcher(config)
                 self.assertEqual(
                     dispatcher.skip_local_expert_mapping,
-                    backend in expected_global,
+                    backend in dispatcher_global_ids,
                 )
                 self.assertEqual(
                     _moe_runner_keeps_global_expert_ids(),
-                    backend in expected_global,
+                    backend in lora_global_ids,
                 )
 
 
@@ -981,6 +984,21 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
                 return_value=keeps_global,
             ),
             mock.patch.object(LoRAMemoryPool, "init_buffers", lambda self, _m: None),
+            # The pool reads its TP placement from the parallel context; state
+            # a whole layout so the topology check sees a consistent one.
+            get_parallel().override(
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                attn_tp_size=tp_size,
+                attn_tp_rank=tp_rank,
+                attn_dp_size=1,
+                attn_dp_rank=0,
+                attn_cp_size=1,
+                attn_cp_rank=0,
+                moe_tp_size=tp_size,
+                moe_ep_size=1,
+                moe_dp_size=1,
+            ),
         ):
             hf_cfg = types.SimpleNamespace(
                 num_hidden_layers=1,
@@ -994,9 +1012,6 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
                 base_hf_config=hf_cfg,
                 max_loras_per_batch=1,
                 dtype=torch.bfloat16,
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-                attn_tp_size=tp_size,
                 max_lora_rank=8,
                 target_modules={"qkv_proj"},
                 base_model=base_model,
@@ -1125,8 +1140,8 @@ class TestMoeBufferShardsByMoeTp(unittest.TestCase):
         pool.max_loras_per_batch = 2
         pool.tp_size = tp_size
         pool.tp_rank = 0
-        # Without --enable-dp-attention the attention TP group equals the
-        # outer TP group.
+        # Without attention DP the attention TP group equals the outer TP
+        # group.
         pool.attn_tp_size = tp_size
         pool.moe_ep_size = ep_size
         pool.moe_ep_rank = ep_rank
@@ -1231,8 +1246,8 @@ class TestAttnModulesShardByAttnTp(unittest.TestCase):
     """Regression: attention-module LoRA buffers must shard by `attn_tp_size`,
     not the outer `tp_size`.
 
-    Under `--enable-dp-attention` attention layers are built on the attn_tp
-    group (`attn_tp_size = tp_size // dp_size`), so e.g. MLA `o_proj` holds an
+    Under `--attn-dp-size` attention layers are built on the attn_tp group
+    (`attn_tp_size = tp_size // attn_dp_size`), so e.g. MLA `o_proj` holds an
     attn_tp-local input shard. Sizing the LoRA buffer by the outer `tp_size`
     would make it narrower than the slice produced by
     `RowParallelLinearWithLoRA.slice_lora_a_weights` (which slices by the base
@@ -1414,6 +1429,204 @@ class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):
                     "Passing the outer tp_rank slices past "
                     "intermediate_size_per_partition when ep_size < tp_size.",
                 )
+
+
+class _FakeRowLinear(torch.nn.Module):
+    """RowParallelLinear stand-in exposing only the shard bookkeeping the pool reads."""
+
+    def __init__(self, input_size_per_partition: int):
+        super().__init__()
+        self.input_size_per_partition = input_size_per_partition
+
+
+class _FakeColLinear(torch.nn.Module):
+    """MergedColumnParallelLinear stand-in exposing only the shard bookkeeping the pool reads."""
+
+    def __init__(self, output_partition_sizes: tuple[int, ...]):
+        super().__init__()
+        self.output_partition_sizes = list(output_partition_sizes)
+
+
+class TestRowParallelLoraAShardsByBaseLinear(unittest.TestCase):
+    """Regression: dense row-parallel LoRA-A buffers must match the base linear's
+    real input shard.
+
+    Under `--attn-dp-size N --moe-dense-tp-size 1` the dense-MLP and
+    shared-expert `down_proj` are fully replicated (K is the full intermediate
+    size) although the outer `tp_size` is large. Dividing by `tp_size` undersized
+    the buffer and `sgemm_lora_a_fwd` failed its `x.shape[-1] == K` assertion.
+    """
+
+    HIDDEN, INTER, MOE_INTER, TP = 64, 256, 32, 32
+
+    def _pool(self) -> LoRAMemoryPool:
+        pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.max_loras_per_batch = 1
+        pool.tp_size = self.TP
+        pool.tp_rank = 0
+        pool.attn_tp_size = 1
+        pool.moe_ep_size = self.TP
+        pool.moe_ep_rank = 0
+        pool.moe_tp_size = 1
+        pool.moe_tp_rank = 0
+        pool.moe_use_local_expert_ids = False
+        pool._num_experts_local = 1
+        pool.experts_shared_outer_loras = False
+        pool.base_hf_config = types.SimpleNamespace(
+            hidden_size=self.HIDDEN,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            head_dim=self.HIDDEN // 8,
+            intermediate_size=self.INTER,
+            first_k_dense_replace=1,
+            moe_layer_freq=1,
+            moe_intermediate_size=self.MOE_INTER,
+            n_shared_experts=1,
+        )
+        return pool
+
+    @staticmethod
+    def _model(dense_partition: int, shared_partition: int) -> torch.nn.Module:
+        model = torch.nn.Module()
+        model.model = torch.nn.Module()
+        model.model.layers = torch.nn.ModuleList()
+        dense = torch.nn.Module()
+        dense.mlp = torch.nn.Module()
+        dense.mlp.down_proj = _FakeRowLinear(dense_partition)
+        moe = torch.nn.Module()
+        moe.mlp = torch.nn.Module()
+        moe.mlp.shared_experts = torch.nn.Module()
+        moe.mlp.shared_experts.down_proj = _FakeRowLinear(shared_partition)
+        model.model.layers.append(dense)
+        model.model.layers.append(moe)
+        return model
+
+    def test_replicated_down_proj_keeps_the_full_input_dim(self):
+        model = self._model(dense_partition=256, shared_partition=32)
+        pool = self._pool()
+        self.assertEqual(pool.get_lora_A_shape("down_proj", model, 8, 0), (1, 8, 256))
+        self.assertEqual(pool.get_lora_A_shape("down_proj", model, 8, 1), (1, 8, 32))
+
+    def test_sharded_down_proj_uses_the_local_input_width(self):
+        model = self._model(dense_partition=256 // 8, shared_partition=32 // 8)
+        pool = self._pool()
+        self.assertEqual(pool.get_lora_A_shape("down_proj", model, 8, 0), (1, 8, 32))
+        self.assertEqual(pool.get_lora_A_shape("down_proj", model, 8, 1), (1, 8, 4))
+
+    def test_module_width_wins_when_the_config_disagrees(self):
+        model = self._model(dense_partition=256, shared_partition=32)
+        pool = self._pool()
+        pool.base_hf_config.first_k_dense_replace = None
+        self.assertEqual(pool.get_lora_A_shape("down_proj", model, 8, 1), (1, 8, 32))
+        pool.tp_size = 1
+        self.assertEqual(pool.get_lora_A_shape("down_proj", model, 8, 1), (1, 8, 32))
+
+    def test_probe_miss_falls_back_to_tp_size(self):
+        model = torch.nn.Module()
+        pool = self._pool()
+        self.assertEqual(
+            pool.get_lora_A_shape("down_proj", model, 8, 0), (1, 8, 256 // self.TP)
+        )
+
+    def test_attention_o_proj_still_shards_by_attn_tp(self):
+        model = self._model(dense_partition=256, shared_partition=32)
+        pool = self._pool()
+        pool.attn_tp_size = 4
+        self.assertEqual(pool.get_lora_A_shape("o_proj", model, 8, 0), (1, 8, 16))
+
+
+class TestColumnParallelLoraBShardsByBaseLinear(unittest.TestCase):
+    """Regression: dense column-parallel LoRA-B buffers must match the base linear's
+    real output shard (the `gate_up_proj` twin of the row-parallel LoRA-A case).
+    """
+
+    HIDDEN, INTER, MOE_INTER, TP = 64, 256, 32, 32
+
+    def _pool(self) -> LoRAMemoryPool:
+        pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.max_loras_per_batch = 1
+        pool.tp_size = self.TP
+        pool.tp_rank = 0
+        pool.attn_tp_size = 1
+        pool.moe_ep_size = self.TP
+        pool.moe_ep_rank = 0
+        pool.moe_tp_size = 1
+        pool.moe_tp_rank = 0
+        pool.moe_use_local_expert_ids = False
+        pool._num_experts_local = 1
+        pool.experts_shared_outer_loras = False
+        pool.base_hf_config = types.SimpleNamespace(
+            hidden_size=self.HIDDEN,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            head_dim=self.HIDDEN // 8,
+            intermediate_size=self.INTER,
+            first_k_dense_replace=1,
+            moe_layer_freq=1,
+            moe_intermediate_size=self.MOE_INTER,
+            n_shared_experts=1,
+        )
+        return pool
+
+    @staticmethod
+    def _model(
+        dense_partitions: tuple[int, ...], shared_partitions: tuple[int, ...]
+    ) -> torch.nn.Module:
+        model = torch.nn.Module()
+        model.model = torch.nn.Module()
+        model.model.layers = torch.nn.ModuleList()
+        dense = torch.nn.Module()
+        dense.mlp = torch.nn.Module()
+        dense.mlp.gate_up_proj = _FakeColLinear(dense_partitions)
+        moe = torch.nn.Module()
+        moe.mlp = torch.nn.Module()
+        moe.mlp.shared_experts = torch.nn.Module()
+        moe.mlp.shared_experts.gate_up_proj = _FakeColLinear(shared_partitions)
+        model.model.layers.append(dense)
+        model.model.layers.append(moe)
+        return model
+
+    def test_replicated_gate_up_proj_keeps_the_full_output_dim(self):
+        model = self._model(dense_partitions=(256, 256), shared_partitions=(32, 32))
+        pool = self._pool()
+        self.assertEqual(
+            pool.get_lora_B_shape("gate_up_proj", model, 8, 0), (1, 512, 8)
+        )
+        self.assertEqual(pool.get_lora_B_shape("gate_up_proj", model, 8, 1), (1, 64, 8))
+
+    def test_sharded_gate_up_proj_uses_the_local_output_width(self):
+        model = self._model(dense_partitions=(32, 32), shared_partitions=(4, 4))
+        pool = self._pool()
+        self.assertEqual(pool.get_lora_B_shape("gate_up_proj", model, 8, 0), (1, 64, 8))
+        self.assertEqual(pool.get_lora_B_shape("gate_up_proj", model, 8, 1), (1, 8, 8))
+
+    def test_module_width_wins_when_the_config_disagrees(self):
+        model = self._model(dense_partitions=(256, 256), shared_partitions=(32, 32))
+        pool = self._pool()
+        pool.base_hf_config.first_k_dense_replace = None
+        self.assertEqual(pool.get_lora_B_shape("gate_up_proj", model, 8, 1), (1, 64, 8))
+        pool.tp_size = 1
+        self.assertEqual(pool.get_lora_B_shape("gate_up_proj", model, 8, 1), (1, 64, 8))
+
+    def test_only_lora_slices_count_toward_the_output_width(self):
+        model = self._model(dense_partitions=(256, 256, 64), shared_partitions=(32, 32))
+        pool = self._pool()
+        self.assertEqual(
+            pool.get_lora_B_shape("gate_up_proj", model, 8, 0), (1, 512, 8)
+        )
+
+    def test_probe_miss_falls_back_to_tp_size(self):
+        model = torch.nn.Module()
+        pool = self._pool()
+        self.assertEqual(
+            pool.get_lora_B_shape("gate_up_proj", model, 8, 0), (1, 512 // self.TP, 8)
+        )
+
+    def test_attention_qkv_proj_still_shards_by_attn_tp(self):
+        model = self._model(dense_partitions=(256, 256), shared_partitions=(32, 32))
+        pool = self._pool()
+        pool.attn_tp_size = 4
+        self.assertEqual(pool.get_lora_B_shape("qkv_proj", model, 8, 0), (1, 48, 8))
 
 
 if __name__ == "__main__":

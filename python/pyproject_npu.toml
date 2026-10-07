@@ -33,8 +33,6 @@ dependencies = [
   "interegular",
   "IPython",
   "llguidance>=1.7.6,<2.0.0",
-  "memfabric-hybrid==1.1.4",
-  "memfabric-zbal==1.1.2",
   "mistral_common>=1.11.5",
   "modelscope",
   "msgspec",
@@ -54,20 +52,21 @@ dependencies = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
+  "regex",
   "requests",
   "scipy",
-  "sentencepiece",
+  "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
-  "smg-grpc-servicer>=0.5.0",
+  "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
   "tqdm",
-  "transformers==5.12.1",
+  "transformers==5.19.0",
   "uvicorn",
   "uvloop",
   "xxhash",
-  "xgrammar==0.2.1",
+  "xgrammar==0.2.7",
 ]
 
 [project.optional-dependencies]
@@ -106,7 +105,7 @@ test = [
   "peft>=0.18.0",
   "pytest",
   "sentence_transformers",
-  "sgl-eval==0.1.0",
+  "sgl-eval==0.1.2",
   "tabulate",
 ]
 
@@ -127,6 +126,10 @@ sglang = "sglang.cli.main:main"
   "srt/**/*",
   "kernels/**/*"
 ]
+
+[tool.setuptools.exclude-package-data]
+# .claude/skills is a directory symlink; setuptools build_py cannot copy it.
+"sglang.multimodal_gen" = [".claude/*"]
 
 [tool.setuptools.packages.find]
 exclude = [

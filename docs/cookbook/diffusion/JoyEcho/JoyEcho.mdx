@@ -31,13 +31,7 @@ Review the model license on the [JoyAI-Echo Hugging Face page](https://huggingfa
 
 ## 2. SGLang-diffusion Installation
 
-Install SGLang with diffusion dependencies:
-
-```bash
-uv pip install "sglang[diffusion]" --prerelease=allow
-```
-
-For platform-specific setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation). Docker is recommended for Linux GPU deployments; run the commands below inside the container or your installed Python environment.
 
 ## 3. Model Deployment
 
@@ -212,7 +206,7 @@ CUDA_VISIBLE_DEVICES=0,1 sglang generate \
   --config joy_echo_h200.json --prompt "A curious raccoon" \
   --width 640 --height 384 --num-frames 33 --num-inference-steps 8 --seed 42 \
   --num-gpus 2 --ulysses-degree 2 \
-  --performance-mode manual --enable-torch-compile=false --quality lossless \
+  --performance-mode manual --enable-torch-compile=false --quality exact \
   --component-residency=all=resident --warmup-mode request \
   --save-output --perf-dump-path joy_echo_h200.json.perf
 ```
@@ -238,3 +232,9 @@ Use `quality=lossless` for this recipe. High-mode output did not pass the separa
 - For **2-GPU latency**, try **Ulysses SP** (`--num-gpus 2 --ulysses-degree 2`) on both single-shot and multi-shot runs. Use **TP** when you need a different sharding strategy or more than two GPUs.
 - Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for long multi-shot SP sessions.
 - JoyEcho outputs per-shot mp4 files with synchronized audio. There is no built-in two-stage HQ upscaling path like LTX-2.3 HQ.
+
+## 6. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="video" />

@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -33,7 +33,7 @@ NIXL_COMMON = [
     "--mem-fraction-static",
     "0.78",
 ]
-DP_ATTN = ["--dp", "8", "--enable-dp-attention"]
+DP_ATTN = ["--attn-dp-size", "8"]
 ELASTIC_NIXL = [
     "--elastic-ep-backend",
     "nixl",
@@ -77,12 +77,11 @@ class _EPTestBase(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(metrics)
         return metrics
 

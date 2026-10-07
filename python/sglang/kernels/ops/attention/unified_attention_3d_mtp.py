@@ -52,13 +52,24 @@ try:  # gfx950 assembly MTP-verify attention (in-tree .s, assembled at first use
     from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
         mtp_verify_attn_fwd_asm as _mtp_verify_attn_fwd_asm,
     )
+    from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
+        reset_seg_plan_cache as _reset_seg_plan_cache,
+    )
 except ImportError:
     _mtp_verify_attn_fwd_asm = None
     _AsmKernelUnavailable = RuntimeError
+    _reset_seg_plan_cache = None
 
 import os as _os
 
 from sglang.srt.utils import get_hip_version, is_gfx95_supported
+
+
+def reset_verify_attn_plan_cache() -> None:
+    """Drop the per-forward split-KV segment plan of the asm kernel;
+    the attention backend calls this at the start of every forward."""
+    if _reset_seg_plan_cache is not None:
+        _reset_seg_plan_cache()
 
 
 def asm_verify_attn_enabled() -> bool:

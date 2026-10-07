@@ -21,7 +21,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -46,9 +45,8 @@ class Qwen3MoeForCausalLMMTP(Qwen3MoeForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         config.num_hidden_layers = 1
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         self.pre_fc_norm_embedding = RMSNorm(

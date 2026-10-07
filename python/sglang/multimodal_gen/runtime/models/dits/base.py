@@ -34,6 +34,7 @@ class BaseDiT(nn.Module, ABC):
     _fsdp_forward_methods: tuple[str, ...] = ()
     param_names_mapping: dict
     reverse_param_names_mapping: dict
+    lora_param_names_mapping: dict = {}
     hidden_size: int
     num_attention_heads: int
     num_channels_latents: int
