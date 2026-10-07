@@ -49,6 +49,7 @@ class ToleranceConfig:
     load_peak_vram: float = 0.01
     runtime_peak_vram: float = 0.02
     host_anon: float = 0.02
+    load: float | None = None
 
     @classmethod
     def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
@@ -102,6 +103,7 @@ class ToleranceConfig:
                 )
             ),
             host_anon=float(tol_data.get("host_anon", 0.02)),
+            load=float(tol_data["load"]) if "load" in tol_data else None,
         )
 
 
@@ -358,6 +360,27 @@ class DiffusionTestCase:
             and self.sampling_params.realtime_num_chunks is not None
         ):
             raise ValueError(f"{self.id}: request warmup requires non-realtime metrics")
+
+        # A consistency golden records one path, and these were recorded on the
+        # reference one, so the case asks for it by name instead of inheriting
+        # whichever level is the server default. Without this the check would
+        # answer two questions at once -- "did the code regress" and "how far
+        # is the default level from the goldens" -- and spend its whole budget
+        # on the second: the default's own drift already sits at SSIM 0.91
+        # against goldens whose threshold is 0.92. A case that names a level
+        # keeps it; refreshing the goldens onto the default level is what
+        # removes the pin.
+        # Replaces rather than mutates: several cases share one module-level
+        # sampling-params instance.
+        if self.run_consistency_check and "quality" not in self.sampling_params.extras:
+            object.__setattr__(
+                self,
+                "sampling_params",
+                replace(
+                    self.sampling_params,
+                    extras={**self.sampling_params.extras, "quality": "exact"},
+                ),
+            )
 
         has_startup_lora = self.server_args.lora_path is not None
         has_dynamic_lora = self.server_args.dynamic_lora_path is not None
