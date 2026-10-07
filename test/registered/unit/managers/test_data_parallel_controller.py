@@ -439,15 +439,10 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
             ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=room))
             ctl.workers[expected_rank].send_pyobj.assert_called()
 
-    def test_missing_bootstrap_room_is_handed_to_a_scheduler(self):
-        # An exception in the controller SIGQUITs the server; the scheduler 400s it.
+    def test_requires_bootstrap_room(self):
         ctl = _make_controller(num_dp_ranks=4)
-        ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=None))
-        sent = [w for w in ctl.workers if w.send_pyobj.called]
-        self.assertEqual(len(sent), 1)
-        ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=None))
-        sent = [w for w in ctl.workers if w.send_pyobj.called]
-        self.assertEqual(len(sent), 2)
+        with self.assertRaises(AssertionError):
+            ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=None))
 
     def test_routed_dp_rank_bypasses_bootstrap_room(self):
         ctl = _make_controller(num_dp_ranks=4)

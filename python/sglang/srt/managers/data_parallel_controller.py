@@ -876,16 +876,10 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        if req.bootstrap_room is None:
-            # An exception here SIGQUITs the whole server. Any scheduler
-            # rejects a room-less PD request with a 400, as with --dp 1.
-            logger.warning(
-                "Request %s has no bootstrap_room; dispatching it round-robin "
-                "so the scheduler can reject it. Send requests through the router.",
-                req.rid,
-            )
-            self.round_robin_scheduler(req)
-            return
+        assert req.bootstrap_room is not None, (
+            "req.bootstrap_room should not be None. Do not send requests directly to "
+            "prefill or decode instances; send to the router instead."
+        )
         target_rank = req.bootstrap_room % len(self.workers)
         sock_send(self.workers[target_rank], req)
 
