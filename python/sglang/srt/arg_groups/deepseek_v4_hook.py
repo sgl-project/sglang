@@ -138,10 +138,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
                 f"backend for both phases, got prefill={prefill_backend!r}, "
                 f"decode={decode_backend!r}."
             )
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_fp8,
-        )
-
         unsupported = (
             ("multiple nodes", cfg.nnodes > 1),
             (
@@ -153,7 +149,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
                 cfg.enable_decoder_swa_bounded_replay,
             ),
             ("--enable-two-batch-overlap", cfg.enable_two_batch_overlap),
-            ("the fp8 unified_kv pool", is_unified_kv_fp8()),
         )
         for feature, enabled in unsupported:
             if enabled:
