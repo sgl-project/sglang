@@ -4070,9 +4070,14 @@ class ServingChatTestCase(CustomTestCase):
         enter_override(
             self, get_context().override_server_args(enable_cache_report=True)
         )
-        usages = self._collect_continuous_usage(cached_tokens=6)
-        self.assertTrue(usages, "continuous_usage_stats attached no usage")
-        self.assertEqual(usages[0]["prompt_tokens_details"]["cached_tokens"], 6)
+        for cached_tokens in (0, 6):
+            with self.subTest(cached_tokens=cached_tokens):
+                usages = self._collect_continuous_usage(cached_tokens=cached_tokens)
+                self.assertTrue(usages, "continuous_usage_stats attached no usage")
+                self.assertEqual(
+                    usages[0]["prompt_tokens_details"]["cached_tokens"],
+                    cached_tokens,
+                )
 
     def test_continuous_usage_omits_cached_tokens_when_report_disabled(self):
         """With cache reporting off, continuous_usage_stats must not leak cached tokens."""
