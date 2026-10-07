@@ -23,7 +23,6 @@ from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import (
     CPUGPTQConfig,
     GPTQAscendConfig,
-    GPTQConfig,
     GPTQMarlinConfig,
     GPTQXPUConfig,
 )
@@ -75,7 +74,6 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "awq_marlin": AWQMarlinConfig,
     "bitsandbytes": BitsAndBytesConfig,
     "gguf": GGUFConfig,
-    "gptq": GPTQConfig,
     "gptq_marlin": GPTQMarlinConfig,
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
@@ -112,6 +110,18 @@ if is_npu():
             # upstream `Mxfp4Config` OCP-MoE path is only registered on
             # cpu/cuda/hip above, so there is no collision here).
             "mxfp4": Mxfp4W4A4Config,
+        }
+    )
+
+
+if is_cpu():
+    # Plain GPTQ is CUDA-only in name: the kernel is gone, but the Intel AMX
+    # path below is untouched. `get_quantization_config` rejects anything
+    # missing from this registry before it can consult CPU_QUANTIZATION_METHODS,
+    # so the key has to exist here for the CPU path to stay reachable.
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "gptq": CPUGPTQConfig,
         }
     )
 

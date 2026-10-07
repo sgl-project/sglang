@@ -215,6 +215,10 @@ class Qwen3Attention(nn.Module):
             k_item = k[batch_index : batch_index + 1]
             v_item = v[batch_index : batch_index + 1]
 
+            if valid_len == 0:
+                outputs.append(torch.zeros_like(q_item))
+                continue
+
             real_output = self.attn(
                 q_item[:, :valid_len],
                 k_item[:, :valid_len],
@@ -322,6 +326,8 @@ class Qwen3ForCausalLM(TextEncoder):
     - QK-Norm for better training stability
     - FSDP sharding for CPU offload
     """
+
+    _aliases = ["Qwen3Model"]
 
     def __init__(self, config: Qwen3TextConfig) -> None:
         super().__init__(config)

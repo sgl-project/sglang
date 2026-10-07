@@ -8,7 +8,8 @@ export const Nemotron3NanoDeployment = () => {
       items: [
         { id: 'h200', label: 'H200', default: false },
         { id: 'b200', label: 'B200', default: true },
-        { id: 'b300', label: 'B300', default: false }
+        { id: 'b300', label: 'B300', default: false },
+        { id: 'arc_b', label: 'BMG', default: false }
       ]
     },
     modelVariant: {
@@ -74,6 +75,10 @@ export const Nemotron3NanoDeployment = () => {
     cmd += `  --kv-cache-dtype ${kvcache} \\\n`;
     if (hardware === 'b300') {
       cmd += `  --attention-backend flashinfer \\\n`;
+    }
+
+    if (hardware === 'arc_b') {
+      cmd += `  --device xpu \\\n`;
     }
 
     // Add thinking parser and tool call parser if enabled
@@ -153,7 +158,18 @@ export const Nemotron3NanoDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      if (prev.hardware === 'arc_b' && optionName === 'modelVariant' && value !== 'bf16') {
+        return prev;
+      }
+
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'arc_b') {
+        next.modelVariant = 'bf16';
+        next.tp = '4';
+      }
+      return next;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
@@ -327,7 +343,11 @@ export const Nemotron3NanoDeployment = () => {
               ) : (
                 items.map((item) => {
                   const isChecked = values[option.name] === item.id;
-                  const isDisabled = Boolean(item.disabled);
+                  const isArcBModelLocked =
+                    values.hardware === 'arc_b' &&
+                    option.name === 'modelVariant' &&
+                    item.id !== 'bf16';
+                  const isDisabled = Boolean(item.disabled || isArcBModelLocked);
                   return (
                     <label
                       key={item.id}

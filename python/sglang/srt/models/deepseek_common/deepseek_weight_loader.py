@@ -403,8 +403,8 @@ class DeepseekV2WeightLoaderMixin:
                         # Skip loading extra bias for GPTQ models.
                         if name.endswith(".bias") and name not in params_dict:
                             continue
-                        # Skip loading embed_tokens if not first rank in pipeline parallelism
-                        if ".embed_tokens." in name and not self.pp_group.is_first_rank:
+                        # The last PP stage also owns an embedding for its NextN draft.
+                        if ".embed_tokens." in name and name not in params_dict:
                             continue
                         # Skip loading norm if not last rank in pipeline parallelism
                         if ".norm." in name and not self.pp_group.is_last_rank:
@@ -628,7 +628,10 @@ class DeepseekV2WeightLoaderMixin:
                         if hasattr(self_attn.kv_b_proj, "weight_scale")
                         else self_attn.kv_b_proj.weight_scale_inv
                     )
-                    if _is_fp8_fnuz:
+                    is_ue8m0_uint8 = (
+                        weight_scale.format_ue8m0 and weight_scale.dtype == torch.uint8
+                    )
+                    if _is_fp8_fnuz and not is_ue8m0_uint8:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                             weight=w,
                             weight_scale=weight_scale,
@@ -638,7 +641,7 @@ class DeepseekV2WeightLoaderMixin:
                         weight = w
 
                     # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
-                    if weight_scale.format_ue8m0 and weight_scale.dtype == torch.uint8:
+                    if is_ue8m0_uint8:
                         weight_scale = (weight_scale.to(torch.int32) << 23).view(
                             torch.float32
                         )

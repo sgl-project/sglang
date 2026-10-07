@@ -190,6 +190,8 @@ def _layernorm_modulate_kernel(
     FP8_MAX: tl.constexpr,
     STORE_BF16: tl.constexpr,
     QUANTIZE_FP8: tl.constexpr,
+    HAS_SHIFT: tl.constexpr = True,
+    POST_OP: tl.constexpr = "bf16_modulate",
 ):
     pid = tl.program_id(0).to(tl.int64)
     row_offs = pid * ROWS + tl.arange(0, ROWS)
@@ -255,19 +257,37 @@ def _layernorm_modulate_kernel(
             mask=mask,
             other=0.0,
         ).to(tl.float32)
-        y = round_bf16_to_fp32(rstd * (x - mean))
+        y = rstd * (x - mean)
+        if POST_OP == "bf16_modulate":
+            y = round_bf16_to_fp32(y)
         sc = tl.load(
             scale_ptr + batch[:, None] * scale_row_stride + cols[None, :],
             mask=mask,
             other=0.0,
         ).to(tl.float32)
-        sh = tl.load(
-            shift_ptr + batch[:, None] * scale_row_stride + cols[None, :],
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-        one_plus = round_bf16_to_fp32(1.0 + sc)
-        y = round_bf16_to_fp32(y * one_plus) + sh
+        if POST_OP == "bf16_modulate":
+            one_plus = round_bf16_to_fp32(1.0 + sc)
+            y = round_bf16_to_fp32(y * one_plus)
+            if HAS_SHIFT:
+                sh = tl.load(
+                    shift_ptr + batch[:, None] * scale_row_stride + cols[None, :],
+                    mask=mask,
+                    other=0.0,
+                ).to(tl.float32)
+                y = y + sh
+        else:
+            sh = tl.load(
+                shift_ptr + batch[:, None] * scale_row_stride + cols[None, :],
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            if POST_OP == "fp32_affine":
+                # Native FP32 LayerNorm contracts gamma * normalized + beta.
+                y = tl.fma(y, sc, sh)
+            else:
+                # Native FP32 LN, separate FP32 multiply/add, one BF16 store.
+                # The caller disables implicit FMA contraction.
+                y = y * (1.0 + sc) + sh
         if STORE_BF16:
             tl.store(y_ptr + row_base[:, None] + cols[None, :], y, mask=mask)
         if QUANTIZE_FP8:
@@ -388,7 +408,7 @@ def _mod_row_stride(t: torch.Tensor, batch: int, hidden: int) -> int | None:
 
 
 def can_use_fused_layernorm_modulate(
-    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor | None
 ) -> bool:
     if not (
         _is_bf16_cuda(x)
@@ -398,28 +418,93 @@ def can_use_fused_layernorm_modulate(
         and x.shape[-1] % 4 == 0
         and x.shape[-1] <= 8192
         and _is_bf16_cuda(scale)
-        and _is_bf16_cuda(shift)
         and scale.device == x.device
-        and shift.device == x.device
     ):
         return False
     batch, _, hidden = x.shape
     q = _mod_row_stride(scale, batch, hidden)
+    if shift is None:
+        return q is not None
+    if not _is_bf16_cuda(shift) or shift.device != x.device:
+        return False
     v = _mod_row_stride(shift, batch, hidden)
     return q is not None and v is not None and q == v
 
 
 def _fake_ln_modulate(
-    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor | None, eps: float
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
 
+def try_fused_fp32_layernorm_bf16(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float,
+    *,
+    affine: bool = False,
+) -> torch.Tensor | None:
+    """BF16 input/output with native FP32 LN and FP32 affine or adaLN math.
+
+    Replicate ``layer_norm(x.float()).bfloat16()`` with FP32 affine rows,
+    or affine-free FP32 LN followed by ``* (1 + scale) + shift``. Callers
+    must verify the live Torch reduction dispatch before enabling this path.
+    """
+    if (
+        not _is_bf16_cuda(x)
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or x.ndim != 3
+        or x.numel() == 0
+        or not x.is_contiguous()
+        or x.shape[-1] % 4 != 0
+        or x.shape[-1] > 8192
+        or scale.dtype != torch.float32
+        or shift.dtype != torch.float32
+        or scale.device != x.device
+        or shift.device != x.device
+    ):
+        return None
+    batch, tokens, channels = x.shape
+    stride = _mod_row_stride(scale, batch, channels)
+    if stride is None or _mod_row_stride(shift, batch, channels) != stride:
+        return None
+    output = torch.empty_like(x)
+    rows = 2
+    _layernorm_modulate_kernel[(triton.cdiv(batch * tokens, rows),)](
+        output,
+        output,
+        x,
+        scale,
+        shift,
+        scale,
+        tokens,
+        batch * tokens,
+        stride,
+        eps,
+        D=channels,
+        ROWS=rows,
+        FP8_DTYPE=fp8_dtype_to_triton(fp8_dtype),
+        FP8_MIN=fp8_min,
+        FP8_MAX=fp8_max,
+        STORE_BF16=True,
+        QUANTIZE_FP8=False,
+        POST_OP="fp32_affine" if affine else "fp32_modulate",
+        num_warps=4 if channels >= 2048 else 2,
+        enable_fp_fusion=False,
+    )
+    return output
+
+
 def fused_layernorm_modulate_raw(
-    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor | None, eps: float
 ) -> torch.Tensor:
     """``LN(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)``, bit-exact
     vs the eager aten chain (LayerNorm without affine).
+
+    With ``shift=None``, omit the addition, preserving signed zeros in
+    scale-only modulation.
 
     Direct-call variant without the ``torch.ops`` dispatch (which costs tens
     of microseconds per call); use it on CPU-launch-bound eager hot paths
@@ -449,6 +534,7 @@ def fused_layernorm_modulate_raw(
             FP8_MAX=fp8_max,
             STORE_BF16=True,
             QUANTIZE_FP8=False,
+            HAS_SHIFT=shift is not None,
             # H200-tuned: 38.5us at (1, 4096, 4096) vs the 121.8us eager
             # chain, 14.3us at Sana's (2, 1024, 2240) vs 43.1us.  ROWS=1 +
             # 4 warps triggers pathological Triton layout conversions in

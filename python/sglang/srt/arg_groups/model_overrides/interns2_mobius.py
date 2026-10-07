@@ -1,7 +1,4 @@
-"""Config-time override declarations for interns2_mobius.
-
-Architectures: InternS2MobiusForConditionalGeneration.
-"""
+"""Config-time override declarations for interns2_mobius."""
 
 from typing import Any
 

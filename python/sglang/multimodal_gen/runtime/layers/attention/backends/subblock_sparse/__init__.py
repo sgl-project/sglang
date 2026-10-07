@@ -6,9 +6,9 @@ Originally vendored from the standalone SubBlock repository; ``router.py`` and
 
 ``router.py`` scores every (query block, key block) pair from sub-block-pooled
 Q/K and turns the scores into a ``q2k_block_index`` consumed by SGLang's SM90
-CuTe-DSL block-sparse FlashAttention or FlashInfer's architecture-specific
-SM100/SM120 blk64 kernels (bf16, head_dim 128). The estimator and the
-measurements behind its defaults are documented there.
+CuTe-DSL block-sparse FlashAttention, the native SM90 Sage FP8 adapter, or
+FlashInfer's architecture-specific SM100/SM120 blk64 kernels. The estimator and
+the measurements behind its defaults are documented there.
 """
 
 from .router import (

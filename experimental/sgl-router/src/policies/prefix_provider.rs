@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::ExternalPrefixSignal;
-use crate::policies::kv_events::{
+use crate::state::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
 };
 use sgl_kv_indexer::{PrefixMatch, PrefixOutcome};

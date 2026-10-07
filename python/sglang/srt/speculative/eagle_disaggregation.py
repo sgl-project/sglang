@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.disaggregation.utils import get_dsa_seed_metadata_dim
 from sglang.srt.layers.attention.dsa.utils import (
     should_remap_pd_dsa_seed_to_local_slots,
 )
@@ -15,6 +16,10 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+
+def _requires_dsa_seed_for_cuda_graph(hf_config, topk: int) -> bool:
+    return topk == 1 and get_dsa_seed_metadata_dim(hf_config) > 0
 
 
 def build_eagle_disagg_draft_input(
@@ -87,12 +92,20 @@ def build_eagle_disagg_draft_input(
         if torch.any(torch.all(dsa_topk_indices < 0, dim=1)).item():
             dsa_topk_indices = None
 
+    requires_dsa_seed_for_cuda_graph = _requires_dsa_seed_for_cuda_graph(
+        batch.model_config.hf_config,
+        spec.speculative_eagle_topk,
+    )
+
     spec_info = EagleDraftInput(
         topk_p=topk_p,
         topk_index=topk_index,
         hidden_states=hidden_states,
         bonus_tokens=last_tokens_tensor,
         dsa_topk_indices=dsa_topk_indices,
+        cuda_graph_compatible=not (
+            requires_dsa_seed_for_cuda_graph and dsa_topk_indices is None
+        ),
     )
     spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
 

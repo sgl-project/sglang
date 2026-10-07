@@ -1,6 +1,6 @@
 """H200 per-commit coverage for the GLM-5.3-Flash serving recipes.
 
-Runs the Low Latency and High Throughput TP8/EP8 recipes on eight H200 GPUs.
+Runs the Low Latency and High Throughput TP8 recipes on eight H200 GPUs.
 Both recipes must retain GSM8K accuracy; the Low Latency recipe also checks
 EAGLE speculative acceptance and single-request decode performance.
 """
@@ -28,8 +28,6 @@ GPU_IDLE_TIMEOUT = 120
 COMMON_SERVER_ARGS = [
     "--tp-size",
     "8",
-    "--ep-size",
-    "8",
     "--dsa-prefill-backend",
     "tilelang",
     "--dsa-decode-backend",
@@ -39,9 +37,9 @@ COMMON_SERVER_ARGS = [
     "--moe-runner-backend",
     "deep_gemm",
     "--reasoning-parser",
-    "glm45",
+    "auto",
     "--tool-call-parser",
-    "glm47",
+    "auto",
 ]
 
 
@@ -94,7 +92,6 @@ class TestGLM53FlashH200LowLatency(
         "1",
         "--speculative-num-draft-tokens",
         "6",
-        "--speculative-adaptive",
     ]
 
 
@@ -110,8 +107,6 @@ class TestGLM53FlashH200HighThroughput(
         "--enable-dp-attention",
         "--dp-size",
         "8",
-        "--moe-a2a-backend",
-        "deepep",
     ]
 
 

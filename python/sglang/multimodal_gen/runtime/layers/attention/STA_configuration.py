@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from sglang.multimodal_gen.utils import dict_to_3d_list
+from sglang.multimodal_gen.runtime.layers.attention.mask_strategy import dict_to_3d_list
 
 
 def configure_sta(

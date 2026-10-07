@@ -23,7 +23,7 @@ class TestCalcRelDiff:
     def test_zero_vectors(self) -> None:
         z: torch.Tensor = torch.zeros(5)
         result = _calc_rel_diff(z, z)
-        assert not torch.isnan(result) or True  # should not crash
+        assert not torch.isnan(result)
 
 
 class TestArgmaxCoord:

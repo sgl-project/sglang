@@ -18,16 +18,11 @@ on:
         required: false
         type: string
         default: 'all'
-      image_a2:
-        description: 'The a2 running docker image of the test task.'
-        required: false
-        type: string
-        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-910b'
       image_a3:
         description: 'The a3 running docker image of the test task. Must be an image with sglang preinstalled (e.g. lmsysorg/sglang:*a3*).'
         required: false
         type: string
-        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3'
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3'
 
 concurrency:
   group: full-test-npu-${{ inputs.ref || github.ref }}
@@ -39,7 +34,6 @@ jobs:
     outputs:
       ref: ${{ steps.set-vars.outputs.ref }}
       job_filter: ${{ steps.set-vars.outputs.job_filter }}
-      image_a2: ${{ steps.set-vars.outputs.image_a2 }}
       image_a3: ${{ steps.set-vars.outputs.image_a3 }}
     steps:
       # When triggered by PR, no inputs parameters are used. The latest community code is tested by default.
@@ -58,14 +52,8 @@ jobs:
             echo "job_filter=${{ inputs.job_filter }}" >> $GITHUB_OUTPUT
           fi
 
-          if [ -z "${{ inputs.image_a2 }}" ]; then
-            echo "image_a2=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-910b" >> $GITHUB_OUTPUT
-          else
-            echo "image_a2=${{ inputs.image_a2 }}" >> $GITHUB_OUTPUT
-          fi
-
           if [ -z "${{ inputs.image_a3 }}" ]; then
-            echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3" >> $GITHUB_OUTPUT
+            echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3" >> $GITHUB_OUTPUT
           else
             echo "image_a3=${{ inputs.image_a3 }}" >> $GITHUB_OUTPUT
           fi
@@ -80,20 +68,6 @@ jobs:
       job_filter: ${{ needs.set-image-config.outputs.job_filter }}
       image_a3: ${{ needs.set-image-config.outputs.image_a3 }}
     secrets: inherit
-
-  full-4-npu-a2:
-    name: full-4-npu-a2
-    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a2-4
-      test_type: 'perf'
-      test_suite: full-4-npu-a2
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a2 }}
-      device_type_for_deps: '910b'
 
   full-1-npu-a3:
     name: full-1-npu-a3
@@ -317,7 +291,6 @@ jobs:
     if: github.repository == 'sgl-project/sglang' && always()
     needs:
       - nighly-test-npu
-      - full-4-npu-a2
       - full-1-npu-a3
       - full-2-npu-a3
       - full-4-npu-a3

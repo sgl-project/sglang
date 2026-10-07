@@ -14,10 +14,10 @@ see [SGLang installation with NPUs support](/docs/hardware-platforms/ascend-npus
 
 ### Supported Devices
 
-- Atlas 800I A2 inference series (Atlas 800I A2)
-- Atlas 800I A3 inference series (Atlas 800I A3)
+- Ascend A2 Series Products
+- Ascend A3 Series Products
 
-To identify your device, run `npu-smi info -l`: A3 reports `Chip Count: 2` per NPU, while A2 reports `Chip Count: 1` per NPU.
+To identify your device, run `npu-smi info -l`: A3 Series reports `Chip Count: 2` per NPU, while A2 Series reports `Chip Count: 1` per NPU.
 For hardware details, see the [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
 ### Docker
@@ -48,7 +48,7 @@ If you have already downloaded model weights to a local path (e.g., `/path/to/mo
 adding `--volume /path/to/model:/path/to/model` to the `docker run` command below.
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="Ascend A3 Series">
 
 ```shell Command
 # Choose one (uncomment the line you want):
@@ -73,7 +73,7 @@ docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
 ```
 
   </Tab>
-  <Tab title="Atlas 800I A2">
+  <Tab title="Ascend A2 Series">
 
 ```shell Command
 # Choose one (uncomment the line you want):

@@ -685,10 +685,12 @@ Max ITL (ms):                            176.78
 #### 5.2.1 GSM8K Benchmark
 
 ```bash Command
-python -m sglang.test.few_shot_gsm8k \
-  --num-questions 200 \
-  --port 8000
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:8000/v1 \
+  --num-examples 200
 ```
+
+The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
 
 **Results:**
 

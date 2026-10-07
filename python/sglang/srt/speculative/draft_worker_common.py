@@ -9,14 +9,13 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import attention_backends, get_spec
+from sglang.srt.runtime_context import attention_backends, get_platform, get_spec
 from sglang.srt.server_args import DRAFT_ATTENTION_BACKEND_CHOICES, ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -36,13 +35,17 @@ def _resolve_draft_attention_backend_fallback(*, algo_label: str) -> str:
     otherwise the process's prefill backend. Both are resolution's answers, so
     they come from the bags.
     """
+    # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
+    platform_fallback = (
+        "triton" if (get_platform().is_xpu or torch.version.hip) else "flashinfer"
+    )
     draft_backend = get_spec().speculative_draft_attention_backend
     if draft_backend is None:
         draft_backend, _ = attention_backends()
     if draft_backend is None:
-        return "triton" if torch.version.hip else "flashinfer"
+        return platform_fallback
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
-        fallback = "triton" if torch.version.hip else "flashinfer"
+        fallback = platform_fallback
         logger.warning(
             "%s draft worker only supports attention_backend in %s for now, "
             "but got %r. Falling back to '%s'.",
@@ -59,12 +62,12 @@ def build_draft_tp_worker(
     *,
     server_args: ServerArgs,
     gpu_id: int,
-    ps: ParallelState,
     nccl_port: int,
     target_model_config: ModelConfig,
     algo_label: str,
     attention_backend_override: Optional[str] = None,
     draft_worker_cls: type[TpModelWorker] = TpModelWorker,
+    random_seed: Optional[int] = None,
 ) -> DraftWorkerBundle:
     # An override names a draft-specific backend the caller has already
     # validated (e.g. a self-drafting architecture); it skips the generic
@@ -83,9 +86,9 @@ def build_draft_tp_worker(
         draft_worker = draft_worker_cls(
             server_args=server_args,
             gpu_id=gpu_id,
-            ps=ps,
             nccl_port=nccl_port,
             is_draft_worker=True,
+            random_seed=random_seed,
             # The draft runs at absolute target positions.
             context_length=target_model_config.context_len,
             draft_attention_backend=draft_backend,

@@ -396,7 +396,6 @@ class SGLangBackend:
         self.compile_config = config
 
     def configure_post_pass(self):
-        self.post_grad_pass_manager.configure()
         self.inductor_config["post_grad_custom_post_pass"] = self.post_grad_pass_manager
 
     def __call__(self, graph: fx.GraphModule, example_inputs) -> Callable:

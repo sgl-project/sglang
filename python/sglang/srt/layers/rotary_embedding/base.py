@@ -94,6 +94,7 @@ class RotaryEmbedding(BaseFusedOp):
         base: int,
         is_neox_style: bool,
         dtype: torch.dtype,
+        position_start: int = 0,
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -102,6 +103,7 @@ class RotaryEmbedding(BaseFusedOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
+        self.position_start = position_start
         self._force_native = (
             publish_role() is not None
             and get_exec().deterministic.rl_on_policy_target is not None
@@ -181,7 +183,11 @@ class RotaryEmbedding(BaseFusedOp):
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        t = torch.arange(
+            self.position_start,
+            self.position_start + self.max_position_embeddings,
+            dtype=torch.float,
+        )
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
@@ -205,8 +211,9 @@ class RotaryEmbedding(BaseFusedOp):
         inv_freq = self._compute_inv_freq(self.base).to(device=device)
 
         # Incremental computation for new positions only
-        start = cur_len
-        t_new = torch.arange(start, new_len, dtype=inv_freq.dtype, device=device)
+        start = self.position_start + cur_len
+        end = self.position_start + new_len
+        t_new = torch.arange(start, end, dtype=inv_freq.dtype, device=device)
         if t_new.numel() == 0:
             return
 

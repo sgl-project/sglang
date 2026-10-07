@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.models.fsdp import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.models.dits import sana_wm_parity as parity_probe
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 
 # Re-exported for back-compat: callers import these names from this module path.
@@ -77,9 +78,6 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (  # no
     _UpstreamMlp,
     compute_chunk_plucker,
     process_camera_conditions_ucpe,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
-    parity_probe,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 

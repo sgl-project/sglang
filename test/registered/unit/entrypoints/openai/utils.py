@@ -42,12 +42,17 @@ if torch is not None:
 
 
 class MockTokenizerManager:
+    # The model id the cases address; /v1/responses validates ``model`` against it.
+    SERVED_MODEL_NAME = "x"
+
     def __init__(self, *, is_multimodal: bool = False):
         self.model_config = Mock(is_multimodal=is_multimodal, context_len=4096)
         self.model_config.get_default_sampling_params.return_value = {}
         self.model_config.hf_config = Mock(
             model_type="llama", architectures=["LlamaForCausalLM"]
         )
+        self.served_model_name = self.SERVED_MODEL_NAME
+        self.lora_registry = None
         self.server_args = Mock(
             enable_cache_report=False,
             reasoning_parser=None,
@@ -55,6 +60,7 @@ class MockTokenizerManager:
             tokenizer_metrics_allowed_custom_labels=None,
             tool_call_parser=None,
             incremental_streaming_output=False,
+            grammar_backend="xgrammar",
         )
         # Stands in for the context's resolved leaves: an override replaces the
         # field's one live value, the seed stays on server_args.

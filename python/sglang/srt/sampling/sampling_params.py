@@ -111,6 +111,29 @@ def set_request_reasoning_end_token_ids(
     sampling_params["custom_params"] = custom_params
 
 
+# Private transport, like the reasoning terminator above: the request's grammar
+# also describes the reasoning, so it applies from the first output token.
+REQUEST_REASONING_IN_GRAMMAR_KEY = "__sglang_reasoning_in_grammar"
+
+
+def get_request_reasoning_in_grammar(
+    custom_params: Optional[Dict[str, CustomParamValue]],
+) -> bool:
+    return (
+        isinstance(custom_params, dict)
+        and custom_params.get(REQUEST_REASONING_IN_GRAMMAR_KEY) is True
+    )
+
+
+def set_request_reasoning_in_grammar(sampling_params: Dict, enabled: bool) -> None:
+    """Mark a request whose grammar also describes the reasoning."""
+    if not enabled:
+        return
+    custom_params = dict(sampling_params.get("custom_params") or {})
+    custom_params[REQUEST_REASONING_IN_GRAMMAR_KEY] = True
+    sampling_params["custom_params"] = custom_params
+
+
 class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     """
     The sampling parameters.
@@ -159,6 +182,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     stop_str_max_len: int = 0  # set by normalize()
     stop_regex_max_len: int = 0  # set by normalize()
     is_normalized: bool = False  # set by normalize()
+    ebnf_full_assistant: bool = False
 
     def __post_init__(self):
         # For non-optional params, treat None as "use default" so that callers
@@ -270,6 +294,17 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
                     )
+        if self.sampling_seed is not None:
+            if not isinstance(self.sampling_seed, int):
+                raise ValueError(
+                    "sampling_seed must be an integer, got "
+                    f"{type(self.sampling_seed).__name__}."
+                )
+            if not -(2**63) <= self.sampling_seed <= 2**63 - 1:
+                raise ValueError(
+                    "sampling_seed must be in [-2**63, 2**63 - 1], got "
+                    f"{self.sampling_seed}."
+                )
 
         get_request_reasoning_end_token_ids(
             self.custom_params,

@@ -1,6 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
 
+from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline, Req
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -26,6 +28,11 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
 
 class ZImagePipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "ZImagePipeline"
+
+    # Used when the checkpoint is a single safetensors file with no
+    # model_index.json to derive these from.
+    pipeline_config_cls = ZImagePipelineConfig
+    sampling_params_cls = ZImageSamplingParams
 
     _required_config_modules = [
         "text_encoder",

@@ -314,6 +314,9 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
     accuracy = 0.1
+    # Per-case evalscope accuracy retry count. None uses the dataset default
+    # (get_max_retries); set to 1 to fail fast on first measurement.
+    max_retries = None
     test_type = "accuracy"
 
     @classmethod
@@ -478,7 +481,11 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
         port = parsed_url.port
         if self.benchmark_tool == EVALSCOPE:
             model_name = os.path.basename(self.model)
-            max_retries = get_max_retries(self.datasets)
+            max_retries = (
+                self.max_retries
+                if self.max_retries is not None
+                else get_max_retries(self.datasets)
+            )
             best_metrics = None
             for attempt in range(max_retries):
                 metrics = run_evalscope(

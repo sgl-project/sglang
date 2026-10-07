@@ -93,7 +93,7 @@ class TestSWAPoolPipelineLayerOffset(CustomTestCase):
         pool = _stage_pool(swa_ids=[2], full_ids=[3])
         self.assertEqual(pool.start_layer, 2)
 
-        full, swa = _swa_layer_mappings(pool, pool.start_layer)
+        full, swa = _swa_layer_mappings(pool)
         self.assertEqual(swa, {0: 0})
         self.assertEqual(full, {1: 0})
 
@@ -106,7 +106,7 @@ class TestSWAPoolPipelineLayerOffset(CustomTestCase):
     def test_first_stage_is_unchanged(self):
         pool = _stage_pool(swa_ids=[0], full_ids=[1])
         self.assertEqual(pool.start_layer, 0)
-        full, swa = _swa_layer_mappings(pool, pool.start_layer)
+        full, swa = _swa_layer_mappings(pool)
         self.assertEqual(swa, {0: 0})
         self.assertEqual(full, {1: 0})
 

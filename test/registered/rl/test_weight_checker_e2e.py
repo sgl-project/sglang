@@ -80,7 +80,8 @@ class TestWeightCheckerE2E(CustomTestCase):
     def _update_weights(
         self, named_tensors: List[Tuple[str, torch.Tensor]]
     ) -> requests.Response:
-        return requests.post(
+        requests.post(f"{self.url}/begin_weight_update", json={}, timeout=120)
+        resp = requests.post(
             f"{self.url}/update_weights_from_tensor",
             json={
                 "serialized_named_tensors": [
@@ -90,6 +91,8 @@ class TestWeightCheckerE2E(CustomTestCase):
             },
             timeout=120,
         )
+        requests.post(f"{self.url}/end_weight_update", json={}, timeout=120)
+        return resp
 
     def test_a_snapshot_then_compare_unchanged_succeeds(self):
         resp = self._post("snapshot")
@@ -160,7 +163,10 @@ class TestWeightCheckerE2E(CustomTestCase):
         self.assertIn("checksums", first)
         self.assertIn("parallelism_info", first)
 
-        info = first["parallelism_info"]
+        infos = first["parallelism_info"]
+        # one entry per runner; without speculative decoding that is the target
+        self.assertEqual([info["role"] for info in infos], ["target"])
+        info = infos[0]
         for key in (
             "tp_rank",
             "tp_size",

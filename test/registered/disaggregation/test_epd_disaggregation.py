@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import grpc
 import openai
@@ -187,7 +188,7 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
             "--port",
             cls.prefill_port,
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(1, 2))
         prefill_env = os.environ.copy()
         if cls.server_type == "grpc":
             prefill_env["SGLANG_ENCODER_MM_RECEIVER_MODE"] = "grpc"
@@ -214,7 +215,7 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
             "--port",
             cls.decode_port,
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(2, 3))
         cls.process_decode = popen_launch_server(
             cls.model,
             base_url=cls.decode_url,
@@ -703,7 +704,7 @@ class TestEPDDisaggregationOneEncoder(MMMUMixin, PDDisaggregationServerBase):
             "--port",
             cls.prefill_port,
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(1, 2))
         cls.process_prefill = popen_launch_server(
             cls.model,
             base_url=cls.prefill_url,
@@ -727,7 +728,7 @@ class TestEPDDisaggregationOneEncoder(MMMUMixin, PDDisaggregationServerBase):
             "--port",
             cls.decode_port,
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(2, 3))
         cls.process_decode = popen_launch_server(
             cls.model,
             base_url=cls.decode_url,
@@ -824,7 +825,7 @@ class TestEPDDisaggregationKimiVL(PDDisaggregationServerBase):
             cls.prefill_port,
             *cls.model_args,
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(1, 2))
         cls.process_prefill = popen_launch_server(
             cls.model,
             base_url=cls.prefill_url,
@@ -848,7 +849,7 @@ class TestEPDDisaggregationKimiVL(PDDisaggregationServerBase):
             cls.decode_port,
             *cls.model_args,
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(2, 3))
         cls.process_decode = popen_launch_server(
             cls.model,
             base_url=cls.decode_url,
@@ -1219,7 +1220,7 @@ class TestEPDDisaggregationMultiEncoders(MMMUMixin, PDDisaggregationServerBase):
             "--port",
             cls.prefill_port,
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(2, 3))
         cls.process_prefill = popen_launch_server(
             cls.model,
             base_url=cls.prefill_url,
@@ -1243,7 +1244,7 @@ class TestEPDDisaggregationMultiEncoders(MMMUMixin, PDDisaggregationServerBase):
             "--port",
             cls.decode_port,
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(3, 4))
         cls.process_decode = popen_launch_server(
             cls.model,
             base_url=cls.decode_url,
@@ -1352,7 +1353,7 @@ class TestEPDDisaggregationGrpcEncoderMMMU(MMMUMixin, PDDisaggregationServerBase
             "--port",
             cls.prefill_port,
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(1, 2))
         prefill_env = os.environ.copy()
         prefill_env["SGLANG_ENCODER_MM_RECEIVER_MODE"] = "grpc"
         cls.process_prefill = popen_launch_server(
@@ -1378,7 +1379,7 @@ class TestEPDDisaggregationGrpcEncoderMMMU(MMMUMixin, PDDisaggregationServerBase
             "--port",
             cls.decode_port,
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(2, 3))
         cls.process_decode = popen_launch_server(
             cls.model,
             base_url=cls.decode_url,
@@ -1522,23 +1523,28 @@ class TestEPDDisaggregationGrpcEncoderOnly(PDDisaggregationServerBase):
         image_path = os.path.abspath("examples/assets/example_image.png")
 
         try:
-            stub.SchedulerReceiveUrl(
-                sglang_encoder_pb2.SchedulerReceiveUrlRequest(
-                    req_id=req_id,
-                    receive_url=f"{self.base_host}:{recv_port}",
-                    receive_count=1,
-                ),
-                timeout=60,
-            )
-            stub.Encode(
-                sglang_encoder_pb2.EncodeRequest(
-                    mm_items=[image_path],
-                    req_id=req_id,
-                    num_parts=1,
-                    part_idx=0,
-                ),
-                timeout=300,
-            )
+            # A scheduler registers concurrently with Encode, never before it:
+            # the request state only exists once Encode dispatches.
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                registration = pool.submit(
+                    stub.SchedulerReceiveUrl,
+                    sglang_encoder_pb2.SchedulerReceiveUrlRequest(
+                        req_id=req_id,
+                        receive_url=f"{self.base_host}:{recv_port}",
+                        receive_count=1,
+                    ),
+                    timeout=60,
+                )
+                stub.Encode(
+                    sglang_encoder_pb2.EncodeRequest(
+                        mm_items=[image_path],
+                        req_id=req_id,
+                        num_parts=1,
+                        part_idx=0,
+                    ),
+                    timeout=300,
+                )
+                registration.result(timeout=60)
 
             poller = zmq.Poller()
             poller.register(recv_socket, zmq.POLLIN)
@@ -1642,7 +1648,7 @@ class TestEPDDisaggregationMooncake(MMMUMixin, PDDisaggregationServerBase):
             "--port",
             cls.prefill_port,
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(1, 2))
         cls.process_prefill = popen_launch_server(
             cls.model,
             base_url=cls.prefill_url,
@@ -1666,7 +1672,7 @@ class TestEPDDisaggregationMooncake(MMMUMixin, PDDisaggregationServerBase):
             "--port",
             cls.decode_port,
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(2, 3))
         cls.process_decode = popen_launch_server(
             cls.model,
             base_url=cls.decode_url,

@@ -86,6 +86,14 @@ def load_jit(
             if flag not in ("--use_fast_math", "-use_fast_math")
         ]
 
+    if envs.SGLANG_JIT_LOG_RESOURCE_USAGE.get():
+        # nvcc reports through ptxas; hipcc through a clang remark pass.
+        extra_cuda_cflags = list(extra_cuda_cflags or []) + (
+            ["-Rpass-analysis=kernel-resource-usage"]
+            if is_hip_runtime()
+            else ["-Xptxas=-v"]
+        )
+
     includes = list(DEFAULT_INCLUDE) + (extra_include_paths or [])
     for dep in sorted(set(extra_dependencies or [])):
         if dep not in REGISTERED_DEPENDENCIES:
@@ -113,7 +121,7 @@ def load_jit(
     build_key = cache.compute_build_key(spec, build_file=build_file)
     scope = cache.build_key_dir(module_name=spec.module_name, build_key=build_key)
 
-    prebuilt = cache.find_prebuilt(scope=scope, module_name=spec.module_name)
+    prebuilt = _find_prebuilt(spec=spec, scope=scope)
     if prebuilt is not None:
         try:
             return _load(prebuilt)
@@ -141,7 +149,7 @@ def load_jit(
         # published exactly what we were about to build. This is what turns N
         # tensor-parallel ranks starting together into one compile plus N-1
         # cache hits instead of N identical compiles.
-        prebuilt = cache.find_prebuilt(scope=scope, module_name=spec.module_name)
+        prebuilt = _find_prebuilt(spec=spec, scope=scope)
         if prebuilt is not None:
             try:
                 return _load(prebuilt)
@@ -180,6 +188,18 @@ def load_jit(
             return module
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+
+
+def _find_prebuilt(*, spec: BuildSpec, scope: pathlib.Path) -> pathlib.Path | None:
+    """The cached build to reuse, or None when there is nothing to reuse.
+
+    Returns None unconditionally under `SGLANG_JIT_FORCE_RECOMPILE`, which is
+    what makes the compiler run again. Both lookups go through here, so the flag
+    cannot take effect on the fast path and not on the one behind the lock.
+    """
+    if envs.SGLANG_JIT_FORCE_RECOMPILE.get():
+        return None
+    return cache.find_prebuilt(scope=scope, module_name=spec.module_name)
 
 
 @contextlib.contextmanager

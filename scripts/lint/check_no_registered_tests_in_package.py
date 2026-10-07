@@ -4,11 +4,12 @@ Pre-commit hook: reject CI-registered tests that live inside the importable
 `sglang` package (python/sglang/).
 
 Registered tests and benchmarks must live under test/registered/ (e.g.
-test/registered/jit/ for JIT kernel tests and test/registered/jit/benchmark/
-for JIT kernel benchmarks) so they are not shipped in the wheel and are
-collected by run_suite.py's registered glob. A registered file placed inside
-the package would be shipped to users AND silently dropped by run_suite.py
-(which no longer globs the package) -- it would never run in CI. This guard
+test/registered/kernels/ops/ for kernel tests and
+test/registered/kernels/benchmark/ for kernel benchmarks) so they are not
+shipped in the wheel and are collected by run_suite.py's registered glob. A
+registered file placed inside the package would be shipped to users AND
+silently dropped by run_suite.py (which no longer globs the package) -- it
+would never run in CI. This guard
 turns that silent skip into a hard failure.
 
 Reuses ut_parse_one_file() from ci_register.py (AST-based) so the registry
@@ -65,8 +66,8 @@ def main() -> int:
         )
         print(
             "  Registered tests and benchmarks must live under test/registered/\n"
-            "  (e.g. test/registered/jit/ for JIT kernel tests and\n"
-            "  test/registered/jit/benchmark/ for JIT kernel benchmarks) so they\n"
+            "  (e.g. test/registered/kernels/ops/ for kernel tests and\n"
+            "  test/registered/kernels/benchmark/ for kernel benchmarks) so they\n"
             "  are not shipped in the wheel and are collected by run_suite.py.\n"
         )
         for f in offenders:

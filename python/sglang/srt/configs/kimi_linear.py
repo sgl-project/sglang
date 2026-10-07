@@ -9,6 +9,8 @@ from sglang.srt.runtime_context import get_parallel
 
 class KimiLinearConfig(PretrainedConfig):
     model_type = "kimi_linear"
+    # Shared MoE utilities use the abbreviated name; checkpoints keep the original.
+    attribute_map = {"num_experts_per_tok": "num_experts_per_token"}
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(

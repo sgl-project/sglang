@@ -12,11 +12,13 @@ Out-of-tree platforms register via setuptools entry_points under the
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Type
+from typing import TYPE_CHECKING, Any, Callable, Optional, Type
 
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 # Re-export for convenience
@@ -56,9 +58,17 @@ class SRTPlatform(DeviceMixin):
         """Return the default attention backend name for this platform."""
         raise NotImplementedError
 
+    def get_default_speculative_draft_attention_backend(self, algorithm: str) -> str:
+        """Return the default draft attention backend for an algorithm."""
+        raise NotImplementedError
+
     def get_graph_runner_cls(self) -> type:
         """Return the graph runner class for this platform."""
         raise NotImplementedError
+
+    def get_full_graph_backend_cls(self) -> type[Any]:
+        """Return the full device-graph backend class for this platform."""
+        return None
 
     def get_mha_kv_pool_cls(self) -> type:
         """Return the MHA KV pool class for this platform."""
@@ -87,6 +97,12 @@ class SRTPlatform(DeviceMixin):
         """Return the piecewise compilation backend class for this platform."""
         raise NotImplementedError
 
+    def get_speculative_cache_locs_fn(
+        self,
+    ) -> Optional[Callable[..., torch.Tensor]]:
+        """Return a platform implementation for speculative KV-cache locations."""
+        return None
+
     def get_quantization_config(
         self, quantization: str
     ) -> Optional[Type[QuantizationConfig]]:
@@ -101,6 +117,16 @@ class SRTPlatform(DeviceMixin):
 
     def supports_fp8(self) -> bool:
         """Whether this platform supports FP8 quantization."""
+        return False
+
+    def supports_speculative_algorithm(self, algorithm: str) -> bool:
+        """Whether this platform supports the named speculative algorithm."""
+        return False
+
+    def supports_speculative_draft_attention_backend(
+        self, algorithm: str, backend: str
+    ) -> bool:
+        """Whether this platform supports a draft backend for an algorithm."""
         return False
 
     def support_cuda_graph(self) -> bool:

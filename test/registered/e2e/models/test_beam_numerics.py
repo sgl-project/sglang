@@ -2,11 +2,14 @@
 
 Each case guards a precision decision of the serving policy: the BF16 head
 projection ahead of FP32 output processing, FP32 rotary and fused-activation
-intermediates under both eager and full-graph Inductor execution, the FP32
-routing coefficients and runner-side routed scale for a one-token compiled MoE,
-and the batch-one compiled decode path against the eager oracle.
+intermediates under both eager and full-graph Inductor execution, the fused
+Q/K norm and rotation against the unfused rounding up to 1M positions, the
+single-rounding CUDA SSMax, the FP32 routing coefficients and runner-side
+routed scale for a one-token compiled MoE, and the batch-one compiled decode
+path against the eager oracle.
 """
 
+import copy
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -17,11 +20,24 @@ import torch.nn.functional as F
 from torch._inductor import config as inductor_config
 
 import sglang as sgl
-from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.fused_op import (
+    BaseFusedOp,
+    get_fused_op_backend,
+    set_fused_op_backend,
+)
+from sglang.kernels.ops.attention.fused_qknorm_rope import fused_qk_norm_rope
+from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.models.beam import BeamAttention, BeamMLP, BeamMoE
+from sglang.srt.models.beam import (
+    BeamAttention,
+    BeamMLP,
+    BeamMoE,
+    apply_ssmax,
+    compute_ssmax_scale,
+)
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import (
@@ -197,6 +213,198 @@ class TestBeamNumerics(CustomTestCase):
             rotary.leave_torch_compile()
 
     @torch.inference_mode()
+    def test_fused_sliding_prologue_keeps_unfused_rounding_at_long_positions(self):
+        config = copy.deepcopy(self.config)
+        config.max_position_embeddings = 1 << 20
+        with (
+            get_context().override_server_args(),
+            get_parallel().override(
+                tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0, attn_dp_size=1
+            ),
+            set_default_torch_dtype(torch.bfloat16),
+            torch.device("cuda"),
+        ):
+            attention = BeamAttention(config, layer_id=0)
+        self.assertTrue(attention.use_fused_qk_norm_rope)
+        generator = torch.Generator(device="cuda").manual_seed(47)
+        for norm in (attention.q_norm, attention.k_norm):
+            norm.weight.copy_(
+                0.5 + torch.rand(norm.weight.shape, device="cuda", generator=generator)
+            )
+        head_dim = config.head_dim
+        sizes = [attention.q_size, attention.kv_size, attention.kv_size]
+        positions = torch.cat(
+            [
+                torch.arange(start, start + 256, device="cuda")
+                for start in (0, 131072, 524288, (1 << 20) - 256)
+            ]
+        )
+        shape = (positions.numel(), sum(sizes))
+        qkv = (3 * torch.randn(shape, device="cuda", generator=generator)).bfloat16()
+
+        q, k, _ = qkv.clone().split(sizes, dim=-1)
+        q = attention.q_norm(q.reshape(-1, head_dim)).view(q.shape)
+        k = attention.k_norm(k.reshape(-1, head_dim)).view(k.shape)
+        unfused = torch.cat(attention.rotary_emb(positions, q, k), dim=-1)
+
+        fused_qkv = qkv.clone()
+        q, k, v = fused_qkv.split(sizes, dim=-1)
+        attention._fused_qk_norm_rope(positions, q, k)
+        torch.testing.assert_close(v, qkv[:, -attention.kv_size :], atol=0, rtol=0)
+        fused = fused_qkv[:, : -attention.kv_size]
+
+        # Norm reductions may still differ by one BF16 ULP in rare elements.
+        self.assertLess((fused != unfused).float().mean().item(), 1e-3)
+        torch.testing.assert_close(fused, unfused, atol=0.05, rtol=2**-7)
+
+        # The fast-math kernel recomputes the angles and fails the same bound.
+        approx_qkv = qkv.clone()
+        fused_qk_norm_rope(
+            qkv=approx_qkv,
+            num_heads_q=attention.num_heads,
+            num_heads_k=attention.num_kv_heads,
+            num_heads_v=attention.num_kv_heads,
+            head_dim=head_dim,
+            eps=config.rms_norm_eps,
+            q_weight=attention.q_norm.weight,
+            k_weight=attention.k_norm.weight,
+            base=config.rope_parameters["sliding_attention"]["rope_theta"],
+            is_neox=True,
+            position_ids=positions.int(),
+            factor=1.0,
+            low=0.0,
+            high=0.0,
+            attention_factor=1.0,
+        )
+        approx = approx_qkv[:, : -attention.kv_size]
+        self.assertGreater((approx != unfused).float().mean().item(), 1e-3)
+
+    @torch.inference_mode()
+    def test_cuda_ssmax_rounds_once_on_packed_query_rows(self):
+        positions = torch.tensor([0, 511, 2047, 8191, 262143, 1048575], device="cuda")
+        generator = torch.Generator(device="cuda").manual_seed(48)
+        q_size, kv_size = 6 * 128, 128
+        qkv = torch.randn(
+            positions.numel(),
+            q_size + 2 * kv_size,
+            device="cuda",
+            generator=generator,
+        ).bfloat16()
+        q = qkv[:, :q_size]
+        scale = compute_ssmax_scale(positions)
+        expected = (q.float() * scale.unsqueeze(-1)).bfloat16()
+
+        actual = apply_ssmax(q, scale)
+
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        self.assertFalse(torch.equal(expected, q * scale.unsqueeze(-1).bfloat16()))
+
+    @torch.inference_mode()
+    def test_forced_torch_keeps_the_prologue_reference_after_construction(self):
+        """Backend forcing must bypass QK and SSMax fusion on existing layers."""
+        previous_backend = get_fused_op_backend()
+        try:
+            set_fused_op_backend(None)
+            with (
+                get_context().override_server_args(
+                    cuda_graph_config=default_cuda_graph_config()
+                ),
+                get_parallel().override(
+                    tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0, attn_dp_size=1
+                ),
+                set_default_torch_dtype(torch.bfloat16),
+                torch.device("cuda"),
+            ):
+                sliding = BeamAttention(self.config, layer_id=0)
+                full = BeamAttention(self.config, layer_id=1)
+                self.assertTrue(sliding.use_fused_qk_norm_rope)
+                set_fused_op_backend(KernelBackend.TORCH)
+                positions = torch.tensor([0, 511], device="cuda")
+                generator = torch.Generator(device="cuda").manual_seed(49)
+                for attention in (sliding, full):
+                    with self.subTest(sliding=attention.apply_rope):
+                        qkv = torch.randn(
+                            2,
+                            attention.q_size + 2 * attention.kv_size,
+                            device="cuda",
+                            generator=generator,
+                        ).bfloat16()
+                        q, k, _ = qkv.split(
+                            [attention.q_size, attention.kv_size, attention.kv_size],
+                            dim=-1,
+                        )
+                        q = attention.q_norm.forward_native(
+                            q.reshape(-1, attention.head_dim)
+                        ).view(q.shape)
+                        k = attention.k_norm.forward_native(
+                            k.reshape(-1, attention.head_dim)
+                        ).view(k.shape)
+                        if attention.apply_rope:
+                            q, k = attention.rotary_emb.forward_native(positions, q, k)
+                        else:
+                            q = (
+                                q.float() * compute_ssmax_scale(positions)[:, None]
+                            ).to(q.dtype)
+                        attention.gate_bias.zero_()
+                        with (
+                            patch.object(
+                                attention.qkv_proj, "forward", return_value=(qkv, None)
+                            ),
+                            patch.object(
+                                attention.attn,
+                                "forward",
+                                side_effect=lambda q, k, v, b: q,
+                            ),
+                            patch.object(
+                                attention.gate_proj,
+                                "forward",
+                                return_value=(torch.zeros_like(q), None),
+                            ),
+                            patch.object(
+                                attention.o_proj,
+                                "forward",
+                                side_effect=lambda x: (x, None),
+                            ),
+                            patch(
+                                "sglang.srt.models.beam.fused_inplace_qknorm_rope",
+                                side_effect=AssertionError(
+                                    "forced Torch called QK+RoPE"
+                                ),
+                            ),
+                            patch(
+                                "sglang.srt.models.utils.fused_inplace_qknorm",
+                                side_effect=AssertionError(
+                                    "forced Torch called QK norm"
+                                ),
+                            ),
+                            patch(
+                                "sglang.srt.models.beam.apply_log_scaling_tau",
+                                side_effect=AssertionError("forced Torch called SSMax"),
+                            ),
+                        ):
+                            actual = attention(
+                                positions,
+                                torch.zeros(2, self.config.hidden_size),
+                                None,
+                                compute_ssmax_scale(positions),
+                            )
+                            with get_context().override_server_args(
+                                cuda_graph_config=None
+                            ):
+                                unconfigured = attention(
+                                    positions,
+                                    torch.zeros(2, self.config.hidden_size),
+                                    None,
+                                    compute_ssmax_scale(positions),
+                                )
+                        torch.testing.assert_close(actual, q * 0.5, atol=0, rtol=0)
+                        torch.testing.assert_close(
+                            unconfigured, q * 0.5, atol=0, rtol=0
+                        )
+        finally:
+            set_fused_op_backend(previous_backend)
+
+    @torch.inference_mode()
     def test_single_token_compiled_moe_preserves_runner_scale(self):
         # No process group is needed at TP1; these lookups only feed the disabled
         # symmetric-memory context. All routing and expert kernels remain real.
@@ -212,15 +420,7 @@ class TestBeamNumerics(CustomTestCase):
                 moe_tp_rank=0,
                 moe_ep_size=1,
                 moe_ep_rank=0,
-            ),
-            patch("sglang.srt.layers.moe.topk.get_tp_group", new=lambda: group),
-            patch(
-                "sglang.srt.layers.moe.fused_moe_triton.layer.get_tp_group",
-                new=lambda: group,
-            ),
-            patch(
-                "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe.get_tp_group",
-                new=lambda: group,
+                tp_group=group,
             ),
             set_default_torch_dtype(torch.bfloat16),
             torch.device("cuda"),

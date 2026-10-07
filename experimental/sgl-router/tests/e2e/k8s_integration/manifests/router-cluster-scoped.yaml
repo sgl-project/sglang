@@ -16,6 +16,9 @@ spec:
         app: sgl-router-cluster
     spec:
       serviceAccountName: sgl-router-cluster
+      # Must exceed --shutdown-drain-secs plus the time in-flight requests need
+      # after the pause, or the pod is SIGKILLed mid-drain.
+      terminationGracePeriodSeconds: 40
       containers:
         - name: router
           image: sgl-router:e2e
@@ -37,6 +40,10 @@ spec:
             - "--service-discovery"
             - "--selector"
             - "app=sglang,cross-ns-test=true"
+            # Parity with router.yaml so the cross-namespace router exercises
+            # the same shutdown path; no test asserts on it here.
+            - "--shutdown-drain-secs"
+            - "8"
           ports:
             - containerPort: 8091
               name: http

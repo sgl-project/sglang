@@ -3,6 +3,7 @@
 import threading
 import unittest
 import unittest.mock
+from functools import partial
 
 import torch
 
@@ -46,6 +47,47 @@ class TestHostKVCache(CustomTestCase):
             device="cpu",
             allocator_type="default",
         )
+
+    def test_multiple_attention_rows_per_token(self):
+        for rows_per_token in (1, 3):
+            device_pool = MHATokenToKVPool(
+                size=4,
+                page_size=self.page_size,
+                dtype=torch.float16,
+                head_num=2 * rows_per_token,
+                head_dim=4,
+                layer_num=2,
+                device="cpu",
+                enable_memory_saver=False,
+            )
+            # Report logical heads while retaining the wider physical rows.
+            device_pool.head_num = 2
+            for layout in (
+                "layer_first",
+                "page_first",
+                "page_first_direct",
+                "page_head",
+            ):
+                with self.subTest(rows_per_token=rows_per_token, layout=layout):
+                    host_pool = MHATokenToKVPoolHost(
+                        device_pool=device_pool,
+                        host_to_device_ratio=2.0,
+                        host_size=0,
+                        page_size=self.page_size,
+                        layout=layout,
+                        pin_memory=False,
+                    )
+                    device_row = device_pool.k_buffer[0][0]
+                    row_bytes = device_row.numel() * device_row.element_size()
+                    self.assertEqual(host_pool.element_dim, device_row.numel())
+                    self.assertEqual(host_pool.token_stride_size, row_bytes)
+                    self.assertEqual(
+                        host_pool.size_per_token, 2 * device_pool.layer_num * row_bytes
+                    )
+                    self.assertEqual(
+                        host_pool.kv_buffer.nbytes,
+                        host_pool.size * host_pool.size_per_token,
+                    )
 
     def test_double_alloc(self):
         indices = self.host_pool.alloc(4)
@@ -241,11 +283,10 @@ class TestHostMemoryBudget(CustomTestCase):
     def _budget_with_ranks(self, ranks):
         # Deliberate single-accessor stub: isolates the budget math from the
         # topology derivation, which the ranks_per_host case below covers.
-        fake_mem = unittest.mock.Mock(available=self._AVAILABLE)
         with (
             unittest.mock.patch.object(base, "ranks_per_host", return_value=ranks),
             unittest.mock.patch.object(
-                base.psutil, "virtual_memory", return_value=fake_mem
+                base, "available_host_memory_bytes", return_value=self._AVAILABLE
             ),
         ):
             return base.host_memory_budget_bytes()
@@ -262,22 +303,77 @@ class TestHostMemoryBudget(CustomTestCase):
         )
 
     def test_ranks_per_host_divides_world_size_by_nodes(self):
-        # The launcher slices ranks uniformly across nodes, so the co-located
-        # rank count is world_size // nnodes — no hostname collective.
-        fake_group = unittest.mock.Mock(world_size=16)
         with (
-            get_context().override_server_args(nnodes=2),
+            get_context().override_server_args(nnodes=2, tp_size=16),
             unittest.mock.patch.object(
                 torch.distributed, "is_initialized", return_value=True
-            ),
-            unittest.mock.patch.object(
-                base, "get_world_group", return_value=fake_group
             ),
         ):
             self.assertEqual(base.ranks_per_host(), 8)
 
 
 class TestHostPoolGroup(CustomTestCase):
+    @staticmethod
+    def _backup_under_host_pressure(
+        order: tuple[PoolName, ...],
+    ) -> tuple[list[str], set[str], dict[PoolName, list[int]]]:
+        pools = {
+            name: LogicalHostPool(2, page_size=1)
+            for name in (PoolName.SWA, PoolName.MAMBA)
+        }
+        leaves: dict[str, dict[PoolName, torch.Tensor]] = {"a": {}, "b": {}}
+        for slots in leaves.values():
+            for name, pool in pools.items():
+                indices = pool.alloc(1)
+                assert indices is not None
+                slots[name] = indices
+
+        # Independent component evictions can give SWA and Mamba opposite host LRUs.
+        lru = {PoolName.SWA: ["a", "b"], PoolName.MAMBA: ["b", "a"]}
+        victims: list[str] = []
+
+        def evict(name: PoolName, size: int) -> None:
+            for leaf in lru[name]:
+                if pools[name].available_size() >= size:
+                    break
+                if leaf in leaves:
+                    victims.append(leaf)
+                    # A host-leaf eviction releases every component, not just name.
+                    for pool_name, indices in leaves.pop(leaf).items():
+                        pools[pool_name].free(indices)
+
+        group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=name,
+                    host_pool=pool,
+                    device_pool=None,
+                    layer_mapper=lambda layer: layer,
+                    host_evict_fn=partial(evict, name),
+                )
+                for name, pool in pools.items()
+            ]
+        )
+        transfers = [
+            PoolTransfer(name=name, device_indices=torch.tensor([0])) for name in order
+        ]
+        assert group.resolve_host_transfers(transfers) is transfers
+        assert tuple(transfer.name for transfer in transfers) == order
+        assert len(victims) == 1
+        assert all(pool.available_size() == 0 for pool in pools.values())
+
+        allocations = {}
+        for transfer in transfers:
+            assert transfer.host_indices is not None
+            allocations[transfer.name] = transfer.host_indices.tolist()
+        return victims, set(leaves), allocations
+
+    def test_host_reclamation_is_independent_of_transfer_order(self):
+        # Rust HashMap iteration can deliver these two orders to different TP ranks.
+        swa_first = self._backup_under_host_pressure((PoolName.SWA, PoolName.MAMBA))
+        mamba_first = self._backup_under_host_pressure((PoolName.MAMBA, PoolName.SWA))
+        self.assertEqual(swa_first, mamba_first)
+
     @staticmethod
     def _group(**sizes):
         return HostPoolGroup(
@@ -315,7 +411,7 @@ class TestHostPoolGroup(CustomTestCase):
         self.assertEqual(group.available_size(PoolName.SWA), 2)
 
     def test_resolve_rolls_back_partial_allocation(self):
-        group = self._group(kv=4, swa=2, mamba=1)
+        group = self._group(kv=4, swa=1, mamba=2)
         transfers = [
             PoolTransfer(name=PoolName.SWA, device_indices=torch.arange(2)),
             PoolTransfer(name=PoolName.MAMBA, device_indices=torch.arange(2)),
@@ -323,7 +419,9 @@ class TestHostPoolGroup(CustomTestCase):
 
         self.assertIsNone(group.resolve_host_transfers(transfers))
         self.assertIsNone(transfers[0].host_indices)
-        self.assertEqual(group.available_size(PoolName.SWA), 2)
+        self.assertIsNone(transfers[1].host_indices)
+        self.assertEqual(group.available_size(PoolName.SWA), 1)
+        self.assertEqual(group.available_size(PoolName.MAMBA), 2)
 
 
 if __name__ == "__main__":

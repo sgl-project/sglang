@@ -39,7 +39,7 @@ import torch
 import torch.distributed
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
     ExpertDispatchCollector,
@@ -48,6 +48,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import get_device as get_device_namespace
 from sglang.srt.runtime_context import (
     get_exec,
+    get_platform,
     get_schedule,
     logs_expert_balancedness_to_server_log,
     reports_expert_balancedness,
@@ -58,6 +59,57 @@ if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 
 logger = logging.getLogger(__name__)
+
+
+# AMD specific function
+def megamoe_prefill_only_recorder_enabled() -> bool:
+    # The prefill-only arm belongs to aiter MegaMoEv2, which only exists on ROCm.
+    # Read the backend through the resolved accessor, not off a supplied
+    # ServerArgs: test_supplied_instance_exposure_ratchet pins (file, field)
+    # pairs where a `server_args` parameter is read for a field that resolution
+    # fills in, and that surface may only shrink.
+    from sglang.srt.layers.moe import get_moe_a2a_backend
+
+    return (
+        get_platform().is_hip
+        and envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
+        and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
+        and get_moe_a2a_backend().is_megamoe()
+    )
+
+
+# non-hip platform always return True
+def should_record_forward_pass(forward_batch: ForwardBatch) -> bool:
+    if not megamoe_prefill_only_recorder_enabled():
+        return True
+    if _is_model_capture_mode():
+        return False
+    if forward_batch.forward_mode not in (
+        ForwardMode.EXTEND,
+        ForwardMode.SPLIT_PREFILL,
+    ):
+        return False
+    return int(forward_batch.extend_num_tokens or 0) > 0
+
+
+# non-hip platform always return True
+def should_advance_eplb_counter(forward_batch: ForwardBatch) -> bool:
+    """Whether a finished pass counts towards the EPLB rebalance interval.
+
+    Unlike `should_record_forward_pass`, which is local to this rank, the
+    counter has to advance in lockstep across ranks, so it keys off the globally
+    synchronized `is_extend_in_batch` rather than this rank's forward mode.
+    """
+    if not megamoe_prefill_only_recorder_enabled():
+        return True
+    return forward_batch.is_extend_in_batch
+
+
+def _is_model_capture_mode() -> bool:
+    from sglang.srt.model_executor.runner_utils.capture_mode import is_capture_mode
+
+    return is_capture_mode
+
 
 # --------------------------------------- Entrypoint -----------------------------------------
 
@@ -117,6 +169,9 @@ class ExpertDistributionRecorder(ABC):
     def on_select_experts(self, topk_ids: torch.Tensor):
         pass
 
+    def get_current_pass_count_buffer(self, layer_idx: int):
+        return None
+
     def on_deepep_dispatch_normal(
         self,
         local_physical_count_of_layer: List[int],
@@ -164,6 +219,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
         self._recording = False
         self._disable_all = False
+        self._record_current_pass = False
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
@@ -208,13 +264,17 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     def _on_forward_pass_start(self, forward_batch: ForwardBatch):
         if not self._recording:
+            self._record_current_pass = False
+            return
+        self._record_current_pass = should_record_forward_pass(forward_batch)
+        if not self._record_current_pass:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             gatherer.reset()
             gatherer.on_forward_pass_start(forward_batch)
 
     def _on_forward_pass_end(self, forward_pass_id: int, outputs: Dict[str, Any]):
-        if not self._recording:
+        if not self._recording or not self._record_current_pass:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             single_pass_data = gatherer.collect()
@@ -224,6 +284,14 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
+
+    def get_current_pass_count_buffer(self, layer_idx: int):
+        if not self._recording or not self._record_current_pass:
+            return None
+        gatherer = self._single_pass_gatherers.get(_SINGLE_PASS_GATHERER_KEY_PRIMARY)
+        if not isinstance(gatherer, _SelectExpertsSinglePassGatherer):
+            return None
+        return gatherer._data[layer_idx]
 
     def on_deepep_dispatch_normal(
         self,
@@ -250,6 +318,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     def _on_hook(self, hook_name: str, **kwargs):
         if self._disable_all:
+            return
+        if megamoe_prefill_only_recorder_enabled() and not self._record_current_pass:
             return
         if not (
             self._recording or torch.get_device_module().is_current_stream_capturing()
@@ -548,7 +618,9 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     # can optimize (e.g. fuse / compile)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         topk_ids = topk_ids.flatten()
-        mask = topk_ids != -1
+        mask = (topk_ids >= 0) & (
+            topk_ids < self._expert_location_metadata.num_physical_experts
+        )
         self._data[layer_idx, :].scatter_add_(
             dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
         )

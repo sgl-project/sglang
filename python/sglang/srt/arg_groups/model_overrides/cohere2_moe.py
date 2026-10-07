@@ -1,7 +1,4 @@
-"""Config-time override declarations for cohere2_moe.
-
-Architectures: Cohere2MoeForCausalLM, Cohere2VisionForConditionalGeneration.
-"""
+"""Config-time override declarations for cohere2_moe."""
 
 import logging
 from typing import Any

@@ -3,11 +3,9 @@
 import asyncio
 import base64
 import copy
-import json
 import math
 import os
 import re
-import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -229,39 +227,6 @@ def _decode_frames_and_timestamps(vdw, ele):
     video_tensor = vdw.get_frames_as_tensor(idx).permute(0, 3, 1, 2).float()
     timestamps = torch.as_tensor(idx, dtype=torch.float32) / video_fps
     return video_tensor, timestamps
-
-
-def _ffprobe_has_audio(src, stdin=None, label=None) -> bool:
-    # Header-only audio-stream probe for HTTP URLs; avoids full download.
-    try:
-        r = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "quiet",
-                "-print_format",
-                "json",
-                "-show_streams",
-                "-select_streams",
-                "a",
-                src,
-            ],
-            input=stdin,
-            capture_output=True,
-            timeout=30,
-        )
-        if r.returncode != 0:
-            stderr = r.stderr.decode("utf-8", errors="replace")
-            raise RuntimeError(f"ffprobe failed for {label}: {stderr}")
-        return bool(json.loads(r.stdout).get("streams"))
-    except subprocess.TimeoutExpired:
-        logger.error("ffprobe timed out for %s", label)
-        raise
-    except FileNotFoundError as e:
-        raise RuntimeError("ffprobe not found; install ffmpeg") from e
-    except json.JSONDecodeError:
-        logger.error("ffprobe returned invalid JSON for %s", label)
-        raise
 
 
 class MiMoProcessor:
@@ -690,7 +655,6 @@ class MiMoProcessor:
     def process_video(
         self, video_input: VideoInput | VideoAudioInput, temporal_padding_factor=None
     ):
-
         def smart_resize_video(
             num_total_frames, min_pixels, max_pixels, total_max_pixels, **kwargs
         ):

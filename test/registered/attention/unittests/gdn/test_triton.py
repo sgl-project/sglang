@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -8,6 +8,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     MambaAttnBackendBase,
 )
+from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -216,6 +217,36 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_gdn_attention_case(self, case)
 
+    def test_multi_item_scoring_mixed_batch_with_empty_query(self):
+        case = GDNAttentionCase(
+            name="gdn_mis_mixed_batch_empty_query",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_k_heads=2,
+            num_v_heads=2,
+            page_size=1,
+            prefix_lens=(0, 0),
+            extend_lens=(9, 7),
+            mis_delimiter_indices=((0, 3, 8), (4, 6)),
+            conv_history_weight=0.25,
+        )
+        run_gdn_attention_case(self, case)
+
+    def test_multi_item_scoring_crosses_chunk_boundaries(self):
+        case = GDNAttentionCase(
+            name="gdn_mis_chunk_boundaries",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_k_heads=2,
+            num_v_heads=2,
+            page_size=1,
+            prefix_lens=(0,),
+            extend_lens=(198,),
+            mis_delimiter_indices=((5, 68, 132, 197),),
+            conv_history_weight=0.25,
+        )
+        run_gdn_attention_case(self, case, max_context_len=256)
+
     # Layout-robustness. See dense/test_triton.py for the rationale.
     # shuffled_pages is the default for all tests; this method opts
     # into the more aggressive interleaved_pages + non_monotonic_extend.
@@ -285,6 +316,24 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
                 spec_kind=spec_kind,
             ):
                 run_gdn_eagle_verify_case(self, case, topk=topk, spec_kind=spec_kind)
+
+    def test_triton_target_verify_skips_prefill_qkv_materialization(self):
+        case, topk, spec_kind = self.EAGLE_VERIFY_CASES[0]
+        with patch.object(
+            gdn_backend,
+            "fused_qkv_split_gdn_prefill",
+            side_effect=AssertionError,
+        ):
+            run_gdn_eagle_verify_case(self, case, topk=topk, spec_kind=spec_kind)
+
+    def test_triton_prefill_keeps_contiguous_qkv_materialization(self):
+        with patch.object(
+            gdn_backend,
+            "fused_qkv_split_gdn_prefill",
+            wraps=gdn_backend.fused_qkv_split_gdn_prefill,
+        ) as split_spy:
+            run_gdn_attention_case(self, self.CASES[0])
+        split_spy.assert_called()
 
     def test_runner_mode_eagle_verify_cuda_graph_cases(self):
         for case, topk, spec_kind in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:

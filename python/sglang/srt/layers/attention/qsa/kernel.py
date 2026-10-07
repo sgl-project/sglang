@@ -34,7 +34,7 @@ def qsa_fast_topk(
         if topk == 512:
             # Prefer the JIT kernel: it ships with the sglang python package,
             # so top-k 512 works regardless of the installed sgl_kernel version.
-            from sglang.kernels.ops.elementwise.fast_topk import fast_topk
+            from sglang.kernels.ops.attention.fast_topk import fast_topk
 
             return fast_topk(logits, lengths, topk=512, row_starts=starts)
 

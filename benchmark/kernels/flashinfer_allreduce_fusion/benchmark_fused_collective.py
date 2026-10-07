@@ -30,14 +30,16 @@ import torch.distributed as dist  # type: ignore
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype as SGLANG_FP8_DTYPE
 from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
-from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
+    get_tp_group,
     graph_capture,
     init_distributed_environment,
     initialize_model_parallel,
 )
 from sglang.srt.layers.layernorm import RMSNorm  # noqa
+from sglang.test.test_utils import publish_build_topology
 
 try:
     from sgl_kernel import fused_add_rmsnorm as SGL_FUSED_ADD_RMS_NORM
@@ -1178,7 +1180,8 @@ def main():
         local_rank=rank,
         backend="nccl",
     )
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
+    publish_build_topology(world_rank=rank, tp_size=world_size)
+    initialize_model_parallel()
 
     # Validate world size (must be > 1 for collective operations)
     if world_size <= 1:
