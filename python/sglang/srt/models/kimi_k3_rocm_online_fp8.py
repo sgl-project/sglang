@@ -27,9 +27,10 @@ path keys off:
 * ``deepseek_common.utils_rocm.accepts_ptpc_fp8_tuple`` keys off ``scheme``, so the
   RMSNorm/gate producer fusions can hand ``(fp8, per-token scale)`` straight to
   ``o_proj``.
-* ``QuarkW8A8Fp8.process_weights_after_loading`` does the transpose, the
-  bpreshuffle and the narrow-N dequant fallback, so the layout stays byte-identical
-  to a Quark checkpoint's.
+* ``QuarkW8A8Fp8.process_weights_after_loading`` does the transpose and the
+  narrow-N dequant fallback. With the K3 PTPC flags on, the weight stays
+  unshuffled so ``torch._scaled_mm`` (ATOM's ``kernel_gemm_0``) can read it;
+  CK ``b_preshuffle`` is the fallback when ``SGLANG_ROCM_K3_PTPC_SCALED_MM=0``.
 
 The conversion therefore runs *before* the merges in ``post_load_weights`` and
 leaves ``process_weights_after_loading`` to the loader, matching the order a Quark
@@ -73,19 +74,19 @@ _SKIP_SUFFIXES = ("f_b_proj",)
 # the slower unfused path.
 _KDA_INPROJ_SUFFIXES = ("fused_qkvg_proj", "f_a_proj", "b_proj")
 
-# The shared-expert down projection is the one weight K3 consumes as a raw
-# dense tensor rather than through ``quant_method``:
+# Shared-expert projections are consumed as raw BF16 tensors by the fused
+# front, not through ``quant_method``:
 #
-# * ``_run_shared_down`` falls back to ``_k3_bf16_gemm(x, down_proj.weight)``,
-#   which reads ``[out, in]``. The loader transposes a quantized weight to
-#   ``[in, out]``, so converting it turns that fallback into a shape error.
+# * ``_merge_front_weights`` refuses a mixed-dtype merge, so converting
+#   ``gate_up_proj`` in place drops the fused front and the latent PTPC split.
+# * ``_forward_shared`` reads ``down_proj.weight`` as ``[out, in]``. The loader
+#   transposes a quantized weight to ``[in, out]``.
 # * ``_eligible_for_fused_front`` requires ``down_proj.weight.dtype`` to be
-#   bf16/fp16, so converting it silently drops the fused-front collective.
+#   bf16/fp16.
 #
-# FP8 for this weight is already available, and done correctly, via
-# ``SGLANG_ROCM_K3_PTPC_FP8_SHARED_DOWN``: it packs a *separate* FP8 copy into
-# ``_shared_down_fp8_w`` and leaves the BF16 weight live for both paths above.
-_SHARED_SKIP_SUFFIXES = ("down_proj",)
+# Both stay BF16. ``k3_prepare_shared_expert_ptpc`` packs a separate FP8 copy
+# (hipBLASLt, same as ATOM) and the forward uses that copy.
+_SHARED_SKIP_SUFFIXES = ("down_proj", "gate_up_proj")
 
 
 class _K3OnlineFp8LinearMethod(LinearMethodBase):

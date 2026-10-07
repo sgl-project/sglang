@@ -2147,12 +2147,40 @@ def _apply_fallback_scaled_mm(
     return output.to(dtype=input_dtype)
 
 
+def _k3_ptpc_scaled_mm() -> bool:
+    """K3 dense PTPC follows ATOM: hipBLASLt ``torch._scaled_mm``.
+
+    ``SGLANG_ROCM_K3_PTPC_SCALED_MM=0`` keeps the CK ``b_preshuffle`` path.
+    Unset, the switch follows the K3 FP8 flags so the load-time layout and
+    the GEMM stay agreed. Other models are unchanged when those flags are off.
+    """
+    import os
+
+    raw = os.environ.get("SGLANG_ROCM_K3_PTPC_SCALED_MM")
+    if raw is not None:
+        return raw == "1"
+    return any(
+        get_bool_env_var(name)
+        for name in (
+            "SGLANG_ROCM_K3_PTPC_FP8",
+            "SGLANG_ROCM_K3_ONLINE_FP8_ATTN",
+            "SGLANG_ROCM_K3_ONLINE_FP8_KDA_INPROJ",
+            "SGLANG_ROCM_K3_ONLINE_FP8_SHARED_EXPERTS",
+            "SGLANG_ROCM_K3_MOE_LATENT_FP8",
+        )
+    )
+
+
 def use_aiter_bpreshuffle_gemm(output_size: int) -> bool:
     # aiter's CK gemm_a8w8_bpreshuffle instances are GemmSpecialization::Default
     # (pre-shuffled weights are never N-padded) with NPerBlock=64, so any N that
     # is not a multiple of 64 raises "This GEMM is not supported!". Measured on
     # gfx950 for M=16384/N=32/K=4096, torch._scaled_mm rowwise runs that shape in
     # 14us against 90us for the cktile instance that does accept it.
+    # A shuffled weight through scaled_mm (or an unshuffled one through CK)
+    # silently returns garbage, so this predicate is also the load-time shuffle.
+    if _k3_ptpc_scaled_mm():
+        return False
     return _use_aiter and output_size % 64 == 0
 
 
@@ -2314,6 +2342,15 @@ def apply_fp8_linear(
                         input_2d,
                         input_scale,
                         use_per_token_if_dynamic=use_per_token_if_dynamic,
+                    )
+                elif _is_hip and _k3_ptpc_scaled_mm():
+                    # ATOM's activation quant. per_token_group_quant_fp8 is a
+                    # different kernel (_per_token_group_quant_8bit).
+                    from aiter import dtypes as aiter_dtypes
+                    from aiter.ops.quant import per_token_quant_hip
+
+                    qinput, x_scale = per_token_quant_hip(
+                        input_2d, quant_dtype=aiter_dtypes.fp8
                     )
                 else:
                     qinput, x_scale = per_token_group_quant_fp8(

@@ -7,6 +7,14 @@ the weight to FP8 per output channel and the activation per token halves the
 bytes the GEMM has to stream, which is the only lever that helps once the
 kernel is already bandwidth-saturated.
 
+The GEMM is hipBLASLt ``torch._scaled_mm`` (the ``kernel_gemm_0`` ATOM uses
+for dense PTPC). CK ``gemm_a8w8_bpreshuffle`` is slower on the same shapes
+and rejects N that is not a multiple of 64. hipBLASLt needs N % 16 == 0, so
+short weights are zero-padded and the padding columns are dropped.
+
+Activation quant is aiter ``per_token_quant_hip``
+(``dynamic_per_token_scaled_quant``), the same kernel ATOM launches.
+
 Routing is deliberately out of scope: FP8 router logits move the top-k
 selection (measured ~15.3/16 agreement), so callers must keep the gate BF16.
 """
@@ -17,40 +25,24 @@ import torch
 
 from sglang.srt.utils import is_hip
 
-# aiter's a8w8 bpreshuffle instances reject N that is not a multiple of 64
-# ("This GEMM is not supported"), so short weights are zero-padded and the
-# padding columns are dropped from the result.
-_N_ALIGN = 64
-_SHUFFLE_LAYOUT = (16, 16)
+# hipBLASLt rejects N that is not a multiple of 16.
+_N_ALIGN = 16
 
 
 def _ops():
     try:
         from aiter import dtypes
-        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_bpreshuffle
         from aiter.ops.quant import per_token_quant_hip
-        from aiter.ops.shuffle import shuffle_weight
     except (ImportError, ModuleNotFoundError):
         return None
-    return dtypes.fp8, gemm_a8w8_bpreshuffle, per_token_quant_hip, shuffle_weight
+    return dtypes.fp8, per_token_quant_hip
 
 
 def available() -> bool:
     return is_hip() and _ops() is not None
 
 
-def pack(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Quantize [out, in] BF16 -> (preshuffled FP8 weight, row scales, out).
-
-    Returns the logical `out` alongside the padded tensors so `run` can slice
-    the padding away.
-    """
-    ops = _ops()
-    if ops is None:
-        raise RuntimeError("aiter PTPC FP8 GEMM is unavailable")
-    fp8, _, per_token_quant, shuffle = ops
-    if weight.ndim != 2 or not weight.is_cuda:
-        raise ValueError(f"expected a 2D CUDA weight, got {tuple(weight.shape)}")
+def _pad_rows(weight: torch.Tensor) -> tuple[torch.Tensor, int, int]:
     out_features, in_features = weight.shape
     padded = out_features + (-out_features) % _N_ALIGN
     if padded != out_features:
@@ -60,10 +52,27 @@ def pack(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
                 weight.new_zeros((padded - out_features, in_features)),
             ]
         )
+    return weight, out_features, padded
+
+
+def pack(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Quantize [out, in] BF16 -> ([K, N] FP8 weight, [1, N] scales, out).
+
+    Returns the logical `out` alongside the padded tensors so `run` can slice
+    the padding away. The weight is unshuffled: ``torch._scaled_mm`` reads
+    ``[K, N]`` directly.
+    """
+    ops = _ops()
+    if ops is None:
+        raise RuntimeError("aiter PTPC FP8 GEMM is unavailable")
+    fp8, per_token_quant = ops
+    if weight.ndim != 2 or not weight.is_cuda:
+        raise ValueError(f"expected a 2D CUDA weight, got {tuple(weight.shape)}")
+    weight, out_features, padded = _pad_rows(weight)
     quantized, scale = per_token_quant(weight.contiguous(), quant_dtype=fp8)
     return (
-        shuffle(quantized, layout=_SHUFFLE_LAYOUT),
-        scale.view(padded, 1).contiguous().float(),
+        quantized.t().contiguous(),
+        scale.reshape(1, padded).contiguous().float(),
         out_features,
     )
 
@@ -80,23 +89,22 @@ def pack_prequantized(
     ops = _ops()
     if ops is None:
         raise RuntimeError("aiter PTPC FP8 GEMM is unavailable")
-    fp8, _, _, shuffle = ops
+    fp8, _ = ops
     if weight.ndim != 2 or not weight.is_cuda:
         raise ValueError(f"expected a 2D CUDA weight, got {tuple(weight.shape)}")
     if weight.dtype != fp8:
         raise ValueError(f"expected {fp8} weight, got {weight.dtype}")
-    out_features, in_features = weight.shape
+    out_features, _in_features = weight.shape
     if scale.numel() != out_features:
         raise ValueError(f"expected {out_features} channel scales, got {scale.numel()}")
-    padded = out_features + (-out_features) % _N_ALIGN
+    weight, out_features, padded = _pad_rows(weight)
     if padded != out_features:
-        weight = torch.cat(
-            [weight, weight.new_zeros((padded - out_features, in_features))]
+        scale = torch.cat(
+            [scale.reshape(-1), scale.reshape(-1).new_ones(padded - out_features)]
         )
-        scale = torch.cat([scale.reshape(-1), scale.new_ones(padded - out_features)])
     return (
-        shuffle(weight.contiguous(), layout=_SHUFFLE_LAYOUT),
-        scale.reshape(padded, 1).contiguous().float(),
+        weight.t().contiguous(),
+        scale.reshape(1, padded).contiguous().float(),
         out_features,
     )
 
@@ -137,25 +145,31 @@ def run(
     out: torch.Tensor | None = None,
     x_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """out[:, :out_features] = (x @ weight.T) with per-token / per-channel FP8."""
+    """out[:, :out_features] = (x @ weight) with per-token / per-channel FP8.
+
+    ``weight`` is the packed ``[K, N]`` tensor from ``pack``.
+    """
     ops = _ops()
     if ops is None:
         raise RuntimeError("aiter PTPC FP8 GEMM is unavailable")
-    fp8, gemm, per_token_quant, _ = ops
+    fp8, per_token_quant = ops
     if x_scale is None:
         xq, xs = per_token_quant(x, quant_dtype=fp8)
         out_dtype = x.dtype
     else:
         xq, xs = x, x_scale
         out_dtype = torch.bfloat16
-    if out is not None and weight.shape[0] != out_features:
-        raise ValueError("out= is unavailable when the packed weight has padded rows")
-    result = gemm(
+    padded_n = weight.shape[1]
+    if out is not None and padded_n != out_features:
+        raise ValueError(
+            "out= is unavailable when the packed weight has padded columns"
+        )
+    result = torch._scaled_mm(
         xq,
         weight,
-        xs.view(xq.shape[0], 1),
-        scale,
-        dtype=out_dtype,
+        scale_a=xs.reshape(xq.shape[0], 1),
+        scale_b=scale.reshape(1, padded_n),
+        out_dtype=out_dtype,
         out=out,
     )
     return result if result.shape[1] == out_features else result[:, :out_features]

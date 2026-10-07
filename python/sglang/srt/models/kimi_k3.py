@@ -1336,8 +1336,14 @@ class KimiK3MoE(nn.Module):
                 shared.down_proj.weight, torch.Tensor
             )
         assert shared is not None
+        act = shared.act_fn(gate_up)
+        if _is_hip and getattr(self, "_shared_down_fp8_w", None) is not None:
+            from sglang.srt.models.kimi_k3_rocm_quant import k3_run_shared_down_fp8
+
+            if k3_run_shared_down_fp8(self, act, shared_output):
+                return
         _k3_bf16_gemm(
-            shared.act_fn(gate_up),
+            act,
             shared.down_proj.weight,
             out=shared_output,
         )
@@ -1378,12 +1384,30 @@ class KimiK3MoE(nn.Module):
             if k3_use_front_down_fp8(self, num_tokens):
                 front_down_fp8 = k3_run_front_down_fp8(self, hidden_states)
         if front_down_fp8 is not None:
-            head = _k3_bf16_gemm(
-                hidden_states,
-                self._front_head,
-                out_dtype=torch.float32 if self._front_fp32 else None,
-            )
-            gate_up, router_logits = torch.split(head, self._front_sizes[:2], dim=-1)
+            gate_up_fp8 = None
+            if getattr(self, "_front_gate_up_fp8_w", None) is not None:
+                from sglang.srt.models.kimi_k3_rocm_quant import (
+                    k3_run_front_gate_up_fp8,
+                )
+
+                gate_up_fp8 = k3_run_front_gate_up_fp8(self, hidden_states)
+            if gate_up_fp8 is not None:
+                # Router stays a BF16 GEMM. FP8 logits move the top-k pick.
+                gate_up = gate_up_fp8
+                router_logits = _k3_bf16_gemm(
+                    hidden_states,
+                    self._front_head[self._front_sizes[0] :],
+                    out_dtype=torch.float32 if self._front_fp32 else None,
+                )
+            else:
+                head = _k3_bf16_gemm(
+                    hidden_states,
+                    self._front_head,
+                    out_dtype=torch.float32 if self._front_fp32 else None,
+                )
+                gate_up, router_logits = torch.split(
+                    head, self._front_sizes[:2], dim=-1
+                )
             routed_input = front_down_fp8
         else:
             fused = _k3_bf16_gemm(
@@ -3690,9 +3714,11 @@ class KimiK3LinearForCausalLM(nn.Module):
                 if _is_hip:
                     from sglang.srt.models.kimi_k3_rocm_quant import (
                         k3_prepare_front_down_fp8,
+                        k3_prepare_shared_expert_ptpc,
                     )
 
                     k3_prepare_front_down_fp8(layer.mlp)
+                    k3_prepare_shared_expert_ptpc(layer.mlp)
                 # Convert the correction bias to fp32 once so the per-call
                 # .to(float32) in topk is a no-op, not one upcast kernel per
                 # MoE layer per step.

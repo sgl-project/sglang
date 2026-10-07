@@ -13,8 +13,8 @@ pytestmark = pytest.mark.skipif(
 
 HIDDEN = 7168
 LATENT = 3584
-# The merged KDA input projection is not a multiple of 64, so it exercises the
-# zero-padded path; 7168 exercises the unpadded one.
+# hipBLASLt needs N % 16 == 0. Both shapes already are, so they take the
+# unpadded torch._scaled_mm path. 100 exercises the zero-padded columns.
 KDA_ROWS = 6288
 
 
@@ -26,7 +26,8 @@ def _ops():
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 8, 32, 64])
 @pytest.mark.parametrize(
-    "out_features,in_features", [(HIDDEN, LATENT), (KDA_ROWS, HIDDEN)]
+    "out_features,in_features",
+    [(HIDDEN, LATENT), (KDA_ROWS, HIDDEN), (100, 256)],
 )
 @torch.inference_mode()
 def test_ptpc_fp8_matches_bf16_reference(num_tokens, out_features, in_features):

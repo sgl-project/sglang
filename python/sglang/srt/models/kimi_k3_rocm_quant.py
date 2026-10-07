@@ -273,3 +273,122 @@ def k3_run_front_down_fp8(
         mlp._front_down_fp8_s,
         mlp._front_down_fp8_n,
     )
+
+
+def k3_prepare_shared_expert_ptpc(mlp: nn.Module) -> None:
+    """Pack shared gate_up and down as hipBLASLt PTPC copies.
+
+    The BF16 parameters stay in place so ``_merge_front_weights`` and
+    ``_eligible_for_fused_front`` keep working. The router rows of the merged
+    front are not packed.
+    """
+    want_gate_up = envs.SGLANG_ROCM_K3_ONLINE_FP8_SHARED_EXPERTS.get()
+    want_down = want_gate_up or envs.SGLANG_ROCM_K3_PTPC_FP8_SHARED_DOWN.get()
+    if not want_gate_up and not want_down:
+        return
+    from sglang.kernels.ops.gemm import ptpc_fp8_aiter_hip
+
+    if not ptpc_fp8_aiter_hip.available():
+        return
+
+    if (
+        want_gate_up
+        and mlp._front_w is not None
+        and mlp._front_sizes is not None
+        and len(mlp._front_sizes) == 3
+        and not mlp._front_is_ep_pair
+    ):
+        rows = mlp._front_sizes[0]
+        gate_up = mlp._front_w[:rows]
+        if (
+            isinstance(gate_up, torch.Tensor)
+            and gate_up.ndim == 2
+            and gate_up.dtype == torch.bfloat16
+        ):
+            if mlp._front_head is None:
+                mlp._front_head = mlp._front_w[: sum(mlp._front_sizes[:-1])]
+            (
+                mlp._front_gate_up_fp8_w,
+                mlp._front_gate_up_fp8_s,
+                mlp._front_gate_up_fp8_n,
+            ) = ptpc_fp8_aiter_hip.pack(gate_up.contiguous())
+            ptpc_fp8_aiter_hip.warmup(
+                mlp._front_gate_up_fp8_w,
+                mlp._front_gate_up_fp8_s,
+                mlp._front_gate_up_fp8_n,
+                gate_up.shape[1],
+            )
+            _k3_log_once(
+                "k3_front_gate_up_fp8",
+                "K3 ROCm: shared gate_up packed as PTPC FP8 (router stays BF16)",
+            )
+
+    shared = getattr(mlp, "shared_experts", None)
+    down = getattr(getattr(shared, "down_proj", None), "weight", None)
+    if (
+        want_down
+        and isinstance(down, torch.Tensor)
+        and down.ndim == 2
+        and down.dtype == torch.bfloat16
+    ):
+        (
+            mlp._shared_down_fp8_w,
+            mlp._shared_down_fp8_s,
+            mlp._shared_down_fp8_n,
+        ) = ptpc_fp8_aiter_hip.pack(down.contiguous())
+        mlp._shared_down_fp8_min_tokens = envs.SGLANG_ROCM_K3_PTPC_FP8_MIN_TOKENS.get()
+        ptpc_fp8_aiter_hip.warmup(
+            mlp._shared_down_fp8_w,
+            mlp._shared_down_fp8_s,
+            mlp._shared_down_fp8_n,
+            down.shape[1],
+        )
+        _k3_log_once(
+            "k3_shared_down_fp8",
+            "K3 ROCm: shared down-projection packed as PTPC FP8 "
+            "(BF16 weight kept, decode batches >= %d)",
+            mlp._shared_down_fp8_min_tokens,
+        )
+
+
+def k3_run_front_gate_up_fp8(
+    mlp: nn.Module, hidden_states: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """``hidden_states @ gate_up.T`` in PTPC FP8, or None if uncovered."""
+    from sglang.kernels.ops.gemm import ptpc_fp8_aiter_hip
+
+    weight = getattr(mlp, "_front_gate_up_fp8_w", None)
+    if not ptpc_fp8_aiter_hip.covered(hidden_states, weight):
+        return None
+    return ptpc_fp8_aiter_hip.run(
+        hidden_states,
+        weight,
+        mlp._front_gate_up_fp8_s,
+        mlp._front_gate_up_fp8_n,
+    )
+
+
+def k3_run_shared_down_fp8(
+    mlp: nn.Module, act: torch.Tensor, out: torch.Tensor
+) -> bool:
+    """Write the shared down GEMM into ``out``. False leaves the BF16 path."""
+    from sglang.kernels.ops.gemm import ptpc_fp8_aiter_hip
+
+    weight = getattr(mlp, "_shared_down_fp8_w", None)
+    if weight is None or act.shape[0] < mlp._shared_down_fp8_min_tokens:
+        return False
+    if not act.is_contiguous():
+        act = act.contiguous()
+    if not ptpc_fp8_aiter_hip.covered(act, weight):
+        return False
+    # Land in the symmetric-buffer slice. copy_ covers the N-padded case,
+    # where torch._scaled_mm cannot take out= of the logical width.
+    out.copy_(
+        ptpc_fp8_aiter_hip.run(
+            act,
+            weight,
+            mlp._shared_down_fp8_s,
+            mlp._shared_down_fp8_n,
+        )
+    )
+    return True
