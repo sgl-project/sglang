@@ -18,9 +18,14 @@ from sglang.multimodal_gen.configs.models import VAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
     should_use_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    cached_vae_encode,
+    register_conditioning_container,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_group_coordinator,
     get_decode_parallel_world_size,
+    get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
     model_parallel_is_initialized,
@@ -137,6 +142,7 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
     def _decode(self, *args, **kwargs) -> torch.Tensor:
         pass
 
+    @cached_vae_encode
     def encode(self, x: torch.Tensor) -> DiagonalGaussianDistribution:
         batch_size, num_channels, num_frames, height, width = x.shape
         latent_num_frames = (num_frames - 1) // self.temporal_compression_ratio + 1
@@ -281,7 +287,8 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         """
         Parallel version of tiled_decode that distributes both temporal and spatial computation across GPUs
         """
-        world_size, rank = get_sp_world_size(), get_sp_parallel_rank()
+        sp_group = get_sp_group()
+        world_size, rank = sp_group.world_size, sp_group.rank_in_group
         _, _, T, H, W = z.shape
 
         tile_latent_min_height = (
@@ -356,7 +363,7 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
             torch.zeros(1, device=results.device, dtype=torch.int64)
             for _ in range(world_size)
         ]
-        dist.all_gather(all_sizes, local_size)
+        dist.all_gather(all_sizes, local_size, group=sp_group.device_group)
         max_size = max(size.item() for size in all_sizes)
 
         padded_results = torch.zeros(
@@ -370,8 +377,12 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
             .repeat(world_size, *[1] * len(padded_results.shape))
             .contiguous()
         )
-        all_gather_single(gathered_results, padded_results)
-        dist.all_gather_object(gathered_dim_metadata, local_dim_metadata)
+        all_gather_single(
+            gathered_results.view(-1), padded_results, group=sp_group.device_group
+        )
+        dist.all_gather_object(
+            gathered_dim_metadata, local_dim_metadata, group=sp_group.cpu_group
+        )
         gathered_dim_metadata = cast(list[list[torch.Size]], gathered_dim_metadata)
 
         data: list = [
@@ -748,6 +759,7 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
 
 
 # adapted from https://github.com/huggingface/diffusers/blob/e7ffeae0a191f710881d1fbde00cd6ff025e81f2/src/diffusers/models/autoencoders/vae.py#L691
+@register_conditioning_container
 class DiagonalGaussianDistribution:
     def __init__(self, parameters: torch.Tensor, deterministic: bool = False):
         self.parameters = parameters

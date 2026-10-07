@@ -157,7 +157,7 @@ class Session:
             or carry_fill is input_ids_unpadded
         ):
             # Unexpected type or aliased with an origin array (extending it
-            # below would double-append): let _refresh_fill_ids rebuild.
+            # below would double-append): let refresh_fill_ids rebuild.
             carry_fill = None
         else:
             del carry_fill[self.committed_fill_len :]

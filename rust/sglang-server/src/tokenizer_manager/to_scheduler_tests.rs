@@ -102,7 +102,7 @@ fn ids_len(req: &SchedulerRequest) -> usize {
 /// further chunk can be delivered, and tell the scheduler to stop generating.
 ///
 /// Neither releases anything, and nothing needs them to. Release ordering used
-/// to be the delicate part here — `FrontendCall::drop` releasing a rid right
+/// to be the delicate part here — `CoreCall::drop` releasing a rid right
 /// after enqueuing the abort ordered the SEND, not the EFFECT, so a retry of
 /// the same rid could `Register` ahead of the stale abort and be torn down by
 /// it. `Rid::from_client` removes the premise: a retry carries a different
@@ -202,7 +202,7 @@ fn total_tokens_over_context_is_rejected() {
     };
     let err = check_total_tokens(&mut g, &limits).unwrap_err();
     let msg = err.to_string();
-    assert_eq!(err.http_status(), 400);
+    assert!(matches!(err, Error::Validation(_)));
     assert!(msg.contains("total of 103 tokens"), "{msg}");
     assert!(msg.contains("3 tokens from the input"), "{msg}");
     assert!(msg.contains("100 tokens for the completion"), "{msg}");
@@ -291,7 +291,7 @@ fn input_length_is_checked_unconditionally() {
     for max_new_tokens in [None, Some(1)] {
         let err = check_total_tokens(&mut req(max_new_tokens), &limits)
             .expect_err("input == context_len must be rejected (Python uses >=)");
-        assert_eq!(err.http_status(), 400);
+        assert!(matches!(err, Error::Validation(_)));
         assert!(err.to_string().contains("longer than the model's context"));
     }
     // One token shorter fits, with or without a cap.
@@ -338,7 +338,7 @@ fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
     };
     let err = check_total_tokens(&mut g, &limits)
         .expect_err("a clamp that inverts min/max must 400, not ride the wire");
-    assert_eq!(err.http_status(), 400);
+    assert!(matches!(err, Error::Validation(_)));
     assert!(err.to_string().contains("min_new_tokens"), "{err}");
 
     // A clamp that keeps the invariant still clamps.
@@ -362,7 +362,7 @@ fn hidden_states_gated_on_server_support() {
     };
     let disabled = test_limits();
     let err = validate(&mut req(true), &disabled).unwrap_err();
-    assert_eq!(err.http_status(), 400);
+    assert!(matches!(err, Error::Validation(_)));
     assert!(
         err.to_string().contains("--enable-return-hidden-states"),
         "message must name the flag: {err}"
@@ -466,7 +466,7 @@ fn detokenize_negative_ids_reject_before_registration() {
     let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
         panic!("sink must receive the validation error");
     };
-    assert_eq!(err.http_status(), 400);
+    assert!(matches!(err, Error::Validation(_)));
     assert!(err.to_string().contains("out of range"), "{err}");
     assert!(detok_rx.try_recv().is_err(), "shard never hears of it");
     assert!(consumer.drain(16).is_empty());
@@ -525,7 +525,7 @@ fn oversized_rid_is_rejected() {
     let mut req = generate_req(51, SamplingParams::default());
     req.rid = "x".repeat(MAX_RID_LEN + 1).into();
     let err = validate(&mut req, &test_limits()).expect_err("must be rejected");
-    assert_eq!(err.http_status(), 400);
+    assert!(matches!(err, Error::Validation(_)));
     assert!(err.to_string().contains("over the"), "{err}");
 
     // A uuid-sized rid — what Python mints — is nowhere near the cap.
@@ -780,7 +780,7 @@ fn mm_pool_gone_deregisters() {
     let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
         panic!("expected a terminal error frame");
     };
-    assert_eq!(err.http_status(), 500, "{err}");
+    assert!(matches!(err, Error::Internal(_)), "{err}");
     assert!(err.to_string().contains("mm worker pool gone"), "{err}");
     assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
     assert!(matches!(
@@ -1140,7 +1140,7 @@ fn mm_text_prompt_under_skip_tokenizer_init_is_a_400() {
     let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
         panic!("expected a terminal error frame");
     };
-    assert_eq!(err.http_status(), 400, "{err}");
+    assert!(matches!(err, Error::Validation(_)), "{err}");
     assert!(err.to_string().contains("must provide input_ids"), "{err}");
     assert!(detok_rx.try_recv().is_err(), "rejected before registration");
     assert!(mm_rx.try_recv().is_err(), "never reaches the mm pool");
