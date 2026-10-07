@@ -936,11 +936,20 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
-    # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
-    # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
-    # output columns ride along nearly free.
+    # Fold the Kimi-K3 KDA [f_a|b] tail into the wide [q,k,v,g] projection.
+    # The merged N=6288 shape is used only up to MAX_TOKENS below, where decode
+    # is bandwidth bound; larger batches keep the tuned N=6144 split path.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # gfx95 KDA extend via AITER FlashKDA. The model keeps beta as logits and
+    # the kernel sigmoids them. Off by default: tracked interior snapshots and
+    # speculative draft-extend stay on Triton either way.
+    SGLANG_AITER_KDA_FLASH_PREFILL = EnvBool(False)
+    # Activation precision for MXFP4-weight dense linears, independent of the
+    # MoE: "fp4" is the checkpoint's own W4A4, "bf16" dequantizes the weights
+    # at load. bf16 by default: K3 GSM8K scores 0.947 vs fp4's 0.908, for
+    # ~3% decode throughput. Ignored off ROCm (both paths are aiter kernels).
+    SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT = EnvStr("bf16")
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
@@ -963,6 +972,26 @@ class Envs:
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
     SGLANG_AITER_MLA_GLUON = EnvBool(True)
+    # 12-head zero-pad topology (Kimi-K3 TP8) with fp8 KV and no DCP: run MLA
+    # decode/verify on aiter's fp8-Q persistent asm kernels (mla_a8w8_*_ps)
+    # instead of Gluon. Off by default; the asm path is slower at concurrency 1.
+    SGLANG_AITER_MLA_A8W8_ASM = EnvBool(False)
+    # gfx950 fp8 PS-ASM prefill memory-faults for 12-head zero-pad models.
+    # Set to 1 to opt into the 12->16 padded ASM prefill path anyway.
+    SGLANG_AITER_MLA_ZERO_PAD_FP8_PREFILL = EnvBool(False)
+    # gfx950 MLA prefill whose head shape FlyDSL FP8 FMHA can serve
+    # (Kimi-K3 TP8 is 12 heads, QK 192, V 128). Quantize the bf16 Q/K/V
+    # and run that kernel instead of the bf16 opus varlen kernel. The
+    # 12-head PS-ASM pad stays off while this is on.
+    SGLANG_AITER_MLA_FLYDSL_FP8_PREFILL = EnvBool(True)
+    # Fail initialization or a declined launch instead of silently using bf16
+    # FMHA. Intended for benchmark recipes that require FlyDSL provenance.
+    SGLANG_AITER_MLA_FLYDSL_FP8_PREFILL_REQUIRED = EnvBool(False)
+    # For an MXFP4 kv_b_proj on the prefix-prefill path, fuse projection,
+    # K/V split, RoPE concat, and the cast to FP8. FlyDSL then consumes those
+    # unit-scale FP8 K/V tensors directly instead of materializing BF16 K/V
+    # and scanning both tensors again for dynamic per-tensor quantization.
+    SGLANG_AITER_MLA_FLYDSL_FUSED_KV_PROJ = EnvBool(False)
     # Select the AITER MLA kernel for DCP decode. "gluon" preserves the native
     # low-head Triton path; "asm" quantizes the DCP-gathered query to FP8 and
     # runs mla_decode_fwd with persistent metadata and return_lse=True.
@@ -1811,6 +1840,24 @@ class Envs:
     # CustomAllReduceV2 with multicast is available; set 0/1 to override in
     # either direction. See srt/layers/communication/k3_ar_fusion.py.
     SGLANG_K3_AR_FUSION = EnvBool(False)
+    # HIP: fuse the K3 latent all-reduce with RMSNorm via AITER's 2-stage
+    # kernel. Only applies when the combined buffer is already in the 2-stage
+    # AR regime (>= 80 KiB on TP8); smaller sizes stay on split AR + RMSNorm.
+    SGLANG_ROCM_K3_FUSED_AR_RMSNORM = EnvBool(True)
+    # Upper token bound for the fused AR+RMSNorm above; 0 disables the cap.
+    # Measured on MI355X TP8 (bench_fused_ar_rmsnorm.py): fused wins by 5.3% at
+    # 8 tokens, 2.5% at 24, then loses 2.8% at 32 and 13% at 96.
+    SGLANG_ROCM_K3_FUSED_AR_RMSNORM_MAX_TOKENS = EnvInt(24)
+    # HIP: when the fused-front [latent | shared] buffer is larger than the
+    # quick-reduce IPC cap, all-reduce the two slices separately instead of
+    # one NCCL Generic. Keeps ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB=256 (16K
+    # scratch). Decode-sized concatenations stay on a single collective.
+    SGLANG_ROCM_K3_SPLIT_OVERSIZED_MOE_AR = EnvBool(True)
+    # HIP: fold the K3 attn-res prefix add into AITER custom all-reduce.
+    # M in {1,2,4} uses 1-stage; M=8 uses a 2-stage residual epilogue that
+    # folds the add into all-gather. Set MAX_TOKENS=4 for the old policy.
+    SGLANG_ROCM_K3_AR_RESIDUAL = EnvBool(True)
+    SGLANG_ROCM_K3_AR_RESIDUAL_MAX_TOKENS = EnvInt(8)
     # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
     # CustomAllReduceV2's MNNVL push workspace. Auto-probed for checked-in
     # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
@@ -1821,12 +1868,111 @@ class Envs:
     # bank write run on the local shard, then only the normalized attention
     # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
+    # Opt-in Kimi-K3 gfx950 MLA decode path: fuse identity-RoPE Q
+    # materialization, Q concat and latent KV-cache write into AITER's
+    # per-head kernel. Fail closed to the existing split/cat/cache chain.
+    SGLANG_ROCM_K3_AITER_MLA_Q_CACHE_FUSION = EnvBool(False)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # Fold the BM=16 MoE sort into the radix-4 launch for decode-sized M.
+    SGLANG_ROCM_K3_RADIX4_FUSE_SORT = EnvBool(True)
+    # Route Kimi-K3's non-EP merged BF16 MoE front through AITER tuned_gemm.
+    # Gated separately from latent MXFP4 so either can be measured alone.
+    SGLANG_ROCM_K3_AITER_TUNED_MOE_FRONT = EnvBool(False)
+    SGLANG_ROCM_K3_AITER_TUNED_MOE_FRONT_MIN_TOKENS = EnvInt(48)
+    SGLANG_ROCM_K3_AITER_TUNED_MOE_FRONT_MAX_TOKENS = EnvInt(192)
+    # Keep packed MXFP4 copies of the non-EP latent down/up projections and use
+    # them only for large token batches. BF16 weights remain live as fallback.
+    SGLANG_ROCM_K3_MOE_LATENT_MXFP4 = EnvBool(False)
+    SGLANG_ROCM_K3_MOE_LATENT_MXFP4_MIN_TOKENS = EnvInt(2048)
+    # The same structural split as MOE_LATENT_MXFP4 -- run the fused front's
+    # router head as its own small BF16 GEMM so the 3584x7168 latent
+    # down-projection beside it can be quantized -- but in PTPC FP8 rather than
+    # MXFP4, and from decode-sized batches rather than only from 2048 tokens.
+    # MXFP4 is a quarter of the bytes but costs GSM8K 0.951 -> 0.923 on these
+    # two projections; e4m3 keeps a per-channel scale over 7168 values where
+    # MXFP4 keeps 4 bits and a shared exponent per 32.
+    SGLANG_ROCM_K3_MOE_LATENT_FP8 = EnvBool(False)
+    # Defaults to the PTPC FP8 batch floor below, which is where the
+    # activation-quant launch starts paying for itself.
+    SGLANG_ROCM_K3_MOE_LATENT_FP8_MIN_TOKENS = EnvInt(8)
+    # PTPC FP8 (per-token activation, per-channel weight) for the BF16 decode
+    # projections the checkpoint leaves unquantized, halving the weight bytes
+    # those HBM-bound GEMMs stream. The router gate must stay BF16: FP8 logits
+    # move the top-k selection.
+    SGLANG_ROCM_K3_PTPC_FP8 = EnvBool(False)
+    SGLANG_ROCM_K3_PTPC_FP8_MAX_TOKENS = EnvInt(256)
+    # Also take the PTPC FP8 latent-up / shared-down GEMMs from this many tokens
+    # up (0 = never). Between the decode cap and ~4K tokens BF16 hipBLASLt is
+    # faster; at an 8192-token prefill chunk FP8 is 1.8x on latent up
+    # [3584 -> 7168] and 1.4x on shared down [768 -> 7168] on MI355X.
+    SGLANG_ROCM_K3_PTPC_FP8_PREFILL_MIN_TOKENS = EnvInt(0)
+    SGLANG_ROCM_K3_PTPC_FP8_SHARED_DOWN = EnvBool(False)
+    # Dequantize Quark MXFP4 shared experts before the MoE front merge so they
+    # join the full fused front and the PTPC shared-down path (needs
+    # SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT=bf16).
+    SGLANG_ROCM_K3_QUARK_SHARED_FULL_FRONT = EnvBool(False)
+    # Below this batch the projections are launch-latency bound, so the extra
+    # activation-quant launch costs more than the halved weight traffic saves.
+    SGLANG_ROCM_K3_PTPC_FP8_MIN_TOKENS = EnvInt(8)
+    # Quantize the linears an unquantized K3 checkpoint leaves dense to
+    # per-output-channel FP8 after load, giving them the same layout a Quark
+    # export ships so the PTPC paths above can serve them.
+    # The attention block minus the KDA input projection: both o_projs, the MLA
+    # gate and the MLA q/kv projections.
+    SGLANG_ROCM_K3_ONLINE_FP8_ATTN = EnvBool(False)
+    # The KDA input projection, the largest dense block in the model, but one
+    # decode already reads through the group-64 AITER pack
+    # (SGLANG_ROCM_K3_AITER_KDA_GROUP64) while it is BF16. Quantizing it trades
+    # that kernel for an FP8 prefill GEMM plus the merged PTPC decode GEMM, so
+    # it is gated separately.
+    SGLANG_ROCM_K3_ONLINE_FP8_KDA_INPROJ = EnvBool(False)
+    # The shared-expert gate/up projections. The shared-expert down projection
+    # is never converted here -- K3 consumes it as a raw dense [out, in] tensor
+    # outside quant_method -- use SGLANG_ROCM_K3_PTPC_FP8_SHARED_DOWN instead,
+    # which packs a separate FP8 copy and leaves the BF16 weight live.
+    SGLANG_ROCM_K3_ONLINE_FP8_SHARED_EXPERTS = EnvBool(False)
+    # Master switch for the ROCm AITER K3 decode path: the MXFP4 SiTU MoE
+    # runner, the fused MoE front and the AITER-backed attention projections.
+    SGLANG_ROCM_K3_AITER_OPT = EnvBool(False)
+    # Per-operator opt-ins for the gfx950 FlyDSL specializations. Each one
+    # fail-closes to the split GEMM chain when the chip, shape or AITER build
+    # cannot service it, so enabling one on unsupported hardware is a no-op.
+    SGLANG_ROCM_K3_AITER_MLA_GATE = EnvBool(False)
+    SGLANG_ROCM_K3_AITER_KDA_GROUP64 = EnvBool(False)
+    SGLANG_ROCM_K3_AITER_MOE_PREROUTE_FP8 = EnvBool(False)
+    SGLANG_ROCM_K3_AITER_LATENT_TAIL_FP8 = EnvBool(False)
+    # Extend the KDA and MoE pre-route fusions from the single-token bucket to
+    # two tokens.
+    SGLANG_ROCM_K3_AITER_B2_FUSIONS = EnvBool(False)
+    # Route two- and four-token MoE decode through the cooperative FlyDSL
+    # tri-projection, which returns the shared expert already SiTU-activated.
+    SGLANG_ROCM_K3_PREROUTE_PREACTIVATED_SHARED = EnvBool(False)
+    # Launch geometry for that cooperative kernel: compute units, waves per
+    # block, waves per execution unit, and the weight-load cache modifier.
+    SGLANG_ROCM_K3_PREROUTE_COOP_CU = EnvInt(256)
+    SGLANG_ROCM_K3_PREROUTE_COOP_WPB = EnvInt(8)
+    SGLANG_ROCM_K3_PREROUTE_COOP_WPE = EnvInt(3)
+    SGLANG_ROCM_K3_PREROUTE_COOP_WCM = EnvInt(3)
+    # Where the K3 FlyDSL kernels come from: "auto" prefers the SGLang copy and
+    # falls back to AITER, "sglang" and "aiter" pin one source.
+    SGLANG_ROCM_K3_FLYDSL_SOURCE = EnvStr("auto")
+    # Set to "aiter" to defer the KDA f_b projection into AITER's fused gfx950
+    # decode kernel instead of running it as a separate GEMM.
+    SGLANG_ROCM_K3_KDA_FUSED_BACKEND = EnvStr("")
+    # Restore the pre-tuning (rows_per_wave, weight_cache_modifier) pair for
+    # the KDA group64 projection so the per-bucket tuning can be A/B'd.
+    SGLANG_ROCM_K3_KDA_GROUP64_LEGACY_LAUNCH = EnvBool(False)
+    # Use the per-bank-depth num_warps / waves_per_eu for the ROCm
+    # attention-residual kernels; set 0 for the untuned launch.
+    SGLANG_ROCM_K3_ATTN_RES_TUNED_LAUNCH = EnvBool(True)
+    # Prepend an SGLang-shipped BF16 tuned-GEMM profile for M=16384 to AITER's
+    # config search path. Read before any import can initialize AITER_CONFIGS.
+    SGLANG_ROCM_K3_AITER_M16384_PROFILE = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
