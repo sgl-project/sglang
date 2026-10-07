@@ -335,10 +335,15 @@ class TestKVLocPlan(unittest.TestCase):
 
         with patch.object(kv_index_translator, "build_kv_read_table", counting_build):
             # The spaces hold the allocator's translates from when the
-            # translator was built; count through them.
-            for kind, write in ((_FULL, counting_write), (_SWA, counting_swa_write)):
-                self.target._spaces[kind] = msgspec.structs.replace(
-                    self.target.space(kind), write=write
+            # translator was built; count through them. The fused draft's full
+            # space is the target's, and whichever asks first translates it.
+            for reader, kind, write in (
+                (self.target, _FULL, counting_write),
+                (self.fused_draft, _FULL, counting_write),
+                (self.target, _SWA, counting_swa_write),
+            ):
+                reader._spaces[kind] = msgspec.structs.replace(
+                    reader.space(kind), write=write
                 )
             plan = self._plan(read_extent=2)
             draft, verify, extend = (SimpleNamespace() for _ in range(3))
@@ -366,6 +371,34 @@ class TestKVLocPlan(unittest.TestCase):
         self.assertEqual(len(builds), 2)
         self.assertTrue(torch.equal(verify.out_cache_loc, plan.write_physical))
         self.assertIs(extend.out_cache_loc, verify.out_cache_loc)
+
+    def test_the_window_is_translated_when_a_writer_first_needs_it(self):
+        """Building the plan translates nothing, nor does binding a reader
+        that indexes virtual ids (a private draft, which runs first in its
+        iteration); the first reader that indexes physical ids translates the
+        window, once."""
+        writes = []
+        real_write = self.allocator.translate_write_loc
+
+        def counting_write(ids, *a, **kw):
+            writes.append(ids)
+            return real_write(ids, *a, **kw)
+
+        for reader in (self.target, self.fused_draft):
+            reader._spaces[_FULL] = msgspec.structs.replace(
+                reader.space(_FULL), write=counting_write
+            )
+        plan = self._plan()
+        self.assertEqual(len(writes), 0)
+        draft, verify = SimpleNamespace(), SimpleNamespace()
+        plan.bind(draft, self.private_draft)
+        self.assertIs(draft.out_cache_loc, self.window)
+        self.assertEqual(len(writes), 0)
+        plan.bind(verify, self.target)
+        self.assertEqual(len(writes), 1)
+        self.assertIs(plan.write_physical, verify.out_cache_loc)
+        self.assertIs(plan.write_ids(self.fused_draft), verify.out_cache_loc)
+        self.assertEqual(len(writes), 1)
 
     def test_a_stream_read_before_a_table_reader_builds_no_table(self):
         """A stream read before any table reader is gathered and translated
