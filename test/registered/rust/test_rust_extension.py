@@ -590,21 +590,23 @@ crate-type = ["cdylib"]
         self.assertNotIn(module_name, sys.modules)
 
     def test_checked_in_crates_are_discovered_from_wheel_metadata(self):
-        grpc_proto = (rust_extension._RUST_WORKSPACE.parent / "proto").resolve()
+        # No crate reads `proto/` at build time: the generated bindings are
+        # checked in under rust/sglang-api-types (`cargo gen-api`), so the
+        # workspace is every extension's only source input.
         for python_module, package, library, features, source_inputs in (
             (
                 "sglang.srt.rust_extensions._server",
                 "sglang-server",
                 "sglang_server",
                 (),
-                (grpc_proto,),
+                (),
             ),
             (
                 "sglang.srt.rust_extensions._grpc",
                 "sglang-grpc",
                 "sglang_grpc_core",
                 (),
-                (grpc_proto,),
+                (),
             ),
             (
                 "sglang.srt.rust_extensions._multimodal",

@@ -281,6 +281,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         queue.tree_cache = SimpleNamespace(
             evictable_size=MagicMock(return_value=0),
             protected_size=MagicMock(return_value=0),
+            maybe_hand_to_session=lambda req: None,
         )
         queue.scheduler = SimpleNamespace(
             enable_hisparse=True,

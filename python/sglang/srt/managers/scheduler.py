@@ -1826,6 +1826,14 @@ class Scheduler(
             "startup_time": self.startup_time,
         }
 
+        if get_serving().grpc_port is not None and not (
+            get_serving().smg_grpc_mode or get_serving().grpc_mode
+        ):
+            result_dict["kv_event_sources"] = (
+                self.kv_events_publisher.local_kv_event_sources(
+                    self.page_size * get_parallel().dcp_size
+                )
+            )
         return result_dict
 
     def release_host_resources(self) -> None:
@@ -3579,7 +3587,7 @@ class Scheduler(
             )
             req.pending_bootstrap = False
         self._release_aborted_request(req)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -4920,6 +4928,7 @@ class Scheduler(
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        self.dp_attn_adapter.drop_sync_wait_carry()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
@@ -5336,7 +5345,7 @@ class Scheduler(
                     self.hisparse_coordinator.request_finished(req)
                 if req.finished_reason is None:
                     req.finished_reason = FINISH_ABORT()
-                release_kv_cache(req, self.tree_cache)
+                release_kv_cache(req, self.tree_cache, checkpoint=True)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.release_aborted_prefill_waiting_req(req)
 
@@ -5345,7 +5354,7 @@ class Scheduler(
                 DisaggregationMode.PREFILL,
                 DisaggregationMode.DECODE,
             ):
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+                release_kv_cache(req, self.tree_cache, checkpoint=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         if self.dllm_config is not None:
@@ -5357,7 +5366,7 @@ class Scheduler(
                     _make_abort_req(req), req
                 )
                 if req.kv.holds_kv or req.kv.holds_mamba:
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    release_kv_cache(req, self.tree_cache, checkpoint=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
