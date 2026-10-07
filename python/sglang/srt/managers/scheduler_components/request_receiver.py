@@ -63,11 +63,6 @@ class SchedulerRequestReceiver:
     recv_skipper: Any
     input_blocker: Any
     mm_receiver: Any
-    tp_group: Any
-    tp_cpu_group: Any
-    attn_tp_cpu_group: Any
-    attn_cp_cpu_group: Any
-    world_group: Any
     server_args: ServerArgs
     model_config: ModelConfig
     max_recv_per_poll: int
@@ -157,7 +152,7 @@ class SchedulerRequestReceiver:
                 recv_reqs = point_to_point_pyobj(
                     [],
                     get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
-                    self.world_group.cpu_group,
+                    get_parallel().world_group.cpu_group,
                     (get_parallel().pp_rank - 1) * get_parallel().tp_size + dp_offset,
                     get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
                 )
@@ -195,22 +190,24 @@ class SchedulerRequestReceiver:
             if _local_ctrl:
                 control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)
             elif get_parallel().tp_size != 1:
+                tp_group = get_parallel().tp_group
                 control_reqs = broadcast_pyobj(
                     control_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
+                    tp_group.rank,
+                    tp_group.cpu_group,
+                    src=tp_group.ranks[0],
                 )
             recv_reqs = work_reqs + control_reqs
         else:
             if recv_reqs is not None:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
+                tp_group = get_parallel().tp_group
                 recv_reqs = broadcast_pyobj(
                     recv_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
+                    tp_group.rank,
+                    tp_group.cpu_group,
+                    src=tp_group.ranks[0],
                 )
         return recv_reqs
 
@@ -268,11 +265,11 @@ class SchedulerRequestReceiver:
         parallel = get_parallel()
         if parallel.attn_dp_enabled:
             if parallel.attn_tp_size > 1:
-                barrier(group=self.attn_tp_cpu_group)
+                barrier(group=parallel.attn_tp_group.cpu_group)
             if parallel.attn_cp_size > 1:
-                barrier(group=self.attn_cp_cpu_group)
+                barrier(group=parallel.attn_cp_group.cpu_group)
         elif parallel.tp_size > 1:
-            barrier(group=self.tp_cpu_group)
+            barrier(group=parallel.tp_group.cpu_group)
 
         # 2. materialize independently so one bad VLM request does not stop the loop
         failed = torch.zeros(len(tokenized_reqs), dtype=torch.int32)
@@ -292,11 +289,15 @@ class SchedulerRequestReceiver:
         # 3. all ranks reject the same requests before entering model collectives
         if parallel.attn_dp_enabled:
             if parallel.attn_tp_size > 1:
-                all_reduce(failed, op=ReduceOp.MAX, group=self.attn_tp_cpu_group)
+                all_reduce(
+                    failed, op=ReduceOp.MAX, group=parallel.attn_tp_group.cpu_group
+                )
             if parallel.attn_cp_size > 1:
-                all_reduce(failed, op=ReduceOp.MAX, group=self.attn_cp_cpu_group)
+                all_reduce(
+                    failed, op=ReduceOp.MAX, group=parallel.attn_cp_group.cpu_group
+                )
         elif parallel.tp_size > 1:
-            all_reduce(failed, op=ReduceOp.MAX, group=self.tp_cpu_group)
+            all_reduce(failed, op=ReduceOp.MAX, group=parallel.tp_group.cpu_group)
 
         error = MMInputsProcessError(
             "Failed to materialize shared-memory multimodal features on a scheduler rank."

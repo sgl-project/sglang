@@ -464,33 +464,6 @@ __all__ = [
 ]
 
 
-# LoRA SGMV Triton kernels migrated into this group (from lora/triton_ops);
-# registered for inventory. Import them from their modules.
-_TRITON_KERNELS = [
-    ("chunked_embedding_lora_a", "chunked_embedding_lora_a_forward"),
-    ("chunked_sgmv_expand", "chunked_sgmv_lora_expand_forward"),
-    ("chunked_sgmv_shrink", "chunked_sgmv_lora_shrink_forward"),
-    ("embedding_lora_a", "embedding_lora_a_fwd"),
-    ("gate_up_lora_b", "gate_up_lora_b_fwd"),
-    ("qkv_lora_b", "qkv_lora_b_fwd"),
-    ("sgemm_lora_a", "sgemm_lora_a_fwd"),
-    ("sgemm_lora_b", "sgemm_lora_b_fwd"),
-    ("kv_b_lora_absorbed", "step_a_q_fwd"),
-    ("kv_b_lora_absorbed", "step_b_q_fwd"),
-    ("kv_b_lora_absorbed", "step_a_v_fwd"),
-    ("kv_b_lora_absorbed", "step_b_v_fwd"),
-]
-for _mod, _fn in _TRITON_KERNELS:
-    register_kernel(
-        KernelSpec(
-            op=f"gemm.{_fn}",
-            backend=KernelBackend.TRITON,
-            target=f"sglang.kernels.ops.gemm.{_mod}:{_fn}",
-        )
-    )
-del _mod, _fn
-
-
 # Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(
     KernelSpec(
@@ -545,6 +518,50 @@ register_kernel(
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))}
         ),
+    )
+)
+# Mirrors SUPPORTED_CAPABILITIES in ops.gemm.convrot_int8 (pinned by a test).
+_CONVROT_INT8 = frozenset(
+    CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
+    for sm in ((9, 0), (10, 0), (12, 0), (12, 1))
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.convrot_rotate_quantize_activation",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.convrot_int8:convrot_rotate_quantize_activation",
+        capabilities=_CONVROT_INT8,
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description="group-wise regular Hadamard rotation + per-row INT8 quant of BF16 [M, K] -> (int8 [M, K], fp32 [M])",
+        ),
+        description="ConvRot INT8 activation / weight quantizer (sglang.kernels.jit).",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.convrot_int8_fused_linear",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.convrot_int8:convrot_int8_fused_linear",
+        capabilities=_CONVROT_INT8,
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16", "int8"),
+            description="BF16 [M, K] x int8 [N, K] -> BF16 [M, N] with in-kernel rotation, INT8 quant and fused per-row x per-column dequant (+ bias)",
+        ),
+        description="ConvRot INT8 W8A8 linear (sglang.kernels.jit).",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.convrot_int8_linear_prequant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.convrot_int8:convrot_int8_linear_prequant",
+        capabilities=_CONVROT_INT8,
+        format_signature=FormatSignature(
+            supported_dtypes=("int8", "float32", "bfloat16"),
+            description="int8 [M, K] x int8 [N, K] with per-row / per-column fp32 scales -> BF16 [M, N] (+ bias); for linears sharing one rotated input",
+        ),
+        description="ConvRot INT8 GEMM on a pre-quantized activation (sglang.kernels.jit).",
     )
 )
 register_kernel(

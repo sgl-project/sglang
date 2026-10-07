@@ -32,6 +32,10 @@ class TboAttnBackend(AttentionBackend):
     def supports_prefill_cuda_graph_max_context_size(self) -> bool:
         return self.primary.supports_prefill_cuda_graph_max_context_size
 
+    @property
+    def dllm_attention(self):
+        return self.primary.dllm_attention
+
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):
         return cls(
