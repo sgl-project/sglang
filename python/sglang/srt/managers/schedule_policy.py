@@ -945,9 +945,10 @@ class PrefillAdder:
 
         return trunc_len
 
-    def _add_dllm_req(self, req: Req, prefix_len: int):
+    def _add_dllm_req(self, req: Req):
+        prefix_len = req.prefix_len
         trunc_len = self._get_dllm_extend_len(req, prefix_len)
-        req.set_extend_range(prefix_len, prefix_len + trunc_len)
+        req.extend_end = prefix_len + trunc_len
 
         self.can_run_list.append(req)
 
@@ -1019,7 +1020,7 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
-        req.set_extend_range(req.prefix_len, req.prefix_len + new_len)
+        req.extend_end = req.prefix_len + new_len
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
@@ -1030,7 +1031,7 @@ class PrefillAdder:
         )
         self._update_prefill_budget(
             0,
-            req.extend_range.length,
+            req.extend_len,
             max_new_tokens,
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
@@ -1092,11 +1093,11 @@ class PrefillAdder:
         )
         if not reserved:
             raise RuntimeError("chunked request exceeds the sharded assembly scratch")
-        req.set_extend_range(req.prefix_len, req.prefix_len + new_len)
+        req.extend_end = req.prefix_len + new_len
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
-            req.extend_range.length,
+            req.extend_len,
             (
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
                 if not truncated
@@ -1105,7 +1106,7 @@ class PrefillAdder:
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             is_chunked_continuation=True,
-            compute_charge=req.extend_range.length if self.exact_chunk_fill else None,
+            compute_charge=req.extend_len if self.exact_chunk_fill else None,
         )
 
         # Return if chunked prefill not finished
@@ -1212,7 +1213,7 @@ class PrefillAdder:
             ) is not None:
                 return tile_stop
 
-            self._add_dllm_req(req, 0)
+            self._add_dllm_req(req)
         elif (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
             or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
@@ -1228,17 +1229,15 @@ class PrefillAdder:
                 extend_len=cand_extend_input_len,
             ):
                 return AddReqResult.OTHER
-            req.set_extend_range(req.prefix_len, len(req.full_untruncated_fill_ids))
+            req.extend_end = len(req.full_untruncated_fill_ids)
             self.can_run_list.append(req)
             self._update_prefill_budget(
                 0,
-                req.extend_range.length,
+                req.extend_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-                compute_charge=(
-                    req.extend_range.length if self.exact_chunk_fill else None
-                ),
+                compute_charge=(req.extend_len if self.exact_chunk_fill else None),
             )
         else:
             if self.rem_chunk_tokens <= 0:
@@ -1255,7 +1254,7 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             assert req.prefix_len == 0
-            req.set_extend_range(req.prefix_len, req.prefix_len + trunc_len)
+            req.extend_end = req.prefix_len + trunc_len
             self.can_run_list.append(req)
             self.new_chunked_req = req
             self._update_prefill_budget(
@@ -1513,9 +1512,7 @@ class PrefillAdder:
         self, req: Req, admission: _PrefillAdmission, mamba_gap_reserve: int
     ) -> None:
         assert req.prefix_len == admission.prefix_len
-        req.set_extend_range(
-            admission.prefix_len, admission.prefix_len + admission.extend_len
-        )
+        req.extend_end = admission.prefix_len + admission.extend_len
         req.lock = self.tree_cache.lock(req.last_node)
         self.can_run_list.append(req)
         if admission.is_chunked:

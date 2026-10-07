@@ -16,7 +16,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.utils.common import Range
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -26,7 +25,6 @@ def _make_req(
     req_pool_idx: int,
     fill_ids: list,
     prefix_len: int,
-    extend_input_len: int,
     fill_len: int,
 ) -> Req:
     req = Req.__new__(Req)
@@ -35,7 +33,7 @@ def _make_req(
     req.output_ids = array("q")
     req.full_untruncated_fill_ids = array("q", fill_ids)
     req.prefix_len = prefix_len
-    req.extend_range = Range(fill_len - extend_input_len, fill_len)
+    req.extend_end = fill_len
     req.inflight_middle_chunks = 0
     req.host_hit_length = 0
     req.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
@@ -132,7 +130,6 @@ class TestStashGatePreservesPrefix(CustomTestCase):
             req_pool_idx=self.POOL_IDX,
             fill_ids=list(range(self.POST_RESET_FILL_LEN)),
             prefix_len=self.INITIAL_PREFIX_LEN,
-            extend_input_len=fill_len - self.INITIAL_PREFIX_LEN,
             fill_len=fill_len,
         )
         s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=req)
