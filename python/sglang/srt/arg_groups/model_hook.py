@@ -75,12 +75,37 @@ def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
         )
 
 
+# First sgl-deep-gemm release whose fp8_einsum dispatches to SM120 kernels.
+# Other DeepGEMM builds can export the same APIs, and even the SM120 dense
+# kernels, while their fp8_einsum still lacks an SM120 path.
+_SM120_FP8_EINSUM_MIN_SGL_DEEP_GEMM = "0.1.5"
+
+
+def _sm120_fp8_einsum_build_verified() -> bool:
+    from importlib.metadata import PackageNotFoundError, version
+
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        installed = Version(version("sgl-deep-gemm"))
+    except (PackageNotFoundError, InvalidVersion):
+        return False
+    return installed >= Version(_SM120_FP8_EINSUM_MIN_SGL_DEEP_GEMM)
+
+
 def _apply_sm120_fp8_wo_a_gemm_default() -> None:
-    """Keep an explicit setting or the global default on capable builds."""
+    """Default the FP8 W_o_A GEMM on only for verified SM120 DeepGEMM builds.
+
+    An explicit setting is kept on any build that passes the DeepGEMM
+    capability check; other builds stay on BF16 unless the user opts in.
+    """
     from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 
+    flag = envs.SGLANG_OPT_FP8_WO_A_GEMM
     if not DEEPGEMM_SCALE_UE8M0:
-        envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+        flag.set(False)
+    elif not flag.is_set() and not _sm120_fp8_einsum_build_verified():
+        flag.set(False)
 
 
 def _rocm_fp8_wo_a_supported() -> bool:

@@ -2202,63 +2202,62 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         ):
             self.assertEqual(_bailing_moe_v3_overrides(_args(), hf), {})
 
-    def test_sm120_fp8_wo_a_gemm_default_gates_on_deepgemm_capability(self):
-        """The SM120 FP8 W_o_A GEMM override is capability-gated, not a force.
+    def test_sm120_fp8_wo_a_gemm_default_requires_verified_deepgemm(self):
+        """The SM120 FP8 W_o_A GEMM default needs a verified DeepGEMM build.
 
-        Only a build without the DeepGEMM ue8m0 capability gets the GEMM turned
-        off; a capable build must be left untouched so the global default or an
-        explicit setting survives to the later DeepGEMM capability check.
+        A build without the DeepGEMM ue8m0 capability always gets the GEMM
+        turned off. A capable build keeps an explicit setting, but the global
+        default only survives on a release whose fp8_einsum supports SM120.
         """
-        from sglang.srt.arg_groups.model_hook import _apply_sm120_fp8_wo_a_gemm_default
-        from sglang.srt.environ import envs
+        from sglang.srt.arg_groups import model_hook
         from sglang.srt.layers.deep_gemm_wrapper import configurer
 
         field = envs.SGLANG_OPT_FP8_WO_A_GEMM
 
-        def _run(capable):
-            """Call the helper with a stubbed capability; return recorded set()."""
+        def _run(*, capable, verified, explicit):
+            """Call the helper with stubbed build state; return recorded set()."""
             with (
                 patch.object(configurer, "DEEPGEMM_SCALE_UE8M0", capable),
+                patch.object(
+                    model_hook,
+                    "_sm120_fp8_einsum_build_verified",
+                    return_value=verified,
+                ),
+                patch.object(field, "is_set", return_value=explicit),
                 patch.object(field, "set") as mock_set,
             ):
-                _apply_sm120_fp8_wo_a_gemm_default()
+                model_hook._apply_sm120_fp8_wo_a_gemm_default()
                 return mock_set
 
-        # Incapable build: forced off.
-        _run(capable=False).assert_called_once_with(False)
+        _run(capable=False, verified=True, explicit=True).assert_called_once_with(False)
+        _run(capable=True, verified=False, explicit=False).assert_called_once_with(
+            False
+        )
+        _run(capable=True, verified=False, explicit=True).assert_not_called()
+        _run(capable=True, verified=True, explicit=False).assert_not_called()
 
-        # Capable build: untouched, keeping the default or explicit setting.
-        _run(capable=True).assert_not_called()
+    def test_sm120_fp8_einsum_build_verification(self):
+        """Only sgl-deep-gemm releases with SM120 fp8_einsum are verified."""
+        from importlib.metadata import PackageNotFoundError
 
-    def test_sm120_deep_gemm_probe_requires_sm120_kernels(self):
-        """Builds that export the SM120 APIs without SM120 kernels are rejected."""
-        import sys
-        import types
+        from sglang.srt.arg_groups import model_hook
 
-        from sglang.srt.layers.deep_gemm_wrapper import configurer
+        def _verified(installed):
+            def _version(name):
+                self.assertEqual(name, "sgl-deep-gemm")
+                if installed is None:
+                    raise PackageNotFoundError(name)
+                return installed
 
-        def _probe(with_sm120_kernel):
-            with tempfile.TemporaryDirectory() as root:
-                package_dir = os.path.join(root, "deep_gemm")
-                impls_dir = os.path.join(package_dir, "include", "deep_gemm", "impls")
-                os.makedirs(impls_dir)
-                if with_sm120_kernel:
-                    open(
-                        os.path.join(impls_dir, "sm120_fp8_fp4_gemm_1d1d.cuh"), "w"
-                    ).close()
-                fake = types.ModuleType("deep_gemm")
-                fake.__file__ = os.path.join(package_dir, "__init__.py")
-                for name in (
-                    "fp8_einsum",
-                    "m_grouped_fp8_fp4_gemm_nt_contiguous",
-                    "transform_sf_into_required_layout",
-                ):
-                    setattr(fake, name, lambda *args, **kwargs: None)
-                with patch.dict(sys.modules, {"deep_gemm": fake}):
-                    return configurer._sm120_deep_gemm_apis_available()
+            with patch("importlib.metadata.version", _version):
+                return model_hook._sm120_fp8_einsum_build_verified()
 
-        self.assertFalse(_probe(with_sm120_kernel=False))
-        self.assertTrue(_probe(with_sm120_kernel=True))
+        # Other DeepGEMM builds export the same APIs without SM120 fp8_einsum.
+        self.assertFalse(_verified(None))
+        self.assertFalse(_verified("0.1.4.post1"))
+        self.assertFalse(_verified("unknown"))
+        self.assertTrue(_verified("0.1.5"))
+        self.assertTrue(_verified("0.2.1.post1"))
 
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (

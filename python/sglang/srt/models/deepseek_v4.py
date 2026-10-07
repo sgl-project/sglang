@@ -3,7 +3,6 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
-import re
 import time
 from array import array
 from contextlib import contextmanager, nullcontext
@@ -273,9 +272,11 @@ def _fp8_config_skips_wo_a(quant_config: Fp8Config) -> bool:
     ignored = quant_config.ignored_layers
     if not ignored:
         return False
+    # The layer index is the only numeric component of a wo_a prefix, so an
+    # entry that matches some layer either names its index or matches layer 0.
     layer_ids = {"0"}
     for entry in ignored:
-        layer_ids.update(re.findall(r"(?:^|\.)layers\.(\d+)(?=\.|$)", entry))
+        layer_ids.update(p for p in entry.rstrip(".").split(".") if p.isdigit())
     prefixes = [f"model.layers.{i}.self_attn.wo_a" for i in sorted(layer_ids)]
     prefixes.append("model.decoder.self_attn.wo_a")
     return any(
@@ -5439,6 +5440,10 @@ def _dequant_fp8_wo_a_streaming(
     emitted = False
 
     for name, tensor in weights:
+        if name.endswith(".wo_a.weight") and tensor.dtype != torch.float8_e4m3fn:
+            # A wo_a excluded from quantization is stored unquantized.
+            yield name, tensor
+            continue
         if name.endswith(".wo_a.weight"):
             prefix = name[: -len(".weight")]
             bucket = pending.setdefault(prefix, {})
