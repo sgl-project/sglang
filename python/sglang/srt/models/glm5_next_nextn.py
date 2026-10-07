@@ -14,6 +14,13 @@
 
 import logging
 
+import torch
+
+from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
+    cp_shard_model_inputs,
+    is_cp_active,
+)
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.srt.models.utils import WeightsMapper
@@ -22,6 +29,32 @@ logger = logging.getLogger(__name__)
 
 
 class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
+    supports_full_sequence_cp = True
+
+    @torch.no_grad()
+    def forward(self, input_ids, positions, forward_batch, pp_proxy_tensors=None):
+        if not is_cp_active(forward_batch):
+            return super().forward(
+                input_ids, positions, forward_batch, pp_proxy_tensors
+            )
+
+        # The worker has rotated the target's multimodal embeddings per request.
+        # Fill each appended token while indices still address full sequences,
+        # then shard embeddings and target hidden states at the same boundary.
+        input_embeds = self.model.embed_input_ids(input_ids, forward_batch)
+        with cp_shard_model_inputs(
+            input_embeds, positions, forward_batch, input_ids
+        ) as (local_embeds, local_positions, local_ids):
+            hidden_states = self.model(
+                local_ids, local_positions, forward_batch, input_embeds=local_embeds
+            )
+        hidden_states = cp_gather_after_forward(
+            hidden_states, forward_batch, torch.cuda.current_stream()
+        )
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
+
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
         text_config = getattr(config, "text_config", config)

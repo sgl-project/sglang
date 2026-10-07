@@ -31,8 +31,17 @@ def resolve_cp_tp_group_sharing(server_args: Any, model_config: Any) -> None:
             f"{architecture} CP/TP group sharing requires --cp-strategy {strategy}."
         )
 
+    # This hook runs before speculative defaults and NEXTN alias resolution.
+    # Native MTP keeps the target's CP/TP placement; other draft architectures
+    # have their own topology and model-boundary contracts.
+    if cfg.speculative_algorithm is not None and (
+        cfg.speculative_algorithm.upper() not in ("EAGLE", "NEXTN")
+        or cfg.speculative_draft_model_path not in (None, cfg.model_path)
+        or cfg.speculative_eagle_topk not in (None, 1)
+    ):
+        raise ValueError("CP/TP group sharing only supports native MTP with top-k 1.")
+
     unsupported = {
-        "speculative-algorithm": cfg.speculative_algorithm is not None,
         "dcp-size > 1": cfg.dcp_size > 1,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,

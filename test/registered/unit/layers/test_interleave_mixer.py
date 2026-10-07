@@ -15,6 +15,102 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestInterleaveMixer(CustomTestCase):
+    def test_mtp_prefill_shards_rotated_mm_embeddings_and_target_states_together(self):
+        """Draft CP must fill MM request tails before sharding, without looking up
+        image sentinel IDs, and restore target states before full-sequence logits.
+        """
+        from sglang.srt.layers.cp import base
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+        from sglang.srt.models.deepseek_nextn import DeepseekModelNextN
+        from sglang.srt.models.glm5_next_nextn import (
+            Glm5NextForConditionalGenerationNextN,
+        )
+        from sglang.srt.runtime_context import get_context, get_parallel
+
+        ids = torch.tensor([1, 900000, 900000, 2, 900000, 3, 4])
+        positions = torch.tensor([1, 2, 3, 4, 1, 2, 3])
+        embeddings = torch.arange(14).reshape(7, 2).float()
+        target_states = embeddings + 100
+        expected_embeddings = embeddings.clone()
+        expected_embeddings[[3, 6]] = torch.tensor([[2.0, 2.0], [4.0, 4.0]])
+        expected = expected_embeddings + target_states
+        packed = torch.zeros(2, 4, 2)
+        packed[0, :4] = expected[::2]
+        packed[1, :3] = expected[1::2]
+
+        class DraftBody(DeepseekModelNextN):
+            def __init__(self):
+                torch.nn.Module.__init__(self)
+                self.embed_tokens = torch.nn.Embedding.from_pretrained(
+                    torch.arange(8).float().repeat_interleave(2).reshape(8, 2)
+                )
+
+            def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+                logical = len(ids[rank::2])
+                torch.testing.assert_close(input_ids[:logical], ids[rank::2])
+                torch.testing.assert_close(
+                    positions[:logical], batch.positions[rank::2]
+                )
+                return input_embeds + forward_batch.spec_info.hidden_states
+
+        model = Glm5NextForConditionalGenerationNextN.__new__(
+            Glm5NextForConditionalGenerationNextN
+        )
+        torch.nn.Module.__init__(model)
+        model.model = DraftBody()
+        model.lm_head = None
+        model.pp_group = SimpleNamespace(is_last_rank=True)
+        model.logits_processor = lambda ids, states, *args, **kw: states
+        runner = SimpleNamespace(model_runner=SimpleNamespace(model=model))
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            input_ids=ids,
+            positions=positions,
+            mm_input_embeds=embeddings.clone(),
+            contains_mm_inputs=lambda: True,
+            extend_start_loc=torch.tensor([0, 4]),
+            extend_seq_lens=torch.tensor([4, 3]),
+            extend_seq_lens_cpu=[4, 3],
+            spec_info=SimpleNamespace(hidden_states=target_states),
+            attn_cp_metadata=InterleaveContextParallelMetadata(
+                total_seq_lens=7,
+                per_rank_actual_token=[4, 4],
+                per_rank_logical_token=[4, 3],
+            ),
+        )
+        for rank in range(2):
+
+            def gather(output, local):
+                torch.testing.assert_close(local, packed[rank])
+                output.copy_(packed.flatten(0, 1))
+
+            with (
+                self.subTest(rank=rank),
+                get_context().override_server_args(
+                    tp_size=2,
+                    attn_cp_size=2,
+                    enable_prefill_cp=True,
+                    cp_strategy="interleave",
+                    cp_tp_group_sharing=True,
+                ),
+                get_parallel().override(
+                    tp_rank=rank, attn_cp_rank=rank, attn_tp_rank=0, attn_cp_group=None
+                ),
+                patch.object(base, "_STRATEGY", interleave.InterleaveCPStrategy(2)),
+                patch.object(interleave, "attn_cp_all_gather_into_tensor", gather),
+                patch.object(interleave, "is_allocation_symmetric", return_value=False),
+                patch("torch.cuda.current_stream", return_value=None),
+            ):
+                # Exercise the same model-boundary dispatch as the eager runner.
+                if getattr(model, "supports_full_sequence_cp", False):
+                    result = model(ids, positions, batch)
+                else:
+                    result = EagerRunner._execute_extend_cp(runner, batch, {})
+                torch.testing.assert_close(result, expected)
+                self.assertIs(batch.spec_info.hidden_states, target_states)
+                self.assertFalse(hasattr(batch, "input_ids_global"))
+
     def test_wrapper_preserves_explicit_embedding_overrides(self):
         """Full-sequence CP must not replace caller embeddings with token lookup."""
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
