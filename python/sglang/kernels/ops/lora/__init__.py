@@ -1,8 +1,10 @@
-"""LoRA adapter kernels that only the LoRA runtime calls: ``dense/`` SGMV GEMMs,
-``moe/`` fused MoE-LoRA, and the experimental TRT-LLM LoRA path."""
+"""LoRA kernels: shared routing/GEMMs, legacy dense adapters and MoE stages.
+
+Runtime plans/providers select implementations; this package records lazy metadata.
+"""
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
 
 # Triton kernels registered for inventory. Import them from their modules.
 _TRITON_KERNELS = [
@@ -30,5 +32,21 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+
+# Host launch APIs; importing this inventory does not import their implementations.
+_ENGINE_TRITON_KERNELS = [
+    ("common.routing", "build_route", "build_route"),
+]
+for _mod, _fn, _op in _ENGINE_TRITON_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"lora.{_op}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.lora.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.CUDA}),
+        )
+    )
+del _mod, _fn, _op
 
 __all__: list[str] = []

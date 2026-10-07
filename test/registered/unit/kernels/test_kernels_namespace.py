@@ -341,5 +341,30 @@ def test_deep_select_spec_matches_wrapper_architectures():
     )
 
 
+_LORA_ENGINE_APIS = (("common.routing", "build_route", "build_route"),)
+
+
+@pytest.mark.parametrize("module, function, op", _LORA_ENGINE_APIS)
+def test_lora_engine_launch_apis_are_inventoried(module, function, op):
+    spec = K.select_kernel(f"lora.{op}", backend=KernelBackend.TRITON)
+    assert spec.target == f"sglang.kernels.ops.lora.{module}:{function}"
+    # Validate the lazy target without importing CUDA/Triton/CuTe implementations.
+    root = Path(K.__file__).resolve().parent / "ops/lora"
+    tree = ast.parse(root.joinpath(*module.split(".")).with_suffix(".py").read_text())
+    assert any(
+        isinstance(node, ast.FunctionDef) and node.name == function
+        for node in tree.body
+    )
+
+
+@pytest.mark.parametrize(
+    "platform, eligible", [(_CPU, False), (_HIP, False), (_SM90, True), (_SM100, True)]
+)
+def test_lora_engine_inventory_is_cuda_only(platform, eligible):
+    for _, _, op in _LORA_ENGINE_APIS:
+        spec = K.select_kernel(f"lora.{op}", backend=KernelBackend.TRITON)
+        assert K.capabilities_satisfied(spec.capabilities, platform) is eligible
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
