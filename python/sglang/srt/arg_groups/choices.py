@@ -103,6 +103,7 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
     "fa3",
     "fa4",
     "triton",
+    "aiter",
     "ascend",
     "trtllm_mha",
     "intel_xpu",

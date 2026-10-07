@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.overrides import (
@@ -21,6 +22,8 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
 
     if cfg.speculative_algorithm is None:
         return
+
+    _apply_rocm_dspark_atom_kernels(server_args, cfg)
 
     # Use the fused Kimi-K3/DSPARK CuTeDSL kernel for KDA target verification.
     # Decode is left free (its bf16-ssm SM100+ flashinfer default is fine -- the
@@ -52,6 +55,38 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
         logger.info(
             "Kimi hybrid DSPARK: defaulting "
             "--speculative-draft-attention-backend to trtllm_mha."
+        )
+
+
+def _apply_rocm_dspark_atom_kernels(server_args: ServerArgs, cfg) -> None:
+    """Match ATOM's ROCm DSPARK kernels.
+
+    ATOM's MoE is SiTU A4W4 (``gemm1_a4w4`` / ``gemm2_a4w4``). The recipe's
+    ``AITER_SITUV2_A8W4=1`` and ``AITER_FLYDSL_FORCE=1`` select FlyDSL
+    ``mfma_moe1`` / ``opus_moe_stage2`` instead. ATOM also keeps the draft on
+    aiter; ``aiter`` is not a draft-backend choice, so the prefill backend is
+    rejected and the draft falls back to the triton ``_verify_mla_prefix_stage1``
+    kernel. Override both before workers load weights.
+    """
+    if not get_platform().is_hip or cfg.speculative_algorithm != "DSPARK":
+        return
+    os.environ["AITER_SITUV2_A4W4"] = "1"
+    os.environ["AITER_SITUV2_A8W4"] = "0"
+    os.environ["AITER_FLYDSL_STAGE2_FP8"] = "1"
+    os.environ["AITER_FLYDSL_FORCE"] = "0"
+    logger.info(
+        "Kimi DSPARK on ROCm: MoE env set to ATOM A4W4 "
+        "(AITER_SITUV2_A4W4=1, AITER_SITUV2_A8W4=0, AITER_FLYDSL_FORCE=0)."
+    )
+    if cfg.speculative_draft_attention_backend is None:
+        declare_resolution(
+            server_args,
+            "apply_kimi_k3_spec_backend_defaults",
+            speculative_draft_attention_backend="aiter",
+        )
+        logger.info(
+            "Kimi DSPARK on ROCm: defaulting "
+            "--speculative-draft-attention-backend to aiter."
         )
 
 
