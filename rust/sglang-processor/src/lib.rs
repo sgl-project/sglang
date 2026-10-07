@@ -7,24 +7,33 @@
 
 mod error;
 mod model_files;
+#[cfg(feature = "parser")]
 mod parser;
+#[cfg(feature = "render")]
 mod render;
+#[cfg(feature = "tokenizer")]
 mod tokenizer;
 
 pub use error::ProcessorError;
 pub use model_files::{resolve_model_file, resolve_tokenizer_file};
+#[cfg(feature = "parser")]
 pub use parser::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
     dynamo_tool_parser_name,
 };
+#[cfg(feature = "render")]
 pub use render::{
     ChatFormatter, ChatFormatterOptions, DeepSeekV4Profile, OneOrMany, TemplateError,
     ThinkingTemplates, load_chat_formatter, select_chat_formatter,
 };
+#[cfg(feature = "tokenizer")]
 pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
 
 // Dynamo crates whose types appear in this crate's public API. Hosts use these
 // re-exports so their Dynamo versions always match the processor's.
+#[cfg(any(feature = "parser", feature = "render"))]
 pub use dynamo_protocols;
+#[cfg(feature = "render")]
 pub use dynamo_renderer;
+#[cfg(feature = "tokenizer")]
 pub use dynamo_tokenizers;

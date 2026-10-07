@@ -2399,6 +2399,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Read a node's device->host backup spec (device value + component transfers) now."""
         return self._build_backup_spec(self.node_by_id(node_id))
 
+    def buffer_backup_pool_keys(
+        self, node_id: NodeId, hash_values: list[str]
+    ) -> dict[ComponentType, dict[PoolName, list[str]]]:
+        node = self.node_by_id(node_id)
+        named: dict[ComponentType, dict[PoolName, list[str]]] = {}
+        for comp in self.components:
+            pool_keys = comp.buffer_backup_keys(node, hash_values)
+            if pool_keys:
+                named[comp.component_type] = pool_keys
+        return named
+
+    def build_backup_kv_action(self, node_id: NodeId) -> BackupKV:
+        return self._build_backup_kv_action(self.node_by_id(node_id))
+
     def _build_backup_spec(self, node: UnifiedTreeNode):
         """Gather missing Full and component transfers for Host backup."""
         device_value = node.component_data[BASE_COMPONENT_TYPE].value

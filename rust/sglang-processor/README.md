@@ -11,6 +11,10 @@ validation, transport and runtime.
 Hosts use the re-exported `dynamo_protocols`, `dynamo_renderer` and
 `dynamo_tokenizers` so their Dynamo versions match the processor's.
 
+The `render`, `tokenizer` and `parser` features (all default) gate each
+component and its Dynamo crate, so a host that only renders and tokenizes
+skips `dynamo-parsers`.
+
 ```text
 src/
   model_files.rs   find files in a model dir or the HF cache

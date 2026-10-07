@@ -1,5 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from https://github.com/junjun3518/alias-free-torch under the Apache License 2.0
+"""Alias-free-resampling DSP primitives shared by the BigVGAN-lineage vocoders.
+
+Generic, architecture-agnostic building blocks (Kaiser-windowed-sinc low-pass
+filtering, 2x up/down resampling, and the up-activate-down ``Activation1d``
+wrapper) -- not specific to any one model. Previously duplicated
+byte-for-byte between ``kandinsky6_audio_vae/alias_free.py`` and
+``minimax_h3_audio_vae/alias_free.py``; both ``BigVGANV2``/``BigVGAN``
+implementations now import ``Activation1d`` from here instead, matching this
+package's existing cross-model-shared-VAE-code convention (see ``common.py``
+in this same directory, reused by ``dac.py``, ``ltx_2_audio.py``,
+``wanvae.py``, ``hunyuanvae.py``, and others).
+"""
 
 import math
 
