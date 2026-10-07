@@ -189,7 +189,7 @@ def build_dense_model(
 
 def load_dense(model, mlp, *, mtp=False, changed=False, compatible=False, offset=0):
     projection = base(mlp.gate_up_proj)
-    rank, size = rank_size(projection)[0], rank_size(projection)[1]
+    rank, size = rank_size(projection)
     device, dtype = projection.weight.device, projection.weight.dtype
     full = values(
         (sum(projection.output_sizes), projection.input_size),
@@ -218,7 +218,8 @@ def load_dense(model, mlp, *, mtp=False, changed=False, compatible=False, offset
             ]
         )
     torch.testing.assert_close(projection.weight, expected)
-    expected_down = full_down.chunk(rank_size(down)[1], dim=1)[rank_size(down)[0]]
+    down_rank, down_size = rank_size(down)
+    expected_down = full_down.chunk(down_size, dim=1)[down_rank]
     torch.testing.assert_close(down.weight, expected_down)
     expected_prefix = "model" if mtp else "llm.layers.0"
     assert loaded == {
