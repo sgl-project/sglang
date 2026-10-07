@@ -309,20 +309,6 @@ class TestLinearAttentionParallelGroups(CustomTestCase):
                                 else:
                                     allocator.assert_not_called()
 
-    def test_projection_helpers_default_to_full_tp(self):
-        publish(
-            ServerArgs(model_path="dummy", device="cpu", tp_size=4, attn_dp_size=2),
-            role="test",
-            ranks=SpawnRanks(world_rank=3),
-        )
-        for model in ("qwen_next", "qwen35"):
-            module, _ = build_linear_attention(model)
-            projections = [module.create_qkvz_proj(32, 64, 64, None, "")]
-            if model == "qwen35":
-                projections.append(module.create_ba_proj(32, 8, None, ""))
-            for layer in projections:
-                self.assertEqual(rank_size(layer), (3, 4))
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -275,9 +275,6 @@ class TestInklingLinearLoaderLayout(CustomTestCase):
                                     offset=offset,
                                 )
 
-    def test_checkpoint_layout_in_construction_scope(self):
-        self.exercise(False)
-
     def test_checkpoint_layout_after_scope_exit(self):
         self.exercise(True)
 

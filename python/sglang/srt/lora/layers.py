@@ -80,9 +80,7 @@ class BaseLayerWithLoRA(nn.Module):
     def set_lora_info(self, *args):
         pass
 
-    # Weight slicing derives the shard rank from the wrapped base layer
-    # (base_layer.tp_group.rank_in_group): under DP attention, attention layers are built
-    # on the attn-TP group, so the outer/global TP rank would overshoot.
+    # LoRA slices follow the base layer's group; attention TP can differ from TP.
     def slice_lora_a_weights(self, A: torch.Tensor):
         pass
 

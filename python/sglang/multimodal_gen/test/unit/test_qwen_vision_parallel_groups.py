@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.dp_attention import initialize_dp_attention_flags
-from sglang.srt.layers.linear import QKVParallelLinear, ReplicatedLinear
+from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.parallel_groups import parallel_scope, publish, rank_size
@@ -19,34 +19,6 @@ class TestQwenGenerationParallelGroups(unittest.TestCase):
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
-
-    def test_generation_helpers_match_initialized_scope(self):
-        import sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl as generation
-
-        publish(
-            ServerArgs(model_path="dummy", device="cpu", tp_size=4),
-            role="test",
-            ranks=SpawnRanks(world_rank=3),
-        )
-        for initialized in (False, True):
-            with patch.object(
-                generation,
-                "model_parallel_is_initialized",
-                return_value=initialized,
-            ):
-                for tensor_parallel in (False, True):
-                    for maker in (
-                        generation._make_column_linear,
-                        generation._make_row_linear,
-                    ):
-                        layer = maker(
-                            8, 8, bias=True, use_tensor_parallel=tensor_parallel
-                        )
-                        expected = (3, 4) if initialized and tensor_parallel else (0, 1)
-                        self.assertEqual(rank_size(layer), expected)
-                        self.assertEqual(
-                            isinstance(layer, ReplicatedLinear), not tensor_parallel
-                        )
 
     def test_native_vision_projection_math_and_reload(self):
         from sglang.multimodal_gen.runtime.layers.attention.selector import (

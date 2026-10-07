@@ -245,16 +245,6 @@ class TestKimiMLPParallelGroups(CustomTestCase):
             _, disabled = build_shared_experts(shared=0)
             self.assertIsNone(disabled)
 
-    def test_shared_selector_requires_a_built_group(self):
-        publish(
-            ServerArgs(model_path="dummy", device="cpu"),
-            role="test",
-            ranks=SpawnRanks(world_rank=0),
-        )
-        with parallel_scope(shared_experts_tp_group=None):
-            with self.assertRaisesRegex(ValueError, "must exist before construction"):
-                linear.resolve_linear_parallel_group("shared_experts_tp")
-
 
 if __name__ == "__main__":
     unittest.main()

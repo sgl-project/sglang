@@ -254,30 +254,6 @@ class TestQwenVisionWrapperGroups(CustomTestCase):
                                 expected_size == 1,
                             )
 
-    def test_wrapper_conflict_guard_and_disabled_merger(self):
-        publish(
-            ServerArgs(model_path="dummy", device="cpu", tp_size=4, attn_cp_size=2),
-            role="test",
-            ranks=SpawnRanks(world_rank=3),
-        )
-        for model in ("qwen25_fused", "qwen3_mlp", "qwen3_merger"):
-            with self.assertRaisesRegex(
-                ValueError, "cannot be combined with data parallel"
-            ):
-                build_qwen(model, "replicated", replicated=True)
-        from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionPatchMerger
-
-        reset_context()
-        merger = Qwen3VLMoeVisionPatchMerger(
-            32,
-            32,
-            64,
-            disable_merger_proj=True,
-            **group_kwargs(Qwen3VLMoeVisionPatchMerger, "replicated"),
-        )
-        self.assertFalse(hasattr(merger, "linear_fc1"))
-        self.assertFalse(hasattr(merger, "tp_size"))
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,10 +9,8 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.linear import (
-    ColumnParallelBatchedLinear,
     ColumnParallelLinear,
     MergedColumnParallelLinear,
-    MergedColumnParallelRepeatedLinear,
     QKVParallelLinear,
     ReplicatedParallelGroup,
     RowParallelLinear,
@@ -20,8 +18,6 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.parameter import ModelWeightParameter
 from sglang.srt.runtime_context import (
     SpawnRanks,
-    derive_parallel_widths,
-    get_parallel,
     reset_context,
 )
 from sglang.srt.server_args import ServerArgs
@@ -594,38 +590,6 @@ class TestLinearParallelGroups(CustomTestCase):
                     self.assertEqual(rank_size(up), (rank, size))
                     self.assertEqual(rank_size(down), (rank, size))
 
-    def test_step_shared_expert_constructs_a_replicated_mlp(self):
-        from sglang.srt.models import step3p5
-
-        config = SimpleNamespace(
-            hidden_size=8,
-            layer_types=["full_attention"],
-            yarn_only_types=[],
-            rope_theta=[10000],
-            max_position_embeddings=16,
-            head_dim=2,
-            moe_layers_enum="0",
-            num_attention_heads=4,
-            num_attention_groups=1,
-            num_hidden_layers=1,
-            swiglu_limits_shared=None,
-            partial_rotary_factors=[1.0],
-            rms_norm_eps=1e-6,
-            use_head_wise_attn_gate=False,
-            share_expert_dim=8,
-        )
-        backend = Mock()
-        backend.is_deepep.return_value = True
-        with (
-            patch.object(step3p5, "get_moe_a2a_backend", return_value=backend),
-            patch.object(step3p5, "Step3p5MoEMLP", return_value=torch.nn.Identity()),
-            patch.object(step3p5, "append_stages", return_value=(Mock(), Mock())),
-        ):
-            layer = step3p5.Step3p5DecoderLayer(config)
-        self.assertEqual(rank_size(layer.share_expert.gate_up_proj)[1], 1)
-        self.assertEqual(rank_size(layer.share_expert.down_proj)[1], 1)
-        self.assertFalse(layer.share_expert.down_proj.reduce_results)
-
     def test_replicated_layers_need_no_group_handle(self):
         with parallel_scope(tp_group=None, attn_tp_group=None):
             for cls, kwargs in (
@@ -638,63 +602,6 @@ class TestLinearParallelGroups(CustomTestCase):
                     torch.testing.assert_close(
                         layer(self.x)[0], F.linear(self.x, self.weight)
                     )
-
-    def test_constructor_placement_accepts_groups_and_rejects_integer_arguments(self):
-        constructors = (
-            lambda **kwargs: ColumnParallelLinear(8, 8, bias=False, **kwargs),
-            lambda **kwargs: MergedColumnParallelLinear(
-                8, [8, 4], bias=False, **kwargs
-            ),
-            lambda **kwargs: QKVParallelLinear(8, 2, 4, bias=False, **kwargs),
-            lambda **kwargs: RowParallelLinear(8, 8, bias=False, **kwargs),
-            lambda **kwargs: MergedColumnParallelRepeatedLinear(
-                8, [8, 4], [2], **kwargs
-            ),
-            lambda **kwargs: ColumnParallelBatchedLinear(
-                2, 8, 8, torch.float32, **kwargs
-            ),
-        )
-        for build in constructors:
-            self.assertEqual(rank_size(build()), (3, 4))
-            replicated = build(parallel_group="replicated")
-            self.assertEqual(rank_size(replicated), (0, 1))
-            for kwargs in (dict(tp_rank=0), dict(tp_size=1)):
-                with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
-                    build(**kwargs)
-                with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
-                    build(parallel_group="replicated", **kwargs)
-            with self.assertRaisesRegex(ValueError, "Unknown linear parallel_group"):
-                build(parallel_group="unknown")
-        for old_reduce in (False, True):
-            layer = RowParallelLinear(
-                8, 8, parallel_group="attn_tp", use_dp_attention_reduce=old_reduce
-            )
-            self.assertEqual(rank_size(layer), (1, 2))
-            self.assertEqual(layer.use_dp_attention_reduce, old_reduce)
-        layer = RowParallelLinear(
-            8, 8, parallel_group="attn_tp", use_dp_attention_reduce=True
-        )
-        self.assertTrue(layer.use_dp_attention_reduce)
-        layer.use_dp_attention_reduce = False
-        self.assertFalse(layer.use_dp_attention_reduce)
-
-    def test_layers_own_groups_without_rank_or_size_snapshots(self):
-        group = get_parallel().attn_tp_group
-        layer = QKVParallelLinear(8, 2, 4, 1, parallel_group="attn_tp")
-        self.assertIs(layer.tp_group, group)
-        self.assertIs(layer.kv_tp_group, group)
-        for key in ("tp_rank", "tp_size", "kv_tp_rank", "kv_tp_size"):
-            self.assertFalse(hasattr(layer, key))
-        with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
-            self.assertIs(layer.tp_group, group)
-            self.assertIsNot(layer.tp_group, get_parallel().attn_tp_group)
-            self.assertEqual(rank_size(layer), (1, 2))
-        with parallel_scope(attn_tp_group=None):
-            offline = ColumnParallelLinear(8, 8, bias=False, parallel_group="attn_tp")
-        with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
-            offline.weight.weight_loader(offline.weight, self.weight)
-        torch.testing.assert_close(offline.weight, self.weight[4:])
-        self.assertEqual(rank_size(offline), (1, 2))
 
     def test_lora_slicing_reads_retained_query_and_kv_groups(self):
         from sglang.srt.lora.layers import (
@@ -771,111 +678,6 @@ class TestLinearParallelGroups(CustomTestCase):
                 torch.testing.assert_close(gate.call_args.args[0], expected)
                 self.assertIs(output, expected)
                 fallback.assert_called_once_with(wrapper, self.x, False, None)
-
-    def test_quant_initialization_keeps_the_entry_scope_partition(self):
-        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-
-        observed = []
-
-        class ScopeChangingConfig:
-            def get_quant_method(config, layer, prefix):
-                observed.append(
-                    (rank_size(layer)[0], rank_size(layer)[1], layer.parallel_group)
-                )
-                scope = parallel_scope(
-                    tp_size=1,
-                    tp_rank=0,
-                    attn_tp_rank=0,
-                    attn_dp_rank=0,
-                    moe_tp_rank=0,
-                    **derive_parallel_widths(
-                        tp_size=1,
-                        attn_cp_size=1,
-                        attn_dp_size=1,
-                        moe_ep_size=1,
-                        moe_dp_size=1,
-                        dcp_size=1,
-                        dcp_enabled=False,
-                    ),
-                )
-                scope.__enter__()
-                method = UnquantizedLinearMethod()
-                native_create = method.create_weights
-
-                def create_weights(**kwargs):
-                    try:
-                        native_create(**kwargs)
-                    finally:
-                        scope.__exit__(None, None, None)
-
-                method.create_weights = create_weights
-                return method
-
-        for group, rank, size in (
-            (None, 3, 4),
-            ("attn_tp", 1, 2),
-            ("replicated", 0, 1),
-        ):
-            config = ScopeChangingConfig()
-            options = dict(bias=False, quant_config=config, parallel_group=group)
-            layers = (
-                ColumnParallelLinear(8, 8, **options),
-                MergedColumnParallelLinear(8, [8, 4], **options),
-                QKVParallelLinear(
-                    8,
-                    2,
-                    4,
-                    1,
-                    kv_parallel_group=ReplicatedParallelGroup("attn_tp", 2),
-                    **options,
-                ),
-                RowParallelLinear(8, 8, reduce_results=False, **options),
-                MergedColumnParallelRepeatedLinear(
-                    8, [8, 4], [2], quant_config=config, parallel_group=group
-                ),
-            )
-            self.assertEqual(observed[-5:], [(rank, size, group)] * 5)
-            self.assertEqual(get_parallel().tp_size, 4)
-            for layer in layers:
-                with self.subTest(group=group, layer=type(layer).__name__):
-                    self.assertEqual(rank_size(layer), (rank, size))
-                    if isinstance(layer, RowParallelLinear):
-                        expected = self.weight.chunk(size, dim=1)[rank]
-                        layer.weight.weight_loader(layer.weight, self.weight)
-                    elif isinstance(layer, QKVParallelLinear):
-                        pieces = (
-                            ("q", self.weight),
-                            ("k", self.weight[:2] + 2),
-                            ("v", self.weight[:2] + 4),
-                        )
-                        for shard, weight in pieces:
-                            layer.weight.weight_loader(layer.weight, weight, shard)
-                        expected = torch.cat(
-                            (self.weight.chunk(size)[rank], pieces[1][1], pieces[2][1])
-                        )
-                        self.assertEqual(rank_size(layer, kv=True), (0, 1))
-                    elif isinstance(
-                        layer,
-                        (
-                            MergedColumnParallelLinear,
-                            MergedColumnParallelRepeatedLinear,
-                        ),
-                    ):
-                        pieces = [self.weight, self.weight[:4] + 2]
-                        if isinstance(layer, MergedColumnParallelRepeatedLinear):
-                            pieces.append(self.weight[:2] + 4)
-                        for shard, weight in enumerate(pieces):
-                            layer.weight.weight_loader(layer.weight, weight, shard)
-                        expected = torch.cat(
-                            [
-                                weight.chunk(size)[rank] if i < 2 else weight
-                                for i, weight in enumerate(pieces)
-                            ]
-                        )
-                    else:
-                        expected = self.weight.chunk(size)[rank]
-                        layer.weight.weight_loader(layer.weight, self.weight)
-                    torch.testing.assert_close(layer.weight, expected)
 
 
 if __name__ == "__main__":

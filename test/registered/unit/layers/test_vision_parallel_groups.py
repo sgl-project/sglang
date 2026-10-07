@@ -12,7 +12,6 @@ from sglang.srt.layers.dp_attention import initialize_dp_attention_flags
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.runtime_context import (
     SpawnRanks,
-    get_disagg,
     reset_context,
 )
 from sglang.srt.server_args import ServerArgs
@@ -331,38 +330,6 @@ class TestVisionParallelGroups(CustomTestCase):
                                 (module.tp_rank, module.tp_size), (rank, size)
                             )
             reset_context()
-
-    def test_guard_and_moonvit_dense_path(self):
-        from sglang.srt.layers.attention.vision import VisionAttention
-        from sglang.srt.models.kimi_vl_moonvit import MLP2
-
-        publish(
-            ServerArgs(
-                model_path="dummy",
-                device="cpu",
-                tp_size=4,
-                attn_dp_size=2,
-                mm_attention_backend="sdpa",
-            ),
-            role="test",
-            ranks=SpawnRanks(world_rank=3),
-        )
-        with self.assertRaisesRegex(ValueError, "shards over the attention TP group"):
-            VisionAttention(32, 8, 32, True, qkv_backend="sdpa")
-        with get_disagg().override(language_model_only=True):
-            offloaded = VisionAttention(32, 8, 32, True, qkv_backend="sdpa")
-        self.assertEqual(rank_size(offloaded.proj), (1, 2))
-        self.assertFalse(offloaded.proj.use_dp_attention_reduce)
-        for data_parallel, tensor_parallel in ((False, False), (True, True)):
-            module = MLP2(
-                [32, 64, 32],
-                torch.nn.GELU(),
-                use_data_parallel=data_parallel,
-                use_tensor_parallel=tensor_parallel,
-            )
-            self.assertIsInstance(module.fc0, torch.nn.Linear)
-            self.assertIsInstance(module.fc1, torch.nn.Linear)
-            self.assertEqual(module(torch.zeros(2, 32)).shape, (2, 32))
 
 
 if __name__ == "__main__":

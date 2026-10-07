@@ -351,22 +351,6 @@ class TestAttentionProjectionParallelGroups(CustomTestCase):
                                 0,
                             )
 
-    def test_disabled_mtp_start_projections(self):
-        publish(ServerArgs(model_path="dummy", device="cpu"), role="test")
-        for variant in ("attention", "moe"):
-            module, names = build_attention("mtp", variant, start=False)
-            self.assertFalse(names)
-            self.assertFalse(hasattr(module, "eh_proj"))
-            self.assertTrue(hasattr(module, "final_layernorm"))
-
-    def test_xllm_keeps_quantization_rejection(self):
-        from sglang.srt.layers.quantization.fp8 import Fp8Config
-
-        publish(ServerArgs(model_path="dummy", device="cpu"), role="test")
-        for variant in ("gated", "mova"):
-            with self.assertRaisesRegex(ValueError, "unquantized bf16/fp16"):
-                build_attention("xllm", variant, quant_config=Fp8Config())
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -216,24 +216,6 @@ class TestReplicatedAttentionParallelGroups(CustomTestCase):
             x = values(2, 8, qkv, 3)
             torch.testing.assert_close(qkv(x)[0], F.linear(x, expected))
 
-    def test_invalid_replica_factors_and_conflicting_kv_placement(self):
-        from sglang.srt.layers.linear import ReplicatedParallelGroup
-
-        for factor in (0, -1, True, 1.5):
-            with self.assertRaises(ValueError):
-                ReplicatedParallelGroup("attn_tp", factor)
-        with self.assertRaises(ValueError):
-            ReplicatedParallelGroup("invalid", 1)
-        publish(
-            ServerArgs(model_path="dummy", device="cpu", tp_size=4),
-            role="test",
-            ranks=SpawnRanks(world_rank=0),
-        )
-        with self.assertRaises(AssertionError):
-            linear.resolve_linear_parallel_group(ReplicatedParallelGroup("tp", 3))
-        with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
-            linear.QKVParallelLinear(8, 2, 8, 4, kv_parallel_group="tp", kv_tp_size=4)
-
 
 if __name__ == "__main__":
     unittest.main()

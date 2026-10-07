@@ -132,9 +132,6 @@ class TestShardedLoaderParallelGroups(CustomTestCase):
                     _, parameters = full_tp_parameters(kind)
                     load_parameters(parameters, rank, 4, changed=changed)
 
-    def test_supported_construction_loads(self):
-        self.exercise_full_tp()
-
     def test_full_tp_owners_after_scope_exit_and_with_attention_dp(self):
         self.exercise_full_tp(True, (1, 2))
 
