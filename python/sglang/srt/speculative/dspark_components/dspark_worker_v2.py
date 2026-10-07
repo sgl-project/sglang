@@ -51,6 +51,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     make_next_draft_input,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
+    log_int8_markov_walk_off,
     maybe_build_draft_sampler,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -515,6 +516,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._proposer.attach_draft_sampler(self._draft_sampler)
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
+            )
+        if (
+            self._draft_sampler is None
+            and envs.SGLANG_DSPARK_OPT_INT8_MARKOV_WALK.get()
+        ):
+            log_int8_markov_walk_off(
+                tp_rank=self._target_tp_rank,
+                reason="the draft proposal is not folded into the draft cuda graph",
             )
 
     def _maybe_build_draft_sampler(self, *, available_memory_gb: float):

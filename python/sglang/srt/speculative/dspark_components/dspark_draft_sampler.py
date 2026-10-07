@@ -369,7 +369,7 @@ def maybe_build_draft_sampler(
     return draft_sampler
 
 
-def _log_int8_markov_walk_off(*, tp_rank: int, reason: str) -> None:
+def log_int8_markov_walk_off(*, tp_rank: int, reason: str) -> None:
     if tp_rank == 0:
         logger.warning(
             "SGLANG_DSPARK_OPT_INT8_MARKOV_WALK ignored, the draft keeps the stock "
@@ -428,7 +428,7 @@ def _maybe_build_int8_markov_walker(
         draft_model=draft_model, gamma=gamma, tp_size=tp_size, device=device
     )
     if reason is not None:
-        _log_int8_markov_walk_off(tp_rank=tp_rank, reason=reason)
+        log_int8_markov_walk_off(tp_rank=tp_rank, reason=reason)
         return None
     head = draft_model.markov_head
     try:
@@ -442,7 +442,7 @@ def _maybe_build_int8_markov_walker(
         )
     # A JIT build failure, V % 8 != 0 or a V too large for the SM count.
     except Exception as e:
-        _log_int8_markov_walk_off(tp_rank=tp_rank, reason=f"{type(e).__name__}: {e}")
+        log_int8_markov_walk_off(tp_rank=tp_rank, reason=f"{type(e).__name__}: {e}")
         return None
 
 
@@ -453,7 +453,7 @@ def _attach_int8_markov_walker(
         draft_sampler.attach_int8_markov_walker(walker)
     except Exception as e:
         reason = f"warmup failed: {type(e).__name__}: {e}"
-        _log_int8_markov_walk_off(tp_rank=tp_rank, reason=reason)
+        log_int8_markov_walk_off(tp_rank=tp_rank, reason=reason)
         return
     if tp_rank == 0:
         logger.info(
