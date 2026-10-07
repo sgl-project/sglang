@@ -9,10 +9,12 @@ from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.marlin import fused_experts_none_to_marlin
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     prepare_moe_mxfp4_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.mxfp4_marlin_moe import build_marlin_moe_quant_info
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_moe_runner_marlin import MarlinLoraRunnerCore
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -84,6 +86,24 @@ def test_mxfp4_marlin_lora(M):
     layer.dispatcher = SimpleNamespace(local_expert_mapping=None)
     prepare_moe_mxfp4_layer_for_marlin(layer)
     quant = build_marlin_moe_quant_info(layer)
+    # CUDA graph setup must also accept packed Marlin weights, which expose
+    # w13_qweight rather than the Triton quant-info field w13_weight.
+    backend = BaseLoRABackend(2, torch.device(device))
+    backend.init_cuda_graph_moe_buffers(
+        M,
+        2,
+        torch.bfloat16,
+        SimpleNamespace(
+            base_layer=SimpleNamespace(
+                top_k=2,
+                num_experts=E,
+                hidden_size=K,
+                intermediate_size_per_partition=N,
+            ),
+            _quant_info=quant,
+            _lora_runner_backend=MoeRunnerBackend.MARLIN,
+        ),
+    )
     config = MoeRunnerConfig(
         intermediate_size_per_partition=N,
         activation="silu",
