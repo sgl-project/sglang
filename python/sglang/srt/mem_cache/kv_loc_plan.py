@@ -21,8 +21,7 @@ same slots and reads the same rows, and compaction does not move a page while
 the iteration's forwards are in flight.
 
     writes   `write_ids`    the iteration's write window, translated once per
-                            sub-pool, here, when a writer first asks for it in
-                            that sub-pool's ids; every writer binds it
+                            sub-pool, here; every writer binds it
     reads    `read_table`   the rows' page table over [0, seq_lens + extent),
                             built when a reader that reads the table form asks
                             for it, and then shared by every later reader
@@ -154,12 +153,6 @@ class KVLocPlan:
         self.seq_lens_cpu = seq_lens_cpu
         self.read_extent = read_extent
         full = source.space(IdSpaceKind.FULL)
-        self._full = full
-        self._full_key = full.key
-        # The window in each sub-pool's ids, and each sub-pool's read table,
-        # by space key.
-        self._write_ids: Dict[Hashable, Optional[torch.Tensor]] = {}
-        self._read_tables: Dict[Hashable, KVIndexTable] = {}
         if write_slots is not None:
             # A runner's own write buffer, for a graph capture or a warmup run:
             # in its own pool's ids by construction, naming the sink until a
@@ -167,24 +160,31 @@ class KVLocPlan:
             # as it is.
             assert write_virtual is None
             self.write_virtual = None if full.write is not None else write_slots
-            self._write_ids[full.key] = write_slots
+            self.write_physical = write_slots
         else:
             # Aliases the ScheduleBatch's tensor, which stays virtual for the
             # radix tree, the accept path and lazy compaction's in-flight write
-            # set. Not translated yet: a speculative iteration plans its window
-            # before its draft runs, and a draft that indexes virtual ids (a
-            # private pool) must not wait on a translation only the target's
-            # later forwards need.
+            # set.
             self.write_virtual = write_virtual
-            if full.write is None or write_virtual is None:
-                self._write_ids[full.key] = write_virtual
-
-    @property
-    def write_physical(self) -> Optional[torch.Tensor]:
-        """The window in the full sub-pool's ids, translated on first use."""
-        if self._full_key not in self._write_ids:
-            self._write_ids[self._full_key] = self._window_in(self._full)
-        return self._write_ids[self._full_key]
+            # FIXME: a speculative iteration builds its plan before its draft
+            # runs, so this launch sits on the host path ahead of the draft's
+            # graph, idle GPU time at low concurrency. Translate the window
+            # inside the iteration's first captured forward instead, into a
+            # capture-stable buffer the plan owns, which every later forward
+            # and direct writer reads -- once per sub-pool, the sliding-window
+            # ids (derived in `write_ids`) included.
+            self.write_physical = (
+                full.write(write_virtual)
+                if full.write is not None and write_virtual is not None
+                else write_virtual
+            )
+        self._full_key = full.key
+        # The window in each sub-pool's ids, and each sub-pool's read table,
+        # by space key.
+        self._write_ids: Dict[Hashable, Optional[torch.Tensor]] = {
+            full.key: self.write_physical
+        }
+        self._read_tables: Dict[Hashable, KVIndexTable] = {}
 
     # -- writes ----------------------------------------------------------------
 
@@ -192,10 +192,8 @@ class KVLocPlan:
         """Give ``batch`` (a ForwardBatch, or a view standing in for one) this
         plan, the part of its window it writes (``cols``), and its write ids in
         the full-attention ids `reader`'s pool indexes. The one way a forward
-        gets its write ids; the plan, not the forward, translates them, the
-        first time a reader asks for them in its sub-pool's ids. A consumer of
-        another sub-pool takes its ids from the plan
-        (`KVIndexTranslator.write_ids`)."""
+        gets its write ids; nothing here translates. A consumer of another
+        sub-pool takes its ids from the plan (`KVIndexTranslator.write_ids`)."""
         batch.kv_loc_plan = self
         batch.kv_loc_cols = cols
         batch.out_cache_loc = self.write_ids(reader, cols=cols)
@@ -309,6 +307,7 @@ class KVLocPlan:
             read_extent=read_extent,
         )
         plan.write_virtual = self.write_virtual
+        plan.write_physical = self.write_physical
         plan._write_ids = self._write_ids
         return plan
 
