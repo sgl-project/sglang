@@ -15,7 +15,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.parallel_groups import parallel_scope, publish
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=15, stage="nightly", runner_config="1-gpu-large")
 
 
 def values(shape, *, device="cpu", dtype=torch.float32, offset=0):

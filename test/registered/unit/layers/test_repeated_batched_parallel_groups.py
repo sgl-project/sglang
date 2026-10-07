@@ -16,7 +16,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, stage="weekly", runner_config="cpu")
 
 CASES = (
     ("glm", "fused"),
