@@ -1,4 +1,4 @@
-"""Optional Mooncake transport for per-request replay outputs.
+"""Optional Mooncake transport for per-request token outputs.
 
 A request that sets ``return_outputs_via_store`` keeps its routed experts, indexer
 top-k, and sampling mask out of the response: when it finishes, the tokenizer writes
@@ -84,8 +84,8 @@ class OutputStoreStash(Protocol):
         ...
 
 
-class TokenReplayStash(msgspec.Struct):
-    """Per-token replay outputs of one request, unencoded until its final response."""
+class TokenOutputStash(msgspec.Struct):
+    """Per-token outputs of one request, unencoded until its final response."""
 
     routed_experts: Optional[torch.Tensor] = None
     indexer_topk: Optional[torch.Tensor] = None

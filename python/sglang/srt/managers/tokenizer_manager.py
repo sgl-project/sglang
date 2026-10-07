@@ -109,7 +109,7 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.output_store import (
     OUTPUT_STORE_REF_KEY,
     OutputStoreWriter,
-    TokenReplayStash,
+    TokenOutputStash,
     maybe_create_output_store,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -269,8 +269,8 @@ class ReqState:
     # For streaming output
     last_output_offset: int = 0
 
-    # Unencoded replay outputs of a request that returns them via the output store.
-    output_store_stash: Optional[TokenReplayStash] = None
+    # Unencoded token outputs of a request that returns them via the output store.
+    token_output_stash: Optional[TokenOutputStash] = None
 
     # Accumulate text lazily so incremental streaming can emit the incoming
     # delta directly without rebuilding the full output prefix.
@@ -1966,9 +1966,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         return None
 
-    async def _put_output_store_stash(self, *, out: dict, state: ReqState) -> None:
-        stash = state.output_store_stash
-        state.output_store_stash = None
+    async def _put_token_output_stash(self, *, out: dict, state: ReqState) -> None:
+        stash = state.token_output_stash
+        state.token_output_stash = None
         meta_info = out["meta_info"]
         if stash.is_empty() or _is_failing_abort(meta_info["finish_reason"]):
             return
@@ -2067,8 +2067,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 out = build_beam_search_out(out)
 
             if finished:
-                if state.output_store_stash is not None:
-                    await self._put_output_store_stash(out=out, state=state)
+                if state.token_output_stash is not None:
+                    await self._put_token_output_stash(out=out, state=state)
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
@@ -2581,7 +2581,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and state.obj.return_sampling_mask
             ):
                 output_sampling_mask = recv_obj.output_token_sampling_mask
-                stash = state.output_store_stash
+                stash = state.token_output_stash
                 if output_sampling_mask is not None and stash is not None:
                     stash.add_sampling_mask(output_sampling_mask[i])
                 elif output_sampling_mask is not None:
@@ -2657,8 +2657,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     encoded=recv_obj.routed_experts,
                     i=i,
                 )
-                if routed_experts is not None and state.output_store_stash is not None:
-                    state.output_store_stash.routed_experts = routed_experts
+                if routed_experts is not None and state.token_output_stash is not None:
+                    state.token_output_stash.routed_experts = routed_experts
                 elif routed_experts is not None:
                     meta_info["routed_experts"] = _encode_replay_output(routed_experts)
                 indexer_topk = _replay_output_at(
@@ -2666,8 +2666,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     encoded=recv_obj.indexer_topk,
                     i=i,
                 )
-                if indexer_topk is not None and state.output_store_stash is not None:
-                    state.output_store_stash.indexer_topk = indexer_topk
+                if indexer_topk is not None and state.token_output_stash is not None:
+                    state.token_output_stash.indexer_topk = indexer_topk
                 elif indexer_topk is not None:
                     meta_info["indexer_topk"] = _encode_replay_output(indexer_topk)
                     if recv_obj.indexer_topk_num_layers is not None:
@@ -3855,7 +3855,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             if self._uses_output_store(sub_obj):
-                state.output_store_stash = TokenReplayStash()
+                state.token_output_stash = TokenOutputStash()
             self.rid_to_state[rid] = state
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
