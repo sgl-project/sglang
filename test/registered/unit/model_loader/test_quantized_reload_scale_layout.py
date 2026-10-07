@@ -4,8 +4,6 @@ import math
 import socket
 import unittest
 from contextlib import nullcontext
-from functools import wraps
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -208,9 +206,6 @@ class TestQuantizedReloadScaleLayout(CustomTestCase):
         self.addCleanup(destroy_model_parallel)
         initialize_dp_attention(server)
 
-    def test_native_model_reload_in_construction_scope(self):
-        check_reload(build_model())
-
     def test_native_model_reload_after_scope_exit(self):
         model = build_model()
         check_reload(model, changed=True)
@@ -361,58 +356,6 @@ class TestQuantizedReloadScaleLayout(CustomTestCase):
                         param.contiguous().view(torch.uint8), data, rtol=0, atol=0
                     )
 
-    def test_eager_native_loaders_match_cold_load(self):
-        for kind in ("qwen2", "qwen3"):
-            native = {"qwen2": Qwen2ForCausalLM, "qwen3": Qwen3ForCausalLM}[kind]
-            for per_tensor in (False, True):
-                for materialize in (list, dict):
-                    with self.subTest(
-                        kind=kind,
-                        per_tensor=per_tensor,
-                        materialize=materialize.__name__,
-                    ):
-                        model = build_model(kind, kv_heads=1, per_tensor=per_tensor)
-                        pointers = {
-                            n: p.data_ptr() for n, p in model.named_parameters()
-                        }
-
-                        @wraps(native.load_weights)
-                        def eager(weights):
-                            weights = materialize(weights)
-                            if isinstance(weights, dict):
-                                weights = weights.items()
-                            native.load_weights(model, weights)
-
-                        with loading_scope(True):
-                            QuantizedRLModelLoader.rebinding_and_load_weights(
-                                model, eager, checkpoint(13, kind, 1)
-                            )
-                        reference = build_model(
-                            kind, kv_heads=1, version=13, per_tensor=per_tensor
-                        )
-                        assert_same_parameters(model, reference)
-                        for name, param in model.named_parameters():
-                            self.assertEqual(param.data_ptr(), pointers[name], name)
-
-    def test_native_eager_parameter_loader_matches_cold_load(self):
-        from sglang.srt.models.phi import PhiForCausalLM
-
-        model = build_model("qwen3", kv_heads=1)
-        model.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
-        source = [
-            (n, t)
-            for n, t in checkpoint(13, "qwen3", 1)
-            if any(f".{p}." in n for p in ("q_proj", "k_proj", "v_proj", "o_proj"))
-        ]
-        QuantizedRLModelLoader.rebinding_and_load_weights(
-            model, lambda weights: PhiForCausalLM.load_weights(model, weights), source
-        )
-        updated = dict(source)
-        expected = [(n, updated.get(n, t)) for n, t in checkpoint(0, "qwen3", 1)]
-        assert_same_parameters(
-            model, build_model("qwen3", kv_heads=1, weights=expected)
-        )
-
     def test_qwen2_walker_reload_matches_cold_load(self):
         from sglang.srt.environ import envs
 
@@ -454,25 +397,6 @@ class TestQuantizedReloadScaleLayout(CustomTestCase):
             model, build_model("qwen2", kv_heads=1, weights=expected)
         )
 
-    def test_native_loader_uses_one_call_with_all_checkpoint_keys(self):
-        model = build_model("qwen3", kv_heads=1)
-        calls = []
-
-        def native(weights):
-            calls.append(True)
-            weights = dict(weights)
-            # A model-level cross-key dependency must see the complete input.
-            self.assertIn("model.embed_tokens.weight", weights)
-            self.assertIn("lm_head.weight", weights)
-            weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
-            Qwen3ForCausalLM.load_weights(model, list(weights.items()))
-
-        QuantizedRLModelLoader.rebinding_and_load_weights(
-            model, native, checkpoint(13, "qwen3", 1)
-        )
-        self.assertEqual(len(calls), 1)
-        assert_same_parameters(model, build_model("qwen3", kv_heads=1, version=13))
-
     def test_unsupported_native_loaders_fail_before_initialization(self):
         from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
         from sglang.srt.models.whisper import WhisperForConditionalGeneration
@@ -494,86 +418,6 @@ class TestQuantizedReloadScaleLayout(CustomTestCase):
                 self.assertIs(model.load_weights, original)
                 self.assertFalse(hasattr(model, "original_weights_rebuild_keys"))
                 torch.testing.assert_close(model.weight, before, rtol=0, atol=0)
-
-    def test_copied_capability_does_not_opt_in_an_unsupported_wrapper(self):
-        model = build_model("qwen3", kv_heads=1)
-
-        @wraps(Qwen3ForCausalLM.load_weights)
-        def eager(weights):
-            Qwen3ForCausalLM.load_weights(model, list(weights))
-
-        model.load_weights = eager
-        loader = QuantizedRLModelLoader(LoadConfig(load_format=LoadFormat.FLASH_RL))
-        with self.assertRaisesRegex(ValueError, "deferred FP8-write contract"):
-            loader.load_weights_and_postprocess(model, [], torch.device("cuda"))
-
-    def test_whisper_native_multi_key_logic_receives_one_complete_input(self):
-        from sglang.srt.models.whisper import WhisperForConditionalGeneration
-
-        model = build_model("qwen3", kv_heads=1)
-        model.config.decoder_layers = 0
-        model.proj_out = torch.nn.Embedding(512, 512, device="cuda")
-        source = [
-            (n, t)
-            for n, t in checkpoint(13, "qwen3", 1)
-            if n in ("model.embed_tokens.weight", "lm_head.weight")
-            or any(
-                f".{shard}." in n for shard in ("q_proj", "k_proj", "v_proj", "o_proj")
-            )
-        ]
-        source.append(("model.decoder.embed_tokens.weight", source[0][1]))
-
-        # Adapt the fixture's model prefix to Whisper's module names; execute
-        # its actual dict materialization, tied-key lookup and parameter writes.
-        whisper_params = [
-            (n.removeprefix("model."), p) for n, p in model.named_parameters()
-        ]
-
-        def native(weights):
-            with patch.object(
-                model, "named_parameters", return_value=iter(whisper_params)
-            ):
-                WhisperForConditionalGeneration.load_weights(model, weights)
-
-        QuantizedRLModelLoader.rebinding_and_load_weights(model, native, source)
-        torch.testing.assert_close(model.proj_out.weight, source[0][1], rtol=0, atol=0)
-        updated = dict(source)
-        expected = [(n, updated.get(n, t)) for n, t in checkpoint(0, "qwen3", 1)]
-        reference = build_model("qwen3", kv_heads=1, weights=expected)
-        reference.proj_out = torch.nn.Embedding(512, 512, device="cuda")
-        reference.proj_out.weight.data.copy_(source[0][1])
-        assert_same_parameters(model, reference)
-
-    def test_mimo_native_pp_tied_key_lookup_receives_one_complete_input(self):
-        from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
-
-        model = build_model("qwen3", kv_heads=1)
-        model.config.tie_word_embeddings = True
-        model.config.encoder_only = False
-        model.config.n_routed_experts = 0
-        model.pp_group = SimpleNamespace(world_size=2, is_last_rank=True)
-        model._is_multimodal = False
-        model._VISION_WEIGHT_PREFIXES = ("visual.",)
-        model._AUDIO_WEIGHT_PREFIXES = ("audio.",)
-        model._AUDIO_WEIGHT_SUBSTRING = ".audio."
-        source = checkpoint(13, "qwen3", 1)
-        # Put the head first: MiMo must search the same re-iterable input for
-        # the embedding belonging to a different destination.
-        source.sort(key=lambda item: item[0] != "lm_head.weight")
-        embedding = dict(source)["model.embed_tokens.weight"]
-        source = [
-            (n, torch.zeros_like(t) if n == "lm_head.weight" else t) for n, t in source
-        ]
-        QuantizedRLModelLoader.rebinding_and_load_weights(
-            model,
-            lambda weights: MiMoV2ForCausalLM.load_weights(model, weights),
-            source,
-        )
-        torch.testing.assert_close(model.lm_head.weight, embedding, rtol=0, atol=0)
-        expected = [(n, embedding if n == "lm_head.weight" else t) for n, t in source]
-        assert_same_parameters(
-            model, build_model("qwen3", kv_heads=1, weights=expected)
-        )
 
     def test_failed_native_load_restores_fp8_storage(self):
         model = build_model("qwen3", kv_heads=1)

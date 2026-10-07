@@ -1159,17 +1159,12 @@ class LayeredModelLoader(DefaultModelLoader):
 
 
 class QuantizedRLModelLoader(DefaultModelLoader):
-    """
-    Model loader for RL training with FP8 quantization using audited native loaders.
+    """FP8 RL loader for audited Qwen2 (legacy/v2) and Qwen3 native loaders.
 
-    Qwen2ForCausalLM (legacy/v2) and Qwen3ForCausalLM declare the reload contract.
-    Other native loaders are rejected before initialization loads any weights.
-
-    Workflow:
-      1. Initial load: Load base model → Record state → Apply FP8 quantization
-      2. Training Actor in full precision
-      3. Reload: Trainer sends full precision weights → Quantize to FP8 → Copy to original memory
-      4. Use torch.as_strided to preserve memory locations across reloads
+    Initial loads record native parameter loaders before quantization. Reloads
+    invoke the native loader once, deferring FP8 writes; each local destination
+    is staged and quantized into its existing FP8 weight and scale buffers.
+    Unsupported native loaders are rejected before initialization loads weights.
 
     Usage:
       --model-path Qwen/Qwen2.5-7B --quantization fp8 --load-format flash_rl
