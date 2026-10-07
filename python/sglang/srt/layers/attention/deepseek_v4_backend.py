@@ -82,6 +82,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     CapturedPrefillInputs,
     DecodeInputs,
     PrefillInputs,
+    RowShard,
     has_dense_fp4_indexer,
     is_sm100_or_newer,
     make_candidate_indexer,
@@ -939,6 +940,10 @@ def _tail_rows(
 # Rows per logits chunk for the ratio-1/2 indexer inside the prefill CUDA graph;
 # its width is the graph's max_seq_len, and longer contexts replay eagerly.
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
+
+# Arbitrary floor: below it the dense scores are short enough that the
+# all-gather's fixed latency eats most of what sharding saves.
+_INDEXER_TP_SHARD_MIN_ROWS = 512
 
 
 def _prefill_graph_max_seq_len() -> Optional[int]:
@@ -3265,6 +3270,13 @@ class DeepseekV4AttnBackend(
     ) -> PrefillInputs:
         core = self.forward_metadata.core_metadata
         tail = self.forward_metadata.late_layer_tail
+        # Prefill CP hands each rank its own interleaved subset of rows; every
+        # other path holds the batch's rows on every attention-TP rank.
+        row_shard = (
+            self._indexer_row_shard(layer, num_rows=x.shape[0])
+            if rows_per_request is None
+            else None
+        )
         if rows_per_request is not None:
             rows_per_request_device = async_h2d(
                 rows_per_request, dtype=torch.int32, device=x.device
@@ -3295,6 +3307,24 @@ class DeepseekV4AttnBackend(
                 if self._low_ratio_prefill_reads_page_indices(forward_batch)
                 else None
             ),
+            row_shard=row_shard,
+        )
+
+    def _indexer_row_shard(self, layer, *, num_rows: int) -> Optional[RowShard]:
+        # Every input here is the same on all attention-TP ranks, so either all
+        # of them reach the all-gather or none does.
+        parallel = get_parallel()
+        if (
+            not envs.SGLANG_OPT_DSV4_INDEXER_TP_SHARD.get()
+            or parallel.attn_tp_size == 1
+            or num_rows < _INDEXER_TP_SHARD_MIN_ROWS
+        ):
+            return None
+        return RowShard(
+            group=parallel.attn_tp_group,
+            rank=parallel.attn_tp_rank,
+            world=parallel.attn_tp_size,
+            row_align=128 // layer.indexer.n_heads,
         )
 
     def _low_ratio_prefill_reads_page_indices(self, forward_batch: ForwardBatch):

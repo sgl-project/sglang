@@ -1589,6 +1589,10 @@ class Envs:
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+    # Shard the ratio-1/2 index sources' dense prefill scores across the
+    # attention-TP group and all-gather the selections, instead of every rank
+    # scoring every row. Bitwise identical to the replicated path.
+    SGLANG_OPT_DSV4_INDEXER_TP_SHARD = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
