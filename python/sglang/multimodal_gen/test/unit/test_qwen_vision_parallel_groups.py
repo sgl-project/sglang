@@ -29,39 +29,24 @@ class TestQwenGenerationParallelGroups(unittest.TestCase):
             ranks=SpawnRanks(world_rank=3),
         )
         for initialized in (False, True):
-            with (
-                patch.object(
-                    generation,
-                    "model_parallel_is_initialized",
-                    return_value=initialized,
-                ),
-                patch.object(generation, "get_tp_world_size", return_value=4),
+            with patch.object(
+                generation,
+                "model_parallel_is_initialized",
+                return_value=initialized,
             ):
-                # Parent-only helper reads the same rank as the published bridge scope.
-                with patch.object(
-                    generation, "get_tp_rank", return_value=3, create=True
-                ):
-                    for tensor_parallel in (False, True):
-                        for maker in (
-                            generation._make_column_linear,
-                            generation._make_row_linear,
-                        ):
-                            layer = maker(
-                                8, 8, bias=True, use_tensor_parallel=tensor_parallel
-                            )
-                            expected = (
-                                (3, 4) if initialized and tensor_parallel else (0, 1)
-                            )
-                            self.assertEqual(
-                                (
-                                    getattr(layer, "tp_rank", 0),
-                                    getattr(layer, "tp_size", 1),
-                                ),
-                                expected,
-                            )
-                            self.assertEqual(
-                                isinstance(layer, ReplicatedLinear), not tensor_parallel
-                            )
+                for tensor_parallel in (False, True):
+                    for maker in (
+                        generation._make_column_linear,
+                        generation._make_row_linear,
+                    ):
+                        layer = maker(
+                            8, 8, bias=True, use_tensor_parallel=tensor_parallel
+                        )
+                        expected = (3, 4) if initialized and tensor_parallel else (0, 1)
+                        self.assertEqual((layer.tp_rank, layer.tp_size), expected)
+                        self.assertEqual(
+                            isinstance(layer, ReplicatedLinear), not tensor_parallel
+                        )
 
     def test_native_vision_projection_math_and_reload(self):
         from sglang.multimodal_gen.runtime.layers.attention.selector import (
