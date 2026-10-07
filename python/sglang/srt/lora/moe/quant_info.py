@@ -96,3 +96,36 @@ def _admit_fp8_block_weights(quant_info: MoeLoraFp8QuantInfo) -> None:
 
 # Marlin's packed weights do not use the standard row-domain layout.
 StandardLayoutQuantInfo = MoeLoraBf16QuantInfo | MoeLoraFp8QuantInfo
+
+
+class MoeLoraNvFp4MarlinQuantInfo(msgspec.Struct, kw_only=True):
+    """Prepared Marlin W4A16: INT32 weights, E4M3 group-16 and FP16/BF16 globals."""
+
+    w13_qweight: torch.Tensor
+    w2_qweight: torch.Tensor
+    w13_scales: torch.Tensor
+    w2_scales: torch.Tensor
+    w13_global_scale: torch.Tensor
+    w2_global_scale: torch.Tensor
+    num_local_experts: int
+    intermediate_size: int
+    hidden_size: int
+
+    @classmethod
+    def from_layer(cls, base_layer: FusedMoE) -> MoeLoraNvFp4MarlinQuantInfo:
+        for name in ("w13_weight", "w2_weight"):
+            if getattr(base_layer, name).dtype != torch.int32:
+                raise ValueError(
+                    f"NVFP4 MoE LoRA requires already-prepared Marlin {name}."
+                )
+        return cls(
+            w13_qweight=base_layer.w13_weight,
+            w2_qweight=base_layer.w2_weight,
+            w13_scales=base_layer.w13_weight_scale,
+            w2_scales=base_layer.w2_weight_scale,
+            w13_global_scale=base_layer.w13_weight_scale_2,
+            w2_global_scale=base_layer.w2_weight_scale_2,
+            num_local_experts=int(base_layer.num_local_experts),
+            intermediate_size=int(base_layer.intermediate_size_per_partition),
+            hidden_size=int(base_layer.hidden_size),
+        )
