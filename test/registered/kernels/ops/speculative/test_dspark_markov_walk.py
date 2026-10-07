@@ -23,8 +23,8 @@ pytestmark = pytest.mark.skipif(
 
 DEV = "cuda"
 SENTINEL = -777.0  # exact in bf16
-# case -> (i8s tiles per CTA, gamma, batch sizes): the standard layout routes bs
-# 1 / 2..4 / 5..64 to i8 / i8b / i8s, the big-vocabulary one every bs to i8s.
+# case -> (wgmma tiles per CTA, gamma, batch sizes): the standard layout routes bs
+# 1 / 2..4 / 5..64 to single / small_batch / wgmma, the big-vocabulary one every bs to wgmma.
 CASES = {"std": (18, 16, (1, 3, 4, 5, 33, 64)), "big": (30, 15, (1, 5, 33, 64))}
 
 
@@ -33,7 +33,7 @@ def _vocab_for(tiles: int) -> int:
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     if sms == 132:
         return {18: 151936, 30: 248320}[tiles]
-    return sms * mw.I8S_TILE_ROWS * tiles - 5120
+    return sms * mw.WGMMA_TILE_ROWS * tiles - 5120
 
 
 class Reference:
@@ -60,12 +60,15 @@ class Reference:
         d_lo = (self.q_lo[prev].float() @ self.qw2_t).double()
         s_hi, s_lo = self.s_hi[prev][:, None], self.s_lo[prev][:, None]
         base = base_k.double()
-        if kind in ("i8", "i8b"):  # fmul(sr, fma(s_hi, d_hi, fmul(s_lo, d_lo))) + base
+        if kind in (
+            "single",
+            "small_batch",
+        ):  # fmul(sr, fma(s_hi, d_hi, fmul(s_lo, d_lo))) + base
             bias = f32(self.row_scale * f32(s_hi * d_hi + f32(s_lo * d_lo)))
             return (base + bias).float()
         bias = f32(
             s_lo * f32(256.0 * d_hi + d_lo)
-        )  # i8s: fma(sr, fmul(s_lo, 256 d_hi + d_lo), base)
+        )  # wgmma: fma(sr, fmul(s_lo, 256 d_hi + d_lo), base)
         return (self.row_scale * bias + base).float()
 
     def greedy(
@@ -255,28 +258,28 @@ def _launch_one_step(walker, kind, base, anchor, temps, tokens):
         valid_rows=walker.vocab,
         seed=walker.seeds[kind],
     )
-    if kind == "i8s":
-        mw.markov_walk_i8s(
+    if kind == "wgmma":
+        mw.markov_walk_wgmma(
             w2_res=w.w2_res,
             w2_str=w.w2_str,
             w1f=w.w1f,
             stream_mask=w.stream_mask,
             **common,
         )
-    elif kind == "i8b":
-        mw.markov_walk_i8b(frag=w.frag, w1q=w.w1q, **common)
+    elif kind == "small_batch":
+        mw.markov_walk_small_batch(frag=w.frag, w1q=w.w1q, **common)
     else:
-        mw.markov_walk_i8(frag=w.frag, w1q=w.w1q, **common)
+        mw.markov_walk_single(frag=w.frag, w1q=w.w1q, **common)
 
 
-@pytest.mark.parametrize("kind", ["i8", "i8b", "i8s"])
+@pytest.mark.parametrize("kind", ["single", "small_batch", "wgmma"])
 def test_sampling_distribution(case, kind):
     """Single-step samples follow softmax(bf16 logits / T) (chi-square p > 1e-4)
     for a flat and a peaked row at T in {0.6, 1, 2}: guards the Gumbel and
     inverse-CDF transforms and the per-request, per-launch noise counters."""
     walker, ref, _, _, _ = case
-    if walker.weights.big_vocab and kind != "i8s":
-        pytest.skip("the big-vocabulary layout has no i8 / i8b weights")
+    if walker.weights.big_vocab and kind != "wgmma":
+        pytest.skip("the big-vocabulary layout has no single / small_batch weights")
     n_samples = 8000
     cand_base, cand_anchor = _batch(walker, 16, seed=211)
     top1 = torch.softmax(
@@ -288,11 +291,11 @@ def test_sampling_distribution(case, kind):
     base6 = cand_base[rows, :1].contiguous()
     anchor6 = cand_anchor[rows].contiguous()
     temps6 = torch.tensor([c[1] for c in cases], dtype=torch.float32, device=DEV)
-    # per launch: i8 one case, i8b three, i8s 6 cases x 8 (two 32-request blocks)
+    # per launch: one case for single, three for small_batch, 6 cases x 8 for wgmma (two 32-request blocks)
     groups = {
-        "i8": [[i] for i in range(6)],
-        "i8b": [[0, 1, 2], [3, 4, 5]],
-        "i8s": [list(range(6)) * 8],
+        "single": [[i] for i in range(6)],
+        "small_batch": [[0, 1, 2], [3, 4, 5]],
+        "wgmma": [list(range(6)) * 8],
     }[kind]
     samples = [[] for _ in cases]
     for grp in groups:
@@ -321,7 +324,7 @@ def test_sampling_distribution(case, kind):
 def test_nan_and_inf_rows_stay_in_range(case):
     """A padded graph row of all NaN / -inf (or half NaN) logits still yields
     tokens in [0, V) on every step, greedy and sampled: the next step gathers
-    W1[token], and an out-of-range token is an illegal address. i8s answers 0, as
+    W1[token], and an out-of-range token is an illegal address. wgmma answers 0, as
     torch.argmax would; the finite rows are unaffected."""
     walker, ref, _, _, _ = case
     for bs in (1, 2, 5, 33):
@@ -339,7 +342,7 @@ def test_nan_and_inf_rows_stay_in_range(case):
         for temps in (None, torch.ones(bs, dtype=torch.float32, device=DEV)):
             out = walker.walk(base, anchor, temps, tokens, corrected)
             assert bool(((out >= 0) & (out < walker.vocab)).all()), (kind, bs)
-            if kind == "i8s":
+            if kind == "wgmma":
                 assert bool((out[: min(bs, 2)] == 0).all()), (kind, bs)
             if temps is None and bs > 3:
                 assert torch.equal(out[3:], ref.greedy(kind, base[3:], anchor[3:])), (
@@ -399,7 +402,7 @@ def test_host_rejects_bad_arguments(case):
     temps = torch.zeros(bs, dtype=torch.float32, device=DEV)
     tokens = torch.empty(bs * walker.gamma, dtype=torch.int64, device=DEV)
 
-    def i8s(**over):
+    def wgmma(**over):
         args = dict(
             w2_res=w.w2_res,
             w2_str=w.w2_str,
@@ -409,7 +412,7 @@ def test_host_rejects_bad_arguments(case):
             anchor=anchor,
             tokens_out=tokens,
             corrected_out=None,
-            state=walker.states["i8s"],
+            state=walker.states["wgmma"],
             temps=temps,
             num_steps=walker.gamma,
             valid_rows=walker.vocab,
@@ -417,7 +420,7 @@ def test_host_rejects_bad_arguments(case):
             stream_mask=w.stream_mask,
         )
         args.update(over)
-        mw.markov_walk_i8s(**args)
+        mw.markov_walk_wgmma(**args)
 
     big = torch.zeros(
         mw.MAX_BS + 1, walker.gamma, walker.vocab, dtype=torch.bfloat16, device=DEV
@@ -432,7 +435,7 @@ def test_host_rejects_bad_arguments(case):
         dict(valid_rows=walker.vocab + 8),
         dict(tokens_out=tokens[:-1]),
         dict(temps=temps[:-1]),
-        dict(state=walker.states["i8s"][1:]),
+        dict(state=walker.states["wgmma"][1:]),
         dict(w2_res=w.w2_res[:-1]),
         dict(
             corrected_out=torch.zeros(
@@ -450,11 +453,11 @@ def test_host_rejects_bad_arguments(case):
     ]
     for over in bad_calls:
         with pytest.raises(RuntimeError):
-            i8s(**over)
+            wgmma(**over)
     with pytest.raises(ValueError):
         walker.walk(base[:, :-1], anchor, temps, tokens[: bs * (walker.gamma - 1)])
-    i8s()
-    assert torch.equal(tokens.view(bs, -1), ref.greedy("i8s", base, anchor))
+    wgmma()
+    assert torch.equal(tokens.view(bs, -1), ref.greedy("wgmma", base, anchor))
 
 
 if __name__ == "__main__":

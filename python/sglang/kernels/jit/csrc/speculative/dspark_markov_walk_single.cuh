@@ -41,7 +41,7 @@
 #include "dspark_markov_walk_common.cuh"
 #include <cstdint>
 
-namespace sglang::dspark_markov_walk::i8 {
+namespace sglang::dspark_markov_walk::single {
 
 constexpr int kUSmemBytes = 544;  // SMEM slot of the gathered W1q row (kURowBytes rounded up)
 // W2 slice per CTA: TS SMEM tiles + NG register tiles per warp, 72 16-row tiles = 1152 rows
@@ -72,7 +72,7 @@ fill_gumbel_v(float* dst, int row_base, int rows_cta, unsigned step, u64 round, 
   }
 }
 
-__global__ void __launch_bounds__(kThreads, 1) markov_walk_i8_kernel(
+__global__ void __launch_bounds__(kThreads, 1) markov_walk_single_kernel(
     const uint4* __restrict__ frag,
     const float* __restrict__ row_scale,
     const uint32_t* __restrict__ w1q,
@@ -420,7 +420,7 @@ inline void walk(
   static_assert(kRowsCta / 8 <= kThreads, "epilogue covers 8 rows per thread");
   constexpr std::size_t kSmem = kUSmemBytes + 16 * kRowsCta + 64 * kTilesPerCta + kTilesSmem * kTileVecs * 16;
   launch_cooperative(
-      markov_walk_i8_kernel,
+      markov_walk_single_kernel,
       device.unwrap(),
       static_cast<uint32_t>(rows_pad.unwrap() / kRowsCta),
       kThreads,
@@ -441,4 +441,4 @@ inline void walk(
       static_cast<u64>(seed));
 }
 
-}  // namespace sglang::dspark_markov_walk::i8
+}  // namespace sglang::dspark_markov_walk::single

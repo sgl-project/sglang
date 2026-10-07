@@ -16,12 +16,12 @@ the stock walk on the bf16 weights. The logits are rounded to bf16 once; argmax
 and sampler read exactly those values, and ``corrected_out`` receives exactly
 those bits, which is what the verifier rebuilds q = softmax(corrected / T) from.
 
-Layout modes, from V and the SM count (tiles = ceil(V / (#SMs x 64)) i8s tiles
+Layout modes, from V and the SM count (tiles = ceil(V / (#SMs x 64)) wgmma tiles
 of 64 rows per CTA):
 
-* standard (tiles <= 18): bs 1 -> i8, bs 2..4 -> i8b, bs 5..64 -> i8s;
-* big vocabulary (18 < tiles <= 32): i8s for every bs (its W2 partly streams
-  from L2; i8 / i8b keep all of W2 on chip and cannot hold it).
+* standard (tiles <= 18): bs 1 -> single, bs 2..4 -> small_batch, bs 5..64 -> wgmma;
+* big vocabulary (18 < tiles <= 32): wgmma for every bs (its W2 partly streams
+  from L2; single / small_batch keep all of W2 on chip and cannot hold it).
 """
 
 from __future__ import annotations
@@ -38,24 +38,28 @@ if TYPE_CHECKING:
 
 MARKOV_RANK = 256  # hard-wired in every kernel: 528-B W1 rows, 8 k32 chunks
 MAX_STEPS = 16  # kMaxSteps
-MAX_BS = 64  # kMaxB of i8b / i8s
-I8B_MAX_BS = 4  # serving dispatch; the i8b launcher itself takes up to 8
-ROWS_CTA = 1152  # standard layouts: 72 x 16-row (i8 / i8b), 18 x 64-row (i8s)
-I8S_TILE_ROWS = 64  # one wgmma N = 64 B operand, 16 KiB
+MAX_BS = 64  # kMaxB of small_batch / wgmma
+SMALL_BATCH_MAX_BS = (
+    4  # serving dispatch; the small_batch launcher itself takes up to 8
+)
+ROWS_CTA = (
+    1152  # standard layouts: 72 x 16-row (single / small_batch), 18 x 64-row (wgmma)
+)
+WGMMA_TILE_ROWS = 64  # one wgmma N = 64 B operand, 16 KiB
 W1_ROW_BYTES = 528  # 256 q_hi + 256 q_lo + s_hi f32 + s_lo f32 + 8 pad
-I8S_RES, I8S_RING = 11, 2  # i8s template parameters kRes, kRing
-I8S_TILES = ROWS_CTA // I8S_TILE_ROWS
-I8S_MAX_TILES = 32  # the stream mask is a 32-bit word
+WGMMA_RES, WGMMA_RING = 11, 2  # wgmma template parameters kRes, kRing
+WGMMA_TILES = ROWS_CTA // WGMMA_TILE_ROWS
+WGMMA_MAX_TILES = 32  # the stream mask is a 32-bit word
 # Measured on H100 SXM (132 SMs): the 18-tile layout streams these tiles.
-I8S_MASK = sum(1 << t for t in (1, 2, 4, 7, 9, 11, 14))
+WGMMA_MASK = sum(1 << t for t in (1, 2, 4, 7, 9, 11, 14))
 # int64 words of the kernels' kStateU64: round | pad | two sets of {key, count}
-# pairs (16-B pairs for i8, 128-B for i8b / i8s).
-STATE_I8_WORDS = 2 + 4 * MAX_STEPS
+# pairs (16-B pairs for single, 128-B for small_batch / wgmma).
+STATE_SINGLE_WORDS = 2 + 4 * MAX_STEPS
 STATE_BATCHED_WORDS = 16 + 2 * MAX_STEPS * MAX_BS * 16
 
-# i8s: in every 64-row tile, wgmma column n = 8 i + 2 tig + e holds tile row
+# wgmma: in every 64-row tile, wgmma column n = 8 i + 2 tig + e holds tile row
 # rho(n), so a thread's 16 columns are the 8-row runs 8 tig.. and 32 + 8 tig..
-I8S_RHO = [
+WGMMA_RHO = [
     (
         8 * ((n % 8) // 2) + 2 * (n // 8) + n % 2
         if n // 8 < 4
@@ -71,40 +75,40 @@ def _require_sm90() -> None:
 
 
 @cache_once
-def _jit_i8_module() -> Module:
+def _jit_single_module() -> Module:
     _require_sm90()
     return load_jit(
-        "dspark_markov_walk_i8",
-        cuda_files=["speculative/dspark_markov_walk_i8.cuh"],
-        cuda_wrappers=[("walk", "dspark_markov_walk::i8::walk")],
+        "dspark_markov_walk_single",
+        cuda_files=["speculative/dspark_markov_walk_single.cuh"],
+        cuda_wrappers=[("walk", "dspark_markov_walk::single::walk")],
     )
 
 
 @cache_once
-def _jit_i8b_module() -> Module:
+def _jit_small_batch_module() -> Module:
     _require_sm90()
     return load_jit(
-        "dspark_markov_walk_i8b",
-        cuda_files=["speculative/dspark_markov_walk_i8b.cuh"],
-        cuda_wrappers=[("walk", "dspark_markov_walk::i8b::walk")],
+        "dspark_markov_walk_small_batch",
+        cuda_files=["speculative/dspark_markov_walk_small_batch.cuh"],
+        cuda_wrappers=[("walk", "dspark_markov_walk::small_batch::walk")],
     )
 
 
 @cache_once
-def _jit_i8s_module(tiles: int, res: int, stream_mask: int) -> Module:
+def _jit_wgmma_module(tiles: int, res: int, stream_mask: int) -> Module:
     _require_sm90()
-    if not res < tiles <= I8S_MAX_TILES or bin(stream_mask).count("1") != tiles - res:
-        raise ValueError(f"bad i8s layout: {tiles=}, {res=}, mask={stream_mask:#x}")
-    args = make_cpp_args(tiles, res, I8S_RING, stream_mask)
+    if not res < tiles <= WGMMA_MAX_TILES or bin(stream_mask).count("1") != tiles - res:
+        raise ValueError(f"bad wgmma layout: {tiles=}, {res=}, mask={stream_mask:#x}")
+    args = make_cpp_args(tiles, res, WGMMA_RING, stream_mask)
     return load_jit(
-        "dspark_markov_walk_i8s",
+        "dspark_markov_walk_wgmma",
         *args,
-        cuda_files=["speculative/dspark_markov_walk_i8s.cuh"],
-        cuda_wrappers=[("walk", f"dspark_markov_walk::i8s::walk<{args}>")],
+        cuda_files=["speculative/dspark_markov_walk_wgmma.cuh"],
+        cuda_wrappers=[("walk", f"dspark_markov_walk::wgmma::walk<{args}>")],
     )
 
 
-def markov_walk_i8(
+def markov_walk_single(
     *,
     frag: torch.Tensor,
     row_scale: torch.Tensor,
@@ -126,7 +130,7 @@ def markov_walk_i8(
     bf16 shaped like base_logits, written for T > 0 only. The weights and the
     state are those of MarkovWalkWeights / MarkovWalker.states.
     """
-    _jit_i8_module().walk(
+    _jit_single_module().walk(
         frag,
         row_scale,
         w1q,
@@ -142,7 +146,7 @@ def markov_walk_i8(
     )
 
 
-def markov_walk_i8b(
+def markov_walk_small_batch(
     *,
     frag: torch.Tensor,
     row_scale: torch.Tensor,
@@ -160,9 +164,9 @@ def markov_walk_i8b(
     """bs 1..8 walk sharing one on-chip W2.
 
     base_logits bf16 [bs, kb, V]; anchor int64 [bs]; temps fp32 [bs]; tokens_out
-    int64 [bs * num_steps], row-major; otherwise as markov_walk_i8.
+    int64 [bs * num_steps], row-major; otherwise as markov_walk_single.
     """
-    _jit_i8b_module().walk(
+    _jit_small_batch_module().walk(
         frag,
         row_scale,
         w1q,
@@ -178,7 +182,7 @@ def markov_walk_i8b(
     )
 
 
-def markov_walk_i8s(
+def markov_walk_wgmma(
     *,
     w2_res: torch.Tensor,
     w2_str: torch.Tensor,
@@ -198,9 +202,9 @@ def markov_walk_i8s(
     """bs 1..64 wgmma walk; W2 tiles SMEM-resident or streamed from L2.
 
     w2_res / w2_str int8 [grid, res | tiles - res, 16384]; bit t of stream_mask
-    = tile t streams. Batch tensors as markov_walk_i8b.
+    = tile t streams. Batch tensors as markov_walk_small_batch.
     """
-    module = _jit_i8s_module(
+    module = _jit_wgmma_module(
         w2_res.shape[1] + w2_str.shape[1], w2_res.shape[1], stream_mask
     )
     module.walk(
@@ -223,19 +227,19 @@ def markov_walk_i8s(
 # ===== Weight layouts =====
 
 
-def _i8s_tiles_for(vocab: int, num_sms: int) -> int:
-    """i8s tiles per CTA for `vocab` rows on `num_sms` co-resident CTAs: the
-    standard 18 whenever that fits (then i8 / i8b fit too), else the minimum."""
-    need = -(-vocab // (num_sms * I8S_TILE_ROWS))
-    if need > I8S_MAX_TILES:
+def _wgmma_tiles_for(vocab: int, num_sms: int) -> int:
+    """wgmma tiles per CTA for `vocab` rows on `num_sms` co-resident CTAs: the
+    standard 18 whenever that fits (then single / small_batch fit too), else the minimum."""
+    need = -(-vocab // (num_sms * WGMMA_TILE_ROWS))
+    if need > WGMMA_MAX_TILES:
         raise ValueError(
-            f"V = {vocab} needs {need} i8s tiles per CTA on {num_sms} SMs; at most "
-            f"{I8S_MAX_TILES} are supported"
+            f"V = {vocab} needs {need} wgmma tiles per CTA on {num_sms} SMs; at most "
+            f"{WGMMA_MAX_TILES} are supported"
         )
-    return max(need, I8S_TILES)
+    return max(need, WGMMA_TILES)
 
 
-def _i8s_stream_mask(tiles: int, res: int = I8S_RES, ring: int = I8S_RING) -> int:
+def _wgmma_stream_mask(tiles: int, res: int = WGMMA_RES, ring: int = WGMMA_RING) -> int:
     """A stream mask (bit t = tile t streams) with tiles - res streamed tiles.
 
     Warpgroup p takes tiles p, p + 4, ... (with 64 requests: even / odd tiles
@@ -245,8 +249,10 @@ def _i8s_stream_mask(tiles: int, res: int = I8S_RES, ring: int = I8S_RING) -> in
     open on a streamed tile, as they consume the ring prefill, the others on a
     resident one; streamed tiles are spread evenly over each warpgroup.
     """
-    if not 1 <= res < tiles <= I8S_MAX_TILES:
-        raise ValueError(f"need 1 <= res < tiles <= {I8S_MAX_TILES}: {res=}, {tiles=}")
+    if not 1 <= res < tiles <= WGMMA_MAX_TILES:
+        raise ValueError(
+            f"need 1 <= res < tiles <= {WGMMA_MAX_TILES}: {res=}, {tiles=}"
+        )
     seqs = [list(range(p, tiles, 4)) for p in range(4)]
     quota = [res * len(sq) / tiles for sq in seqs]
     resident = [int(q) for q in quota]
@@ -272,8 +278,8 @@ def _i8s_stream_mask(tiles: int, res: int = I8S_RES, ring: int = I8S_RING) -> in
     return mask
 
 
-def _i8s_mask_for(tiles: int) -> int:
-    return I8S_MASK if tiles == I8S_TILES else _i8s_stream_mask(tiles)
+def _wgmma_mask_for(tiles: int) -> int:
+    return WGMMA_MASK if tiles == WGMMA_TILES else _wgmma_stream_mask(tiles)
 
 
 def quantize_markov(
@@ -284,7 +290,7 @@ def quantize_markov(
     W2 [V, 256]: per-row scale max|w| / 127 (at least 1e-30), q_w2 =
     round(w / scale) clamped to +-127. W1 [V, 256]: u ~= s_hi q_hi + s_lo q_lo,
     s_hi = max|u| / 127, and q_lo quantizes the residual with the FIXED ratio
-    s_lo = s_hi / 256 (i8s combines the planes as s_lo (256 d_hi + d_lo)).
+    s_lo = s_hi / 256 (wgmma combines the planes as s_lo (256 d_hi + d_lo)).
     """
     vocab, dev = w2.shape[0], w2.device
     out = {
@@ -313,7 +319,7 @@ def quantize_markov(
 
 
 def _build_frag(qp: torch.Tensor) -> torch.Tensor:
-    """i8 / i8b: padded int8 rows -> m16n8k32 A fragments [tiles, 8 chunks,
+    """single / small_batch: padded int8 rows -> m16n8k32 A fragments [tiles, 8 chunks,
     32 lanes, 16 B]; lane bytes 4q..4q+3 = row g + 8 (q & 1), cols
     32 j + 4 tig + 16 (q >> 1) + i."""
     lane = torch.arange(32, device=qp.device)
@@ -332,7 +338,7 @@ def _scales_as_bytes(planes: dict[str, torch.Tensor]) -> torch.Tensor:
 
 
 def _build_w1q(planes: dict[str, torch.Tensor]) -> torch.Tensor:
-    """i8 / i8b W1 rows: q_hi[256] | q_lo[256] | s_hi f32 | s_lo f32 | pad."""
+    """single / small_batch W1 rows: q_hi[256] | q_lo[256] | s_hi f32 | s_lo f32 | pad."""
     vocab, dev = planes["q_hi"].shape[0], planes["q_hi"].device
     row = torch.zeros(vocab, W1_ROW_BYTES, dtype=torch.uint8, device=dev)
     row[:, :512] = torch.cat([planes["q_hi"], planes["q_lo"]], 1).view(torch.uint8)
@@ -340,14 +346,14 @@ def _build_w1q(planes: dict[str, torch.Tensor]) -> torch.Tensor:
     return row
 
 
-def _build_i8s_tiles(
+def _build_wgmma_tiles(
     qp: torch.Tensor, *, tiles: int, stream_mask: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """i8s: padded int8 rows -> per CTA 64-row tiles as canonical K-major wgmma
+    """wgmma: padded int8 rows -> per CTA 64-row tiles as canonical K-major wgmma
     B operands [j][8 col groups][2 k16 cores][8 cols][16 B], columns permuted by
     rho; split into resident / streamed [grid, RES | tiles - RES, 16384]."""
-    n_tiles = qp.shape[0] // I8S_TILE_ROWS
-    t = qp.view(n_tiles, I8S_TILE_ROWS, MARKOV_RANK)[:, I8S_RHO]
+    n_tiles = qp.shape[0] // WGMMA_TILE_ROWS
+    t = qp.view(n_tiles, WGMMA_TILE_ROWS, MARKOV_RANK)[:, WGMMA_RHO]
     v = t.view(n_tiles, 8, 8, 8, 2, 16).permute(0, 3, 1, 4, 2, 5)
     v = v.contiguous().view(n_tiles // tiles, tiles, 16384)
     streamed = torch.tensor(
@@ -357,7 +363,7 @@ def _build_i8s_tiles(
 
 
 def _build_w1f(planes: dict[str, torch.Tensor]) -> torch.Tensor:
-    """i8s W1 rows in A-fragment order: per chunk j and tig, q_hi(32j+4tig..) |
+    """wgmma W1 rows in A-fragment order: per chunk j and tig, q_hi(32j+4tig..) |
     q_lo(..) | q_hi(32j+16+4tig..) | q_lo(..), 4 B each, so the per-step gather
     is 8 x LDG.128 straight into the fragment registers; then s_hi, s_lo."""
     vocab, dev = planes["q_hi"].shape[0], planes["q_hi"].device
@@ -371,36 +377,36 @@ def _build_w1f(planes: dict[str, torch.Tensor]) -> torch.Tensor:
 
 
 class MarkovWalkWeights(msgspec.Struct, frozen=True):
-    """The int8 layouts the kernels read; i8 / i8b ones in standard mode only."""
+    """The int8 layouts the kernels read; single / small_batch ones in standard mode only."""
 
     vocab: int
     tiles: int
     stream_mask: int
     row_scale: torch.Tensor  # fp32 [rows_pad], natural order, 1e-30 on padding
-    w2_res: torch.Tensor  # int8 [grid, I8S_RES, 16384]
-    w2_str: torch.Tensor  # int8 [grid, tiles - I8S_RES, 16384]
+    w2_res: torch.Tensor  # int8 [grid, WGMMA_RES, 16384]
+    w2_str: torch.Tensor  # int8 [grid, tiles - WGMMA_RES, 16384]
     w1f: torch.Tensor  # uint8 [V, 528]
     frag: Optional[torch.Tensor]  # int8 [rows_pad * 256]
     w1q: Optional[torch.Tensor]  # uint8 [V, 528]
 
     @property
     def big_vocab(self) -> bool:
-        return self.tiles != I8S_TILES
+        return self.tiles != WGMMA_TILES
 
 
 def _build_weights(
     w1: torch.Tensor, w2: torch.Tensor, *, num_sms: int
 ) -> MarkovWalkWeights:
     vocab = w2.shape[0]
-    tiles = _i8s_tiles_for(vocab, num_sms)
-    stream_mask = _i8s_mask_for(tiles)
-    rows_cta = tiles * I8S_TILE_ROWS
+    tiles = _wgmma_tiles_for(vocab, num_sms)
+    stream_mask = _wgmma_mask_for(tiles)
+    rows_cta = tiles * WGMMA_TILE_ROWS
     rows_pad = -(-vocab // rows_cta) * rows_cta
     planes = quantize_markov(w1, w2)
     qp = torch.zeros(rows_pad, MARKOV_RANK, dtype=torch.int8, device=w2.device)
     qp[:vocab] = planes.pop("q_w2")
-    big_vocab = tiles != I8S_TILES
-    w2_res, w2_str = _build_i8s_tiles(qp, tiles=tiles, stream_mask=stream_mask)
+    big_vocab = tiles != WGMMA_TILES
+    w2_res, w2_str = _build_wgmma_tiles(qp, tiles=tiles, stream_mask=stream_mask)
     frag = None if big_vocab else _build_frag(qp)
     del qp
     row_scale = torch.full((rows_pad,), 1e-30, dtype=torch.float32, device=w2.device)
@@ -421,9 +427,9 @@ def _build_weights(
 def _kernel_for(bs: int, *, big_vocab: bool) -> str:
     if not 1 <= bs <= MAX_BS:
         raise ValueError(f"markov walk kernels take 1 <= bs <= {MAX_BS}, got {bs}")
-    if big_vocab or bs > I8B_MAX_BS:
-        return "i8s"
-    return "i8" if bs == 1 else "i8b"
+    if big_vocab or bs > SMALL_BATCH_MAX_BS:
+        return "wgmma"
+    return "single" if bs == 1 else "small_batch"
 
 
 def _aligned_zeros(n: int, *, device: torch.device) -> torch.Tensor:
@@ -485,7 +491,11 @@ class MarkovWalker:
         # One Philox key per kernel family: their counters overlap, and a request
         # moving between families (bs 1 -> a 2..4 batch) must not replay noise.
         base_seed = seed & ((1 << 63) - 1)
-        salts = {"i8": 0, "i8b": 0x2545F4914F6CDD1D, "i8s": 0x5851F42D4C957F2D}
+        salts = {
+            "single": 0,
+            "small_batch": 0x2545F4914F6CDD1D,
+            "wgmma": 0x5851F42D4C957F2D,
+        }
         self.seeds = {k: (base_seed ^ s) & ((1 << 63) - 1) for k, s in salts.items()}
         with torch.cuda.device(device), torch.no_grad():
             self._load_modules_and_weights(w1, w2)
@@ -497,8 +507,10 @@ class MarkovWalker:
         self.weights = _build_weights(
             w1.to(self.device), w2.to(self.device), num_sms=num_sms
         )
-        kinds = ("i8s",) if self.weights.big_vocab else ("i8", "i8b", "i8s")
-        words = {"i8": STATE_I8_WORDS, "i8b": STATE_BATCHED_WORDS}
+        kinds = (
+            ("wgmma",) if self.weights.big_vocab else ("single", "small_batch", "wgmma")
+        )
+        words = {"single": STATE_SINGLE_WORDS, "small_batch": STATE_BATCHED_WORDS}
         self.states = {
             k: _aligned_zeros(words.get(k, STATE_BATCHED_WORDS), device=self.device)
             for k in kinds
@@ -508,9 +520,9 @@ class MarkovWalker:
         self.temps_buf = torch.zeros(MAX_BS, dtype=torch.float32, device=self.device)
         self._greedy_temps = torch.zeros_like(self.temps_buf)
         if not self.weights.big_vocab:
-            _jit_i8_module()
-            _jit_i8b_module()
-        _jit_i8s_module(self.weights.tiles, I8S_RES, self.weights.stream_mask)
+            _jit_single_module()
+            _jit_small_batch_module()
+        _jit_wgmma_module(self.weights.tiles, WGMMA_RES, self.weights.stream_mask)
 
     def supports(self, bs: int) -> bool:
         return 1 <= bs <= self.max_bs
@@ -591,18 +603,18 @@ class MarkovWalker:
             valid_rows=self.vocab,
             seed=self.seeds[kind],
         )
-        if kind == "i8s":
-            markov_walk_i8s(
+        if kind == "wgmma":
+            markov_walk_wgmma(
                 w2_res=w.w2_res,
                 w2_str=w.w2_str,
                 w1f=w.w1f,
                 stream_mask=w.stream_mask,
                 **common,
             )
-        elif kind == "i8b":
-            markov_walk_i8b(frag=w.frag, w1q=w.w1q, **common)
+        elif kind == "small_batch":
+            markov_walk_small_batch(frag=w.frag, w1q=w.w1q, **common)
         else:
-            markov_walk_i8(frag=w.frag, w1q=w.w1q, **common)
+            markov_walk_single(frag=w.frag, w1q=w.w1q, **common)
 
     def warmup(
         self,

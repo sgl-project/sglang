@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Shared by the int8 DSpark markov-walk kernels: dspark_markov_walk_i8.cuh (bs = 1), dspark_markov_walk_i8b.cuh
-// (bs 2..4), dspark_markov_walk_i8s.cuh (bs 5..64, and every bs for big vocabularies).  Device helpers, then the
-// cooperative launch.  The weight layouts are built by python/sglang/kernels/ops/speculative/dspark/markov_walk.py.
+// Shared by the int8 DSpark markov-walk kernels: dspark_markov_walk_single.cuh (bs = 1),
+// dspark_markov_walk_small_batch.cuh (bs 2..4), dspark_markov_walk_wgmma.cuh (bs 5..64, and every bs for big
+// vocabularies).  Device helpers, then the cooperative launch.  The weight layouts are built by
+// python/sglang/kernels/ops/speculative/dspark/markov_walk.py.
 #pragma once
 
 #include <sgl_kernel/utils.h>
@@ -20,11 +21,12 @@ namespace sglang::dspark_markov_walk {
 using u64 = unsigned long long;
 
 inline constexpr int kMaxSteps = 16;  // K <= 16 draft steps per launch
-// i8 / i8b CTA and W2 layout: 256 threads; a 16-row W2 tile = 8 k32-chunks x 32 lanes of 16-B mma A fragments
+// single / small_batch CTA and W2 layout: 256 threads; a 16-row W2 tile = 8 k32-chunks x 32 lanes of 16-B mma A
+// fragments
 inline constexpr int kThreads = 256;
 inline constexpr int kWarps = kThreads / 32;
 inline constexpr int kTileVecs = 256;  // uint4 per tile
-// i8 / i8b W1q row: q_hi[256] | q_lo[256] | s_hi f32 | s_lo f32 | 8 B pad = 528 B
+// single / small_batch W1q row: q_hi[256] | q_lo[256] | s_hi f32 | s_lo f32 | 8 B pad = 528 B
 inline constexpr int kURowWords = 132;
 inline constexpr int kURowBytes = kURowWords * 4;
 
@@ -165,7 +167,8 @@ SGL_DEVICE int bf16x8_first_eq(unsigned p0, unsigned p1, unsigned p2, unsigned p
   return qi;
 }
 
-// ---- i8 / i8b tensor-core GEMV: one m16n8k32 s8.s8.s32 mma, A = a 16-row W2 tile chunk, B = two W1q planes
+// ---- single / small_batch tensor-core GEMV: one m16n8k32 s8.s8.s32 mma, A = a 16-row W2 tile chunk, B = two W1q
+// planes
 
 SGL_DEVICE void mma_s8(int (&c)[4], const uint4& a, uint32_t b0, uint32_t b1) {
   asm volatile(
@@ -200,7 +203,7 @@ SGL_DEVICE float half_uniform(unsigned x) {                // x < 2^31: v;  x >=
 }
 // Each transform below evaluates ONE log for E whichever half x is in (the half is a per-lane random bit, so a warp
 // that called a different log per half would execute both).
-// Gumbel(0,1) = -log(E) with accurate logs (i8).  x >= 2^31: E = -logf(t).  x < 2^31: E = -log1p(-t) from the same
+// Gumbel(0,1) = -log(E) with accurate logs (single).  x >= 2^31: E = -logf(t).  x < 2^31: E = -log1p(-t) from the same
 // logf: u = fl(1 - t), r = (1 - u) - t = (1 - t) - u exactly (Sterbenz, twice), log(1 - t) = log(u) + log1p(r / u)
 // with |r / u| <= 2^-24, and r / u = r (1 + t + t^2) to well below an ulp of E -- no division, no branch; the
 // large-Gumbel end (t -> 0: u = 1, E = t (1 + t + t^2)) stays exact.  Max |G error| over all x: 1.0e-6 (half an ulp of
@@ -230,9 +233,9 @@ SGL_DEVICE float ex2_ftz(float x) {
 SGL_DEVICE float logf_ftz(float x) {
   return lg2_ftz(x) * 0.693147182464599609375f;
 }
-// Gumbel(0,1) with MUFU logs (i8b: the epilogue's cost at T > 0 is mostly these logs).  E by its series for v < 2^-7
-// (the large-Gumbel end stays exact).  Max |G error| over all x: 9.0e-6.  Log arguments: t in [2^-33, 1/2], 1 - t in
-// [1/2, 1 - 2^-7], E in [2^-33, 23]: all normal.
+// Gumbel(0,1) with MUFU logs (small_batch: the epilogue's cost at T > 0 is mostly these logs).  E by its series for v <
+// 2^-7 (the large-Gumbel end stays exact).  Max |G error| over all x: 9.0e-6.  Log arguments: t in [2^-33, 1/2], 1 - t
+// in [1/2, 1 - 2^-7], E in [2^-33, 23]: all normal.
 SGL_DEVICE float gumbel_fast(unsigned x) {
   const float t = half_uniform(x);
   const bool hi = x >> 31;
@@ -240,7 +243,7 @@ SGL_DEVICE float gumbel_fast(unsigned x) {
   const float e = !hi && t < 0.0078125f ? t * (1.f + t * (0.5f + t * (0.33333334f + t * 0.25f))) : l;
   return -logf_ftz(e);
 }
-// Base-2 Gumbel for keys compared in log2 units (i8s): -log2(-log2(1 - v)) = G / ln 2 + log2(ln 2), i.e. G / ln 2 up
+// Base-2 Gumbel for keys compared in log2 units (wgmma): -log2(-log2(1 - v)) = G / ln 2 + log2(ln 2), i.e. G / ln 2 up
 // to a constant shift that does not change an argmax; computed as gumbel_fast with lg2.  Max |error| over all x: 1.3e-5
 // (log2 units).
 SGL_DEVICE float gumbel2_fast(unsigned x) {
@@ -251,7 +254,7 @@ SGL_DEVICE float gumbel2_fast(unsigned x) {
       !hi && t < 0.0078125f ? t * 1.4426950408889634f * (1.f + t * (0.5f + t * (0.33333334f + t * 0.25f))) : l;
   return -lg2_ftz(e);
 }
-// Uniform in (0, 1) for an inverse CDF (i8s, inside an 8-row item): u = ((x >> 9) + 0.5) 2^-23, every value exact,
+// Uniform in (0, 1) for an inverse CDF (wgmma, inside an 8-row item): u = ((x >> 9) + 0.5) 2^-23, every value exact,
 // u in [2^-24, 1 - 2^-24].  So u * c < c for every normal fp32 c (the product rounds to at most c - ulp), and a row of
 // zero mass is never drawn.  (24 bits, ((x >> 8) + 0.5) 2^-24, rounds to 1.0f at x >> 8 = 2^24 - 1.)
 SGL_DEVICE float uniform23(unsigned x) {

@@ -460,7 +460,7 @@ def _attach_int8_markov_walker(
             "DSpark int8 markov walk on: kernels %s for bs <= %d (larger graph "
             "buckets keep the stock walk), gamma=%d, %.0f MiB resident, ready "
             "in %.1f s.",
-            "i8s" if walker.weights.big_vocab else "i8/i8b/i8s",
+            "wgmma" if walker.weights.big_vocab else "single/small_batch/wgmma",
             walker.max_bs,
             walker.gamma,
             walker.memory_bytes() / (1 << 20),

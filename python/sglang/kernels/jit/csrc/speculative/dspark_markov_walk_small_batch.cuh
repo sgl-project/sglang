@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Batched int8 DSpark markov walk (serving: bs 2..4; the launcher takes 1..8): B independent walks share one on-chip
-// int8 W2.  Same W2 / W1q formats, tiling and load path as dspark_markov_walk_i8.cuh.
+// int8 W2.  Same W2 / W1q formats, tiling and load path as dspark_markov_walk_single.cuh.
 //
 //   for every request b:  prev_b = anchor_b;  for k < K:  logit = bf16(base[b, k] + W2 W1[prev_b]);
 //                         tok[b, k] = argmax(logit)  or  argmax(logit / T_b + Gumbel);  prev_b = tok[b, k]
@@ -34,7 +34,7 @@
 #include "dspark_markov_walk_common.cuh"
 #include <cstdint>
 
-namespace sglang::dspark_markov_walk::i8b {
+namespace sglang::dspark_markov_walk::small_batch {
 
 constexpr int kMaxB = 64;                              // state / SMEM array sizing
 constexpr int kPairMaxB = 8;                           // launcher limit (two mma passes)
@@ -57,7 +57,7 @@ store_bias_rn(const int (&c)[4], float sr_lo, float sr_hi, float u_hi, float u_l
       __fmul_rn(sr_hi, __fmaf_rn(u_hi, static_cast<float>(c[2]), __fmul_rn(u_lo, static_cast<float>(c[3]))));
 }
 
-__global__ void __launch_bounds__(kThreads, 1) markov_walk_i8b_kernel(
+__global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
     const uint4* __restrict__ frag,
     const float* __restrict__ row_scale,
     const uint32_t* __restrict__ w1q,
@@ -282,7 +282,7 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_i8b_kernel(
           const int r = row_base + l;
           float m;
           int idx;
-          if (inv_t > 0.f) {  // Gumbel-max; Philox counter (row / 4, step | request << 8, round), i8b's own key
+          if (inv_t > 0.f) {  // Gumbel-max; Philox counter (row / 4, step | request << 8, round), small_batch's own key
             // corrected: sampling requests only (the verifier's q), valid rows only
             if (corrected && r < valid_rows) *reinterpret_cast<uint4*>(corrected + out) = o;
             lg[0] = __uint_as_float(o.x << 16);
@@ -377,7 +377,7 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_i8b_kernel(
 /**
  * \brief One round of the batched (bs 2..4; the launcher takes 1..8) markov walk in one cooperative launch.
  *
- * \param frag       int8 [rows_pad * 256], W2 in m16n8k32 A-fragment order (as dspark_markov_walk_i8.cuh).
+ * \param frag       int8 [rows_pad * 256], W2 in m16n8k32 A-fragment order (as dspark_markov_walk_single.cuh).
  * \param row_scale  fp32 [rows_pad], W2 row scales; rows_pad = grid x 1152 sets the grid.
  * \param w1q        uint8 [V, 528], W1 rows: q_hi | q_lo | s_hi f32 | s_lo f32 | pad.
  * \param base       bf16 [B, kb, ld], kb >= num_steps, ld >= valid_rows, ld % 8 == 0 (sglang: [bs, K, V]); rows
@@ -438,7 +438,7 @@ inline void walk(
   // base / bias double buffers, row scales, SMEM tiles, then nb + 1 u rows
   constexpr std::size_t kSmemFixed = 2 * kGrp * kRowsCta * 6 + 64 * kTilesPerCta + kTilesSmem * kTileVecs * 16;
   launch_cooperative(
-      markov_walk_i8b_kernel,
+      markov_walk_small_batch_kernel,
       device.unwrap(),
       static_cast<uint32_t>(rows_pad.unwrap() / kRowsCta),
       kThreads,
@@ -461,4 +461,4 @@ inline void walk(
       static_cast<u64>(seed));
 }
 
-}  // namespace sglang::dspark_markov_walk::i8b
+}  // namespace sglang::dspark_markov_walk::small_batch

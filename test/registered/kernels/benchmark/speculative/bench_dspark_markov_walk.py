@@ -138,17 +138,19 @@ def _ours(
         seed=1,
     )
     kind = walker.kernel_for(bs)
-    if kind == "i8s":
-        mw.markov_walk_i8s(stream_mask=walker.weights.stream_mask, **weights, **common)
-    elif kind == "i8b":
-        mw.markov_walk_i8b(**weights, **common)
+    if kind == "wgmma":
+        mw.markov_walk_wgmma(
+            stream_mask=walker.weights.stream_mask, **weights, **common
+        )
+    elif kind == "small_batch":
+        mw.markov_walk_small_batch(**weights, **common)
     else:
-        mw.markov_walk_i8(**weights, **common)
+        mw.markov_walk_single(**weights, **common)
 
 
 def _ours_weights(walker, bs):
     w = walker.weights
-    if walker.kernel_for(bs) == "i8s":
+    if walker.kernel_for(bs) == "wgmma":
         return dict(row_scale=w.row_scale, w2_res=w.w2_res, w2_str=w.w2_str, w1f=w.w1f)
     return dict(row_scale=w.row_scale, frag=w.frag, w1q=w.w1q)
 

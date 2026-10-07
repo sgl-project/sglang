@@ -56,7 +56,7 @@ register_kernel(
 )
 
 # Exactly SM90: wgmma / mma.sync int8 kernels launched as cooperative grids, tuned on H100.
-for _fn in ("markov_walk_i8", "markov_walk_i8b", "markov_walk_i8s"):
+for _fn in ("markov_walk_single", "markov_walk_small_batch", "markov_walk_wgmma"):
     register_kernel(
         KernelSpec(
             op=f"speculative.dspark_{_fn}",

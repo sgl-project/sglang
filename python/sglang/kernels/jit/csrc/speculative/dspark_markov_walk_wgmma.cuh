@@ -39,8 +39,8 @@
 // (each thread's per-run tile limits lim0 / lim1 predicate its base loads) and never stored.  A request with no
 // candidate row at all (every logit NaN / -inf, e.g. a padded CUDA-graph row) gets token 0, as torch.argmax would.
 // SMEM per CTA = (kRes + kRing) x 16 KiB + kRowsCta x 4 B (row scales) + ~2.7 KiB static, within the 227 KiB opt-in for
-// every kTiles <= 32.  State: as dspark_markov_walk_i8b.cuh (round | pad | two sets of 128-B {key, count} pairs; CTA 0
-// clears the other set and closes the round).
+// every kTiles <= 32.  State: as dspark_markov_walk_small_batch.cuh (round | pad | two sets of 128-B {key, count}
+// pairs; CTA 0 clears the other set and closes the round).
 #pragma once
 
 #include <sgl_kernel/tensor.h>
@@ -55,7 +55,7 @@
 #include "dspark_markov_walk_common.cuh"
 #include <cstdint>
 
-namespace sglang::dspark_markov_walk::i8s {
+namespace sglang::dspark_markov_walk::wgmma {
 
 constexpr int kMaxB = 64;
 constexpr int kThr = 512, kNumWG = 4;
@@ -142,7 +142,7 @@ SGL_DEVICE int add_acq_rel_s32(int* p, int v) {
 
 // W2 placement: kRes of the kTiles tiles SMEM-resident, the others (kStreamMask) streamed through a kRing-slot TMA ring
 template <int kTiles, int kRes, int kRing, uint32_t kStreamMask>
-__global__ void __launch_bounds__(kThr, 1) markov_walk_i8s_kernel(
+__global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
     const unsigned char* __restrict__ w2_res,
     const unsigned char* __restrict__ w2_str,
     const float* __restrict__ row_scale,
@@ -559,7 +559,7 @@ inline void walk(
       << rows_pad;
   constexpr std::size_t kSmem = (kRes + kRing) * kTileBytes + kRowsCta * 4;
   launch_cooperative(
-      markov_walk_i8s_kernel<kTiles, kRes, kRing, kStreamMask>,
+      markov_walk_wgmma_kernel<kTiles, kRes, kRing, kStreamMask>,
       device.unwrap(),
       static_cast<uint32_t>(grid.unwrap()),
       kThr,
@@ -586,4 +586,4 @@ inline void walk(
 #undef DSPARK_MW_WG_D32_OUT
 #undef DSPARK_MW_WG_D32
 
-}  // namespace sglang::dspark_markov_walk::i8s
+}  // namespace sglang::dspark_markov_walk::wgmma
