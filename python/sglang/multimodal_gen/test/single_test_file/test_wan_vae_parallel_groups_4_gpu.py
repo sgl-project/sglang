@@ -66,9 +66,9 @@ def _worker(sp_size, tp_size):
         kwargs = dict(
             dim=4,
             z_dim=2,
-            dim_mult=(1, 2),
+            dim_mult=(1, 2, 2),
             num_res_blocks=1,
-            temperal_downsample=(False,),
+            temperal_downsample=(False, False),
             is_residual=residual,
         )
         reference = WanEncoder3d(**kwargs).cuda().eval()
@@ -78,7 +78,7 @@ def _worker(sp_size, tp_size):
             assert parallel.parallel_group is sp_group
             assert parallel.conv_in.parallel_group is sp_group
             assert parallel.conv_out.parallel_group is sp_group
-        x = torch.randn(1, 3, 1, 16, 8, device="cuda") + get_tp_group().rank_in_group
+        x = torch.randn(1, 3, 3, 32, 16, device="cuda") + get_tp_group().rank_in_group
         with torch.inference_mode():
             torch.testing.assert_close(parallel(x), reference(x), rtol=1e-4, atol=1e-4)
 
