@@ -20,6 +20,8 @@ register_cpu_ci(est_time=24, suite="base-a-test-cpu")
 _CPU = PlatformInfo(device_type="cpu")
 _SM90 = PlatformInfo(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
 _SM100 = PlatformInfo(device_type="cuda", cuda_arch_major=10, cuda_arch_minor=0)
+_SM80 = PlatformInfo(device_type="cuda", cuda_arch_major=8, cuda_arch_minor=0)
+_SM89 = PlatformInfo(device_type="cuda", cuda_arch_major=8, cuda_arch_minor=9)
 _HIP = PlatformInfo(device_type="hip")
 
 
@@ -423,6 +425,30 @@ def test_lora_engine_inventory_is_cuda_only(platform, eligible):
     for _, _, op in _LORA_ENGINE_APIS:
         spec = K.select_kernel(f"lora.{op}", backend=KernelBackend.TRITON)
         assert K.capabilities_satisfied(spec.capabilities, platform) is eligible
+
+
+@pytest.mark.parametrize(
+    "function",
+    [
+        "prepare_masked_bf16",
+        "prepare_contiguous_bf16",
+    ],
+)
+def test_lora_cute_dsl_grouped_gemms_are_inventoried(function):
+    spec = K.select_kernel(f"lora.{function}", backend=KernelBackend.CUTE_DSL)
+    assert spec.target == f"sglang.kernels.ops.lora.moe.cutedsl.api:{function}"
+    # The grouped GEMMs have SM90 and SM100 kernel classes only.
+    for platform in (_CPU, _HIP, _SM80, _SM89):
+        assert not K.capabilities_satisfied(spec.capabilities, platform)
+    for platform in (_SM90, _SM100):
+        assert K.capabilities_satisfied(spec.capabilities, platform)
+    tree = ast.parse(
+        (Path(K.__file__).resolve().parent / "ops/lora/moe/cutedsl/api.py").read_text()
+    )
+    assert any(
+        isinstance(node, ast.FunctionDef) and node.name == function
+        for node in tree.body
+    )
 
 
 if __name__ == "__main__":

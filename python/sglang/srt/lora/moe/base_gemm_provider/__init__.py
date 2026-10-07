@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # The first vendor is the default for each weight family.
 VENDORS = {
-    "bf16": ("triton",),
+    "bf16": ("cutedsl", "triton"),
 }
 
 
@@ -39,7 +39,19 @@ def select_provider_cls(
                 vendors[0],
             )
         vendor = vendors[0]
+    expert_major = base_gemm_rows == "expert_major"
     match vendor, family:
+        case "cutedsl", "bf16":
+            from sglang.srt.lora.moe.base_gemm_provider.cutedsl_bf16 import (
+                CuteDslBf16ContiguousProvider,
+                CuteDslBf16MaskedProvider,
+            )
+
+            return (
+                CuteDslBf16MaskedProvider
+                if expert_major
+                else CuteDslBf16ContiguousProvider
+            )
         case "triton", "bf16":
             from sglang.srt.lora.moe.base_gemm_provider.triton_bf16 import (
                 TritonBf16ContiguousProvider,
