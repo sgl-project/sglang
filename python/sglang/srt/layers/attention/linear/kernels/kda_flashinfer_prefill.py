@@ -75,7 +75,7 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
     uses_state_checkpoints = True
     supports_track_state_snapshot = True
     supports_safe_gate = True
-    expects_beta_logits = True
+    expects_beta_logits: bool = True
 
     def __init__(self):
         if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):

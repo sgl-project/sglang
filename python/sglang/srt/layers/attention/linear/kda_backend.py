@@ -209,9 +209,7 @@ class KDAKernelDispatcher:
                 "SM100, ptx_kda SM100 or SM103)."
             )
 
-        self.prefill_beta_is_raw = getattr(
-            self.extend_kernel, "expects_beta_logits", False
-        )
+        self.prefill_beta_is_raw = self.extend_kernel.expects_beta_logits
 
         self.supports_packed_decode = getattr(
             self.decode_kernel, "supports_packed_decode", False
