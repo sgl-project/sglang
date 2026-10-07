@@ -1178,5 +1178,70 @@ def test_packed_varlen_prefill_contract(
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("lower_bound", [-5.0, None])
+@pytest.mark.parametrize("tree", [False, True])
+def test_target_verify_contract(dtype, lower_bound, tree):
+    from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
+    from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
+    from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+
+    torch.manual_seed(42)
+    n, t, h, hv, k, v = 4, 6, 2, 4, 128, 128
+    total = 15
+    qkv = torch.randn(1, total, 2 * h * k + hv * v, device="cuda", dtype=torch.bfloat16)
+    q, keys, values = qkv.split([h * k, h * k, hv * v], -1)
+    q = q.view(1, total, h, k)
+    keys = keys.view(1, total, h, k)
+    values = values.view(1, total, hv, v)
+    state = torch.randn(8, hv, v, k, device="cuda", dtype=dtype) * 0.01
+    initial = state.clone()
+    snapshots = torch.full((8, t + 1, hv, v, k), -99.0, device="cuda", dtype=dtype)
+    actual_snapshots = snapshots.clone()
+    args = dict(
+        q=q,
+        k=keys,
+        v=values,
+        a=torch.randn(total, hv * k, device="cuda", dtype=torch.bfloat16),
+        b=torch.randn(total, hv, device="cuda", dtype=torch.bfloat16),
+        A_log=torch.randn(hv, device="cuda"),
+        dt_bias=torch.randn(hv * k, device="cuda"),
+        ssm_states=state,
+        cache_indices=torch.tensor([3, 5, 0, -1], device="cuda", dtype=torch.int32),
+        query_start_loc=torch.tensor(
+            [0, 6, 9, 9, 15], device="cuda", dtype=torch.int32
+        ),
+        intermediate_states_buffer=snapshots,
+        intermediate_state_indices=torch.tensor(
+            [2, 4, 1, -1], device="cuda", dtype=torch.int64
+        ),
+        cache_steps=t,
+        retrieve_parent_token=torch.tensor(
+            [[0, 0, 0, 1, 1, 3]] * n, device="cuda", dtype=torch.int64
+        )
+        if tree
+        else None,
+        lower_bound=lower_bound,
+    )
+    dispatcher = KDAKernelDispatcher(
+        decode_backend=LinearAttnKernelBackend.TRITON,
+        prefill_backend=LinearAttnKernelBackend.TRITON,
+        verify_backend=LinearAttnKernelBackend.HELION,
+    )
+    expected = TritonKDAKernel().target_verify(**args)
+    args["intermediate_states_buffer"] = actual_snapshots
+    actual = dispatcher.target_verify(**args)
+    torch.testing.assert_close(actual, expected, atol=0.003, rtol=0.02)
+    torch.testing.assert_close(actual_snapshots, snapshots, atol=0.003, rtol=0.02)
+    torch.testing.assert_close(state, initial, atol=0, rtol=0)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = dispatcher.target_verify(**args)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, actual, atol=0, rtol=0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
