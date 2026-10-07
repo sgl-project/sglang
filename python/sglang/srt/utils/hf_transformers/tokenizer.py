@@ -31,6 +31,7 @@ from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
 from ..hf_transformers_patches import _ensure_gguf_version
 from .common import (
+    _cached_file_exists,
     _resolve_local_or_cached_file,
     attach_additional_stop_token_ids,
     check_gguf_file,
@@ -314,6 +315,55 @@ def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
         backend.decoder = raw.decoder
 
 
+def _fix_v5_bare_spm_backend(tokenizer, model_name_or_path, revision=None):
+    """Rebuild the backend of a remote-code fast tokenizer shipped as tokenizer.model only.
+
+    transformers v5 skips the SentencePiece proto build for classes with a custom
+    __init__ (e.g. InternLM2TokenizerFast) and ignores their SLOW_TO_FAST_CONVERTERS
+    entry, leaving a bare BPE: no normalizer or decoder (spaces dropped, U+2581
+    leaked), and added tokens appended past the vocab instead of replacing the
+    placeholder pieces (out-of-range ids). TokenizersBackend still does the full build.
+    """
+    if not isinstance(tokenizer, PreTrainedTokenizerFast):
+        return
+    backend = tokenizer.backend_tokenizer
+    if backend.normalizer is not None or backend.pre_tokenizer is not None:
+        return
+
+    if _cached_file_exists(
+        model_name_or_path, "tokenizer.json", revision
+    ) or not _cached_file_exists(model_name_or_path, "tokenizer.model", revision):
+        return
+
+    from transformers import TokenizersBackend
+
+    try:
+        rebuilt = TokenizersBackend.from_pretrained(
+            model_name_or_path, revision=revision
+        ).backend_tokenizer
+    except (OSError, ValueError, RuntimeError, ImportError) as e:
+        logger.warning(
+            "Failed to rebuild SentencePiece backend for %s: %s", model_name_or_path, e
+        )
+        return
+    # sentencepiece 0.2.2 rejects some protos, and transformers then silently
+    # falls back to TikToken, which yields the same bare backend.
+    if rebuilt.normalizer is None:
+        logger.warning(
+            "Tokenizer for %s has no normalizer and could not be rebuilt from "
+            "tokenizer.model; check that the sentencepiece version matches the pin.",
+            model_name_or_path,
+        )
+        return
+
+    logger.info(
+        "Rebuilt bare v5 SentencePiece backend for %s (%s)",
+        model_name_or_path,
+        type(tokenizer).__name__,
+    )
+    tokenizer._tokenizer = rebuilt
+
+
 def _fix_v5_add_bos_eos_token(tokenizer, model_name_or_path, revision=None):
     """Restore add_bos_token/add_eos_token stripped by transformers v5.
 
@@ -426,6 +476,7 @@ def _fix_special_tokens_pattern(tokenizer):
 def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
     """Apply all post-load patches and return the final tokenizer."""
     _install_tokenizer_warnings_filter(tokenizer)
+    _fix_v5_bare_spm_backend(tokenizer, tokenizer_name, revision)
     _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision)
     _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, revision)
 
