@@ -24,18 +24,23 @@ snapshot names the allocation site of a block a captured graph recorded.
 
 Recording is started once per process and left active. The allocator keeps
 one process-wide history recorder, and stopping it discards the recorded
-events (live blocks keep the stacks they were allocated with). The CUDA
-graph runner's capture profiler (``--enable-profile-cuda-graph``) therefore
-hands the recorder back through :func:`stop_memory_history` instead of
-stopping it. Another feature that stops recording itself (the ``MEM``
-activity of the torch profiler) still clears the events: a dump that finds
-no history entries writes the snapshot anyway, since its live blocks still
-map addresses to allocation stacks, re-arms recording with the configured
+events (live blocks keep the stacks they were allocated with), while
+changing ``max_entries`` on a recorder that already holds events leaves its
+ring buffer misordered. The CUDA graph runner's capture profiler
+(``--enable-profile-cuda-graph``) therefore records through
+:func:`start_memory_history` and :func:`stop_memory_history`, which keep the
+forensics configuration and history untouched while forensics owns the
+recorder (its capture snapshot then uses that configuration). Another feature that stops recording itself (the ``MEM`` activity
+of the torch profiler) still clears the events: a dump that finds no history
+entries writes the snapshot anyway, since its live blocks still map
+addresses to allocation stacks, re-arms recording with the configured
 parameters, and leaves the tag unconsumed, so the next request for that tag
-writes a snapshot whose history starts at the re-arm. Both entry points
+writes a snapshot whose history starts at the re-arm.
+:func:`maybe_start_memory_forensics` and :func:`maybe_dump_memory_forensics`
 return without touching ``torch.cuda`` unless the directory variable is set,
 and dump failures are logged and never raised, so the original failure path
-of a caller is preserved even on a faulted CUDA context.
+of a caller is preserved even on a faulted CUDA context. The profiler hooks
+call ``torch.cuda`` as the profiler itself did and propagate its errors.
 """
 
 from __future__ import annotations
@@ -54,6 +59,7 @@ logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _started = False
+_max_entries = 0
 _dumped_tags: set[str] = set()
 
 
@@ -71,12 +77,18 @@ def _rank_label() -> str:
 
 
 def _start_recording() -> None:
+    # Always the max_entries recording started with: changing it on a
+    # recorder that holds events leaves the ring buffer misordered.
     torch.cuda.memory._record_memory_history(
         enabled="all",
         context="all",
         stacks="python",
-        max_entries=envs.SGLANG_MEM_FORENSICS_MAX_ENTRIES.get(),
+        max_entries=_max_entries,
     )
+
+
+def _owns_recorder() -> bool:
+    return _started and memory_forensics_enabled()
 
 
 def _snapshot_has_history(snapshot) -> bool:
@@ -85,7 +97,7 @@ def _snapshot_has_history(snapshot) -> bool:
 
 def maybe_start_memory_forensics() -> None:
     """Begin allocator-history recording once per process when enabled."""
-    global _started
+    global _started, _max_entries
     if not memory_forensics_enabled():
         return
     with _lock:
@@ -94,6 +106,7 @@ def maybe_start_memory_forensics() -> None:
         try:
             if not torch.cuda.is_available():
                 return
+            _max_entries = envs.SGLANG_MEM_FORENSICS_MAX_ENTRIES.get()
             _start_recording()
         except Exception:
             logger.exception("Memory forensics recording failed to start")
@@ -102,22 +115,27 @@ def maybe_start_memory_forensics() -> None:
         logger.info(
             "Memory forensics recording started (dir=%s, max_entries=%d)",
             envs.SGLANG_MEM_FORENSICS_DIR.get(),
-            envs.SGLANG_MEM_FORENSICS_MAX_ENTRIES.get(),
+            _max_entries,
         )
 
 
-def stop_memory_history() -> None:
-    """Stop allocator-history recording started by another profiler.
+def start_memory_history() -> None:
+    """Start allocator-history recording for another profiler.
 
-    When memory forensics owns the recorder, restore its configuration
-    instead of stopping, so the history recorded so far is kept.
+    While memory forensics owns the recorder, keep (or re-arm) its own
+    configuration instead of the default one, so its history stays ordered.
     """
-    if _started:
-        try:
-            _start_recording()
-            return
-        except Exception:
-            logger.exception("Memory forensics recording failed to resume")
+    if _owns_recorder():
+        _start_recording()
+    else:
+        torch.cuda.memory._record_memory_history()
+
+
+def stop_memory_history() -> None:
+    """Stop recording begun by :func:`start_memory_history`; while memory
+    forensics owns the recorder, leave it and its history in place."""
+    if _owns_recorder():
+        return
     torch.cuda.memory._record_memory_history(enabled=None)
 
 
