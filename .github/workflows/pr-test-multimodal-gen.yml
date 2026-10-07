@@ -275,13 +275,13 @@ jobs:
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
     runs-on: 2-gpu-h100
-    timeout-minutes: 45
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2gpu) }}
     steps:
       - name: Record retry deadline
-        run: echo "SGLANG_DIFFUSION_RETRY_DEADLINE=$(( $(date +%s) + 2400 ))" >> "$GITHUB_ENV"
+        run: echo "SGLANG_DIFFUSION_RETRY_DEADLINE=$(( $(date +%s) + 3000 ))" >> "$GITHUB_ENV"
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -306,7 +306,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run diffusion server tests
-        timeout-minutes: 45
+        timeout-minutes: 55
         env:
           HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}

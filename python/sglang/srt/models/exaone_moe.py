@@ -28,9 +28,14 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
 )
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -39,10 +44,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
-    reduce_moe_output,
-)
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -59,7 +61,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
+from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_pp_layers
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +136,6 @@ class ExaoneMoESparseMoEBlock(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
-        self.moe_ep_size = get_parallel().moe_ep_size
         self.layer_id = layer_id
         self.routed_scaling_factor = config.routed_scaling_factor
         self.alt_stream = alt_stream
@@ -200,7 +201,6 @@ class ExaoneMoESparseMoEBlock(nn.Module):
             )
 
         if get_moe_a2a_backend().is_deepep():
-            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
                 config.num_experts + get_exec().moe.ep_num_redundant_experts
             )
@@ -288,7 +288,6 @@ class ExaoneMoESparseMoEBlock(nn.Module):
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -360,6 +359,7 @@ class ExaoneMoEAttention(nn.Module):
             hidden_size,
             bias=bias,
             quant_config=o_quant_config,
+            reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -404,6 +404,8 @@ class ExaoneMoEAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if hidden_states.shape[0] == 0:
+            return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
@@ -450,8 +452,6 @@ class ExaoneMoEDecoderLayer(nn.Module):
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False
         )
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         self.self_attn = ExaoneMoEAttention(
             config=config,
@@ -482,11 +482,25 @@ class ExaoneMoEDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=False,
                 prefix=add_prefix("mlp", prefix),
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
+        )
+        is_moe_layer = config.is_moe_layer
+        num_layers = config.num_hidden_layers
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=is_moe_layer[layer_id],
+                    next_layer_sparse=layer_id + 1 < num_layers
+                    and is_moe_layer[layer_id + 1],
+                ),
+                self.post_attention_layernorm,
+            ),
         )
 
     def forward(
@@ -494,13 +508,11 @@ class ExaoneMoEDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        capture_output=None,
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, capture=capture_output
+        )
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -509,11 +521,11 @@ class ExaoneMoEDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         # Fully Connected
-        hidden_states = self.mlp(hidden_states)
-
-        return hidden_states, residual
+        hidden_states = self.mlp(hidden_states, forward_batch)
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class ExaoneMoEModel(nn.Module):
@@ -541,7 +553,7 @@ class ExaoneMoEModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: ExaoneMoEDecoderLayer(
                 layer_id=idx,
@@ -550,8 +562,6 @@ class ExaoneMoEModel(nn.Module):
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
 
@@ -576,34 +586,29 @@ class ExaoneMoEModel(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states + residual)
-                layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual
+                hidden_states = self.layers[i](
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    capture_output=aux_hidden_states.capture
+                    if i in self.layers_to_capture
+                    else None,
                 )
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-        else:
-            if hidden_states.shape[0] != 0:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
         if len(aux_hidden_states) == 0:
             return hidden_states
 
@@ -698,6 +703,7 @@ class ExaoneMoEForCausalLM(nn.Module):
         start, end = split_interval
         # embed
         if start == 0:
+            residual_batch.start(forward_batch)
             if input_embeds is None:
                 forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
@@ -705,19 +711,17 @@ class ExaoneMoEForCausalLM(nn.Module):
         # decoder layer
         for i in range(start, end):
             layer = self.model.layers[i]
-            forward_batch.hidden_states, forward_batch.residual = layer(
+            forward_batch.hidden_states = layer(
                 positions,
                 forward_batch.hidden_states,
                 forward_batch,
-                forward_batch.residual,
             )
 
         if end == self.model.config.num_hidden_layers:
             # norm
-            hidden_states, _ = self.model.norm(
-                forward_batch.hidden_states, forward_batch.residual
+            forward_batch.hidden_states = residual_batch.final_norm(
+                forward_batch.hidden_states, forward_batch, self.model.norm
             )
-            forward_batch.hidden_states = hidden_states
             # logits process
             result = self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
@@ -792,6 +796,7 @@ class ExaoneMoEForCausalLM(nn.Module):
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
 
+            is_expert_weight = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -813,7 +818,11 @@ class ExaoneMoEForCausalLM(nn.Module):
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
+                    is_expert_weight = True
                     name = name.replace(weight_name, param_name)
+                    if name not in params_dict:
+                        # The expert's layer lives on another pipeline rank.
+                        continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -825,6 +834,8 @@ class ExaoneMoEForCausalLM(nn.Module):
                     )
                     break
                 else:
+                    if is_expert_weight:
+                        continue
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
@@ -865,4 +876,8 @@ class ExaoneMoEForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
-EntryClass = ExaoneMoEForCausalLM
+class ExaoneMoeForCausalLM(ExaoneMoEForCausalLM):
+    pass
+
+
+EntryClass = [ExaoneMoEForCausalLM, ExaoneMoeForCausalLM]

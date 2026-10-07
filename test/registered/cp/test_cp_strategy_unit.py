@@ -98,28 +98,21 @@ class TestCPStrategyUnit(CustomTestCase):
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
 
-    def test_hip_dsa_cp_is_disabled(self):
-        parallel = SimpleNamespace(
-            attn_cp_size=2,
-        )
-        model_config = SimpleNamespace(hf_config=SimpleNamespace())
-
-        with (
-            patch(
-                "sglang.srt.layers.attention.dsa.utils.get_parallel",
-                return_value=parallel,
-            ),
-            patch(
-                "sglang.srt.layers.attention.dsa.utils.process_model_config",
-                return_value=model_config,
-            ),
-            patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=True),
-            patch(
-                "sglang.srt.configs.model_config.is_deepseek_dsa",
-                return_value=True,
-            ),
-        ):
-            self.assertFalse(is_dsa_enable_prefill_cp())
+    def test_hip_dsa_cp_is_deepseek_v4_only(self):
+        utils = "sglang.srt.layers.attention.dsa.utils"
+        model_config = "sglang.srt.configs.model_config"
+        parallel = SimpleNamespace(attn_cp_size=2)
+        config = SimpleNamespace(hf_config=SimpleNamespace())
+        for is_v4 in (True, False):
+            with (
+                self.subTest(is_v4=is_v4),
+                patch(f"{utils}.get_parallel", return_value=parallel),
+                patch(f"{utils}.process_model_config", return_value=config),
+                patch(f"{utils}.is_hip", return_value=True),
+                patch(f"{model_config}.is_deepseek_dsa", return_value=not is_v4),
+                patch(f"{model_config}.is_deepseek_v4", return_value=is_v4),
+            ):
+                self.assertEqual(is_dsa_enable_prefill_cp(), is_v4)
 
 
 class TestPrefillCPBCGReplay(CustomTestCase):
@@ -146,6 +139,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
             input_embeds=None,
             replace_embeds=None,
             mm_inputs=None,
+            contains_mm_inputs=lambda: False,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_tokens_cpu=None,
@@ -614,6 +608,7 @@ class TestCPZigzagStrategy(CustomTestCase):
         swa_loc = torch.arange(5) + 16
         forward_batch = SimpleNamespace(
             out_cache_loc=cache_loc,
+            out_cache_loc_is_physical=False,
             encoder_out_cache_loc=torch.arange(3) + 32,
         )
         layer = SimpleNamespace(

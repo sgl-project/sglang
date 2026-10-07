@@ -67,7 +67,9 @@ class MambaComponent(TreeComponent):
         assert isinstance(params.req_to_token_pool, HybridReqToTokenPool), (
             f"MambaComponent requires HybridReqToTokenPool, got {type(params.req_to_token_pool)}"
         )
-        if not params.enable_mamba_extra_buffer:
+        # Without the extra buffer only the sequence-end state exists, so a cached
+        # state needs page 1; a disabled tree caches none.
+        if not params.enable_mamba_extra_buffer and not params.disable:
             assert params.page_size == 1, (
                 f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
             )
@@ -538,6 +540,28 @@ class MambaComponent(TreeComponent):
         else:
             self.cache.req_to_token_pool.mamba_allocator.free(mamba_value)
 
+    def _select_finished_checkpoint(
+        self, req: Req, token_ids_len: int
+    ) -> Optional[tuple[int, int]]:
+        # None means donate nothing, not "no slot found".
+        pool = self.cache.req_to_token_pool
+        keep_idx = pool.get_mamba_ping_pong_keep_idx(req)
+        cache_len = req.kv.mamba_last_track_seqlen or 0
+
+        if cache_len <= token_ids_len:
+            return cache_len, keep_idx
+
+        # Overshoot: the latest state ran past the key. The other slot always
+        # holds a tensor; only this seqlen says whether a key can name it.
+        previous_cache_len = req.kv.mamba_prev_track_seqlen
+        if (
+            pool.mamba_ping_pong_track_buffer_size != 2
+            or previous_cache_len is None
+            or previous_cache_len > token_ids_len
+        ):
+            return None
+        return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
+
     def prepare_for_caching_req(
         self,
         req: Req,
@@ -566,9 +590,11 @@ class MambaComponent(TreeComponent):
             if cache_len is None:
                 cache_len = 0
             if self.cache.enable_mamba_extra_buffer:
-                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
-                    req
-                )
+                checkpoint = self._select_finished_checkpoint(req, token_ids_len)
+                if checkpoint is None:
+                    return 0
+                cache_len, keep_idx = checkpoint
+                insert_params.mamba_keep_idx = keep_idx
                 active_value = (
                     req.kv.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
                 )
@@ -641,11 +667,11 @@ class MambaComponent(TreeComponent):
                 return
 
             if self.cache.enable_mamba_extra_buffer:
-                keep_idx = (
-                    pool.get_mamba_ping_pong_keep_idx(req)
-                    if mamba_value_inserted
-                    else None
+                # Keep the slot prepare picked, so cleanup cannot pick another.
+                prepared_keep_idx = (
+                    insert_params.mamba_keep_idx if insert_params is not None else None
                 )
+                keep_idx = prepared_keep_idx if mamba_value_inserted else None
                 pool.free_mamba_cache(
                     req, mamba_ping_pong_track_buffer_to_keep=keep_idx
                 )
@@ -659,6 +685,7 @@ class MambaComponent(TreeComponent):
             ):
                 self._free_mamba_value(insert_params.mamba_value)
             req.kv.mamba_last_track_seqlen = None
+            req.kv.mamba_prev_track_seqlen = None
 
     def build_external_linker_transfer(
         self,
