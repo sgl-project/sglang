@@ -26,6 +26,7 @@ kept out of per-commit CI to bound cost.
     python -m pytest test/registered/models/test_inkling_unified.py -v
 """
 
+import importlib.util
 import os
 import unittest
 
@@ -127,6 +128,14 @@ def _greedy_generate(base_url, text, max_new_tokens=32, logprobs=False):
     return resp.json()
 
 
+# tml-renderers ships cp311-abi3 wheels only; the Python 3.10 lanes lack it.
+_needs_tml_renderers = unittest.skipUnless(
+    importlib.util.find_spec("tml_renderers") is not None,
+    "tml-renderers is not installed (it requires Python >= 3.11)",
+)
+
+
+@_needs_tml_renderers
 class TestInklingUnifiedTriPool(CustomTestCase):
     @classmethod
     def server_args(cls):
@@ -224,6 +233,7 @@ class TestInklingUnifiedFullPrefillGraph(TestInklingUnifiedTriPool):
     os.environ.get("INKLING_UNIFIED_PARITY") == "1",
     "eval-host lane: set INKLING_UNIFIED_PARITY=1 (two sequential server boots)",
 )
+@_needs_tml_renderers
 class TestInklingUnifiedVsStaticParity(CustomTestCase):
     """Greedy logprob parity: unified tri-pool vs static pools, same prompts.
     Two sequential boots -- the strongest wrong-slot tripwire short of GSM8K."""

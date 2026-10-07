@@ -8,6 +8,7 @@ or misaligns any of them collapses generation rather than shaving accuracy.
 MXFP8 KV needs SM100+, so this is Blackwell-only.
 """
 
+import importlib.util
 import os
 import unittest
 
@@ -61,6 +62,14 @@ COMMON_ARGS = [
 ]
 
 
+# tml-renderers ships cp311-abi3 wheels only; the Python 3.10 lanes lack it.
+_needs_tml_renderers = unittest.skipUnless(
+    importlib.util.find_spec("tml_renderers") is not None,
+    "tml-renderers is not installed (it requires Python >= 3.11)",
+)
+
+
+@_needs_tml_renderers
 class TestDisaggregationInklingMXFP8(PDDisaggregationServerBase, GSM8KMixin):
     # Shot count, TP and floor match the single-server Inkling case, so its 0.900
     # is a peer number rather than a rough reference. A dropped or misaligned state
