@@ -329,5 +329,37 @@ class TestMambaHostPrivateDraftRefused(CustomTestCase):
         self.assertIsNone(self._resolve(decision=FusedDraftDecision(), eagle=False))
 
 
+class TestSWAHostPrivateDraftRefused(CustomTestCase):
+    """A hybrid-SWA host's boot solve prices a private EAGLE draft at the
+    target's per-token size, so a draft that does not fuse is refused there
+    too; the fused arm is the only EAGLE arm such a host builds."""
+
+    def _resolve(self, *, decision, eagle=True):
+        from sglang.srt.mem_cache import kv_cache_configurator as kvc
+
+        cfg = kvc.KVCacheConfigurator.__new__(kvc.KVCacheConfigurator)
+        cfg.is_draft_worker = False
+        cfg.spec_algorithm = SimpleNamespace(is_eagle=lambda: eagle)
+        with patch.object(
+            kvc.KVCacheConfigurator, "_fused_draft_decision", return_value=decision
+        ):
+            return cfg._fused_draft_for_swa_factory()
+
+    def test_a_declined_eagle_draft_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "KV cache dtype"):
+            self._resolve(
+                decision=FusedDraftDecision(
+                    declined="the draft's KV cache dtype (bf16) differs from the host's"
+                )
+            )
+
+    def test_a_placed_draft_and_other_algorithms_pass(self):
+        placement = _place(_profile()).placement
+        self.assertIs(
+            self._resolve(decision=FusedDraftDecision(placement=placement)), placement
+        )
+        self.assertIsNone(self._resolve(decision=FusedDraftDecision(), eagle=False))
+
+
 if __name__ == "__main__":
     unittest.main()

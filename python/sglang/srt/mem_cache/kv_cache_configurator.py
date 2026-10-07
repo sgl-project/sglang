@@ -836,8 +836,8 @@ class KVCacheConfigurator:
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, env-var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
-            # Draft workers keep the token-count byte sum (spec is asserted
-            # off under unified; belt only).
+            # A draft worker sizes its own pool by token count; only the
+            # target's unified buffer takes the profiled byte budget.
             unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
         )
         return bundle
@@ -939,8 +939,8 @@ class KVCacheConfigurator:
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
             forward_stream=self.forward_stream,
             lazy_compaction=_should_enable_lazy_compaction(),
-            # Draft workers keep the token-count byte sum (spec is asserted
-            # off under unified; belt only).
+            # A draft worker sizes its own pool by token count; only the
+            # target's unified buffer takes the profiled byte budget.
             unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
             # bs=1 feasibility floor input (context len is already passed).
             sliding_window_size=self.model_config.sliding_window_size,
@@ -1104,6 +1104,29 @@ class KVCacheConfigurator:
             )
         return placement
 
+    def _fused_draft_for_swa_factory(self):
+        """`_fused_draft_for_pool_factory` for a hybrid-SWA host. Its boot solve
+        prices a private EAGLE draft pool at the target's per-token size, not
+        at the draft's own heads, head_dim and KV dtype, so a draft that does
+        not fuse is refused here, as on a mamba host, instead of overcommitting
+        GPU memory."""
+        placement = self._fused_draft_for_pool_factory()
+        if (
+            placement is None
+            and self.spec_algorithm.is_eagle()
+            and not self.is_draft_worker
+        ):
+            reason = (
+                self._fused_draft_decision().declined or "fusion does not apply to it"
+            )
+            raise ValueError(
+                "--enable-unified-memory + EAGLE/EAGLE3 on a hybrid-SWA target "
+                "needs the draft's KV fused into the target's pages, but this "
+                f"draft would keep a private pool ({reason}), which the unified "
+                "pool's sizing does not price."
+            )
+        return placement
+
     def _fused_draft_for_pool_factory(self):
         """Resolve ONCE per factory call (not inline) so the boot log reports
         exactly the placement the factory is handed: a declined fusion and an
@@ -1221,7 +1244,7 @@ class KVCacheConfigurator:
             # charged, see `_check_bs1_feasibility_floor`.
             model_context_len=self.model_config.context_len,
             sliding_window_size=self.model_config.sliding_window_size,
-            fused_draft=self._fused_draft_for_pool_factory(),
+            fused_draft=self._fused_draft_for_swa_factory(),
         )
         return UnifiedPoolBundle(
             unified_memory_pool=bundle.unified_memory_pool,
