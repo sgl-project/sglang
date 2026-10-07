@@ -67,6 +67,8 @@ Pick your hardware + recipe to generate the launch command:
 - **Low-Latency** — fastest reply for a single user. Pick for chat.
 - **High-Throughput** — most tokens per second across many users. Best for batch jobs.
 
+For long AgentX tool traces on B200, see the [workload-specific DSpark serving settings](#3-6-b200-agentx-serving-with-dspark) below.
+
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/deepseek-ai/deepseek-v4_1.jsx";
 
@@ -207,7 +209,7 @@ Only the L2 tier is exposed here. For the storage (L3) tier and the canonical fl
 
 ### 3.6 B200 AgentX serving with DSpark
 
-The general-purpose deployment panel above uses SGLang's verified cells. For an AgentX-style workload with long, multi-turn tool traces, [InferenceX PR #3745](https://github.com/SemiAnalysisAI/InferenceX/pull/3745) exercised the following **four-B200-GPU** aggregate shapes from its [pinned recipe](https://github.com/SemiAnalysisAI/InferenceX/blob/322bc37b368c85828357afb57dce6739d94ef955/inferencex-e2e/benchmarks/single_node/srt-slurm-recipes/dsv41flash/sglang/b200-fp4-mtp/agentic.yaml) on `lmsysorg/sglang:nightly-dev-cu13-20261004-295a53c9@sha256:7cfd4dd8e0e902d2a3c0560565963c4e172091e1586aaed15ff5a0a131394d34`. The [successful sweep](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/37420473448) ran eight performance points and separate AgentX evals at concurrency 32 and 128. The performance harness used synthetic draft acceptance; the evals used normal verification. These settings are workload-specific and do not replace the deployment panel's general recommendations.
+The general-purpose deployment panel above uses SGLang's verified cells. For an AgentX-style workload with long, multi-turn tool traces, the following **four-B200-GPU** aggregate shapes were exercised on `lmsysorg/sglang:nightly-dev-cu13-20261004-295a53c9@sha256:7cfd4dd8e0e902d2a3c0560565963c4e172091e1586aaed15ff5a0a131394d34`. Eight performance points used synthetic draft acceptance; separate AgentX evals at concurrency 32 and 128 used normal verification. These settings are workload-specific and do not replace the deployment panel's general recommendations.
 
 Run either server command **inside that image**, with four B200 GPUs visible. Plan for sufficient CPU memory and huge pages for efficient host-resident Engram tables. The commands enable thinking by default to match the measured workload; applications can instead select reasoning per request.
 
