@@ -1906,6 +1906,11 @@ class Envs:
     # Feature-owned ROCm controls.
     SGLANG_ROCM_K3_FLYDSL_SOURCE = EnvStr("auto")
 
+    # Feature-owned ROCm controls.
+    SGLANG_ROCM_K3_AITER_KDA_GROUP64 = EnvBool(False)
+    SGLANG_ROCM_K3_AITER_B2_FUSIONS = EnvBool(False)
+    SGLANG_ROCM_K3_KDA_GROUP64_LEGACY_LAUNCH = EnvBool(False)
+
 
 envs = Envs()
 EnvField._allow_set_name = False
