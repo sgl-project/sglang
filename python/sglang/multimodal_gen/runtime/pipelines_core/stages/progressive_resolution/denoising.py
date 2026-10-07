@@ -88,7 +88,7 @@ def _activation_time(P: float, delta: float) -> float:
     denom = P * (1.0 + P - delta)
     if denom <= 0 or delta >= 1.0 + P:
         raise ValueError(
-            f"delta={delta} >= 1+P={1+P:.4f}; criterion trivially satisfied."
+            f"delta={delta} >= 1+P={1 + P:.4f}; criterion trivially satisfied."
         )
     return 1.0 / (1.0 + math.sqrt(delta / denom))
 
@@ -303,7 +303,10 @@ class ProgressiveDenoisingStage(DenoisingStage):
         return None if (preset is None or preset == "none") else preset
 
     def _refresh_cache_dit_context(
-        self, n_remaining: int, scm_preset: str | None
+        self,
+        n_remaining: int,
+        scm_preset: str | None,
+        ctx: DenoisingContext | None = None,
     ) -> None:
         """Refresh cache-dit activations and step counter at a stage transition.
 
@@ -615,7 +618,7 @@ class ProgressiveDenoisingStage(DenoisingStage):
                 if self._cache_dit_enabled:
                     n_remaining = n_steps - stage_end
                     self._refresh_cache_dit_context(
-                        n_remaining, self._effective_scm_preset()
+                        n_remaining, self._effective_scm_preset(), ctx
                     )
                     logger.info(
                         "cache-dit context refreshed at stage transition "

@@ -298,9 +298,9 @@ class NDRotaryEmbedding(torch.nn.Module):
             self.theta_rescale_factor = [theta_rescale_factor[0]] * self.ndim
         else:
             self.theta_rescale_factor = theta_rescale_factor
-        assert (
-            len(self.theta_rescale_factor) == self.ndim
-        ), "len(theta_rescale_factor) should equal to len(rope_dim_list)"
+        assert len(self.theta_rescale_factor) == self.ndim, (
+            "len(theta_rescale_factor) should equal to len(rope_dim_list)"
+        )
 
         if isinstance(interpolation_factor, (int, float)):
             self.interpolation_factor = [interpolation_factor] * self.ndim
@@ -308,9 +308,9 @@ class NDRotaryEmbedding(torch.nn.Module):
             self.interpolation_factor = [interpolation_factor[0]] * self.ndim
         else:
             self.interpolation_factor = interpolation_factor
-        assert (
-            len(self.interpolation_factor) == self.ndim
-        ), "len(interpolation_factor) should equal to len(rope_dim_list)"
+        assert len(self.interpolation_factor) == self.ndim, (
+            "len(interpolation_factor) should equal to len(rope_dim_list)"
+        )
 
         self.rope_generators: list[OneDRotaryEmbedding] = torch.nn.ModuleList()
         _config_to_gen_idx: dict[tuple, int] = {}

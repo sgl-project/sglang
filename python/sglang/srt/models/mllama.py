@@ -20,9 +20,10 @@ from transformers.models.mllama.modeling_mllama import (
     _prepare_aspect_ratio_attention_mask,
 )
 
-import sglang.srt.distributed.parallel_state as ps
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.layer_boundary import layer_stack
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -85,7 +86,6 @@ class ColumnParallelConv2dPatch(torch.nn.Module):
 
 
 class MllamaPrecomputedAspectRatioEmbedding(nn.Module):
-
     def __init__(self, config: config_mllama.MllamaVisionConfig, is_gated: bool = True):
         super().__init__()
         self.max_num_tiles = config.max_num_tiles
@@ -393,7 +393,7 @@ class MllamaVisionModel(nn.Module):
             pixel_values.to(self.layernorm_pre.weight.dtype)
         )
         hidden_state = patch_embeds
-        hidden_state = ps.get_tp_group().all_gather(hidden_state)
+        hidden_state = get_parallel().tp_group.all_gather(hidden_state)
 
         # tile embeddings
         _, num_patches, dim = hidden_state.shape
@@ -679,26 +679,27 @@ class MllamaTextModel(nn.Module):
         self.cross_attention_layers = config.cross_attention_layers
 
         layers = []
-        for layer_id in range(config.num_hidden_layers):
-            if layer_id in self.cross_attention_layers:
-                layers.append(
-                    MllamaCrossAttentionDecoderLayer(
-                        config,
-                        layer_id,
-                        quant_config=quant_config,
-                        prefix=add_prefix(f"layers.{layer_id}", prefix),
+        with layer_stack():
+            for layer_id in range(config.num_hidden_layers):
+                if layer_id in self.cross_attention_layers:
+                    layers.append(
+                        MllamaCrossAttentionDecoderLayer(
+                            config,
+                            layer_id,
+                            quant_config=quant_config,
+                            prefix=add_prefix(f"layers.{layer_id}", prefix),
+                        )
                     )
-                )
-            else:
-                # TODO: force LlamaDecoderLayer to config.attention_bias=False
-                layers.append(
-                    LlamaDecoderLayer(
-                        config,
-                        quant_config=quant_config,
-                        layer_id=layer_id,
-                        prefix=add_prefix(f"layers.{layer_id}", prefix),
+                else:
+                    # TODO: force LlamaDecoderLayer to config.attention_bias=False
+                    layers.append(
+                        LlamaDecoderLayer(
+                            config,
+                            quant_config=quant_config,
+                            layer_id=layer_id,
+                            prefix=add_prefix(f"layers.{layer_id}", prefix),
+                        )
                     )
-                )
 
         self.layers = nn.ModuleList(layers)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -727,13 +728,14 @@ class MllamaTextModel(nn.Module):
                         forward_batch=forward_batch,
                     )
             elif isinstance(decoder_layer, LlamaDecoderLayer):
-                hidden_states, residual = decoder_layer(
+                residual_batch.start(forward_batch)
+                hidden_states = decoder_layer(
                     positions=positions,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
-                    residual=None,
                 )
-                hidden_states = hidden_states + residual
+                hidden_states = residual_batch.fold(hidden_states, forward_batch)
+                hidden_states = residual_batch.take_output(hidden_states, forward_batch)
             else:
                 raise ValueError(f"Unknown decoder layer type {type(decoder_layer)}")
         hidden_states = self.norm(hidden_states)
@@ -870,7 +872,6 @@ class MllamaForConditionalGeneration(nn.Module):
         # pixel_values: shape (bs, num_image, num_tiles, 3, image_res, image_res)
         max_num_images = max_num_tiles = bs = 0
         for i, mm_input in enumerate(forward_batch.mm_inputs):
-
             if not forward_batch.encoder_cached[i] and mm_input is not None:
                 pixel_values = torch.cat(
                     [item.feature for item in mm_input.mm_items], dim=0

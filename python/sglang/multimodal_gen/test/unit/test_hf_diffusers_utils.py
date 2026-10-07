@@ -298,6 +298,46 @@ def test_metadata_only_cached_lora_snapshot_is_a_usable_hit(
     assert calls == ["probe"]
 
 
+def test_cached_lora_snapshot_downloads_missing_selected_weight(monkeypatch, tmp_path):
+    calls = []
+    selected_file = "loras/adapter.safetensors"
+
+    def fake_snapshot_download(**kwargs):
+        calls.append("probe" if kwargs.get("local_files_only") else "download")
+        if not kwargs.get("local_files_only"):
+            target = tmp_path / selected_file
+            target.parent.mkdir()
+            target.write_bytes(b"weights")
+        return str(tmp_path)
+
+    monkeypatch.setattr(hf_diffusers_utils, "snapshot_download", fake_snapshot_download)
+
+    result = maybe_download_model(
+        "org/repo",
+        is_lora=True,
+        allow_patterns=["*.json", selected_file],
+    )
+
+    assert result == str(tmp_path)
+    assert calls == ["probe", "download"]
+
+
+def test_cached_lora_snapshot_reports_missing_selected_weight_offline(
+    recording_snapshot_download, tmp_path
+):
+    calls = recording_snapshot_download(tmp_path)
+
+    with pytest.raises(ValueError, match="loras/adapter.safetensors"):
+        maybe_download_model(
+            "org/repo",
+            download=False,
+            is_lora=True,
+            allow_patterns=["*.json", "loras/adapter.safetensors"],
+        )
+
+    assert calls == ["probe"]
+
+
 def test_force_diffusers_model_stub_keeps_its_existing_path(
     recording_snapshot_download, tmp_path
 ):

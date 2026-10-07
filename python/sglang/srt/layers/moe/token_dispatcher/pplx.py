@@ -155,7 +155,7 @@ class PplxAllToAllManager:
         # pplx forces ep_size == world_size
         # with pp_size == 1 (enforced in _ensure_nvshmem), so the EP group spans
         # a single node iff the whole job runs on one node.
-        is_internode = get_parallel().config.nnodes > 1
+        is_internode = get_parallel().nnodes > 1
 
         if is_internode:
             cls._all_to_all = AllToAll.internode(

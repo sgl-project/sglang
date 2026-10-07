@@ -1,4 +1,4 @@
-"""Test for ComfyUIQwenImageEditPipeline with pass-through scheduler (I2I/edit mode)."""
+"""Test for QwenImageEditPlusPipeline with pass-through scheduler (I2I/edit mode)."""
 
 import os
 import sys
@@ -12,7 +12,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 
 
 def test_comfyui_qwen_image_edit_pipeline_direct() -> None:
-    """Test ComfyUIQwenImageEditPipeline with edit mode (I2I) and custom inputs."""
+    """Test QwenImageEditPlusPipeline with edit mode (I2I) and custom inputs."""
     model_path = os.environ.get(
         "SGLANG_TEST_QWEN_IMAGE_EDIT_MODEL_PATH",
         "Qwen/Qwen-Image-Edit-2511",  # Supports both safetensors file and diffusers format
@@ -20,7 +20,7 @@ def test_comfyui_qwen_image_edit_pipeline_direct() -> None:
 
     generator = DiffGenerator.from_pretrained(
         model_path=model_path,
-        pipeline_class_name="ComfyUIQwenImageEditPipeline",
+        pipeline_class_name="QwenImageEditPlusPipeline",
         num_gpus=1,
         comfyui_mode=True,
         dit_layerwise_offload=False,
@@ -116,12 +116,12 @@ def test_comfyui_qwen_image_edit_pipeline_direct() -> None:
 
     assert noise_pred is not None, "noise_pred should not be None in OutputBatch"
     assert isinstance(noise_pred, torch.Tensor), "noise_pred should be a torch.Tensor"
-    assert (
-        noise_pred.device.type == "cuda"
-    ), f"noise_pred should be on cuda, got {noise_pred.device}"
-    assert (
-        noise_pred.dtype == torch.bfloat16
-    ), f"noise_pred should be bfloat16, got {noise_pred.dtype}"
+    assert noise_pred.device.type == "cuda", (
+        f"noise_pred should be on cuda, got {noise_pred.device}"
+    )
+    assert noise_pred.dtype == torch.bfloat16, (
+        f"noise_pred should be bfloat16, got {noise_pred.dtype}"
+    )
 
     print("✓ Successfully retrieved noise_pred from OutputBatch (Edit Mode)!")
     print(f"  noise_pred shape: {noise_pred.shape}")
