@@ -1107,9 +1107,10 @@ impl TokenizerRegistry {
 /// prepends `reasoning_content + </think>` (a trailing turn is always at/after
 /// the last user index, so `drop_thinking` never strips it — same as in the
 /// full conversation). Tools are irrelevant here: they render into the
-/// system-turn prefix, which the strip removes. An encoder for which the
-/// derivation is wrong (e.g. a Jinja template that appends a generation
-/// prompt, or errors on an empty conversation) fails
+/// system-turn prefix, which the strip removes. A template that cannot render
+/// an empty conversation (e.g. one reading `messages[0]` unconditionally) is
+/// diffed against a one-user-turn anchor instead, the position a reply always
+/// follows. An encoder for which the derivation is wrong still fails
 /// [`extension_concat_safe`] and never takes the incremental path in
 /// production.
 fn assistant_turn_suffix(
@@ -1121,13 +1122,19 @@ fn assistant_turn_suffix(
     // NEXT round's history — request-level surgery must not run here (it
     // would rewrite the trailing turn's role, producing a suffix no next
     // round ever contains).
-    let empty = encoder
-        .render_plain(&serde_json::Value::Array(Vec::new()), None, opts)
-        .ok()?;
-    let solo = encoder
-        .render_plain(&serde_json::Value::Array(vec![reply.clone()]), None, opts)
-        .ok()?;
-    solo.strip_prefix(&empty).map(str::to_owned)
+    let render = |messages: Vec<serde_json::Value>| {
+        encoder
+            .render_plain(&serde_json::Value::Array(messages), None, opts)
+            .ok()
+    };
+    if let Some(empty) = render(Vec::new()) {
+        let solo = render(vec![reply.clone()])?;
+        return solo.strip_prefix(&empty).map(str::to_owned);
+    }
+    let anchor = serde_json::json!({"role": "user", "content": "x"});
+    let base = render(vec![anchor.clone()])?;
+    let with_reply = render(vec![anchor, reply.clone()])?;
+    with_reply.strip_prefix(&base).map(str::to_owned)
 }
 
 /// One-time per-model probe backing [`TokenizerRegistry::encode_chat_extension`]:
@@ -2216,6 +2223,68 @@ mod tests {
                 .is_none(),
             "a failing self-check must force the full-re-encode fallback"
         );
+    }
+
+    /// A Jinja template that reads `messages[0]` unconditionally (as Step5's
+    /// does) cannot render an empty conversation. Its reply suffix must still
+    /// be derivable, so cache-sim extensions stay incremental instead of
+    /// re-encoding the whole conversation on every response.
+    #[test]
+    fn encode_chat_extension_matches_full_reencode_when_empty_render_fails() {
+        let reg = TokenizerRegistry::default();
+        reg.inner.insert(
+            "tiny".into(),
+            TokenizerShards::shared(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
+        );
+        reg.attach_chat_template_for_test(
+            "tiny",
+            &serde_json::json!({
+                "chat_template": concat!(
+                    "{{ bos_token }}{% if messages[0].role == 'system' %}",
+                    "<|im_start|>system\n{{ messages[0].content }}<|im_end|>\n{% endif %}",
+                    "{% for m in messages %}{% if m.role == 'assistant' %}",
+                    "<|im_start|>assistant\n<think>{{ m.reasoning_content or '' }}</think>",
+                    "{{ m.content }}<|im_end|>\n",
+                    "{% elif not (m.role == 'system' and loop.first) %}",
+                    "<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endif %}{% endfor %}",
+                    "{% if add_generation_prompt %}<|im_start|>assistant\n<think>{% endif %}",
+                ),
+                "bos_token": "<s>",
+            }),
+        );
+        let opts = ChatRenderOpts::chat();
+        assert!(
+            reg.encode_chat_plain("tiny", &serde_json::json!([]), None, &opts)
+                .is_none(),
+            "precondition: the template must fail on an empty conversation"
+        );
+
+        let messages = serde_json::json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "what is 2+2?"},
+            {"role": "assistant", "content": "4", "reasoning_content": "2+2 is 4"},
+            {"role": "user", "content": "and 3+3?"},
+        ]);
+        let prompt_ids = reg
+            .encode_chat("tiny", &messages, None, &opts)
+            .expect("encode_chat");
+        let replies = [
+            serde_json::json!({"role": "assistant", "content": "6"}),
+            serde_json::json!({"role": "assistant", "content": "6", "reasoning_content": "3+3 is 6"}),
+            serde_json::json!({"role": "assistant", "content": " six"}),
+            serde_json::json!({"role": "assistant", "content": "\nsix"}),
+        ];
+        for reply in &replies {
+            let inc = reg
+                .encode_chat_extension("tiny", &prompt_ids, reply, &opts)
+                .expect("an empty-render failure must not force the full re-encode");
+            let mut msgs = messages.as_array().unwrap().clone();
+            msgs.push(reply.clone());
+            let full = reg
+                .encode_chat_plain("tiny", &serde_json::Value::Array(msgs), None, &opts)
+                .expect("full re-encode");
+            assert_eq!(inc, full, "incremental extension diverged for {reply}");
+        }
     }
 
     #[test]
