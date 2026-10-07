@@ -1009,6 +1009,9 @@ def initialize_fp8_gemm_config() -> None:
     backend = get_exec().kernel.fp8_gemm_runner_backend
     if backend == "auto" and get_platform().is_sm120:
         backend = "cutlass"
+    elif backend == "auto" and get_platform().is_sm110:
+        # DeepGEMM's block-FP8 kernel does not support SM110.
+        backend = "triton"
 
     backend = Fp8GemmRunnerBackend(backend)
 
