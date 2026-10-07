@@ -916,8 +916,6 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             base_output, self.mm_tokens, **processor_kwargs
         )
 
-        self._mark_cuda_ipc_features_for_deferred_reconstruction(mm_items)
-
         audio_feature_lengths = None
 
         if self.model_type == "qwen3_omni_moe":
@@ -927,16 +925,19 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                     audio_item.feature_attention_mask, dim=1
                 )
 
+        process_time = time.perf_counter()
+
+        base_input_ids = getattr(base_output, "input_ids", None)
+        video_data = request_obj.video_data
+        self._mark_cuda_ipc_features_for_deferred_reconstruction(mm_items)
+
         second_per_grid_ts = self._get_processor_output_value(ret, "second_per_grid_ts")
         if second_per_grid_ts is None:
             second_per_grid_ts = self._get_processor_output_value(
                 ret, "video_second_per_grid"
             )
 
-        process_time = time.perf_counter()
-
         input_ids = input_ids.flatten()
-        base_input_ids = getattr(base_output, "input_ids", None)
         if (
             isinstance(base_input_ids, list)
             and len(base_input_ids) == input_ids.numel()
@@ -958,7 +959,6 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         else:
             padded_input_ids = list(padded_input_ids)
 
-        video_data = request_obj.video_data
         mrope_positions, mrope_position_delta = self._compute_mrope_positions(
             ret,
             mm_items,
@@ -968,17 +968,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             second_per_grid_ts=second_per_grid_ts,
             audio_feature_lengths=audio_feature_lengths,
         )
-        get_rope_index_time = time.perf_counter()
-        logger.debug(
-            f"[QwenVLProcessor Perf] {rid=}, "
-            f"load_time: {(load_time - entry_time) * 1000:.2f} ms, "
-            f"preprocess_time: {(preprocess_time - load_time) * 1000:.2f} ms, "
-            f"process_time: {(process_time - preprocess_time) * 1000:.2f} ms, "
-            f"get_rope_index_time: {(get_rope_index_time - process_time) * 1000:.2f} ms, "
-            f"total_time: {(get_rope_index_time - entry_time) * 1000:.2f} ms"
-        )
-
-        return MultimodalProcessorOutput(
+        output = MultimodalProcessorOutput(
             input_ids=input_ids_list,
             padded_input_ids=padded_input_ids,
             mm_items=mm_items,
@@ -990,6 +980,17 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             mrope_positions=mrope_positions,
             mrope_position_delta=mrope_position_delta,
         )
+        get_rope_index_time = time.perf_counter()
+        logger.debug(
+            f"[QwenVLProcessor Perf] {rid=}, "
+            f"load_time: {(load_time - entry_time) * 1000:.2f} ms, "
+            f"preprocess_time: {(preprocess_time - load_time) * 1000:.2f} ms, "
+            f"process_time: {(process_time - preprocess_time) * 1000:.2f} ms, "
+            f"get_rope_index_time: {(get_rope_index_time - process_time) * 1000:.2f} ms, "
+            f"total_time: {(get_rope_index_time - entry_time) * 1000:.2f} ms"
+        )
+
+        return output
 
     async def process_mm_data_async(
         self,
