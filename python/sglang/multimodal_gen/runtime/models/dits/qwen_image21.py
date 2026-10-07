@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -399,6 +400,17 @@ class QwenImage21Attention(nn.Module):
 
     def packed_qkv_weight(self):
         """The [3C, C] view over to_q/to_k/to_v when they are consecutive slices of one storage, else None."""
+        # LoRA wrappers keep the projection, and its quant method, in base_layer.
+        if not all(
+            isinstance(
+                (
+                    layer.base_layer if isinstance(layer, BaseLayerWithLoRA) else layer
+                ).quant_method,
+                UnquantizedLinearMethod,
+            )
+            for layer in (self.to_q, self.to_k, self.to_v)
+        ):
+            return None
         q, k, v = self.to_q.weight, self.to_k.weight, self.to_v.weight
         rows, cols = q.shape
         if not (
@@ -807,6 +819,15 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
     _compile_conditions = _fsdp_shard_conditions
     layer_names = ["transformer_blocks"]
     param_names_mapping = {}
+    # Plain nn.Linear outside the blocks: GGUF quantizes them, so dequantize on load.
+    gguf_dequantize_prefixes = (
+        "img_in.",
+        "txt_in.",
+        "time_text_embed.",
+        "modulation.",
+        "norm_out.",
+        "proj_out.",
+    )
 
     def __init__(self, config, hf_config, quant_config=None, **kwargs):
         super().__init__(config, hf_config=hf_config, **kwargs)
