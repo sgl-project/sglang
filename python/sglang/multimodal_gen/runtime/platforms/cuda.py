@@ -6,10 +6,10 @@
 pynvml. However, it should not initialize cuda context.
 """
 
-import importlib
 import os
 from collections.abc import Callable
 from functools import lru_cache, wraps
+from pkgutil import resolve_name
 from typing import Any, TypeVar
 
 import psutil
@@ -35,11 +35,6 @@ _CUDNN_SDPA_BACKEND_CLS_STR = (
     "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.CudnnSDPABackend"
 )
 _DYNAMIC_CUDNN_SDPA_BACKEND_CLS_STR = "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.DynamicCudnnSDPABackend"
-# Dense drop-in kernels whose head-size support is narrower than the models
-# that a server-wide `--attention-backend` reaches.
-_HEAD_SIZE_CHECKED_BACKENDS = frozenset(
-    {AttentionBackendEnum.SAGE_ATTN, AttentionBackendEnum.SAGE_ATTN_3}
-)
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -831,34 +826,20 @@ class CudaPlatformBase(Platform):
 
             resolved_backend = resolver.resolve(cls)
             if isinstance(resolved_backend, str):
-                if (
-                    selected_backend in _HEAD_SIZE_CHECKED_BACKENDS
-                    and not cls._backend_supports_head_size(resolved_backend, head_size)
-                ):
-                    # A server-wide approximate backend also reaches encoders whose
-                    # heads it cannot serve (Qwen3-VL vision uses 72); take the
-                    # dense exact fallback there like FlashAttention does.
-                    logger.info(
-                        "Cannot use %s backend for head size %d; using the dense "
-                        "exact fallback.",
-                        selected_backend.name,
-                        head_size,
-                    )
-                    return cls._resolve_flash_attention_backend_cls_str(
-                        AttentionBackendEnum.FA, head_size, dtype
-                    )
+                if selected_backend == AttentionBackendEnum.SAGE_ATTN:
+                    backend_cls = resolve_name(resolved_backend)
+                    if head_size not in backend_cls.get_supported_head_sizes():
+                        # leave fallback policy to the component-aware selector
+                        raise ValueError(
+                            f"SageAttention 2 does not support head size {head_size}; "
+                            "supported head sizes are 1 through 128"
+                        )
                 return resolved_backend
             target_backend = resolved_backend
 
         return cls._resolve_flash_attention_backend_cls_str(
             target_backend, head_size, dtype
         )
-
-    @staticmethod
-    def _backend_supports_head_size(backend_cls_str: str, head_size: int) -> bool:
-        module_name, _, class_name = backend_cls_str.rpartition(".")
-        backend_cls = getattr(importlib.import_module(module_name), class_name)
-        return head_size in backend_cls.get_supported_head_sizes()
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
