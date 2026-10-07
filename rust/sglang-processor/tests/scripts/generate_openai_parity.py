@@ -58,20 +58,26 @@ def generate_defaults():
     return defaults
 
 
-def generate_body(obj, defaults, sampling_defaults):
+def generate_body(obj, defaults):
     """The fields Python set away from their defaults, as `/generate` JSON."""
-    body = {
+    return {
         name: getattr(obj, name)
         for name in defaults
         if name not in SKIPPED_FIELDS and getattr(obj, name) != defaults[name]
     }
-    if isinstance(body.get("sampling_params"), dict):
-        body["sampling_params"] = {
-            k: v
-            for k, v in body["sampling_params"].items()
-            if k not in sampling_defaults or sampling_defaults[k] != v
-        }
-    return body
+
+
+def without_sampling_defaults(body, sampling_defaults):
+    """`body` as stored: only the sampling params a case changes from a bare request's."""
+    params = body.get("sampling_params")
+    if not isinstance(params, dict):
+        return body
+    params = {
+        k: v
+        for k, v in params.items()
+        if k not in sampling_defaults or sampling_defaults[k] != v
+    }
+    return {**body, "sampling_params": params}
 
 
 def trim_meta(output):
@@ -164,11 +170,13 @@ def lower(case, settings, tokenizer):
 
 def run_case(case, settings, tokenizer, engine_url, defaults, sampling_defaults):
     handler, request, raw_request, obj = lower(case, settings, tokenizer)
-    recorded = {"generate": generate_body(obj, defaults, sampling_defaults)}
+    body = generate_body(obj, defaults)
+    recorded = {"generate": without_sampling_defaults(body, sampling_defaults)}
     if case.get("lower_only"):
         return recorded
+    # A bare request's sampling params are not `/generate`'s defaults, so the engine gets them all.
     if engine_url and not case.get("synthetic"):
-        case["engine"] = record_frames(engine_url, recorded["generate"])
+        case["engine"] = record_frames(engine_url, body)
     recorded["engine"] = trim_meta(case["engine"])
     handler.tokenizer_manager.generate_request = replay(case["engine"])
     recorded["openai"] = asyncio.run(openai_response(handler, request, raw_request))
