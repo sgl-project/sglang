@@ -29,6 +29,18 @@ from sglang.kernels.ops.memory.ptr_table import make_ptr_table
 _BLOCK = 1024
 
 
+def _as_contiguous_i64(indices: torch.Tensor) -> torch.Tensor:
+    """Materialize the unit-stride index layout assumed by the Triton kernels.
+
+    The kernels below read index arrays as ``tl.load(index_ptr + iid)``, i.e.
+    they require element stride 1. ``Tensor.to(torch.int64)`` is a no-op for a
+    tensor that is already int64, so a non-contiguous int64 view would be
+    passed through unchanged and the kernel would read the wrong addresses —
+    leaving all but the first slot uncleared/uncopied.
+    """
+    return indices.to(dtype=torch.int64).contiguous()
+
+
 class ConvSlotDescriptor(NamedTuple):
     ptr: torch.Tensor  # [T] int64-viewed base byte-addresses (make_ptr_table)
     feat: torch.Tensor  # [T] int64 per-slot feature length (elements)
@@ -131,7 +143,7 @@ def fused_clear_conv_slots(desc: ConvSlotDescriptor, indices: torch.Tensor):
     """Zero ``indices`` slots (dim 1) across every conv tensor in one launch."""
     if desc.ptr.numel() == 0 or indices.numel() == 0:
         return
-    index_arr = indices.to(torch.int64)
+    index_arr = _as_contiguous_i64(indices)
     # Slot count on the unbounded grid axis (gridDim.y/z cap at 65535).
     grid = (index_arr.numel(), desc.ptr.numel(), desc.num_layers)
     _fused_slot_clear_kernel[grid](
@@ -158,8 +170,8 @@ def fused_copy_conv_slots(
     """
     if desc.ptr.numel() == 0 or src_indices.numel() == 0:
         return
-    src_arr = src_indices.to(torch.int64)
-    dst_arr = dst_indices.to(torch.int64)
+    src_arr = _as_contiguous_i64(src_indices)
+    dst_arr = _as_contiguous_i64(dst_indices)
     grid = (src_arr.numel(), desc.ptr.numel(), desc.num_layers)
     _fused_slot_copy_kernel[grid](
         desc.ptr,
