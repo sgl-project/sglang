@@ -25,7 +25,7 @@ def main() -> None:
     test = runpy.run_path(
         str(
             Path(__file__).resolve().parents[2]
-            / "ops/attention/kda_flydsl/test_kimi_k3_kda_decode.py"
+            / "ops/attention/kda_flydsl/test_kda_decode.py"
         )
     )
     f_a, f_b_weight, inputs = test["_make_fb_inputs"](args.batch)
@@ -48,7 +48,7 @@ def main() -> None:
         norm_eps=test["_NORM_EPS"],
         out=out,
     )
-    fn = test["flydsl_kimi_k3_kda_decode_with_f_b"]
+    fn = test["flydsl_kda_decode_with_f_b"]
     for _ in range(args.warmup):
         fn(**kwargs)
     torch.cuda.synchronize()
@@ -86,6 +86,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     if is_in_ci():
-        print("Skipping bench_kimi_k3_kda_decode.py in CI")
+        print("Skipping bench_kda_decode.py in CI")
         raise SystemExit(0)
     main()

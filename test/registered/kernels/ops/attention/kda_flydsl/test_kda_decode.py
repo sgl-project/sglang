@@ -15,11 +15,11 @@ import torch.nn.functional as F
 pytest.importorskip("flydsl")
 pytest.importorskip("aiter")
 
-from sglang.kernels.ops.attention.kda_flydsl.kimi_k3_kda_decode import (
+from sglang.kernels.ops.attention.kda_flydsl.kda_decode import (
     _fb_build_options,
-    flydsl_kimi_k3_kda_decode,
-    flydsl_kimi_k3_kda_decode_with_f_b,
-    is_flydsl_kimi_k3_kda_decode_supported,
+    flydsl_kda_decode,
+    flydsl_kda_decode_with_f_b,
+    is_flydsl_kda_decode_supported,
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -29,7 +29,7 @@ register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
 def _gfx950_flydsl_available() -> bool:
     if importlib.util.find_spec("flydsl") is None:
         return False
-    return is_flydsl_kimi_k3_kda_decode_supported()
+    return is_flydsl_kda_decode_supported()
 
 
 pytestmark = pytest.mark.skipif(
@@ -273,7 +273,7 @@ def _relative_rmse(
 
 
 def _run(inputs: Inputs) -> torch.Tensor:
-    return flydsl_kimi_k3_kda_decode(
+    return flydsl_kda_decode(
         x=inputs.x,
         conv_weight=inputs.conv_weight,
         conv_bias=None,
@@ -326,7 +326,7 @@ def _run_with_f_b(
     f_b_weight: torch.Tensor,
     inputs: Inputs,
 ) -> torch.Tensor:
-    return flydsl_kimi_k3_kda_decode_with_f_b(
+    return flydsl_kda_decode_with_f_b(
         f_a=f_a,
         f_b_weight=f_b_weight,
         x=inputs.x,
@@ -348,22 +348,16 @@ def _run_with_f_b(
 def test_public_api_and_support_predicate() -> None:
     import sglang.kernels.ops.attention.kda_flydsl as flydsl_ops
 
-    assert flydsl_ops.flydsl_kimi_k3_kda_decode is flydsl_kimi_k3_kda_decode
-    assert (
-        flydsl_ops.is_flydsl_kimi_k3_kda_decode_supported
-        is is_flydsl_kimi_k3_kda_decode_supported
-    )
-    assert is_flydsl_kimi_k3_kda_decode_supported(0)
-    assert not is_flydsl_kimi_k3_kda_decode_supported("cpu")
+    assert flydsl_ops.flydsl_kda_decode is flydsl_kda_decode
+    assert flydsl_ops.is_flydsl_kda_decode_supported is is_flydsl_kda_decode_supported
+    assert is_flydsl_kda_decode_supported(0)
+    assert not is_flydsl_kda_decode_supported("cpu")
 
 
 def test_f_b_public_api() -> None:
     import sglang.kernels.ops.attention.kda_flydsl as flydsl_ops
 
-    assert (
-        flydsl_ops.flydsl_kimi_k3_kda_decode_with_f_b
-        is flydsl_kimi_k3_kda_decode_with_f_b
-    )
+    assert flydsl_ops.flydsl_kda_decode_with_f_b is flydsl_kda_decode_with_f_b
 
 
 def test_f_b_batch_two_dispatch_is_guarded() -> None:
@@ -380,7 +374,7 @@ def test_f_b_batch_two_dispatch_is_guarded() -> None:
 
 
 @pytest.mark.parametrize("batch", [1, 8, 16])
-def test_kimi_k3_kda_decode_matches_reference(batch: int) -> None:
+def test_kda_decode_matches_reference(batch: int) -> None:
     seed = _make_inputs(batch)
     reference_inputs = _copy_inputs(seed)
     actual_inputs = _copy_inputs(seed)
@@ -389,7 +383,7 @@ def test_kimi_k3_kda_decode_matches_reference(batch: int) -> None:
     actual = _run(actual_inputs)
     torch.cuda.synchronize()
 
-    assert is_flydsl_kimi_k3_kda_decode_supported(_DEVICE)
+    assert is_flydsl_kda_decode_supported(_DEVICE)
     assert not torch.isnan(actual).any()
     assert _relative_rmse(reference, actual) < 1e-3
     assert (
@@ -420,7 +414,7 @@ def test_non_positive_slots_do_not_modify_caches() -> None:
 
 
 @pytest.mark.parametrize("batch", [1, 8, 16])
-def test_kimi_k3_kda_decode_with_f_b_matches_reference(batch: int) -> None:
+def test_kda_decode_with_f_b_matches_reference(batch: int) -> None:
     f_a, f_b_weight, seed = _make_fb_inputs(batch)
     reference_inputs = _copy_inputs(seed)
     actual_inputs = _copy_inputs(seed)
@@ -435,7 +429,7 @@ def test_kimi_k3_kda_decode_with_f_b_matches_reference(batch: int) -> None:
     assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
 
 
-def test_kimi_k3_kda_decode_with_f_b_recurrent_sequence() -> None:
+def test_kda_decode_with_f_b_recurrent_sequence() -> None:
     f_a, f_b_weight, seed = _make_fb_inputs(batch=2)
     reference_inputs = _copy_inputs(seed)
     actual_inputs = _copy_inputs(seed)
@@ -448,14 +442,14 @@ def test_kimi_k3_kda_decode_with_f_b_recurrent_sequence() -> None:
     assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
 
 
-def test_kimi_k3_kda_decode_with_f_b_graph_replay() -> None:
+def test_kda_decode_with_f_b_graph_replay() -> None:
     f_a, f_b_weight, inputs = _make_fb_inputs(batch=2)
     out = torch.empty((1, 2, _HEADS, _DIM), dtype=torch.bfloat16, device=_DEVICE)
     _run_with_f_b(f_a, f_b_weight, inputs)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        flydsl_kimi_k3_kda_decode_with_f_b(
+        flydsl_kda_decode_with_f_b(
             f_a=f_a,
             f_b_weight=f_b_weight,
             x=inputs.x,

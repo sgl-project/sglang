@@ -869,6 +869,8 @@ Other layers (e.g. projections in the attention layers) have their weights quant
 
 SGLang running on AMD GPUs with hardware FP4 support (CDNA4 architecture, e.g. MI355x) supports the quantization method `--quantization quark_mxfp4`, that will quantize BF16 or NVFP4 model weights to MXFP4 at load time, use dynamic MXFP4 quantization for activations and MXFP4 GEMMs instead of BF16 GEMMs.
 
+Dense (non-MoE) linear layers are the exception by default: they dequantize their MXFP4 weights back to BF16 after loading and run BF16 GEMMs, because FP4 activations cost accuracy on residual-stream outliers. They keep the MXFP4 rounding of the weights but not the memory savings. Set `SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT=fp4` to run them as W4A4 MXFP4 as well; MoE layers are not affected by this setting. It applies the same way to checkpoints that are already MXFP4-quantized with Quark.
+
 Example (BF16 to MXFP4 requantization):
 
 ```bash

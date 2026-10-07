@@ -1883,6 +1883,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Activation precision for dense (non-MoE) linear layers on the Quark MXFP4 scheme, whether the weights come from an MXFP4 checkpoint or from <code>--quantization quark_mxfp4</code>. MoE experts are not affected. <code>bf16</code> dequantizes these weights to BF16 once at load and runs BF16 GEMMs, which keeps residual-stream outliers out of FP4 activation groups but stores the weights at roughly 3.8× their packed size. <code>fp4</code> keeps the packed weights and quantizes activations to MXFP4 on the fly (W4A4); it needs FP4 activation support (gfx95x, e.g. MI355X), so keep <code>bf16</code> on gfx1250; with <code>AITER_FORCE_A8W4=1</code> set, <code>fp4</code> falls back to <code>bf16</code> with a warning. On Kimi-K3, <code>bf16</code> scores 0.947 on GSM8K against 0.908 for <code>fp4</code>, at about 3% lower decode throughput. Any other value is rejected at startup. Ignored off ROCm, with a warning if set.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>bf16</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HACK_FLASHMLA_BACKEND</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-V4 HIP decode attention kernel: <code>auto</code> takes aiter's gluon sparse kernel on gfx950 and the tilelang partial + combine elsewhere; <code>aiter_sparse</code>, <code>tilelang</code>, <code>triton</code>, <code>torch</code>, <code>comparison</code> or <code>unified_kv_triton</code> force one.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
