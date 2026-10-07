@@ -579,138 +579,185 @@ pub mod sglang_service_server {
     /// Generated trait containing gRPC methods that should be implemented for use with SglangServiceServer.
     #[async_trait]
     pub trait SglangService: std::marker::Send + std::marker::Sync + 'static {
-        /// Server streaming response type for the TextGenerate method.
-        type TextGenerateStream: tonic::codegen::tokio_stream::Stream<
-                Item = std::result::Result<super::TextGenerateResponse, tonic::Status>,
-            > + std::marker::Send
-            + 'static;
         /// SGLang-native RPCs (typed proto)
         async fn text_generate(
             &self,
             request: tonic::Request<super::TextGenerateRequest>,
-        ) -> std::result::Result<tonic::Response<Self::TextGenerateStream>, tonic::Status>;
-        /// Server streaming response type for the Generate method.
-        type GenerateStream: tonic::codegen::tokio_stream::Stream<
-                Item = std::result::Result<super::GenerateResponse, tonic::Status>,
-            > + std::marker::Send
-            + 'static;
+        ) -> std::result::Result<
+            tonic::Response<BoxStream<super::TextGenerateResponse>>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn generate(
             &self,
             request: tonic::Request<super::GenerateRequest>,
-        ) -> std::result::Result<tonic::Response<Self::GenerateStream>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<BoxStream<super::GenerateResponse>>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn text_embed(
             &self,
             request: tonic::Request<super::TextEmbedRequest>,
-        ) -> std::result::Result<tonic::Response<super::TextEmbedResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::TextEmbedResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn embed(
             &self,
             request: tonic::Request<super::EmbedRequest>,
-        ) -> std::result::Result<tonic::Response<super::EmbedResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::EmbedResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn classify(
             &self,
             request: tonic::Request<super::ClassifyRequest>,
-        ) -> std::result::Result<tonic::Response<super::ClassifyResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::ClassifyResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn tokenize(
             &self,
             request: tonic::Request<super::TokenizeRequest>,
-        ) -> std::result::Result<tonic::Response<super::TokenizeResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::TokenizeResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn detokenize(
             &self,
             request: tonic::Request<super::DetokenizeRequest>,
-        ) -> std::result::Result<tonic::Response<super::DetokenizeResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::DetokenizeResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn health_check(
             &self,
             request: tonic::Request<super::HealthCheckRequest>,
-        ) -> std::result::Result<tonic::Response<super::HealthCheckResponse>, tonic::Status>;
-        /// Server streaming response type for the WatchEngineState method.
-        type WatchEngineStateStream: tonic::codegen::tokio_stream::Stream<
-                Item = std::result::Result<super::EngineStateSnapshot, tonic::Status>,
-            > + std::marker::Send
-            + 'static;
+        ) -> std::result::Result<tonic::Response<super::HealthCheckResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn watch_engine_state(
             &self,
             request: tonic::Request<super::WatchEngineStateRequest>,
-        ) -> std::result::Result<tonic::Response<Self::WatchEngineStateStream>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<BoxStream<super::EngineStateSnapshot>>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn get_model_info(
             &self,
             request: tonic::Request<super::GetModelInfoRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetModelInfoResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::GetModelInfoResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn get_server_info(
             &self,
             request: tonic::Request<super::GetServerInfoRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetServerInfoResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::GetServerInfoResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn list_models(
             &self,
             request: tonic::Request<super::ListModelsRequest>,
-        ) -> std::result::Result<tonic::Response<super::ListModelsResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::ListModelsResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn get_load(
             &self,
             request: tonic::Request<super::GetLoadRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetLoadResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::GetLoadResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn abort(
             &self,
             request: tonic::Request<super::AbortRequest>,
-        ) -> std::result::Result<tonic::Response<super::AbortResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::AbortResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn flush_cache(
             &self,
             request: tonic::Request<super::FlushCacheRequest>,
-        ) -> std::result::Result<tonic::Response<super::FlushCacheResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::FlushCacheResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn pause_generation(
             &self,
             request: tonic::Request<super::PauseGenerationRequest>,
-        ) -> std::result::Result<tonic::Response<super::PauseGenerationResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::PauseGenerationResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn continue_generation(
             &self,
             request: tonic::Request<super::ContinueGenerationRequest>,
-        ) -> std::result::Result<tonic::Response<super::ContinueGenerationResponse>, tonic::Status>;
-        /// Server streaming response type for the ChatComplete method.
-        type ChatCompleteStream: tonic::codegen::tokio_stream::Stream<
-                Item = std::result::Result<super::OpenAiStreamChunk, tonic::Status>,
-            > + std::marker::Send
-            + 'static;
+        ) -> std::result::Result<tonic::Response<super::ContinueGenerationResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         /// OpenAI-compatible RPCs (JSON pass-through)
         async fn chat_complete(
             &self,
             request: tonic::Request<super::OpenAiRequest>,
-        ) -> std::result::Result<tonic::Response<Self::ChatCompleteStream>, tonic::Status>;
-        /// Server streaming response type for the Complete method.
-        type CompleteStream: tonic::codegen::tokio_stream::Stream<
-                Item = std::result::Result<super::OpenAiStreamChunk, tonic::Status>,
-            > + std::marker::Send
-            + 'static;
+        ) -> std::result::Result<tonic::Response<BoxStream<super::OpenAiStreamChunk>>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn complete(
             &self,
             request: tonic::Request<super::OpenAiRequest>,
-        ) -> std::result::Result<tonic::Response<Self::CompleteStream>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<BoxStream<super::OpenAiStreamChunk>>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn open_ai_embed(
             &self,
             request: tonic::Request<super::OpenAiRequest>,
-        ) -> std::result::Result<tonic::Response<super::OpenAiResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::OpenAiResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn open_ai_classify(
             &self,
             request: tonic::Request<super::OpenAiRequest>,
-        ) -> std::result::Result<tonic::Response<super::OpenAiResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::OpenAiResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn score(
             &self,
             request: tonic::Request<super::OpenAiRequest>,
-        ) -> std::result::Result<tonic::Response<super::OpenAiResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::OpenAiResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn rerank(
             &self,
             request: tonic::Request<super::OpenAiRequest>,
-        ) -> std::result::Result<tonic::Response<super::OpenAiResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::OpenAiResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         /// Admin/Ops RPCs
         async fn start_profile(
             &self,
             request: tonic::Request<super::StartProfileRequest>,
-        ) -> std::result::Result<tonic::Response<super::StartProfileResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::StartProfileResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn stop_profile(
             &self,
             request: tonic::Request<super::StopProfileRequest>,
-        ) -> std::result::Result<tonic::Response<super::StopProfileResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::StopProfileResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
         async fn update_weights_from_disk(
             &self,
             request: tonic::Request<super::UpdateWeightsRequest>,
-        ) -> std::result::Result<tonic::Response<super::UpdateWeightsResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<super::UpdateWeightsResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
     }
     #[derive(Debug)]
     pub struct SglangServiceServer<T> {
@@ -793,7 +840,7 @@ pub mod sglang_service_server {
                         for TextGenerateSvc<T>
                     {
                         type Response = super::TextGenerateResponse;
-                        type ResponseStream = T::TextGenerateStream;
+                        type ResponseStream = BoxStream<super::TextGenerateResponse>;
                         type Future =
                             BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
                         fn call(
@@ -837,7 +884,7 @@ pub mod sglang_service_server {
                         for GenerateSvc<T>
                     {
                         type Response = super::GenerateResponse;
-                        type ResponseStream = T::GenerateStream;
+                        type ResponseStream = BoxStream<super::GenerateResponse>;
                         type Future =
                             BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
                         fn call(
@@ -1116,7 +1163,7 @@ pub mod sglang_service_server {
                         for WatchEngineStateSvc<T>
                     {
                         type Response = super::EngineStateSnapshot;
-                        type ResponseStream = T::WatchEngineStateStream;
+                        type ResponseStream = BoxStream<super::EngineStateSnapshot>;
                         type Future =
                             BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
                         fn call(
@@ -1481,7 +1528,7 @@ pub mod sglang_service_server {
                         for ChatCompleteSvc<T>
                     {
                         type Response = super::OpenAiStreamChunk;
-                        type ResponseStream = T::ChatCompleteStream;
+                        type ResponseStream = BoxStream<super::OpenAiStreamChunk>;
                         type Future =
                             BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
                         fn call(
@@ -1525,7 +1572,7 @@ pub mod sglang_service_server {
                         for CompleteSvc<T>
                     {
                         type Response = super::OpenAiStreamChunk;
-                        type ResponseStream = T::CompleteStream;
+                        type ResponseStream = BoxStream<super::OpenAiStreamChunk>;
                         type Future =
                             BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
                         fn call(

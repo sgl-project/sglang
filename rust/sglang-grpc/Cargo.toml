@@ -35,5 +35,9 @@ uuid = { workspace = true }
 prost-types = { workspace = true }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
+[dev-dependencies]
+# `ProstCodec` for the hand-rolled unary call in the metadata-service test.
+tonic-prost = { workspace = true }
+
 [features]
 default = ["pyo3/extension-module"]

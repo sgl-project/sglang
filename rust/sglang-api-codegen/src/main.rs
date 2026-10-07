@@ -43,6 +43,10 @@ struct Target {
     python_out: Option<&'static str>,
     /// prost `boxed` paths (message fields stored as `Box<T>`).
     boxed: &'static [&'static str],
+    /// Emit every service method with an UNIMPLEMENTED default body, so a
+    /// server may implement a subset (the runtime.v1 follower metadata
+    /// service). Off for a contract every server implements in full.
+    default_stubs: bool,
 }
 
 const TARGETS: &[Target] = &[
@@ -53,6 +57,7 @@ const TARGETS: &[Target] = &[
         python_out: Some("python/sglang/api/v1/api_types.py"),
         // Boxed abort payload won't set the size of every ChunkEvent.
         boxed: &[".sglang.api.v1.FinishReason.kind.abort"],
+        default_stubs: false,
     },
     Target {
         root: "sglang/runtime/v1/sglang.proto",
@@ -60,6 +65,7 @@ const TARGETS: &[Target] = &[
         rust_out: "rust/sglang-api-types/src/generated",
         python_out: None,
         boxed: &[],
+        default_stubs: true,
     },
 ];
 
@@ -100,7 +106,11 @@ fn generate(target: &Target, repo_root: &Path, proto_root: &Path, scratch_dir: &
     config
         .out_dir(&out_dir)
         .file_descriptor_set_path(&descriptor_path)
-        .service_generator(tonic_prost_build::configure().service_generator())
+        .service_generator(
+            tonic_prost_build::configure()
+                .generate_default_stubs(target.default_stubs)
+                .service_generator(),
+        )
         .protoc_arg("--experimental_allow_proto3_optional");
     for path in target.boxed {
         config.boxed(path);
