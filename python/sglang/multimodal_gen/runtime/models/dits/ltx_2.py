@@ -12,9 +12,9 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
+    can_use_fused_rmsnorm_scale_shift,
     can_use_linear_gelu,
     can_use_ltx2_qknorm_split_rope_cuda,
-    can_use_ltx2_rms_norm_modulate,
     can_use_modulate_scale_shift_cuda,
     fused_gelu_active,
     fused_linear_gelu_tanh,
@@ -44,7 +44,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNormNoWeight
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, RMSNormNoWeight
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -208,8 +208,10 @@ def _ltx2_rms_norm_modulate(
     default). The fused kernel is not bit-exact (<=1 bf16 ULP) so it is gated
     on the request-scoped mount rather than a runtime self-check.
     """
-    if ltx2_rms_norm_modulate_active(block) and can_use_ltx2_rms_norm_modulate(
-        x, scale, shift
+    if (
+        ltx2_rms_norm_modulate_active(block)
+        and x.is_cuda
+        and can_use_fused_rmsnorm_scale_shift(x.dtype, x.shape[-1])
     ):
         return fused_ltx2_rms_norm_modulate(x, scale, shift, eps)
     normed = rms_norm(x, eps)
@@ -237,12 +239,12 @@ def _ltx2_try_fused_ada_values9(
     if (
         _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED
         or get_tp_world_size() != 1
-        or not timestep.is_cuda
+        or not current_platform.tensor_on_device(timestep)
         or timestep.dtype != torch.bfloat16
         or timestep.ndim != 3
         or int(timestep.shape[0]) != int(batch_size)
         or not timestep.is_contiguous()
-        or not scale_shift_table.is_cuda
+        or not current_platform.tensor_on_device(scale_shift_table)
         or scale_shift_table.dtype not in (torch.bfloat16, torch.float32)
         or scale_shift_table.ndim != 2
         or int(scale_shift_table.shape[0]) != 9
@@ -811,8 +813,12 @@ class LTX2Attention(nn.Module):
         self.k_norm: nn.Module | None = None
         if self.qk_norm:
             if tp_size == 1:
-                self.q_norm = torch.nn.RMSNorm(self.inner_dim, eps=self.norm_eps)
-                self.k_norm = torch.nn.RMSNorm(self.inner_dim, eps=self.norm_eps)
+                if _is_npu:
+                    self.q_norm = RMSNorm(self.inner_dim, eps=self.norm_eps)
+                    self.k_norm = RMSNorm(self.inner_dim, eps=self.norm_eps)
+                else:
+                    self.q_norm = torch.nn.RMSNorm(self.inner_dim, eps=self.norm_eps)
+                    self.k_norm = torch.nn.RMSNorm(self.inner_dim, eps=self.norm_eps)
             else:
                 self.q_norm = LTX2TPRMSNormAcrossHeads(
                     full_hidden_size=self.inner_dim,
@@ -1778,6 +1784,12 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hf_config.get("rope_double_precision", arch.double_precision_rope)
             )
         )
+        if rope_double_precision and not current_platform.is_float64_supported():
+            logger.warning(
+                "Current platform does not support float64. Falling back to float32."
+            )
+            rope_double_precision = False
+
         self.quantize_video_rope_coords_to_hidden_dtype = bool(
             hf_config.get("quantize_video_rope_coords_to_hidden_dtype", False)
         )

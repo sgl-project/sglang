@@ -55,6 +55,7 @@ class TestDeepseekV4RoPEPolicy(CustomTestCase):
             o_lora_rank=8,
             rms_norm_eps=1e-6,
             compress_ratios=[compress_ratio],
+            q_head_norm=True,
             rope_theta=10_000,
             compress_rope_theta=160_000,
             max_position_embeddings=128,

@@ -25,7 +25,7 @@ single placement to serve two different lifecycle objectives.
 from __future__ import annotations
 
 import statistics
-from typing import TYPE_CHECKING, Iterable, Mapping
+from typing import Iterable, Mapping
 
 import msgspec
 
@@ -38,9 +38,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     is_dit_component_name,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 logger = init_logger(__name__)
 
@@ -181,25 +178,6 @@ class ResidencyTarget(msgspec.Struct, frozen=True):
         return f"{self.component_name}:{permanence}:layers={layer_counts}:pins={pinned}"
 
 
-class DefaultWorkload(msgspec.Struct, frozen=True):
-    """The model-default request shape the planner is calibrated for."""
-
-    width: int | None
-    height: int | None
-    num_frames: int
-    num_inference_steps: int
-
-    def workload_units(self) -> int | None:
-        if self.width is None or self.height is None:
-            return None
-        return max(1, self.width) * max(1, self.height) * max(1, self.num_frames)
-
-    def describe(self) -> str:
-        if self.width is None or self.height is None:
-            return "model-default"
-        return f"{self.width}x{self.height}x{self.num_frames}f"
-
-
 class RankResidencyReport(msgspec.Struct, frozen=True):
     """One rank's inputs to the replica-wide placement decision."""
 
@@ -223,52 +201,6 @@ class RankResidencyReport(msgspec.Struct, frozen=True):
     candidate_latency_savings_ns: dict[str, int] = {}
     candidates: list[ResidencyTarget] = []
     skip_reason: str | None = None
-
-
-def resolve_default_workload(server_args: ServerArgs) -> DefaultWorkload:
-    """Resolve the default request shape the planner is optimized for."""
-    from sglang.multimodal_gen.runtime.warmup_request_builder import (
-        get_model_sampling_defaults,
-        resolve_default_workload_shape,
-    )
-
-    defaults = get_model_sampling_defaults(server_args)
-    width, height, num_frames = resolve_default_workload_shape(server_args, defaults)
-    return DefaultWorkload(
-        width=width,
-        height=height,
-        num_frames=num_frames,
-        num_inference_steps=defaults.num_inference_steps or 1,
-    )
-
-
-def resolve_measured_default_workload(
-    workload: DefaultWorkload, records: Iterable[WarmupMemoryRecord]
-) -> DefaultWorkload:
-    """Fill an implicit default resolution from the executed warmup.
-
-    Image-edit pipelines can derive their output size from the input image, so
-    the sampling defaults legitimately omit width and height. The warmup record
-    is captured after input validation and therefore contains the effective
-    serving shape. Keep the model-default frame count because video warmup may
-    intentionally cap frames before measurement.
-    """
-    if workload.workload_units() is not None:
-        return workload
-    measured = [
-        record
-        for record in records
-        if record.succeeded and record.width > 0 and record.height > 0
-    ]
-    if not measured:
-        return workload
-    representative = max(measured, key=lambda record: record.width * record.height)
-    return DefaultWorkload(
-        width=representative.width,
-        height=representative.height,
-        num_frames=workload.num_frames,
-        num_inference_steps=workload.num_inference_steps,
-    )
 
 
 def estimate_layerwise_layer_uses(

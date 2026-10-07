@@ -20,13 +20,13 @@ from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import GenerationResult
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     MemorySnapshot,
     PerformanceLogger,
     RequestMetrics,
 )
-from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
 

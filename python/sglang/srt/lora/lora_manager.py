@@ -48,9 +48,12 @@ from sglang.srt.lora.utils import (
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
+    LoRABatchLayout,
     get_exec,
+    get_forward,
     get_lora,
     get_parallel,
+    get_schedule,
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
@@ -72,8 +75,6 @@ class LoRAManager:
         dtype: torch.dtype,
         server_args: ServerArgs,
         lora_backend: str = "triton",
-        tp_size: int = 1,
-        tp_rank: int = 0,
         max_lora_rank: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
         lora_paths: Optional[List[LoRARef]] = None,
@@ -87,8 +88,6 @@ class LoRAManager:
         self.load_config: LoadConfig = load_config
         self.dtype: torch.dtype = dtype
         self.device: torch.device = next(self.base_model.parameters()).device
-        self.tp_size: int = tp_size
-        self.tp_rank: int = tp_rank
         # Attention projections shard on the attn-TP group; extracted once
         # here (parallel groups are frozen after init_torch_distributed).
         self.attn_tp_size: int = get_parallel().attn_tp_size
@@ -96,10 +95,30 @@ class LoRAManager:
         self.enable_lora_overlap_loading: Optional[bool] = (
             get_lora().enable_lora_overlap_loading
         )
+        self.attn_dp_enabled: bool = get_parallel().attn_dp_enabled
+        if (
+            self.attn_dp_enabled
+            and self.enable_lora_overlap_loading
+            and not LoRAMemoryPool.supports_dp_attention_overlap_loading
+        ):
+            raise ValueError(
+                "The configured LoRA memory pool does not support DP-attention "
+                "overlap loading; use a pool that coordinates adapter slots "
+                "across DP ranks or disable overlap loading"
+            )
+        # LoRA routing knows only DP-local and TP-global token layouts. A wider
+        # attention TP/CP group can scatter one DP rank's tokens across ranks.
+        if self.attn_dp_enabled and (
+            self.attn_tp_size != 1 or get_parallel().attn_cp_size != 1
+        ):
+            raise ValueError(
+                "LoRA with DP attention requires --attn-dp-size equal to --tp-size "
+                f"(got attention TP size {self.attn_tp_size} and attention CP "
+                f"size {get_parallel().attn_cp_size})"
+            )
         self.pending_lora_load_events = {}
 
         self.eviction_policy = get_lora().lora_eviction_policy
-        self.enable_dp_attention: bool = get_parallel().enable_dp_attention
         self._experts_shared_outer_override: Optional[bool] = (
             get_lora().experts_shared_outer_loras
         )
@@ -115,6 +134,10 @@ class LoRAManager:
             device=self.device,
             server_args=server_args,
         )
+        if self.attn_dp_enabled and not self.lora_backend.supports_dp_attention:
+            raise ValueError(
+                f"LoRA backend {lora_backend!r} does not support DP attention"
+            )
 
         # Initialize mutable internal state of the LoRAManager.
         self.init_state(
@@ -136,6 +159,15 @@ class LoRAManager:
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_req=num_tokens_per_req,
         )
+        max_moe_tokens = max_bs_in_cuda_graph * num_tokens_per_req
+        if self.attn_dp_enabled:
+            self.lora_backend.init_dp_attention_cuda_graph_batch_info(max_moe_tokens)
+            max_moe_tokens *= get_parallel().num_dp_ranks
+        if self.lora_backend.resize_cuda_graph_moe_buffers(max_moe_tokens):
+            logger.info(
+                "Right-sized shared MoE LoRA CUDA graph buffers "
+                f"(max_tokens={max_moe_tokens})"
+            )
 
         # ===== TO BE REFACTORED ====
         # Pre-create the experimental LoRA two-stream side stream now (gated) so the
@@ -148,22 +180,40 @@ class LoRAManager:
             init_lora_two_stream_resources(self.device)
         # ===== END TO BE REFACTORED ====
 
-    def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
-        """Allocate the static prefill-CUDA-graph LoRA metadata, sized by the
-        largest captured token bucket. Called before capture."""
+    def init_prefill_cuda_graph_batch_info(
+        self, max_num_tokens: int, max_num_requests: Optional[int] = None
+    ):
+        """Allocate static LoRA metadata and MoE scratch before prefill capture."""
         self.lora_backend.init_prefill_cuda_graph_batch_info(
-            max_num_tokens=max_num_tokens
+            max_num_tokens=max_num_tokens, max_num_requests=max_num_requests
         )
+        for module in self.base_model.modules():
+            if isinstance(module, FusedMoEWithLoRA):
+                self.lora_backend.init_cuda_graph_moe_buffers(
+                    max_bs=max_num_tokens,
+                    max_loras=self.max_loras_per_batch,
+                    compute_dtype=self.dtype,
+                    moe_layer=module,
+                    prefill=True,
+                )
+                break
 
     @property
     def supports_prefill_cuda_graph(self) -> bool:
-        """Whether LoRA kernels can be captured into the prefill CUDA graph;
-        excludes MoE LoRA and DP attention."""
-        return (
-            self.lora_backend.supports_prefill_cuda_graph
-            and not self.lora_backend.is_moe_lora
-            and not self.enable_dp_attention
+        """MoE LoRA supports full and breakable capture; DP attention is unsupported."""
+        from sglang.srt.model_executor.cuda_graph_config import (
+            Backend,
+            Phase,
+            check_cuda_graph_backend,
         )
+
+        if self.attn_dp_enabled or not self.lora_backend.supports_prefill_cuda_graph:
+            return False
+        if self.lora_backend.is_moe_lora:
+            return check_cuda_graph_backend(
+                Phase.PREFILL, Backend.BREAKABLE
+            ) or check_cuda_graph_backend(Phase.PREFILL, Backend.FULL)
+        return True
 
     @property
     def prefill_cuda_graph_max_bs(self) -> Optional[int]:
@@ -180,7 +230,7 @@ class LoRAManager:
             return False
         # DP attention: per-rank eligibility could diverge across ranks and
         # desync collectives; keep LoRA prefill eager.
-        if self.enable_dp_attention:
+        if self.attn_dp_enabled:
             return False
         # Decode-CUDA-graph extend modes (TARGET_VERIFY, DLLM_EXTEND) are
         # owned by the decode static batch info path.
@@ -276,6 +326,9 @@ class LoRAManager:
         """
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
         """
+        assert not self.attn_dp_enabled or lora_ref.pinned, (
+            "DP-attention LoRA requires pinned adapters"
+        )
         if lora_config.lora_added_tokens_size > 0:
             raise ValueError(
                 f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support adapters that add tokens to the vocabulary"
@@ -335,12 +388,7 @@ class LoRAManager:
         delete the corresponding LoRA modules.
         """
 
-        adapter = self.configs.get(lora_ref.lora_id)
-        lora_ref = self.lora_refs.get(lora_ref.lora_id)
-        assert adapter is not None and lora_ref is not None, (
-            f"LoRA adapter with ID {lora_ref.lora_id} is not loaded. This should have been verified before request is sent to the backend."
-        )
-
+        loaded_lora_ref = self.lora_refs.get(lora_ref.lora_id)
         try:
             pending_events = getattr(self, "pending_lora_load_events", {})
             pending_event = pending_events.get(lora_ref.lora_id)
@@ -351,10 +399,11 @@ class LoRAManager:
             removed_slot = self.memory_pool.remove_lora(lora_ref.lora_id)
             if removed_slot is not None:
                 self._notify_lora_slots_updated({removed_slot})
-            del self.configs[lora_ref.lora_id]
-            del self.loras[lora_ref.lora_id]
-            del self.lora_refs[lora_ref.lora_id]
-            self.num_pinned_loras -= int(lora_ref.pinned)
+            self.configs.pop(lora_ref.lora_id, None)
+            self.loras.pop(lora_ref.lora_id, None)
+            self.lora_refs.pop(lora_ref.lora_id, None)
+            if loaded_lora_ref is not None:
+                self.num_pinned_loras -= int(loaded_lora_ref.pinned)
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,
@@ -442,30 +491,46 @@ class LoRAManager:
             return
 
         # set up batch info shared by all lora modules
-        bs = forward_batch.batch_size
-
-        use_cuda_graph = (
-            hasattr(self, "max_bs_in_cuda_graph")
-            and bs <= self.max_bs_in_cuda_graph
-            and forward_batch.forward_mode.is_cuda_graph()
-        )
+        use_cuda_graph = self._use_cuda_graph_batch(forward_batch)
         # Eligible extend batches refresh the static prefill batch info in
         # place so captured kernels read current values at replay.
         use_prefill_cuda_graph = not use_cuda_graph and self.can_use_prefill_cuda_graph(
             forward_batch
         )
 
-        weight_indices = [0] * len(forward_batch.lora_ids)
+        active_lora_ids = set(forward_batch.lora_ids)
+        if self.attn_dp_enabled:
+            get_forward().set("lora_batch_layout", LoRABatchLayout.DP_LOCAL)
+            gathered_lora_ids = get_parallel().tp_group.all_gather_object(
+                forward_batch.lora_ids
+            )
+            active_lora_ids = {
+                lora_id
+                for rank_lora_ids in gathered_lora_ids
+                for lora_id in rank_lora_ids
+            }
+            if not self.validate_lora_batch(active_lora_ids):
+                raise ValueError(
+                    "The global DP-attention batch contains more LoRA adapters than "
+                    "the memory pool can hold"
+                )
+            self.fetch_new_loras(active_lora_ids)
+
+        base_weight_index = self.memory_pool.uid_to_buffer_id.get(None, 0)
+        weight_indices = [base_weight_index] * len(forward_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
         for i, uid in enumerate(forward_batch.lora_ids):
             if uid not in self.memory_pool.uid_to_buffer_id:
                 continue
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
-            if uid is not None:
-                lora = self.loras[uid]
-                lora_ranks[weight_indices[i]] = lora.config.r
-                scalings[weight_indices[i]] = lora.scaling
+        for uid in active_lora_ids:
+            if uid is None:
+                continue
+            weight_index = self.memory_pool.get_buffer_id(uid)
+            lora = self.loras[uid]
+            lora_ranks[weight_index] = lora.config.r
+            scalings[weight_index] = lora.scaling
         # Do in-place updates when CUDA graph is enabled and the batch forward mode
         # could use CUDA graph.
         self.lora_backend.prepare_lora_batch(
@@ -478,6 +543,20 @@ class LoRAManager:
         )
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices
+        )
+        if self.attn_dp_enabled:
+            self.lora_backend.prepare_global_lora_batch(forward_batch)
+            if forward_batch.forward_mode.is_idle():
+                # Idle ranks must join the global routing collectives, but
+                # their DP-local attention path has no tokens to adapt.
+                self.lora_backend.batch_info = None
+
+    def _use_cuda_graph_batch(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            hasattr(self, "max_bs_in_cuda_graph")
+            and forward_batch.batch_size <= self.max_bs_in_cuda_graph
+            and forward_batch.forward_mode.is_cuda_graph()
+            and (not self.attn_dp_enabled or forward_batch.can_run_decode_cuda_graph)
         )
 
     def prepare_lora_token_segments(
@@ -921,9 +1000,6 @@ class LoRAManager:
             base_hf_config=self.base_hf_config,
             max_loras_per_batch=self.max_loras_per_batch,
             dtype=self.dtype,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            attn_tp_size=self.attn_tp_size,
             max_lora_rank=self.max_lora_rank,
             target_modules=self.target_modules,
             base_model=self.base_model,
@@ -1096,10 +1172,18 @@ def init_lora_cuda_graph_moe_buffers(
     from sglang.srt.lora.layers import FusedMoEWithLoRA
 
     max_bs = get_exec().graph.cuda_graph_config.decode.max_bs
+    max_running_requests = get_schedule().max_running_requests
+    if max_running_requests is not None:
+        max_bs = min(
+            max_bs,
+            max_running_requests // get_parallel().attn_dp_size,
+        )
     # With spec on, the decode graph captures TARGET_VERIFY batches of
     # num_draft_tokens per request, and the buffers below are per-token, so
     # they must be sized in tokens rather than requests.
     max_tokens = max_bs * (get_spec().speculative_num_draft_tokens or 1)
+    if get_parallel().attn_dp_enabled:
+        max_tokens *= get_parallel().attn_dp_size
     max_loras = get_lora().max_loras_per_batch
     for module in model.modules():
         if isinstance(module, FusedMoEWithLoRA):
