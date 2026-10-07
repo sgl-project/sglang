@@ -268,26 +268,10 @@ def _thinking_format(
 
 
 def _nonempty_start(closers: list[str]) -> dict[str, Any]:
-    """The start of non-empty text that does not begin with a closer. It ends on
-    a character that starts no closer, so no closer begins inside it."""
-    closers = [closer for closer in closers if closer]
-    starts = {closer[0] for closer in closers}
-    prefixes = dict.fromkeys(
-        [""] + [closer[:end] for closer in closers for end in range(1, len(closer))]
-    )
-    branches = []
-    for prefix in prefixes:
-        # A prefix holding a whole closer has already closed the text.
-        if any(closer in prefix for closer in closers):
-            continue
-        nexts = {
-            closer[len(prefix)]
-            for closer in closers
-            if len(closer) > len(prefix) and closer.startswith(prefix)
-        }
-        excluded = "".join(map(_class_escape, sorted(starts | nexts)))
-        branches.append(f"{_escape(prefix)}[^{excluded}]")
-    return {"type": "regex", "pattern": "|".join(branches)}
+    """A first character that starts none of the `closers`."""
+    starts = {closer[0] for closer in closers if closer}
+    excluded = "".join(map(_class_escape, sorted(starts)))
+    return {"type": "regex", "pattern": f"[^{excluded}]"}
 
 
 def _class_escape(char: str) -> str:
