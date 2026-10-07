@@ -9,11 +9,24 @@ from sglang.srt.layers.attention.qsa import kernel, mqa
 from sglang.srt.layers.attention.qsa.metadata import build_qsa_row_ranges
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_npu
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=60, suite="base-b-test-1-npu-a3")
 pytestmark = pytest.mark.skipif(not is_npu(), reason="NPU is required")
+
+
+@pytest.fixture
+def runtime_context():
+    publish(
+        ServerArgs(model_path="dummy", speculative_num_draft_tokens=4), role="test"
+    )
+    try:
+        yield
+    finally:
+        reset_context()
 
 
 def _expected(blocks, positions, lengths, ratio, token_topk):
@@ -172,7 +185,7 @@ def test_packed_mqa_current_topk_expansion_graph(rows, block_topk):
     "mode", [ForwardMode.DECODE, ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2]
 )
 @pytest.mark.parametrize("batch_size", [2, 32])
-def test_backend_graph_metadata_current_topk_expansion(mode, batch_size):
+def test_backend_graph_metadata_current_topk_expansion(mode, batch_size, runtime_context):
     # Real backend methods/persistent buffers; synthetic pool and Q/K.
     # Includes sparse attention; not projection, compression, scheduler or service.
     raw_width = 4096

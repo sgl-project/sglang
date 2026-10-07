@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import nn
 
-from sglang.kernels.ops import qwen4_ple
+from sglang.kernels.ops.mamba import qwen4_short_conv
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import qwen4_exp as model
 from sglang.test.ci.ci_register import register_npu_ci
@@ -39,8 +39,11 @@ def _make_case(
     )
     state = random_tensor(5, channels, state_len)
     initial_state = state.clone()
-    intermediate = state.new_zeros(2, width, channels, state_len)
+    pool_size = 2
+    # Verify scratch has one extra row for inactive requests.
+    intermediate = state.new_zeros(pool_size + 1, width, channels, state_len)
     pool = SimpleNamespace(
+        size=pool_size,
         short_conv_layer_cache=lambda _: state,
         short_conv_layer_intermediate_cache=lambda _: intermediate,
     )
@@ -71,6 +74,7 @@ def _make_case(
         ngram_eos_token_id=None,
     )
     forward_batch = SimpleNamespace(
+        req_pool_indices=torch.arange(pool_size, device=device, dtype=torch.int32),
         mamba_track_indices=torch.tensor([3, 4], device=device),
         mamba_track_mask=torch.tensor([True, False], device=device),
         mamba_track_aligned_lens=lambda: torch.tensor(
@@ -125,7 +129,7 @@ def test_ple_short_conv_npu(
         pytest.skip("Prefill retains native convolution outside graph capture")
     # Isolate convolution from the optional CUDA fused state-movement kernel.
     monkeypatch.setattr(
-        qwen4_ple, "can_fuse_qwen4_short_conv_state", lambda *args: False
+        qwen4_short_conv, "can_fuse_qwen4_short_conv_state", lambda *args: False
     )
     device = "cpu" if execution == "cpu" else "npu"
     case = _make_case(
@@ -227,7 +231,7 @@ def test_ple_short_conv_state_preparation(monkeypatch, record_property, dtype, c
     reference = _make_case("npu", dtype, "decode_fast", 4, 3, width=1, channels=10240)
     record_property(
         "fused_state",
-        qwen4_ple.can_fuse_qwen4_short_conv_state(
+        qwen4_short_conv.can_fuse_qwen4_short_conv_state(
             case.state, case.batch.state_indices, case.x
         ),
     )
@@ -257,7 +261,7 @@ def test_ple_short_conv_state_preparation(monkeypatch, record_property, dtype, c
             item.state.copy_(item.initial_state)
         with monkeypatch.context() as reference_patch:
             reference_patch.setattr(
-                qwen4_ple, "can_fuse_qwen4_short_conv_state", lambda *args: False
+                qwen4_short_conv, "can_fuse_qwen4_short_conv_state", lambda *args: False
             )
             expected = _run(reference, reference_patch, npu=False)
         if graph is None:

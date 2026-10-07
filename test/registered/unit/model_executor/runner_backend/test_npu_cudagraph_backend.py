@@ -10,6 +10,7 @@ import torch
 from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
     NPUCudaGraphBackend,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -20,11 +21,13 @@ def make_backend(request):
     def make(graph):
         runner = SimpleNamespace(
             device_module=SimpleNamespace(
-                current_device=Mock(return_value=0), set_device=Mock()
+                current_device=Mock(return_value=0),
+                set_device=Mock(),
+                Event=Mock(side_effect=lambda: Mock(spec=["record", "synchronize"])),
             ),
-            model_runner=SimpleNamespace(tp_group=Mock()),
         )
-        backend = NPUCudaGraphBackend(runner)
+        with get_parallel().override(tp_group=Mock()):
+            backend = NPUCudaGraphBackend(runner)
         request.addfinalizer(backend.cleanup)
         backend._graphs = {1: graph}
         backend._outputs = {1: object()}
@@ -52,24 +55,44 @@ def test_npu_graph_update_success(legacy, make_backend):
     assert output is backend._outputs[1]
     graph.replay.assert_called_once_with()
     backend._device_module.set_device.assert_called_once_with(0)
+    backend._rebind_fence.record.assert_called_once_with()
+    backend._rebind_fence.synchronize.assert_not_called()
 
 
-def test_npu_graph_waits_for_update_before_replay_and_reuses_worker(make_backend):
+def test_npu_graph_overlaps_update_and_replay_and_reuses_worker(make_backend):
     caller_thread = threading.get_ident()
     update_threads = []
     events = []
+    replay_started = threading.Event()
 
     def update(**kwargs):
         backend._device_module.set_device.assert_called_once_with(0)
         update_threads.append(threading.get_ident())
         events.append("update")
+        assert replay_started.wait(timeout=5), "replay must not wait for update to finish"
+        events.append("update_done")
 
-    graph = SimpleNamespace(update=update, replay=lambda: events.append("replay"))
+    def replay():
+        events.append("replay")
+        replay_started.set()
+
+    graph = SimpleNamespace(update=update, replay=replay)
     backend = make_backend(graph)
     for _ in range(2):
+        replay_started.clear()
+        events.clear()
+        previous_fence = backend._rebind_fence
+        if previous_fence is not None:
+            previous_fence.synchronize.side_effect = lambda: events.append("synchronize")
         result = backend.replay_with_input_update(1, None, cpu_update_input=[{}, {}])
         assert result is backend._outputs[1]
-    assert events == ["update", "replay", "update", "replay"]
+        assert events.count("update") == events.count("replay") == 1
+        assert events[-1] == "update_done"
+        if previous_fence is not None:
+            previous_fence.synchronize.assert_called_once_with()
+            assert events[0] == "synchronize"
+        assert backend._rebind_fence is not previous_fence
+        backend._rebind_fence.record.assert_called_once_with()
     assert update_threads[0] == update_threads[1] != caller_thread
     backend._device_module.set_device.assert_called_once_with(0)
 
@@ -83,8 +106,8 @@ def test_npu_graph_propagates_failures(failure, make_backend):
     with pytest.raises(RuntimeError) as exc_info:
         backend.replay_with_input_update(1, None, cpu_update_input=[{}])
     assert exc_info.value is error
-    if failure == "update":
-        graph.replay.assert_not_called()
+    graph.replay.assert_called_once_with()
+    assert backend._rebind_fence is None
 
 
 def test_npu_graph_cleanup_stops_update_worker(make_backend):

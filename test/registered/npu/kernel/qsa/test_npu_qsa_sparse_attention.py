@@ -162,14 +162,6 @@ def test_backend_kv_write_mapping_and_output_padding(mode, width, monkeypatch):
 
     monkeypatch.setattr(backend_module, "qsa_sparse_attention", forbidden)
     q, k, v, _ = inputs()
-    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
-    table = torch.arange(64, device="npu", dtype=torch.int32)[None, :]
-    backend.forward_metadata = SimpleNamespace(
-        is_cuda_graph=False,
-        token_to_batch_idx=torch.zeros(3, device="npu", dtype=torch.int32),
-        sequence_lengths=torch.tensor([64], device="npu", dtype=torch.int32),
-        token_slot_table=table,
-    )
 
     class Pool:
         def set_kv_buffer(self, layer, loc, keys, values):
@@ -182,7 +174,26 @@ def test_backend_kv_write_mapping_and_output_padding(mode, width, monkeypatch):
         def get_value_buffer(self, layer_id):
             return v.reshape(4, 16, 1, 256)
 
-    backend.token_to_kv_pool = Pool()
+    config = SimpleNamespace(
+        indexer_n_heads=4,
+        indexer_kv_heads=1,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+    )
+    runner = SimpleNamespace(
+        token_to_kv_pool=Pool(),
+        device=q.device,
+        model_config=SimpleNamespace(hf_text_config=config, context_len=64),
+    )
+    backend = QwenSparseAttnBackend(runner)
+    table = torch.arange(64, device="npu", dtype=torch.int32)[None, :]
+    backend.forward_metadata = SimpleNamespace(
+        is_cuda_graph=False,
+        token_to_batch_idx=torch.zeros(3, device="npu", dtype=torch.int32),
+        sequence_lengths=torch.tensor([64], device="npu", dtype=torch.int32),
+        token_slot_table=table,
+    )
     layer = SimpleNamespace(tp_q_head_num=3, head_dim=256, layer_id=0, scaling=1 / 16)
     batch = SimpleNamespace(
         forward_mode=mode,
