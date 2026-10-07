@@ -13,6 +13,7 @@
 # ==============================================================================
 """The baseclass of a backend for reasoner grammar-guided constrained decoding."""
 
+import json
 import logging
 from typing import List, Optional, Sequence, Tuple, Union
 
@@ -352,4 +353,16 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         ret = self.grammar_backend._init_value_dispatch(key, reasoning)
         if ret is None or isinstance(ret, InvalidGrammarObject):
             return ret
+        if key[0] == "full_assistant_ebnf":
+            return ret
+        if not self.enable_strict_thinking and key[0] == "structural_tag":
+            from sglang.srt.function_call.inkling_detector import InklingDetector
+
+            # Only this canonical schema owns the full turn; user restrictions may not.
+            if json.loads(key[1]) == (
+                InklingDetector()
+                .get_auto_tool_call_structural_tag()
+                .model_dump(by_alias=True)
+            ):
+                return ret
         return self._make_grammar_object(ret, reasoning)

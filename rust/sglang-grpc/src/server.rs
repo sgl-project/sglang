@@ -1,30 +1,131 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use pyo3::PyErr;
 use pyo3::Python;
 use pyo3::exceptions::{PyTypeError, PyValueError};
-use tokio::sync::{Notify, mpsc::Receiver};
+use tokio::sync::{Notify, mpsc::Receiver, watch};
 use tokio::time::{Duration, timeout};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
 use crate::bridge::{PyBridge, ResponseChunk, TerminalError};
-use crate::proto;
 use crate::utils::{
     build_classify_dict, build_embed_dict, build_generate_dict, build_text_embed_dict,
     build_text_generate_dict, extract_model_path,
 };
+use sglang_grpc_types::sglang::runtime::v1 as proto;
 
 pub struct SglangServiceImpl {
     pub bridge: Arc<PyBridge>,
     pub response_timeout: Duration,
+    engine_state: EngineStatePublisher,
+    stream_shutdown: watch::Receiver<bool>,
+}
+
+/// A follower has no tokenizer manager or inference bridge. It exposes the same
+/// discovery RPC as the leader, with a node-local startup snapshot. Generated
+/// default handlers return UNIMPLEMENTED for every other RPC.
+pub struct MetadataService {
+    pub server_info_json: String,
+}
+
+#[tonic::async_trait]
+impl proto::sglang_service_server::SglangService for MetadataService {
+    async fn get_server_info(
+        &self,
+        _request: Request<proto::GetServerInfoRequest>,
+    ) -> Result<Response<proto::GetServerInfoResponse>, Status> {
+        Ok(Response::new(proto::GetServerInfoResponse {
+            json_info: self.server_info_json.clone(),
+        }))
+    }
 }
 
 type StreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 pub const DEFAULT_RESPONSE_TIMEOUT_SECS: u64 = 300;
+
+#[derive(Clone)]
+struct EngineStatePublisher {
+    bridge: Arc<PyBridge>,
+    instance_id: u64,
+    sender: watch::Sender<proto::EngineStateSnapshot>,
+}
+
+impl EngineStatePublisher {
+    async fn new(bridge: Arc<PyBridge>) -> Result<Self, Status> {
+        let instance_id = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| {
+                    Status::internal(format!("system clock before Unix epoch: {error}"))
+                })?
+                .as_nanos(),
+        )
+        .map_err(|_| Status::internal("engine instance timestamp does not fit in uint64"))?;
+        let snapshot = build_engine_state_snapshot(bridge.clone(), instance_id, 1).await?;
+        let (sender, _) = watch::channel(snapshot);
+        Ok(Self {
+            bridge,
+            instance_id,
+            sender,
+        })
+    }
+
+    fn subscribe(&self) -> watch::Receiver<proto::EngineStateSnapshot> {
+        self.sender.subscribe()
+    }
+
+    async fn publish_current(&self) -> Result<(), Status> {
+        let revision = self.sender.borrow().revision + 1;
+        let snapshot =
+            build_engine_state_snapshot(self.bridge.clone(), self.instance_id, revision).await?;
+        tracing::info!(
+            instance_id = snapshot.instance_id,
+            revision = snapshot.revision,
+            healthy = snapshot.healthy,
+            is_pause = snapshot.is_pause,
+            "publishing SGLang engine state"
+        );
+        self.sender.send_replace(snapshot);
+        Ok(())
+    }
+}
+
+async fn build_engine_state_snapshot(
+    bridge: Arc<PyBridge>,
+    instance_id: u64,
+    revision: u64,
+) -> Result<proto::EngineStateSnapshot, Status> {
+    let values = tokio::task::spawn_blocking(move || {
+        Ok::<_, PyErr>((
+            bridge.health_check()?,
+            bridge.is_pause()?,
+            bridge.get_model_info()?,
+            bridge.get_server_info()?,
+        ))
+    })
+    .await
+    .map_err(|error| Status::internal(format!("engine snapshot task failed: {error}")))?
+    .map_err(|error| pyerr_to_status(error, "Failed to build engine state snapshot"))?;
+    let (healthy, is_pause, model_json, server_json) = values;
+    Ok(proto::EngineStateSnapshot {
+        instance_id,
+        revision,
+        healthy,
+        is_pause,
+        model_info: Some(proto::GetModelInfoResponse {
+            model_path: extract_model_path(&model_json),
+            json_info: model_json,
+        }),
+        server_info: Some(proto::GetServerInfoResponse {
+            json_info: server_json,
+        }),
+    })
+}
 
 /// 64 MiB — leaves headroom for multimodal inputs and OpenAI JSON pass-through bodies,
 /// well above tonic's 4 MiB decode default.
@@ -218,12 +319,10 @@ fn openai_status_code(meta_info: &HashMap<String, String>, default: i32) -> i32 
 impl proto::sglang_service_server::SglangService for SglangServiceImpl {
     // --- SGLang-native RPCs: TextGenerate / Generate ---
 
-    type TextGenerateStream = StreamResult<proto::TextGenerateResponse>;
-
     async fn text_generate(
         &self,
         request: Request<proto::TextGenerateRequest>,
-    ) -> Result<Response<Self::TextGenerateStream>, Status> {
+    ) -> Result<Response<StreamResult<proto::TextGenerateResponse>>, Status> {
         let req = request.into_inner();
         let rid = req
             .rid
@@ -287,12 +386,10 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    type GenerateStream = StreamResult<proto::GenerateResponse>;
-
     async fn generate(
         &self,
         request: Request<proto::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<StreamResult<proto::GenerateResponse>>, Status> {
         let req = request.into_inner();
         let rid = req
             .rid
@@ -494,14 +591,12 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         }
 
         // Fallback to Python
-        let json_str = tokio::task::spawn_blocking({
-            let bridge = self.bridge.clone();
-            let text = req.text.clone();
-            move || bridge.tokenize_py(&text, add_special)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| pyerr_to_status(e, "Tokenize failed"))?;
+        let text = req.text.clone();
+        let json_str = self
+            .blocking_bridge_call("Tokenize failed", move |bridge| {
+                bridge.tokenize_py(&text, add_special)
+            })
+            .await?;
 
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
@@ -539,14 +634,11 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         }
 
         // Fallback to Python
-        let json_str = tokio::task::spawn_blocking({
-            let bridge = self.bridge.clone();
-            let tokens = req.tokens;
-            move || bridge.detokenize_py(tokens)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| pyerr_to_status(e, "Detokenize failed"))?;
+        let json_str = self
+            .blocking_bridge_call("Detokenize failed", move |bridge| {
+                bridge.detokenize_py(req.tokens)
+            })
+            .await?;
 
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
@@ -561,28 +653,53 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         _request: Request<proto::HealthCheckRequest>,
     ) -> Result<Response<proto::HealthCheckResponse>, Status> {
-        let healthy = tokio::task::spawn_blocking({
-            let bridge = self.bridge.clone();
-            move || bridge.health_check()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| pyerr_to_status(e, "Health check failed"))?;
+        let healthy = self
+            .blocking_bridge_call("Health check failed", PyBridge::health_check)
+            .await?;
 
         Ok(Response::new(proto::HealthCheckResponse { healthy }))
+    }
+
+    async fn watch_engine_state(
+        &self,
+        _request: Request<proto::WatchEngineStateRequest>,
+    ) -> Result<Response<StreamResult<proto::EngineStateSnapshot>>, Status> {
+        let mut receiver = self.engine_state.subscribe();
+        let mut shutdown = self.stream_shutdown.clone();
+        let stream = async_stream::stream! {
+            if *shutdown.borrow_and_update() {
+                return;
+            }
+            let initial = receiver.borrow_and_update().clone();
+            yield Ok(initial);
+            loop {
+                tokio::select! {
+                    biased;
+                    result = shutdown.changed() => {
+                        if result.is_err() || *shutdown.borrow_and_update() {
+                            break;
+                        }
+                    }
+                    result = receiver.changed() => {
+                        if result.is_err() {
+                            break;
+                        }
+                        let update = receiver.borrow_and_update().clone();
+                        yield Ok(update);
+                    }
+                }
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn get_model_info(
         &self,
         _request: Request<proto::GetModelInfoRequest>,
     ) -> Result<Response<proto::GetModelInfoResponse>, Status> {
-        let json_info = tokio::task::spawn_blocking({
-            let bridge = self.bridge.clone();
-            move || bridge.get_model_info()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| pyerr_to_status(e, "Failed to get model info"))?;
+        let json_info = self
+            .blocking_bridge_call("Failed to get model info", PyBridge::get_model_info)
+            .await?;
 
         Ok(Response::new(proto::GetModelInfoResponse {
             model_path: extract_model_path(&json_info),
@@ -594,13 +711,9 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         _request: Request<proto::GetServerInfoRequest>,
     ) -> Result<Response<proto::GetServerInfoResponse>, Status> {
-        let json_info = tokio::task::spawn_blocking({
-            let bridge = self.bridge.clone();
-            move || bridge.get_server_info()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| pyerr_to_status(e, "Failed to get server info"))?;
+        let json_info = self
+            .blocking_bridge_call("Failed to get server info", PyBridge::get_server_info)
+            .await?;
 
         Ok(Response::new(proto::GetServerInfoResponse { json_info }))
     }
@@ -609,13 +722,9 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         _request: Request<proto::ListModelsRequest>,
     ) -> Result<Response<proto::ListModelsResponse>, Status> {
-        let json_str = tokio::task::spawn_blocking({
-            let bridge = self.bridge.clone();
-            move || bridge.list_models()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| pyerr_to_status(e, "Failed to list models"))?;
+        let json_str = self
+            .blocking_bridge_call("Failed to list models", PyBridge::list_models)
+            .await?;
 
         let models_arr: Vec<serde_json::Value> = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse models JSON: {}", e)))?;
@@ -735,22 +844,18 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
 
     // --- OpenAI-compatible RPCs (JSON pass-through) ---
 
-    type ChatCompleteStream = StreamResult<proto::OpenAiStreamChunk>;
-
     async fn chat_complete(
         &self,
         request: Request<proto::OpenAiRequest>,
-    ) -> Result<Response<Self::ChatCompleteStream>, Status> {
+    ) -> Result<Response<StreamResult<proto::OpenAiStreamChunk>>, Status> {
         self.openai_streaming_rpc(request, "submit_openai_chat")
             .await
     }
 
-    type CompleteStream = StreamResult<proto::OpenAiStreamChunk>;
-
     async fn complete(
         &self,
         request: Request<proto::OpenAiRequest>,
-    ) -> Result<Response<Self::CompleteStream>, Status> {
+    ) -> Result<Response<StreamResult<proto::OpenAiStreamChunk>>, Status> {
         self.openai_streaming_rpc(request, "submit_openai_complete")
             .await
     }
@@ -847,8 +952,20 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
     }
 }
 
-// Helper methods for OpenAI pass-through RPCs.
+// Shared RPC helpers.
 impl SglangServiceImpl {
+    async fn blocking_bridge_call<T, F>(&self, context: &str, call: F) -> Result<T, Status>
+    where
+        T: Send + 'static,
+        F: FnOnce(&PyBridge) -> Result<T, PyErr> + Send + 'static,
+    {
+        let bridge = self.bridge.clone();
+        tokio::task::spawn_blocking(move || call(&bridge))
+            .await
+            .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
+            .map_err(|e| pyerr_to_status(e, context))
+    }
+
     async fn openai_streaming_rpc(
         &self,
         request: Request<proto::OpenAiRequest>,
@@ -971,6 +1088,14 @@ async fn recv_json_response(
     }
 }
 
+pub enum ServerMode {
+    Inference {
+        bridge: Arc<PyBridge>,
+        response_timeout: Duration,
+    },
+    Metadata(MetadataService),
+}
+
 /// Start the Tonic gRPC server on the given address.
 //
 // TODO(grpc-auth): this listener is currently unauthenticated. Before exposing
@@ -978,17 +1103,51 @@ async fn recv_json_response(
 // checks the HTTP server applies (see issue tracking gRPC auth parity).
 pub async fn run_grpc_server(
     listener: std::net::TcpListener,
-    bridge: Arc<PyBridge>,
+    mode: ServerMode,
     shutdown: Arc<Notify>,
-    response_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr = listener.local_addr()?;
-    let listener = tokio::net::TcpListener::from_std(listener)?;
+    let (bridge, response_timeout) = match mode {
+        ServerMode::Metadata(service) => {
+            return serve_grpc(listener, service, shutdown, None).await;
+        }
+        ServerMode::Inference {
+            bridge,
+            response_timeout,
+        } => (bridge, response_timeout),
+    };
+    let (state_changed_tx, mut state_changed_rx) = tokio::sync::mpsc::channel(1);
+    bridge.set_engine_state_changed_callback(state_changed_tx)?;
+    let engine_state = EngineStatePublisher::new(bridge.clone()).await?;
+    let (stream_shutdown_tx, stream_shutdown_rx) = watch::channel(false);
     let service = SglangServiceImpl {
         bridge,
         response_timeout,
+        engine_state: engine_state.clone(),
+        stream_shutdown: stream_shutdown_rx,
     };
 
+    let monitor = tokio::spawn(async move {
+        while state_changed_rx.recv().await.is_some() {
+            while state_changed_rx.try_recv().is_ok() {}
+            if let Err(error) = engine_state.publish_current().await {
+                tracing::warn!(%error, "failed to publish SGLang engine state");
+            }
+        }
+    });
+
+    let result = serve_grpc(listener, service, shutdown, Some(stream_shutdown_tx)).await;
+    monitor.abort();
+    result
+}
+
+async fn serve_grpc(
+    listener: std::net::TcpListener,
+    service: impl proto::sglang_service_server::SglangService,
+    shutdown: Arc<Notify>,
+    stream_shutdown: Option<watch::Sender<bool>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr = listener.local_addr()?;
+    let listener = tokio::net::TcpListener::from_std(listener)?;
     let max_message_size = resolve_max_message_size();
     let svc = proto::sglang_service_server::SglangServiceServer::new(service)
         .max_decoding_message_size(max_message_size)
@@ -996,13 +1155,17 @@ pub async fn run_grpc_server(
 
     tracing::info!("gRPC server listening on {}", addr);
 
-    tonic::transport::Server::builder()
+    let result = tonic::transport::Server::builder()
         .add_service(svc)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.notified().await;
+            if let Some(stream_shutdown) = stream_shutdown {
+                stream_shutdown.send_replace(true);
+            }
             tracing::info!("gRPC server shutting down");
         })
-        .await?;
+        .await;
+    result?;
 
     Ok(())
 }

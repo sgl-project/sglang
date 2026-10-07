@@ -106,6 +106,10 @@ class ContextParallelStrategy(ABC):
     def per_layer_attn_cp_comm(self) -> bool:
         return _is_dsa_active()
 
+    def moe_num_token_non_padded(self, forward_batch):
+        """Valid local rows when MoE dispatch consumes this strategy's shard."""
+        return forward_batch.num_token_non_padded
+
     @abstractmethod
     def can_apply(self, num_tokens: int, forward_batch: ForwardBatch) -> bool:
         """Return True if this strategy can shard the current forward."""
@@ -144,6 +148,11 @@ class ContextParallelStrategy(ABC):
         stream: Optional[Any] = None,
     ) -> Any:
         """Gather rank-local KV payloads back to full token order."""
+
+    def local_q_indices(self, num_tokens: int, forward_batch: ForwardBatch) -> Any:
+        raise NotImplementedError(
+            f"{self.name} strategy does not support local q indices"
+        )
 
     def shard_per_request(
         self,

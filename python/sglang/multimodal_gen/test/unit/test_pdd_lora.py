@@ -286,7 +286,7 @@ def test_denoise_loop_calls_arm_pdd_step():
     assert armed == [0, 1]
 
 
-def test_accepts_mxfp8_input_unwraps_lora_wrapper():
+def test_accepts_mxfp8_input_rejects_lora_wrapper():
     from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
         _accepts_mxfp8_input,
     )

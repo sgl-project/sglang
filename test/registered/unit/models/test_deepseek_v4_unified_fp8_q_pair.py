@@ -78,6 +78,7 @@ class _Harness(deepseek_v4.MQALayer):
         self._attn_sink_local = None
         self.alt_streams = None
         self.dsa_enable_prefill_cp = False
+        self.use_fused_wo_a = False
         self.use_npu_arch35_mxfp8_wo_a = False
         self.compressor = object()
         self.wo_a = SimpleNamespace(
@@ -88,7 +89,7 @@ class _Harness(deepseek_v4.MQALayer):
                 dtype=torch.bfloat16,
             )
         )
-        self.wo_b = lambda value: (value, None)
+        self.wo_b = lambda value, skip_all_reduce=False: (value, None)
         self.prepare_kwargs = None
 
     def _forward_prepare(
@@ -115,6 +116,15 @@ class _Harness(deepseek_v4.MQALayer):
         return q_out, k_nope_out
 
 
+_NO_HIP_GLUE = SimpleNamespace(
+    skip_head_pad=lambda attn: False,
+    attention_inv_rope=lambda *args, **kwargs: None,
+    wo_a_emits_fp8_grid=lambda attn: False,
+    wo_b_emits_mxfp8=lambda attn, num_tokens: False,
+    wo_a_fp8_grid_matmul=lambda o, wo_a, fp8_grid, emit_fp8=False: None,
+)
+
+
 def _run(fp8, mode=ForwardMode.DECODE, cp=False, fused_verify=True):
     layer = _Harness()
     layer.dsa_enable_prefill_cp = cp
@@ -136,11 +146,14 @@ def _run(fp8, mode=ForwardMode.DECODE, cp=False, fused_verify=True):
             deepseek_v4, "get_parallel", return_value=SimpleNamespace(tp_size=8)
         ),
         patch.object(deepseek_v4, "get_attn_backend", return_value=backend),
-        patch.object(deepseek_v4, "dsa_use_prefill_cp", return_value=cp),
+        patch.object(deepseek_v4, "is_cp_active", return_value=cp),
         patch.object(deepseek_v4, "fused_rope_inplace", return_value=None),
         patch.object(deepseek_v4, "_FP8_WO_A_GEMM", False),
         patch.object(deepseek_v4, "_is_gfx942_supported", False),
+        patch.object(deepseek_v4, "_is_gfx95_supported", False),
         patch.object(deepseek_v4, "_is_hip", True),
+        # the ROCm model glue is only imported on ROCm; the unified path needs none of it
+        patch.object(deepseek_v4, "_hip", _NO_HIP_GLUE),
         patch.object(deepseek_v4, "_is_npu", False),
     ):
         layer.forward(
