@@ -2454,7 +2454,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     role="assistant",
                     content=text if text else "",
                     tool_calls=tool_calls,
-                    reasoning_content=reasoning_text,
+                    # Only K2 templates replay empty reasoning; other parsers report None.
+                    reasoning_content=(
+                        reasoning_text
+                        if reasoning_text or self.reasoning_parser == "k2_horizon"
+                        else None
+                    ),
                 ),
                 logprobs=choice_logprobs,
                 finish_reason=finish_reason["type"] if finish_reason else None,
