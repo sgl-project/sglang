@@ -14,8 +14,10 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.platforms.aiter import IS_GFX1250
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -244,6 +246,15 @@ class RocmPlatform(Platform):
                     exc_info=True,
                 )
 
+        if IS_GFX1250:
+            count = cls._force_math_sdpa_in_attention(vae)
+            if count > 0:
+                logger.info(
+                    "Pinned %d VAE attention modules to the math SDPA backend "
+                    "(AOTriton faults above head_dim 256 on gfx1250)",
+                    count,
+                )
+
         use_bf16 = envs.SGLANG_USE_ROCM_VAE_CONV2D_BF16
         use_conv2d = envs.SGLANG_USE_ROCM_VAE_CONV2D or use_bf16
         if use_conv2d:
@@ -258,6 +269,39 @@ class RocmPlatform(Platform):
                 )
 
         return vae
+
+    @staticmethod
+    def _force_math_sdpa_in_attention(module: torch.nn.Module) -> int:
+        """Wrap VAE attention forwards so SDPA resolves to the math backend.
+
+        Both AOTriton backends fault for head_dim > 256 on gfx1250 while
+        reporting themselves usable, so torch never falls back on its own. VAE
+        attention is a single head over the channel count, which is above that
+        bound for every VAE here, and math is also the faster path at that
+        shape.
+
+        Matches on structure rather than class so diffusers' Attention and
+        sglang's own blocks are both covered.
+        """
+        count = 0
+        for child in module.modules():
+            if getattr(child, "_sgl_math_sdpa", False):
+                continue
+            has_qkv = hasattr(child, "to_qkv") or all(
+                getattr(child, a, None) is not None for a in ("to_q", "to_k", "to_v")
+            )
+            if not has_qkv:
+                continue
+            original = child.forward
+
+            def wrapped(*args, _orig=original, **kwargs):
+                with sdpa_kernel(SDPBackend.MATH):
+                    return _orig(*args, **kwargs)
+
+            child.forward = wrapped
+            child._sgl_math_sdpa = True
+            count += 1
+        return count
 
     @staticmethod
     def _replace_groupnorm(module: torch.nn.Module, aiter_gn_cls: type) -> int:
