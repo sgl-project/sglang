@@ -37,8 +37,8 @@ def model_json_response(content: Any) -> Any:
     Returning the model itself makes FastAPI run ``jsonable_encoder``: a
     ``model_dump`` followed by a pure-Python walk over the dumped payload, which
     dominates large responses such as top-k logprobs. The JSON values match
-    FastAPI's (aliases applied), except that non-finite floats become null, as
-    in ``dumps_json``, where Starlette would raise.
+    FastAPI's (aliases applied); non-finite floats become null, as in
+    ``dumps_json``.
     """
     if not isinstance(content, BaseModel):
         return content
