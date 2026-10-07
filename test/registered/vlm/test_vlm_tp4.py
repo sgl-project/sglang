@@ -66,7 +66,7 @@ class TestVLMTP4(CustomTestCase):
             max_tokens=2048,
             chat_template_kwargs={"enable_thinking": False},
             base_url=self.base_url,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval(args)
