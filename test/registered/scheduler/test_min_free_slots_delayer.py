@@ -1,6 +1,10 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
@@ -12,6 +16,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -620,6 +625,77 @@ class TestMinFreeSlotsDelayerWithPrefillDelayer(unittest.TestCase):
                     admitted_pass,
                     2 * 8 + self.PREFILL_DELAYER_MAX_DELAY_PASSES,
                 )
+
+
+class _PassedReplacementBatching(Exception):
+    """Raised once a prefill attempt gets past replacement batching."""
+
+
+class TestSchedulerReplacementBatching(unittest.TestCase):
+    """Drive the delayer through the scheduler's prefill entry point."""
+
+    MAX_RUNNING_REQUESTS = 48
+
+    def _scheduler(self):
+        scheduler = object.__new__(Scheduler)
+        scheduler.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+        scheduler.enable_priority_preemption = False
+        scheduler.is_hybrid_swa = False
+        scheduler.chunked_req = None
+        scheduler.waiting_queue = []
+        scheduler.processed_tokens_counter = None
+        scheduler.min_free_slots_delayer = MinFreeSlotsDelayer(
+            min_free_slots=4, scale_with_observed_target=True
+        )
+        scheduler.min_free_slots_delayer.on_prefill_admitted(
+            active_running_bs=0, admitted_bs=8
+        )
+        scheduler.get_num_allocatable_reqs = lambda running_bs, running_batch=None: (
+            self.MAX_RUNNING_REQUESTS - running_bs
+        )
+        # Stop at the first step after replacement batching has let the
+        # attempt through; the rest of admission is not under test.
+        scheduler.policy = MagicMock()
+        scheduler.policy.calc_priority.side_effect = _PassedReplacementBatching
+        return scheduler
+
+    @staticmethod
+    def _running_batch(active_running_bs):
+        return SimpleNamespace(
+            reqs=[SimpleNamespace(finished=lambda: False)] * active_running_bs,
+            batch_is_full=False,
+            is_prefill_only=False,
+        )
+
+    @staticmethod
+    def _is_delayed(scheduler, running_batch):
+        try:
+            batch, _ = scheduler._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=None, running_batch=running_batch
+            )
+        except _PassedReplacementBatching:
+            return False
+        assert batch is None
+        return True
+
+    def test_emptied_queue_gives_a_later_replacement_a_fresh_budget(self):
+        scheduler = self._scheduler()
+        running_batch = self._running_batch(7)
+
+        scheduler.waiting_queue = [object()]
+        for _ in range(8):
+            self.assertTrue(self._is_delayed(scheduler, running_batch))
+        # The deadline expired, but another admission gate rejected the pass.
+        self.assertFalse(self._is_delayed(scheduler, running_batch))
+
+        # The waiting request is cancelled before it is admitted.
+        scheduler.waiting_queue = []
+        self.assertTrue(self._is_delayed(scheduler, running_batch))
+
+        # A later replacement starts a new refill wait instead of inheriting
+        # the expired deadline.
+        scheduler.waiting_queue = [object()]
+        self.assertTrue(self._is_delayed(scheduler, running_batch))
 
 
 if __name__ == "__main__":

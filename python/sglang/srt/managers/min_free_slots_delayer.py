@@ -87,7 +87,7 @@ class MinFreeSlotsDelayer:
         self._target_running_bs = max(self._target_running_bs, active_running_bs)
         waiting_bs = max(0, int(waiting_bs))
         if waiting_bs == 0:
-            self._delay_passes = 0
+            self.on_waiting_queue_empty()
             return False
         refillable_bs = min(max(0, int(num_allocatable_reqs)), waiting_bs)
         if refillable_bs == 0:
@@ -149,6 +149,10 @@ class MinFreeSlotsDelayer:
             return resolve_auto_min_free_slots(self._target_running_bs)
         threshold = min(self._min_free_slots, self._target_running_bs)
         return threshold if threshold > 1 else None
+
+    def on_waiting_queue_empty(self) -> None:
+        """Give the next queued replacement a fresh delay budget."""
+        self._delay_passes = 0
 
     def on_prefill_admitted(self, *, active_running_bs: int, admitted_bs: int) -> None:
         """Record the request target established by an actual prefill batch."""

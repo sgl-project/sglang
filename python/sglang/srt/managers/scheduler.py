@@ -3861,6 +3861,12 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
 
+        if self.min_free_slots_delayer is not None and len(self.waiting_queue) == 0:
+            # The early return below skips should_delay(). Restart the refill
+            # delay budget here so a later replacement does not inherit one
+            # that expired while an earlier request waited.
+            self.min_free_slots_delayer.on_waiting_queue_empty()
+
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
