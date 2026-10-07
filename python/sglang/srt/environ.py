@@ -1589,6 +1589,9 @@ class Envs:
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+    # One compressed-cache dequant per kv_source group in sparse prefill,
+    # instead of one per consumer layer. Escape hatch for A/B and debugging.
+    SGLANG_OPT_DSV4_SPARSE_PREFILL_DEQUANT_DEDUP = EnvBool(True)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.

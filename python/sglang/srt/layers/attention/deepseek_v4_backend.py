@@ -3653,6 +3653,9 @@ class DeepseekV4AttnBackend(
             combined_indices = cache.c0_combined_indices
             combined_lens = cache.c0_combined_lens
             swa_slice = workspace
+            # The c0 SWA gather starts at offset 0 and overwrites the compressed
+            # region a later consumer would otherwise reuse.
+            cache.compressed_dequant_key = None
         else:
             extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
             extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
@@ -3667,13 +3670,31 @@ class DeepseekV4AttnBackend(
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:
-            dequantize_k_cache_paged(
-                extra_k_cache,
-                flat_token_ids,
-                page_size=extra_page_size,
-                out=compressed_slice,
-                layout=token_to_kv_pool.get_extra_key_layout(layer_id),
+            # Consumer layers of one kv_source group gather identical compressed
+            # rows (the source wrote this chunk's rows before its own attention),
+            # so one dequant per (workspace, source cache, gather) serves the
+            # whole group instead of one per layer. Any key change -- a new
+            # source group, a workspace reallocation, or a different gather --
+            # falls back to a fresh dequant.
+            extra_layout = token_to_kv_pool.get_extra_key_layout(layer_id)
+            dequant_key = (
+                workspace.data_ptr(),
+                extra_k_cache.data_ptr(),
+                flat_token_ids.data_ptr(),
+                flat_token_ids.shape[0],
+                extra_layout,
             )
+            if cache.compressed_dequant_key != dequant_key or not (
+                envs.SGLANG_OPT_DSV4_SPARSE_PREFILL_DEQUANT_DEDUP.get()
+            ):
+                dequantize_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                    layout=extra_layout,
+                )
+                cache.compressed_dequant_key = dequant_key
         dequantize_k_cache_paged(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
