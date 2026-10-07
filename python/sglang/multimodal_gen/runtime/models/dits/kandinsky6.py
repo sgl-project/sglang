@@ -10,11 +10,14 @@ NABLA attention is not supported.
 
 import math
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
+from torch.utils.checkpoint import checkpoint
 
 from sglang.kernels.ops.diffusion import apply_matrix_rope, residual_gate_fp32
 from sglang.multimodal_gen.configs.models.dits.kandinsky6 import (
@@ -67,6 +70,28 @@ _KANDINSKY6_BLOCK_CONTAINERS = (
 
 def _is_kandinsky6_transformer_block(name: str, module: object) -> bool:
     return is_module_list_entry_in(name, _KANDINSKY6_BLOCK_CONTAINERS)
+
+
+def _validate_parallelism(num_heads: int, **tp_dimensions: int) -> None:
+    """TP splits heads/FFNs; Ulysses splits video heads remaining after TP."""
+    tp_size = get_tp_world_size()
+    ulysses_size, _ = get_ulysses_ctx()
+    ring_size, _ = get_ring_ctx()
+    for name, size in (("TP", tp_size), ("Ulysses", ulysses_size), ("ring", ring_size)):
+        if size <= 0:
+            raise ValueError(f"Kandinsky6 {name} size must be positive.")
+    for name, value in dict(num_attention_heads=num_heads, **tp_dimensions).items():
+        if value % tp_size:
+            raise ValueError(
+                f"Kandinsky6 {name}={value} must be divisible by TP size {tp_size}."
+            )
+    # ring rotates complete K/V shards, so it imposes no head divisibility constraint
+    local_heads = num_heads // tp_size
+    if local_heads % ulysses_size:
+        raise ValueError(
+            f"Kandinsky6 TP-local video attention heads {local_heads} must be "
+            f"divisible by Ulysses size {ulysses_size} (total heads={num_heads}, TP={tp_size})."
+        )
 
 
 def _build_rotary_freqs(dim: int, max_period: float) -> torch.Tensor:
@@ -146,20 +171,13 @@ class Kandinsky6VisualEmbeddings(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, duration, height, width, dim = x.shape
-        x = (
-            x.view(
-                batch_size,
-                duration // self.patch_size[0],
-                self.patch_size[0],
-                height // self.patch_size[1],
-                self.patch_size[1],
-                width // self.patch_size[2],
-                self.patch_size[2],
-                dim,
-            )
-            .permute(0, 1, 3, 5, 2, 4, 6, 7)
-            .flatten(4, 7)
+        pt, ph, pw = self.patch_size
+        x = rearrange(
+            x,
+            "b (t pt) (h ph) (w pw) c -> b t h w (pt ph pw c)",
+            pt=pt,
+            ph=ph,
+            pw=pw,
         )
         x, _ = self.in_layer(x)
         return x
@@ -321,30 +339,22 @@ class Kandinsky6Attention(nn.Module):
         tp_size = get_tp_world_size()
         self.local_num_heads = divide(self.num_heads, tp_size)
 
-        self.to_query = ColumnParallelLinear(
-            num_channels,
-            num_channels,
-            bias=True,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_query", prefix),
-        )
-        self.to_key = ColumnParallelLinear(
-            kv_dim,
-            num_channels,
-            bias=True,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_key", prefix),
-        )
-        self.to_value = ColumnParallelLinear(
-            kv_dim,
-            num_channels,
-            bias=True,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_value", prefix),
-        )
+        for name, width in (
+            ("to_query", num_channels),
+            ("to_key", kv_dim),
+            ("to_value", kv_dim),
+        ):
+            self.add_module(
+                name,
+                ColumnParallelLinear(
+                    width,
+                    num_channels,
+                    bias=True,
+                    gather_output=False,
+                    quant_config=quant_config,
+                    prefix=add_prefix(name, prefix),
+                ),
+            )
         self.query_norm = Kandinsky6QKNorm(head_dim)
         self.key_norm = Kandinsky6QKNorm(head_dim)
         self.out_layer = RowParallelLinear(
@@ -414,48 +424,20 @@ class Kandinsky6Attention(nn.Module):
             key = gather_seq(key, context_seq_len)
             value = gather_seq(value, context_seq_len)
 
-        try:
-            hidden_states = self.attention(
-                query,
-                key,
-                value,
-                attn_mask_meta=attn_mask_meta,
-                skip_sequence_parallel_override=skip_sequence_parallel,
-            )
-        except AssertionError as exc:
-            # standalone single-rank parity uses SDPA without a pipeline forward context
-            if "Forward context is not set" not in str(exc):
-                raise
-
-            query_shape = query.shape[:-2]
-            key_shape = key.shape[:-2]
-            query = query.reshape(
-                query_shape[0], -1, self.local_num_heads, query.shape[-1]
-            ).transpose(1, 2)
-            key = key.reshape(
-                key_shape[0], -1, self.local_num_heads, key.shape[-1]
-            ).transpose(1, 2)
-            value = value.reshape(
-                key_shape[0], -1, self.local_num_heads, value.shape[-1]
-            ).transpose(1, 2)
-            hidden_states = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=None,
-                is_causal=False,
-            )
-            hidden_states = hidden_states.transpose(1, 2).reshape(
-                *query_shape, self.local_num_heads, -1
-            )
-
+        hidden_states = self.attention(
+            query,
+            key,
+            value,
+            attn_mask_meta=attn_mask_meta,
+            skip_sequence_parallel_override=skip_sequence_parallel,
+        )
         hidden_states = hidden_states.flatten(-2, -1)
         hidden_states, _ = self.out_layer(hidden_states)
         return hidden_states
 
 
-class _Kandinsky6MLP(nn.Module):
-    """Bias-free TP MLP with checkpoint-mapped fc_in/fc_out names.
+class Kandinsky6FeedForward(nn.Module):
+    """Bias-free TP MLP with checkpoint-mapped mlp.fc_in/fc_out names.
 
     The shared MLP currently hardcodes bias=True, so it cannot be used here."""
 
@@ -467,7 +449,9 @@ class _Kandinsky6MLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
-        self.fc_in = ColumnParallelLinear(
+        prefix = add_prefix("mlp", prefix)
+        self.mlp = nn.Module()
+        self.mlp.fc_in = ColumnParallelLinear(
             dim,
             ff_dim,
             bias=False,
@@ -475,8 +459,8 @@ class _Kandinsky6MLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("fc_in", prefix),
         )
-        self.act = get_act_fn("gelu")
-        self.fc_out = RowParallelLinear(
+        self.mlp.act = get_act_fn("gelu")
+        self.mlp.fc_out = RowParallelLinear(
             ff_dim,
             dim,
             bias=False,
@@ -486,27 +470,10 @@ class _Kandinsky6MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, _ = self.fc_in(x)
-        x = self.act(x)
-        x, _ = self.fc_out(x)
+        x, _ = self.mlp.fc_in(x)
+        x = self.mlp.act(x)
+        x, _ = self.mlp.fc_out(x)
         return x
-
-
-class Kandinsky6FeedForward(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        ff_dim: int,
-        prefix: str = "",
-        quant_config: QuantizationConfig | None = None,
-    ):
-        super().__init__()
-        self.mlp = _Kandinsky6MLP(
-            dim, ff_dim, prefix=add_prefix("mlp", prefix), quant_config=quant_config
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(x)
 
 
 def _norm_scale_shift(
@@ -535,7 +502,11 @@ class Kandinsky6OutLayer(nn.Module):
         )
 
     def forward(
-        self, visual_embed: torch.Tensor, time_embed: torch.Tensor
+        self,
+        visual_embed: torch.Tensor,
+        time_embed: torch.Tensor,
+        *,
+        compute_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         shift, scale = torch.chunk(
             self.modulation(time_embed).unsqueeze(dim=1), 2, dim=-1
@@ -543,28 +514,18 @@ class Kandinsky6OutLayer(nn.Module):
         visual_embed = (
             self.norm(visual_embed.float()) * (scale.float()[:, None, None] + 1.0)
             + shift.float()[:, None, None]
-        ).type_as(visual_embed)
+        ).to(dtype=compute_dtype or visual_embed.dtype)
 
         x, _ = self.out_layer(visual_embed)
 
-        batch_size, duration, height, width, _ = x.shape
-        x = (
-            x.view(
-                batch_size,
-                duration,
-                height,
-                width,
-                -1,
-                self.patch_size[0],
-                self.patch_size[1],
-                self.patch_size[2],
-            )
-            .permute(0, 1, 5, 2, 6, 3, 7, 4)
-            .flatten(1, 2)
-            .flatten(2, 3)
-            .flatten(3, 4)
+        pt, ph, pw = self.patch_size
+        return rearrange(
+            x,
+            "b t h w (c pt ph pw) -> b (t pt) (h ph) (w pw) c",
+            pt=pt,
+            ph=ph,
+            pw=pw,
         )
-        return x
 
 
 class Kandinsky6OutLayerAudio(nn.Module):
@@ -591,8 +552,12 @@ class Kandinsky6OutLayerAudio(nn.Module):
         return out
 
 
-class Kandinsky6TransformerEncoderBlock(nn.Module):
-    """Text-only self-attention + feed-forward block (video/audio text towers)."""
+class Kandinsky6TransformerBlock(nn.Module):
+    """Shared parameter layout for text, video and SR transformer blocks."""
+
+    modulation_name = "visual_modulation"
+    with_cross_attention = False
+    skip_sequence_parallel = False
 
     def __init__(
         self,
@@ -605,30 +570,51 @@ class Kandinsky6TransformerEncoderBlock(nn.Module):
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
-        self.text_modulation = Kandinsky6Modulation(time_dim, model_dim, 6)
-
-        self.self_attention_norm = LayerNormScaleShift(
-            model_dim, eps=1e-5, elementwise_affine=False, dtype=torch.float32
+        self.add_module(
+            self.modulation_name,
+            Kandinsky6Modulation(
+                time_dim, model_dim, 9 if self.with_cross_attention else 6
+            ),
         )
-        self.self_attention = Kandinsky6Attention(
-            model_dim,
-            head_dim,
-            supported_attention_backends=supported_attention_backends,
-            prefix=add_prefix("self_attention", prefix),
-            quant_config=quant_config,
-            # text is replicated across SP ranks, so skip Ulysses even for self-attention
-            skip_sequence_parallel=True,
+        attention_names = (
+            ("self_attention", "cross_attention")
+            if self.with_cross_attention
+            else ("self_attention",)
         )
-
-        self.feed_forward_norm = LayerNormScaleShift(
-            model_dim, eps=1e-5, elementwise_affine=False, dtype=torch.float32
-        )
+        for name in (*attention_names, "feed_forward"):
+            self.add_module(
+                f"{name}_norm",
+                LayerNormScaleShift(
+                    model_dim, eps=1e-5, elementwise_affine=False, dtype=torch.float32
+                ),
+            )
+        for name in attention_names:
+            self.add_module(
+                name,
+                Kandinsky6Attention(
+                    model_dim,
+                    head_dim,
+                    supported_attention_backends,
+                    prefix=add_prefix(name, prefix),
+                    quant_config=quant_config,
+                    is_cross_attention=name == "cross_attention",
+                    skip_sequence_parallel=self.skip_sequence_parallel
+                    or name == "cross_attention",
+                ),
+            )
         self.feed_forward = Kandinsky6FeedForward(
             model_dim,
             ff_dim,
             prefix=add_prefix("feed_forward", prefix),
             quant_config=quant_config,
         )
+
+
+class Kandinsky6TransformerEncoderBlock(Kandinsky6TransformerBlock):
+    """Replicated text self-attention and FFN."""
+
+    modulation_name = "text_modulation"
+    skip_sequence_parallel = True
 
     def forward(
         self, x: torch.Tensor, time_embed: torch.Tensor, rope: torch.Tensor
@@ -649,59 +635,10 @@ class Kandinsky6TransformerEncoderBlock(nn.Module):
         return x
 
 
-class Kandinsky6TransformerDecoderBlock(nn.Module):
-    """Self-attention, text cross-attention and FFN.
+class Kandinsky6TransformerDecoderBlock(Kandinsky6TransformerBlock):
+    """Video self-attention, text cross-attention and FFN."""
 
-    The joint decoder invokes these sublayers separately to insert cross-modal attention."""
-
-    def __init__(
-        self,
-        model_dim: int,
-        time_dim: int,
-        ff_dim: int,
-        head_dim: int,
-        supported_attention_backends: set[AttentionBackendEnum] | None = None,
-        prefix: str = "",
-        quant_config: QuantizationConfig | None = None,
-    ):
-        super().__init__()
-        self.visual_modulation = Kandinsky6Modulation(time_dim, model_dim, 9)
-
-        self.self_attention_norm = LayerNormScaleShift(
-            model_dim, eps=1e-5, elementwise_affine=False, dtype=torch.float32
-        )
-        self.self_attention = Kandinsky6Attention(
-            model_dim,
-            head_dim,
-            supported_attention_backends=supported_attention_backends,
-            prefix=add_prefix("self_attention", prefix),
-            quant_config=quant_config,
-            # Video self-attention over the (long) visual token sequence --
-            # the one role this port's sequence parallelism actually shards.
-        )
-
-        self.cross_attention_norm = LayerNormScaleShift(
-            model_dim, eps=1e-5, elementwise_affine=False, dtype=torch.float32
-        )
-        self.cross_attention = Kandinsky6Attention(
-            model_dim,
-            head_dim,
-            supported_attention_backends=supported_attention_backends,
-            prefix=add_prefix("cross_attention", prefix),
-            quant_config=quant_config,
-            # video queries attend to replicated text K/V
-            is_cross_attention=True,
-        )
-
-        self.feed_forward_norm = LayerNormScaleShift(
-            model_dim, eps=1e-5, elementwise_affine=False, dtype=torch.float32
-        )
-        self.feed_forward = Kandinsky6FeedForward(
-            model_dim,
-            ff_dim,
-            prefix=add_prefix("feed_forward", prefix),
-            quant_config=quant_config,
-        )
+    with_cross_attention = True
 
     def forward(
         self,
@@ -747,12 +684,6 @@ class Kandinsky6TransformerDecoderBlock(nn.Module):
         ).type_as(visual_embed)
 
         return visual_embed
-
-
-def _apply_gate_sum(
-    x: torch.Tensor, out: torch.Tensor, gate: torch.Tensor
-) -> torch.Tensor:
-    return residual_gate_fp32(x, out, gate)
 
 
 def _apply_scale_shift(
@@ -856,7 +787,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             self.videoT.visual_modulation(t_v).unsqueeze(dim=1), 3, dim=-1
         )
         shift, scale, gate = torch.chunk(sa_p, 3, dim=-1)
-        vis = _apply_gate_sum(
+        vis = residual_gate_fp32(
             vis,
             self.videoT.self_attention(
                 _norm_scale_shift(self.videoT.self_attention_norm, vis, shift, scale),
@@ -877,7 +808,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             self.audioT.visual_modulation(t_a).unsqueeze(dim=1), 3, dim=-1
         )
         shift, scale, gate = torch.chunk(sa_p, 3, dim=-1)
-        aud = _apply_gate_sum(
+        aud = residual_gate_fp32(
             aud,
             self.audioT.self_attention(
                 _norm_scale_shift(self.audioT.self_attention_norm, aud, shift, scale),
@@ -893,7 +824,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
         aud_out_t = self.audioT.cross_attention(
             aud_pre_ca, encoder_hidden_states=text_a
         )
-        aud = _apply_gate_sum(aud, aud_out_t, gate_a)
+        aud = residual_gate_fp32(aud, aud_out_t, gate_a)
 
         t_va_mod = t_a if not self.fix_modulation else t_v
         t_av_mod = t_v if not self.fix_modulation else t_a
@@ -910,7 +841,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             va_shift, va_scale, va_gate = torch.chunk(va_params, 3, dim=-1)
             av_shift, av_scale, av_gate = torch.chunk(av_params, 3, dim=-1)
 
-        vis = _apply_gate_sum(vis, vis_out_t, gate_v)
+        vis = residual_gate_fp32(vis, vis_out_t, gate_v)
         vis_for_va = _apply_scale_shift(self.va_normalization, vis, va_scale, va_shift)
         aud_for_av = _apply_scale_shift(self.av_normalization, aud, av_scale, av_shift)
         rq_v = vis_rope if self.ca_rope else None
@@ -928,19 +859,19 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             rotary_emb_kv=rq_v,
             context_seq_len=video_seq_len,
         )
-        vis = _apply_gate_sum(
+        vis = residual_gate_fp32(
             vis,
             vis_from_aud,
             (va_gate if not self.cross_gates else av_gate) * va_gate_scale,
         )
-        aud = _apply_gate_sum(
+        aud = residual_gate_fp32(
             aud,
             aud_from_vis,
             (av_gate if not self.cross_gates else va_gate) * av_gate_scale,
         )
 
         shift, scale, gate = torch.chunk(ff_p, 3, dim=-1)
-        vis = _apply_gate_sum(
+        vis = residual_gate_fp32(
             vis,
             self.videoT.feed_forward(
                 _norm_scale_shift(self.videoT.feed_forward_norm, vis, shift, scale)
@@ -948,7 +879,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             gate,
         )
         shift, scale, gate = torch.chunk(ff_p_a, 3, dim=-1)
-        aud = _apply_gate_sum(
+        aud = residual_gate_fp32(
             aud,
             self.audioT.feed_forward(
                 _norm_scale_shift(self.audioT.feed_forward_norm, aud, shift, scale)
@@ -977,42 +908,6 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         AttentionBackendEnum.TORCH_SDPA,
     }
 
-    @staticmethod
-    def _validate_tp_config(
-        *, arch: Kandinsky6ArchConfig, tp_size: int, num_heads: int, num_heads_a: int
-    ) -> None:
-        if tp_size <= 0:
-            raise ValueError("Kandinsky6 TP size must be positive.")
-        for name, value in (
-            ("num_attention_heads (video)", num_heads),
-            ("num_attention_heads_a (audio)", num_heads_a),
-            ("ff_dim", arch.ff_dim),
-            ("ff_dim_a", arch.ff_dim_a),
-        ):
-            if value % tp_size:
-                raise ValueError(
-                    f"Kandinsky6 {name}={value} must be divisible by TP size {tp_size}."
-                )
-
-    @staticmethod
-    def _validate_sequence_parallel_config(
-        *, tp_size: int, num_heads: int, ulysses_size: int, ring_size: int
-    ) -> None:
-        if ulysses_size <= 0:
-            raise ValueError("Kandinsky6 Ulysses size must be positive.")
-        if ring_size <= 0:
-            raise ValueError("Kandinsky6 ring size must be positive.")
-        if ulysses_size == 1 and ring_size == 1:
-            return
-        # only Ulysses splits heads; ring rotates complete K/V shards
-        local_heads = num_heads // tp_size
-        if local_heads % ulysses_size:
-            raise ValueError(
-                f"Kandinsky6 TP-local video attention heads {local_heads} must be "
-                f"divisible by Ulysses size {ulysses_size} (total video heads="
-                f"{num_heads}, TP={tp_size})."
-            )
-
     def __init__(
         self,
         config: Kandinsky6VideoAudioConfig,
@@ -1034,20 +929,11 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         head_dim = sum(arch.axes_dims)
         head_dim_a = sum(arch.axes_dims_a)
 
-        tp_size = get_tp_world_size()
-        ulysses_size, _ = get_ulysses_ctx()
-        ring_size, _ = get_ring_ctx()
-        self._validate_tp_config(
-            arch=arch,
-            tp_size=tp_size,
-            num_heads=arch.model_dim // head_dim,
-            num_heads_a=arch.model_dim_a // head_dim_a,
-        )
-        self._validate_sequence_parallel_config(
-            tp_size=tp_size,
-            num_heads=arch.model_dim // head_dim,
-            ulysses_size=ulysses_size,
-            ring_size=ring_size,
+        _validate_parallelism(
+            arch.model_dim // head_dim,
+            num_attention_heads_a=arch.model_dim_a // head_dim_a,
+            ff_dim=arch.ff_dim,
+            ff_dim_a=arch.ff_dim_a,
         )
         self.in_visual_dim = arch.in_visual_dim
         self.in_audio_dim = arch.in_audio_dim
@@ -1079,46 +965,10 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         )
 
         if not self.is_multimodal:
-            self.time_embeddings = Kandinsky6TimeEmbeddings(
-                arch.model_dim, arch.time_dim
+            self._build_text_tower(
+                "", arch.model_dim, arch.time_dim, arch.ff_dim, head_dim
             )
-            self.text_embeddings = Kandinsky6TextEmbeddings(
-                arch.in_text_dim, arch.model_dim
-            )
-            self.pooled_text_embeddings = Kandinsky6TextEmbeddings(
-                arch.in_text_dim2, arch.time_dim
-            )
-            self.text_rope_embeddings = Kandinsky6RoPE1D(head_dim)
-            self.text_transformer_blocks = nn.ModuleList(
-                [
-                    Kandinsky6TransformerEncoderBlock(
-                        arch.model_dim,
-                        arch.time_dim,
-                        arch.ff_dim,
-                        head_dim,
-                        self._supported_attention_backends,
-                        prefix=add_prefix(f"text_transformer_blocks.{i}", self.prefix),
-                        quant_config=quant_config,
-                    )
-                    for i in range(arch.num_text_blocks)
-                ]
-            )
-            self.visual_transformer_blocks = nn.ModuleList(
-                [
-                    Kandinsky6TransformerDecoderBlock(
-                        arch.model_dim,
-                        arch.time_dim,
-                        arch.ff_dim,
-                        head_dim,
-                        self._supported_attention_backends,
-                        prefix=add_prefix(
-                            f"visual_transformer_blocks.{i}", self.prefix
-                        ),
-                        quant_config=quant_config,
-                    )
-                    for i in range(arch.num_visual_blocks)
-                ]
-            )
+            block_cls = Kandinsky6TransformerDecoderBlock
         else:
             self.audio_embeddings = Kandinsky6TextEmbeddings(
                 arch.in_audio_dim, arch.model_dim_a
@@ -1132,81 +982,35 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 arch.out_audio_dim or arch.in_audio_dim,
             )
 
-            for (
-                tower_prefix,
-                tower_model_dim,
-                tower_time_dim,
-                tower_head_dim,
-                tower_ff_dim,
-            ) in (
-                ("video", arch.model_dim, arch.time_dim, head_dim, arch.ff_dim),
-                ("audio", arch.model_dim_a, arch.time_dim_a, head_dim_a, arch.ff_dim_a),
-            ):
-                setattr(
-                    self,
-                    f"{tower_prefix}_time_embeddings",
-                    Kandinsky6TimeEmbeddings(tower_model_dim, tower_time_dim),
-                )
-                setattr(
-                    self,
-                    f"{tower_prefix}_text_embeddings",
-                    Kandinsky6TextEmbeddings(arch.in_text_dim, tower_model_dim),
-                )
-                setattr(
-                    self,
-                    f"{tower_prefix}_pooled_text_embeddings",
-                    Kandinsky6TextEmbeddings(arch.in_text_dim2, tower_time_dim),
-                )
-                setattr(
-                    self,
-                    f"{tower_prefix}_text_rope_embeddings",
-                    Kandinsky6RoPE1D(tower_head_dim),
-                )
-                setattr(
-                    self,
-                    f"{tower_prefix}_text_transformer_blocks",
-                    nn.ModuleList(
-                        [
-                            Kandinsky6TransformerEncoderBlock(
-                                tower_model_dim,
-                                tower_time_dim,
-                                tower_ff_dim,
-                                tower_head_dim,
-                                self._supported_attention_backends,
-                                prefix=add_prefix(
-                                    f"{tower_prefix}_text_transformer_blocks.{i}",
-                                    self.prefix,
-                                ),
-                                quant_config=quant_config,
-                            )
-                            for i in range(arch.num_text_blocks)
-                        ]
-                    ),
-                )
-
-            self.visual_transformer_blocks = nn.ModuleList(
-                [
-                    Kandinsky6FusedTransformerDecoderBlock(
-                        arch.model_dim,
-                        arch.time_dim,
-                        arch.ff_dim,
-                        head_dim,
-                        arch.model_dim_a,
-                        arch.time_dim_a,
-                        arch.ff_dim_a,
-                        head_dim_a,
-                        self._supported_attention_backends,
-                        prefix=add_prefix(
-                            f"visual_transformer_blocks.{i}", self.prefix
-                        ),
-                        ca_rope=arch.ca_rope,
-                        cross_gates=arch.cross_gates,
-                        fix_modulation=arch.fix_modulation,
-                        quant_config=quant_config,
-                    )
-                    for i in range(arch.num_visual_blocks)
-                ]
+            self._build_text_tower(
+                "video_", arch.model_dim, arch.time_dim, arch.ff_dim, head_dim
             )
+            self._build_text_tower(
+                "audio_", arch.model_dim_a, arch.time_dim_a, arch.ff_dim_a, head_dim_a
+            )
+
+            block_cls = partial(
+                Kandinsky6FusedTransformerDecoderBlock,
+                model_dim_a=arch.model_dim_a,
+                time_dim_a=arch.time_dim_a,
+                ff_dim_a=arch.ff_dim_a,
+                head_dim_a=head_dim_a,
+                ca_rope=arch.ca_rope,
+                cross_gates=arch.cross_gates,
+                fix_modulation=arch.fix_modulation,
+            )
+        self.visual_transformer_blocks = nn.ModuleList(
+            block_cls(
+                arch.model_dim,
+                arch.time_dim,
+                arch.ff_dim,
+                head_dim,
+                supported_attention_backends=self._supported_attention_backends,
+                prefix=add_prefix(f"visual_transformer_blocks.{i}", self.prefix),
+                quant_config=quant_config,
+            )
+            for i in range(arch.num_visual_blocks)
+        )
 
         self.gradient_checkpointing = False
         self.hidden_size = arch.hidden_size
@@ -1218,6 +1022,38 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             else ["text_transformer_blocks"]
         ) + ["visual_transformer_blocks"]
         self.__post_init__()
+
+    def _build_text_tower(self, prefix, model_dim, time_dim, ff_dim, head_dim):
+        arch = self.config
+        self.add_module(
+            f"{prefix}time_embeddings", Kandinsky6TimeEmbeddings(model_dim, time_dim)
+        )
+        self.add_module(
+            f"{prefix}text_embeddings",
+            Kandinsky6TextEmbeddings(arch.in_text_dim, model_dim),
+        )
+        self.add_module(
+            f"{prefix}pooled_text_embeddings",
+            Kandinsky6TextEmbeddings(arch.in_text_dim2, time_dim),
+        )
+        self.add_module(f"{prefix}text_rope_embeddings", Kandinsky6RoPE1D(head_dim))
+        self.add_module(
+            f"{prefix}text_transformer_blocks",
+            nn.ModuleList(
+                Kandinsky6TransformerEncoderBlock(
+                    model_dim,
+                    time_dim,
+                    ff_dim,
+                    head_dim,
+                    self._supported_attention_backends,
+                    prefix=add_prefix(
+                        f"{prefix}text_transformer_blocks.{i}", self.prefix
+                    ),
+                    quant_config=self.quant_config,
+                )
+                for i in range(arch.num_text_blocks)
+            ),
+        )
 
     def _encode_text(
         self,
@@ -1237,11 +1073,8 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         text_rope = rope_embeddings(text_rope_pos).unsqueeze(dim=0)
         for block in blocks:
             if torch.is_grad_enabled() and self.gradient_checkpointing:
-                te = torch.utils.checkpoint.checkpoint(
-                    block, te, tm, text_rope, use_reentrant=False
-                )
-            else:
-                te = block(te, tm, text_rope)
+                block = partial(checkpoint, block, use_reentrant=False)
+            te = block(te, tm, text_rope)
         return te, tm
 
     def forward(
@@ -1332,51 +1165,27 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             audio_rope = self.audio_rope_embeddings(audio_rope_pos).unsqueeze(dim=0)
             for block in self.visual_transformer_blocks:
                 if torch.is_grad_enabled() and self.gradient_checkpointing:
-                    visual_embed, audio_embed = torch.utils.checkpoint.checkpoint(
-                        block,
-                        visual_embed,
-                        audio_embed,
-                        video_te,
-                        audio_te,
-                        (video_tm, audio_tm),
-                        visual_rope,
-                        audio_rope,
-                        va_gate_scale,
-                        av_gate_scale,
-                        video_seq_len=shard.orig_len,
-                        video_attn_meta=attn_meta,
-                        use_reentrant=False,
-                    )
-                else:
-                    visual_embed, audio_embed = block(
-                        visual_embed,
-                        audio_embed,
-                        video_te,
-                        audio_te,
-                        (video_tm, audio_tm),
-                        visual_rope,
-                        audio_rope,
-                        va_gate_scale,
-                        av_gate_scale,
-                        video_seq_len=shard.orig_len,
-                        video_attn_meta=attn_meta,
-                    )
+                    block = partial(checkpoint, block, use_reentrant=False)
+                visual_embed, audio_embed = block(
+                    visual_embed,
+                    audio_embed,
+                    video_te,
+                    audio_te,
+                    (video_tm, audio_tm),
+                    visual_rope,
+                    audio_rope,
+                    va_gate_scale,
+                    av_gate_scale,
+                    video_seq_len=shard.orig_len,
+                    video_attn_meta=attn_meta,
+                )
         else:
             for block in self.visual_transformer_blocks:
                 if torch.is_grad_enabled() and self.gradient_checkpointing:
-                    visual_embed = torch.utils.checkpoint.checkpoint(
-                        block,
-                        visual_embed,
-                        video_te,
-                        video_tm,
-                        visual_rope,
-                        attn_mask_meta=attn_meta,
-                        use_reentrant=False,
-                    )
-                else:
-                    visual_embed = block(
-                        visual_embed, video_te, video_tm, visual_rope, attn_meta
-                    )
+                    block = partial(checkpoint, block, use_reentrant=False)
+                visual_embed = block(
+                    visual_embed, video_te, video_tm, visual_rope, attn_meta
+                )
 
         visual_embed = gather_seq(visual_embed, shard.orig_len).reshape(
             *visual_shape, -1
