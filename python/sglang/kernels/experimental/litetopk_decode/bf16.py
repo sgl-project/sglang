@@ -89,7 +89,7 @@ class Bf16Dsv41DecodeStorage:
 
 
 class Bf16Dsv41DecodePlan:
-    """A fixed row count, with the same scores/select split as Dsv41DecodePlan.
+    """A fixed row count; ``scores`` fills the histogram that ``select`` consumes.
 
     Q, KV, BF16 weights and scheduler metadata use the paged MQA layouts.
     ``indices`` identifies requests shared by DSpark rows and must match the

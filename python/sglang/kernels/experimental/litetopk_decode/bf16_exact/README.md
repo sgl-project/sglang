@@ -35,7 +35,7 @@ scores, slots = plan(q=q, kv_cache=kv_cache, weights=weights, context_lens=conte
 
 The buffers take about 72 KB per row: the 4 KiB histogram, 16 bytes of hand-off state, 8 * `candidate_capacity`
 bytes of candidates (64 KiB by default) and a 2 KiB output. Each call leaves every row's histogram and candidates at
-zero and its hand-off state balanced, so the plans of a `Dsv41DecodeStorage` share its memory whatever their row
+zero and its hand-off state balanced, so the plans of a `Bf16Dsv41DecodeStorage` share its memory whatever their row
 counts: a plan takes the storage's last `rows` hand-off states and first `rows` candidate lists.
 
 It requires the paired sgl-gemm APIs `get_paged_mqa_logits_bf16_metadata` and
