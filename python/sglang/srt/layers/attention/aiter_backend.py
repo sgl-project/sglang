@@ -137,8 +137,6 @@ def _asm_cprr_kernel_heads(gathered_heads: int, q_len: int) -> int:
     return 0
 
 
-_CPRR_EMPTY_LSE = -1e30
-
 # (v_head_dim -> query head counts) that aiter's mla_reduce_v1 has an
 # instantiation. This map is copied from MLA_REDUCE_ROUTER in
 # aiter/csrc/kernels/mla/reduce.cu. See https://github.com/ROCm/aiter/blob/7915f53a4225b3f9cb632a97a23369dbebcf1be0/csrc/kernels/mla/reduce.cu#L923
@@ -221,7 +219,7 @@ class ForwardMetadata:
     prefill_ps_metadata: Optional[MlaPrefillPsMetadata] = None
     chunked_skip_prefix_ps_metadata: Optional[MlaPrefillPsMetadata] = None
     chunked_prefix_ps_metadatas: Optional[list[Optional[MlaPrefillPsMetadata]]] = None
-
+    # cprr
     global_kv_indptr: Optional[torch.Tensor] = None
     use_asm_cprr_verify: bool = False
     cprr_kernel_heads: int = 0
@@ -1787,7 +1785,7 @@ class AiterAttnBackend(AttentionBackend):
             out_a, lse_a = self._forward_verify_asm_cprr(q, layer, k_descale, n_rows)
             empty = fm.cprr_empty_rows
             out_a.masked_fill_(empty[:, None, None], 0.0)
-            lse_a.masked_fill_(empty[:, None], _CPRR_EMPTY_LSE)
+            lse_a.masked_fill_(empty[:, None], -1e30)
             return out_a, lse_a
 
         out_a, lse_a = mla_gluon_decode(
@@ -2008,7 +2006,7 @@ class AiterAttnBackend(AttentionBackend):
         local_kv_lens = None
         verify_token_table = None
         global_kv_indptr = None
-        cprr_ok = False
+        use_asm_cprr_verify = False
         cprr_kv_indices = cprr_kv_indptr = cprr_empty_rows = None
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or forward_batch.forward_mode.is_idle():
@@ -2246,8 +2244,8 @@ class AiterAttnBackend(AttentionBackend):
             if self.use_mla:
                 draft_num = spec_info.draft_token_num
                 device = forward_batch.seq_lens.device
-                cprr_ok = self._asm_cprr_supports_verify_shape(draft_num)
-                if self.dcp_world_size > 1 and not cprr_ok:
+                use_asm_cprr_verify = self._asm_cprr_supports_verify_shape(draft_num)
+                if self.dcp_world_size > 1 and not use_asm_cprr_verify:
                     kv_lens = forward_batch.seq_lens.to(torch.int32).clone()
                     kv_lens_sum = forward_batch.seq_lens_sum
                 else:
@@ -2298,11 +2296,11 @@ class AiterAttnBackend(AttentionBackend):
                         bs,
                         draft_num,
                         self._dcp_max_local_kv_len(
-                            max_kv_len + (draft_num if cprr_ok else 0)
+                            max_kv_len + (draft_num if use_asm_cprr_verify else 0)
                         ),
                     )
 
-                if cprr_ok:
+                if use_asm_cprr_verify:
                     (
                         cprr_kv_indices,
                         cprr_kv_indptr,
@@ -2310,10 +2308,14 @@ class AiterAttnBackend(AttentionBackend):
                     ) = self._build_dcp_verify_ragged_indices(
                         verify_token_table, local_kv_lens, bs, draft_num
                     )
-                if _use_mla_ps_kernel and (self.dcp_world_size <= 1 or cprr_ok):
+                if _use_mla_ps_kernel and (
+                    self.dcp_world_size <= 1 or use_asm_cprr_verify
+                ):
                     max_seqlen_qo = draft_num
                     is_cp_round_robin = self.dcp_world_size > 1
-                    metadata_heads = self.cprr_kernel_heads if cprr_ok else None
+                    metadata_heads = (
+                        self.cprr_kernel_heads if use_asm_cprr_verify else None
+                    )
                     (
                         work_metadata,
                         work_indptr,
@@ -2324,13 +2326,15 @@ class AiterAttnBackend(AttentionBackend):
                     ) = self.make_mla_decode_meta_data_buffer(
                         max_seqlen_qo,
                         bs,
-                        metadata_fast_mode=(self.cprr_fast_mode if cprr_ok else None),
+                        metadata_fast_mode=(
+                            self.cprr_fast_mode if use_asm_cprr_verify else None
+                        ),
                         metadata_intra_batch_mode=(
-                            self.cprr_intra_batch_mode if cprr_ok else None
+                            self.cprr_intra_batch_mode if use_asm_cprr_verify else None
                         ),
                         nhead_override=metadata_heads,
                         max_split_per_batch=(
-                            self.max_split_per_batch if cprr_ok else None
+                            self.max_split_per_batch if use_asm_cprr_verify else None
                         ),
                     )
 
@@ -2338,7 +2342,7 @@ class AiterAttnBackend(AttentionBackend):
 
                     self.make_mla_meta_data(
                         qo_indptr,
-                        cprr_kv_indptr if cprr_ok else kv_indptr,
+                        cprr_kv_indptr if use_asm_cprr_verify else kv_indptr,
                         self.kv_last_page_len[:bs],
                         work_metadata,
                         work_info_set,
@@ -2347,10 +2351,14 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_final_map,
                         reduce_partial_map,
                         max_seqlen_qo,
-                        fast_mode=(self.cprr_fast_mode if cprr_ok else fast_mode),
+                        fast_mode=(
+                            self.cprr_fast_mode if use_asm_cprr_verify else fast_mode
+                        ),
                         max_split_per_batch=num_kv_splits,
                         intra_batch_mode=(
-                            self.cprr_intra_batch_mode if cprr_ok else intra_batch_mode
+                            self.cprr_intra_batch_mode
+                            if use_asm_cprr_verify
+                            else intra_batch_mode
                         ),
                         is_cp_round_robin=is_cp_round_robin,
                         nhead_override=metadata_heads,
@@ -2375,8 +2383,10 @@ class AiterAttnBackend(AttentionBackend):
                     local_kv_lens=local_kv_lens,
                     verify_token_table=verify_token_table,
                     global_kv_indptr=global_kv_indptr,
-                    use_asm_cprr_verify=cprr_ok,
-                    cprr_kernel_heads=self.cprr_kernel_heads if cprr_ok else 0,
+                    use_asm_cprr_verify=use_asm_cprr_verify,
+                    cprr_kernel_heads=self.cprr_kernel_heads
+                    if use_asm_cprr_verify
+                    else 0,
                     cprr_kv_indices=cprr_kv_indices,
                     cprr_kv_indptr=cprr_kv_indptr,
                     cprr_empty_rows=cprr_empty_rows,
@@ -2795,7 +2805,9 @@ class AiterAttnBackend(AttentionBackend):
                 (True, False) if self.use_mla_dcp_asm else (fast_mode, intra_batch_mode)
             )
 
-            graph_cprr_ok = self._asm_cprr_supports_verify_shape(self.num_draft_tokens)
+            graph_use_asm_cprr_verify = self._asm_cprr_supports_verify_shape(
+                self.num_draft_tokens
+            )
             (
                 self.work_metadata,
                 self.work_indptr,
@@ -2807,31 +2819,35 @@ class AiterAttnBackend(AttentionBackend):
                 max_seqlen_qo,
                 max_bs,
                 metadata_fast_mode=(
-                    self.cprr_fast_mode if graph_cprr_ok else metadata_fast_mode
+                    self.cprr_fast_mode
+                    if graph_use_asm_cprr_verify
+                    else metadata_fast_mode
                 ),
                 metadata_intra_batch_mode=(
                     self.cprr_intra_batch_mode
-                    if graph_cprr_ok
+                    if graph_use_asm_cprr_verify
                     else metadata_intra_batch_mode
                 ),
-                nhead_override=(self.cprr_kernel_heads if graph_cprr_ok else None),
+                nhead_override=(
+                    self.cprr_kernel_heads if graph_use_asm_cprr_verify else None
+                ),
                 max_split_per_batch=(
-                    self.max_split_per_batch if graph_cprr_ok else None
+                    self.max_split_per_batch if graph_use_asm_cprr_verify else None
                 ),
             )
             logger.info(
-                "aiter DCP cp verify graph buffers: cprr_ok=%s num_draft_tokens=%s "
+                "aiter DCP cp verify graph buffers: use_asm_cprr_verify=%s num_draft_tokens=%s "
                 "max_seqlen_qo=%d max_bs=%d nhead=%s intra=%s split_cap=%s "
                 "reduce_partial_map=%d",
-                graph_cprr_ok,
+                graph_use_asm_cprr_verify,
                 self.num_draft_tokens,
                 max_seqlen_qo,
                 max_bs,
-                self.cprr_kernel_heads if graph_cprr_ok else None,
+                self.cprr_kernel_heads if graph_use_asm_cprr_verify else None,
                 self.cprr_intra_batch_mode
-                if graph_cprr_ok
+                if graph_use_asm_cprr_verify
                 else metadata_intra_batch_mode,
-                self.max_split_per_batch if graph_cprr_ok else None,
+                self.max_split_per_batch if graph_use_asm_cprr_verify else None,
                 self.reduce_partial_map.numel(),
             )
 
@@ -2888,7 +2904,7 @@ class AiterAttnBackend(AttentionBackend):
         verify_token_table = None
         global_kv_indptr = None
         cprr_kv_indices = cprr_kv_indptr = cprr_empty_rows = None
-        cprr_ok = False
+        use_asm_cprr_verify = False
 
         swa_page_table = None
         max_kv_len = (
@@ -3061,10 +3077,12 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
             if self.use_mla:
-                cprr_ok = self._asm_cprr_supports_verify_shape(self.num_draft_tokens)
+                use_asm_cprr_verify = self._asm_cprr_supports_verify_shape(
+                    self.num_draft_tokens
+                )
                 kv_lens = (
                     seq_lens
-                    if (self.dcp_world_size > 1 and not cprr_ok)
+                    if (self.dcp_world_size > 1 and not use_asm_cprr_verify)
                     else seq_lens + self.num_draft_tokens
                 )
             else:
@@ -3123,7 +3141,7 @@ class AiterAttnBackend(AttentionBackend):
                     out=self.cuda_graph_verify_token_table[:n_rows],
                     out_lens=self.cuda_graph_verify_local_kv_lens[:n_rows],
                 )
-                if cprr_ok:
+                if use_asm_cprr_verify:
                     (
                         cprr_kv_indices,
                         cprr_kv_indptr,
@@ -3140,13 +3158,15 @@ class AiterAttnBackend(AttentionBackend):
 
             if self.use_mla:
                 max_q_len = self.num_draft_tokens
-                if _use_mla_ps_kernel and (self.dcp_world_size <= 1 or cprr_ok):
+                if _use_mla_ps_kernel and (
+                    self.dcp_world_size <= 1 or use_asm_cprr_verify
+                ):
                     num_kv_splits = self.max_split_per_batch
                     is_cp_round_robin = self.dcp_world_size > 1
 
                     self.make_mla_meta_data(
                         qo_indptr,
-                        cprr_kv_indptr if cprr_ok else kv_indptr,
+                        cprr_kv_indptr if use_asm_cprr_verify else kv_indptr,
                         kv_last_page_len,
                         self.work_metadata,
                         self.work_info_set,
@@ -3155,13 +3175,19 @@ class AiterAttnBackend(AttentionBackend):
                         self.reduce_final_map,
                         self.reduce_partial_map,
                         max_q_len,
-                        fast_mode=(self.cprr_fast_mode if cprr_ok else fast_mode),
+                        fast_mode=(
+                            self.cprr_fast_mode if use_asm_cprr_verify else fast_mode
+                        ),
                         max_split_per_batch=num_kv_splits,
                         intra_batch_mode=(
-                            self.cprr_intra_batch_mode if cprr_ok else intra_batch_mode
+                            self.cprr_intra_batch_mode
+                            if use_asm_cprr_verify
+                            else intra_batch_mode
                         ),
                         is_cp_round_robin=is_cp_round_robin,
-                        nhead_override=(self.cprr_kernel_heads if cprr_ok else None),
+                        nhead_override=(
+                            self.cprr_kernel_heads if use_asm_cprr_verify else None
+                        ),
                     )
 
                     work_metadata = self.work_metadata
@@ -3189,8 +3215,10 @@ class AiterAttnBackend(AttentionBackend):
                     local_kv_lens=local_kv_lens,
                     verify_token_table=verify_token_table,
                     global_kv_indptr=global_kv_indptr,
-                    use_asm_cprr_verify=cprr_ok,
-                    cprr_kernel_heads=self.cprr_kernel_heads if cprr_ok else 0,
+                    use_asm_cprr_verify=use_asm_cprr_verify,
+                    cprr_kernel_heads=self.cprr_kernel_heads
+                    if use_asm_cprr_verify
+                    else 0,
                     cprr_kv_indices=cprr_kv_indices,
                     cprr_kv_indptr=cprr_kv_indptr,
                     cprr_empty_rows=cprr_empty_rows,
