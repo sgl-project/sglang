@@ -901,7 +901,8 @@ class ChatCompletionRequest(BaseModel):
     # choices[].logprobs top_logprobs lists are then left empty. Requires
     # return_meta_info.
     return_flat_raw_output_top_logprobs: bool = False
-    return_flat_raw_top_logprobs_b64: bool = False
+    # Base64 by default for those arrays; false returns plain JSON lists.
+    return_flat_raw_top_logprobs_b64: bool = True
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "

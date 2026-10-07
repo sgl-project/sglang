@@ -1259,7 +1259,11 @@ class OpenAIServingChat(OpenAIServingBase):
             stream=request.stream,
             return_text_in_logprobs=True,
             return_flat_raw_output_top_logprobs=request.return_flat_raw_output_top_logprobs,
-            return_flat_raw_top_logprobs_b64=request.return_flat_raw_top_logprobs_b64,
+            # GenerateReqInput rejects b64 without a flat flag; chat has only the output one
+            return_flat_raw_top_logprobs_b64=(
+                request.return_flat_raw_output_top_logprobs
+                and request.return_flat_raw_top_logprobs_b64
+            ),
             modalities=processed_messages.modalities,
             lora_path=lora_path,
             bootstrap_host=request.bootstrap_host,
