@@ -352,6 +352,11 @@ class RadixCache(BasePrefixCache):
         )
         self.kv_events.record_all_cleared()
 
+    def get_match_key_raw_token_limit(self, max_reusable_kv_rows: int) -> int:
+        # Exact-type opt-in: subclasses may change matching/resource contracts
+        # and must not inherit permission to read an extra proof token.
+        return max_reusable_kv_rows + int(type(self) is RadixCache and self.is_eagle)
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
 

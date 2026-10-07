@@ -1651,6 +1651,18 @@ class Req(ReqDllmMixin):
             if reprefill_tail:
                 capped = max(0, input_len - reprefill_tail)
                 key_limit = capped if key_limit is None else min(key_limit, capped)
+            if (
+                key_limit is not None
+                and self.session is None
+                and get_disagg().disaggregation_mode == DisaggregationMode.NULL.value
+                and not get_spec().enable_multi_layer_eagle
+            ):
+                # Execution caps count KV rows; bigram matching additionally
+                # reads the final row's successor without reusing that token.
+                # Multi-layer draft dependencies need a separate proof contract.
+                key_limit = tree_cache.get_match_key_raw_token_limit(
+                    max_reusable_kv_rows=key_limit
+                )
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(

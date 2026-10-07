@@ -599,6 +599,18 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
 
+    def get_match_key_raw_token_limit(self, max_reusable_kv_rows: int) -> int:
+        # Exact types keep subclasses and replacement components on their own
+        # contracts; only the built-in FULL path opts into successor proof.
+        use_bigram_proof_limit = (
+            type(self) is UnifiedRadixCache
+            and self.tree_core.is_eagle
+            and self.tree_components == (ComponentType.FULL,)
+            and type(self.components[ComponentType.FULL]) is FullComponent
+            and not self.tree_core.enable_hicache
+        )
+        return max_reusable_kv_rows + int(use_bigram_proof_limit)
+
     def supports_prefix_sharing(self) -> bool:
         return not self.disable
 

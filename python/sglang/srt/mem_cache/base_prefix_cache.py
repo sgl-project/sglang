@@ -435,6 +435,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         pass
 
+    def get_match_key_raw_token_limit(self, max_reusable_kv_rows: int) -> int:
+        """Convert a reusable-KV-row cap to ``RadixKey.limit`` (raw tokens).
+
+        Supported bigram caches read one extra successor: E rows require E+1
+        raw tokens. That token proves the final row; it is not reused as KV.
+        The default preserves the existing limit for other cache contracts.
+        """
+        return max_reusable_kv_rows
+
     def supports_fast_match_prefix(self) -> bool:
         return False
 
