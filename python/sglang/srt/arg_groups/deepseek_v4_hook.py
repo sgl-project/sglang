@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
 from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
@@ -212,9 +213,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+    if (
+        cfg.dsv4_attn_backend == "trtllm"
+        and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 TRT-LLM requires --cuda-graph-backend-prefill disabled"
+        )
     if cfg.enable_encoder_swa_bounded_replay:
-        from sglang.srt.model_executor.cuda_graph_config import Backend
-
         incompatible = (
             (
                 "hardware other than CUDA or gfx950",
@@ -259,8 +265,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ),
         ("HiSparse", cfg.enable_hisparse),
         ("the unified KV layout", is_unified_kv_triton()),
-        # The trtllm-gen path has no uniform-FP8 pool for V4.1's ratio-1/2 layers.
-        ("the trtllm DSv4 attention backend", cfg.dsv4_attn_backend == "trtllm"),
+        (
+            "TRT-LLM with SWA bounded replay",
+            cfg.dsv4_attn_backend == "trtllm"
+            and (
+                cfg.enable_encoder_swa_bounded_replay
+                or cfg.enable_decoder_swa_bounded_replay
+            ),
+        ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
         ("pipeline parallelism", cfg.pp_size > 1),
     )
@@ -291,8 +303,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "block size and TP size."
             )
 
-    from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-
     prefill_graph = cfg.cuda_graph_config.prefill
     if prefill_graph.backend != Backend.DISABLED and prefill_graph.max_seq_len is None:
         # The captured low-ratio indexer scores a static context width; 16k
@@ -310,8 +320,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
 
     if cfg.enable_decoder_swa_bounded_replay:
-        from sglang.srt.model_executor.cuda_graph_config import Backend
-
         # Late layers see a per-request tail slice, not the captured prefill shape.
         incompatible = (
             (

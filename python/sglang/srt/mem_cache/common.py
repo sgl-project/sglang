@@ -23,12 +23,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-# Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
-MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
-# Lazy mode: 1 + 1 slots (1 ping-pong + 1 running), second ping-pong allocated on demand at boundary.
-MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
-MAMBA_STATE_PER_REQ_NO_CACHE = 1
-
 logger = logging.getLogger(__name__)
 
 
@@ -176,6 +170,10 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
     if req.skip_radix_cache_insert:
+        # Kept out of the tree; the next extend still resumes from prefix_indices.
+        req.prefix_indices = tree_cache.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, : req.extend_range.end
+        ].to(dtype=torch.int64, copy=True)
         return
 
     tree_cache.checkpoint(req, up_to=req.extend_range.end)
@@ -328,7 +326,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         tree_cache.checkpoint(req, up_to=owned_kv_len)
     # The protected prefix is not this req's to free.
     tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
-    tree_cache.unpin(req)
+    tree_cache.unlock(req.lock)
+    req.lock = None
     _release_overallocated_kv_indices(
         req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
     )

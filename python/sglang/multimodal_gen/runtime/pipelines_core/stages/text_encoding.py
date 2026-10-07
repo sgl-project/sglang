@@ -12,7 +12,13 @@ import inspect
 import torch
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
-from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
+from sglang.multimodal_gen.configs.pipeline_configs.base import (
+    PipelineConfig,
+    TextConditioningOutput,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.kandinsky6 import (
+    Kandinsky6TI2VAPipelineConfig,
+)
 from sglang.multimodal_gen.runtime.cache.conditioning import (
     cached_encoder_call,
     prefer_conditioning_cache,
@@ -104,6 +110,26 @@ def _data_parallel_text_encode(forward_fn, forward_kwargs: dict, group):
         attentions=_gather_seq(local_out.attentions),
         attention_mask=_gather(local_out.attention_mask),
     )
+
+
+def _text_encoder_max_length_is_fixed(
+    pipeline_config: PipelineConfig, encoder_index: int
+) -> bool:
+    """True when ``encoder_index``'s tokenizer ``max_length`` is
+    architecturally fixed and must never be overridden by a request's
+    ``max_sequence_length``.
+
+    Flux v1's encoder 0 and Kandinsky6 TI2VA's encoder 1 are both CLIP with
+    a fixed 77-token pooled-embedding context; overriding it corrupts CLIP
+    tokenization. Every other encoder (Flux v1's encoder 1 T5, Kandinsky6's
+    encoder 0 Reason1/Qwen, and every other pipeline's encoders) is meant to
+    take the request's override, so this returns False for them.
+    """
+    if pipeline_config.is_flux_v1():
+        return encoder_index == 0
+    if isinstance(pipeline_config, Kandinsky6TI2VAPipelineConfig):
+        return encoder_index == 1
+    return False
 
 
 def stack_tensors(name: str, tensors: list[torch.Tensor]) -> torch.Tensor:
@@ -593,10 +619,12 @@ class TextEncodingStage(ConditionEncodingStage):
                 encoder_config.tokenizer_kwargs,
                 **text_encoder_extra_arg,
             )
-            # Pass max_length to tokenizer if specified in the request. Flux v1 encoder 0
-            # is CLIP with a fixed 77-token context; overriding breaks tokenization.
-            is_flux_v1 = server_args.pipeline_config.is_flux_v1()
-            if max_length is not None and not (is_flux_v1 and i == 0):
+            # Pass max_length to tokenizer if specified in the request, except
+            # for a text encoder whose context is architecturally fixed (see
+            # _text_encoder_max_length_is_fixed).
+            if max_length is not None and not _text_encoder_max_length_is_fixed(
+                server_args.pipeline_config, i
+            ):
                 tok_kwargs["max_length"] = max_length
 
             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
