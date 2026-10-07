@@ -142,6 +142,14 @@ class Memory(msgspec.Struct):
             ],
         ),
     ] = "page_first"
+    enable_mla_hicache_host_dedup: A[
+        bool,
+        "Deduplicate the replicated MLA/DSA KV in the HiCache host tier across "
+        "attention-TP ranks: each rank backs up and loads back a round-robin share "
+        "of the layers, and every loaded layer is broadcast from its owner. Needs "
+        "--hicache-io-backend direct and --hicache-mem-layout page_first_direct, "
+        "without a storage backend.",
+    ] = False
     hicache_storage_backend: A[
         Optional[str],
         Arg(
