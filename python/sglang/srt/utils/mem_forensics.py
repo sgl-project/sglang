@@ -23,19 +23,19 @@ snapshot. Mapping a corrupted tensor's ``data_ptr`` onto the ``ready``
 snapshot names the allocation site of a block a captured graph recorded.
 
 Recording is started once per process and left active. The allocator keeps
-one process-wide history recorder, so another feature that calls
-``torch.cuda.memory._record_memory_history`` itself (the ``MEM`` activity of
-the torch profiler, the CUDA graph runner's capture-debug path) stops or
-reconfigures it. A dump therefore checks the snapshot for history entries
-first: when there are none, it re-arms recording with the configured
-parameters, writes nothing, and leaves the tag unconsumed, so the next
-request for that tag writes a snapshot whose history starts at the re-arm.
-Limitation: the first request after another profiler stopped recording only
-re-arms, and the snapshot that follows carries no history from before that
-point. Both entry points return without touching ``torch.cuda`` unless the
-directory variable is set, and dump failures are logged and never raised, so
-the original failure path of a caller is preserved even on a faulted CUDA
-context.
+one process-wide history recorder, and stopping it discards the recorded
+events (live blocks keep the stacks they were allocated with). The CUDA
+graph runner's capture profiler (``--enable-profile-cuda-graph``) therefore
+hands the recorder back through :func:`stop_memory_history` instead of
+stopping it. Another feature that stops recording itself (the ``MEM``
+activity of the torch profiler) still clears the events: a dump that finds
+no history entries writes the snapshot anyway, since its live blocks still
+map addresses to allocation stacks, re-arms recording with the configured
+parameters, and leaves the tag unconsumed, so the next request for that tag
+writes a snapshot whose history starts at the re-arm. Both entry points
+return without touching ``torch.cuda`` unless the directory variable is set,
+and dump failures are logged and never raised, so the original failure path
+of a caller is preserved even on a faulted CUDA context.
 """
 
 from __future__ import annotations
@@ -106,44 +106,64 @@ def maybe_start_memory_forensics() -> None:
         )
 
 
+def stop_memory_history() -> None:
+    """Stop allocator-history recording started by another profiler.
+
+    When memory forensics owns the recorder, restore its configuration
+    instead of stopping, so the history recorded so far is kept.
+    """
+    if _started:
+        try:
+            _start_recording()
+            return
+        except Exception:
+            logger.exception("Memory forensics recording failed to resume")
+    torch.cuda.memory._record_memory_history(enabled=None)
+
+
 def maybe_dump_memory_forensics(tag: str) -> None:
     """Write one snapshot pickle per (process, tag).
 
     The snapshot is written to a temporary file and moved into place
-    atomically; the tag is consumed only after a successful write, so a
-    transient failure does not suppress a later retry. A snapshot without
-    history entries is not written: recording is re-armed instead and the
-    tag stays unconsumed (see the module docstring). File names embed the
-    distributed rank, the PID, and a nanosecond timestamp, so concurrent
-    data-parallel replicas, restarts, and multiple servers sharing the
-    directory cannot collide.
+    atomically; the tag is consumed only after a successful write of a
+    snapshot with history, so a transient failure does not suppress a later
+    retry. A snapshot without history entries is still written, recording
+    is re-armed and the tag stays unconsumed (see the module docstring).
+    File names embed the distributed rank, the PID, and a nanosecond
+    timestamp, so concurrent data-parallel replicas, restarts, and multiple
+    servers sharing the directory cannot collide.
     """
     if not _started:
+        return
+    out_dir = envs.SGLANG_MEM_FORENSICS_DIR.get()
+    if not out_dir:
         return
     with _lock:
         if tag in _dumped_tags:
             return
-        out_dir = envs.SGLANG_MEM_FORENSICS_DIR.get()
-        path = os.path.join(
-            out_dir,
-            f"mem-forensics-{tag}-rank{_rank_label()}"
-            f"-pid{os.getpid()}-{time.time_ns()}.pickle",
-        )
         try:
+            path = os.path.join(
+                out_dir,
+                f"mem-forensics-{tag}-rank{_rank_label()}"
+                f"-pid{os.getpid()}-{time.time_ns()}.pickle",
+            )
             snapshot = torch.cuda.memory._snapshot()
-            if not _snapshot_has_history(snapshot):
-                # Another memory profiler stopped the process-wide recorder.
-                # Re-arm now and defer the dump: the next request for this
-                # tag writes a snapshot with history from this point on.
-                _start_recording()
+            has_history = _snapshot_has_history(snapshot)
+            if not has_history:
+                # Another memory profiler stopped the process-wide recorder
+                # and its events are gone, but live blocks keep their
+                # allocation stacks: re-arm, and write this snapshot; the
+                # next request for this tag carries history again.
                 logger.warning(
-                    "Memory forensics snapshot %r deferred: allocator history "
-                    "was not being recorded (another memory profiler stopped "
-                    "it); recording re-armed, the next request for this tag "
-                    "writes a snapshot.",
+                    "Memory forensics snapshot %r has no allocator history "
+                    "(another memory profiler stopped recording); writing it "
+                    "with live-block stacks only and re-arming recording.",
                     tag,
                 )
-                return
+                try:
+                    _start_recording()
+                except Exception:
+                    logger.exception("Memory forensics recording failed to re-arm")
             os.makedirs(out_dir, exist_ok=True)
             tmp_path = path + ".tmp"
             try:
@@ -159,5 +179,6 @@ def maybe_dump_memory_forensics(tag: str) -> None:
         except Exception:
             logger.exception("Memory forensics dump failed for tag %r", tag)
             return
-        _dumped_tags.add(tag)
+        if has_history:
+            _dumped_tags.add(tag)
         logger.info("Memory forensics snapshot written: %s", path)
