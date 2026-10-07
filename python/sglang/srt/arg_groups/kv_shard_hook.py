@@ -159,11 +159,20 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "allocator index space."
         )
     if cfg.enable_hierarchical_cache:
-        raise ValueError(
-            "--enable-kv-cache-sharding does not support "
-            "--enable-hierarchical-cache yet: HiCache backup/load assumes "
-            "each rank holds full pages."
-        )
+        prefill_backend, _ = attention_backends_of(cfg)
+        if prefill_backend != "dsa" or cfg.attn_cp_size <= 1:
+            raise ValueError("Sharded HiCache requires the CP DSA pool")
+        if cfg.hicache_storage_backend is not None:
+            raise ValueError("CP-sharded HiCache supports CPU L2 only")
+        if cfg.hicache_host_memory_mode != "cache":
+            raise ValueError("CP-sharded HiCache requires host memory mode cache")
+        if cfg.hicache_io_backend != "kernel" or cfg.hicache_mem_layout not in (
+            "layer_first",
+            "page_first",
+        ):
+            raise ValueError(
+                "CP-sharded HiCache requires kernel I/O with layer_first or page_first"
+            )
     if cfg.enable_lmcache:
         raise ValueError(
             "--enable-kv-cache-sharding does not support --enable-lmcache."

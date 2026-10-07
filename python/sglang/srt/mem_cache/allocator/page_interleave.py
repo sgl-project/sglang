@@ -172,6 +172,37 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             "rotation base)"
         )
 
+    def alloc_matching(self, indices: torch.Tensor):
+        """Allocate whole pages with the same owners as another cache tier.
+
+        The mirrored logical page plan preserves a prefix's rotation when
+        moving between GPU and CPU. Check all classes before consuming any
+        page so a tight owner cannot leave a partial allocation behind.
+        """
+        ps, n = self.page_size, self.shard_size
+        source = indices.detach().to(device="cpu", dtype=torch.int64)
+        if source.ndim != 1 or source.numel() % ps:
+            raise ValueError("Sharded HiCache transfers require whole pages")
+        if not source.numel():
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        blocks = source.reshape(-1, ps)
+        if not torch.equal(blocks, blocks[:, :1] + torch.arange(ps)) or bool(
+            (blocks[:, 0] < n * ps).any() or (blocks[:, 0] % ps != 0).any()
+        ):
+            raise ValueError("Sharded HiCache requires aligned, nonreserved pages")
+        owners = blocks[:, 0] // ps % n
+        needs = torch.bincount(owners, minlength=n).tolist()
+        if any(need > free for need, free in zip(needs, self.class_free_page_counts())):
+            return None
+        self.merge_and_sort_free()
+        pages = torch.empty(len(owners), dtype=torch.int64, device=self.device)
+        for rank, count in enumerate(needs):
+            if count:
+                positions = torch.where(owners == rank)[0].to(self.device)
+                pages[positions] = self.class_free_pages[rank][:count]
+                self.class_free_pages[rank] = self.class_free_pages[rank][count:]
+        return (pages[:, None] * ps + torch.arange(ps, device=self.device)).flatten()
+
     @staticmethod
     def _class_counts(start_class: int, new_pages: int, shard_size: int) -> List[int]:
         """Pages drawn from each class by a cyclic run of ``new_pages`` pages

@@ -2134,6 +2134,8 @@ class _DsaStrategy(StackStrategy):
         }
 
     def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        if getattr(kvcache, "shard_size", 1) > 1:
+            raise ValueError("CP-sharded DSA supports CPU L2, not the external linker")
         from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
             _build_dsa_device_pool_group,
         )
@@ -2163,8 +2165,35 @@ class _DsaStrategy(StackStrategy):
             transfer_page_size=params.page_size,
             packed_draft_device_pools=params.mtp_draft_device_pools,
         )
-        host_pool_group = build_host_pool_group(config=config)
-        cache_controller = HybridCacheController(
+        controller_cls = HybridCacheController
+        if getattr(kvcache, "shard_size", 1) > 1:
+            from sglang.srt.mem_cache.sharded_hicache import (
+                ShardedDSAHiCacheController,
+                ShardedDSAHostPoolGroup,
+            )
+
+            if storage_backend is not None:
+                raise ValueError("CP-sharded HiCache supports CPU L2 only")
+            if get_memory().hicache_host_memory_mode != "cache":
+                raise ValueError("CP-sharded HiCache requires host memory mode cache")
+            if get_memory().hicache_io_backend != "kernel":
+                raise ValueError("CP-sharded HiCache requires the kernel I/O backend")
+            if get_memory().hicache_mem_layout not in ("layer_first", "page_first"):
+                raise ValueError("Sharded DSA HiCache supports layer_first or page_first")
+            root = config.pools[0]
+            root_host_pool = build_kv_host_pool(
+                kv_pool=root.decl.device_pool,
+                page_size=config.transfer_page_size,
+                mtp_draft_device_pools=root.packed_draft_device_pools,
+            )
+            host_pool_group = ShardedDSAHostPoolGroup(
+                _build_pool_entries(config=config, root_host_pool=root_host_pool),
+                kvcache,
+            )
+            controller_cls = ShardedDSAHiCacheController
+        else:
+            host_pool_group = build_host_pool_group(config=config)
+        cache_controller = controller_cls(
             params.token_to_kv_pool_allocator,
             host_pool_group,
             config.transfer_page_size,

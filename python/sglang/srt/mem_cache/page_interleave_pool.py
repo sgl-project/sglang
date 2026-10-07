@@ -207,12 +207,18 @@ class PageInterleaveKVPoolMixin:
         if layer_transfer_counter is None:
             super().register_layer_transfer_counter(None)
             return
-        # Layer-wise KV load-back is unsupported here, and refusing it at
-        # registration is the only safe answer. The gather in `_prefetch_layer`
+        if isinstance(self, DSATokenToKVPool):
+            # The DSA HiCache adapter filters logical source/destination pairs
+            # before native L2 copies. Prefix gathers wait for the same ready
+            # generation, including the packed draft's layer-zero transfers.
+            super().register_layer_transfer_counter(layer_transfer_counter)
+            return
+        # Other pool types still lack an owner-aware load-back adapter. The
+        # gather in `_prefetch_layer`
         # reads pool rows directly (`_gather_pairs`), so it never passes
         # through the base getters' `wait_until` hook -- and the first gather
         # is kicked from `begin_shard_extend`, before any getter runs. Adding
-        # the wait would not make the combination work: the loader writes whole
+        # the wait alone would not make those combinations work: the loader writes whole
         # pool rows at LOGICAL indices with no ownership filter, while this
         # pool's rows are local physical ones, so ordering the read would only
         # turn a race into a silent wrong-row read. Same reason as
@@ -411,6 +417,9 @@ class PageInterleaveKVPoolMixin:
         # writes that produced the prefix rows.
         self.kv_gather_stream.wait_stream(self.device_module.current_stream())
         with self.device_module.stream(self.kv_gather_stream):
+            counter = getattr(self, "layer_transfer_counter", None)
+            if counter is not None:
+                counter.wait_until(local_layer)
             for pool_buf, name in self._gather_pairs(local_layer):
                 send_rows = self._gather_send_rows(name)
                 block = send_rows.numel()

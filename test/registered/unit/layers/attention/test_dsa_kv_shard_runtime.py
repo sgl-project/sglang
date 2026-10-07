@@ -81,6 +81,10 @@ def _cfg(**overrides):
         enable_flexkv=False,
         enable_unified_memory=False,
         enable_hierarchical_cache=False,
+        hicache_storage_backend=None,
+        hicache_host_memory_mode="cache",
+        hicache_io_backend="kernel",
+        hicache_mem_layout="layer_first",
         enable_lmcache=False,
         enable_hisparse=False,
         enable_dynamic_chunking=False,
@@ -139,6 +143,53 @@ def test_glm_mtp_gate_disables_both_graph_phases(gate):
     graph = declaration.call_args.kwargs["cuda_graph_config"]
     assert graph.prefill.backend == Backend.DISABLED
     assert graph.decode.backend == Backend.DISABLED
+
+
+@pytest.mark.parametrize("layout", ["layer_first", "page_first"])
+def test_glm_mtp_sharded_hicache_accepts_cpu_l2(gate, layout):
+    cfg, _, declaration = gate
+    cfg.enable_hierarchical_cache = True
+    cfg.hicache_mem_layout = layout
+    kv_shard_hook.handle_kv_cache_sharding(object(), gpu_mem=80 * 1024)
+    graph = declaration.call_args.kwargs["cuda_graph_config"]
+    assert graph.prefill.backend == Backend.DISABLED
+    assert graph.decode.backend == Backend.DISABLED
+
+
+@pytest.mark.parametrize(
+    "name,value,error",
+    [
+        ("attn_cp_size", 1, "requires the CP DSA pool"),
+        ("hicache_storage_backend", "file", "CPU L2 only"),
+        ("hicache_host_memory_mode", "buffer_only", "host memory mode cache"),
+        ("hicache_io_backend", "direct", "requires kernel I/O"),
+        ("hicache_mem_layout", "page_first_direct", "requires kernel I/O"),
+        (
+            "enable_unified_cache_external_linker",
+            True,
+            "does not support --enable-unified-cache-external-linker",
+        ),
+    ],
+)
+def test_sharded_hicache_rejects_unwired_paths(gate, name, value, error):
+    cfg, _, _ = gate
+    cfg.enable_hierarchical_cache = True
+    setattr(cfg, name, value)
+    with pytest.raises(ValueError, match=error):
+        kv_shard_hook.handle_kv_cache_sharding(object(), gpu_mem=80 * 1024)
+
+
+def test_sharded_hicache_rejects_non_dsa_cp(gate):
+    cfg, model, _ = gate
+    cfg.enable_hierarchical_cache = True
+    cfg.speculative_algorithm = None
+    model.hf_config.architectures = ["DeepseekV3ForCausalLM"]
+    del model.hf_config.index_topk
+    with patch.object(
+        kv_shard_hook, "attention_backends_of", return_value=("fa3", "fa3")
+    ):
+        with pytest.raises(ValueError, match="requires the CP DSA pool"):
+            kv_shard_hook.handle_kv_cache_sharding(object(), gpu_mem=80 * 1024)
 
 
 def test_dsa_cannot_enter_dense_backend_sharding(gate):
