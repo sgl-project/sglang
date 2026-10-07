@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -9,6 +10,15 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
+    EndWeightUpdateReqInput,
+    UpdateWeightsFromDistributedReqInput,
+)
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    SchedulerWeightUpdaterManager,
+    _WeightUpdateSession,
+)
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
@@ -95,6 +105,111 @@ class TestWeightUpdateRunners(CustomTestCase):
                 self.assertEqual(
                     [(role, runners.index(r)) for role, r in got], expected
                 )
+
+
+class TestNcclM2NFrozenDraft(CustomTestCase):
+    def _manager(self, cls, attrs):
+        target = Mock()
+        target.weight_updater._m2n_receivers = {"pp0": Mock()}
+        drafts = [Mock(), Mock()]
+        manager = SchedulerWeightUpdaterManager(
+            tp_worker=SimpleNamespace(
+                model_runner=target,
+                weight_update_runners=lambda: [("target", target)],
+            ),
+            draft_worker=_bare(cls, **attrs(drafts)),
+            tp_cpu_group=None,
+            memory_saver_adapter=None,
+            flush_cache=Mock(return_value=True),
+            is_fully_idle=Mock(return_value=True),
+            scheduler=Mock(spec=["record_weight_version_change"]),
+        )
+        return manager, target, drafts
+
+    def _request(self, *, selector="target", concurrent=False):
+        return UpdateWeightsFromDistributedReqInput(
+            names=[],
+            dtypes=[],
+            shapes=[],
+            group_name="pp0",
+            load_format="nccl_m2n",
+            selector=selector,
+            flush_cache=False,
+            m2n_group_names=["pp0"] if concurrent else None,
+        )
+
+    def test_target_only_session_leaves_every_draft_family_frozen(self):
+        for case, (cls, attrs, _) in CASES.items():
+            for concurrent in (False, True):
+                with self.subTest(case=case, concurrent=concurrent):
+                    manager, target, drafts = self._manager(cls, attrs)
+                    with patch("torch.distributed.barrier"):
+                        self.assertTrue(
+                            manager.begin_weight_update(
+                                BeginWeightUpdateReqInput(selector="target")
+                            ).success
+                        )
+                        self.assertTrue(
+                            manager.update_weights_from_distributed(
+                                self._request(concurrent=concurrent)
+                            ).success
+                        )
+                        self.assertTrue(
+                            manager.end_weight_update(EndWeightUpdateReqInput()).success
+                        )
+                    target.weight_updater.begin_weight_update.assert_called_once_with()
+                    if concurrent:
+                        target.weight_updater.receive_weights_from_m2n_groups.assert_called_once_with(
+                            ["pp0"]
+                        )
+                    else:
+                        target.weight_updater.receive_weights_from_m2n.assert_called_once_with(
+                            "pp0"
+                        )
+                    target.weight_updater.end_weight_update.assert_called_once_with(
+                        run_post_load=True
+                    )
+                    for draft in drafts:
+                        self.assertEqual(draft.weight_updater.mock_calls, [])
+
+    def test_non_target_session_is_rejected_before_preparing_drafts(self):
+        for case, (cls, attrs, _) in CASES.items():
+            for selector in ("all", "draft"):
+                with self.subTest(case=case, selector=selector):
+                    manager, target, drafts = self._manager(cls, attrs)
+                    with patch("torch.distributed.barrier") as barrier:
+                        output = manager.begin_weight_update(
+                            BeginWeightUpdateReqInput(selector=selector)
+                        )
+                    self.assertFalse(output.success)
+                    self.assertIn("selector='target'", output.message)
+                    self.assertIsNone(manager._session)
+                    barrier.assert_not_called()
+                    target.weight_updater.begin_weight_update.assert_not_called()
+                    for draft in drafts:
+                        self.assertEqual(draft.weight_updater.mock_calls, [])
+
+    def test_incompatible_request_selectors_are_rejected_before_receive(self):
+        for case, (cls, attrs, _) in CASES.items():
+            for session_selector, selector in (
+                ("all", "target"),
+                ("target", "all"),
+                ("target", "draft"),
+            ):
+                with self.subTest(
+                    case=case, session_selector=session_selector, selector=selector
+                ):
+                    manager, target, drafts = self._manager(cls, attrs)
+                    manager._session = _WeightUpdateSession(selector=session_selector)
+                    output = manager.update_weights_from_distributed(
+                        self._request(selector=selector)
+                    )
+                    self.assertFalse(output.success)
+                    target.weight_updater.receive_weights_from_m2n.assert_not_called()
+                    target.weight_updater.receive_weights_from_m2n_groups.assert_not_called()
+                    self.assertFalse(manager._session.requires_post_load)
+                    for draft in drafts:
+                        self.assertEqual(draft.weight_updater.mock_calls, [])
 
 
 if __name__ == "__main__":
