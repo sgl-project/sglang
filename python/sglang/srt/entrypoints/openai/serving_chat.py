@@ -1377,13 +1377,18 @@ class OpenAIServingChat(OpenAIServingBase):
             enable_thinking = (request.chat_template_kwargs or {}).get(
                 "enable_thinking"
             )
+            # GLM-5.3's template opens <think> on every turn and ignores
+            # enable_thinking, so the grammar must keep accepting </think>
+            # or the model can never leave the thinking block.
+            reasoning_config = self.template_manager.reasoning_config
+            glm_thinking_mode = (
+                reasoning_config is not None and reasoning_config.always_on
+            ) or (True if enable_thinking is None else bool(enable_thinking))
             parser = FunctionCallParser(request.tools or [], self.tool_call_parser)
             tool_call_constraint = parser.get_structure_constraint(
                 request.tool_choice,
                 parallel_tool_calls=request.parallel_tool_calls,
-                thinking_mode=True
-                if enable_thinking is None
-                else bool(enable_thinking),
+                thinking_mode=glm_thinking_mode,
             )
 
         # Apply chat template and its stop strings
