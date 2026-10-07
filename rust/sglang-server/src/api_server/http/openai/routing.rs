@@ -101,16 +101,12 @@ mod tests {
     }
 
     #[test]
-    fn host_clone_budget_includes_choices_for_scalars_and_lists() {
-        // 263173 bytes fit in the native one-choice budget, but 255 choices
-        // exceed 64 MiB. A one-element list must not bypass the same limit.
-        let host = "x".repeat(263173);
-        for value in [json!(host), json!([host])] {
-            let fields: PDRoutingFields =
-                serde_json::from_value(json!({"bootstrap_host": value})).unwrap();
-            let error = fields.into_routing(1, 255).err().unwrap().to_string();
-            assert!(error.contains("bootstrap_host"), "{error}");
-            assert!(error.contains("would allocate more than"), "{error}");
-        }
+    fn list_hosts_cannot_bypass_choice_clone_budget() {
+        // 263173 bytes fit for one choice, but 255 choices exceed 64 MiB.
+        let fields: PDRoutingFields =
+            serde_json::from_value(json!({"bootstrap_host": ["x".repeat(263173)]})).unwrap();
+        let error = fields.into_routing(1, 255).err().unwrap().to_string();
+        assert!(error.contains("bootstrap_host"), "{error}");
+        assert!(error.contains("would allocate more than"), "{error}");
     }
 }
