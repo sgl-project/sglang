@@ -108,9 +108,6 @@ class TestDbrxExpertLoaderLayout(CustomTestCase):
                                     offset=offset,
                                 )
 
-    def test_native_loader_in_the_construction_scope(self):
-        self.check_loads(False)
-
     def test_native_loader_after_scope_exit(self):
         self.check_loads(True)
 

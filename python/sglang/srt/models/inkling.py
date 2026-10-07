@@ -100,10 +100,8 @@ STACKED_DENSE_PARAMS_MAPPING = [
     ("down_proj", "down_proj", None),
 ]
 
-# Online RL weight-sync streams routed experts one at a time as FULL (unsharded)
-# per-expert tensors named `...mlp.experts.{j}.gate_proj/up_proj/down_proj.weight`.
-# Disk checkpoints only ever carry the fused w13_weight/w2_weight, so this pattern
-# never fires on the ordinary loading path.
+# Online RL updates use full per-expert gate/up/down tensors; disk checkpoints
+# contain fused w13/w2 weights and do not match this pattern.
 _PER_EXPERT_WEIGHT_RE = re.compile(
     r"^(?P<pfx>.+\.mlp\.experts)\.(?P<eid>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
 )
@@ -112,12 +110,7 @@ _PER_EXPERT_WEIGHT_RE = re.compile(
 def _shard_full_to_local(
     loaded_weight: torch.Tensor, dst: torch.Tensor, dim: int, *, tp_rank: int
 ) -> torch.Tensor:
-    """Slice a FULL (unsharded) per-expert weight to this MoE-TP rank's shard along `dim`.
-
-    The online weight-sync ships full per-expert tensors (parallelism-agnostic HF
-    layout); the owning module supplies its MoE-TP rank. With TP1 the dims
-    already match and this is the identity, so the ordinary path is unchanged.
-    """
+    """Shard full HF per-expert updates with the owning module's MoE TP rank."""
     if loaded_weight.shape[dim] == dst.shape[dim]:
         return loaded_weight
     return loaded_weight.narrow(dim, tp_rank * dst.shape[dim], dst.shape[dim])

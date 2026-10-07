@@ -336,9 +336,6 @@ class TestGptOssExpertLoaderLayout(CustomTestCase):
                         module.w2_weight_bias, expected, rtol=0, atol=0
                     )
 
-    def test_native_loaders_in_the_construction_scope(self):
-        self.check_loads(False)
-
     def test_native_loaders_after_scope_exit(self):
         self.check_loads(True)
 

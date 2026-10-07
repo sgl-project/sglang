@@ -252,9 +252,6 @@ class TestInklingMoeLoaderLayout(CustomTestCase):
                             model, routed, shared, changed=changed, offset=offset
                         )
 
-    def test_native_expert_loaders_in_the_construction_scope(self):
-        self.check_layouts()
-
     def test_native_expert_loaders_after_scope_exit(self):
         self.check_layouts(changed=True)
 

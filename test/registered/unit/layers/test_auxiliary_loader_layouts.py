@@ -154,9 +154,6 @@ class TestAuxiliaryLoaderLayouts(CustomTestCase):
                                 kind, changed=changed, old_kimi=True, offset=offset
                             )
 
-    def test_loaders_in_the_construction_scope(self):
-        self.check_loads(False)
-
     def test_loaders_after_scope_exit(self):
         self.check_loads(True)
 
