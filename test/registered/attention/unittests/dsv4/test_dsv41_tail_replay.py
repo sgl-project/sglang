@@ -42,9 +42,13 @@ class TestTailMetadataReplay(CustomTestCase):
         backend.enable_decoder_swa_bounded_replay = True
         eager = fixture.forward_batch
 
-        def batch(rows, prefix=0):
+        def batch(rows, prefixes=None):
             return _make_forward_batch(
-                replace(case, prefix_lens=(prefix,) * len(rows), extend_lens=rows),
+                replace(
+                    case,
+                    prefix_lens=(0,) * len(rows) if prefixes is None else prefixes,
+                    extend_lens=rows,
+                ),
                 fixture.runner,
                 max_context_len=1024,
                 device="cuda",
@@ -70,24 +74,25 @@ class TestTailMetadataReplay(CustomTestCase):
             with torch.cuda.graph(graph):
                 output.copy_(slots)
 
-            for rows, prefix, tail_rows in [
-                ((44,), 0, list(range(44))),
-                ((24, 24), 0, list(range(48))),
-                ((80,), 0, list(range(80))),
-                ((127,), 0, list(range(127))),
-                ((128,), 128, list(range(128))),
-                ((129,), 0, list(range(1, 129))),
-                ((256,), 0, list(range(128, 256))),
-                ((320, 160), 0, list(range(192, 320)) + list(range(352, 480))),
-                ((44,), 512, list(range(44))),
-                ((24, 24), 256, list(range(48))),
-                ((511,), 0, list(range(383, 511))),
-                ((512,), 0, list(range(384, 512))),
+            for rows, prefixes, tail_rows in [
+                ((44,), None, list(range(44))),
+                ((24, 24), None, list(range(48))),
+                ((80,), None, list(range(80))),
+                ((127,), None, list(range(127))),
+                ((128,), (128,), list(range(128))),
+                ((129,), None, list(range(1, 129))),
+                ((256,), None, list(range(128, 256))),
+                ((320, 160), None, list(range(192, 320)) + list(range(352, 480))),
+                ((320, 160), (512, 256), list(range(192, 320)) + list(range(352, 480))),
+                ((44,), (512,), list(range(44))),
+                ((24, 24), (256, 256), list(range(48))),
+                ((511,), None, list(range(383, 511))),
+                ((512,), None, list(range(384, 512))),
             ] * 4:
-                with self.subTest(rows=rows, prefix=prefix):
+                with self.subTest(rows=rows, prefixes=prefixes):
                     backend.init_forward_metadata(eager)
                     self.assertIsNotNone(backend.tail_forward_metadata)
-                    live = batch(rows, prefix)
+                    live = batch(rows, prefixes)
                     static = copy.copy(live)
                     static.max_seq_len_override = 1024
                     static.out_cache_loc = torch.nn.functional.pad(
