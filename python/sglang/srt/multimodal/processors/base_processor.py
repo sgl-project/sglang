@@ -854,7 +854,11 @@ class BaseMultimodalProcessor(ABC):
         if configured == "cuda":
             return f"cuda:{server_args.base_gpu_id}"
         platform = self._platform_mm_preprocessing_device()
-        if platform is not None and platform.startswith("cuda") and self.mm_preprocessing_device is not None:
+        if (
+            platform is not None
+            and platform.startswith("cuda")
+            and self.mm_preprocessing_device is not None
+        ):
             return self.mm_preprocessing_device
         return platform
 

@@ -13,6 +13,8 @@ from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.runtime_context import publish, reset_context
@@ -219,7 +221,17 @@ def _fast_path_processor(cls=_StubProcessor, **fields):
 @contextmanager
 def _gpu_platform():
     with (
-        patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=False, platforms=SimpleNamespace(current_platform=SimpleNamespace(is_cuda_alike=lambda: True, device_type="cuda"))),
+        patch.multiple(
+            BASE,
+            _is_cpu=False,
+            _is_xpu=False,
+            _is_npu=False,
+            platforms=SimpleNamespace(
+                current_platform=SimpleNamespace(
+                    is_cuda_alike=lambda: True, device_type="cuda"
+                )
+            ),
+        ),
         patch(f"{BASE}.BaseImageProcessor", _FastImageProcessor),
     ):
         yield
@@ -394,7 +406,17 @@ class TestProcessMmDataDevice(CustomTestCase):
 
 class TestGpuImageDecodeFollowsThePlacement(CustomTestCase):
     def _decode(self, processor):
-        with patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=False, platforms=SimpleNamespace(current_platform=SimpleNamespace(is_cuda_alike=lambda: True, device_type="cuda"))):
+        with patch.multiple(
+            BASE,
+            _is_cpu=False,
+            _is_xpu=False,
+            _is_npu=False,
+            platforms=SimpleNamespace(
+                current_platform=SimpleNamespace(
+                    is_cuda_alike=lambda: True, device_type="cuda"
+                )
+            ),
+        ):
             return processor._resolve_gpu_image_decode()
 
     def test_server_cpu_turns_gpu_decode_off(self):
@@ -524,6 +546,114 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
             events,
             ["enter", ("call", "cuda:0"), ("copy", "cpu"), "exit"],
         )
+
+
+class TestModelProcessorsUseTheResolver(CustomTestCase):
+    """Model processors that build their own fast processor call pass the same
+    resolved device (regression: they called a helper the resolver replaced,
+    so the first image request raised AttributeError)."""
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def _qwen(self, **fields):
+        from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+
+        calls = []
+
+        class ImageProcessor(_FastImageProcessor):
+            def __call__(self, images, **kwargs):
+                calls.append(kwargs.get("device"))
+                return {
+                    "pixel_values": torch.zeros(4 * len(images), 2),
+                    "image_grid_thw": torch.tensor([[1, 2, 2]] * len(images)),
+                }
+
+        processor = _make(QwenVLImageProcessor, base_gpu_id=0, **fields)
+        processor.disable_fast_image_processor = False
+        processor.image_config = {}
+        processor.mm_feature_transport = "cpu"
+        processor.precompute_hash_before_cpu_transfer = False
+        processor.mm_preprocess_cache = SimpleNamespace(enabled=False)
+        processor._processor = SimpleNamespace(image_processor=ImageProcessor())
+        processor._tokenizer = None
+        return processor, calls
+
+    def _qwen_artifact_device(self, **fields):
+        from sglang.srt.multimodal.media_artifacts import MediaArtifactInput
+
+        processor, calls = self._qwen(**fields)
+        entry = MediaArtifactInput(
+            content_digest="sha256:" + "0" * 64,
+            artifact_key="sha256:" + "1" * 64,
+            modality=Modality.IMAGE,
+            media="image",
+        )
+        with (
+            _gpu_platform(),
+            patch(
+                "sglang.srt.multimodal.processors.qwen_vl.BaseImageProcessor",
+                _FastImageProcessor,
+            ),
+            patch(f"{BASE}.torch.cuda.device", return_value=nullcontext()),
+            patch(f"{BASE}.torch.cuda.MemPool", return_value="pool"),
+            patch(f"{BASE}.torch.cuda.use_mem_pool", return_value=nullcontext()),
+        ):
+            (artifact,) = processor.prepare_artifact_batch([entry])
+        self.assertEqual(tuple(artifact.feature.shape), (4, 2))
+        (device,) = calls
+        return device
+
+    def test_qwen_artifact_preprocessing_follows_the_resolver(self):
+        for setting, expected in (("auto", "cuda:0"), ("cpu", "cpu")):
+            with self.subTest(setting=setting):
+                self.assertEqual(
+                    self._qwen_artifact_device(mm_preprocessing_device=setting),
+                    expected,
+                )
+
+    def _bailing_call_device(self, **fields):
+        from sglang.srt.multimodal.processors.bailing_mm import (
+            BailingMMMultimodalProcessor,
+        )
+
+        calls = []
+
+        class Processor:
+            image_processor = _FastImageProcessor()
+
+            def __call__(self, **kwargs):
+                calls.append(kwargs.get("device"))
+                return {"pixel_values": torch.zeros(4, 2)}
+
+        processor = _make(BailingMMMultimodalProcessor, base_gpu_id=0, **fields)
+        processor.mm_feature_transport = "cpu"
+        processor.FEATURE_NAMES = ["pixel_values"]
+        processor._processor = Processor()
+        processor._tokenizer = None
+        with (
+            _gpu_platform(),
+            patch(
+                "sglang.srt.multimodal.processors.bailing_mm.BaseImageProcessor",
+                _FastImageProcessor,
+            ),
+        ):
+            processor.process_mm_data("t", images=["image"])
+            choice = processor._mm_preprocessing_device_choice()
+            places_itself = processor._places_preprocessing_itself()
+        (device,) = calls
+        self.assertEqual(device, choice)
+        self.assertFalse(places_itself)
+        return device
+
+    def test_bailing_visual_call_follows_the_resolver(self):
+        for setting, expected in (("auto", "cuda:0"), ("cpu", "cpu")):
+            with self.subTest(setting=setting):
+                self.assertEqual(
+                    self._bailing_call_device(mm_preprocessing_device=setting),
+                    expected,
+                )
 
 
 if __name__ == "__main__":
