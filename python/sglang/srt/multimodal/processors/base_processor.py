@@ -1098,63 +1098,12 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             assert isinstance(prompt, str)
             prompt_str = prompt
 
-        futures: List[Tuple[Modality, int, concurrent.futures.Future]] = []
-
-        modalities_data = [
-            (image_data, Modality.IMAGE),
-            (video_data, Modality.VIDEO),
-            (audio_data, Modality.AUDIO),
-        ]
-
-        for data_list, modality in modalities_data:
-            futures.extend(
-                self._submit_mm_data_loading_tasks_simple(
-                    data_list, modality, audio_sample_rate, discard_alpha_channel
-                )
-            )
-
-        logger.debug("[load_mm_data(simple)] total futures submitted: %d", len(futures))
-
-        images: List[Any] = [None] * len(image_data) if image_data else []
-        videos: List[Any] = [None] * len(video_data) if video_data else []
-        audios: List[Any] = [None] * len(audio_data) if audio_data else []
-
-        for modality, idx, future in futures:
-            try:
-                result = await asyncio.wrap_future(future)
-            except ValueError as e:
-                logger.info(
-                    "[load_mm_data(simple)] invalid %s data at index=%d: %s",
-                    modality.name,
-                    idx,
-                    e,
-                )
-                raise ValueError(
-                    f"An exception occurred while loading {modality.name} data "
-                    f"at index {idx}: {e}"
-                ) from e
-            except Exception as e:
-                logger.exception(
-                    "[load_mm_data(simple)] error loading %s data at index=%d",
-                    modality.name,
-                    idx,
-                )
-                raise RuntimeError(
-                    f"An exception occurred while loading {modality.name} data at index {idx}: {e}"
-                )
-
-            if modality == Modality.IMAGE:
-                images[idx] = result
-            elif modality == Modality.VIDEO:
-                videos[idx] = result
-            elif modality == Modality.AUDIO:
-                audios[idx] = result
-
-        logger.debug(
-            "[load_mm_data(simple)] loaded counts: images=%d, videos=%d, audios=%d",
-            len(images),
-            len(videos),
-            len(audios),
+        images, videos, audios = await self._load_media_lists(
+            image_data,
+            video_data,
+            audio_data,
+            audio_sample_rate=audio_sample_rate,
+            discard_alpha_channel=discard_alpha_channel,
         )
 
         return BaseMultiModalProcessorOutput(
