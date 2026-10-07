@@ -2681,6 +2681,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.is_dllm():
             # For DLLM, we use a separate forward mode
             self.forward_mode = ForwardMode.DLLM_EXTEND
+            for req in self.reqs:
+                if req.dllm_block_id == 0 or req.dllm_block_done:
+                    req.dllm_block_id += 1
+                    req.dllm_block_done = False
 
         # Init tensors
         reqs = self.reqs

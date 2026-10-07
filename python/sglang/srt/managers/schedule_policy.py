@@ -915,11 +915,7 @@ class PrefillAdder:
         if _rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
 
-        reuse_block = (
-            self.dllm_config.first_done_first_out_mode
-            and req.kv.holds_kv
-            and not req.dllm_block_done
-        )
+        reuse_block = req.kv.holds_kv and not req.dllm_block_done
         cand_extend_input_len = (
             req.extend_range.length
             if reuse_block

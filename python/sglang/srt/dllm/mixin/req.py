@@ -74,8 +74,6 @@ class ReqDllmMixin:
             # non-incomplete path which also defers it to the adder.
             return
 
-        self.dllm_block_id += 1
-        self.dllm_block_done = False
         self.dllm_block_offset = (
             0
             if not self.dllm_initialized

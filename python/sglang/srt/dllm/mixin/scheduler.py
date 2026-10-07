@@ -45,8 +45,8 @@ class SchedulerDllmMixin:
         # Create prefill adder with resource constraints
         adder = self._create_dllm_prefill_adder(running_bs, running_batch=running_batch)
 
-        # Initialize DLLM manager and transfer requests
-        self.dllm_manager.init_next_round()
+        # Clear the previous batch and fetch waiting requests
+        self.dllm_manager.staging_queue = []
         self._fetch_waiting_reqs()
 
         # Process batches
@@ -331,6 +331,12 @@ class SchedulerDllmMixin:
     ) -> AddReqResult:
         """Process staging DLLM requests with resource allocation."""
         for req in reqs:
+            if req.dllm_block_done and req.kv.holds_kv:
+                if self.dllm_config.first_done_first_out_mode:
+                    self._clear_dllm_future(req)
+                self.stash_chunked_request(req)
+                self.req_to_token_pool.free(req)
+                req.init_next_round_input()
             res = adder.add_dllm_staging_req(req)
             if res == AddReqResult.NO_TOKEN:
                 return res
@@ -423,16 +429,3 @@ class DllmManager:
             setattr(self, queue_name, kept_queue)
 
         return aborted_reqs
-
-    def init_next_round(self) -> None:
-        """Initialize staging requests for next round and clear staging queue."""
-        fdfo = (
-            self.dllm_config is not None and self.dllm_config.first_done_first_out_mode
-        )
-        for req in self.staging_queue:
-            # Marker unset: this block is still open. Do not append the next mask
-            # block; the next forward takes tokens from FutureMap.
-            if fdfo and not req.dllm_block_done:
-                continue
-            req.init_next_round_input()
-        self.staging_queue = []
