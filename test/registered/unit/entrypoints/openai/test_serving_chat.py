@@ -25,7 +25,7 @@ from unittest.mock import Mock, patch
 
 from fastapi import Request
 
-from sglang.srt.entrypoints.openai import chat_encoding
+from sglang.srt.entrypoints.openai import chat_encoding, inkling_chat_adapter
 from sglang.srt.entrypoints.openai.chat_encoding import (
     resolve_dsv4_reasoning_effort_profile,
 )
@@ -4710,11 +4710,26 @@ _needs_tml_renderers = unittest.skipUnless(
 )
 
 
+def _inkling_serving() -> OpenAIServingChat:
+    serving = object.__new__(OpenAIServingChat)
+    serving.chat_encoding_spec = "inkling"
+    serving.reasoning_parser = "inkling"
+    serving.tool_call_parser = "inkling"
+    serving._inkling = inkling_chat_adapter.InklingChatAdapter(
+        reasoning_parser=serving.reasoning_parser,
+        tool_call_parser=serving.tool_call_parser,
+        tool_call_parsing_active=serving._tool_call_parsing_active,
+        history_tool_calls_cnt=serving._get_history_tool_calls_cnt,
+        tool_call_id=serving._process_tool_call_id,
+    )
+    return serving
+
+
 class InklingReasoningEffortTest(unittest.TestCase):
     """Inkling reasoning-effort mapping and validation."""
 
     def test_named_levels(self):
-        parse = OpenAIServingChat._parse_inkling_reasoning_effort
+        parse = inkling_chat_adapter.parse_reasoning_effort
         self.assertEqual(parse("none"), 0.0)
         self.assertEqual(parse("minimal"), 0.1)
         self.assertEqual(parse("low"), 0.2)
@@ -4726,7 +4741,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
         self.assertEqual(parse("max"), parse("xhigh"))
 
     def test_scalar_range_is_validated(self):
-        parse = OpenAIServingChat._parse_inkling_reasoning_effort
+        parse = inkling_chat_adapter.parse_reasoning_effort
         self.assertEqual(parse(0.5), 0.5)
         self.assertEqual(parse(0.99), 0.99)
         for value in (1.0, "1.0", 2.0, "1.5", -1.0, float("nan"), True):
@@ -4734,7 +4749,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
                 parse(value)
 
     def test_invalid_and_none(self):
-        parse = OpenAIServingChat._parse_inkling_reasoning_effort
+        parse = inkling_chat_adapter.parse_reasoning_effort
         self.assertIsNone(parse(None))
         with self.assertRaises(ValueError):
             parse("garbage")
@@ -4742,7 +4757,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
     def test_env_default(self):
         from sglang.srt.environ import envs
 
-        get = OpenAIServingChat._get_inkling_default_reasoning_effort
+        get = inkling_chat_adapter.get_default_reasoning_effort
         env = envs.SGLANG_INKLING_DEFAULT_REASONING_EFFORT
         try:
             env.clear()  # unset -> EnvStr default "0.9"
@@ -4782,8 +4797,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
     def test_serving_does_not_prefill_model_message(self):
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
 
-        serving = object.__new__(OpenAIServingChat)
-        serving.chat_encoding_spec = "inkling"
+        serving = _inkling_serving()
         request = ChatCompletionRequest(
             model="test-model",
             messages=[{"role": "user", "content": "hello"}],
@@ -4805,8 +4819,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
         render as an OPEN model text block."""
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
 
-        serving = object.__new__(OpenAIServingChat)
-        serving.chat_encoding_spec = "inkling"
+        serving = _inkling_serving()
         request = ChatCompletionRequest(
             model="test-model",
             messages=[
@@ -4839,8 +4852,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
         it must keep rendering as a closed historical turn."""
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
 
-        serving = object.__new__(OpenAIServingChat)
-        serving.chat_encoding_spec = "inkling"
+        serving = _inkling_serving()
         request = ChatCompletionRequest(
             model="test-model",
             messages=[
@@ -4880,11 +4892,7 @@ class InklingTokenOutputTest(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
-        self.serving = object.__new__(OpenAIServingChat)
-        self.serving.chat_encoding_spec = "inkling"
-        self.serving.reasoning_parser = "inkling"
-        self.serving.tool_call_parser = "inkling"
-        self.serving._inkling_token_output = True
+        self.inkling = _inkling_serving()._inkling
         self.request = ChatCompletionRequest(
             model="test-model",
             messages=[{"role": "user", "content": "weather?"}],
@@ -4916,10 +4924,10 @@ class InklingTokenOutputTest(CustomTestCase):
         ]
 
     def test_non_stream_maps_calls_and_finish_reason(self):
-        reasoning, content, tool_calls, finish_reason = (
-            self.serving._parse_inkling_response(
-                self.request, self._output_ids(), {"type": "stop", "matched": 200006}
-            )
+        reasoning, content, tool_calls, finish_reason = self.inkling.parse_response(
+            request=self.request,
+            output_ids=self._output_ids(),
+            finish_reason={"type": "stop", "matched": 200006},
         )
         self.assertEqual(reasoning, "plan")
         self.assertEqual(content, "")
@@ -4950,8 +4958,10 @@ class InklingTokenOutputTest(CustomTestCase):
             tokenizer.encode_special("end_message"),
             tokenizer.encode_special("content_model_end_sampling"),
         ]
-        _, content, tool_calls, _ = self.serving._parse_inkling_response(
-            request, output_ids, {"type": "stop", "matched": 200006}
+        _, content, tool_calls, _ = self.inkling.parse_response(
+            request=request,
+            output_ids=output_ids,
+            finish_reason={"type": "stop", "matched": 200006},
         )
         self.assertEqual(content, " 5, 7, 11")
         self.assertIsNone(tool_calls)
@@ -4960,7 +4970,7 @@ class InklingTokenOutputTest(CustomTestCase):
         """Non-incremental chunks carry the cumulative ids and an incremental
         abort chunk re-sends streamed ids; either way a token parsed twice
         would duplicate text."""
-        new_ids = OpenAIServingChat._new_inkling_output_ids
+        new_ids = inkling_chat_adapter.select_new_output_ids
         self.assertEqual(
             new_ids(
                 output_ids=[1, 2, 3, 4],
@@ -5011,7 +5021,7 @@ class InklingTokenOutputTest(CustomTestCase):
             incremental_streaming_output=incremental
         ):
             for ids, finish in steps:
-                chunks += self.serving._inkling_stream_chunks(
+                chunks += self.inkling.stream_chunks(
                     content={
                         "output_ids": ids,
                         "meta_info": {
@@ -5026,7 +5036,7 @@ class InklingTokenOutputTest(CustomTestCase):
                     has_tool_calls={} if has_tool_calls is None else has_tool_calls,
                     choice_logprobs=None,
                     finish_reason_type=finish and finish["type"],
-                    continuous_usage_stats=False,
+                    usage=None,
                 )
         return [
             json.loads(chunk[len("data: ") :])["choices"][0]["delta"]
@@ -5036,8 +5046,10 @@ class InklingTokenOutputTest(CustomTestCase):
     def _reasoning_and_content(
         self, request, output_ids, finish_reason, *, split=2
     ) -> dict:
-        reasoning, content, _, _ = self.serving._parse_inkling_response(
-            request, output_ids, finish_reason
+        reasoning, content, _, _ = self.inkling.parse_response(
+            request=request,
+            output_ids=output_ids,
+            finish_reason=finish_reason,
         )
         results = {"non-stream": (reasoning or "", content)}
         for incremental in (False, True):
@@ -5292,8 +5304,10 @@ class InklingTokenOutputTest(CustomTestCase):
             special("end_message"),
             eos,
         ]
-        _, _, tool_calls, finish_reason = self.serving._parse_inkling_response(
-            self.request, call, {"type": "stop", "matched": eos}
+        _, _, tool_calls, finish_reason = self.inkling.parse_response(
+            request=self.request,
+            output_ids=call,
+            finish_reason={"type": "stop", "matched": eos},
         )
         self.assertEqual(finish_reason["type"], "tool_calls")
         self.assertEqual(
