@@ -2,7 +2,9 @@
 
 import importlib.util
 import os
-import time
+import subprocess
+import sys
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -16,43 +18,67 @@ SPEC.loader.exec_module(PROCESS)
 kill_process_tree = PROCESS.kill_process_tree
 
 
-@unittest.skipUnless(hasattr(os, "fork"), "requires POSIX process semantics")
+@unittest.skipUnless(os.name == "posix", "requires POSIX process semantics")
 class TestKillProcessTree(unittest.TestCase):
     def setUp(self):
         self.children = []
 
     def tearDown(self):
-        for pid in self.children:
-            try:
-                os.kill(pid, 9)
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(pid, 0)
-            except ChildProcessError:
-                pass
+        for process in self.children:
+            # let the tree root reap its children before terminating the root
+            kill_process_tree(process.pid, include_parent=False)
+            kill_process_tree(process.pid)
+            process.wait(timeout=10)
 
     def spawn_child(self):
-        pid = os.fork()
-        if pid == 0:
-            while True:
-                time.sleep(60)
-        self.children.append(pid)
-        return pid
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(600)"]
+        )
+        self.children.append(process)
+        return process.pid
+
+    def spawn_tree(self):
+        script = textwrap.dedent(
+            """
+            import subprocess
+            import sys
+            import time
+
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(600)"]
+            )
+            print(child.pid, flush=True)
+            child.wait()
+            time.sleep(600)
+            """
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", script], stdout=subprocess.PIPE, text=True
+        )
+        self.children.append(process)
+        with process.stdout:
+            child_pid = int(process.stdout.readline())
+        return process.pid, child_pid
 
     def test_waits_for_killed_children(self):
-        child_pid = self.spawn_child()
+        parent_pid, child_pid = self.spawn_tree()
+        sibling_pid = self.spawn_child()
 
-        kill_process_tree(os.getpid(), include_parent=False)
+        kill_process_tree(parent_pid, include_parent=False)
 
         self.assertFalse(psutil.pid_exists(child_pid))
+        self.assertTrue(psutil.pid_exists(parent_pid))
+        self.assertTrue(psutil.pid_exists(sibling_pid))
 
     def test_skip_pid_keeps_child_alive(self):
-        child_pid = self.spawn_child()
+        parent_pid, child_pid = self.spawn_tree()
+        sibling_pid = self.spawn_child()
 
-        kill_process_tree(os.getpid(), include_parent=False, skip_pid=child_pid)
+        kill_process_tree(parent_pid, include_parent=False, skip_pid=child_pid)
 
         self.assertTrue(psutil.pid_exists(child_pid))
+        self.assertTrue(psutil.pid_exists(parent_pid))
+        self.assertTrue(psutil.pid_exists(sibling_pid))
 
     def test_waits_for_included_parent(self):
         child_pid = self.spawn_child()
