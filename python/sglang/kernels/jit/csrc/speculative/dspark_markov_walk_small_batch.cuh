@@ -207,11 +207,9 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
   };
   constexpr int kXchgWarp = kWarps - 1;
   const u64 n = gridDim.x;
-  auto tick = [](int) {};
   for (int k = 0; k < num_steps; ++k) {
     // u rows of all requests (prefetched into L2 by the CTAs that held a local winner)
     fetch_u(0);  // pass 0's u rows; pass p fetches pass p+1's
-    tick(0);
     for (int ps = 0; ps < npass; ++ps) {
       const int it = k * npass + ps, r0 = ps * kGrp, nr = min(kGrp, nb - r0);
       if (ps + 1 < npass) fetch_u(ps + 1);
@@ -220,7 +218,6 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
         const int rq = r0 + (g >> 1);
         int acc[NG + TS][4];
         gemv(acc, u_s + (rq < nb ? rq : nb) * kURowWords);
-        tick(1);
         if (tig < nr) {  // lane tig: request r0 + tig, rows g / g+8 of every tile of this warp
           const uint32_t* ur = u_s + (r0 + tig) * kURowWords;
           const float u_hi = __uint_as_float(ur[128]), u_lo = __uint_as_float(ur[129]);
@@ -232,10 +229,8 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
           }
         }
       }
-      tick(2);
       ptx::cp_async_wait<0>();  // this item's base (the only group in flight)
       __syncthreads();          // bias + base of item it visible; every thread is past item it-1's epilogue
-      tick(3);
       if (it + 1 < n_items) prefetch_base(it + 1);  // into the buffer item it-1 used
       // epilogue: wpr = kWarps / (nr rounded up to a power of 2) whole warps per request (8 for a lone request:
       // sampling's noise is the bulk of the work), lane's 8-row chunks (warp % wpr) * 32 + lane + 32 wpr j --
@@ -326,10 +321,8 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
         const unsigned lo = __reduce_max_sync(0xffffffffu, hi == mx ? static_cast<unsigned>(best) : 0u);
         if (lane == 0) wbest_s[b][warp % wpr] = (static_cast<u64>(mx) << 32) | lo;
       }
-      tick(4);
     }
     __syncthreads();  // every request's warp bests are in wbest_s
-    tick(5);
     if (warp == kXchgWarp) {
       // post: W1q[local winner] -> L2 (the global winner's row is then an L2 hit for every CTA), atomicMax of the
       // key, then the arrival count with release semantics (orders this lane's max before its arrival)
@@ -370,7 +363,6 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
       }
     }
     __syncthreads();
-    tick(6);
   }
   // every CTA has seen every final count (no CTA still reads this round's state): CTA 0 closes the round
   if (blockIdx.x == 0 && threadIdx.x == 0) ptx::st_relaxed(state, round + 1);

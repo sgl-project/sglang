@@ -290,7 +290,7 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
 
 #pragma unroll 2
     for (int t = phase; t < kTiles; t += wpb) {
-      // mask & bit: nvcc 13.1 compiles (kStreamMask >> t) & 1 into a longer bit test (2 more SASS per tile)
+      // mask & bit, not (kStreamMask >> t) & 1: the shift form compiles to a longer bit test (2 more SASS per tile)
       const bool streamed = (kStreamMask & (1u << t)) != 0u;
       unsigned bd;
       int q = 0;

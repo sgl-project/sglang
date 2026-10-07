@@ -51,8 +51,7 @@ SGL_DEVICE void st_relaxed(unsigned long long* p, unsigned long long v) {
 // HARDWARE ASSUMPTION: a 16-B aligned ld.relaxed.gpu.v2.u64 observes both words at one point in L2 (single-copy
 // atomic), so the load that sees the final count also sees every max ordered before it.  PTX does not promise this
 // (vector accesses are modelled as unordered scalar accesses, and a relaxed load does not synchronize with the
-// release); it holds on H100 (sm_90), where an aligned 16-B load is served by one L2 sector access.  Stress-tested
-// with a per-CTA record of every exchanged token (1e8 exchanges, no disagreement).
+// release); it holds on H100 (sm_90), where an aligned 16-B load is served by one L2 sector access.
 SGL_DEVICE ulonglong2 ld_relaxed_v2(const unsigned long long* p) {
   ulonglong2 v;
   asm volatile("ld.relaxed.gpu.global.v2.u64 {%0, %1}, [%2];" : "=l"(v.x), "=l"(v.y) : "l"(p) : "memory");
