@@ -672,29 +672,15 @@ pub(crate) fn normalize_bootstrap_columns(
     prompt_count: usize,
     choices_per_prompt: usize,
 ) -> Result<BootstrapColumns, Error> {
-    let bootstrap_hosts = match hosts {
-        Some(OneOrMany::One(host)) => {
-            // Charge both prompt and choice clones before broadcasting.
-            check_broadcast_budget(
-                host.heap_bytes(),
-                prompt_count.saturating_mul(choices_per_prompt),
-                "bootstrap_host",
-            )?;
-            vec![host; prompt_count]
-        }
-        other => {
-            if choices_per_prompt > 1
-                && let Some(OneOrMany::Many(hosts)) = &other
-            {
-                check_broadcast_budget(
-                    hosts.iter().map(HeapBytes::heap_bytes).sum(),
-                    choices_per_prompt,
-                    "bootstrap_host",
-                )?;
-            }
-            flatten_column(fan_out(other, prompt_count, "bootstrap_host")?)
-        }
-    };
+    let bootstrap_hosts = flatten_column(fan_out(hosts, prompt_count, "bootstrap_host")?);
+    // Prompt expansion is already bounded; charge the choices before admission.
+    if choices_per_prompt > 1 {
+        check_broadcast_budget(
+            bootstrap_hosts.iter().map(HeapBytes::heap_bytes).sum(),
+            choices_per_prompt,
+            "bootstrap_host",
+        )?;
+    }
     let bootstrap_ports = flatten_column(fan_out(ports, prompt_count, "bootstrap_port")?);
     let bootstrap_rooms = match rooms {
         // Wrapping preserves distinct pairing keys at the i64 boundary;
