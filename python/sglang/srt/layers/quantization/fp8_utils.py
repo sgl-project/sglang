@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 from functools import lru_cache, partial
-from typing import Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
 
@@ -32,7 +32,6 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import (
     get_exec,
-    get_parallel,
     get_platform,
 )
 from sglang.srt.utils import (
@@ -54,6 +53,9 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.custom_op import register_custom_op
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.linear import LinearBase
 
 logger = logging.getLogger(__name__)
 
@@ -2515,7 +2517,7 @@ def apply_fp8_ptpc_linear(
 
 
 def validate_fp8_block_shape(
-    layer: torch.nn.Module,
+    layer: LinearBase,
     input_size: int,
     output_size: int,
     input_size_per_partition: int,
@@ -2524,9 +2526,9 @@ def validate_fp8_block_shape(
 ) -> None:
     """Validate block quantization shapes for tensor parallelism."""
 
-    # Lazy: a ``getattr`` default would read the published bag even for a
-    # layer that carries its own tp_size.
-    tp_size = layer.tp_size if hasattr(layer, "tp_size") else get_parallel().tp_size
+    tp_group = layer.tp_group
+
+    tp_size = tp_group.world_size if tp_group is not None else 1
     block_n, block_k = block_size[0], block_size[1]
 
     # Required by row parallel

@@ -1,6 +1,5 @@
 """Dense MLP placement stays frozen while reduction uses its own policy."""
 
-import inspect
 import unittest
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
@@ -10,12 +9,13 @@ import torch.nn.functional as F
 
 from sglang.srt.models.inkling_common import dense_mlp
 from sglang.srt.models.llama import LlamaMLP
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, stage="weekly", runner_config="cpu")
 
 
 def build_mlp(
@@ -44,18 +44,7 @@ def build_mlp(
             use_global_scale=True, layer_id=0, fused=fused, tp_group=execution_group
         )
     if group is not None:
-        if "parallel_group" in inspect.signature(cls).parameters:
-            kwargs["parallel_group"] = group
-        else:
-            parallel = get_parallel()
-            rank, size = (
-                (0, 1)
-                if group == "replicated"
-                else (parallel.attn_tp_rank, parallel.attn_tp_size)
-                if group == "attn_tp"
-                else (parallel.tp_rank, parallel.tp_size)
-            )
-            kwargs.update(tp_rank=rank, tp_size=size)
+        kwargs["parallel_group"] = group
     with patch.object(dense_mlp, "lora_compatible_layout_enabled", return_value=lora):
         module = cls(**kwargs)
     return module
@@ -71,11 +60,11 @@ def load_projection(layer):
     ).to(layer.weight.dtype) / 64
     layer.weight.weight_loader(layer.weight, weight)
     if row:
-        expected = weight.chunk(layer.tp_size, dim=1)[layer.tp_rank]
+        expected = weight.chunk(rank_size(layer)[1], dim=1)[rank_size(layer)[0]]
     else:
         expected = torch.cat(
             [
-                part.chunk(layer.tp_size)[layer.tp_rank]
+                part.chunk(rank_size(layer)[1])[rank_size(layer)[0]]
                 for part in weight.split(layer.output_sizes)
             ]
         )
@@ -121,7 +110,7 @@ class TestLlamaInklingParallelGroups(CustomTestCase):
                                 "attn_tp": (1, 2),
                                 "replicated": (0, 1),
                             }[expected_group]
-                            with get_parallel().override(
+                            with parallel_scope(
                                 tp_rank=0, attn_dp_rank=0, attn_tp_rank=0
                             ):
                                 a, b = load_projection(up), load_projection(down)
@@ -141,9 +130,7 @@ class TestLlamaInklingParallelGroups(CustomTestCase):
                             tp.all_reduce.reset_mock()
                             attn.all_reduce.reset_mock()
                             with (
-                                get_parallel().override(
-                                    tp_group=tp, attn_tp_group=attn
-                                ),
+                                parallel_scope(tp_group=tp, attn_tp_group=attn),
                                 patch(
                                     "sglang.srt.layers.linear.is_allocation_symmetric",
                                     return_value=False,
@@ -179,8 +166,8 @@ class TestLlamaInklingParallelGroups(CustomTestCase):
                                     )
                                 else:
                                     comm.assert_not_called()
-                            self.assertEqual((up.tp_rank, up.tp_size), (rank, size))
-                            self.assertEqual((down.tp_rank, down.tp_size), (rank, size))
+                            self.assertEqual(rank_size(up), (rank, size))
+                            self.assertEqual(rank_size(down), (rank, size))
                             self.assertEqual(down.reduce_results, row_reduce)
                             self.assertEqual(down.use_dp_attention_reduce, dp_reduce)
 
@@ -202,7 +189,7 @@ class TestLlamaInklingParallelGroups(CustomTestCase):
             module.act_fn.forward = function._torchdynamo_orig_callable
             module.scattered_sconv = True
             with (
-                get_parallel().override(tp_group=Mock()),
+                parallel_scope(tp_group=Mock()),
                 patch(
                     "sglang.srt.layers.linear.use_symmetric_memory",
                     return_value=nullcontext(),

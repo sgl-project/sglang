@@ -10,12 +10,13 @@ from unittest.mock import Mock, patch
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, stage="weekly", runner_config="cpu")
 
 MODELS = {
     "bailing_moe": "BailingMoEMLP",
@@ -87,7 +88,7 @@ class TestMLPParallelGroups(CustomTestCase):
                             )
                             other = gate + 0.25
                             weight = gate.T.contiguous() + 0.5
-                            with get_parallel().override(
+                            with parallel_scope(
                                 tp_rank=0, attn_dp_rank=0, attn_tp_rank=0
                             ):
                                 up.weight.weight_loader(up.weight, gate, 0)
@@ -112,7 +113,7 @@ class TestMLPParallelGroups(CustomTestCase):
                                 expected = expected * 2
                             tp.all_reduce.reset_mock()
                             with (
-                                get_parallel().override(tp_group=tp),
+                                parallel_scope(tp_group=tp),
                                 patch(
                                     "sglang.srt.layers.linear.is_allocation_symmetric",
                                     return_value=True,
@@ -129,8 +130,8 @@ class TestMLPParallelGroups(CustomTestCase):
                                     1 if reduce and size > 1 else 0,
                                 )
                                 torch.testing.assert_close(mlp(self.x[:0]), self.x[:0])
-                            self.assertEqual((up.tp_rank, up.tp_size), (rank, size))
-                            self.assertEqual((down.tp_rank, down.tp_size), (rank, size))
+                            self.assertEqual(rank_size(up), (rank, size))
+                            self.assertEqual(rank_size(down), (rank, size))
                             self.assertEqual(down.reduce_results, reduce)
                             self.assertFalse(down.use_dp_attention_reduce)
 

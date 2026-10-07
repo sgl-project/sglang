@@ -144,13 +144,13 @@ class Qwen3_VisionMLP(nn.Module):
         parallel_group = _resolve_vision_parallel_group(
             use_data_parallel=use_data_parallel, parallel_group=parallel_group
         )
-        self.tp_rank, self.tp_size = resolve_linear_parallel_group(parallel_group)
+        _, tp_size = resolve_linear_parallel_group(parallel_group)
         # TODO: this layer shards over attention TP but reduces over the full TP
         # group without attention DP; reduce over the attention-TP group so
         # attention CP narrower than TP can run it.
         reject_attn_tp_shard_with_tp_reduce(
             type(self).__name__,
-            shard_tp_size=self.tp_size,
+            shard_tp_size=tp_size,
             reduces_over_attn_tp=is_dp_attention_enabled(),
             multimodal_encoder=True,
             hint=", or --mm-enable-dp-encoder where the model supports it",
@@ -163,6 +163,7 @@ class Qwen3_VisionMLP(nn.Module):
             prefix=add_prefix("linear_fc1", prefix),
             parallel_group=parallel_group,
         )
+        self.tp_group = self.linear_fc1.tp_group
         self.linear_fc2 = RowParallelLinear(
             hidden_features,
             in_features,
@@ -319,13 +320,13 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             parallel_group = _resolve_vision_parallel_group(
                 use_data_parallel=use_data_parallel, parallel_group=parallel_group
             )
-            self.tp_rank, self.tp_size = resolve_linear_parallel_group(parallel_group)
+            _, tp_size = resolve_linear_parallel_group(parallel_group)
             # TODO: this layer shards over attention TP but reduces over the full TP
             # group without attention DP; reduce over the attention-TP group so
             # attention CP narrower than TP can run it.
             reject_attn_tp_shard_with_tp_reduce(
                 type(self).__name__,
-                shard_tp_size=self.tp_size,
+                shard_tp_size=tp_size,
                 reduces_over_attn_tp=is_dp_attention_enabled(),
                 multimodal_encoder=True,
                 hint=", or --mm-enable-dp-encoder where the model supports it",
@@ -338,6 +339,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
                 prefix=add_prefix("linear_fc1", prefix),
                 parallel_group=parallel_group,
             )
+            self.tp_group = self.linear_fc1.tp_group
             self.act_fn = nn.GELU()
             self.linear_fc2 = RowParallelLinear(
                 self.padded_context_dim,

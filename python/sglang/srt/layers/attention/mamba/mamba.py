@@ -413,12 +413,19 @@ class MambaMixer2(torch.nn.Module):
         self.dt_bias = nn.Parameter(torch.ones(num_heads // self.tp_size))
         self.use_rms_norm = use_rms_norm
 
-        set_weight_attrs(self.D, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.D,
+            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
+        )
         a_weight_loader = composed_weight_loader(
-            sharded_weight_loader(0), lambda x: -torch.exp(x.float())
+            sharded_weight_loader(0, parallel_group=parallel_group),
+            lambda x: -torch.exp(x.float()),
         )
         set_weight_attrs(self.A, {"weight_loader": a_weight_loader})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.dt_bias,
+            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
+        )
 
         # By default the stage boundary reduces the output under DP attention.
         if reduce_results is None:

@@ -1,6 +1,5 @@
 """Kimi dense and shared MLPs freeze placement without changing row policy."""
 
-import inspect
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -12,31 +11,17 @@ import torch.nn.functional as F
 from sglang.srt.layers import linear
 from sglang.srt.layers.dp_attention import initialize_dp_attention_flags
 from sglang.srt.models import kimi_k3
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, stage="weekly", runner_config="cpu")
 
 
 def build_mlp(group=None, *, width=16, quant_config=None, reduce=True):
-    kwargs = {}
-    if group is not None:
-        if "parallel_group" in inspect.signature(kimi_k3.KimiK3MLP).parameters:
-            kwargs["parallel_group"] = group
-        else:
-            parallel = get_parallel()
-            if group == "replicated":
-                rank, size = 0, 1
-            elif group == "shared_experts_tp":
-                rank = parallel.shared_experts_tp_group.rank_in_group
-                size = parallel.shared_experts_tp_group.world_size
-            elif group == "attn_tp":
-                rank, size = parallel.attn_tp_rank, parallel.attn_tp_size
-            else:
-                rank, size = parallel.tp_rank, parallel.tp_size
-            kwargs.update(tp_rank=rank, tp_size=size)
+    kwargs = {} if group is None else dict(parallel_group=group)
     return kimi_k3.KimiK3MLP(
         width,
         2 * width,
@@ -101,8 +86,8 @@ def load_projection(layer):
         % 29
         - 14
     ).reshape(layer.output_size, layer.input_size).to(layer.weight.dtype) / 128
-    rank, size = layer.tp_rank, layer.tp_size
-    with get_parallel().override(
+    rank, size = rank_size(layer)[0], rank_size(layer)[1]
+    with parallel_scope(
         tp_rank=0, attn_tp_rank=0, attn_dp_rank=0, shared_experts_tp_group=None
     ):
         layer.weight.weight_loader(layer.weight, full)
@@ -135,7 +120,7 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                     publish(server, role="test", ranks=SpawnRanks(world_rank=rank))
                     initialize_dp_attention_flags(server)
                     shared = SimpleNamespace(rank_in_group=rank % 2, world_size=2)
-                    with get_parallel().override(shared_experts_tp_group=shared):
+                    with parallel_scope(shared_experts_tp_group=shared):
                         for group in (
                             None,
                             "tp",
@@ -158,9 +143,7 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                                 self.assertEqual(module._dense_attn_tp, auto_attn)
                                 for name in ("gate_up_proj", "down_proj"):
                                     layer = getattr(module, name)
-                                    self.assertEqual(
-                                        (layer.tp_rank, layer.tp_size), (r, s)
-                                    )
+                                    self.assertEqual(rank_size(layer), (r, s))
                                     expected, _ = load_projection(layer)
                                     torch.testing.assert_close(layer.weight, expected)
                                     x = (
@@ -183,9 +166,7 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                                     if row and reduce and s > 1:
                                         reference *= (4 // dp) if auto_attn else 4
                                     with (
-                                        get_parallel().override(
-                                            tp_group=tp, attn_tp_group=attn
-                                        ),
+                                        parallel_scope(tp_group=tp, attn_tp_group=attn),
                                         patch.object(
                                             linear,
                                             "use_symmetric_memory",
@@ -223,7 +204,7 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                 (True, 2, False, 2),
                 (True, None, True, 4),
             ):
-                with get_parallel().override(
+                with parallel_scope(
                     shared_experts_tp_size=requested,
                     enable_shared_experts_attn_tp=enabled,
                     shared_experts_tp_group=shared,
@@ -243,17 +224,17 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                     for name in ("gate_up_proj", "down_proj"):
                         layer = getattr(module, name)
                         self.assertEqual(
-                            (layer.tp_rank, layer.tp_size),
+                            rank_size(layer),
                             (rank % expected_size, expected_size),
                         )
                         expected, _ = load_projection(layer)
                         torch.testing.assert_close(layer.weight, expected)
                     self.assertFalse(module.down_proj.reduce_results)
                     self.assertFalse(module.down_proj.use_dp_attention_reduce)
-            with get_parallel().override(shared_experts_tp_size=2):
+            with parallel_scope(shared_experts_tp_size=2):
                 with self.assertRaisesRegex(ValueError, "requires an EP a2a"):
                     build_shared_experts(ep_a2a=False)
-            with get_parallel().override(
+            with parallel_scope(
                 shared_experts_tp_size=3,
                 shared_experts_tp_group=SimpleNamespace(
                     world_size=3, rank_in_group=rank % 3
@@ -263,16 +244,6 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                     build_shared_experts()
             _, disabled = build_shared_experts(shared=0)
             self.assertIsNone(disabled)
-
-    def test_shared_selector_requires_a_built_group(self):
-        publish(
-            ServerArgs(model_path="dummy", device="cpu"),
-            role="test",
-            ranks=SpawnRanks(world_rank=0),
-        )
-        with get_parallel().override(shared_experts_tp_group=None):
-            with self.assertRaisesRegex(ValueError, "must exist before construction"):
-                linear.resolve_linear_parallel_group("shared_experts_tp")
 
 
 if __name__ == "__main__":

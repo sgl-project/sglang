@@ -54,7 +54,6 @@ from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
-    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -151,7 +150,6 @@ class Qwen2_5_VLMLP(nn.Module):
             parallel_group = "replicated"
         elif parallel_group is None:
             parallel_group = "tp"
-        self.tp_rank, self.tp_size = resolve_linear_parallel_group(parallel_group)
         self.fuse_gate_up = fuse_gate_up
         if fuse_gate_up:
             self.gate_up_proj = MergedColumnParallelLinear(
@@ -178,7 +176,11 @@ class Qwen2_5_VLMLP(nn.Module):
                 **projection_kwargs,
                 prefix=add_prefix("up_proj", prefix),
             )
-        if not self.fuse_gate_up and self.tp_size == 1:
+        self.tp_group = (
+            self.gate_up_proj if self.fuse_gate_up else self.gate_proj
+        ).tp_group
+        tp_size = self.tp_group.world_size if self.tp_group is not None else 1
+        if not self.fuse_gate_up and tp_size == 1:
             self.down_proj = ReplicatedLinear(
                 hidden_features,
                 in_features,

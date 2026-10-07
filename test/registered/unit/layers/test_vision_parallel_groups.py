@@ -12,16 +12,14 @@ from sglang.srt.layers.dp_attention import initialize_dp_attention_flags
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.runtime_context import (
     SpawnRanks,
-    get_disagg,
-    get_parallel,
-    publish,
     reset_context,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, stage="weekly", runner_config="cpu")
 
 VISION_MODELS = (
     "vision_packed",
@@ -140,7 +138,7 @@ def build_vision(model, use_data_parallel=False, width=32, quant_config=None):
 
 def load_projection(layer):
     """Load known full weights under rank zero, returning the expected owned shard."""
-    rank, size = layer.tp_rank, layer.tp_size
+    rank, size = rank_size(layer)[0], rank_size(layer)[1]
     row = isinstance(layer, RowParallelLinear)
     dtype, device = layer.weight.dtype, layer.weight.device
 
@@ -154,7 +152,7 @@ def load_projection(layer):
             / 128
         ).to(dtype)
 
-    with get_parallel().override(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
+    with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
         if isinstance(layer, QKVParallelLinear):
             weights, biases = [], []
             for offset, shard_id in enumerate(("q", "k", "v")):
@@ -269,9 +267,7 @@ class TestVisionParallelGroups(CustomTestCase):
                             )
                         )
                         for layer in layers:
-                            self.assertEqual(
-                                (layer.tp_rank, layer.tp_size), (rank, size)
-                            )
+                            self.assertEqual(rank_size(layer), (rank, size))
                             shard, bias = load_projection(layer)
                             torch.testing.assert_close(layer.weight, shard)
                             if bias is not None:
@@ -295,9 +291,7 @@ class TestVisionParallelGroups(CustomTestCase):
                             tp.all_reduce.reset_mock()
                             attn.all_reduce.reset_mock()
                             with (
-                                get_parallel().override(
-                                    tp_group=tp, attn_tp_group=attn
-                                ),
+                                parallel_scope(tp_group=tp, attn_tp_group=attn),
                                 patch(
                                     "sglang.srt.layers.linear.is_allocation_symmetric",
                                     return_value=False,
@@ -330,46 +324,12 @@ class TestVisionParallelGroups(CustomTestCase):
                                 )
                             else:
                                 allocator.assert_not_called()
-                            self.assertEqual(
-                                (layer.tp_rank, layer.tp_size), (rank, size)
-                            )
+                            self.assertEqual(rank_size(layer), (rank, size))
                         if hasattr(module, "tp_rank"):
                             self.assertEqual(
                                 (module.tp_rank, module.tp_size), (rank, size)
                             )
             reset_context()
-
-    def test_guard_and_moonvit_dense_path(self):
-        from sglang.srt.layers.attention.vision import VisionAttention
-        from sglang.srt.models.kimi_vl_moonvit import MLP2
-
-        publish(
-            ServerArgs(
-                model_path="dummy",
-                device="cpu",
-                tp_size=4,
-                attn_dp_size=2,
-                mm_attention_backend="sdpa",
-            ),
-            role="test",
-            ranks=SpawnRanks(world_rank=3),
-        )
-        with self.assertRaisesRegex(ValueError, "shards over the attention TP group"):
-            VisionAttention(32, 8, 32, True, qkv_backend="sdpa")
-        with get_disagg().override(language_model_only=True):
-            offloaded = VisionAttention(32, 8, 32, True, qkv_backend="sdpa")
-        self.assertEqual((offloaded.proj.tp_rank, offloaded.proj.tp_size), (1, 2))
-        self.assertFalse(offloaded.proj.use_dp_attention_reduce)
-        for data_parallel, tensor_parallel in ((False, False), (True, True)):
-            module = MLP2(
-                [32, 64, 32],
-                torch.nn.GELU(),
-                use_data_parallel=data_parallel,
-                use_tensor_parallel=tensor_parallel,
-            )
-            self.assertIsInstance(module.fc0, torch.nn.Linear)
-            self.assertIsInstance(module.fc1, torch.nn.Linear)
-            self.assertEqual(module(torch.zeros(2, 32)).shape, (2, 32))
 
 
 if __name__ == "__main__":

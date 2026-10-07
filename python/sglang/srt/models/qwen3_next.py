@@ -192,8 +192,14 @@ class Qwen3GatedDeltaNet(nn.Module):
             torch.zeros(self.num_v_heads // self.attn_tp_size, dtype=torch.float32)
         )
 
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.A_log,
+            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
+        )
+        set_weight_attrs(
+            self.dt_bias,
+            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
+        )
         self.norm = (
             RMSNormGated(
                 self.head_v_dim,
@@ -283,9 +289,14 @@ class Qwen3GatedDeltaNet(nn.Module):
                 # Fused checkpoint: weight is in packed (per-head-group)
                 # format. Do contiguous TP slice like ColumnParallelLinear.
                 output_dim = getattr(param, "output_dim", None)
-                if output_dim is not None and module.tp_size > 1:
+                group = module.tp_group
+                if (
+                    output_dim is not None
+                    and group is not None
+                    and group.world_size > 1
+                ):
                     shard_size = param.data.shape[output_dim]
-                    start_idx = module.tp_rank * shard_size
+                    start_idx = group.rank_in_group * shard_size
                     if (
                         _is_cpu and _is_amx_available
                     ) and start_idx + shard_size > loaded_weight.shape[output_dim]:

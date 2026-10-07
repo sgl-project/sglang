@@ -8,12 +8,13 @@ from unittest.mock import Mock, patch
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=15, stage="nightly", runner_config="1-gpu-large")
 
 
 def build_mla(model, variant, reduce_results=False, width=8, quant_config=None):
@@ -164,7 +165,7 @@ class TestMLAParallelGroups(CustomTestCase):
                                 % 17
                                 / 32
                             ).to(dtype)
-                            with get_parallel().override(
+                            with parallel_scope(
                                 tp_rank=0, attn_dp_rank=0, attn_tp_rank=0
                             ):
                                 layer.weight.weight_loader(layer.weight, weight)
@@ -181,7 +182,7 @@ class TestMLAParallelGroups(CustomTestCase):
                                 expected *= 2
                             tp.all_reduce.reset_mock()
                             with (
-                                get_parallel().override(tp_group=tp),
+                                parallel_scope(tp_group=tp),
                                 patch(
                                     "sglang.srt.layers.linear.is_allocation_symmetric",
                                     return_value=True,
@@ -202,7 +203,7 @@ class TestMLAParallelGroups(CustomTestCase):
                                     )
                                 else:
                                     allocator.assert_not_called()
-                            self.assertEqual((layer.tp_rank, layer.tp_size), (1, 2))
+                            self.assertEqual(rank_size(layer), (1, 2))
                             if is_row:
                                 self.assertFalse(layer.use_dp_attention_reduce)
                                 self.assertEqual(

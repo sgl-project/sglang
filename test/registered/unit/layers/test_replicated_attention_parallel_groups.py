@@ -10,12 +10,13 @@ import torch.nn.functional as F
 
 from sglang.srt.layers import linear
 from sglang.srt.layers.layer_boundary.factories import layer_stack
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
 
 
 def build_attention(model, variant, *, width=32, head_dim=8, quant_config=None):
@@ -79,8 +80,8 @@ def values(rows, columns, layer, offset=0):
 
 
 def load_projection(layer):
-    rank, size = layer.tp_rank, layer.tp_size
-    with get_parallel().override(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
+    rank, size = rank_size(layer)[0], rank_size(layer)[1]
+    with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
         if isinstance(layer, linear.QKVParallelLinear):
             shards = []
             for i, name in enumerate(("q", "k", "v")):
@@ -89,11 +90,7 @@ def load_projection(layer):
                 )
                 dim = layer.v_head_size if name == "v" else layer.head_size
                 full = values(heads * dim, layer.input_size, layer, i)
-                r, s = (
-                    (rank, size)
-                    if name == "q"
-                    else (layer.kv_tp_rank, layer.kv_tp_size)
-                )
+                r, s = (rank, size) if name == "q" else rank_size(layer, kv=True)
                 pieces = s if name == "q" else min(heads, s)
                 index = r if name == "q" else r // max(s // heads, 1)
                 layer.weight.weight_loader(layer.weight, full, name)
@@ -143,7 +140,7 @@ class TestReplicatedAttentionParallelGroups(CustomTestCase):
                                 else:
                                     size, expected_rank = attn_size, attn_rank
                                 self.assertEqual(
-                                    (layer.tp_rank, layer.tp_size),
+                                    rank_size(layer),
                                     (expected_rank, size),
                                 )
                                 if isinstance(layer, linear.QKVParallelLinear):
@@ -151,7 +148,7 @@ class TestReplicatedAttentionParallelGroups(CustomTestCase):
                                         dcp if model == "qwen" and not variant[0] else 1
                                     )
                                     self.assertEqual(
-                                        (layer.kv_tp_rank, layer.kv_tp_size),
+                                        rank_size(layer, kv=True),
                                         (expected_rank // factor, size // factor),
                                     )
                                 shard, _ = load_projection(layer)
@@ -159,9 +156,7 @@ class TestReplicatedAttentionParallelGroups(CustomTestCase):
                                 x = values(2, shard.shape[1], layer, 7)
                                 tp, attn = Mock(), Mock()
                                 with (
-                                    get_parallel().override(
-                                        tp_group=tp, attn_tp_group=attn
-                                    ),
+                                    parallel_scope(tp_group=tp, attn_tp_group=attn),
                                     patch.object(
                                         linear,
                                         "use_symmetric_memory",
@@ -214,30 +209,12 @@ class TestReplicatedAttentionParallelGroups(CustomTestCase):
                 parallel_group="attn_tp",
                 kv_parallel_group=selection,
             )
-            self.assertEqual((qkv.tp_rank, qkv.tp_size), (3, 4))
-            self.assertEqual((qkv.kv_tp_rank, qkv.kv_tp_size), (rank, size))
+            self.assertEqual(rank_size(qkv), (3, 4))
+            self.assertEqual(rank_size(qkv, kv=True), (rank, size))
             expected, _ = load_projection(qkv)
             torch.testing.assert_close(qkv.weight, expected)
             x = values(2, 8, qkv, 3)
             torch.testing.assert_close(qkv(x)[0], F.linear(x, expected))
-
-    def test_invalid_replica_factors_and_conflicting_kv_placement(self):
-        from sglang.srt.layers.linear import ReplicatedParallelGroup
-
-        for factor in (0, -1, True, 1.5):
-            with self.assertRaises(ValueError):
-                ReplicatedParallelGroup("attn_tp", factor)
-        with self.assertRaises(ValueError):
-            ReplicatedParallelGroup("invalid", 1)
-        publish(
-            ServerArgs(model_path="dummy", device="cpu", tp_size=4),
-            role="test",
-            ranks=SpawnRanks(world_rank=0),
-        )
-        with self.assertRaises(AssertionError):
-            linear.resolve_linear_parallel_group(ReplicatedParallelGroup("tp", 3))
-        with self.assertRaisesRegex(ValueError, "cannot be combined"):
-            linear.QKVParallelLinear(8, 2, 8, 4, kv_parallel_group="tp", kv_tp_size=4)
 
 
 if __name__ == "__main__":

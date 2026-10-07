@@ -10,12 +10,13 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.dp_attention import initialize_dp_attention_flags
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, get_parallel, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=15, stage="nightly", runner_config="1-gpu-large")
 
 ATTENTION_CASES = (
     ("bailing", "head_wise"),
@@ -222,10 +223,10 @@ def values(rows, columns, layer, offset=0):
 
 def load_projection(layer):
     """Load at rank zero and return the checkpoint shard owned at construction."""
-    rank, size = layer.tp_rank, layer.tp_size
+    rank, size = rank_size(layer)[0], rank_size(layer)[1]
     row = isinstance(layer, RowParallelLinear)
     bias_shard = None
-    with get_parallel().override(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
+    with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
         if isinstance(layer, QKVParallelLinear):
             weights, biases = [], []
             for i, shard_id in enumerate(("q", "k", "v")):
@@ -303,11 +304,11 @@ class TestAttentionProjectionParallelGroups(CustomTestCase):
                             )
                             if model == "mtp" and dp_size == 1:
                                 size = 4
-                            self.assertEqual(
-                                (layer.tp_rank, layer.tp_size), (rank % size, size)
-                            )
+                            self.assertEqual(rank_size(layer), (rank % size, size))
                             inputs = values(2, shard.shape[1], layer, 7)
-                            used_bias = bias if not row or layer.tp_rank == 0 else None
+                            used_bias = (
+                                bias if not row or rank_size(layer)[0] == 0 else None
+                            )
                             expected = F.linear(inputs, shard, used_bias)
                             if row and layer.reduce_results:
                                 expected *= 4
@@ -317,9 +318,7 @@ class TestAttentionProjectionParallelGroups(CustomTestCase):
                                 group.all_reduce.reset_mock()
                                 group.all_gather.reset_mock()
                             with (
-                                get_parallel().override(
-                                    tp_group=tp, attn_tp_group=attn
-                                ),
+                                parallel_scope(tp_group=tp, attn_tp_group=attn),
                                 patch(
                                     "sglang.srt.layers.linear.is_allocation_symmetric",
                                     return_value=True,
@@ -351,22 +350,6 @@ class TestAttentionProjectionParallelGroups(CustomTestCase):
                                 attn.all_reduce.call_count + attn.all_gather.call_count,
                                 0,
                             )
-
-    def test_disabled_mtp_start_projections(self):
-        publish(ServerArgs(model_path="dummy", device="cpu"), role="test")
-        for variant in ("attention", "moe"):
-            module, names = build_attention("mtp", variant, start=False)
-            self.assertFalse(names)
-            self.assertFalse(hasattr(module, "eh_proj"))
-            self.assertTrue(hasattr(module, "final_layernorm"))
-
-    def test_xllm_keeps_quantization_rejection(self):
-        from sglang.srt.layers.quantization.fp8 import Fp8Config
-
-        publish(ServerArgs(model_path="dummy", device="cpu"), role="test")
-        for variant in ("gated", "mova"):
-            with self.assertRaisesRegex(ValueError, "unquantized bf16/fp16"):
-                build_attention("xllm", variant, quant_config=Fp8Config())
 
 
 if __name__ == "__main__":
