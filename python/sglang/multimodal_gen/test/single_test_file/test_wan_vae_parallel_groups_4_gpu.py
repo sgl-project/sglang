@@ -102,7 +102,7 @@ def _worker(sp_size, tp_size):
 @pytest.mark.parametrize("sp_size,tp_size", [(1, 4), (2, 2), (4, 1)])
 def test_wan_vae_parallel_groups(sp_size, tp_size):
     if not torch.cuda.is_available() or torch.cuda.device_count() < 4:
-        pytest.skip("requires four CUDA GPUs")
+        pytest.fail("requires four CUDA GPUs")
     process = subprocess.Popen(
         [
             sys.executable,
