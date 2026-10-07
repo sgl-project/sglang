@@ -263,24 +263,11 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
     let top_logprobs_nums = fan_out(top_logprobs_num, n, "top_logprobs_num")?;
     let return_hidden = fan_out(return_hidden_states, n, "return_hidden_states")?;
 
-    // PD fields fan out like Python `_normalize_bootstrap_params`: scalars
-    // broadcast — except a scalar `bootstrap_room`, which becomes `room + i`
-    // (each item needs a distinct room; rooms are the P↔D pairing key).
-    // `fan_out` yields `Option<Option<T>>` for these nullable elements
-    // (outer: absent, inner: an explicit `null` element) — flatten, both
-    // mean "not set" downstream.
-    let bootstrap_hosts = flatten_column(fan_out(bootstrap_host, n, "bootstrap_host")?);
-    let bootstrap_ports = flatten_column(fan_out(bootstrap_port, n, "bootstrap_port")?);
-    let bootstrap_rooms = match bootstrap_room {
-        // `wrapping_add`, not `checked_`: rooms are drawn from `[0, 2^63)`,
-        // so a batch can only overflow by starting within `n` of `i64::MAX`
-        // — and distinct-but-wrapped still pairs P↔D, where saturating
-        // would collide every item onto one room.
-        Some(OneOrMany::One(Some(room))) => {
-            (0..n).map(|i| Some(room.wrapping_add(i as i64))).collect()
-        }
-        other => flatten_column(fan_out(other, n, "bootstrap_room")?),
-    };
+    let BootstrapColumns {
+        bootstrap_hosts,
+        bootstrap_ports,
+        bootstrap_rooms,
+    } = normalize_bootstrap_columns(bootstrap_host, bootstrap_port, bootstrap_room, n, 1)?;
     let bootstrap_pair_keys = flatten_column(fan_out(bootstrap_pair_key, n, "bootstrap_pair_key")?);
     let decode_tp_sizes = flatten_column(fan_out(decode_tp_size, n, "decode_tp_size")?);
     // `mm_hashes` has no batch form: honoring it only here would give the two
@@ -666,6 +653,64 @@ fn fan_out<T: OneOrManyItem + Clone + HeapBytes>(
     }
 }
 
+/// Validated bootstrap columns, one value per prompt.
+pub(crate) struct BootstrapColumns {
+    pub(crate) bootstrap_hosts: Vec<Option<String>>,
+    pub(crate) bootstrap_ports: Vec<Option<i64>>,
+    pub(crate) bootstrap_rooms: Vec<Option<i64>>,
+}
+
+/// Normalize native and OpenAI bootstrap fields after wire decoding.
+/// Missing values and null elements stay unset; lists must match the prompt count.
+/// Scalar rooms advance per prompt; each prompt's choices share that room.
+/// `choices_per_prompt` accounts for the adapter's later host clones without
+/// expanding the columns beyond `prompt_count`.
+pub(crate) fn normalize_bootstrap_columns(
+    hosts: Option<OneOrMany<Option<String>>>,
+    ports: Option<OneOrMany<Option<i64>>>,
+    rooms: Option<OneOrMany<Option<i64>>>,
+    prompt_count: usize,
+    choices_per_prompt: usize,
+) -> Result<BootstrapColumns, Error> {
+    let bootstrap_hosts = match hosts {
+        Some(OneOrMany::One(host)) => {
+            // Charge both prompt and choice clones before broadcasting.
+            check_broadcast_budget(
+                host.heap_bytes(),
+                prompt_count.saturating_mul(choices_per_prompt),
+                "bootstrap_host",
+            )?;
+            vec![host; prompt_count]
+        }
+        other => {
+            if choices_per_prompt > 1
+                && let Some(OneOrMany::Many(hosts)) = &other
+            {
+                check_broadcast_budget(
+                    hosts.iter().map(HeapBytes::heap_bytes).sum(),
+                    choices_per_prompt,
+                    "bootstrap_host",
+                )?;
+            }
+            flatten_column(fan_out(other, prompt_count, "bootstrap_host")?)
+        }
+    };
+    let bootstrap_ports = flatten_column(fan_out(ports, prompt_count, "bootstrap_port")?);
+    let bootstrap_rooms = match rooms {
+        // Wrapping preserves distinct pairing keys at the i64 boundary;
+        // saturating would make multiple prompts share a room.
+        Some(OneOrMany::One(Some(room))) => (0..prompt_count)
+            .map(|i| Some(room.wrapping_add(i as i64)))
+            .collect(),
+        other => flatten_column(fan_out(other, prompt_count, "bootstrap_room")?),
+    };
+    Ok(BootstrapColumns {
+        bootstrap_hosts,
+        bootstrap_ports,
+        bootstrap_rooms,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -990,6 +1035,17 @@ mod tests {
         .to_string();
         let err = requests(&body).unwrap_err().to_string();
         assert!(err.contains("would allocate more than"), "{err}");
+
+        // Native requests have one choice per prompt; scalar hosts still
+        // need their broadcast budget before per-prompt allocation.
+        let body = serde_json::json!({
+            "text": vec!["hi"; 200],
+            "bootstrap_host": blob,
+        })
+        .to_string();
+        let err = requests(&body).unwrap_err().to_string();
+        assert!(err.contains("bootstrap_host"), "{err}");
+        assert!(err.contains("would allocate more than"), "{err}");
     }
 
     #[test]
@@ -1161,6 +1217,14 @@ mod tests {
 
         let err = requests(r#"{"text": ["a", "b"], "bootstrap_room": [1, 2, 3]}"#).unwrap_err();
         assert!(err.to_string().contains("bootstrap_room"), "{err}");
+
+        let (ps, _) = requests(&format!(
+            r#"{{"text": ["a", "b"], "bootstrap_room": {}}}"#,
+            i64::MAX
+        ))
+        .unwrap();
+        assert_eq!(ps[0].bootstrap_room, Some(i64::MAX));
+        assert_eq!(ps[1].bootstrap_room, Some(i64::MIN));
     }
 
     /// The PD router (mini_lb) and PD-warmup payload shapes must parse. The
