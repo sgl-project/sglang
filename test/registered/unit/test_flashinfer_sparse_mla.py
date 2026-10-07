@@ -7,6 +7,7 @@ import torch
 from sglang.kernels.ops.attention.flash_mla_sm120 import (
     _flashinfer_sparse_mla_max_tokens,
     _validate_flashinfer_sparse_mla_backend,
+    create_flashinfer_sparse_mla_lse_buffer,
     create_flashinfer_sparse_mla_runner,
     flashinfer_sparse_mla_forward,
 )
@@ -44,6 +45,7 @@ class TestFlashInferSparseMLAAdapter(unittest.TestCase):
         backend = SimpleNamespace(
             workspace_buffer=torch.zeros(2 * 1024 * 1024, dtype=torch.uint8),
             flashinfer_sparse_mla_runner=FakeRunner(),
+            flashinfer_sparse_mla_lse=torch.empty(4096, 8),
             real_page_size=64,
             kv_cache_dim=528,
             qk_nope_head_dim=256,
@@ -73,6 +75,10 @@ class TestFlashInferSparseMLAAdapter(unittest.TestCase):
         self.assertEqual(captured["sm_scale"], 0.125)
         self.assertEqual(tuple(captured["mid_out"].shape), (2, 8, 34, 512))
         self.assertEqual(tuple(captured["mid_lse"].shape), (2, 8, 34))
+        self.assertEqual(tuple(captured["out_lse"].shape), (2, 8))
+        self.assertEqual(
+            captured["out_lse"].data_ptr(), backend.flashinfer_sparse_mla_lse.data_ptr()
+        )
         self.assertEqual(tuple(output.shape), (2, 8, 512))
         self.assertTrue(torch.all(output == 2))
 
@@ -93,7 +99,7 @@ class TestFlashInferSparseMLARunnerCompatibility(unittest.TestCase):
 
     def test_nope_requires_advertised_native_support(self):
         with patch("flashinfer.mla.SparseMLASm120Wrapper", None, create=True):
-            with self.assertRaisesRegex(RuntimeError, "glm53_nope"):
+            with self.assertRaisesRegex(RuntimeError, r"glm53_nope.*0\.7\.1"):
                 self._create()
 
     def test_nope_requires_compact_capable_native_backend(self):
@@ -160,6 +166,24 @@ class TestFlashInferSparseMLARunnerCompatibility(unittest.TestCase):
         torch.testing.assert_close(output, expected.squeeze(1))
         self.assertEqual(legacy.call_args.kwargs["query"].shape, (2, 1, 8, 576))
         self.assertEqual(legacy.call_args.kwargs["kv_cache"].shape, (2, 1, 64, 656))
+
+    def test_installed_flashinfer_matches_native_requirement(self):
+        # No capability mocks: the installed FlashInfer either advertises
+        # compact GLM NoPE rows (0.7.1 and newer) or the runner refuses to
+        # start with a message naming the required version.
+        from importlib.metadata import version
+
+        from flashinfer import mla
+        from packaging.version import Version
+
+        configs = getattr(mla, "supported_sparse_mla_sm120_configs", None)
+        config = configs().get("glm53_nope") if configs is not None else None
+        compact = getattr(config, "bytes_per_token", None) == 528
+        installed = Version(version("flashinfer-python"))
+        self.assertEqual(compact, installed >= Version("0.7.1rc1"))
+        if not compact:
+            with self.assertRaisesRegex(RuntimeError, r"FlashInfer 0\.7\.1"):
+                self._create()
 
 
 class TestFlashInferSparseMLABackendGate(unittest.TestCase):
@@ -348,6 +372,88 @@ class TestFlashInferSparseMLARunnerCapacity(unittest.TestCase):
             speculative_num_draft_tokens=None,
         )
         self.assertGreaterEqual(capacity, 65536 + 4)
+
+
+class _RetainingRunner:
+    """Follows FlashInfer's wrapper contract for a missing ``out_lse``.
+
+    ``SparseMLASm120Wrapper.run`` caches one prepared call per tensor-shape
+    signature and, when the caller passes no ``out_lse``, that prepared call
+    owns a new FP32 ``[tokens, heads]`` LSE allocation for its lifetime.
+    """
+
+    def __init__(self):
+        self.retained = {}
+        self.out_lse = []
+
+    def run(self, q, kv_cache, indices, output, sm_scale, **kwargs):
+        out_lse = kwargs.get("out_lse")
+        if out_lse is None:
+            self.retained.setdefault(
+                tuple(q.shape), torch.empty(q.shape[0], q.shape[1])
+            )
+        else:
+            self.out_lse.append(out_lse)
+        output.zero_()
+
+
+class TestFlashInferSparseMLALseOwnership(unittest.TestCase):
+    heads = 8
+
+    def _forward(self, runner, tokens, out_lse):
+        return flashinfer_sparse_mla_forward(
+            q=torch.zeros(tokens, self.heads, 512, dtype=torch.bfloat16),
+            kv_cache=torch.zeros(1, 64, 528, dtype=torch.uint8),
+            indices=torch.zeros(tokens, 2051, dtype=torch.int32),
+            seq_lens=torch.full((tokens,), 8192, dtype=torch.int32),
+            workspace_buffer=torch.zeros(1, dtype=torch.uint8),
+            runner=runner,
+            out_lse=out_lse,
+            page_size=64,
+            kv_cache_dim=528,
+            qk_nope_head_dim=256,
+            kv_lora_rank=512,
+            qk_rope_head_dim=0,
+            sm_scale=0.125,
+            skip_softmax_threshold_scale_factor=None,
+        )
+
+    def test_variable_prefill_lengths_reuse_one_lse_buffer(self):
+        runner = _RetainingRunner()
+        lse = create_flashinfer_sparse_mla_lse_buffer(
+            runner, max_num_tokens=1024, max_num_heads=self.heads, device="cpu"
+        )
+        self.assertEqual(tuple(lse.shape), (1024, self.heads))
+        self.assertEqual(lse.dtype, torch.float32)
+        lengths = (65, 66, 127, 511, 1024)
+        for tokens in lengths:
+            self._forward(runner, tokens, lse)
+        self.assertEqual(runner.retained, {})
+        self.assertEqual(
+            [tuple(x.shape) for x in runner.out_lse],
+            [(tokens, self.heads) for tokens in lengths],
+        )
+        self.assertTrue(all(x.data_ptr() == lse.data_ptr() for x in runner.out_lse))
+
+    def test_forward_without_buffer_still_passes_lse(self):
+        runner = _RetainingRunner()
+        for tokens in (65, 66, 67):
+            self._forward(runner, tokens, None)
+        self.assertEqual(runner.retained, {})
+        self.assertEqual(len(runner.out_lse), 3)
+
+    def test_too_small_lse_buffer_is_rejected(self):
+        for shape in ((64, self.heads), (128, self.heads - 1)):
+            with self.subTest(shape=shape):
+                with self.assertRaisesRegex(ValueError, "LSE buffer is too small"):
+                    self._forward(_RetainingRunner(), 65, torch.empty(shape))
+
+    def test_rope_path_does_not_allocate_lse(self):
+        self.assertIsNone(
+            create_flashinfer_sparse_mla_lse_buffer(
+                None, max_num_tokens=1024, max_num_heads=8, device="cpu"
+            )
+        )
 
 
 class TestFlashInferSparseMLAIndexAndWorkspaceBounds(unittest.TestCase):

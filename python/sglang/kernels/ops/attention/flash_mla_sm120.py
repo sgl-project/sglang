@@ -35,6 +35,9 @@ _GLM_DSA_MODEL_ARCHS = (
 
 _GLM53_NOPE_FLASHINFER_TOPK = 2176
 _GLM53_NOPE_FLASHINFER_KV_DIMS = (528, 656)
+# First FlashInfer release line with compact glm53_nope rows, masked candidate
+# reads and eight-head decode (flashinfer-ai/flashinfer#5075 and #5197).
+_GLM53_NOPE_MIN_FLASHINFER = "0.7.1"
 
 # Page layout constants for DSv4-Flash (MODEL1):
 #   nope_dim = 448, rope_dim = 64, quantize_block_size = 64
@@ -742,6 +745,35 @@ def _validate_flashinfer_sparse_mla_backend(
     return uses_flashinfer_sparse_mla
 
 
+def _flashinfer_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("flashinfer-python")
+    except Exception:
+        return "unknown"
+
+
+def create_flashinfer_sparse_mla_lse_buffer(
+    runner: object | None,
+    *,
+    max_num_tokens: int,
+    max_num_heads: int,
+    device: str,
+) -> torch.Tensor | None:
+    """Preallocate the native runner's final LSE output.
+
+    Without a caller-provided ``out_lse``, FlashInfer's wrapper allocates and
+    caches an FP32 ``[tokens, heads]`` buffer for every distinct call shape,
+    so serving variable prefill lengths would keep accumulating GPU memory.
+    """
+    if runner is None:
+        return None
+    return torch.empty(
+        (max_num_tokens, max_num_heads), dtype=torch.float32, device=device
+    )
+
+
 def create_flashinfer_sparse_mla_runner(
     *,
     qk_rope_head_dim: int,
@@ -763,9 +795,10 @@ def create_flashinfer_sparse_mla_runner(
     if wrapper is None or getattr(config, "bytes_per_token", None) != 528:
         raise RuntimeError(
             "GLM NoPE sparse MLA requires FlashInfer native SM120 support "
-            "with compact GLM NoPE rows (glm53_nope). "
-            "Upgrade FlashInfer to a build including compact rows, "
-            "masked candidate reads, and eight-head decode support."
+            "with compact GLM NoPE rows (glm53_nope), available from FlashInfer "
+            f"{_GLM53_NOPE_MIN_FLASHINFER} (including its release candidates). "
+            f"Installed FlashInfer {_flashinfer_version()} does not provide it; "
+            "upgrade FlashInfer or select another DSA backend."
         )
     return wrapper(
         max_num_tokens=max_num_tokens,
@@ -784,6 +817,7 @@ def flashinfer_sparse_mla_forward(
     workspace_buffer: torch.Tensor,
     runner: object | None = None,
     *,
+    out_lse: torch.Tensor | None = None,
     page_size: int,
     kv_cache_dim: int,
     qk_nope_head_dim: int,
@@ -804,7 +838,8 @@ def flashinfer_sparse_mla_forward(
         if qk_rope_head_dim == 0 and kv_lora_rank == 512:
             raise RuntimeError(
                 "GLM NoPE sparse MLA requires FlashInfer native SM120 support "
-                "with the glm53_nope configuration."
+                "with the glm53_nope configuration (FlashInfer "
+                f"{_GLM53_NOPE_MIN_FLASHINFER} or newer)."
             )
         from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
@@ -901,6 +936,20 @@ def flashinfer_sparse_mla_forward(
             .view(q.shape[0], scratch_heads, num_splits)
         )
 
+    # Always pass the LSE output: the wrapper otherwise retains a new FP32
+    # [tokens, heads] buffer per distinct call shape. SGLang does not consume
+    # the LSE, so a shared buffer only needs the capacity of the largest call.
+    num_tokens, num_heads = q.shape[0], q.shape[1]
+    if out_lse is None:
+        out_lse = torch.empty(
+            num_tokens, num_heads, dtype=torch.float32, device=q.device
+        )
+    elif out_lse.shape[0] < num_tokens or out_lse.shape[1] < num_heads:
+        raise ValueError(
+            "FlashInfer sparse-MLA LSE buffer is too small: need "
+            f"[{num_tokens}, {num_heads}], have {list(out_lse.shape)}"
+        )
+
     runner.run(
         q,
         kv_cache_u8,
@@ -908,6 +957,7 @@ def flashinfer_sparse_mla_forward(
         output,
         float(sm_scale),
         topk_length=seq_lens,
+        out_lse=out_lse[:num_tokens, :num_heads],
         mid_out=mid_out,
         mid_lse=mid_lse,
     )

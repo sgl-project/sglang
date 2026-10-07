@@ -647,6 +647,7 @@ class DeepseekSparseAttnBackend(
         from sglang.kernels.ops.attention.flash_mla_sm120 import (
             _flashinfer_sparse_mla_max_tokens,
             _validate_flashinfer_sparse_mla_backend,
+            create_flashinfer_sparse_mla_lse_buffer,
             create_flashinfer_sparse_mla_runner,
         )
 
@@ -677,6 +678,12 @@ class DeepseekSparseAttnBackend(
             self.flashinfer_sparse_mla_runner = create_flashinfer_sparse_mla_runner(
                 qk_rope_head_dim=self.qk_rope_head_dim,
                 kv_lora_rank=self.kv_lora_rank,
+                max_num_tokens=max_runner_tokens,
+                max_num_heads=self.num_q_heads,
+                device=model_runner.device,
+            )
+            self.flashinfer_sparse_mla_lse = create_flashinfer_sparse_mla_lse_buffer(
+                self.flashinfer_sparse_mla_runner,
                 max_num_tokens=max_runner_tokens,
                 max_num_heads=self.num_q_heads,
                 device=model_runner.device,
@@ -3070,6 +3077,7 @@ class DeepseekSparseAttnBackend(
             seq_lens=seq_lens,
             workspace_buffer=self.workspace_buffer,
             runner=self.flashinfer_sparse_mla_runner,
+            out_lse=self.flashinfer_sparse_mla_lse,
             page_size=self.physical_page_size,
             kv_cache_dim=self.kv_cache_dim,
             qk_nope_head_dim=self.qk_nope_head_dim,
