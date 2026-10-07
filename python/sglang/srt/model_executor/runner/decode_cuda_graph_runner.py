@@ -222,6 +222,13 @@ def build_replay_fb_view(
     )
 
 
+def _lora_backend_skips_inactive(model_runner) -> bool:
+    manager = getattr(model_runner, "lora_manager", None)
+    return manager is not None and bool(
+        getattr(manager.lora_backend, "skip_inactive_dense_lora", False)
+    )
+
+
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
@@ -240,7 +247,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         record_nolora_graph: bool = False,
     ):
         super().__init__(model_runner)
-        self.record_nolora_graph = record_nolora_graph
+        # A LoRA backend whose dense layers skip inactive batches gets a LoRA-free
+        # graph per batch size for all-base batches (see BaseLoRABackend).
+        self.record_nolora_graph = record_nolora_graph or _lora_backend_skips_inactive(
+            model_runner
+        )
 
         # In-graph metadata prep: shared buffers -> in-graph private data
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
