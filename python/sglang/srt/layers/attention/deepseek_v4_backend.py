@@ -967,9 +967,11 @@ class DSV4Metadata:
     # Later layers overwrite real heads and preserve the zero padding.
     q_pad_buffer: Optional[torch.Tensor] = None
 
-    # What the candidate-source layer published for the index-source layers after
-    # it, in the implementation's own type; never copied from the host.
-    candidate_metadata: Optional[CandidateMetadata] = None
+    # What each compress ratio's candidate-source layer published for the
+    # index-source layers after it, keyed by compress ratio, in the
+    # implementation's own type; never copied from the host. One global
+    # publisher (ratio 1) unless SGLANG_OPT_DSV4_PER_RATIO_CANDIDATES.
+    candidate_metadata: Dict[int, CandidateMetadata] = field(default_factory=dict)
 
     # Built at the runner's prefill WAR boundary when the fast path is on,
     # otherwise lazily by ``_forward_prefill_sparse``.
@@ -3167,7 +3169,7 @@ class DeepseekV4AttnBackend(
         is_source = layer.indexer.is_candidate_source
         is_consumer = layer.indexer.uses_candidates
         ratio = layer.compress_ratio
-        published = self.forward_metadata.candidate_metadata
+        published = self.forward_metadata.candidate_metadata.get(ratio)
         mode = forward_batch.forward_mode
         if mode.is_decode() or mode.is_target_verify():
             from sglang.srt.model_executor.runner_utils.capture_mode import (
@@ -3185,7 +3187,7 @@ class DeepseekV4AttnBackend(
             )
             if is_source:
                 published = self.decode_candidates.publish_decode(inputs)
-                self._publish_candidate_metadata(published)
+                self._publish_candidate_metadata(ratio, published)
             elif is_consumer:
                 self.decode_candidates.consume_decode(inputs, published)
             else:
@@ -3196,7 +3198,7 @@ class DeepseekV4AttnBackend(
             )
             if is_source:
                 published = self.prefill_candidates.publish_prefill(inputs)
-                self._publish_candidate_metadata(published)
+                self._publish_candidate_metadata(ratio, published)
             elif is_consumer:
                 self.prefill_candidates.consume_prefill(inputs, published)
             else:
@@ -3310,15 +3312,17 @@ class DeepseekV4AttnBackend(
             or not envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
         )
 
-    def _publish_candidate_metadata(self, published: Optional[CandidateMetadata]):
+    def _publish_candidate_metadata(
+        self, ratio: int, published: Optional[CandidateMetadata]
+    ):
         if published is None:
             return
-        self.forward_metadata.candidate_metadata = published
+        self.forward_metadata.candidate_metadata[ratio] = published
         tail_metadata = self.tail_forward_metadata
         if tail_metadata is None or tail_metadata is self.forward_metadata:
             return
         tail = tail_metadata.late_layer_tail
-        tail_metadata.candidate_metadata = published.tail(
+        tail_metadata.candidate_metadata[ratio] = published.tail(
             tail.local_lens_cpu
             if tail.cp_metadata is not None
             else tail.extend_seq_lens_cpu

@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.dsv4.torch_quant import (
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_gemv_split_k_max_tokens
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
+from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix, is_gfx95_supported
@@ -203,6 +204,23 @@ class DeepseekV41Indexer(nn.Module):
         self.owns_k = layer_id in config.kv_source_layer_ids
         self.is_candidate_source = layer_id == config.candidate_source_layer_id
         self.uses_candidates = 0 <= config.candidate_source_layer_id < layer_id
+        if envs.SGLANG_OPT_DSV4_PER_RATIO_CANDIDATES.get():
+            # Per-ratio candidate publishing: the first index-source layer of
+            # each compress-ratio group publishes and the later ones consume.
+            # The checkpoint's candidate_source_layer_id only covers ratio 1,
+            # leaving every other ratio group's index sources on a full dense
+            # scan per layer. Within a ratio group the index pools share one
+            # slot space, so the published schedule is valid for a consumer's
+            # own keys (consume paths read the consumer layer's k cache).
+            ratio = config.compress_ratios[layer_id]
+            group = [
+                lid
+                for lid in config.index_source_layer_ids
+                if config.compress_ratios[lid] == ratio
+            ]
+            if group:
+                self.is_candidate_source = layer_id == group[0]
+                self.uses_candidates = layer_id in group[1:]
         self.candidate_topk_blocks = config.candidate_topk_blocks
         self.candidate_block_size = config.candidate_block_size
         self.softmax_scale = self.index_head_dim**-0.5
