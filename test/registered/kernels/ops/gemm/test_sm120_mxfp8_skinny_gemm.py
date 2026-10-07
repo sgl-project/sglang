@@ -227,8 +227,7 @@ def build_linear(monkeypatch):
             params_dtype=torch.bfloat16,
             quant_config=quant_config,
             prefix="model.layers.0.mlp.up_proj",
-            tp_rank=0,
-            tp_size=1,
+            parallel_group="replicated",
             skip_block_quant_check=True,
         ).cuda()
         w, s = _weight(n, k)
@@ -309,6 +308,38 @@ def test_linear_bias_and_fp32_keep_existing_path(build_linear, skinny_rows):
     # only BF16 and FP16.
     assert layer.quant_method._apply_mxfp8_skinny(layer, x.float()) is None
     assert skinny_rows == []
+
+
+def test_weight_reload_keeps_captured_buffers(build_linear):
+    """A weight reload reruns postprocessing without recapturing CUDA graphs, so
+    the kernel's scale and counter buffers must keep their storage, take the new
+    scales, and start from zeroed counters."""
+    from sglang.test.layer_ut_utils import load_linear_weights
+
+    n, k = 1792, 5120
+    layer, _ = build_linear(n, k)
+    scale, counters = layer.mxfp8_skinny_scale, layer.mxfp8_skinny_counters
+    assert counters is not None, "exercise the split-K counters"
+    x = torch.randn(6, k, device="cuda", dtype=torch.bfloat16)
+    layer(x)  # compile outside capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = layer(x)[0]
+    counters.fill_(1)  # stale arrivals the reload must clear
+    w, s = _weight(n, k)
+    load_linear_weights(layer, weight=w, weight_scale_inv=s.to(torch.float8_e8m0fnu))
+    layer.quant_method.process_weights_after_loading(layer)
+    assert layer.mxfp8_skinny_scale is scale
+    assert layer.mxfp8_skinny_counters is counters
+    assert torch.equal(scale, s)
+    assert not counters.any()
+    # Same-size allocations that would take over buffers freed by the reload.
+    taken = [torch.full_like(counters, 7), torch.full_like(scale, 3.0)]
+    graph.replay()
+    assert torch.equal(out, layer(x)[0])
+    assert not counters.any()
+    del taken
 
 
 def test_linear_gates(build_linear, skinny_rows):
