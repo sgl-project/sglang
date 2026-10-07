@@ -111,10 +111,41 @@ class KVReadStream(msgspec.Struct, frozen=True):
     kv_start_idx: Optional[torch.Tensor]
 
 
-# This process's translators: a plan asks the ones that read its rows whether
-# its table would be read (`table_is_read_again`).
-_TRANSLATORS: weakref.WeakSet[KVIndexTranslator] = weakref.WeakSet()
-_BINDINGS = [0]  # bumped whenever a translator learns its backends
+class _TranslatorRegistry:
+    """This process's live translators: a plan asks the ones that read its rows
+    whether its table would be read (`table_is_read_again`).
+
+    `generation` changes whenever an answer could: a translator is built or
+    collected, or one learns its backends. An answer cached under an older
+    generation is stale.
+    """
+
+    def __init__(self):
+        self._refs: Dict[int, weakref.ref] = {}
+        self.generation = 0
+
+    def add(self, translator: KVIndexTranslator) -> None:
+        key = id(translator)
+
+        def collected(ref, key=key):
+            if self._refs.get(key) is ref:
+                del self._refs[key]
+                self.changed()
+
+        self._refs[key] = weakref.ref(translator, collected)
+        self.changed()
+
+    def changed(self) -> None:
+        self.generation += 1
+
+    def __iter__(self):
+        for ref in list(self._refs.values()):
+            translator = ref()
+            if translator is not None:
+                yield translator
+
+
+_TRANSLATORS = _TranslatorRegistry()
 
 
 class KVIndexTranslator:
@@ -581,8 +612,9 @@ class KVIndexTranslator:
         plan (a speculative iteration's draft and target), or a runner of them
         reads the table form itself. A runner whose backends are not bound yet
         counts as one that does."""
+        generation = _TRANSLATORS.generation
         cached = self._table_read_again.get(kind)
-        if cached is not None and cached[0] == _BINDINGS[0]:
+        if cached is not None and cached[0] == generation:
             return cached[1]
         readers = [
             t
@@ -590,7 +622,7 @@ class KVIndexTranslator:
             if t.req_to_token is self.req_to_token and t._reads_translated(kind)
         ]
         value = len(readers) > 1 or any(t._reads_table is not False for t in readers)
-        self._table_read_again[kind] = (_BINDINGS[0], value)
+        self._table_read_again[kind] = (generation, value)
         return value
 
     def bind_and_verify_backends(self, backends) -> None:
@@ -606,7 +638,7 @@ class KVIndexTranslator:
             if backend is not None
         )
         self._reads_table = bool(self._reads_table) or reads_table
-        _BINDINGS[0] += 1
+        _TRANSLATORS.changed()
         for backend in backends:
             if backend is None:
                 continue

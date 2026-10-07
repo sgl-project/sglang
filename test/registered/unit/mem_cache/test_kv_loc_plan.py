@@ -41,6 +41,7 @@
   python -m pytest test/registered/unit/mem_cache/test_kv_loc_plan.py -v
 """
 
+import gc
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -409,8 +410,8 @@ class TestKVLocPlan(unittest.TestCase):
         one runner reads these rows, and through streams only -- the first
         stream reader gets its stream alone: one gather of its rows, no table.
         A second runner of the same rows, or one that reads tables, brings the
-        shared build back; a table read after a stream-only one still gets its
-        table."""
+        shared build back, and its going away takes it out again; a table read
+        after a stream-only one still gets its table."""
         calls = {"packed": 0, "fused": 0, "table": 0}
 
         def counting(name, real):
@@ -489,6 +490,11 @@ class TestKVLocPlan(unittest.TestCase):
             )
             self.assertEqual(calls["packed"], 2)
             self.assertFalse(shared.has_read_table(_SWA))
+
+            # The draft goes away: the target reads its rows alone again.
+            del peer
+            gc.collect()
+            self.assertFalse(solo.table_is_read_again(_FULL))
 
     def test_a_captured_first_reader_holds_the_table(self):
         """When the plan's first reader is a captured table, the table is built
