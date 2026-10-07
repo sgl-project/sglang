@@ -11,6 +11,7 @@ import os
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -630,6 +631,51 @@ class TestHiSparseUnit(unittest.TestCase):
     # ==================================================================
     # Test: Staging (PD Colocate) path
     # ==================================================================
+    def test_speculative_release_reclaims_post_staging_pages(self):
+        """Real paged allocation after staging must not leak on request release."""
+        initial = self._get_initial_sizes()
+        fill_len = 2 * self.page_size
+        for repeat in range(4):
+            req = _make_req(f"spec-release-{repeat}", list(range(fill_len)))
+            self._alloc_req_slot(req)
+            kv_loc = self._alloc_kv(req, fill_len)
+            self.coordinator.admit_request_into_staging(req)
+            get_device_module().synchronize()
+            self.assertEqual(self.coordinator.collect_ready_reqs(), [req])
+
+            # EAGLE reserves pages via alloc_extend, unlike the logical-only
+            # single-token decode allocator. These slots are not in the buffer.
+            prefix = torch.tensor([fill_len], dtype=torch.int64)
+            end = prefix + self.page_size
+            extra = self.allocator.alloc_extend(
+                prefix_lens=prefix.to(DEVICE),
+                prefix_lens_cpu=prefix,
+                seq_lens=end.to(DEVICE),
+                seq_lens_cpu=end,
+                last_loc=kv_loc[-1:],
+                extend_num_tokens=self.page_size,
+            )
+            self.assertIsNotNone(extra)
+            self.req_to_token_pool.write(
+                (req.kv.req_pool_idx, slice(fill_len, fill_len + self.page_size)),
+                extra,
+            )
+            req.kv.kv_allocated_len = fill_len + self.page_size
+            req.kv.kv_committed_len = fill_len + 1
+            side = self.coordinator.req_to_device_buffer[req.kv.req_pool_idx, 0]
+            self.allocator.full_to_hisparse_device_index_mapping[kv_loc[0]] = side
+            owned = torch.cat((kv_loc, extra))
+            self._cleanup_req(req, owned)
+            get_device_module().synchronize()
+            self._assert_sizes_restored(initial, f"spec release iteration {repeat}")
+            self.assertTrue(
+                torch.all(
+                    self.allocator.full_to_hisparse_device_index_mapping[owned] == 0
+                )
+            )
+            free_pages = self.allocator.hisparse_attn_allocator.get_all_free_pages()
+            self.assertEqual(torch.unique(free_pages).numel(), free_pages.numel())
+
     def test_request_lifecycle_staging_path(self):
         """prefill -> staging DMA -> collect_ready -> swap-in -> finish."""
         initial = self._get_initial_sizes()
@@ -663,6 +709,146 @@ class TestHiSparseUnit(unittest.TestCase):
 
         self._cleanup_req(req, kv_loc)
         self._assert_sizes_restored(initial, "staging_path")
+
+    def test_speculative_verify_gather_eager_and_graph(self):
+        """Exact KV oracle for shared-buffer eviction and resident MTP tails."""
+        for batch_size in (1, 4):
+            for queries in (2, 4, 6):
+                with self.subTest(batch=batch_size, queries=queries):
+                    self._check_speculative_verify_gather(batch_size, queries)
+
+    def _check_speculative_verify_gather(self, batch_size, queries):
+        initial = self._get_initial_sizes()
+        reqs, owned, expected = [], [], {}
+        # Mix long prompts requiring host swap with short prompts, all with a
+        # partial page on the page64 path. Four requests fit the small fixture.
+        prefixes = [769, 193, 769, 65][:batch_size]
+        width = self.device_pool.kv_cache_dim
+        for i, prefix in enumerate(prefixes):
+            req = _make_req(f"verify-{i}", list(range(prefix)))
+            self._alloc_req_slot(req)
+            rpi = req.kv.req_pool_idx
+            logical = self._alloc_kv(req, prefix)
+            physical = self.allocator.full_to_hisparse_device_index_mapping[logical]
+            for layer in range(LAYER_NUM):
+                values = (
+                    (
+                        torch.arange(prefix + queries, device=DEVICE)[:, None] * 131
+                        + torch.arange(width, device=DEVICE)[None, :] * 13
+                        + rpi * 5003
+                        + layer * 17
+                    )
+                    .remainder(251)
+                    .to(torch.bfloat16)
+                    .unsqueeze(1)
+                )
+                expected[rpi, layer] = values
+                self.device_pool.kv_buffer[layer][physical] = values[:prefix]
+            self.coordinator.admit_request_into_staging(req)
+            get_device_module().synchronize()
+            with patch(
+                "sglang.srt.managers.hisparse_coordinator.get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="EAGLE"),
+            ):
+                self.assertEqual(self.coordinator.collect_ready_reqs(), [req])
+            end = (
+                (prefix + queries + self.page_size - 1)
+                // self.page_size
+                * self.page_size
+            )
+            extra = self.allocator.alloc_extend(
+                prefix_lens=torch.tensor([prefix], device=DEVICE),
+                prefix_lens_cpu=torch.tensor([prefix]),
+                seq_lens=torch.tensor([end], device=DEVICE),
+                seq_lens_cpu=torch.tensor([end]),
+                last_loc=logical[-1:],
+                extend_num_tokens=end - prefix,
+            )
+            self.assertIsNotNone(extra)
+            self.req_to_token_pool.write((rpi, slice(prefix, end)), extra)
+            req.kv.kv_allocated_len = end
+            req.kv.kv_committed_len = prefix + 1
+            physical_tail = self.allocator.full_to_hisparse_device_index_mapping[
+                extra[:queries]
+            ]
+            self.assertTrue(torch.all(physical_tail > 0))
+            for layer in range(LAYER_NUM):
+                self.device_pool.kv_buffer[layer][physical_tail] = expected[rpi, layer][
+                    prefix:
+                ]
+            reqs.append(req)
+            owned.append(torch.cat((logical, extra)))
+
+        req_indices = torch.tensor([r.kv.req_pool_idx for r in reqs], device=DEVICE)
+        topk = torch.empty(
+            (batch_size, queries, TOP_K), dtype=torch.int32, device=DEVICE
+        )
+        lengths = torch.empty((batch_size, queries), dtype=torch.int64, device=DEVICE)
+
+        def inputs(order, shift):
+            req_indices.copy_(
+                torch.tensor([reqs[i].kv.req_pool_idx for i in order], device=DEVICE)
+            )
+            for b, i in enumerate(order):
+                prefix = prefixes[i]
+                for q in range(queries):
+                    # Different sets force later queries to reuse the hot slots.
+                    tokens = (
+                        torch.arange(TOP_K, device=DEVICE) * 3 + q * 167 + shift
+                    ) % prefix
+                    # Keep prompt selections unique, as the production indexer
+                    # does, for contexts shorter than top_k.
+                    if prefix < TOP_K:
+                        tokens = torch.arange(TOP_K, device=DEVICE)
+                        tokens[tokens >= prefix] = -1
+                    tokens[0] = prefix + q  # Current verification token is resident.
+                    if q:
+                        tokens[1] = prefix  # An earlier generated token stays resident.
+                    tokens[-1] = -1 if q % 2 == 0 else prefix + q + 1
+                    topk[b, q] = tokens
+                    lengths[b, q] = prefix + q + 1
+
+        def check(result, order, layer, real):
+            cache, pages = result
+            pages = pages.view(batch_size, queries, TOP_K)
+            for b, i in enumerate(order):
+                valid = (topk[b] >= 0) & (topk[b] < lengths[b, :, None])
+                self.assertTrue(torch.all(pages[b][~valid] == -1))
+                if b >= real:
+                    self.assertTrue(torch.all(pages[b] == -1))
+                    continue
+                self.assertTrue(torch.all(pages[b][valid] >= 0))
+                actual = cache[pages[b][valid].long()]
+                reference = expected[reqs[i].kv.req_pool_idx, layer][
+                    topk[b][valid].long()
+                ]
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+        order = list(range(batch_size))
+        inputs(order, 0)
+        self.coordinator.num_real_reqs.fill_(batch_size)
+        for layer in range(LAYER_NUM):
+            result = self.coordinator.gather_for_verify(
+                req_indices, lengths, topk, layer
+            )
+            check(result, order, layer, batch_size)
+        if is_cuda() or is_hip():
+            # Warm all kernel specializations before capture, then change the
+            # request order, selected tokens and real/padded count before replay.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = self.coordinator.gather_for_verify(
+                    req_indices, lengths, topk, 0
+                )
+            order.reverse()
+            inputs(order, 59)
+            real = max(1, batch_size - 1)
+            self.coordinator.num_real_reqs.fill_(real)
+            graph.replay()
+            check(captured, order, 0, real)
+        for req, loc in zip(reqs, owned, strict=True):
+            self._cleanup_req(req, loc)
+        self._assert_sizes_restored(initial, "verify gather")
 
     # ==================================================================
     # Test: Single-node staging host page allocation

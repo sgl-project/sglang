@@ -19,6 +19,122 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+class TestHiSparseRequestRelease(CustomTestCase):
+    def check_release(self, page_size, *, buffered=True, extra=True, need_sort=False):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            HiSparseTokenToKVPoolAllocator,
+        )
+
+        # Only the storage/streams are doubled. Both physical and logical page
+        # allocation/free use the real allocator, including page deduplication.
+        pool = SimpleNamespace()
+        pool.register_mapping = lambda mapping: setattr(
+            pool, "full_to_hisparse_device_index_mapping", mapping
+        )
+        pool._translate_loc_to_hisparse_device = lambda loc: (
+            pool.full_to_hisparse_device_index_mapping[loc]
+        )
+        pool.translate_loc_from_full_to_compressed = lambda loc: loc
+        allocator = HiSparseTokenToKVPoolAllocator(
+            8 * page_size, page_size, torch.float32, "cpu", pool, need_sort
+        )
+        device = allocator.hisparse_attn_allocator
+        device.debug_mode = True
+        logical = allocator.logical_attn_allocator.alloc(2 * page_size)
+        other_logical = allocator.logical_attn_allocator.alloc(page_size)
+        other_device = device.alloc(page_size)
+        mapping = pool.full_to_hisparse_device_index_mapping
+        mapping[other_logical] = other_device
+        side = (
+            device.alloc(page_size) if buffered else torch.empty(0, dtype=torch.int64)
+        )
+        if buffered:
+            # Different indices on the same page also appear in the side buffer.
+            mapping[logical[:page_size]] = side
+        if extra:
+            # Speculative alloc_extend can reserve physical slots outside the
+            # side buffer, including beyond the last committed token.
+            mapping[logical[page_size:]] = device.alloc(page_size)
+
+        host_free = MagicMock()
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.decode_producer_stream = None
+        coordinator.wait_for_pending_backup = MagicMock()
+        coordinator.token_to_kv_pool_allocator = allocator
+        coordinator.mem_pool_device = pool
+        coordinator.req_device_buffer_size = torch.tensor([len(side)])
+        coordinator.req_to_device_buffer = torch.zeros(
+            (1, page_size), dtype=torch.int64
+        )
+        coordinator.req_to_device_buffer[0, : len(side)] = side
+        coordinator.req_to_token_pool = SimpleNamespace(
+            req_to_token=logical.reshape(1, -1)
+        )
+        coordinator.mem_pool_host = SimpleNamespace(
+            allocated_host_indices=lambda *args: torch.tensor([7]), free=host_free
+        )
+        coordinator.req_to_host_pool = torch.zeros(
+            (1, 2 * page_size), dtype=torch.int64
+        )
+        coordinator.req_to_host_pool_allocated_len = torch.tensor([2 * page_size])
+        coordinator.req_device_buffer_tokens = torch.zeros((1, 1, page_size))
+        coordinator.req_device_buffer_token_locs = torch.zeros((1, 1, page_size))
+        coordinator.lru_slots = torch.zeros((1, 1, page_size))
+        coordinator._lru_init = torch.arange(page_size)
+        coordinator._skip_first_backup = [True]
+        req = SimpleNamespace(
+            kv=SimpleNamespace(
+                req_pool_idx=0,
+                kv_committed_len=page_size,
+                kv_allocated_len=2 * page_size,
+            )
+        )
+
+        coordinator.request_finished(req)
+        self.assertEqual(device.available_size(), 7 * page_size)
+        self.assertEqual(len(torch.unique(device.get_all_free_pages())), 7)
+        self.assertTrue(torch.all(mapping[logical] == 0))
+        torch.testing.assert_close(mapping[other_logical], other_device)
+        self.assertFalse(
+            torch.isin(other_device // page_size, device.get_all_free_pages()).any()
+        )
+        host_free.assert_called_once()
+        coordinator.wait_for_pending_backup.assert_called_once()
+
+        # Normal release follows coordinator cleanup; it must not free the same
+        # physical page again through stale logical-to-device mapping entries.
+        allocator.free(logical)
+        self.assertEqual(device.available_size(), 7 * page_size)
+        self.assertEqual(
+            allocator.logical_attn_allocator.available_size(), 15 * page_size
+        )
+        allocator.free(other_logical)
+        self.assertEqual(device.available_size(), 8 * page_size)
+        self.assertEqual(
+            allocator.logical_attn_allocator.available_size(), 16 * page_size
+        )
+
+    def test_releases_speculative_pages_outside_device_buffer(self):
+        for page_size in (1, 64):
+            for need_sort in (False, True):
+                with self.subTest(page_size=page_size, need_sort=need_sort):
+                    self.check_release(page_size, need_sort=need_sort)
+
+    def test_mapping_only_request_release(self):
+        for page_size in (1, 64):
+            with self.subTest(page_size=page_size):
+                self.check_release(page_size, buffered=False)
+
+    def test_buffer_aliases_are_not_double_freed(self):
+        for page_size in (1, 64):
+            with self.subTest(page_size=page_size):
+                self.check_release(page_size, extra=False)
+
+    def test_empty_device_ownership(self):
+        self.check_release(64, buffered=False, extra=False)
+
+
 class TestHiSparseDecodeRemap(CustomTestCase):
     def test_page_size_one_reclaims_temporary_device_slot(self):
         """Decode remapping must reclaim its temporary slot without freeing the live slot."""

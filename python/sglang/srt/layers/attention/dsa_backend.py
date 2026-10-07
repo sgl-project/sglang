@@ -2062,6 +2062,18 @@ class DeepseekSparseAttnBackend(
         )
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, dsa_impl)
         self._check_kpool_tail_backend(topk_indices, dsa_impl, phase)
+        hisparse_verify = (
+            self.hisparse_coordinator is not None
+            and forward_batch.forward_mode.is_target_verify()
+        )
+        if hisparse_verify and dsa_impl not in (
+            "tilelang",
+            "triton",
+            "flashmla_sparse",
+        ):
+            raise NotImplementedError(
+                f"HiSparse target verification does not support {dsa_impl}"
+            )
 
         if dsa_impl == "trtllm" and not self.use_mha:
             return self._forward_trtllm(
@@ -2133,7 +2145,19 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode
         )
 
-        if self.use_fused_topk:
+        if hisparse_verify:
+            assert self.dsa_index_kpool == 1
+            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+            batch_size = forward_batch.batch_size
+            num_queries = q_nope.shape[0] // batch_size
+            assert q_nope.shape[0] == batch_size * num_queries
+            kv_cache, page_table_1 = self.hisparse_coordinator.gather_for_verify(
+                forward_batch.req_pool_indices,
+                metadata.dsa_seqlens_expanded.view(batch_size, num_queries),
+                topk_indices.view(batch_size, num_queries, -1),
+                layer.layer_id,
+            )
+        elif self.use_fused_topk:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
@@ -2169,7 +2193,7 @@ class DeepseekSparseAttnBackend(
                 )
 
         # todo hisparse: to cover more backends
-        if self.hisparse_coordinator is not None:
+        if self.hisparse_coordinator is not None and not hisparse_verify:
             # flash_mla_sparse_fwd / tilelang require int32 page indices.
             page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                 page_table_1
@@ -3821,7 +3845,10 @@ class DeepseekSparseAttnBackend(
     ) -> DSAIndexerMetadata:
         force_unfused = not self.use_fused_topk or (
             self.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
