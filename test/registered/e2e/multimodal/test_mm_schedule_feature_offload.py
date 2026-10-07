@@ -176,6 +176,7 @@ def _run_embed_routine(requests, encoder, device, check):
         extend_prefix_lens_cpu=[0] * len(requests),
         extend_seq_lens_cpu=seq_lens,
         input_embeds=None,
+        spec_algorithm=None,
     )
     language_model = _FakeLanguageModel(device, check)
     out = mm_utils.general_mm_embed_routine(
@@ -225,8 +226,8 @@ def test_offload_items_to_host_only_touches_device_tensors():
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_offload_items_to_host_skips_none_placeholders(device):
-    """The final pass hands the helper the raw ``mm_items`` list, which may
-    carry ``None`` placeholders that the inline loop it replaces tolerated."""
+    """A request's ``mm_items`` list may carry ``None`` placeholders; the
+    helper skips them rather than failing on the attribute access."""
     item = _item(1, 0, 2, device)
     mm_schedule._offload_items_to_host([None, item, None])
     _assert_on_host([item])
@@ -477,13 +478,17 @@ def test_every_release_site_invokes_offload(fresh_cache, runtime_stubs, monkeypa
     assert [_ids(call) for call in encoder.calls] == [_ids([first])]
     assert offloaded(first) and offloaded(second)
 
-    # Final pass of general_mm_embed_routine: every request's item list goes
-    # through the helper once more, right before the language model runs.
+    # The whole routine: every request's items are released by the
+    # per-modality pass before the language model runs. The final cleanup
+    # loop in general_mm_embed_routine only runs for device embeddings, so on
+    # CPU this is the release the language model actually sees.
     items_a, items_b = [_item(11, 0, 3)], [_item(12, 0, 2)]
     calls.clear()
-    _run_embed_routine([items_a, items_b], _fake_encoder(device), device, lambda: None)
-    final_calls = [_ids(call) for call in calls[-2:]]
-    assert final_calls == [_ids(items_a), _ids(items_b)]
+
+    def check():
+        assert offloaded(items_a[0]) and offloaded(items_b[0])
+
+    _run_embed_routine([items_a, items_b], _fake_encoder(device), device, check)
 
 
 if __name__ == "__main__":
