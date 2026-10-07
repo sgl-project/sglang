@@ -409,6 +409,10 @@ fn valid_message(message: &Value) -> bool {
                         .as_array()
                         .is_some_and(|calls| calls.iter().all(valid_tool_call))
                 })
+                // Non-empty tools never get here.
+                && optional(message, "tools", |tools| {
+                    tools.as_array().is_some_and(Vec::is_empty)
+                })
         }
         _ => false,
     }
@@ -873,6 +877,7 @@ mod tests {
             json!(["hi"]),
             json!([{"role": "assistant", "content": "a", "name": 1}]),
             json!([{"role": "assistant", "content": "a", "phase": "draft"}]),
+            json!([{"role": "system", "content": "a", "tools": false}]),
             json!([{"role": "assistant", "content": null, "tool_calls": [{"function": null}]}]),
             json!([{"role": "assistant", "content": null, "tool_calls": [{"type": null, "function": {}}]}]),
             json!([{"role": "assistant", "content": null, "tool_calls": [{"function": {"arguments": 1}}]}]),
@@ -888,7 +893,7 @@ mod tests {
     #[test]
     fn text_messages_are_lowered() {
         let messages = json!([
-            {"role": "System", "content": "be brief"},
+            {"role": "System", "content": "be brief", "tools": []},
             {"role": "user", "content": [{"type": "text", "text": "hi"}], "name": 1},
             {"role": "assistant", "content": null, "phase": null, "tool_calls": [
                 {"id": "c", "index": 0, "type": "function", "function": {"name": "f", "arguments": {}}}
