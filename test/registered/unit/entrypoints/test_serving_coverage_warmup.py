@@ -47,6 +47,9 @@ class FakeTokenizerManager:
             else None
         )
         self.is_generation = True
+        # What each DP rank's scheduler reports through get_internal_state.
+        self.internal_states = [{"effective_max_running_requests_per_dp": MAX_RUNNING}]
+        self.internal_state_queries = 0
         self.requests = []
         self.max_in_flight = 0
         self._in_flight = 0
@@ -58,6 +61,32 @@ class FakeTokenizerManager:
         await asyncio.sleep(0)
         self._in_flight -= 1
         yield {}
+
+    async def get_internal_state(self):
+        self.internal_state_queries += 1
+        return self.internal_states
+
+
+class DecodeWaveManager(FakeTokenizerManager):
+    """Groups each DP rank's requests into the waves that ran together."""
+
+    def __init__(self, limits, **kwargs):
+        super().__init__(**kwargs)
+        self.internal_states = [
+            {"effective_max_running_requests_per_dp": n} for n in limits
+        ]
+        self.waves = {}
+        self._rank_in_flight = {}
+
+    async def generate_request(self, req, request):
+        rank = req.routed_dp_rank
+        if self._rank_in_flight.get(rank, 0) == 0:
+            self.waves.setdefault(rank, []).append([])
+        self.waves[rank][-1].append(req)
+        self._rank_in_flight[rank] = self._rank_in_flight.get(rank, 0) + 1
+        async for response in super().generate_request(req, request):
+            yield response
+        self._rank_in_flight[rank] -= 1
 
 
 def _phases(tokenizer_manager, disaggregation_mode="null"):
@@ -103,6 +132,7 @@ class TestServingCoveragePhases(_PublishedConfig):
                 "cached-prefix",
                 "natural-text",
                 "sampling",
+                "decode-batches",
             ],
         )
 
@@ -297,6 +327,54 @@ class TestServingCoveragePhases(_PublishedConfig):
             with self.assertRaisesRegex(ValueError, "sampling is not supported"):
                 await _phases(tm)["sampling"]()
         self.assertEqual(len(tm.requests), len(_SERVING_COVERAGE_SAMPLING_VARIANTS))
+
+    async def test_decode_batches_run_power_of_two_waves_up_to_the_limit(self):
+        tm = DecodeWaveManager(limits=[12])
+        tm.model_config.vocab_size = 500
+        await _phases(tm)["decode-batches"]()
+
+        waves = tm.waves[None]
+        self.assertEqual([len(w) for w in waves], [1, 2, 4, 8, 12])
+        for wave in waves:
+            temperatures = {r.sampling_params["temperature"] for r in wave}
+            self.assertEqual(temperatures, {0.0, 1.0} if len(wave) > 1 else {0.0})
+            for req in wave:
+                self.assertTrue(16 <= len(req.input_ids) <= 256)
+                self.assertLess(max(req.input_ids), 500)
+                self.assertEqual(req.sampling_params["max_new_tokens"], 16)
+                self.assertTrue(req.sampling_params["ignore_eos"])
+                self.assertIsNone(req.routed_dp_rank)
+                self.assertIsNone(req.bootstrap_host)
+
+    async def test_decode_batches_fall_back_to_the_configured_limit(self):
+        # A scheduler that does not report its effective limit.
+        tm = DecodeWaveManager(limits=[])
+        tm.internal_states = [{}]
+        await _phases(tm)["decode-batches"]()
+        self.assertEqual([len(w) for w in tm.waves[None]], [1, 2, MAX_RUNNING])
+
+    async def test_decode_batches_give_disaggregated_requests_unique_rooms(self):
+        tm = DecodeWaveManager(limits=[3])
+        await _phases(tm, disaggregation_mode="prefill")["decode-batches"]()
+
+        rooms = [r.bootstrap_room for r in tm.requests]
+        self.assertEqual(len(rooms), 1 + 2 + 3)
+        self.assertEqual(len(rooms), len(set(rooms)))
+        for req in tm.requests:
+            self.assertEqual(req.bootstrap_host, FAKE_BOOTSTRAP_HOST)
+
+    async def test_decode_batches_run_only_for_generative_models(self):
+        tm = DecodeWaveManager(limits=[4])
+        await serving_coverage("null", tm)
+        self.assertEqual(tm.internal_state_queries, 1)
+        # decode-batches is the last phase without an image processor.
+        self.assertEqual([len(w) for w in tm.waves[None][-3:]], [1, 2, 4])
+
+        tm = DecodeWaveManager(limits=[4])
+        tm.is_generation = False
+        await serving_coverage("null", tm)
+        self.assertEqual(tm.internal_state_queries, 0)
+        self.assertEqual(tm.waves, {})
 
     async def test_token_ids_stay_inside_the_vocabulary(self):
         tm = FakeTokenizerManager()
@@ -536,6 +614,23 @@ class TestDataParallelCoverage(_PublishedConfig):
         self.assertEqual(ranks, set(range(self.dp_size)))
         sampled = [r for r in tm.requests if r.sampling_params["temperature"] > 0]
         self.assertEqual({r.routed_dp_rank for r in sampled}, set(range(self.dp_size)))
+
+
+class TestDecodeBatchesPerRank(_PublishedConfig):
+    dp_size = 2
+
+    async def test_each_dp_rank_is_filled_to_its_own_limit(self):
+        tm = DecodeWaveManager(limits=[4, 2])
+        await _phases(tm)["decode-batches"]()
+        self.assertEqual([len(w) for w in tm.waves[0]], [1, 2, 4])
+        self.assertEqual([len(w) for w in tm.waves[1]], [1, 2])
+
+    async def test_without_one_limit_per_rank_every_rank_uses_the_smallest(self):
+        tm = DecodeWaveManager(limits=[4])
+        tm.internal_states.append({})
+        await _phases(tm)["decode-batches"]()
+        self.assertEqual([len(w) for w in tm.waves[0]], [1, 2, 4])
+        self.assertEqual([len(w) for w in tm.waves[1]], [1, 2, 4])
 
 
 class TestWideDataParallelWindows(_PublishedConfig):
