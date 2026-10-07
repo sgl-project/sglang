@@ -1035,6 +1035,11 @@ class Scheduler(
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+        # only now: building the draft worker replaces the draft's embed and head with the target's
+        for role, runner in self.draft_worker.weight_update_runners():
+            runner.remote_instance_weight_transporter.maybe_register_and_publish_weight_info(
+                role=role
+            )
 
         if self.spec_algorithm.is_ngram():
             from sglang.srt.speculative.external_corpus_manager import (
