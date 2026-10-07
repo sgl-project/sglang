@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import sys
 import types
@@ -19,6 +20,54 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 ROOT = Path(__file__).resolve().parents[4]
 LORA_MOE = ROOT / "python/sglang/srt/lora/moe"
 ROUTE_KERNELS = ROOT / "python/sglang/kernels/ops/lora/common/routing.py"
+
+
+def _load_plan():
+    module_name = "_route_factory_plan"
+    spec = importlib.util.spec_from_file_location(module_name, LORA_MOE / "plan.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    with mock.patch.dict(sys.modules, {module_name: module}):
+        spec.loader.exec_module(module)
+    return module
+
+
+PLAN = _load_plan()
+
+
+def _serial_materialized_reference():
+    """Use standalone stages with no fusion or overlap."""
+    return PLAN.MoePlan(
+        gate_up_a=PLAN.ASpec(
+            PLAN.Site.GATE_UP,
+            PLAN.AFamily.GROUPED,
+            False,
+            PLAN.BridgeLayout.PAIR_MAJOR,
+        ),
+        gate_up_b=PLAN.BSpec(
+            PLAN.Site.GATE_UP,
+            PLAN.BFamily.GROUPED,
+            False,
+            PLAN.BridgeLayout.PAIR_MAJOR,
+        ),
+        act=PLAN.ActSpec(PLAN.ActFamily.MATERIALIZED, PLAN.ActivationFn.SILU),
+        down_a=PLAN.ASpec(
+            PLAN.Site.DOWN,
+            PLAN.AFamily.GROUPED,
+            False,
+            PLAN.BridgeLayout.PAIR_MAJOR,
+        ),
+        down_b=PLAN.BSpec(
+            PLAN.Site.DOWN,
+            PLAN.BFamily.GROUPED,
+            False,
+            PLAN.BridgeLayout.PAIR_MAJOR,
+        ),
+        finalize=PLAN.FinalizeSpec(PLAN.FinalizeFamily.MATERIALIZED),
+    )
+
+
+SERIAL_MATERIALIZED_REFERENCE = _serial_materialized_reference()
 
 
 def _arch_pdl(enabled: bool):
@@ -45,7 +94,7 @@ RouteView = ROUTE_VIEW.RouteView
 RouteViewKind = ROUTE_VIEW.RouteViewKind
 
 
-def _load_shared_routing():
+def _load_routing():
     package_names = (
         "sglang",
         "sglang.kernels",
@@ -54,6 +103,7 @@ def _load_shared_routing():
         "sglang.srt",
         "sglang.srt.lora",
         "sglang.kernels.ops.lora.common",
+        "sglang.srt.lora.moe",
     )
     packages = {}
     for name in package_names:
@@ -80,25 +130,37 @@ def _load_shared_routing():
 
             return launch
 
-    # Load the real shared routing module with its module alias confined to
-    # the sandbox.
+    # Isolate the fused builder's metadata import from test collection order.
+    workspace = types.ModuleType("sglang.srt.lora.workspace")
+    workspace.LoraWorkspace = object
+
+    # Load the real shared routing module before the MoE bundle,
+    # with both module aliases confined to the sandbox.
     shared_spec = importlib.util.spec_from_file_location(
         "sglang.kernels.ops.lora.common.routing", ROUTE_KERNELS
     )
     assert shared_spec is not None and shared_spec.loader is not None
     shared = importlib.util.module_from_spec(shared_spec)
+    module_name = "_host_routing"
+    spec = importlib.util.spec_from_file_location(module_name, LORA_MOE / "routing.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
     with mock.patch.dict(
         sys.modules,
         {
             **packages,
             "triton": fake_triton,
             "triton.language": fake_tl,
+            "sglang.srt.lora.moe.plan": PLAN,
             virtual_experts.__name__: virtual_experts,
             "sglang.kernels.ops.lora.common.route_view": ROUTE_VIEW,
+            workspace.__name__: workspace,
             shared.__name__: shared,
+            module_name: module,
         },
     ):
         shared_spec.loader.exec_module(shared)
+        spec.loader.exec_module(module)
     # The fake triton.jit leaves the route kernels plain functions.
     for kernel in (
         "_build_route_bucket_ids_kernel",
@@ -108,10 +170,10 @@ def _load_shared_routing():
         "_route_scan_kernel",
     ):
         setattr(shared, kernel, _Unlaunched())
-    return shared
+    return module, shared
 
 
-SHARED_ROUTING = _load_shared_routing()
+ROUTING, SHARED_ROUTING = _load_routing()
 
 
 class _Workspace:
@@ -601,6 +663,370 @@ class TestRouteDispatchContract(CustomTestCase):
             builder.assert_not_called()
         self.assertIs(route.view, RouteViewKind.RAW)
         self.assertEqual(workspace.tensors, {})
+
+
+class TestRoutePdlWiring(CustomTestCase):
+    def test_parallel_route_builder_only_forks_for_both_aligned_views(self):
+        reference = SERIAL_MATERIALIZED_REFERENCE
+        per_row = dataclasses.replace(
+            reference,
+            **{
+                site: dataclasses.replace(getattr(reference, site), family=family)
+                for site, family in (
+                    ("gate_up_a", PLAN.AFamily.PER_ROW),
+                    ("gate_up_b", PLAN.BFamily.PER_ROW),
+                    ("down_a", PLAN.AFamily.PER_ROW),
+                    ("down_b", PLAN.BFamily.PER_ROW),
+                )
+            },
+        )
+        shared_only = dataclasses.replace(
+            per_row,
+            gate_up_a=dataclasses.replace(reference.gate_up_a, is_shared_outer=True),
+            down_b=dataclasses.replace(per_row.down_b, is_shared_outer=True),
+        )
+        both = dataclasses.replace(
+            reference,
+            down_b=dataclasses.replace(reference.down_b, is_shared_outer=True),
+        )
+        token_plan = dataclasses.replace(
+            reference,
+            gate_up_a=PLAN.ASpec(
+                PLAN.Site.GATE_UP,
+                PLAN.AFamily.TOKEN_GROUPED,
+                True,
+                PLAN.BridgeLayout.TOKEN_MAJOR,
+            ),
+            gate_up_b=None,
+            act=PLAN.ActSpec(PLAN.ActFamily.B_ACTIVATION, PLAN.ActivationFn.SILU),
+            down_b=None,
+            finalize=PLAN.FinalizeSpec(PLAN.FinalizeFamily.SHARED_TOKEN_DELTA, True),
+        )
+        both_token = dataclasses.replace(
+            both,
+            gate_up_a=token_plan.gate_up_a,
+            gate_up_b=dataclasses.replace(
+                reference.gate_up_b, input_layout=PLAN.BridgeLayout.TOKEN_MAJOR
+            ),
+        )
+        slots = torch.tensor([0, 1], dtype=torch.int32)
+        ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+
+        class Workspace(_Workspace):
+            def run_parallel(self, **kwargs):
+                events.append("fork")
+                result = super().run_parallel(**kwargs)
+                events.append("joined")
+                return result
+
+        def fake_route(token_slots, **kwargs):
+            route = RouteView(
+                token_slots=token_slots,
+                group_ids=kwargs.get("group_ids"),
+                groups_per_slot=kwargs.get("groups_per_slot", 1),
+                **{key: kwargs[key] for key in ("view", "max_loras", "block_size")},
+            )
+            built[id(route)] = kwargs
+            events.append(kwargs.get("tensor_prefix"))
+            return route
+
+        for plan, expected in (
+            (reference, {"aligned_per_expert"}),
+            (
+                shared_only,
+                {"raw_per_expert", "raw_shared_outer", "aligned_shared_outer"},
+            ),
+            (per_row, {"raw_per_expert"}),
+            (both, {"aligned_per_expert", "aligned_shared_outer"}),
+            (token_plan, {"raw_shared_outer", "aligned_per_expert", "shared_token"}),
+            (
+                both_token,
+                {"aligned_per_expert", "aligned_shared_outer", "shared_token"},
+            ),
+        ):
+            for builder in PLAN.RouteBuilderFamily:
+                with self.subTest(routes=expected, builder=builder):
+                    workspace = Workspace()
+                    built = {}
+                    events = []
+                    with (
+                        mock.patch.object(
+                            ROUTING, "build_route", side_effect=fake_route
+                        ),
+                        mock.patch.object(
+                            workspace, "run_parallel", wraps=workspace.run_parallel
+                        ) as parallel,
+                    ):
+                        routes = ROUTING.build_moe_routes(
+                            dataclasses.replace(plan, route_builder=builder),
+                            topk_ids=ids,
+                            token_lora_mapping=slots,
+                            num_local_experts=2,
+                            max_loras=2,
+                            block_size=16,
+                            workspace=workspace,
+                        )
+                    self.assertEqual(len(built), len(expected))
+                    for field in dataclasses.fields(routes):
+                        route = getattr(routes, field.name)
+                        if field.name not in expected:
+                            self.assertIsNone(route)
+                            continue
+                        kwargs = built.pop(id(route))
+                        self.assertIs(route.token_slots, slots)
+                        self.assertIs(
+                            kwargs.pop("group_ids", None),
+                            None if field.name == "shared_token" else ids,
+                        )
+                        raw = field.name.startswith("raw_")
+                        inputs = dict(
+                            view=RouteViewKind.RAW if raw else RouteViewKind.ALIGNED,
+                            max_loras=2,
+                            block_size=16,
+                        )
+                        self.assertIs(route.view, inputs["view"])
+                        if field.name != "shared_token":
+                            inputs["groups_per_slot"] = (
+                                2 if field.name.endswith("per_expert") else 1
+                            )
+                        if not raw:
+                            prefix = (
+                                "shared_token:sorted:16"
+                                if field.name == "shared_token"
+                                else field.name
+                            )
+                            inputs.update(
+                                workspace=workspace, tensor_prefix=f"route:{prefix}"
+                            )
+                        self.assertEqual(kwargs, inputs)
+                    self.assertEqual(built, {})
+                    forked = (
+                        plan in (both, both_token)
+                        and builder is PLAN.RouteBuilderFamily.PARALLEL_SHARED_OUTER
+                    )
+                    self.assertEqual(parallel.call_count, int(forked))
+                    if forked:
+                        self.assertEqual(
+                            parallel.call_args.kwargs["name"], "route:parallel"
+                        )
+                        self.assertEqual(
+                            parallel.call_args.kwargs["device"], ids.device
+                        )
+                        if plan is both_token:
+                            self.assertLess(
+                                events.index("joined"),
+                                events.index("route:shared_token:sorted:16"),
+                            )
+
+    def _run_route(self, *, use_pdl, is_shared_outer=False):
+        recorders = [_KernelRecorder() for _ in range(3)]
+        with (
+            _arch_pdl(bool(use_pdl)),
+            mock.patch.object(SHARED_ROUTING, "_route_histogram_kernel", recorders[0]),
+            mock.patch.object(SHARED_ROUTING, "_route_scan_kernel", recorders[1]),
+            mock.patch.object(SHARED_ROUTING, "_route_place_kernel", recorders[2]),
+        ):
+            route = SHARED_ROUTING._build_large_route(
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([[0, 1]], dtype=torch.int32),
+                groups_per_slot=1 if is_shared_outer else 2,
+                max_loras=2,
+                block_size=16,
+                workspace=_Workspace(),
+                tensor_prefix="test:route",
+            )
+        return route, recorders
+
+    def test_route_launches_real_pdl_chain(self):
+        route, (hist, scan, expand) = self._run_route(use_pdl=True)
+
+        self.assertIsNotNone(route)
+        self.assertTrue(hist.calls[0][2]["USE_PDL"])
+        self.assertNotIn("launch_pdl", hist.calls[0][2])
+        for consumer in (scan, expand):
+            self.assertTrue(consumer.calls[0][2]["USE_PDL"])
+            self.assertTrue(consumer.calls[0][2]["launch_pdl"])
+
+    def test_route_pdl_off_leaves_launches_unarmed(self):
+        _, recorders = self._run_route(use_pdl=False)
+        for recorder in recorders:
+            self.assertFalse(recorder.calls[0][2]["USE_PDL"])
+            self.assertNotIn("launch_pdl", recorder.calls[0][2])
+
+
+class TestSharedTokenRoute(CustomTestCase):
+    def test_shared_token_route_groups_the_tokens_by_slot_without_groups(self):
+        # Shared-token routes contain one row per token, grouped only by adapter slot.
+        reference = SERIAL_MATERIALIZED_REFERENCE
+        shared_plan = dataclasses.replace(
+            reference,
+            gate_up_a=PLAN.ASpec(
+                PLAN.Site.GATE_UP,
+                PLAN.AFamily.TOKEN_GROUPED,
+                True,
+                PLAN.BridgeLayout.TOKEN_MAJOR,
+            ),
+            gate_up_b=dataclasses.replace(
+                reference.gate_up_b,
+                input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
+            ),
+        )
+        topk_ids = torch.tensor([[-1, -1], [-1, 1], [0, -1]], dtype=torch.int32)
+        token_lora_mapping = torch.tensor([0, 1, 0], dtype=torch.int32)
+        workspace = _Workspace()
+        seen = {}
+
+        def fake_aligned(route_token_slots, **kwargs):
+            if kwargs["tensor_prefix"].startswith("route:shared_token"):
+                seen.update(kwargs, token_slots=route_token_slots)
+            return _route(
+                route_token_slots,
+                group_ids=kwargs.get("group_ids"),
+                block_size=kwargs["block_size"],
+                padded_count=torch.tensor([16], dtype=torch.int32),
+                groups_per_slot=kwargs.get("groups_per_slot", 1),
+                max_loras=kwargs["max_loras"],
+            )
+
+        with (
+            _arch_pdl(False),
+            mock.patch.object(ROUTING, "build_route", side_effect=fake_aligned),
+        ):
+            routes = ROUTING.build_moe_routes(
+                shared_plan,
+                topk_ids=topk_ids,
+                token_lora_mapping=token_lora_mapping,
+                num_local_experts=2,
+                max_loras=2,
+                block_size=16,
+                workspace=workspace,
+            )
+        self.assertIs(seen["token_slots"], token_lora_mapping)
+        self.assertIsNone(seen.get("group_ids"))
+        self.assertEqual(seen.get("groups_per_slot", 1), 1)
+        self.assertEqual(seen["tensor_prefix"], "route:shared_token:sorted:16")
+        self.assertEqual(routes.shared_token.groups_per_slot, 1)
+
+    def test_large_shared_token_route_cannot_overwrite_retained_pair_counts(self):
+        """Retained routes need distinct workspace prefixes even when bucket counts match.
+        With one expert, shared-token and pair routes collide at G but retain different
+        counts (T versus T*K); constructing one must not overwrite the other.
+        """
+        reference = SERIAL_MATERIALIZED_REFERENCE
+        shared_plan = dataclasses.replace(
+            reference,
+            gate_up_a=PLAN.ASpec(
+                PLAN.Site.GATE_UP,
+                PLAN.AFamily.TOKEN_GROUPED,
+                True,
+                PLAN.BridgeLayout.TOKEN_MAJOR,
+            ),
+            gate_up_b=dataclasses.replace(
+                reference.gate_up_b,
+                input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
+            ),
+            down_b=dataclasses.replace(
+                reference.down_b,
+                is_shared_outer=True,
+            ),
+        )
+        num_tokens = 16384
+        top_k = 8
+        topk_ids = torch.zeros((num_tokens, top_k), dtype=torch.int32)
+        token_lora_mapping = torch.zeros(num_tokens, dtype=torch.int32)
+
+        for num_local_experts in (1, 2):
+            with self.subTest(num_local_experts=num_local_experts):
+                workspace = _Workspace()
+                prefixes = []
+
+                def fake_route(
+                    route_token_slots,
+                    *,
+                    group_ids=None,
+                    groups_per_slot=1,
+                    max_loras,
+                    block_size,
+                    view,
+                    workspace=None,
+                    tensor_prefix=None,
+                ):
+                    self.assertEqual(view, "aligned")
+                    self.assertIsNotNone(workspace)
+                    prefixes.append(tensor_prefix)
+                    # Model the real allocation: one scalar per route, named.
+                    padded = workspace.tensor(
+                        f"{tensor_prefix}:padded_pairs",
+                        (1,),
+                        dtype=torch.int32,
+                        device=route_token_slots.device,
+                    )
+                    rows = route_token_slots if group_ids is None else group_ids
+                    padded.fill_(rows.numel())
+                    built = _route(
+                        route_token_slots,
+                        group_ids=group_ids,
+                        block_size=block_size,
+                        padded_count=padded,
+                        groups_per_slot=groups_per_slot,
+                        max_loras=max_loras,
+                    )
+                    return built
+
+                with mock.patch.object(ROUTING, "build_route", side_effect=fake_route):
+                    routes = ROUTING.build_moe_routes(
+                        shared_plan,
+                        topk_ids=topk_ids,
+                        token_lora_mapping=token_lora_mapping,
+                        num_local_experts=num_local_experts,
+                        max_loras=2,
+                        block_size=16,
+                        workspace=workspace,
+                    )
+
+                # Distinct prefix per route is the whole guarantee.
+                self.assertEqual(
+                    set(prefixes),
+                    {
+                        "route:aligned_per_expert",
+                        "route:aligned_shared_outer",
+                        "route:shared_token:sorted:16",
+                    },
+                )
+                self.assertEqual(len(prefixes), len(set(prefixes)))
+
+                pair_count = num_tokens * top_k
+                self.assertEqual(
+                    routes.aligned_per_expert.maybe_num_pairs_post_padded.item(),
+                    pair_count,
+                )
+                self.assertEqual(
+                    routes.aligned_shared_outer.maybe_num_pairs_post_padded.item(),
+                    pair_count,
+                )
+                self.assertEqual(
+                    routes.shared_token.maybe_num_pairs_post_padded.item(),
+                    num_tokens,
+                )
+                # ... and the scalars are separate storage, so the T-row plan
+                # cannot have overwritten either T*K-row one.
+                pointers = {
+                    route.maybe_num_pairs_post_padded.data_ptr()
+                    for route in (
+                        routes.aligned_per_expert,
+                        routes.aligned_shared_outer,
+                        routes.shared_token,
+                    )
+                }
+                self.assertEqual(len(pointers), 3)
+
+
+class TestLaunchConfigRoutePreflight(CustomTestCase):
+    def test_subwarp_route_tile_is_rejected_at_construction(self):
+        # The grouped LoRA kernels take this value as their tl.dot row tile,
+        # so the config constructor itself rejects anything below 16.
+        with self.assertRaisesRegex(ValueError, ">= 16"):
+            PLAN.MoeLoraLaunchConfig(routing_block_size=8)
 
 
 if __name__ == "__main__":
