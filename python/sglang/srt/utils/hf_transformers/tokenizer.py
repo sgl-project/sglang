@@ -346,8 +346,7 @@ def _fix_v5_bare_spm_backend(tokenizer, model_name_or_path, revision=None):
             "Failed to rebuild SentencePiece backend for %s: %s", model_name_or_path, e
         )
         return
-    # sentencepiece 0.2.2 rejects some protos, and transformers then silently
-    # falls back to TikToken, which yields the same bare backend.
+    # A rebuild without a normalizer would be as broken as the original; keep the original.
     if rebuilt.normalizer is None:
         logger.warning(
             "Tokenizer for %s has no normalizer and could not be rebuilt from "
