@@ -21,7 +21,7 @@ use tower::util::ServiceExt;
 
 use super::{indexed_decode_stream, openai_error, routes};
 use crate::api_server::core::{CoreCall, CoreEvent, CoreHandle};
-use crate::message::config::{DisaggregationMode, ServerArgs};
+use crate::message::config::ServerArgs;
 use crate::message::request::RequestKind;
 use crate::message::response::{ChunkEvent, ResponseItem};
 use crate::tokenizer_manager::wiring::TmEvent;
@@ -159,20 +159,17 @@ pub(super) async fn body_json(response: Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-fn routing_app(mode: DisaggregationMode) -> (Router<()>, flume::Receiver<TmEvent>) {
+fn routing_app() -> (Router<()>, flume::Receiver<TmEvent>) {
     let (intake_tx, intake_rx) = flume::unbounded();
-    let args = Arc::new(ServerArgs {
-        disaggregation_mode: mode,
-        ..server_args().as_ref().clone()
-    });
+    let args = server_args();
     let core = CoreHandle::new(
         intake_tx,
         flume::unbounded().0,
         crate::api_server::core::CoreConfig {
             response_capacity: 8,
             response_activity: Default::default(),
-            startup_ready: true,
-            is_disaggregation: args.is_disaggregation(),
+            startup_ready: false,
+            is_disaggregation: false,
             mm_limits: Default::default(),
             metadata: crate::api_server::core::CoreMetadata::from(args.as_ref()),
         },
@@ -201,10 +198,9 @@ type ExpectedRouting = (
 async fn assert_routing_requests(
     path: &str,
     body: serde_json::Value,
-    mode: DisaggregationMode,
     expected: Vec<ExpectedRouting>,
 ) {
-    let (app, intake_rx) = routing_app(mode);
+    let (app, intake_rx) = routing_app();
     let response = post_json(app, path, body);
     let responder = async {
         for (host, port, room, dp_rank, prefill_dp_rank) in expected {
@@ -258,7 +254,6 @@ async fn chat_preserves_pd_fields_through_admission() {
             "routed_dp_rank": 1,
             "disagg_prefill_dp_rank": 3,
         }),
-        DisaggregationMode::Decode,
         vec![
             (
                 Some("prefill"),
@@ -277,10 +272,7 @@ async fn chat_preserves_pd_fields_through_admission() {
 async fn completions_preserve_per_prompt_pd_pairing() {
     // Python TokenizerManager copies each prompt's routing across its samples:
     // scalar room 41 -> [41, 41, 42, 42], list [41, 52] -> [41, 41, 52, 52].
-    for (mode, stream, list, token_ids) in [
-        (DisaggregationMode::Decode, true, false, true),
-        (DisaggregationMode::Prefill, false, true, false),
-    ] {
+    for (stream, list, token_ids) in [(true, false, true), (false, true, false)] {
         let prompt = if token_ids {
             json!([[1], [2]])
         } else {
@@ -311,7 +303,6 @@ async fn completions_preserve_per_prompt_pd_pairing() {
         assert_routing_requests(
             "/v1/completions",
             body,
-            mode,
             per_prompt
                 .into_iter()
                 .flat_map(|routing| std::iter::repeat_n(routing, 2))
@@ -321,8 +312,8 @@ async fn completions_preserve_per_prompt_pd_pairing() {
     }
 }
 
-async fn assert_routing_rejected(path: &str, body: serde_json::Value, mode: DisaggregationMode) {
-    let (app, intake_rx) = routing_app(mode);
+async fn assert_routing_rejected(path: &str, body: serde_json::Value) {
+    let (app, intake_rx) = routing_app();
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         post_json(app, path, body),
@@ -340,22 +331,20 @@ async fn invalid_pd_metadata_is_rejected_before_any_prompt_is_submitted() {
     for field in ["bootstrap_host", "bootstrap_room"] {
         let mut body = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
         body[field] = json!([null]);
-        assert_routing_rejected("/v1/chat/completions", body, DisaggregationMode::Decode).await;
+        assert_routing_rejected("/v1/chat/completions", body).await;
     }
     assert_routing_rejected(
         "/v1/completions",
         json!({"model": "model", "prompt": ["one", "two"], "n": 2, "stream": true, "bootstrap_room": [41]}),
-        DisaggregationMode::Decode,
     )
     .await;
     let body = json!({"model": "model", "prompt": vec!["hi"; 2048], "n": 2, "bootstrap_host": "x".repeat(16385)});
-    assert_routing_rejected("/v1/completions", body, DisaggregationMode::Prefill).await;
+    assert_routing_rejected("/v1/completions", body).await;
     // A one-element list must not bypass the scalar host's 64 MiB clone
     // budget when that prompt fans out to 255 choices.
     assert_routing_rejected(
         "/v1/chat/completions",
         json!({"model": "model", "messages": [{"role": "user", "content": "hi"}], "n": 255, "bootstrap_host": ["x".repeat(263173)]}),
-        DisaggregationMode::Decode,
     )
     .await;
 }
