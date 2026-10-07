@@ -407,3 +407,17 @@ for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
         )
     )
 del _fn
+
+register_kernel(
+    KernelSpec(
+        op="attention.fused_qk_norm_mrope",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.fused_qk_norm_mrope:fused_qk_norm_mrope",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 0))}),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            in_place=True,
+            description="Q/K RMSNorm and full-width NeoX MRoPE with 128-element heads.",
+        ),
+    )
+)
