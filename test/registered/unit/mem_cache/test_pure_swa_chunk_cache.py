@@ -38,6 +38,7 @@ class _FakeAllocator:
 def _make_req():
     return SimpleNamespace(
         last_node=None,
+        lock=None,
         kv=ReqKvInfo(
             req_pool_idx=0,
             cache_protected_len=2,
@@ -63,7 +64,7 @@ class TestPureSWAChunkCache(CustomTestCase):
         req = _make_req()
         cache.checkpoint(req, up_to=8)
         cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, 8)])
-        cache.unpin(req)
+        cache.unlock(req.lock)
 
         self.assertEqual(cache.token_to_kv_pool_allocator.freed, [2, 6, 7])
         self.assertEqual(cache.token_to_kv_pool_allocator.skipped, [3, 4, 5])
