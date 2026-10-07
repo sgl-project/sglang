@@ -657,8 +657,6 @@ def build_kda_attention_fixture(
         device=device,
     )
     # KDA gate input is per-head-channel ([T, HV*K] raw); beta is per-head ([T, HV]).
-    # Extend unflattens gate to [1, T, HV, K]; decode keeps it flat.
-    # Beta stays raw in every phase; each kernel adapter owns its activation.
     a_raw = torch.randn(
         case.num_input_tokens,
         case.num_v_heads * head_k_dim,
@@ -882,14 +880,6 @@ def make_kda_case_with_prefix_lens(
 
 
 def kda_fixture_inputs(fixture: KDAAttentionFixture) -> dict[str, torch.Tensor]:
-    # `a, b` are the per-forward-mode shaped tensors the actual module
-    # consumes (see `build_kda_attention_fixture`: for DECODE
-    # `a = a_raw [T, HV*K]` and `b = b_raw.unsqueeze(0) [1, T, HV]`; for
-    # non-DECODE `a = a_raw.unflatten(-1, (HV, K)).unsqueeze(0)` and
-    # `b = b_raw.unsqueeze(0)`). The verify reference
-    # (`expected_kda_verify_output_from_inputs` →
-    # `_pure_torch_kda_gating`) expects raw `[T, HV*K]` / `[T, HV]`
-    # instead, so we expose both shapes through the inputs dict.
     return {
         "mixed_qkv": fixture.mixed_qkv,
         "a": fixture.a,

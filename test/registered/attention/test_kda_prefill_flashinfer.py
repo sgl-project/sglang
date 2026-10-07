@@ -174,7 +174,6 @@ def test_kda_prefill_checkpoints(state_dtype, layout, prefix_len):
             < 5e-2
         )
 
-    # Restore the floor-aligned boundary: 130 -> 128; cached 512 + 578 -> 1024.
     boundary = 512 if prefix_len else 128
     prefix_state, _ = run(fi, prefix_tokens=boundary)
     if prefix_len:

@@ -513,7 +513,6 @@ class KimiDeltaAttention(nn.Module):
                 hidden_states
             )
 
-        # KDA backends consume raw gate and beta projections in every phase.
         if (
             not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()

@@ -33,7 +33,6 @@ def build_flashinfer_kda_checkpoint_plan(
 
     checkpoint_counts = [length // chunk_size for length in extend_lens]
     checkpoint_starts = list(accumulate(checkpoint_counts, initial=0))
-    # -1 skips boundaries SGLang will never restore from the radix cache.
     checkpoint_destinations = [-1] * checkpoint_starts[-1]
     num_tracked_checkpoints = 0
     for row, tracked in enumerate(track_mask):
@@ -41,7 +40,7 @@ def build_flashinfer_kda_checkpoint_plan(
             continue
         relative_track_len = track_lens[row] - prefix_lens[row]
         if relative_track_len % chunk_size == 0:
-            continue  # The final state is copied from the live state pool.
+            continue
         completed_chunks = relative_track_len // chunk_size
         assert 0 < completed_chunks <= checkpoint_counts[row], (
             f"Invalid KDA checkpoint metadata: row={row}, "
@@ -56,7 +55,6 @@ def build_flashinfer_kda_checkpoint_plan(
     assert num_tracked_checkpoints == metadata.track_ssm_h_batch_src.numel(), (
         "KDA checkpoint rows disagree with the prefill tracking metadata"
     )
-    # The backend selects these same unaligned rows with build_prefill_track_plan.
     metadata.state_checkpoint_cu_starts = torch.tensor(
         checkpoint_starts, dtype=torch.int64, device=device
     )
@@ -118,10 +116,7 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             q=q.contiguous(),
             k=k.contiguous(),
             v=v.contiguous(),
-            # Fused projections may leave padding between token rows.
             g=g[:, : q.shape[1]].contiguous(),
-            # Kimi-K3 slices beta from a fused projection, so its token stride
-            # can exceed the number of heads even in a normal prefill.
             beta=beta[:, : q.shape[1]].contiguous(),
             A_log=A_log.reshape(-1).float().contiguous(),
             dt_bias=dt_bias.reshape(q.shape[2], 128).float().contiguous(),
