@@ -1056,9 +1056,11 @@ class DSV4Metadata:
     # Set once a CUDA graph captures q_pad_buffer; it may not grow after that.
     q_pad_captured: bool = False
 
-    # What the candidate-source layer published for the index-source layers after
-    # it, in the implementation's own type; never copied from the host.
-    candidate_metadata: Optional[CandidateMetadata] = None
+    # What each compress ratio's candidate-source layer published for the
+    # index-source layers after it, keyed by compress ratio, in the
+    # implementation's own type; never copied from the host. One global
+    # publisher (ratio 1) unless SGLANG_OPT_DSV4_PER_RATIO_CANDIDATES.
+    candidate_metadata: Dict[int, CandidateMetadata] = field(default_factory=dict)
 
     # Built at the runner's prefill WAR boundary when the fast path is on,
     # otherwise lazily by ``_forward_prefill_sparse``.
@@ -3424,7 +3426,7 @@ class DeepseekV4AttnBackend(
                     # candidate source hands its block table to the consumers.
                     out = _bcg_prefill_graph_full_topk(layer, x, q_lora, pos)
                     if layer.indexer.is_candidate_source:
-                        self.forward_metadata.candidate_metadata = (
+                        self.forward_metadata.candidate_metadata[layer.compress_ratio] = (
                             self.prefill_candidates.bind_prefill_graph_table(out)
                         )
             return
@@ -3821,7 +3823,7 @@ class DeepseekV4AttnBackend(
         is_source = layer.indexer.is_candidate_source
         is_consumer = layer.indexer.uses_candidates
         ratio = layer.compress_ratio
-        published = self.forward_metadata.candidate_metadata
+        published = self.forward_metadata.candidate_metadata.get(ratio)
         mode = forward_batch.forward_mode
         if mode.is_decode() or mode.is_target_verify():
             from sglang.srt.model_executor.runner_utils.capture_mode import (
@@ -3839,7 +3841,7 @@ class DeepseekV4AttnBackend(
             )
             if is_source:
                 published = self.decode_candidates.publish_decode(inputs)
-                self._publish_candidate_metadata(published)
+                self._publish_candidate_metadata(ratio, published)
             elif is_consumer:
                 self.decode_candidates.consume_decode(inputs, published)
             else:
@@ -3850,7 +3852,7 @@ class DeepseekV4AttnBackend(
             )
             if is_source:
                 published = self.prefill_candidates.publish_prefill(inputs)
-                self._publish_candidate_metadata(published)
+                self._publish_candidate_metadata(ratio, published)
             elif is_consumer:
                 self.prefill_candidates.consume_prefill(inputs, published)
             else:
@@ -3871,7 +3873,7 @@ class DeepseekV4AttnBackend(
         )
         # At any width: the consumer scores only the blocks the source published.
         self.prefill_candidates.consume_prefill_captured(
-            inputs, self.forward_metadata.candidate_metadata
+            inputs, self.forward_metadata.candidate_metadata.get(ratio)
         )
 
     def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
@@ -3966,10 +3968,12 @@ class DeepseekV4AttnBackend(
             or not self._use_sparse_prefill(forward_batch, num_qo_tokens=0)
         )
 
-    def _publish_candidate_metadata(self, published: Optional[CandidateMetadata]):
+    def _publish_candidate_metadata(
+        self, ratio: int, published: Optional[CandidateMetadata]
+    ):
         if published is None:
             return
-        self.forward_metadata.candidate_metadata = published
+        self.forward_metadata.candidate_metadata[ratio] = published
 
     def _prefill_graph_seq_limit(self) -> Optional[int]:
         """The replayed context limit: cuda_graph_config[prefill].max_seq_len when
