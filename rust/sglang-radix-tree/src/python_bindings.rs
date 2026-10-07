@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyAssertionError, PyKeyError, PyRuntimeError, PyValueError};
@@ -11,8 +11,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tch::{Device, Kind, Tensor};
 
-use crate::components::bindings::{ComponentBindingKey, TreeComponentBinding};
-use crate::components::{ComponentSet, ComponentType, FULL, MAMBA, SWA, TreeComponent};
+use crate::components::registry::{
+    TreeComponentFactorySnapshot, TreeComponentKey, default_factory_key, tree_component_registry,
+};
+use crate::components::{ComponentSet, ComponentType, FULL, MAMBA, SWA};
 use crate::node::ChildKeyType;
 use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError};
 use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
@@ -27,7 +29,7 @@ use crate::unified_tree_core::{
 /// Translate only Rust panics; ordinary Python errors pass through unchanged.
 /// Keep this boundary outside the whole binding call so its MutexGuard unwinds
 /// and poisons the core before the panic is caught. A poisoned core stays unusable.
-pub(crate) fn catch_native_panic<T>(operation: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
+fn catch_native_panic<T>(operation: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
     match catch_unwind(AssertUnwindSafe(operation)) {
         Ok(result) => result,
         Err(payload) => {
@@ -507,7 +509,7 @@ pub struct TreeCoreInitParamsBinding {
 
 impl TreeCoreInitParamsBinding {
     /// Convert into the tree core's construction params.
-    pub(crate) fn to_cache_init_params(&self) -> PyResult<CacheInitParams> {
+    fn to_cache_init_params(&self) -> PyResult<CacheInitParams> {
         Ok(CacheInitParams {
             eviction_policy: self.eviction_policy.clone(),
             slru_protected_threshold: self.slru_protected_threshold,
@@ -995,30 +997,39 @@ struct TreeCoreBinding<K: ChildKeyType> {
 impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     /// Build a tree core for the given component types from the cache's
     /// init params.
-    fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self> {
+    fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self>
+    where
+        K: TreeComponentKey,
+    {
         Self::construct(init_params, component_types, None)
     }
 
-    fn with_components(
+    fn with_component_factories(
         init_params: &TreeCoreInitParamsBinding,
-        component_types: Vec<u8>,
-        components: Vec<PyRef<'_, TreeComponentBinding>>,
+        factory_keys: Vec<String>,
     ) -> PyResult<Self>
     where
-        K: ComponentBindingKey,
+        K: TreeComponentKey,
     {
-        let components = components
+        let snapshot = tree_component_registry()
+            .snapshot(&factory_keys)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let component_types = snapshot
+            .component_types()
             .iter()
-            .map(|component| K::component_from_binding(component))
-            .collect::<PyResult<Vec<_>>>()?;
-        Self::construct(init_params, component_types, Some(components))
+            .map(|&ct| component_type_to_u8(ct))
+            .collect();
+        Self::construct(init_params, component_types, Some(snapshot))
     }
 
     fn construct(
         init_params: &TreeCoreInitParamsBinding,
         component_types: Vec<u8>,
-        components: Option<Vec<Arc<dyn TreeComponent<K> + Send + Sync>>>,
-    ) -> PyResult<Self> {
+        snapshot: Option<TreeComponentFactorySnapshot>,
+    ) -> PyResult<Self>
+    where
+        K: TreeComponentKey,
+    {
         let component_types = component_types
             .into_iter()
             .map(parse_component_type)
@@ -1058,12 +1069,22 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let params = init_params.to_cache_init_params()?;
         let device = params.device;
         let page_size = params.page_size;
-        let core = if let Some(components) = components {
-            UnifiedTreeCore::with_components(params, component_types, components)
-                .map_err(|error| PyValueError::new_err(error.to_string()))?
+        let snapshot = if let Some(snapshot) = snapshot {
+            snapshot
+                .validate_configuration(&params)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            snapshot
         } else {
-            UnifiedTreeCore::new(params, component_types)
+            let factory_keys = component_types
+                .iter()
+                .map(|&ct| default_factory_key(ct).to_owned())
+                .collect::<Vec<_>>();
+            tree_component_registry()
+                .snapshot(&factory_keys)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?
         };
+        let core = UnifiedTreeCore::with_component_factory_snapshot(params, snapshot)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(TreeCoreBinding {
             core: Mutex::new(core),
             device,
@@ -2740,19 +2761,17 @@ macro_rules! tree_core_binding {
                 })
             }
 
-            /// Construct a tree from native component handles in component-type order.
+            /// Construct a tree from an ordered list of native factory keys.
             #[staticmethod]
-            fn with_components(
+            fn with_component_factories(
                 init_params: &TreeCoreInitParamsBinding,
-                component_types: Vec<u8>,
-                components: Vec<PyRef<'_, TreeComponentBinding>>,
+                factory_keys: Vec<String>,
             ) -> PyResult<Self> {
                 catch_native_panic(|| {
                     Ok($name {
-                        inner: TreeCoreBinding::with_components(
+                        inner: TreeCoreBinding::with_component_factories(
                             init_params,
-                            component_types,
-                            components,
+                            factory_keys,
                         )?,
                     })
                 })
@@ -3994,11 +4013,20 @@ fn get_hash_str(
     })
 }
 
+/// A copy of the native factory keys and their immutable component kinds.
+#[pyfunction]
+fn registered_tree_components() -> HashMap<String, u8> {
+    crate::components::registry::registered_tree_components()
+        .into_iter()
+        .map(|(name, component_type)| (name, component_type_to_u8(component_type)))
+        .collect()
+}
+
 fn register_mem_cache_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TlruFloatConfigBinding>()?;
     m.add_function(wrap_pyfunction!(get_hash_str, m)?)?;
+    m.add_function(wrap_pyfunction!(registered_tree_components, m)?)?;
     m.add_class::<TreeCoreInitParamsBinding>()?;
-    m.add_class::<TreeComponentBinding>()?;
     m.add_class::<MatchParamsBinding>()?;
     m.add_class::<InsertParamsBinding>()?;
     m.add_class::<MatchResultBinding>()?;

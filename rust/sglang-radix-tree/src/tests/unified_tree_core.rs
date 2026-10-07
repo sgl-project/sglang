@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use tch::Tensor;
 
 use super::*;
+use crate::components::registry::{TreeComponentArgument, TreeComponentRegistry};
 use crate::components::{ComponentSet, FULL, MAMBA, SWA, SwaComponent};
 use crate::node::{NodeAccessError, ValueSlotIdx};
 use crate::test_utils::{accumulate_step, action_kinds};
@@ -220,16 +221,35 @@ impl<K: ChildKeyType> TreeComponent<K> for CountingComponentForTest {
     }
 }
 
-fn exercise_supplied_component<K: ChildKeyType>(key: K) {
-    let counter = Arc::new(CountingComponentForTest::default());
-    let driver: Arc<dyn TreeComponent<K> + Send + Sync> = counter.clone();
-    let mut tc = UnifiedTreeCore::with_components(
-        CacheInitParams::default(),
-        vec![FULL, SWA],
-        vec![Arc::new(components::FullComponent), Arc::clone(&driver)],
-    )
-    .unwrap();
-    assert!(Arc::ptr_eq(&tc.component_by_type_(SWA), &driver));
+fn exercise_registered_component<K: TreeComponentKey>(key: K) {
+    let registry = TreeComponentRegistry::default();
+    let validator_calls = Arc::new(Mutex::new(0));
+    let observed_calls = Arc::clone(&validator_calls);
+    let factory_calls = Arc::new(Mutex::new(0));
+    let observed_factories = Arc::clone(&factory_calls);
+    registry
+        .register_tree_component(
+            "counting",
+            SWA,
+            move |argument: &TreeComponentArgument<'_>| {
+                assert_eq!(argument.component_type, SWA);
+                assert_eq!(argument.is_bigram, K::IS_BIGRAM);
+                assert_eq!(argument.params.page_size, 1);
+                *factory_calls.lock().unwrap() += 1;
+                Ok(CountingComponentForTest {
+                    validator_calls: Arc::clone(&validator_calls),
+                })
+            },
+            false,
+        )
+        .unwrap();
+    let snapshot = registry
+        .snapshot(&["full".to_owned(), "counting".to_owned()])
+        .unwrap();
+    let mut tc =
+        UnifiedTreeCore::with_component_factory_snapshot(CacheInitParams::default(), snapshot)
+            .unwrap();
+    let driver = tc.component_by_type_(SWA);
 
     for expected_calls in 1..=2 {
         let values = Tensor::from_slice(&[10i64, 11]);
@@ -239,8 +259,10 @@ fn exercise_supplied_component<K: ChildKeyType>(key: K) {
             namespace: Default::default(),
         });
         assert!(result.device_indices.equal(&values));
-        assert_eq!(*counter.validator_calls.lock().unwrap(), expected_calls);
+        assert_eq!(*observed_calls.lock().unwrap(), expected_calls);
+        assert_eq!(*observed_factories.lock().unwrap(), 1);
         tc.reset();
+        assert!(Arc::ptr_eq(&tc.component_by_type_(SWA), &driver));
     }
     let default_core = UnifiedTreeCore::<K>::new(
         CacheInitParams {
@@ -253,9 +275,9 @@ fn exercise_supplied_component<K: ChildKeyType>(key: K) {
 }
 
 #[test]
-fn supplied_component_dispatches_after_reset_for_both_key_types() {
-    exercise_supplied_component(vec![1i64, 2]);
-    exercise_supplied_component(vec![(1i64, 2i64), (2, 3)]);
+fn registered_component_dispatches_after_reset_for_both_key_types() {
+    exercise_registered_component(vec![1i64, 2]);
+    exercise_registered_component(vec![(1i64, 2i64), (2, 3)]);
 }
 
 #[test]

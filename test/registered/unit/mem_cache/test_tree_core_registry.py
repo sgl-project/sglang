@@ -13,7 +13,6 @@ from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInte
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.rust_tree_core import component_registry as rust_components
 from sglang.srt.mem_cache.unified_cache import tree_core_registry
 from sglang.srt.mem_cache.unified_cache.component_factory import (
     DEFAULT_COMPONENT_FACTORY_KEYS,
@@ -103,72 +102,44 @@ class _StubAuxiliarySWAComponent(_StubFullComponent):
 
 class NamedComponentRegistryTest(CustomTestCase):
     def setUp(self):
-        for registry in (
-            python_components._PYTHON_TREE_COMPONENT_REGISTRY,
-            rust_components._TREE_COMPONENT_REGISTRY,
-            rust_components._PAIRED_PYTHON_COMPONENT_FACTORIES,
-        ):
-            patcher = mock.patch.dict(registry)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(python_components._PYTHON_TREE_COMPONENT_REGISTRY)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-    def test_registries_are_independent_and_return_snapshots(self):
-        native_factory = mock.Mock()
+    def test_python_registry_returns_snapshots(self):
         python_components.register_python_tree_component(
             "test_full", _StubFullComponent
         )
-        self.assertIsNone(rust_components.get_tree_component("test_full"))
-        rust_components.register_tree_component("test_full", native_factory)
+        snapshot = python_components.registered_python_tree_components()
+        self.assertIs(snapshot["test_full"], _StubFullComponent)
+        snapshot.clear()
         self.assertIs(
             python_components.get_python_tree_component("test_full"), _StubFullComponent
         )
-        self.assertIs(rust_components.get_tree_component("test_full"), native_factory)
-        python_components.registered_python_tree_components().clear()
-        rust_components.registered_tree_components().clear()
         self.assertIsNotNone(python_components.get_python_tree_component("full"))
-        self.assertTrue(callable(rust_components.get_tree_component("full")))
 
     def test_registration_is_idempotent_but_rejects_conflicting_names(self):
-        native_factory = mock.Mock()
-        replacement_factory = mock.Mock()
         for _ in range(2):
             python_components.register_python_tree_component(
                 "test_full", _StubFullComponent
             )
-            rust_components.register_tree_component("test_full", native_factory)
         with self.assertRaisesRegex(ValueError, "already registered"):
             python_components.register_python_tree_component(
                 "test_full", _StubMambaComponent
             )
-        with self.assertRaisesRegex(ValueError, "already registered"):
-            rust_components.register_tree_component("test_full", replacement_factory)
         python_components.register_python_tree_component(
             "test_full", _StubMambaComponent, replace=True
-        )
-        rust_components.register_tree_component(
-            "test_full", replacement_factory, replace=True
         )
         self.assertIs(
             python_components.get_python_tree_component("test_full"),
             _StubMambaComponent,
         )
-        self.assertIs(
-            rust_components.get_tree_component("test_full"), replacement_factory
-        )
 
     def test_registration_rejects_invalid_definitions(self):
-        for register, component in (
-            (python_components.register_python_tree_component, _StubFullComponent),
-            (rust_components.register_tree_component, mock.Mock()),
-        ):
-            with self.subTest(register=register), self.assertRaises(ValueError):
-                register("  ", component)
-        for register in (
-            python_components.register_python_tree_component,
-            rust_components.register_tree_component,
-        ):
-            with self.subTest(register=register), self.assertRaises(TypeError):
-                register("invalid", 42)
+        with self.assertRaises(ValueError):
+            python_components.register_python_tree_component("  ", _StubFullComponent)
+        with self.assertRaises(TypeError):
+            python_components.register_python_tree_component("invalid", 42)
 
     def test_python_callable_receives_python_arguments(self):
         calls = []
@@ -215,14 +186,6 @@ class NamedComponentRegistryTest(CustomTestCase):
                 _cache_init_params(
                     component_registry_override={ComponentType.FULL: "test_invalid"}
                 ),
-            )
-
-    def test_unknown_native_factory_is_rejected_before_loading_extension(self):
-        with self.assertRaisesRegex(ValueError, "component_registry_override"):
-            rust_components.resolve_component_factories(
-                _cache_init_params(
-                    component_registry_override={ComponentType.FULL: "missing"}
-                )
             )
 
     def test_python_resolution_rejects_unknown_names_and_wrong_kinds(self):
@@ -329,14 +292,20 @@ class TreeCoreRegistryTest(CustomTestCase):
 class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
     def setUp(self):
         self._registry_snapshot = dict(_TREE_CORE_REGISTRY)
-        for registry in (
-            python_components._PYTHON_TREE_COMPONENT_REGISTRY,
-            rust_components._TREE_COMPONENT_REGISTRY,
-            rust_components._PAIRED_PYTHON_COMPONENT_FACTORIES,
-        ):
-            patcher = mock.patch.dict(registry)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(python_components._PYTHON_TREE_COMPONENT_REGISTRY)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        native_registry = mock.patch.object(
+            tree_core_registry,
+            "_registered_tree_components",
+            return_value={
+                "full": int(ComponentType.FULL),
+                "swa": int(ComponentType.SWA),
+                "mamba": int(ComponentType.MAMBA),
+            },
+        )
+        self.native_registry = native_registry.start()
+        self.addCleanup(native_registry.stop)
         for name, component in (
             ("test_full", _StubFullComponent),
             ("test_mamba", _StubMambaComponent),
@@ -392,23 +361,47 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
         component = cache.components[ComponentType.FULL]
         self.assertIs(component.tree_core, cache.tree_core)
 
-    def test_named_python_component_falls_back_before_loading_rust(self):
-        python_components.register_python_tree_component(
-            "test_full", _StubFullComponent
-        )
-        with mock.patch.object(
-            tree_core_registry.importlib.util, "find_spec"
-        ) as find_spec:
-            cache = UnifiedRadixCache(
-                self._cache_params(
-                    component_registry_override={ComponentType.FULL: "test_full"},
-                    tree_core_backend="rust",
-                )
-            )
+    def test_named_python_component_falls_back_after_native_metadata_query(self):
+        with (
+            mock.patch.object(tree_core_registry.sys, "platform", "linux"),
+            mock.patch.object(tree_core_registry.torch, "__version__", "2.14.1"),
+            mock.patch.dict(
+                tree_core_registry.sys.modules,
+                {tree_core_registry._RUST_TREE_CORE_MODULE: SimpleNamespace()},
+            ),
+        ):
+            cache = UnifiedRadixCache(self._cache_params(tree_core_backend="rust"))
         self.assertIsInstance(cache.tree_core, UnifiedTreeCore)
         self.assertIsInstance(cache.components[ComponentType.FULL], _StubFullComponent)
         self.assertIs(cache.components[ComponentType.FULL].tree_core, cache.tree_core)
-        find_spec.assert_not_called()
+        self.native_registry.assert_called_once_with()
+
+    def test_native_metadata_must_match_the_selected_component_kind(self):
+        params = self._cache_params()
+        for registered, compatible in (
+            ({}, False),
+            ({"test_full": int(ComponentType.SWA)}, False),
+            ({"test_full": int(ComponentType.FULL)}, True),
+        ):
+            with self.subTest(registered=registered):
+                self.native_registry.return_value = registered
+                reason = tree_core_registry._component_factory_fallback_reason(params)
+                self.assertEqual(reason is None, compatible)
+
+    def test_matching_native_name_and_kind_selects_rust(self):
+        self.native_registry.return_value = {"test_full": int(ComponentType.FULL)}
+        with (
+            mock.patch.object(tree_core_registry.sys, "platform", "linux"),
+            mock.patch.object(tree_core_registry.torch, "__version__", "2.14.1"),
+            mock.patch.dict(
+                tree_core_registry.sys.modules,
+                {tree_core_registry._RUST_TREE_CORE_MODULE: SimpleNamespace()},
+            ),
+        ):
+            self.assertEqual(
+                resolve_tree_core_backend("rust", self._cache_params()), "rust"
+            )
+        self.native_registry.assert_called_once_with()
 
     def test_named_component_override_is_instance_local(self):
         python_components.register_python_tree_component(
@@ -431,27 +424,6 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
             python_components.get_python_tree_component("full"),
         )
 
-    def test_replacing_python_factory_invalidates_native_pairing(self):
-        native_factory = mock.Mock()
-        rust_components.register_tree_component("test_full", native_factory)
-        self.assertTrue(rust_components.supports_tree_component("test_full"))
-        python_components.register_python_tree_component(
-            "test_full",
-            lambda args: _StubFullComponent(args.cache, args.params),
-            replace=True,
-        )
-        params = self._cache_params(
-            component_registry_override={ComponentType.FULL: "test_full"}
-        )
-        with mock.patch.object(
-            tree_core_registry.importlib.util, "find_spec"
-        ) as find_spec:
-            self.assertEqual(resolve_tree_core_backend("rust", params), "python")
-        find_spec.assert_not_called()
-        native_factory.assert_not_called()
-        rust_components.register_tree_component("test_full", native_factory)
-        self.assertTrue(rust_components.supports_tree_component("test_full"))
-
     def test_replacing_factory_affects_only_new_cache_instances(self):
         first = UnifiedRadixCache(self._cache_params(tree_core_backend="python"))
         replacement = mock.Mock(
@@ -468,20 +440,31 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
         self.assertIs(second.components[ComponentType.FULL].tree_core, second.tree_core)
         replacement.assert_called_once()
 
-    def test_replacing_builtin_python_factory_requires_a_new_native_pairing(self):
-        python_components.register_python_tree_component(
-            "full", _StubFullComponent, replace=True
-        )
-        with mock.patch.object(
-            tree_core_registry.importlib.util, "find_spec"
-        ) as find_spec:
-            self.assertEqual(
-                resolve_tree_core_backend(
-                    "rust", self._cache_params(component_registry_override=None)
-                ),
-                "python",
-            )
-        find_spec.assert_not_called()
+    def test_replacing_builtin_python_factory_falls_back_before_loading_rust(self):
+        for component_type, key in DEFAULT_COMPONENT_FACTORY_KEYS.items():
+            with (
+                self.subTest(key=key),
+                mock.patch.dict(python_components._PYTHON_TREE_COMPONENT_REGISTRY),
+            ):
+                python_components.register_python_tree_component(
+                    key, _StubFullComponent, replace=True
+                )
+                components = tuple(dict.fromkeys((ComponentType.FULL, component_type)))
+                with mock.patch.object(
+                    tree_core_registry.importlib.util, "find_spec"
+                ) as find_spec:
+                    self.assertEqual(
+                        resolve_tree_core_backend(
+                            "rust",
+                            self._cache_params(
+                                tree_components=components,
+                                component_registry_override=None,
+                            ),
+                        ),
+                        "python",
+                    )
+                find_spec.assert_not_called()
+                self.native_registry.assert_not_called()
 
     def test_explicit_rust_cache_records_the_python_fallback(self):
         with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):

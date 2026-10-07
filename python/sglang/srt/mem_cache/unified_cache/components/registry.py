@@ -15,7 +15,12 @@ from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 PythonTreeComponentFactory = (
     type[TreeComponent] | Callable[[PythonTreeComponentArgument], TreeComponent]
 )
-_PYTHON_TREE_COMPONENT_REGISTRY: dict[str, PythonTreeComponentFactory] = {}
+_DEFAULT_PYTHON_TREE_COMPONENT_FACTORIES: dict[str, PythonTreeComponentFactory] = {
+    "full": FullComponent,
+    "swa": SWAComponent,
+    "mamba": MambaComponent,
+}
+_PYTHON_TREE_COMPONENT_REGISTRY = dict(_DEFAULT_PYTHON_TREE_COMPONENT_FACTORIES)
 
 
 def register_python_tree_component(
@@ -40,6 +45,15 @@ def registered_python_tree_components() -> dict[str, PythonTreeComponentFactory]
     return dict(_PYTHON_TREE_COMPONENT_REGISTRY)
 
 
+def is_default_python_tree_component(name: str) -> bool:
+    """Whether a built-in key still selects its original Python cache hooks."""
+    return (
+        name in _DEFAULT_PYTHON_TREE_COMPONENT_FACTORIES
+        and get_python_tree_component(name)
+        is _DEFAULT_PYTHON_TREE_COMPONENT_FACTORIES[name]
+    )
+
+
 def create_python_tree_component(
     factory: PythonTreeComponentFactory, args: PythonTreeComponentArgument
 ) -> TreeComponent:
@@ -61,8 +75,3 @@ def create_python_tree_component(
             f"expected {args.component_type.name}"
         )
     return component
-
-
-register_python_tree_component("full", FullComponent)
-register_python_tree_component("swa", SWAComponent)
-register_python_tree_component("mamba", MambaComponent)

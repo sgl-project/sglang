@@ -19,10 +19,8 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.rust_tree_core.component_registry import (
-    supports_tree_component,
-)
 from sglang.srt.mem_cache.unified_cache.component_factory import (
+    DEFAULT_COMPONENT_FACTORY_KEYS,
     resolve_component_factory_keys,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -32,6 +30,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 from sglang.srt.mem_cache.unified_cache.components.registry import (
     create_python_tree_component,
     get_python_tree_component,
+    is_default_python_tree_component,
 )
 
 if TYPE_CHECKING:
@@ -70,7 +69,10 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
     ):
         return "custom components require the Python TreeCore"
     for key in resolve_component_factory_keys(params).values():
-        if not isinstance(key, str) or not supports_tree_component(key):
+        if (
+            key in DEFAULT_COMPONENT_FACTORY_KEYS.values()
+            and not is_default_python_tree_component(key)
+        ):
             return "custom components require the Python TreeCore"
     if sys.platform != "linux":
         return "the Rust TreeCore supports Linux only"
@@ -126,6 +128,26 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
     return None
 
 
+def _registered_tree_components() -> dict[str, int]:
+    """Load the extension only when component discovery needs its registry."""
+    from sglang.srt.mem_cache.rust_tree_core.extension import bindings
+
+    return bindings.registered_tree_components()
+
+
+def _component_factory_fallback_reason(params: CacheInitParams) -> Optional[str]:
+    factory_keys = resolve_component_factory_keys(params)
+    if all(
+        key in DEFAULT_COMPONENT_FACTORY_KEYS.values() for key in factory_keys.values()
+    ):
+        return None
+    registered = _registered_tree_components()
+    for component_type, key in factory_keys.items():
+        if registered.get(key) != int(component_type):
+            return "the selected component factories require the Python TreeCore"
+    return None
+
+
 def resolve_tree_core_backend(name: str, params: CacheInitParams) -> str:
     """Resolve known Rust capability gaps before loading a backend.
 
@@ -135,6 +157,8 @@ def resolve_tree_core_backend(name: str, params: CacheInitParams) -> str:
     if name != "rust":
         return name
     reason = _rust_fallback_reason(params)
+    if reason is None:
+        reason = _component_factory_fallback_reason(params)
     if reason is not None:
         logger.info("Using the Python TreeCore: %s", reason)
         return "python"

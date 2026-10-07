@@ -28,11 +28,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.rust_tree_core.component_registry import (
-    TreeComponentArgument,
-    create_tree_component,
-    resolve_component_factories,
-)
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
@@ -45,6 +40,9 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     RecoverSWAWithLockedFull,
     ReplaceWriteThroughOnNodeSplit,
     SWARebuild,
+)
+from sglang.srt.mem_cache.unified_cache.component_factory import (
+    resolve_component_factory_keys,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
@@ -344,7 +342,24 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 sorted(component.name for component in unsupported_components)
             )
             raise ValueError(f"Rust TreeCore does not support components: {names}")
-        component_factories = resolve_component_factories(params)
+        if any(
+            isinstance(selector, type)
+            for selector in (params.component_registry_override or {}).values()
+        ):
+            raise ValueError(
+                "Rust TreeCore does not support class-valued component_registry_override"
+            )
+        component_factory_keys = resolve_component_factory_keys(params)
+        registered_types = self._bindings.registered_tree_components()
+        for component_type, key in component_factory_keys.items():
+            registered_type = registered_types.get(key)
+            if registered_type is None:
+                raise ValueError(f"unknown component factory {key!r}")
+            if registered_type != int(component_type):
+                raise ValueError(
+                    f"Tree component factory {key!r} has kind {registered_type}, "
+                    f"expected {component_type.name}"
+                )
         # Validate the same constructor options as Python before passing the
         # configured eviction parameters to the native strategy.
         eviction_strategy = get_eviction_strategy(
@@ -428,22 +443,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             ),
         )
         binding_class = self._binding_class()
-        component_types = [int(component) for component in self.tree_components]
-        components = [
-            create_tree_component(
-                factory,
-                TreeComponentArgument(
-                    component_type,
-                    params,
-                    native_init_params=binding_params,
-                    native_bindings=self._bindings,
-                    is_bigram=self.is_eagle,
-                ),
-            )
-            for component_type, factory in component_factories.items()
-        ]
-        self._binding = binding_class.with_components(
-            binding_params, component_types, components
+        self._binding = binding_class.with_component_factories(
+            binding_params,
+            [component_factory_keys[component] for component in self.tree_components],
         )
         self.kv_events = _RustKVCacheEventRecorder(
             self._binding, params.enable_kv_cache_events

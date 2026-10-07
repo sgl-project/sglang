@@ -86,21 +86,15 @@ Supported component sets are `[Full]`, `[Full, SWA]`, `[Full, Mamba]`, and `[Ful
 
 Three separate registries connect backend selection and component construction:
 
-- `register_tree_core_backend(name, factory)` selects a tree-core implementation.
-- `register_python_tree_component(name, factory)` registers a callable that receives `PythonTreeComponentArgument` and returns a Python `TreeComponent`; existing component classes with `(cache, params)` constructors are also accepted.
-- `register_tree_component(name, factory)` registers a callable that receives `TreeComponentArgument` and returns a native `TreeComponentBinding` handle.
+- Python's `register_tree_core_backend(name, factory)` selects a tree-core implementation.
+- Python's `register_python_tree_component(name, factory)` registers a callable that receives `PythonTreeComponentArgument` and returns a Python `TreeComponent`; existing component classes with `(cache, params)` constructors are also accepted.
+- Rust's `register_tree_component(name, component_type, factory, replace)` registers a native factory. Registration, factory lookup, and component construction all run in Rust.
 
-Python's `PythonTreeComponentArgument`, defined in `unified_cache/components/base.py`, requires `component_type`, `params`, and `cache`. The independent `TreeComponentArgument`, defined in `rust_tree_core/component_registry.py`, requires `component_type`, `params`, `native_init_params`, `native_bindings`, and `is_bigram`.
+`PythonTreeComponentArgument`, defined in `unified_cache/components/base.py`, requires `component_type`, `params`, and `cache`. Rust's independent `TreeComponentArgument`, defined in `src/components/registry.rs`, contains `component_type`, a borrowed `params`, and `is_bigram`. Native factories receive `&TreeComponentArgument` and return `Result<C, ComponentInitError>`, where `C` implements `TreeComponent` for both key types. Factories with separate implementations for each key type can implement `TreeComponentFactory` directly.
 
-Factories run during construction; Rust retains the native component and performs tree operations without Python node callbacks. Factories should construct a fresh component for each cache. Both backends validate the returned component kind; Rust also validates its key mode. New native behavior requires a constructor compiled into the extension; a Python factory cannot turn a Python `TreeComponent` subclass into a native implementation.
-
-For example, these factories select the existing Full implementations under a shared name:
+For example, register the existing Python Full implementation under a custom name:
 
 ```python
-from sglang.srt.mem_cache.rust_tree_core.component_registry import (
-    TreeComponentArgument,
-    register_tree_component,
-)
 from sglang.srt.mem_cache.unified_cache.components.base import PythonTreeComponentArgument
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.registry import register_python_tree_component
@@ -110,20 +104,39 @@ def python_full_component_factory(args: PythonTreeComponentArgument):
     return FullComponent(args.cache, args.params)
 
 
-def full_component_factory(args: TreeComponentArgument):
-    return args.native_bindings.TreeComponentBinding.full(
-        args.native_init_params, args.is_bigram
-    )
-
-
 register_python_tree_component("custom_full", python_full_component_factory)
-register_tree_component("custom_full", full_component_factory)
 ```
 
-Register the Python counterpart first: a full cache always needs Python cache orchestration hooks, including with a Rust tree core. A Python-only name selects Python before the native extension is loaded. Direct `RustUnifiedTreeCore` construction does not require Python cache hooks.
+The matching native registration belongs in code compiled into the extension and called during native initialization:
 
-Registration rejects conflicting names unless `replace=True` is supplied. Replacement affects future caches; existing caches retain their components. Replacing a Python factory invalidates its previous Rust pairing until the corresponding Rust factory is registered again. The built-in keys are `full`, `swa`, and `mamba`, and enum selectors resolve through these replaceable keys; no custom native implementation is enabled by default.
+```rust
+use crate::components::registry::{register_tree_component, TreeComponentArgument};
+use crate::components::{ComponentInitError, ComponentType, FullComponent};
 
-Finish registration and replacement before constructing a cache; factories must not mutate registries or register concurrently with cache construction.
+fn full_component_factory(
+    _: &TreeComponentArgument<'_>,
+) -> Result<FullComponent, ComponentInitError> {
+    Ok(FullComponent)
+}
 
-Overrides are programmatic configuration, not a server CLI flag. A registered radix-cache backend can populate `ctx.params.component_registry_override` before calling `create_unified_radix_cache(ctx)`; `--radix-cache-backend` selects that backend. Registration must run in each scheduler process, for example through an installed `sglang.srt.plugins` entry point. The C128 and MLX factories supply named Python defaults while preserving explicit caller overrides. Legacy class-valued overrides remain supported and select Python.
+fn register_custom_components() -> Result<(), ComponentInitError> {
+    register_tree_component(
+        "custom_full",
+        ComponentType::Full,
+        full_component_factory,
+        false,
+    )
+}
+```
+
+The Python binding accepts only the ordered factory-key list through `with_component_factories(init_params, factory_keys)`. Rust derives component kinds from its registry, validates their order, and invokes the selected factories. The original constructor accepting component kinds remains available. Python can query a copy of native name-to-kind metadata with `registered_tree_components()`; it cannot register native factories or pass Python callbacks or component objects into native construction.
+
+A full cache always needs Python cache orchestration hooks, including with a Rust tree core. Matching custom names and kinds declare that the Python hooks and native implementation are compatible; use a new name for semantic changes. After runtime compatibility checks, a custom key absent from the native metadata, or registered under another kind, selects Python. Legacy class overrides and replaced built-in Python factories select Python before loading the extension. Direct native core construction does not require Python cache hooks.
+
+Python registration rejects conflicting factories unless `replace=True` is supplied. Rust registration rejects existing names unless `replace` is true, and a name's component kind cannot change. Replacement affects future caches; existing caches retain their components. Rust takes an immutable factory snapshot for each construction and releases the registry lock before calling factories. Factories should construct fresh components for each cache. Both backends validate the produced component kind.
+
+Finish Python registration or replacement before constructing caches; Python factories must not mutate their registry during construction.
+
+The built-in keys are `full`, `swa`, and `mamba`; enum selectors resolve through those keys. Replacing a built-in Python factory selects Python because the native compatibility check requires its original class. No custom native implementation is enabled by default. New native behavior must be compiled into the extension; Python factories cannot turn arbitrary Python `TreeComponent` subclasses into native implementations.
+
+Overrides are programmatic configuration, not a server CLI flag. A registered radix-cache backend can populate `ctx.params.component_registry_override` before calling `create_unified_radix_cache(ctx)`; `--radix-cache-backend` selects that backend. Python registration must run in each scheduler process, for example through an installed `sglang.srt.plugins` entry point. The C128 and MLX factories supply named Python defaults while preserving explicit caller overrides.

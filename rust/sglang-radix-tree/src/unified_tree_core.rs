@@ -8,6 +8,9 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use tch::{Device, Kind, Tensor};
 
+use crate::components::registry::{
+    TreeComponentFactorySnapshot, TreeComponentKey, default_factory_key, tree_component_registry,
+};
 use crate::components::{self, ComponentInitError, ComponentSet, TreeComponent};
 use crate::components::{
     BASE_COMPONENT_TYPE, ComponentType, FULL, MAMBA, NUM_COMPONENT_TYPES, SWA,
@@ -812,20 +815,55 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         assert!(params.page_size >= 1, "page_size must be at least 1");
     }
 
-    pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self {
+    pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self
+    where
+        K: TreeComponentKey,
+    {
         Self::validate_init_params(&params, &component_types);
-        let components = component_types
+        let factory_keys = component_types
             .iter()
-            .map(|ct| -> Arc<dyn TreeComponent<K> + Send + Sync> {
-                match ct {
-                    ComponentType::Full => Arc::new(components::FullComponent),
-                    ComponentType::Swa => Arc::new(components::SwaComponent::new(&params)),
-                    ComponentType::Mamba => Arc::new(components::MambaComponent::new(&params)),
-                }
-            })
-            .collect();
+            .map(|&ct| default_factory_key(ct).to_owned())
+            .collect::<Vec<_>>();
+        let components = tree_component_registry()
+            .snapshot(&factory_keys)
+            .and_then(|snapshot| snapshot.create_components::<K>(&params))
+            .unwrap_or_else(|error| panic!("{error}"));
         Self::with_components(params, component_types, components)
             .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Resolve an ordered list of factory keys entirely within the native registry.
+    pub fn with_component_factories(
+        params: CacheInitParams,
+        factory_keys: Vec<String>,
+    ) -> Result<Self, ComponentInitError>
+    where
+        K: TreeComponentKey,
+    {
+        let snapshot = tree_component_registry().snapshot(&factory_keys)?;
+        snapshot.validate_configuration(&params)?;
+        Self::with_component_factory_snapshot(params, snapshot)
+    }
+
+    pub(crate) fn with_component_factory_snapshot(
+        params: CacheInitParams,
+        snapshot: TreeComponentFactorySnapshot,
+    ) -> Result<Self, ComponentInitError>
+    where
+        K: TreeComponentKey,
+    {
+        let component_types = snapshot.component_types();
+        if component_types != [FULL]
+            && component_types != [FULL, SWA]
+            && component_types != [FULL, MAMBA]
+            && component_types != [FULL, SWA, MAMBA]
+        {
+            return Err(ComponentInitError::InvalidConfiguration(
+                "only the [Full], [Full, Swa], [Full, Mamba], and [Full, Swa, Mamba] component sets are supported",
+            ));
+        }
+        let components = snapshot.create_components::<K>(&params)?;
+        Self::with_components(params, component_types, components)
     }
 
     /// Construct a tree from native drivers in component-type order.

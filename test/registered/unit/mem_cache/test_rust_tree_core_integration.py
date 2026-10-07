@@ -40,13 +40,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.rust_tree_core import component_registry as rust_components
 from sglang.srt.mem_cache.rust_tree_core.adapter import (
     RustUnifiedTreeCore,
     _tlru_float_config,
-)
-from sglang.srt.mem_cache.rust_tree_core.component_registry import (
-    TreeComponentArgument,
 )
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings as mem_cache
 from sglang.srt.mem_cache.rust_tree_core.extension import load_tree_core_extension
@@ -138,17 +134,6 @@ def test_match_on_the_empty_tree_returns_no_indices():
     assert result.device_indices.numel() == 0
 
 
-@pytest.fixture
-def component_factories(monkeypatch):
-    for module, attribute in (
-        (python_components, "_PYTHON_TREE_COMPONENT_REGISTRY"),
-        (rust_components, "_TREE_COMPONENT_REGISTRY"),
-        (rust_components, "_PAIRED_PYTHON_COMPONENT_FACTORIES"),
-    ):
-        monkeypatch.setattr(module, attribute, dict(getattr(module, attribute)))
-    return python_components, rust_components
-
-
 @pytest.mark.parametrize("is_eagle", [False, True])
 @pytest.mark.parametrize("selector", [ComponentType.FULL, "full"])
 def test_builtin_component_factory_constructs_native_cache_and_matches(
@@ -175,148 +160,135 @@ def test_builtin_component_factory_constructs_native_cache_and_matches(
     assert result.device_indices.tolist() == values
 
 
+def test_native_component_registry_is_read_only_and_independent(monkeypatch):
+    monkeypatch.setattr(
+        python_components,
+        "_PYTHON_TREE_COMPONENT_REGISTRY",
+        dict(python_components._PYTHON_TREE_COMPONENT_REGISTRY),
+    )
+    python_components.register_python_tree_component("test_python_only", FullComponent)
+    expected = {
+        "full": int(ComponentType.FULL),
+        "swa": int(ComponentType.SWA),
+        "mamba": int(ComponentType.MAMBA),
+    }
+    snapshot = mem_cache.registered_tree_components()
+    assert snapshot == expected
+    snapshot["test_python_only"] = int(ComponentType.FULL)
+    snapshot.pop("full")
+    assert mem_cache.registered_tree_components() == expected
+    assert not hasattr(mem_cache, "register_tree_component")
+    assert not hasattr(mem_cache, "TreeComponentBinding")
+
+
 @pytest.mark.parametrize("is_eagle", [False, True])
-def test_native_callable_constructs_components_for_each_cache(
-    component_factories, is_eagle
-):
-    python_components, rust_components = component_factories
-    calls = []
-    handles = []
-
-    def factory(args):
-        calls.append(args)
-        handle = args.native_bindings.TreeComponentBinding.full(
-            args.native_init_params, args.is_bigram
-        )
-        handles.append(handle)
-        return handle
-
-    python_components.register_python_tree_component("test_native_full", FullComponent)
-    rust_components.register_tree_component("test_native_full", factory)
-    caches = [
-        UnifiedRadixCache(
-            CacheInitParams(
-                disable=False,
-                req_to_token_pool=None,
-                token_to_kv_pool_allocator=None,
-                page_size=1,
-                is_eagle=is_eagle,
-                tree_components=(ComponentType.FULL,),
-                component_registry_override={ComponentType.FULL: "test_native_full"},
-                tree_core_backend="rust",
-            )
+def test_native_factory_selection_constructs_independent_cores(is_eagle):
+    cores = [
+        _tree_core(
+            is_eagle=is_eagle,
+            component_registry_override={ComponentType.FULL: "full"},
         )
         for _ in range(2)
     ]
-    assert len(calls) == 2
-    assert handles[0] is not handles[1]
-    for args, handle, cache in zip(calls, handles, caches):
-        assert isinstance(args, TreeComponentArgument)
-        assert not hasattr(args, "cache")
-        assert args.component_type == ComponentType.FULL
-        assert args.params.is_eagle is is_eagle
-        assert args.is_bigram is is_eagle
-        assert args.native_bindings is mem_cache
-        assert handle.component_type == int(ComponentType.FULL)
-        assert handle.is_bigram is is_eagle
-        assert isinstance(cache.tree_core, RustUnifiedTreeCore)
-    handles.clear()
-    del handle
     values = list(range(10, 14 - int(is_eagle)))
-    _insert(caches[0].tree_core, [1, 2, 3, 4], values)
+    _insert(cores[0], [1, 2, 3, 4], values)
     assert (
-        caches[0]
-        .tree_core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4])))
+        cores[0]
+        .match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4])))
         .device_indices.tolist()
         == values
     )
     assert (
-        caches[1]
-        .tree_core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4])))
+        cores[1]
+        .match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4])))
+        .device_indices.numel()
+        == 0
+    )
+    cores[0].reset()
+    assert (
+        cores[0]
+        .match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4])))
         .device_indices.numel()
         == 0
     )
 
 
-def test_direct_native_core_factory_does_not_require_python_registration(
-    component_factories,
-):
-    python_components, rust_components = component_factories
-    calls = []
-
-    def factory(args):
-        calls.append(args)
-        return args.native_bindings.TreeComponentBinding.full(
-            args.native_init_params, args.is_bigram
-        )
-
-    rust_components.register_tree_component("test_native_only", factory)
-    assert python_components.get_python_tree_component("test_native_only") is None
-    core = _tree_core(
-        component_registry_override={ComponentType.FULL: "test_native_only"}
-    )
-    assert len(calls) == 1
-    assert isinstance(calls[0], TreeComponentArgument)
-    assert not hasattr(calls[0], "cache")
-    _insert(core, [1, 2], [10, 11])
-    assert core.match_prefix(
-        MatchPrefixParams(key=_key([1, 2]))
-    ).device_indices.tolist() == [10, 11]
-
-
-@pytest.mark.parametrize("invalid", ["kind", "mode", "object"])
-@pytest.mark.parametrize("is_eagle", [False, True])
-def test_native_factory_rejects_incompatible_results(
-    component_factories, invalid, is_eagle
-):
-    _, rust_components = component_factories
-
-    def factory(args):
-        if invalid == "object":
-            return object()
-        constructor = getattr(
-            args.native_bindings.TreeComponentBinding,
-            "swa" if invalid == "kind" else "full",
-        )
-        return constructor(
-            args.native_init_params,
-            not args.is_bigram if invalid == "mode" else args.is_bigram,
-        )
-
-    rust_components.register_tree_component("test_invalid", factory)
-    error = TypeError if invalid == "object" else ValueError
-    with pytest.raises(error):
-        _tree_core(
-            is_eagle=is_eagle,
-            sliding_window_size=4,
-            component_registry_override={ComponentType.FULL: "test_invalid"},
-        )
-
-
 @pytest.mark.parametrize("is_bigram", [False, True])
-def test_native_component_handles_require_exact_kind_coverage(is_bigram):
+@pytest.mark.parametrize("factory_keys", [["full"], ["full", "swa"]])
+def test_native_binding_derives_component_kinds_from_factory_keys(
+    is_bigram, factory_keys
+):
     params = mem_cache.TreeCoreInitParamsBinding(swa_sliding_window_size=4)
-    full = mem_cache.TreeComponentBinding.full(params, is_bigram)
-    swa = mem_cache.TreeComponentBinding.swa(params, is_bigram)
-    wrong_mode = mem_cache.TreeComponentBinding.full(params, not is_bigram)
     cls = (
         mem_cache.RustBigramUnifiedTreeCoreBinding
         if is_bigram
         else mem_cache.RustUnifiedTreeCoreBinding
     )
-    for component_types, handles, message in (
-        ([0], [], "missing component Full"),
-        ([0], [full, full], "duplicate component type Full"),
-        ([0], [full, swa], "component Swa is not enabled"),
-        ([0, 1], [swa, full], "component has type Swa, expected Full"),
-        ([0], [wrong_mode], "tree requires .* component handles"),
-    ):
-        with pytest.raises(ValueError, match=message):
-            cls.with_components(params, component_types, handles)
-    binding = cls.with_components(params, [0, 1], [full, swa])
-    del full, swa, handles
+    binding = cls.with_component_factories(params, factory_keys)
     binding.reset()
     assert binding.empty_match_result().device_indices.numel() == 0
+
+
+@pytest.mark.parametrize("is_bigram", [False, True])
+@pytest.mark.parametrize(
+    "factory_keys, message",
+    [
+        ([], "component sets"),
+        ([""], "must be non-empty"),
+        (["missing"], "unknown component factory"),
+        (["full", "full"], "duplicate component type Full"),
+        (["swa"], "component sets"),
+        (["swa", "full"], "component sets"),
+    ],
+)
+def test_native_binding_rejects_invalid_factory_selections(
+    is_bigram, factory_keys, message
+):
+    params = mem_cache.TreeCoreInitParamsBinding(swa_sliding_window_size=4)
+    cls = (
+        mem_cache.RustBigramUnifiedTreeCoreBinding
+        if is_bigram
+        else mem_cache.RustUnifiedTreeCoreBinding
+    )
+    with pytest.raises(ValueError, match=message):
+        cls.with_component_factories(params, factory_keys)
+
+
+@pytest.mark.parametrize("is_bigram", [False, True])
+@pytest.mark.parametrize("invalid_key", [int(ComponentType.FULL), FullComponent])
+def test_native_binding_accepts_only_factory_key_strings(is_bigram, invalid_key):
+    cls = (
+        mem_cache.RustBigramUnifiedTreeCoreBinding
+        if is_bigram
+        else mem_cache.RustUnifiedTreeCoreBinding
+    )
+    with pytest.raises(TypeError):
+        cls.with_component_factories(
+            mem_cache.TreeCoreInitParamsBinding(), [invalid_key]
+        )
+
+
+@pytest.mark.parametrize(
+    "tree_components, factory_key, message",
+    [
+        ((ComponentType.FULL,), "missing", "unknown component factory"),
+        ((ComponentType.FULL,), "swa", "expected FULL"),
+        (
+            (ComponentType.FULL, ComponentType.FULL),
+            "full",
+            "duplicate component type Full",
+        ),
+    ],
+)
+def test_adapter_rejects_invalid_factory_selections(
+    tree_components, factory_key, message
+):
+    with pytest.raises(ValueError, match=message):
+        _tree_core(
+            tree_components=tree_components,
+            sliding_window_size=4,
+            component_registry_override={ComponentType.FULL: factory_key},
+        )
 
 
 @pytest.mark.parametrize("instance_backend", [None, "rust"])
