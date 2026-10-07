@@ -992,10 +992,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.qo_indptr = attn_backend.qo_indptr
-        # Kept ONLY for the spec-info branch (generate_attn_arg_prefill), which
-        # is static-pool-only: unified memory asserts spec off. The normal
-        # builder reads req_to_token through the translator.
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
     def update(

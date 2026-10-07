@@ -1840,10 +1840,6 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
-        # Kept ONLY for the spec-info branches (generate_attn_arg_prefill),
-        # which are static-pool-only: unified memory asserts spec off. The
-        # normal builders source from the per-batch KVIndexTable.
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._swa_kv_pool = attn_backend._swa_kv_pool
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
