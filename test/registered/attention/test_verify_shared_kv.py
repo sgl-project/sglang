@@ -190,10 +190,7 @@ class TestVerifySharedKV(CustomTestCase):
         )
 
     def _run_decode_parity(self, seq_lens, cache_dtype, kv_scale, atol, rtol):
-        # Decode through the grouped-head kernel: one query row per request
-        # whose token is already the last page-table entry, trimmed from the
-        # prefix by kv_len_adjust=-1. Reference: the per-head decode kernel
-        # over the full page table.
+        # reference: the per-head decode kernel over the full page table
         h_q, head_dim = 16, 128
         bs = len(seq_lens)
         q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = _build_inputs(

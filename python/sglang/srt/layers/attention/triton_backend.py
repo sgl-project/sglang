@@ -94,8 +94,7 @@ def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv
         return is_kimi_k3(model_config.hf_config)
     if is_dspark_draft(model_config.hf_config):
         return use_verify_splitkv
-    # GQA models whose local query heads all share one TP-local KV head:
-    # Qwen3.5, the MiniMax-M3 dense layers and its Llama EAGLE3 draft.
+    # GQA archs tuned for all local query heads on one TP-local KV head
     hf_config = model_config.hf_config
     if not (
         is_qwen3_5(hf_config)
@@ -250,8 +249,7 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
-        # Decode is a verify with one query row per request whose token is
-        # already in the page table, so the same GQA shapes reuse that kernel.
+        # decode reuses the verify kernel as one extend row per request
         self._decode_shared_kv_qo_indptr = (
             torch.arange(max_bs + 1, dtype=torch.int32, device=model_runner.device)
             if self.use_verify_shared_kv and not self.use_mla
@@ -1790,9 +1788,7 @@ class TritonAttnBackend(AttentionBackend):
         # sliding-window / ragged / topk>1), so we fall through to
         # extend_attention_fwd below. Correctness is never at risk.
         # Route target-verify to the grouped-head kernel when eligible, else the
-        # per-head split-KV kernel. The v2 draft-extend has the same shape (a
-        # constant-length causal chain per request over a prefix-only
-        # kv_indices), so it takes the same path.
+        # per-head split-KV kernel. The v2 draft-extend is the same constant-length chain.
         if self.use_verify_shared_kv:
             verify_fwd = self.verify_shared_kv_fwd
         elif self.use_verify_splitkv:
@@ -2393,9 +2389,7 @@ class TritonAttnBackend(AttentionBackend):
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
-        # Grouped-head decode: one query row per request; kv_len_adjust=-1
-        # drops the new token from the prefix so it is attended to only once,
-        # as the extend row.
+        # grouped-head decode: the new token is the extend row, so trim it from the prefix
         if (
             self._decode_shared_kv_qo_indptr is not None
             and score_mod is None
