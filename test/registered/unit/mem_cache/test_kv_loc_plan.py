@@ -677,6 +677,48 @@ class TestKVLocPlan(unittest.TestCase):
         self.assertIs(private.out_cache_loc, self.window)
         self.assertIsNone(private.out_cache_loc_virtual)
 
+    def test_an_npu_dcp_target_writes_rank_local_slots(self):
+        """On NPU with DCP a target writes its rank's slots, while the
+        scheduler, `req_to_token` and the replicated draft pool keep
+        allocator-global ones: a plan's window stays global whichever runner
+        built it (a target prefill handing its plan to the draft, a draft
+        handing its window to the verify), the target binds it rank-local,
+        and the draft binds it global."""
+        parallel = SimpleNamespace(
+            dcp_enabled=True, dcp_size=2, dcp_rank=1, attn_dcp_size=1
+        )
+        with (
+            patch.object(kv_index_translator, "_is_npu", True),
+            patch.object(kv_index_translator, "get_parallel", return_value=parallel),
+        ):
+            target, draft = (
+                KVIndexTranslator(
+                    req_to_token=self.req_to_token,
+                    token_to_kv_pool_allocator=self.allocator,
+                    token_to_kv_pool=_FakeKVCache(64),
+                    page_size=4,
+                    device=_DEV,
+                    is_draft_worker=is_draft_worker,
+                )
+                for is_draft_worker in (False, True)
+            )
+        global_ids = torch.arange(8, 16)
+        # Rank 1 of 2 owns every other 4-slot page, compacted.
+        local_ids = torch.tensor([-1, -1, -1, -1, 4, 5, 6, 7])
+        for source in (target, draft):
+            plan = source.plan(
+                req_pool_indices=self.rpi,
+                seq_lens=self.seq_lens,
+                seq_lens_cpu=self.seq_lens.clone(),
+                write_virtual=global_ids,
+            )
+            target_batch, draft_batch = SimpleNamespace(), SimpleNamespace()
+            plan.bind(target_batch, target)
+            plan.bind(draft_batch, draft)
+            self.assertTrue(torch.equal(target_batch.out_cache_loc, local_ids))
+            self.assertTrue(torch.equal(draft_batch.out_cache_loc, global_ids))
+            self.assertIs(plan.write_virtual, global_ids)
+
     def test_runner_slots_are_used_as_they_are(self):
         for translator, writes_swa in (
             (self.target, True),

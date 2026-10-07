@@ -58,6 +58,7 @@ DCP index kernels select them.
 
 from __future__ import annotations
 
+import functools
 import weakref
 from typing import Dict, Optional
 
@@ -72,6 +73,7 @@ from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table_and_stream,
     build_kv_read_table_packed,
 )
+from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWAAllocatorBase,
 )
@@ -89,6 +91,9 @@ from sglang.srt.mem_cache.kv_loc_plan import (
 )
 from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 
 class KVIndexTable(msgspec.Struct, frozen=True):
@@ -159,6 +164,7 @@ class KVIndexTranslator:
         token_to_kv_pool,
         page_size: int,
         device: str,
+        is_draft_worker: bool = False,
     ):
         self.req_to_token = req_to_token
         self.page_size = page_size
@@ -221,7 +227,24 @@ class KVIndexTranslator:
             self._full_v2p_table = None
             self._translate_full = None
             self.defer_read_translate = False
-            self._spaces[IdSpaceKind.FULL] = IdSpace(key=(IdSpaceKind.FULL, None))
+            parallel = get_parallel()
+            if _is_npu and parallel.dcp_enabled and not is_draft_worker:
+                # An NPU DCP target writes its rank's share of the window in
+                # rank-local slots (-1: another rank's); the scheduler,
+                # `req_to_token` and the replicated draft pool keep the
+                # allocator-global ones the window is planned in.
+                localize = functools.partial(
+                    localize_dcp_indices,
+                    dcp_size=parallel.dcp_size,
+                    dcp_rank=parallel.dcp_rank,
+                    interleave_size=page_size,
+                )
+                self._spaces[IdSpaceKind.FULL] = IdSpace(
+                    key=(IdSpaceKind.FULL, "dcp-rank-local"), write=localize
+                )
+            else:
+                localize = None
+                self._spaces[IdSpaceKind.FULL] = IdSpace(key=(IdSpaceKind.FULL, None))
             # `translate_loc_from_full_to_swa` is abstract on `BaseSWAKVPool`,
             # which is also what the backends' `_resolve_swa_kv_pool` keys on.
             # Reads stay in `req_to_token`; the backends map them themselves.
@@ -229,9 +252,14 @@ class KVIndexTranslator:
                 not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
                 or token_to_kv_pool.request_window is None
             ):
+                to_swa = token_to_kv_pool.translate_loc_from_full_to_swa
                 self._spaces[IdSpaceKind.SLIDING_WINDOW] = IdSpace(
                     key=(IdSpaceKind.SLIDING_WINDOW, id(token_to_kv_pool)),
-                    write=token_to_kv_pool.translate_loc_from_full_to_swa,
+                    write=(
+                        to_swa
+                        if localize is None
+                        else lambda ids: to_swa(localize(ids))
+                    ),
                 )
 
         self._rows: Optional[torch.Tensor] = (
