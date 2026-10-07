@@ -6,6 +6,8 @@ after the candidate metadata changes, and check that variable eager token
 counts do not retain per-shape LSE allocations.
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -18,27 +20,29 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
-if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12):
-    pytest.skip(
-        "Native GLM NoPE sparse MLA requires CUDA SM 12.x.", allow_module_level=True
-    )
-
 
 def _has_compact_glm_nope() -> bool:
     try:
         from flashinfer import mla
-    except ImportError:
+    except Exception:
         return False
     configs = getattr(mla, "supported_sparse_mla_sm120_configs", None)
     config = configs().get("glm53_nope") if configs is not None else None
     return getattr(config, "bytes_per_token", None) == 528
 
 
-if not _has_compact_glm_nope():
-    pytest.skip(
-        "Installed FlashInfer lacks compact glm53_nope support.",
-        allow_module_level=True,
-    )
+# Marks rather than module-level skips keep `python3 file.py` (how CI runs
+# registered files) a clean pytest run that reports skips.
+pytestmark = [
+    pytest.mark.skipif(
+        not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12),
+        reason="Native GLM NoPE sparse MLA requires CUDA SM 12.x.",
+    ),
+    pytest.mark.skipif(
+        not _has_compact_glm_nope(),
+        reason="Installed FlashInfer lacks compact glm53_nope rows (needs 0.7.1+).",
+    ),
+]
 
 D_LATENT = 512
 TILE = 128
@@ -240,3 +244,7 @@ def test_variable_eager_lengths_do_not_retain_lse():
     assert growth < retained_if_owned // 4, (growth, retained_if_owned)
     prepared = getattr(runner, "_prepared_calls", {})
     assert all(getattr(call, "lse", None) is None for call in prepared.values())
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
