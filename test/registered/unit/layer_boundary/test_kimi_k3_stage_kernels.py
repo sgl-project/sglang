@@ -16,7 +16,10 @@ from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
 from sglang.srt.layers.layer_boundary import BatchVariant, layer_stack
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.ops import attn_tp_gather_input, keep_output
-from sglang.srt.layers.layer_boundary.residual.attn_bank import AttnBank
+from sglang.srt.layers.layer_boundary.residual.attn_bank import (
+    AttnBank,
+    AttnBankOutputRead,
+)
 from sglang.srt.models import kimi_k3
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -53,11 +56,26 @@ def moe_layer(*, bank, sp_moe, all_reduce_fusion):
 
 def declare(layers, *, sp_moe, carries=False, config=CONFIG):
     """Declare ``layers`` (index -> layer) in one layer stack, as if the
-    stack carried the bank's shards (``carries``)."""
+    stack carried the bank's shards (``carries``). A bank stack ends on the
+    model's final read of the bank, which gathers an SP-MoE layer's rows in
+    K3's tuned all-gather."""
     bank = AttnBank()
+    final_read = (
+        AttnBankOutputRead(
+            bank,
+            None,
+            None,
+            fixture.Norm(),
+            attn_tp_gather=k3_sp_collective.all_gather if sp_moe else None,
+            reads_attn_tp_slices=carries,
+        )
+        if any(layer.use_attn_residuals for layer in layers.values())
+        else None
+    )
     with (
         patch.object(k3_sp_collective, "enabled", return_value=True),
         patch.object(k3_ar_fusion, "enabled", return_value=True),
+        patch.object(kimi_k3, "_shards_moe_rows", return_value=sp_moe),
         patch.object(kimi_k3, "_carries_bank_slices", return_value=carries),
         envs.SGLANG_K3_SP_ATTN_RES.override(carries),
         fixture.planning(
@@ -65,7 +83,7 @@ def declare(layers, *, sp_moe, carries=False, config=CONFIG):
             a2a=sp_moe,
             boundary_reduction="ar",
         ),
-        layer_stack(),
+        layer_stack(final_read=final_read),
     ):
         for idx, layer in layers.items():
             layer._declare_stages(config, idx, bank)

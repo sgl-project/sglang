@@ -12,7 +12,6 @@ import torch
 from sglang.srt.layers import attn_residual
 from sglang.srt.layers.layer_boundary import (
     BatchVariant,
-    ExitRows,
     ReadoutFusion,
     SumGroup,
     append_stages,
@@ -86,7 +85,7 @@ class _Layer:
     def mlp(self, x):
         return torch.sin(x) * self.mlp_weight
 
-    def ops(self, bank):
+    def ops(self, bank, *, reads_slices=False):
         return AttnBankState(
             bank,
             self.attn_proj,
@@ -94,6 +93,7 @@ class _Layer:
             self.ffn_proj,
             self.ffn_score_norm,
             writes_block=self.writes_block,
+            reads_slices=reads_slices,
         ).residual_ops()
 
 
@@ -347,9 +347,9 @@ class TestAttnBankSpMoeStages(CustomTestCase):
     """A latent MoE dispatched over an a2a backend with attention TP runs on
     this rank's shard of the rows: the FFN's entry reduce-scatters the
     attention output and slices the residual, and each MoE layer's exit
-    gathers its stream back to every row."""
+    gathers its stream back to every row, which the bank's next read needs."""
 
-    def build(self, exit_rows):
+    def build(self, *, reads_slices=False):
         holder = AttnBank()
         with (
             fixture.planning(
@@ -372,12 +372,14 @@ class TestAttnBankSpMoeStages(CustomTestCase):
                             sparse=True,
                             next_layer_sparse=True,
                             output_complete=True,
-                            exit_rows=exit_rows,
                         ),
                         fixture.Norm(),
                     ),
                 )[1]
-                for ops in (LAYER_LIST[i].ops(holder) for i in range(3))
+                for ops in (
+                    LAYER_LIST[i].ops(holder, reads_slices=reads_slices)
+                    for i in range(3)
+                )
             ]
 
     def entry_step(self, ffn):
@@ -385,7 +387,7 @@ class TestAttnBankSpMoeStages(CustomTestCase):
         return prepare.keywords["step"]
 
     def test_each_moe_layer_returns_to_every_row(self):
-        for ffn in self.build(ExitRows.ATTENTION):
+        for ffn in self.build():
             step = self.entry_step(ffn)
             self.assertIs(step.func, comm_ops._attn_tp_reduce_scatter_update_read)
             self.assertTrue(step.keywords["scatters_residual"])

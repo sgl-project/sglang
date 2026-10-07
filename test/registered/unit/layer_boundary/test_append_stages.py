@@ -457,48 +457,73 @@ class TestUnpaddedBatches(CustomTestCase):
                 self.assertNotIn(BatchVariant.UNPADDED, ffn.plan.paths)
 
 
-class TestSliceExitRows(CustomTestCase):
-    """An FFN on this rank's attention-TP slice that declares ExitRows.SLICE
-    leaves its output there, the stack's last one too, where the final read
-    then takes it; the next layer's attention reads it there and gathers what
-    it read, in the declared gather when that takes the batch."""
+class TestRowsTheConsumerReads(CustomTestCase):
+    """An FFN on this rank's attention-TP slice leaves its output there unless
+    the stage after it needs the attention's rows: a read that needs every row
+    (reads_after_attn_tp_gather) has the FFN's exit gather them, in that
+    stage's declared gather. At the stack's end the model's final read takes
+    that place: one that reads the slice (reads_attn_tp_slices) takes the
+    last FFN's output there, and its own gather serves the last FFN's exit."""
 
-    def build(self, exit_rows, *, disable_attn_tp_gather=False, gather=None):
+    class EveryRowRead(NormQuantReadout):
+        reads_after_attn_tp_gather = True
+
+    def build(
+        self,
+        *,
+        final_read=None,
+        disable_attn_tp_gather=False,
+        gather=None,
+        read=None,
+    ):
         parallel = fixture.parallel_of(
             attn_dp=1, attn_tp=2, disable_attn_tp_gather=disable_attn_tp_gather
         )
+        attn_read = {} if read is None else dict(read=read)
         with fixture.planning(parallel, a2a=True, boundary_reduction="ar"):
-            with layer_stack():
+            with layer_stack(final_read=final_read):
                 return [
                     stage
                     for idx in range(2)
                     for stage in append_stages(
                         (
-                            declare_attn(attn_tp_gather=gather if idx else None),
+                            declare_attn(
+                                attn_tp_gather=gather if idx else None, **attn_read
+                            ),
                             fixture.Norm(),
                         ),
                         (
-                            declare_ffn(
-                                sparse=True,
-                                next_layer_sparse=True,
-                                exit_rows=exit_rows,
-                            ),
+                            declare_ffn(sparse=True, next_layer_sparse=True),
                             fixture.Norm(),
                         ),
                     )
                 ]
 
-    def test_the_last_ffn_stays_on_its_slice(self):
-        for exit_rows in (ExitRows.SLICE, None):
-            with self.subTest(exit_rows=exit_rows):
-                last = self.build(exit_rows)[-1].plan.paths[BatchVariant.ORDINARY]
-                if exit_rows is ExitRows.SLICE:
-                    self.assertIs(last.output_move, keep_output)
+    def test_the_last_ffn_stays_on_its_slice_for_a_read_of_the_slice(self):
+        for reads_slices in (True, False):
+            with self.subTest(reads_slices=reads_slices):
+                final_read = SimpleNamespace(reads_attn_tp_slices=reads_slices)
+                last = self.build(final_read=final_read)[-1]
+                path = last.plan.paths[BatchVariant.ORDINARY]
+                if reads_slices:
+                    self.assertIs(path.output_move, keep_output)
                 else:
-                    self.assertIs(last.output_move.func, update_attn_tp_gather_output)
+                    self.assertIs(path.output_move.func, update_attn_tp_gather_output)
+
+    def test_the_last_ffn_gathers_in_the_final_read_gather(self):
+        def gather(hidden_states):
+            return None
+
+        last = self.build(final_read=SimpleNamespace(attn_tp_gather=gather))[-1]
+        move = last.plan.paths[BatchVariant.ORDINARY].output_move
+        self.assertIs(move.func, update_attn_tp_gather_output)
+        self.assertIs(move.keywords["gather"], gather)
 
     def test_an_unpadded_batch_leaves_the_last_ffn_on_the_attention_rows(self):
-        last = self.build(ExitRows.SLICE, disable_attn_tp_gather=True)[-1]
+        last = self.build(
+            final_read=SimpleNamespace(reads_attn_tp_slices=True),
+            disable_attn_tp_gather=True,
+        )[-1]
         unpadded = last.plan.paths[BatchVariant.UNPADDED]
         self.assertEqual(unpadded.output.layout.sharded, frozenset())
         self.assertIs(unpadded.output_move, keep_output)
@@ -507,10 +532,24 @@ class TestSliceExitRows(CustomTestCase):
         def gather(hidden_states):
             return None
 
-        _, _, attention, _ = self.build(ExitRows.SLICE, gather=gather)
+        first_ffn, attention = self.build(gather=gather)[1:3]
         move = attention.plan.paths[BatchVariant.ORDINARY].entry.input_move
         self.assertIs(move.func, attn_tp_gather_input)
         self.assertIs(move.keywords["gather"], gather)
+        path = first_ffn.plan.paths[BatchVariant.ORDINARY]
+        self.assertIs(path.output_move, keep_output)
+
+    def test_a_read_of_every_row_has_the_ffn_gather_in_its_gather(self):
+        def gather(hidden_states):
+            return None
+
+        first_ffn, attention = self.build(gather=gather, read=self.EveryRowRead())[1:3]
+        move = first_ffn.plan.paths[BatchVariant.ORDINARY].output_move
+        self.assertIs(move.func, update_attn_tp_gather_output)
+        self.assertIs(move.keywords["gather"], gather)
+        entry = attention.plan.paths[BatchVariant.ORDINARY].entry
+        self.assertIsNone(entry.input_move)
+        self.assertEqual(entry.input_rows.sharded, frozenset())
 
     def test_a_read_that_gathers_needs_a_plain_add_or_a_written_stream(self):
         def gather_read(hidden_states, residual, norm):
@@ -536,7 +575,7 @@ class TestSliceExitRows(CustomTestCase):
             with self.subTest(update=type(update).__name__):
                 with (
                     fixture.planning(parallel, a2a=True, boundary_reduction="ar"),
-                    layer_stack(),
+                    layer_stack(final_read=SimpleNamespace(reads_attn_tp_slices=True)),
                 ):
                     stages = [
                         stage
@@ -548,7 +587,6 @@ class TestSliceExitRows(CustomTestCase):
                                     sparse=True,
                                     next_layer_sparse=True,
                                     update=update,
-                                    exit_rows=ExitRows.SLICE,
                                 ),
                                 fixture.Norm(),
                             ),

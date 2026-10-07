@@ -46,7 +46,6 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
-    ExitRows,
     ReadoutFusion,
     SumGroup,
     append_stages,
@@ -2520,14 +2519,13 @@ class KimiK3DecoderLayer(nn.Module):
 
     def _declare_stages(self, config, layer_idx, attn_bank):
         """Declare this layer's attention and FFN stages: the reads and updates
-        around them, the rows the FFN takes and leaves, and the kernels K3
-        supplies for the bank path."""
+        around them, the rows the FFN takes, and the kernels K3 supplies for
+        the bank path."""
         # Under attention DP the FFN input is read on this rank's rows
         # once the attention's sum is complete, then gathered.
         attn_ops = {}
         ffn_ops = dict(read=NormReadout(reads_before_dp_gather=True))
         carries = _carries_bank_slices(config)
-        bank_sp_moe = self._sp_moe and self.use_attn_residuals
         tuned_gather = (
             k3_sp_collective.all_gather if k3_sp_collective.enabled() else None
         )
@@ -2543,15 +2541,18 @@ class KimiK3DecoderLayer(nn.Module):
                 fuses_slice_collectives=self._sp_moe
                 and k3_sp_collective.enabled()
                 and envs.SGLANG_K3_SP_ATTN_RES.get(),
+                reads_slices=carries,
             ).residual_ops()
             attn_ops = dict(
                 read=bank_ops.attn_readout,
                 update=bank_ops.attn_update,
-                # An input read on the shard an SP-MoE layer left is gathered
-                # in K3's tuned all-gather when it takes the batch.
+                # The rows an SP-MoE layer left on each rank's shard are
+                # gathered in K3's tuned all-gather when it takes the batch:
+                # before this read, or after it while the bank stays on the
+                # shard.
                 attn_tp_gather=(
                     tuned_gather
-                    if carries and _is_moe_layer(config, layer_idx - 1)
+                    if _shards_moe_rows() and _is_moe_layer(config, layer_idx - 1)
                     else None
                 ),
             )
@@ -2574,23 +2575,9 @@ class KimiK3DecoderLayer(nn.Module):
                         if self._is_moe_layer
                         else get_group_rank_size(self.mlp.down_proj.tp_group)[1]
                     ),
-                    # SP-MoE runs on this rank's attention-TP shard of the
-                    # rows; on the bank path, whose reads write the bank on
-                    # every row, its output returns to all of them, unless
-                    # the bank stays on the shard, read there to the end.
-                    exit_rows=(
-                        (ExitRows.SLICE if carries else ExitRows.ATTENTION)
-                        if bank_sp_moe
-                        else None
-                    ),
                     # A latent MoE completes its output sum together with
                     # the latent reduction its norm needs.
                     output_complete=self._is_moe_layer and self.mlp.use_latent_moe,
-                    # The bank path's gather back to every row, in K3's
-                    # tuned all-gather when it takes the batch.
-                    attn_tp_gather=(
-                        tuned_gather if bank_sp_moe and not carries else None
-                    ),
                 ),
                 self.post_attention_layernorm,
             ),
@@ -2716,19 +2703,8 @@ class KimiK3LinearModel(nn.Module):
         # The attention-residual bank of one forward, which every layer's
         # stage boundaries read.
         self.attn_bank = AttnBank() if config.attn_res_block_size is not None else None
-        self.layers, self.start_layer, self.end_layer = make_pp_layers(
-            config.num_hidden_layers,
-            lambda idx, prefix: KimiK3DecoderLayer(
-                layer_idx=idx,
-                config=config,
-                quant_config=quant_config,
-                prefix=prefix,
-                alt_streams=self.alt_streams,
-                attn_bank=self.attn_bank,
-            ),
-            prefix=f"{prefix}.layers",
-        )
-
+        # The layer stack's last FFN leaves its output on the rows the final
+        # read takes.
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             if config.attn_res_block_size is not None:
@@ -2750,15 +2726,34 @@ class KimiK3LinearModel(nn.Module):
                     self.output_attn_res_proj,
                     self.output_attn_res_norm,
                     self.norm,
+                    # The rows a last SP-MoE layer leaves on each rank's
+                    # shard are gathered in K3's tuned all-gather when it
+                    # takes the batch.
                     attn_tp_gather=(
                         k3_sp_collective.all_gather
-                        if self.carries_bank_slices
+                        if k3_sp_collective.enabled()
+                        and _shards_moe_rows()
+                        and _is_moe_layer(config, config.num_hidden_layers - 1)
                         else None
                     ),
+                    reads_attn_tp_slices=self.carries_bank_slices,
                 )
             )
         else:
             self.norm = PPMissingLayer()
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: KimiK3DecoderLayer(
+                layer_idx=idx,
+                config=config,
+                quant_config=quant_config,
+                prefix=prefix,
+                alt_streams=self.alt_streams,
+                attn_bank=self.attn_bank,
+            ),
+            prefix=f"{prefix}.layers",
+            final_read=self._final_read if self.pp_group.is_last_rank else None,
+        )
 
     def forward(
         self,
