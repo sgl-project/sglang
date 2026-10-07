@@ -326,7 +326,9 @@ def _mix_stats_impl(
                 cfg.sinkhorn_iters,
                 cfg.rms_eps,
                 cfg.eps,
-                decode=decode,
+                # A decode row can also run in a MIXED batch, which takes the
+                # prefill split; batch-invariant mode keeps one split for both.
+                decode=decode and not is_batch_invariant_mode_enabled(),
             )
         return pre, post, comb
     if x.is_cuda and torch.version.cuda is not None:

@@ -1,7 +1,8 @@
 """DeepSeek-V4 mHC: the decoder layer tells hc_mix_stats_sinkhorn whether the forward
 is decode/verify (where SM120 may split K more finely) or prefill, for both
-hyper-connections. Runs the real forward_hc_pre_from_prev, posts and mix_stats on a
-mocked layer, stopping at the kernel."""
+hyper-connections, unless batch-invariant mode needs one split for every batch. Runs
+the real forward_hc_pre_from_prev, posts and mix_stats on a mocked layer, stopping at
+the kernel."""
 
 import unittest
 from contextlib import nullcontext
@@ -64,12 +65,16 @@ def _layer():
 
 
 class TestMhcDecodeFlag(CustomTestCase):
-    def _decode_flags(self, mode):
+    def _decode_flags(self, mode, batch_invariant=False):
         """The ``decode`` argument of each hc_mix_stats_sinkhorn call of one layer."""
         residual = _residual()
         kernel = mock.Mock(return_value=(object(), object(), object()))
         with (
             override_platform(is_blackwell=True, is_sm90=False, is_sm100=False),
+            mock.patch(
+                "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
+                return_value=batch_invariant,
+            ),
             mock.patch.object(torch.version, "cuda", "13.0"),
             mock.patch.object(deepseek_v4_mhc, "_is_gfx95_supported", False),
             mock.patch.object(mhc_kernels, "hc_mix_stats_sinkhorn", kernel),
@@ -103,6 +108,20 @@ class TestMhcDecodeFlag(CustomTestCase):
         for mode in PREFILL_MODES:
             with self.subTest(mode=mode.name):
                 self.assertEqual(self._decode_flags(mode), [False, False])
+
+    def test_batch_invariant_mode_uses_one_split_for_every_mode(self):
+        # A decode row runs in a DECODE batch or, beside prefill rows, in a MIXED
+        # one; in batch-invariant mode both must reduce K with the same slices.
+        with override_platform(device_sm=120):
+            slices = {
+                mode.name: {
+                    mhc_kernels._num_slices_for(HC * HIDDEN, decode=flag)
+                    for flag in self._decode_flags(mode, batch_invariant=True)
+                }
+                for mode in DECODE_MODES + PREFILL_MODES
+            }
+            self.assertEqual(mhc_kernels._num_slices_for(HC * HIDDEN, decode=True), 160)
+        self.assertEqual(slices, {name: {80} for name in slices})
 
     def test_direct_mix_stats_callers_default_to_prefill(self):
         residual = _residual()
