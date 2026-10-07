@@ -1527,7 +1527,11 @@ class AiterAttnBackend(AttentionBackend):
             head_pad_mode=getattr(self, "head_pad_mode", "none"),
             num_head=getattr(self, "num_head", layer.tp_q_head_num),
             kv_cache_dtype=self.kv_cache_dtype,
-        ) and not (_use_mla_ps_kernel and self._asm_ps_supports_qlen(max_q_len)):
+        ) and not (
+            _use_mla_ps_kernel
+            and self.mla_decode_backend == "asm"
+            and self._asm_ps_supports_qlen(max_q_len)
+        ):
             return mla_gluon_decode(
                 q=q,
                 k_buffer=k_buffer,
