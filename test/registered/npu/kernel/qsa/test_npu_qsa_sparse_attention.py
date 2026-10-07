@@ -271,3 +271,7 @@ def test_actual_npu_pool_write_and_graph(fia, monkeypatch):
         expected = torch.zeros_like(q)
         expected[1] = (1 + value) / 2
         torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

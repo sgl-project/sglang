@@ -272,3 +272,7 @@ def test_ple_short_conv_state_preparation(monkeypatch, record_property, dtype, c
         tolerance = 2e-2 if dtype == torch.bfloat16 else 3e-3
         torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
         torch.testing.assert_close(case.state, reference.state, atol=0, rtol=0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -396,3 +396,7 @@ def test_topk_dispatch_errors_are_not_hidden(monkeypatch):
     monkeypatch.setattr(qsa_topk, "fast_topk", fail)
     with pytest.raises(RuntimeError, match="intentional Top-K failure"):
         kernel.qsa_fast_topk(logits, starts, ends, 512)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

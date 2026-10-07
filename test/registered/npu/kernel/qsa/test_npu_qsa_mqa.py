@@ -172,3 +172,7 @@ def test_mqa_independent_output_width_rejected():
     args[-1] -= 1
     with pytest.raises(ValueError, match="Output width"):
         mqa.qsa_mqa_decode(*args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

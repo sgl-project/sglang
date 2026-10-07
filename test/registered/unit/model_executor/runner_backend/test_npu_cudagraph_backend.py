@@ -234,3 +234,7 @@ def test_npu_graph_qwen_qsa_replay_dispatch(
                 "attr_name": "actual_seq_lengths_kv",
                 "attr_type": [],
             }
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
