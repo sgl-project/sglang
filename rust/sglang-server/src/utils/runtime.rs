@@ -182,8 +182,8 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
 
     // The potentially slow/fallible tokenizer load above happens before the
     // ports become visible. Own both sockets before starting any worker or
-    // transport thread, though, so startup remains all-or-nothing: if either
-    // configured port is unavailable, both local listeners are dropped and no
+    // transport thread, though, so startup remains all-or-nothing: if any
+    // configured port is unavailable, every local listener is dropped and no
     // partial runtime needs cleanup.
     let http_addr = cfg.rust_server_args.http_addr;
     let http_listener = bind_tcp_listener(http_addr)
@@ -194,6 +194,22 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 .map_err(|e| format!("binding gRPC listener on {addr} failed: {e}"))?,
         ),
         None => None,
+    };
+    // A PD bootstrap port other than the HTTP port gets its own listener on the
+    // base-port server; it serves the same registry as the HTTP listener.
+    let bootstrap_listener = match cfg.server_args.disaggregation_bootstrap_port {
+        Some(port)
+            if cfg.server_args.enable_pd_bootstrap()
+                && http_addr.port() == cfg.server_args.port
+                && port != http_addr.port() =>
+        {
+            let addr = std::net::SocketAddr::new(http_addr.ip(), port);
+            Some(
+                bind_tcp_listener(addr)
+                    .map_err(|e| format!("binding PD bootstrap listener on {addr} failed: {e}"))?,
+            )
+        }
+        _ => None,
     };
 
     // --- Detokenizer shards (pinned, CPU bound) ---
@@ -343,6 +359,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 rt.block_on(async move {
                     let http = api_server::app::serve(
                         http_listener,
+                        bootstrap_listener,
                         frontend,
                         cfg.server_args.clone(),
                         shutdown_rx.clone(),

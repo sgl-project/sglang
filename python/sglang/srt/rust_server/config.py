@@ -47,6 +47,13 @@ def _build_server_args(
         "prefill": ext.DisaggregationMode.Prefill,
         "decode": ext.DisaggregationMode.Decode,
     }[get_disagg().disaggregation_mode]
+    # Prefill hosts the PD KV bootstrap registry. On decode the field names the
+    # prefill side's port, which this server must not bind.
+    bootstrap_port = (
+        get_disagg().disaggregation_bootstrap_port
+        if get_disagg().disaggregation_mode == "prefill"
+        else None
+    )
     grpc_port = (
         None
         if get_serving().smg_grpc_mode or get_serving().grpc_mode
@@ -76,6 +83,7 @@ def _build_server_args(
         skip_server_warmup=get_serving().skip_server_warmup,
         incremental_streaming_output=get_serving().incremental_streaming_output,
         disaggregation_mode=disaggregation_mode,
+        disaggregation_bootstrap_port=bootstrap_port,
         model_config=ext.ModelConfig(
             context_len=mc.context_len,
             vocab_size=mc.vocab_size,

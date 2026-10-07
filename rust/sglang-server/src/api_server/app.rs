@@ -61,6 +61,8 @@ fn record_startup_warmup_status(
 
 pub async fn serve(
     listener: std::net::TcpListener,
+    // Pre-bound only when the PD bootstrap port differs from the HTTP port.
+    bootstrap_listener: Option<std::net::TcpListener>,
     frontend: FrontendHandle,
     server_args: Arc<ServerArgs>,
     // The runtime's shutdown signal, shared with every worker stage: it fires
@@ -97,12 +99,21 @@ pub async fn serve(
     // Prefill-only KV bootstrap registry. Merged AFTER `with_state` — its
     // router carries its own Arc<Registry> state, so it cannot merge into the
     // Router<Arc<AppState>> above — and before `log::apply`, so bootstrap traffic
-    // shows in the access log.
+    // shows in the access log. A separate bootstrap listener serves the same
+    // registry, plus the `/health` route decode heartbeats probe.
+    let mut bootstrap = None;
     if server_args.enable_pd_bootstrap() {
         let (routes, sweeper) = pd_bootstrap::router_and_sweeper();
         tokio::spawn(sweeper); // cancelled with the runtime on shutdown
-        app = app.merge(routes);
-        tracing::info!("PD KV bootstrap registry mounted on the api listener");
+        app = app.merge(routes.clone());
+        bootstrap = bootstrap_listener.map(|listener| {
+            let routes = routes.route("/health", axum::routing::get(|| async { "OK" }));
+            (listener, log::apply(routes, &server_args))
+        });
+        tracing::info!(
+            port = server_args.disaggregation_bootstrap_port,
+            "PD KV bootstrap registry ready"
+        );
     }
 
     // Apply logging and access log middleware.
@@ -128,10 +139,31 @@ pub async fn serve(
                 tracing::error!(error = %e, "axum serve exited");
             }
         }
+        r = serve_bootstrap(bootstrap) => {
+            if let Err(e) = r {
+                tracing::error!(error = %e, "PD bootstrap listener exited");
+            }
+        }
         _ = shutdown.recv_async() => {
             tracing::info!("shutdown: stopping accepts, aborting in-flight handlers");
         }
     }
+}
+
+/// Serves the PD bootstrap registry on its own listener, pre-bound in
+/// `runtime::start`. Without one it never completes.
+async fn serve_bootstrap(
+    bootstrap: Option<(std::net::TcpListener, Router)>,
+) -> std::io::Result<()> {
+    let Some((listener, routes)) = bootstrap else {
+        return std::future::pending().await;
+    };
+    let listener = tokio::net::TcpListener::from_std(listener)?;
+    axum::serve(
+        listener,
+        routes.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
 }
 
 #[cfg(test)]

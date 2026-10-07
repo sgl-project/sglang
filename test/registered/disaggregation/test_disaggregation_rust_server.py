@@ -42,10 +42,10 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         # Rust-server prefill serves the KV bootstrap registry on its api
-        # listener (a separate --disaggregation-bootstrap-port is a launch
-        # error there), so point both sides' bootstrap port at it: decode's
-        # flag is its fallback for requests without a bootstrap_port field,
-        # which is what mini_lb sends when --prefill carries no port.
+        # listener as well, so point both sides' bootstrap port at it to cover
+        # the shared-port layout: decode's flag is its fallback for requests
+        # without a bootstrap_port field, which is what mini_lb sends when
+        # --prefill carries no port.
         cls.bootstrap_port = cls.prefill_port
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         # launch_all already exercises the PD-specific plumbing: the rust PD
