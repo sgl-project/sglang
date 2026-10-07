@@ -8,6 +8,7 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 import threading
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import sglang.srt.observability.trace as mod
@@ -479,6 +480,144 @@ class TestTraceReqContextEnabled(CustomTestCase):
         for span in (root_span, thread_span, slice_span):
             self.assertEqual(span.end_time, 2000)
             self.assertNotEqual(span.status.status_code, otel_trace.StatusCode.ERROR)
+
+    @contextmanager
+    def _async_exporter_replay(self):
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        from sglang.srt.observability import trace_async
+
+        exporter = InMemorySpanExporter()
+        self.provider.add_span_processor(SimpleSpanProcessor(exporter))
+        process = trace_async._TraceExporterProcess("unused", "test", "unused")
+        contexts = {}
+
+        def replay(message, flags):
+            process._replay_batch(
+                message,
+                contexts,
+                mod.threads_info,
+                mod.TraceCustomIdGenerator,
+                TraceReqContext,
+                TraceSliceContext,
+                TraceEvent,
+            )
+
+        with (
+            patch.object(trace_async, "is_async_tracing_available", return_value=True),
+            patch.object(trace_async, "_get_zmq_socket") as get_socket,
+        ):
+            socket = get_socket.return_value
+            socket.send_pyobj.side_effect = replay
+            try:
+                yield trace_async.TraceReqContextAsync, exporter, contexts, socket
+            finally:
+                for ctx, _ in contexts.values():
+                    ctx.abort()
+
+    def test_async_filtered_slice_still_finishes_thread(self):
+        set_global_trace_level(1)
+        for combined in (False, True):
+            for copied in (False, True):
+                for ts in (None, 2000):
+                    with (
+                        self.subTest(combined=combined, copied=copied, ts=ts),
+                        self._async_exporter_replay() as (
+                            async_context,
+                            exporter,
+                            contexts,
+                            socket,
+                        ),
+                    ):
+                        root = async_context(rid="req-async")
+                        root.trace_req_start(ts=1000)
+                        root_span = root.root_span
+                        ctx = root
+                        if copied:
+                            ctx = async_context.__new__(async_context)
+                            ctx.__setstate__(root.__getstate__())
+                            ctx.rebuild_thread_context(ts=1200)
+                        ctx.flush()
+                        thread = contexts[ctx._context_id][0].thread_context.thread_span
+                        socket.send_pyobj.reset_mock()
+                        with (
+                            patch.object(mod, "get_cur_time_ns", return_value=2000),
+                            patch.object(ctx, "_gen_span_id") as gen_span_id,
+                        ):
+                            if combined:
+                                ctx.trace_slice(
+                                    TraceSliceContext(
+                                        "filtered", 1500, end_time_ns=ts, level=2
+                                    ),
+                                    thread_finish_flag=True,
+                                )
+                            else:
+                                ctx.trace_slice_start("filtered", level=2, ts=1500)
+                                ctx.trace_slice_end(
+                                    "filtered", level=2, ts=ts, thread_finish_flag=True
+                                )
+                        gen_span_id.assert_not_called()
+                        socket.send_pyobj.assert_called_once()
+                        self.assertEqual(thread.end_time, 2000)
+                        self.assertTrue(root.root_span.is_recording())
+                        self.assertEqual(len(exporter.get_finished_spans()), 1)
+                        # Repeated cleanup must not turn normal completion into ERROR.
+                        if copied:
+                            ctx.__del__()
+                            ctx.__del__()
+                        root.trace_req_finish(ts=3000)
+                        self.assertEqual(root_span.end_time, 3000)
+                        spans = exporter.get_finished_spans()
+                        self.assertEqual(len(spans), 3 if copied else 2)
+                        self.assertFalse(any(s.name == "filtered" for s in spans))
+                        self.assertTrue(
+                            all(
+                                s.status.status_code != otel_trace.StatusCode.ERROR
+                                for s in spans
+                            )
+                        )
+
+    def test_async_filtered_slice_without_finish_keeps_open_span(self):
+        set_global_trace_level(1)
+        with self._async_exporter_replay() as (async_context, _, contexts, socket):
+            ctx = async_context(rid="req-async")
+            ctx.trace_req_start(ts=1000)
+            ctx.trace_slice_start("outer", level=1, ts=1200)
+            ctx.flush()
+            span_ids = ctx._span_id_stack.copy()
+            socket.send_pyobj.reset_mock()
+            ctx.trace_slice_end("filtered", level=2, ts=2000)
+            ctx.trace_slice(
+                TraceSliceContext("filtered", 1500, end_time_ns=2000, level=2)
+            )
+            ctx.flush()
+            socket.send_pyobj.assert_not_called()
+            self.assertEqual(ctx._span_id_stack, span_ids)
+            thread = contexts[ctx._context_id][0].thread_context
+            self.assertTrue(thread.thread_span.is_recording())
+            self.assertTrue(thread.cur_slice_stack[-1].span.is_recording())
+            ctx.trace_slice_end("outer", level=1, ts=2500)
+            ctx.trace_req_finish(ts=3000)
+
+    def test_async_disabled_thread_finish_sends_nothing(self):
+        with self._async_exporter_replay() as (async_context, exporter, _, socket):
+            for initialized, level in ((False, 1), (True, 0)):
+                with (
+                    self.subTest(initialized=initialized, level=level),
+                    patch.object(mod, "opentelemetry_initialized", initialized),
+                ):
+                    set_global_trace_level(level)
+                    ctx = async_context(rid="disabled")
+                    ctx.trace_slice_end("filtered", 2, ts=2000, thread_finish_flag=True)
+                    ctx.trace_slice(
+                        TraceSliceContext("filtered", 1500, end_time_ns=2000, level=2),
+                        thread_finish_flag=True,
+                    )
+            socket.send_pyobj.assert_not_called()
+            self.assertEqual(exporter.get_finished_spans(), ())
 
     def test_nested_slices(self):
         ctx = TraceReqContext(rid="req-1")
