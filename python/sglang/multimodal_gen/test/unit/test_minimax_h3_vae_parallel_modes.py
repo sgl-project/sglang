@@ -153,7 +153,7 @@ def test_vit_fast_path_is_gated_and_matches_reference():
 @requires_cuda
 def test_vit_rope_batched_tiles_match_per_tile():
     """Stacked decoder tiles share one RoPE row; the fused (quality) and native
-    (lossless) RoPE kernels over the flattened batch are bit-identical to one
+    (exact) RoPE kernels over the flattened batch are bit-identical to one
     tile at a time."""
     device, dtype = torch.device("cuda"), torch.float16
     tiles, heads, dim_head, rope_dim = 3, 4, 64, 48

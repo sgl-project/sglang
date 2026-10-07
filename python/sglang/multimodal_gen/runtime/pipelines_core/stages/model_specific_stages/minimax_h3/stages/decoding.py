@@ -8,7 +8,7 @@ from contextlib import contextmanager, nullcontext
 import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
-    quality_allows_kernel_fusions,
+    quality_allows,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
@@ -407,7 +407,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 with (
                     use_vae_fast_path(
                         selected_video_vae,
-                        quality_allows_kernel_fusions(batch.sampling_params.quality),
+                        quality_allows(batch.sampling_params.quality, "lossless"),
                     ),
                     set_forward_context(current_timestep=0, attn_metadata=None),
                 ):
