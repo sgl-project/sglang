@@ -256,7 +256,7 @@ What to expect from this route:
 
 Some checkpoints are trained as decision models, with their own prompt layout. SGLang serves them with the request and response of the Jev (System One) API: the server renders the model's trained prompt, runs one prefill, and reads every field's answer from the next-token scores at its position. The supported family is [Intern-Decision](https://github.com/internlm/Intern-Decision) (`internlm/Intern-Decision-0.8B`, `-2B`, `-4B`), detected by the `<decision>` token its tokenizer ships.
 
-Three routes serve it: `POST /v1/jev`; `POST /v1/decisions` when the body has a `state` or its `questions` are keyed by field name, where other bodies stay the requests above; and `POST /v1/systemone` when the served model is a decision model, where other models keep the [System One compatible API](#system-one-compatible-api).
+Three routes serve it: `POST /v1/jev`; `POST /v1/decisions` when the body has a `state` or its `questions` are keyed by field name, where other bodies stay the requests above; and `POST /v1/systemone` when the served model is in the family, where other models, including decision checkpoints such as pplx-decider, keep the [System One compatible API](#system-one-compatible-api).
 
 ```bash Command
 curl -s http://127.0.0.1:30000/v1/decisions -H "Content-Type: application/json" -d '{
