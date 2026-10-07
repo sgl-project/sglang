@@ -45,12 +45,12 @@ class MatchedStopMixin:
         if not isinstance(matched_stop, list):
             matched_stop = [matched_stop]
 
-        assert (
-            res["choices"][0]["finish_reason"] == finish_reason
-        ), f"Expected finish_reason: {finish_reason}, but got: {res['choices'][0]['finish_reason']}"
-        assert (
-            res["choices"][0]["matched_stop"] in matched_stop
-        ), f"Expected matched_stop: {matched_stop}, but got: {res['choices'][0]['matched_stop']}"
+        assert res["choices"][0]["finish_reason"] == finish_reason, (
+            f"Expected finish_reason: {finish_reason}, but got: {res['choices'][0]['finish_reason']}"
+        )
+        assert res["choices"][0]["matched_stop"] in matched_stop, (
+            f"Expected matched_stop: {matched_stop}, but got: {res['choices'][0]['matched_stop']}"
+        )
 
     def _run_chat_completions_generation(
         self,
@@ -89,12 +89,12 @@ class MatchedStopMixin:
         if not isinstance(matched_stop, list):
             matched_stop = [matched_stop]
 
-        assert (
-            res["choices"][0]["finish_reason"] == finish_reason
-        ), f"Expected finish_reason: {finish_reason}, but got: {res['choices'][0]['finish_reason']}"
-        assert (
-            res["choices"][0]["matched_stop"] in matched_stop
-        ), f"Expected matched_stop: {matched_stop}, but got: {res['choices'][0]['matched_stop']}"
+        assert res["choices"][0]["finish_reason"] == finish_reason, (
+            f"Expected finish_reason: {finish_reason}, but got: {res['choices'][0]['finish_reason']}"
+        )
+        assert res["choices"][0]["matched_stop"] in matched_stop, (
+            f"Expected matched_stop: {matched_stop}, but got: {res['choices'][0]['matched_stop']}"
+        )
 
     def test_finish_stop_str(self):
         self._run_completions_generation(

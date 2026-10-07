@@ -40,9 +40,9 @@ def test_stage_entry_sync_excludes_previous_stage_tail(monkeypatch):
         torch.ones(8, device="cuda").sum().cpu()
 
     producer_ms, consumer_ms = metrics.stages["producer"], metrics.stages["consumer"]
-    assert (
-        producer_ms > 250
-    ), f"queued work not attributed to producer: {metrics.stages}"
+    assert producer_ms > 250, (
+        f"queued work not attributed to producer: {metrics.stages}"
+    )
     assert consumer_ms < 100, f"producer tail leaked into consumer: {metrics.stages}"
 
 

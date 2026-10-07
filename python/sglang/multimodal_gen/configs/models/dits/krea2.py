@@ -57,9 +57,9 @@ class Krea2ArchConfig(DiTArchConfig):
         self.num_attention_heads = self.heads
         self.num_channels_latents = self.channels
         assert self.features % self.heads == 0
-        assert (
-            sum(self.axes_dims) == self.features // self.heads
-        ), f"sum(axes_dims)={sum(self.axes_dims)} != head_dim={self.features // self.heads}"
+        assert sum(self.axes_dims) == self.features // self.heads, (
+            f"sum(axes_dims)={sum(self.axes_dims)} != head_dim={self.features // self.heads}"
+        )
 
     @property
     def head_dim(self) -> int:

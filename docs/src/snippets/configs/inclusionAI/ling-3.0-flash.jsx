@@ -1,7 +1,7 @@
 export const config = {
   modelName: "Ling-3.0-flash",
 
-  supportedHardware: ["h20-3e", "h200", "h800", "h100", "b200", "gb300"],
+  supportedHardware: ["h20-3e", "h200", "h800", "h100", "b200", "gb300", "dgx-spark"],
   groupHardware: false,
 
   variants: [{ id: "default", label: "Ling-3.0-flash" }],
@@ -46,6 +46,7 @@ export const config = {
     "h100": "lmsysorg/sglang:dev-Ling-3.0-flash",
     "b200": "lmsysorg/sglang:dev-Ling-3.0-flash",
     "gb300": "lmsysorg/sglang:dev-Ling-3.0-flash",
+    "dgx-spark": "lmsysorg/sglang:dev-Ling-3.0-flash",
   },
 
   dockerHostNetworkWhen: (_sel, { flags }) =>
@@ -62,7 +63,7 @@ export const config = {
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
   --flush-cache`,
     accuracy: {
-      gsm8k_pct: `# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+      gsm8k_pct: `# To install sgl-eval: pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 32`,
@@ -113,7 +114,7 @@ sgl-eval run gsm8k \\
     hicache: {
       defaultBackend: "mooncake",
       requiredFlags: [
-        "--mamba-scheduler-strategy extra_buffer",
+        "--mamba-radix-cache-strategy extra_buffer",
         "--enable-cache-report",
       ],
       backends: [
@@ -375,6 +376,19 @@ sgl-eval run gsm8k \\
       ],
     },
     {
+      match: { hw: "dgx-spark", variant: "default", quant: "mxfp4", strategy: "low-latency", spec: "dspark", nodes: "single" },
+      verified: true,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--moe-runner-backend flashinfer_mxfp4",
+        ...DSPARK_FLAGS,
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "h20-3e", variant: "default", quant: "bf16", strategy: "high-throughput", spec: "off", nodes: "single" },
       verified: false,
       flags: [
@@ -567,6 +581,20 @@ sgl-eval run gsm8k \\
         "--port {{PORT}}",
       ],
     },
+    {
+      match: { hw: "dgx-spark", variant: "default", quant: "mxfp4", strategy: "high-throughput", spec: "off", nodes: "single" },
+      verified: true,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--mem-fraction-static 0.85",
+        "--tool-call-parser ling3",
+        "--reasoning-parser ling3",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
 
     // Hybrid KDA must pass prefix keys to Mooncake; otherwise storage writes are empty.
     // Cold uncached extends above chunked_prefill_size skip write-through for that influx.
@@ -590,7 +618,7 @@ sgl-eval run gsm8k \\
         "--hicache-storage-backend mooncake",
         "--hicache-io-backend direct",
         "--hicache-mem-layout page_first_direct",
-        "--mamba-scheduler-strategy extra_buffer",
+        "--mamba-radix-cache-strategy extra_buffer",
         "--enable-cache-report",
         "--hicache-storage-prefetch-policy wait_complete",
         "--hicache-storage-backend-extra-config '{\"hicache_storage_pass_prefix_keys\":true}'",
@@ -619,7 +647,7 @@ sgl-eval run gsm8k \\
         "--hicache-storage-backend mooncake",
         "--hicache-io-backend direct",
         "--hicache-mem-layout page_first_direct",
-        "--mamba-scheduler-strategy extra_buffer",
+        "--mamba-radix-cache-strategy extra_buffer",
         "--enable-cache-report",
         "--hicache-storage-prefetch-policy wait_complete",
         "--hicache-storage-backend-extra-config '{\"hicache_storage_pass_prefix_keys\":true}'",
@@ -647,7 +675,7 @@ sgl-eval run gsm8k \\
         "--hicache-storage-backend mooncake",
         "--hicache-io-backend direct",
         "--hicache-mem-layout page_first_direct",
-        "--mamba-scheduler-strategy extra_buffer",
+        "--mamba-radix-cache-strategy extra_buffer",
         "--enable-cache-report",
         "--hicache-storage-prefetch-policy wait_complete",
         "--hicache-storage-backend-extra-config '{\"hicache_storage_pass_prefix_keys\":true}'",
@@ -676,7 +704,7 @@ sgl-eval run gsm8k \\
         "--hicache-storage-backend mooncake",
         "--hicache-io-backend direct",
         "--hicache-mem-layout page_first_direct",
-        "--mamba-scheduler-strategy extra_buffer",
+        "--mamba-radix-cache-strategy extra_buffer",
         "--enable-cache-report",
         "--hicache-storage-prefetch-policy wait_complete",
         "--hicache-storage-backend-extra-config '{\"hicache_storage_pass_prefix_keys\":true}'",

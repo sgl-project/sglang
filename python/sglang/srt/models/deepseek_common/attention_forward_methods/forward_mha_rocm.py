@@ -13,16 +13,16 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
-from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.dcp import (
-    all_gather_kv_cache_for_mha_extend,
-    filter_dcp_local_kv_indices,
-)
+from sglang.srt.layers.dcp import all_gather_kv_cache_for_mha_extend
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_token_to_kv_pool,
+)
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
     forward_dsa_indexer_for_mha,
     resolve_attn_backend,
@@ -50,7 +50,6 @@ if _use_aiter_gfx95:
 
 
 class DeepseekMHARocmForwardMixin:
-
     def forward_normal_rocm_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -266,11 +265,29 @@ class DeepseekMHARocmForwardMixin:
             positions, hidden_states, forward_batch, zero_allocator
         )
 
+    def forward_normal_chunked_kv_rocm_prepare(
+        self: DeepseekV2AttentionMLA,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ):
+        # First do normal mha forward to get output for extended part
+        return self.forward_normal_rocm_prepare(
+            positions, hidden_states, forward_batch, zero_allocator
+        )
+
     def _concat_and_cast_mha_k_rocm(
         self: DeepseekV2AttentionMLA,
         k_nope: torch.Tensor,
-        k_pe: torch.Tensor,
+        k_pe: torch.Tensor | None,
     ):
+        if self.qk_rope_head_dim == 0:
+            assert k_pe is None or k_pe.shape[-1] == 0
+            # No RoPE tail to append, so k is k_nope as-is. The concat branch
+            # below keeps k_nope's dtype, so no cast is needed here either.
+            return k_nope.contiguous()
+
         k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
         k = k_nope.new_empty(*k_shape)
         if self.current_attention_backend == "aiter":
@@ -289,13 +306,16 @@ class DeepseekMHARocmForwardMixin:
     ):
         if _use_aiter_gfx95:
             get_token_to_kv_pool().set_mla_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+                self.attn_mha,
+                KVWriteLoc.for_batch(forward_batch),
+                kv_a.unsqueeze(1),
+                k_pe,
             )
         else:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
             latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
             get_token_to_kv_pool().set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+                self.attn_mha, KVWriteLoc.for_batch(forward_batch), latent_cache, None
             )
 
     def _get_mla_kv_buffer_rocm(
@@ -305,7 +325,6 @@ class DeepseekMHARocmForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _use_aiter_gfx95:
-            kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )

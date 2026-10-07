@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-rust>=1.10", "setuptools-scm>=8.0", "torch==2.13.0+xpu", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -40,6 +40,7 @@ dependencies = [
   "openai-harmony==0.0.4",
   "orjson",
   "outlines==0.1.11",
+  "outlines_core==0.1.26",
   "packaging",
   "partial_json_parser",
   "pillow",
@@ -50,12 +51,13 @@ dependencies = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
+  "regex",
   "requests",
   "scipy",
-  "sentencepiece",
+  "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
-  "sgl-kernel @ git+https://github.com/sgl-project/sgl-kernel-xpu.git",
-  "smg-grpc-servicer>=0.5.0",
+  "sglang-kernel-xpu @ https://github.com/sgl-project/whl/releases/download/v0.3.0+xpu/sglang_kernel_xpu-0.3.0-cp310-abi3-manylinux_2_38_x86_64.whl",
+  "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
@@ -64,14 +66,15 @@ dependencies = [
   "torchcodec==0.13.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torch==2.13.0 on XPU uses torchcodec 0.13.0
   "torchvision==0.28.0+xpu",
   "tqdm",
-  "transformers==5.12.1",
+  "transformers==5.19.0",
   "uvicorn",
   "xxhash",
   "uvloop",
-  # "xgrammar==0.2.1", xgrammar depends on CUDA PyTorch and Triton only
+  # "xgrammar==0.2.7", xgrammar depends on CUDA PyTorch and Triton only
 ]
 
 [project.optional-dependencies]
+checkpoint-engine = ["checkpoint-engine @ git+https://github.com/MoonshotAI/checkpoint-engine.git@f772d1858204fa82bdb0436fdfec137f5de2972c"]
 diffusion = [
   "addict==2.4.0",
   "av==16.1.0",
@@ -91,6 +94,12 @@ diffusion = [
   "xatlas",
 ]
 
+ray = [
+  "ray[default]>=2.55.1",
+  # Ray registers no GPU resource on XPU without dpctl.
+  "dpctl",
+]
+
 tracing = [
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
@@ -108,6 +117,7 @@ test = [
   "pandas",
   "parameterized",
   "peft>=0.18.0",
+  "polars",
   "pytest",
   "sentence_transformers",
   "tabulate",
@@ -132,6 +142,10 @@ sglang = "sglang.cli.main:main"
   "srt/**/*",
   "kernels/**/*"
 ]
+
+[tool.setuptools.exclude-package-data]
+# .claude/skills is a directory symlink; setuptools build_py cannot copy it.
+"sglang.multimodal_gen" = [".claude/*"]
 
 [tool.setuptools.packages.find]
 exclude = [
