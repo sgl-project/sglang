@@ -973,6 +973,8 @@ class Envs:
     )
     # Select the AITER MLA kernel for target verify, "asm" or "gluon".
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
+    # Let aiter plan the KV splits for the asm persistent MLA decode.
+    SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)

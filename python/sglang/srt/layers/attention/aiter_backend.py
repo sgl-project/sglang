@@ -668,6 +668,24 @@ class AiterAttnBackend(AttentionBackend):
             if self.num_draft_tokens is None and use_any_mla_persist:
                 self.max_split_per_batch = 64
 
+            # When the env var is on, aiter plans the KV splits. The default
+            # scheduler clamps every request to ceil(num_cu / batch_size)
+            # splits regardless of how long the KV is, and that clamp is
+            # inside the kernel, so no host value lifts it. The v1_2
+            # scheduler sizes the count from the workload, and -1 selects its
+            # auto branch.
+            self.use_mla_auto_kv_splits = (
+                use_any_mla_persist and envs.SGLANG_AITER_MLA_AUTO_KV_SPLITS.get()
+            )
+            if self.use_mla_auto_kv_splits:
+                logger.info(
+                    "aiter MLA: aiter plans the KV splits "
+                    "(SGLANG_AITER_MLA_AUTO_KV_SPLITS=1)"
+                )
+                fast_mode = True
+                intra_batch_mode = False
+                self.max_split_per_batch = -1
+
             self.fix_max_split_per_batch = self.max_split_per_batch
 
     def pad_heads(self, x: torch.Tensor, padded: int) -> torch.Tensor:
@@ -757,7 +775,8 @@ class AiterAttnBackend(AttentionBackend):
         )
         dtype = self.kv_cache_dtype
 
-        if self.attn_dp_enabled:
+        # The auto count is -1, which this min() would turn into a real cap.
+        if self.attn_dp_enabled and not getattr(self, "use_mla_auto_kv_splits", False):
             gpu = torch.cuda.current_device()
             device_properties = torch.cuda.get_device_properties(gpu)
             cu_num = device_properties.multi_processor_count
@@ -1549,6 +1568,11 @@ class AiterAttnBackend(AttentionBackend):
         reduce_final_map = self.forward_metadata.reduce_final_map
         reduce_partial_map = self.forward_metadata.reduce_partial_map
         num_kv_splits = self.forward_metadata.num_kv_splits
+        # None lets mla.py re-decide persistent mode for this shape. An
+        # explicit count keeps whatever _use_mla_ps_kernel chose. The metadata
+        # still takes an int, so only the kernel argument changes.
+        if getattr(self, "use_mla_auto_kv_splits", False):
+            num_kv_splits = None
 
         return self._mla_decode_fwd_with_head_pad(
             q,
