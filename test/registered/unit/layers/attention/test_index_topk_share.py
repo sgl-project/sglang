@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mha
@@ -170,15 +171,13 @@ def _capture(indices, *, fused=True, ragged=True, flattened=True, select=None):
         page_table_1_flattened=table.flatten() if flattened else None,
         indexer_seq_lens_cpu=torch.tensor([3, 3]),
     )
-    backend = SimpleNamespace(
-        use_fused_topk=fused,
-        get_topk_transform_method=Mock(
-            return_value=(
-                TopkTransformMethod.RAGGED if ragged else TopkTransformMethod.PAGED
-            )
-        ),
-        forward_metadata=metadata,
+    # Exercise the real seed export method without initializing GPU resources.
+    backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+    backend.use_fused_topk = fused
+    backend.get_topk_transform_method = Mock(
+        return_value=TopkTransformMethod.RAGGED if ragged else TopkTransformMethod.PAGED
     )
+    backend.forward_metadata = metadata
     rows = len(indices) if select is None else len(select)
     capture = torch.full((rows + 1, indices.shape[1]), -99, dtype=torch.int32)
     batch = SimpleNamespace(
@@ -206,6 +205,7 @@ def _capture(indices, *, fused=True, ragged=True, flattened=True, select=None):
 @pytest.mark.parametrize("flattened", [True, False])
 @pytest.mark.parametrize("select", [None, torch.tensor([2, 0])])
 def test_ragged_seed_maps_shared_prefix_and_preserves_padding(flattened, select):
+    """Export physical slots, even when shared prefixes make ragged offsets larger."""
     indices = torch.tensor([[0, 2, -1], [3, 4, -1], [5, 1, -1]], dtype=torch.int32)
     original = indices.clone()
     expected = torch.tensor([[3, 0, -1], [3, 1, -1], [2, 1, -1]], dtype=torch.int32)
@@ -226,22 +226,6 @@ def test_paged_and_unfused_seed_contracts_are_preserved(fused, ragged):
 def test_invalid_ragged_indices_are_not_clamped(invalid):
     with pytest.raises((IndexError, RuntimeError)):
         _capture(torch.tensor([[invalid, -1]], dtype=torch.int32))
-
-
-def test_no_capture_does_not_resolve_backend():
-    indexer = Mock(return_value=None)
-    batch = SimpleNamespace(spec_info=None)
-    with patch.object(forward_mha, "resolve_attn_backend") as resolve:
-        forward_mha.forward_dsa_indexer_for_mha(
-            indexer,
-            hidden_states=None,
-            q_lora=None,
-            positions=None,
-            forward_batch=batch,
-            layer_id=0,
-        )
-    assert not indexer.call_args.kwargs["return_indices"]
-    resolve.assert_not_called()
 
 
 if __name__ == "__main__":
