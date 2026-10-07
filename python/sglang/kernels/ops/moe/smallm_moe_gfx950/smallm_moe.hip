@@ -17,7 +17,8 @@ typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
 struct __attribute__((packed)) Args {
     const uint16_t* x; const uint8_t* w1; const uint8_t* s1; const uint8_t* w2; const uint8_t* s2;
     const int32_t* ids; const float* wts; uint16_t* hbuf; int32_t* ctrl; uint16_t* out; float* acc;
-    int32_t tok, slots, E, pad;
+    int32_t tok, slots, E;
+    float swiglu_limit;  // > 0: silu(min(g, L)) * clamp(u, -L, L)
 };
 static_assert(sizeof(Args) == 104, "kernarg ABI drift: keep in sync with Args in __init__.py");
 static constexpr int DIM = 4096;
@@ -190,8 +191,12 @@ __device__ __forceinline__ void p1_body(const Args& a) {
             for (int i = 0; i < 4; ++i) {
                 const int mm = 4 * q + i;
                 if (mm < me) {
-                    const float gv = s_red[0][j][i][lane] + s_red[1][j][i][lane];
-                    const float uv = s_red[2][j][i][lane] + s_red[3][j][i][lane];
+                    float gv = s_red[0][j][i][lane] + s_red[1][j][i][lane];
+                    float uv = s_red[2][j][i][lane] + s_red[3][j][i][lane];
+                    if (a.swiglu_limit > 0.f) {
+                        gv = fminf(gv, a.swiglu_limit);
+                        uv = fminf(fmaxf(uv, -a.swiglu_limit), a.swiglu_limit);
+                    }
                     const float hv = gv / (1.f + __expf(-gv)) * uv;
                     a.hbuf[((size_t)s_tok[rank + mm] * slots + s_slot[rank + mm]) * INTER + (s * NTS + j) * 16 + r] = f2bf(hv);
                 }

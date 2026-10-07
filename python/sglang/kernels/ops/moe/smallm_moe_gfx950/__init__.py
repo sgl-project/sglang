@@ -72,7 +72,7 @@ class Args(ctypes.Structure):
         ("tok", ctypes.c_int32),
         ("slots", ctypes.c_int32),
         ("E", ctypes.c_int32),
-        ("pad", ctypes.c_int32),
+        ("swiglu_limit", ctypes.c_float),
     ]
 
 
@@ -252,6 +252,10 @@ def _get_kernels(inter: int):
 
 
 def _workspace(device, slots: int, inter: int):
+    # One buffer set per shape, shared by every call and captured graph: calls must be
+    # stream-ordered. MoE runs on the forward stream (the DeepSeek/GLM dual-stream path
+    # moves only the dense shared expert to alt_stream), so p1 of one call never
+    # overlaps p2 of another.
     key = (device, slots, inter)
     ws = _ws.get(key)
     if ws is None:
@@ -321,8 +325,18 @@ def smallm_moe_supported(
     return True
 
 
-def smallm_moe_fwd(hidden_states, w13, w2, topk_weights, topk_ids, w13_scale, w2_scale):
+def smallm_moe_fwd(
+    hidden_states,
+    w13,
+    w2,
+    topk_weights,
+    topk_ids,
+    w13_scale,
+    w2_scale,
+    swiglu_limit: float = 0.0,
+):
     """out[tok, 4096] (bf16) = sum_j w_tj * down_e(silu(gate_e(x_t)) * up_e(x_t)); e = topk_ids[t, j].
+    swiglu_limit > 0 clamps as aiter does: gate = min(gate, L), up = clamp(up, -L, L).
     w13/w2: fp4x2 [E, 2*inter, 2048] / [E, 4096, inter/2] in aiter shuffle_weight((16,16)) layout;
     w13_scale/w2_scale: e8m0 in e8m0_shuffle layout. Returns None if the workspace cannot be allocated (capture)."""
     tok, slots = topk_ids.shape
@@ -360,7 +374,7 @@ def smallm_moe_fwd(hidden_states, w13, w2, topk_weights, topk_ids, w13_scale, w2
         tok,
         slots,
         E,
-        0,
+        float(swiglu_limit or 0.0),
     )
     stream = torch.cuda.current_stream().cuda_stream
     try:

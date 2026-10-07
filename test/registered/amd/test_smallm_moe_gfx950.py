@@ -74,7 +74,7 @@ class TestSmallMMoeGfx950(CustomTestCase):
         sc = torch.pow(2.0, scale_e8m0.view(torch.uint8).to(torch.float32) - 127.0)
         return vals.view(E, N, -1, 32) * sc.unsqueeze(-1)
 
-    def _reference(self, x, ids, wts):
+    def _reference(self, x, ids, wts, swiglu_limit=0.0):
         tok = x.shape[0]
         out = torch.zeros(tok, self.DIM, device=self.dev, dtype=torch.float32)
         for t in range(tok):
@@ -82,6 +82,9 @@ class TestSmallMMoeGfx950(CustomTestCase):
                 e = int(ids[t, j])
                 g_u = self.w1_deq[e].reshape(2 * self.INTER, self.DIM) @ x[t].float()
                 g, u = g_u[: self.INTER], g_u[self.INTER :]
+                if swiglu_limit > 0:
+                    g = g.clamp(max=swiglu_limit)
+                    u = u.clamp(-swiglu_limit, swiglu_limit)
                 h = (torch.nn.functional.silu(g) * u).to(torch.bfloat16).float()
                 out[t] += float(wts[t, j]) * (
                     self.w2_deq[e].reshape(self.DIM, self.INTER) @ h
@@ -237,6 +240,37 @@ class TestSmallMMoeGfx950I512(TestSmallMMoeGfx950):
                 x, self.w13, self.w2, ids, None, False, True, False, None
             )
         )
+
+    def test_swiglu_limit_clamp(self):
+        # GLM-5.3-Flash ships swiglu_limit=10; x is scaled so gate/up (std ~13) cross +-10
+        M, limit = self.M, 10.0
+        for slots in (8, 9):
+            for tok in (1, 4, 16):
+                with self.subTest(slots=slots, tok=tok):
+                    x = (torch.randn(tok, self.DIM, device=self.dev) * 4.0).to(
+                        torch.bfloat16
+                    )
+                    ids, wts = self._routing(tok)
+                    ids = ids[:, :slots].contiguous()
+                    wts = wts[:, :slots].contiguous()
+                    out = M.smallm_moe_fwd(
+                        x,
+                        self.w13,
+                        self.w2,
+                        wts,
+                        ids,
+                        self.w13_scale,
+                        self.w2_scale,
+                        swiglu_limit=limit,
+                    )
+                    torch.cuda.synchronize()
+                    ref = self._reference(x, ids, wts, swiglu_limit=limit).float()
+                    unclamped = self._reference(x, ids, wts).float()
+                    self.assertGreater(
+                        ((unclamped - ref).norm() / ref.norm()).item(), 0.1
+                    )
+                    rel = ((out.float() - ref).norm() / ref.norm()).item()
+                    self.assertLess(rel, 5e-3, f"rel_l2={rel:.3e}")
 
 
 if __name__ == "__main__":
