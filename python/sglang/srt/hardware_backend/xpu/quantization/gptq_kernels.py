@@ -61,8 +61,14 @@ class GPTQXPULinearKernel:
             sorted_g = g_idx[act_perm].to(torch.int64)
             blocks = sorted_g.view(-1, group_size)
             if not torch.equal(blocks, blocks[:, :1].expand_as(blocks)):
-                tp_group = getattr(layer, "tp_group", None)
-                tp_size = tp_group.world_size if tp_group is not None else 1
+                from sglang.srt.layers.linear import LinearBase
+
+                if isinstance(layer, LinearBase):
+                    tp_size = (
+                        layer.tp_group.world_size if layer.tp_group is not None else 1
+                    )
+                else:
+                    tp_size = layer.tp_size
                 tp_hint = (
                     f" Got tp_size={tp_size}; please use --tp-size 1."
                     if tp_size > 1

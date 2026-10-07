@@ -113,6 +113,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
@@ -555,7 +556,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
     @staticmethod
     def validate_block_quant_shapes(
-        layer: torch.nn.Module,
+        layer: LinearBase,
         quant_config,
         input_size: int,
         input_size_per_partition: int,
@@ -574,7 +575,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 "Skipping block quantization checks for weight partition."
             )
         else:
-            tp_group = getattr(layer, "tp_group", None)
+            tp_group = layer.tp_group
             tp_size = tp_group.world_size if tp_group is not None else 1
             # Required by row parallel
             if tp_size > 1 and input_size // input_size_per_partition == tp_size:

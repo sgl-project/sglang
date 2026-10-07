@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
@@ -137,7 +138,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
 
     def create_weights(
         self,
-        layer: torch.nn.Module,
+        layer: LinearBase,
         input_size_per_partition: int,
         output_partition_sizes: List[int],
         input_size: int,
@@ -148,7 +149,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        tp_group = getattr(layer, "tp_group", None)
+        tp_group = layer.tp_group
 
         tp_size = tp_group.world_size if tp_group is not None else 1
 
