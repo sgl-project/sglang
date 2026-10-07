@@ -89,10 +89,13 @@ class _FakeSparseBackend:
 class _FakePlatform:
     device_name = "test"
     selected_backend = None
+    resolve_fa_to_sdpa = False
 
     @classmethod
     def get_attn_backend_cls_str(cls, selected_backend, _head_size, _dtype):
         cls.selected_backend = selected_backend
+        if selected_backend == AttentionBackendEnum.FA and cls.resolve_fa_to_sdpa:
+            return "fake.SDPABackend"
         if selected_backend == AttentionBackendEnum.AITER:
             return "fake.AITERBackend"
         if selected_backend == AttentionBackendEnum.LASER_ATTN:
@@ -114,6 +117,7 @@ class TestAttentionBackendFallback(unittest.TestCase):
     def setUp(self) -> None:
         _cached_get_attn_backend.cache_clear()
         _FakePlatform.selected_backend = None
+        _FakePlatform.resolve_fa_to_sdpa = False
 
     def _resolve(
         self,
@@ -226,6 +230,20 @@ class TestAttentionBackendFallback(unittest.TestCase):
         )
 
         self.assertIs(backend, _FakeFABackend)
+
+    def test_explicit_backend_rejects_platform_backend_mismatch(self):
+        _FakePlatform.resolve_fa_to_sdpa = True
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Requested attention backend 'fa' resolved to 'torch_sdpa' instead",
+        ):
+            self._resolve(
+                AttentionBackendEnum.FA,
+                explicit=True,
+                is_cross_attention=False,
+                supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            )
 
     def test_explicit_backend_is_not_rejected_by_automatic_selection_set(self):
         backend = self._resolve(

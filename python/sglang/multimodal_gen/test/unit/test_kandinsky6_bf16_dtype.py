@@ -86,6 +86,19 @@ def test_attention_backend_dispatch_and_repeated_forward(monkeypatch, backend, l
     query_len, key_len = lengths
     selected = AttentionBackendEnum[backend]
     with global_force_attn_backend_context_manager(selected):
+        if backend == "FA" and torch.version.hip is not None:
+            with pytest.raises(
+                ValueError,
+                match="Requested attention backend 'fa' resolved to 'torch_sdpa' instead",
+            ):
+                Kandinsky6Attention(
+                    256,
+                    128,
+                    Kandinsky6Transformer3DModel._supported_attention_backends,
+                    kv_dim=128 if key_len is not None else None,
+                    is_cross_attention=key_len is not None,
+                )
+            return
         layer = Kandinsky6Attention(
             256,
             128,
