@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import Decodin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
     EncodeWhileDecoding,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.test.test_utils import CustomTestCase
 
 FPS = 16
@@ -141,6 +142,9 @@ class TestStreamedEncode(CustomTestCase):
                 )
                 self.assertEqual(one_shot.read_bytes(), streamed.read_bytes())
 
+    @unittest.skipUnless(
+        current_platform.is_cuda(), "streaming is gated on the CUDA platform, not ROCm"
+    )
     def test_only_file_path_video_requests_stream(self):
         server_args = _server_args()
         stage = _stage(_vae(_vae_config(wan22=False)), server_args)
