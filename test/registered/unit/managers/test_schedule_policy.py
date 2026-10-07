@@ -140,6 +140,7 @@ class TestShortestPrefillFirst(CustomTestCase):
         req.full_untruncated_fill_ids = req.origin_input_ids[:]
         req.num_matched_prefix_tokens = cached
         req.prefix_indices = list(range(cached))
+        req.prefix_len = len(req.prefix_indices)
         req.time_stats.wait_queue_entry_time = arrived
         return req
 

@@ -11,7 +11,7 @@ from unittest.mock import Mock
 
 import torch
 
-from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
+from sglang.srt.managers.schedule_batch import Req, split_cached_prefix_by_tier
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     InitLoadBackParams,
@@ -32,6 +32,11 @@ from sglang.srt.mem_cache.unified_radix_cache import (
 )
 from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+
+
+class _ReqStub(SimpleNamespace):
+    set_prefix_indices = Req.set_prefix_indices
+
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -109,10 +114,11 @@ def _staged_fixture(full_match=2):
         hash_values=["a", "b", "c"],
         operation_id=1,
     )
-    req = SimpleNamespace(
+    req = _ReqStub(
         rid="r",
         cache_request_handle=_REQ,
         prefix_indices=torch.arange(2),
+        prefix_len=2,
         last_node=1,
         kv=SimpleNamespace(cache_protected_len=2),
         extra_key=None,
@@ -202,6 +208,7 @@ def _two_rank_retry_trace(rank, rendezvous):
                     full_match,
                 )
                 req.prefix_indices = torch.arange(full_match)
+                req.prefix_len = len(req.prefix_indices)
                 if cache.buffer_pipeline.prepare_staged_prefetch(req):
                     assert (
                         cache.init_load_back(
@@ -303,6 +310,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
                     )
                     # A joint match counts bigrams, not their extra raw boundary token.
                     req.prefix_indices = torch.arange(10)
+                    req.prefix_len = len(req.prefix_indices)
                     req.kv.cache_protected_len = 10
                     self.assertTrue(pipeline.prepare_staged_prefetch(req))
                     self.assertFalse(pipeline.has_staged(req.cache_request_handle))
@@ -345,6 +353,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         # A twin made [0, 6) jointly reusable while the fetch was held.
         cache.tree_core.match_full_device_prefix.return_value = (8, 1, 8)
         req.prefix_indices = torch.arange(6)
+        req.prefix_len = len(req.prefix_indices)
         self.assertTrue(pipeline.prepare_staged_prefetch(req))
         self.assertEqual(
             split_cached_prefix_by_tier(
@@ -382,6 +391,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         # A twin finished first: the next pass's joint match runs past the
         # staged span and is kept as is (a shrink would strand its recompute).
         req.prefix_indices = torch.arange(12)
+        req.prefix_len = len(req.prefix_indices)
         req.last_node = 9
         req.kv.cache_protected_len = 12
         self.assertTrue(cache.buffer_pipeline.prepare_staged_prefetch(req))
@@ -416,6 +426,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
                 cache.tree_core.match_full_device_prefix.reset_mock()
                 for attempt in range(1, 4):
                     req.prefix_indices = torch.arange(2)
+                    req.prefix_len = len(req.prefix_indices)
                     self.assertTrue(cache.buffer_pipeline.prepare_staged_prefetch(req))
                     self.assertIsNone(
                         cache.init_load_back(
@@ -457,6 +468,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         # Tree changes occur while queued, before the next preparation pass.
         cache.tree_core.match_full_device_prefix.return_value = (6, 1, 6)
         req.prefix_indices = torch.arange(2)
+        req.prefix_len = len(req.prefix_indices)
         self.assertTrue(cache.buffer_pipeline.prepare_staged_prefetch(req))
         self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (2, 4))
         self.assertTrue(pipeline.has_staged(req.cache_request_handle))
@@ -464,6 +476,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
 
         cache.tree_core.match_full_device_prefix.return_value = (0, 0, 0)
         req.prefix_indices = torch.arange(0)
+        req.prefix_len = len(req.prefix_indices)
         self.assertFalse(cache.buffer_pipeline.prepare_staged_prefetch(req))
         self.assertFalse(pipeline.has_staged(req.cache_request_handle))
         self.assertEqual(
@@ -516,6 +529,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         params = lambda: InitLoadBackParams(None, req.host_hit_length, req=req)
         for attempt in range(1, 4):
             req.prefix_indices = torch.arange(2)
+            req.prefix_len = len(req.prefix_indices)
             self.assertTrue(pipeline.prepare_staged_prefetch(req))
             self.assertIsNone(cache.init_load_back(params()))
             self.assertEqual(pipeline.has_staged(req.cache_request_handle), attempt < 3)

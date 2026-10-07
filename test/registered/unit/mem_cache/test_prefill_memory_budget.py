@@ -205,6 +205,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
             with self.subTest(page_size=page_size):
                 allocator, req, adder = self._new_admission(page_size, pool_pages=6)
                 req.prefix_indices = allocator.alloc(page_size)
+                req.prefix_len = len(req.prefix_indices)
                 self.assertIsNotNone(req.prefix_indices)
                 self.assertTrue(allocator.can_reserve(page_size + 2, page_size + 2))
 

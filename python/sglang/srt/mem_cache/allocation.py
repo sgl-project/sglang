@@ -361,7 +361,17 @@ def alloc_for_extend(
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
-    prefix_tensors = [r.prefix_indices for r in batch.reqs]
+    # A request holding its row (a later chunk, a borrowed session record)
+    # already has its prefix there; a new one writes its matched prefix.
+    req_to_token = batch.req_to_token_pool.req_to_token
+    prefix_tensors = [
+        (
+            req_to_token[r.kv.req_pool_idx, : r.prefix_len].to(torch.int64)
+            if r.kv.holds_kv
+            else r.prefix_indices
+        )
+        for r in batch.reqs
+    ]
 
     reuse_kv = None
     if batch.is_dllm():
@@ -393,6 +403,7 @@ def alloc_for_extend(
         out_cache_loc = _alloc_extend_loc_with_kv_reuse(
             batch,
             reuse_kv,
+            prefix_tensors,
             req_pool_indices_cpu,
             prefix_lens_cpu,
             extend_lens_cpu,
@@ -454,6 +465,7 @@ def alloc_for_extend(
     for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
         req.kv.kv_allocated_len = seq_len
         req.kv.kv_committed_len = seq_len
+        req.prefix_indices = None
         batch.tree_cache.maybe_hand_to_session(req)
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
@@ -462,6 +474,7 @@ def alloc_for_extend(
 def _alloc_extend_loc_with_kv_reuse(
     batch: ScheduleBatch,
     reuse_kv: list[bool],
+    prefix_tensors: list[torch.Tensor],
     req_pool_indices_cpu: torch.Tensor,
     prefix_lens_cpu: torch.Tensor,
     extend_lens_cpu: torch.Tensor,
@@ -505,7 +518,7 @@ def _alloc_extend_loc_with_kv_reuse(
             )
             last_loc = [
                 (t[-1:] if len(t) > 0 else torch.tensor([-1], device=device))
-                for t in (r.prefix_indices for r in batch.reqs)
+                for t in prefix_tensors
             ]
             fresh_slots = alloc_paged_token_slots_extend(
                 tree_cache=batch.tree_cache,

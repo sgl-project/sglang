@@ -66,6 +66,7 @@ def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
     return SimpleNamespace(
         rid=rid,
         prefix_indices=torch.tensor(prefix, dtype=torch.int32),
+        prefix_len=len(prefix),
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
         kv=ReqKvInfo(

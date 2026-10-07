@@ -247,6 +247,12 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
         req.set_extend_range = set_extend_range
 
+        def set_prefix_indices(prefix_indices):
+            req.prefix_indices = prefix_indices
+            req.prefix_len = len(prefix_indices)
+
+        req.set_prefix_indices = set_prefix_indices
+
         class ReqToTokenPool:
             def __init__(self):
                 self.writes = []

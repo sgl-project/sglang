@@ -209,8 +209,8 @@ def match_kv_cache(
         match_result = zero_match_result(
             tree_cache, match_result, extra_key=req.extra_key
         )
+    req.set_prefix_indices(match_result.device_indices)
     (
-        req.prefix_indices,
         req.last_node,
         req.last_host_node,
         req.best_match_node,
@@ -218,7 +218,6 @@ def match_kv_cache(
         req.swa_host_hit_length,
         req.mamba_host_hit_length,
     ) = (
-        match_result.device_indices,
         match_result.last_device_node,
         match_result.last_host_node,
         match_result.best_match_node,
@@ -227,9 +226,7 @@ def match_kv_cache(
         match_result.mamba_host_hit_length,
     )
     max_len = req._compute_max_prefix_len(len(token_ids))
-    req.num_matched_prefix_tokens = min(
-        len(req.prefix_indices) + req.host_hit_length, max_len
-    )
+    req.num_matched_prefix_tokens = min(req.prefix_len + req.host_hit_length, max_len)
     req.swa_branching_seqlen = match_result.swa_branching_seqlen
     # A probe match keeps what it did not report; a new round resets both.
     if match_result.mamba_branching_seqlen is not None:
@@ -245,14 +242,10 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     # The tree reads req.finished() to tell a checkpoint from the final
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
-    if req.skip_radix_cache_insert:
-        # Kept out of the tree; the next extend still resumes from prefix_indices.
-        req.prefix_indices = tree_cache.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, : req.extend_range.end
-        ].to(dtype=torch.int64, copy=True)
-        return
-
-    tree_cache.checkpoint(req, up_to=req.extend_range.end)
+    if not req.skip_radix_cache_insert:
+        tree_cache.checkpoint(req, up_to=req.extend_range.end)
+    # The next extend resumes after this one, published or not.
+    req.prefix_len = req.extend_range.end
 
 
 def evict_from_tree_cache(

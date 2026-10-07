@@ -492,7 +492,14 @@ class MlxTpModelWorker(TpModelWorker):
             elif route == "decode":
                 mixed_decode_rids.append(req.rid)
             else:  # "prefill"
-                prefix_slot_ids = req.prefix_indices.tolist()
+                # The allocation wrote the matched prefix into the request's row.
+                prefix_slot_ids = (
+                    self.req_to_token_pool.req_to_token[
+                        req.kv.req_pool_idx, : req.prefix_len
+                    ].tolist()
+                    if req.prefix_len
+                    else []
+                )
                 full_token_ids = list(req.get_fill_ids())
                 pending_prefills.append(
                     self._mlx_runner.prefill_start(
