@@ -87,6 +87,7 @@ def test_shell_is_not_enabled_on_other_models():
     "action",
     [
         {"commands": []},
+        {"commands": [123]},
         {"commands": ["pwd", "ls"]},
         {"commands": ["pwd"], "timeout_ms": 1},
         {"commands": ["pwd"], "max_output_length": 10},
@@ -95,8 +96,29 @@ def test_shell_is_not_enabled_on_other_models():
 )
 def test_unrepresentable_shell_replay_is_rejected(action):
     with pytest.raises(ValueError):
+        request = ResponsesRequest(
+            input=[{"type": "shell_call", "call_id": "call_x", "action": action}]
+        )
+        registry().input_item(request.input[0])
+
+
+def test_shell_replay_accepts_sdk_input_without_output_id_or_status():
+    replay = registry().input_item(
+        {"type": "shell_call", "call_id": "call_x", "action": {"commands": ["pwd"]}}
+    )
+    assert replay["call_id"] == "call_x"
+    assert replay["id"] is None and replay["status"] == "completed"
+    assert json.loads(replay["arguments"]) == {"command": "pwd"}
+
+
+def test_shell_result_rejects_missing_outcome():
+    with pytest.raises(ValueError):
         registry().input_item(
-            {"type": "shell_call", "call_id": "call_x", "action": action}
+            {
+                "type": "shell_call_output",
+                "call_id": "call_x",
+                "output": [{"stdout": "ok", "stderr": ""}],
+            }
         )
 
 
@@ -260,6 +282,7 @@ def test_invalid_bash_arguments_fail_instead_of_returning_executable_command():
                 {
                     "type": "function_call",
                     "name": "bash",
+                    "id": "fc_x",
                     "call_id": "call_x",
                     "arguments": '{"command":["pwd"]}',
                     "status": "completed",
@@ -278,6 +301,7 @@ def test_partial_shell_calls_never_expose_commands(status):
         {
             "type": "function_call",
             "name": "bash",
+            "id": "fc_x",
             "call_id": "call_x",
             "arguments": '{"command":"echo partial"}',
             "status": status,
@@ -298,6 +322,7 @@ def test_invalid_shell_terminal_event_matches_failed_response():
                     {
                         "type": "function_call",
                         "name": "bash",
+                        "id": "fc_x",
                         "call_id": "call_x",
                         "arguments": "not json",
                         "status": "completed",

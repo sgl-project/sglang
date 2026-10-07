@@ -2,8 +2,15 @@
 """Adapt Beam's trained built-in tools independently of namespace mapping."""
 
 import json
+from typing import Union
+
+from openai.types.responses import ResponseFunctionShellToolCall
+from openai.types.responses.response_input_item_param import ShellCall, ShellCallOutput
+from pydantic import TypeAdapter
 
 from sglang.srt.entrypoints.openai.responses_tools.adapter import ResponseToolAdapter
+
+_SHELL_INPUT = TypeAdapter(Union[ShellCall, ShellCallOutput])
 
 
 class BeamToolAdapter(ResponseToolAdapter):
@@ -119,36 +126,37 @@ class BeamToolAdapter(ResponseToolAdapter):
             if "bash" in self.names and self.builtins.get("bash") != "shell":
                 raise ValueError("Shell replay conflicts with a user-defined bash tool")
         if item.get("type") == "shell_call":
-            from sglang.srt.entrypoints.openai.protocol import ShellCall
-
-            call = ShellCall.model_validate(item)
+            call = _SHELL_INPUT.validate_python(item)
+            self._options(
+                item["action"], {"commands", "timeout_ms", "max_output_length"}
+            )
+            action = call["action"]
             # Cutoffs have no command to replay; keep them only in public history.
-            if call.status == "incomplete" and not call.action.commands:
+            if call.get("status") == "incomplete" and not action["commands"]:
                 return None
             if (
-                len(call.action.commands) != 1
-                or call.action.timeout_ms not in (None, 600000)
-                or call.action.max_output_length is not None
+                len(action["commands"]) != 1
+                or action.get("timeout_ms") not in (None, 600000)
+                or action.get("max_output_length") is not None
             ):
                 raise ValueError(
                     "Beam shell replay supports one command, the default timeout, and no max_output_length"
                 )
             return {
                 "type": "function_call",
-                "id": call.id,
-                "call_id": call.call_id,
+                "id": call.get("id"),
+                "call_id": call["call_id"],
                 "name": "bash",
-                "arguments": json.dumps({"command": call.action.commands[0]}),
-                "status": call.status,
+                "arguments": json.dumps({"command": action["commands"][0]}),
+                "status": call.get("status") or "completed",
             }
         if item.get("type") == "shell_call_output":
-            from sglang.srt.entrypoints.openai.protocol import ShellCallOutput
-
-            output = ShellCallOutput.model_validate(item)
+            output = _SHELL_INPUT.validate_python(item)
+            output["output"] = list(output["output"])
             return {
                 "type": "function_call_output",
-                "call_id": output.call_id,
-                "output": output.model_dump_json(exclude_none=True),
+                "call_id": output["call_id"],
+                "output": _SHELL_INPUT.dump_json(output, exclude_none=True).decode(),
             }
         return item
 
@@ -178,19 +186,19 @@ class BeamToolAdapter(ResponseToolAdapter):
         status = item.get("status", "completed")
         if not valid and status != "in_progress":
             status = "incomplete"
-        return {
-            "type": "shell_call",
-            "id": item.get("id"),
-            "call_id": item["call_id"],
-            "status": status,
-            "action": {
+        return ResponseFunctionShellToolCall(
+            type="shell_call",
+            id=item["id"],
+            call_id=item["call_id"],
+            status=status,
+            action={
                 "commands": [args["command"]]
                 if valid and status == "completed"
                 else [],
                 "timeout_ms": 600000,
                 "max_output_length": None,
             },
-        }
+        ).model_dump()
 
     def response(self, response):
         result = {

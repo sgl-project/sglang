@@ -2044,8 +2044,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
         sequence_number = 0
         async for event in events:
-            # Preserve extended item fields such as message phase.
-            payload = event.model_dump(serialize_as_any=True)
+            payload = event.model_dump()
+            if isinstance(getattr(event, "item", None), ResponseOutputMessage):
+                payload["item"] = event.item.model_dump()
             if tool_adapter is not None:
                 payload = tool_adapter.event(payload)
                 if payload is None:

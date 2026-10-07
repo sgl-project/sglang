@@ -1789,57 +1789,10 @@ class NamespacedCustomCallParam(ResponseCustomToolCallParam, total=False):
     namespace: Optional[str]
 
 
-class ShellAction(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    commands: List[str]
-    timeout_ms: Optional[int] = Field(default=None, gt=0)
-    max_output_length: Optional[int] = Field(default=None, gt=0)
-
-
-class ShellCall(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["shell_call"]
-    id: Optional[str] = None
-    call_id: str
-    action: ShellAction
-    status: Literal["in_progress", "completed", "incomplete"] = "completed"
-
-
-class ShellExit(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["exit"]
-    exit_code: int
-
-
-class ShellTimeout(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["timeout"]
-
-
-class ShellResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    stdout: str
-    stderr: str
-    outcome: Union[ShellExit, ShellTimeout]
-
-
-class ShellCallOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["shell_call_output"]
-    id: Optional[str] = None
-    call_id: str
-    output: List[ShellResult] = Field(min_length=1)
-    max_output_length: Optional[int] = Field(default=None, gt=0)
-
-
-ResponseOutputItem: TypeAlias = Union[
-    ShellCall, ResponseOutputMessage, OpenAIResponseOutputItem
-]
+ResponseOutputItem: TypeAlias = Union[ResponseOutputMessage, OpenAIResponseOutputItem]
 
 
 ResponseInputOutputItem: TypeAlias = Union[
-    ShellCall,
-    ShellCallOutput,
     NamespacedFunctionCallParam,
     NamespacedCustomCallParam,
     ResponseInputMessageParam,
@@ -1872,9 +1825,10 @@ class ResponsesRequest(PDRoutingFields):
             ]
         ]
     ] = None
-    # Accept dict-shaped items as the loose arm; downstream normalization
-    # handles replayed shapes that don't satisfy every openai TypedDict.
-    input: Union[str, List[ResponseInputOutputItem], List[Dict[str, Any]]]
+    # Preserve JSON input for downstream validation; SDK TypedDicts discard extra fields.
+    input: Union[str, List[Dict[str, Any]], List[ResponseInputOutputItem]] = Field(
+        union_mode="left_to_right"
+    )
     instructions: Optional[str] = None
     max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
