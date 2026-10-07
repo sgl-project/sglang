@@ -23,6 +23,8 @@ def model(request):
             num_attention_heads=2,
             num_key_value_heads=2,
             pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=1,
         ),
         vision_config=dict(
             hidden_size=16,
@@ -37,7 +39,7 @@ def model(request):
             deepstack_visual_indexes=[],
         ),
     )
-    with get_parallel().override(tp_size=1, tp_rank=0):
+    with get_parallel().override(tp_size=1, tp_rank=0, tp_group=None):
         yield (
             Qwen2_5_VLModel(config, enable_image_understanding=True)
             if isinstance(config, Qwen2_5_VLConfig)
