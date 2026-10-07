@@ -9,9 +9,11 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX  # noqa: E402
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.observability.metrics_collector import DPBalanceStats  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -30,6 +32,7 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             forward_mode=ForwardMode.DECODE,
             batch_size=lambda: 4,
             spec_info=None,
+            reqs=[],
         )
         tbo_preparer = Mock()
         tbo_preparer.prepare_all_gather.return_value = (
@@ -82,6 +85,191 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             tbo_preparer.compute_output.call_args.args[0].tolist(),
             [[1, ForwardMode.DECODE.value]],
         )
+
+
+class TestDPBalanceStats(CustomTestCase):
+    def _prepare_dp2_batch(
+        self,
+        forward_mode,
+        local_tokens: int,
+        peer_tokens: int,
+        *,
+        reqs=(),
+        peer_health_check: bool = False,
+        get_idle_batch=None,
+        sync_wait_carry=None,
+        wait_seconds=None,
+    ):
+        batch = SimpleNamespace(
+            forward_mode=forward_mode,
+            batch_size=lambda: local_tokens,
+            spec_info=None,
+            reqs=list(reqs),
+            dp_balance_stats=None,
+        )
+        gathered_mode = forward_mode or ForwardMode.IDLE
+        tbo_preparer = Mock()
+        tbo_preparer.prepare_all_gather.return_value = (True, gathered_mode.value)
+        tbo_preparer.compute_output.return_value = (None, gathered_mode)
+
+        def fake_all_gather_single(output, local, group, **_):
+            peer = local.clone()
+            peer[0] = peer[1] = peer_tokens  # num_tokens, num_tokens_for_logprob
+            peer[9] = int(peer_health_check)
+            output.copy_(torch.stack([local, peer]).flatten())
+
+        # all_gather reads the clock once before and once after the collective.
+        clock = (
+            patch.object(dp_attn.time, "perf_counter", side_effect=[0.0, wait_seconds])
+            if wait_seconds is not None
+            else patch.object(
+                dp_attn.time, "perf_counter", wraps=dp_attn.time.perf_counter
+            )
+        )
+        with (
+            clock,
+            envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
+            patch.object(dp_attn, "_ENABLE_METRICS_DP_ATTENTION", True),
+            patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
+            patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
+            patch.object(
+                dp_attn,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    num_dp_ranks=2,
+                    attn_tp_size=1,
+                    attn_cp_size=1,
+                    tp_group=SimpleNamespace(
+                        device_group=object(),
+                        device="cpu",
+                        cpu_group=object(),
+                        active_ranks_cpu=torch.ones(2, dtype=torch.int64),
+                    ),
+                ),
+            ),
+            patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
+            patch.object(
+                dp_attn, "all_gather_single", side_effect=fake_all_gather_single
+            ),
+        ):
+            return dp_attn.prepare_mlp_sync_batch_raw(
+                batch if forward_mode is not None else None,
+                model_runner=SimpleNamespace(
+                    prefill_cuda_graph_runner=None,
+                    spec_algorithm=SpeculativeAlgorithm.NONE,
+                    model_config=object(),
+                ),
+                get_idle_batch=get_idle_batch
+                or Mock(side_effect=AssertionError("local batch must not be replaced")),
+                disable_cuda_graph=False,
+                require_mlp_tp_gather=True,
+                disable_overlap_schedule=True,
+                offload_tags=set(),
+                sync_wait_carry=sync_wait_carry,
+            )
+
+    def test_attached_to_batch_after_dp_gather(self):
+        result = self._prepare_dp2_batch(
+            ForwardMode.DECODE, local_tokens=4, peer_tokens=8
+        )
+
+        self.assertEqual(result.global_num_tokens, [4, 8])
+        stats = result.dp_balance_stats
+        self.assertEqual(
+            (stats.local_tokens, stats.max_tokens, stats.sum_tokens, stats.num_ranks),
+            (4, 8, 12, 2),
+        )
+        self.assertEqual(stats.imbalance_tokens, 4)
+        self.assertAlmostEqual(stats.max_over_mean, 8 * 2 / 12)
+        self.assertGreater(stats.sync_wait_seconds, 0)
+
+    def _adapter(self):
+        return dp_attn.SchedulerDPAttnAdapter(
+            model_runner=object(),
+            req_to_token_pool=object(),
+            token_to_kv_pool_allocator=object(),
+            tree_cache=object(),
+            offload_tags=set(),
+            model_config=object(),
+            enable_overlap=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            get_require_mlp_sync=lambda: True,
+        )
+
+    def test_batchless_gathers_carry_wait_until_recorded_or_idle(self):
+        adapter = self._adapter()
+        carry = adapter.sync_wait_carry
+        idle_batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE, reqs=[], dp_balance_stats=None
+        )
+
+        def batchless_gather(wait_seconds):
+            result = self._prepare_dp2_batch(
+                None,
+                local_tokens=0,
+                peer_tokens=0,
+                get_idle_batch=Mock(return_value=idle_batch),
+                sync_wait_carry=carry,
+                wait_seconds=wait_seconds,
+            )
+            self.assertIsNone(result)
+
+        batchless_gather(0.001)
+        batchless_gather(0.002)
+        self.assertAlmostEqual(carry.seconds, 0.003)
+        result = self._prepare_dp2_batch(
+            ForwardMode.DECODE,
+            local_tokens=4,
+            peer_tokens=8,
+            sync_wait_carry=carry,
+            wait_seconds=0.0005,
+        )
+        self.assertAlmostEqual(result.dp_balance_stats.sync_wait_seconds, 0.0035)
+        self.assertEqual(carry.seconds, 0.0)
+
+        # An iteration that ends without a batch drops what it carried.
+        batchless_gather(0.004)
+        adapter.drop_sync_wait_carry()
+        self.assertEqual(carry.seconds, 0.0)
+
+    def test_unrecorded_batch_steps_do_not_carry_wait(self):
+        carry = self._adapter().sync_wait_carry
+        carry.seconds = 0.003
+        # A prebuilt batch with no work anywhere runs a step but records nothing.
+        result = self._prepare_dp2_batch(
+            ForwardMode.PREBUILT,
+            local_tokens=0,
+            peer_tokens=0,
+            sync_wait_carry=carry,
+            wait_seconds=0.001,
+        )
+        self.assertIsNone(result.dp_balance_stats)
+        self.assertEqual(carry.seconds, 0.0)
+
+    def test_health_check_probe_steps_not_recorded(self):
+        probe = SimpleNamespace(rid=f"{HEALTH_CHECK_RID_PREFIX}-0")
+        result = self._prepare_dp2_batch(
+            ForwardMode.DECODE, local_tokens=1, peer_tokens=0, reqs=[probe]
+        )
+        self.assertIsNone(result.dp_balance_stats)
+
+        # The gathered flag skips the step on the ranks that only ran idle.
+        idle_batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE, reqs=[], dp_balance_stats=None
+        )
+        result = self._prepare_dp2_batch(
+            None,
+            local_tokens=0,
+            peer_tokens=1,
+            peer_health_check=True,
+            get_idle_batch=Mock(return_value=idle_batch),
+        )
+        self.assertIs(result, idle_batch)
+        self.assertIsNone(result.dp_balance_stats)
+
+    def test_create_rejects_steps_without_tokens(self):
+        with self.assertRaises(ValueError):
+            DPBalanceStats.create(0, [0, 0], 0.0)
 
 
 class TestDecodeToExtendConversionVote(CustomTestCase):

@@ -3243,7 +3243,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 page_size=1,
                 # `use_mla_backend` reads the model configuration; a non-MLA
                 # one keeps these assertions about the page constraints.
-                _model_config=SimpleNamespace(attention_arch=None),
+                _model_config=SimpleNamespace(
+                    attention_arch=None, hf_config=SimpleNamespace(architectures=[])
+                ),
             )
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
