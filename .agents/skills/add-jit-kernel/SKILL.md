@@ -78,6 +78,7 @@ These hold for every step below.
   - Resolves the CUDA stream from a `DLDevice` via TVM-FFI automatically.
   - Checks the CUDA error with file/line info after launch via `operator()(kernel, args...)`.
   - Supports `.enable_pdl(bool)` for PDL (Programmatic Dependent Launch, SM90+).
+  - Supports `.enable_cooperative(bool)` for grids whose CTAs wait on each other: the launch fails instead of hanging when the grid cannot be co-resident.
 - **`device::PDLWaitPrimary<kUsePDL>()`** / **`device::PDLTriggerSecondary<kUsePDL>()`** — The two halves of PDL, on sm_90+ (no-ops on older archs and ROCm). Their guarantees are **not** symmetric:
   - `PDLTriggerSecondary` (`griddepcontrol.launch_dependents`) only lets the next kernel in the stream *start* early. It carries no memory ordering and publishes nothing — matching that, the header's asm has no `"memory"` clobber.
   - `PDLWaitPrimary` (`griddepcontrol.wait`) is the ordering point: it waits until the preceding kernel has fully finished and its writes are visible.
