@@ -941,7 +941,9 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def _prepare_mxfp8_skinny(self, layer: Module) -> None:
         """On SM120, decode-sized rows of a tuned shape run a small-M MXFP8 GEMM
-        that reads the 32x32 block scales directly."""
+        that reads the 32x32 block scales directly. Reached only when the layer
+        is served as MXFP8, which on SM120 needs --fp8-gemm-backend
+        flashinfer_cutlass or flashinfer_cutedsl (auto resolves to cutlass)."""
         layer.mxfp8_skinny_scale = None
         layer.mxfp8_skinny_counters = None
         if not (is_sm120() and envs.SGLANG_ENABLE_SM120_MXFP8_SKINNY_GEMM.get()):
@@ -983,8 +985,8 @@ class Fp8LinearMethod(LinearMethodBase):
         elif isinstance(x, torch.Tensor) and x.dtype in (
             torch.bfloat16,
             torch.float16,
-            torch.float32,
         ):
+            # The activation dtypes the FlashInfer MXFP8 path accepts.
             data, a_sf = x, None
         else:
             return None

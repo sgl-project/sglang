@@ -155,9 +155,9 @@ def mxfp8_skinny_gemm(
     a: BF16/FP16/FP32 [M, K] (quantized in-kernel) or E4M3 [M, K] with `a_sf`
     (UE8M0, FlashInfer 128x4 swizzled). weight: E4M3 [N, K].
     weight_block_scale: FP32 power-of-two scales [ceil(N / 32), K / 32].
-    counters: only for shapes that split K; int32 zeros with at least
-    ceil(N / BN) entries, used by one stream at a time; the kernel leaves them
-    zero.
+    counters: only for shapes that split K; a contiguous int32 tensor of at
+    least ceil(N / BN) zeros on the device of `a`, used by one stream at a
+    time; the kernel leaves them zero.
     """
     m, k = a.shape
     n = weight.shape[0]
@@ -175,8 +175,17 @@ def mxfp8_skinny_gemm(
     bn, split, bk = _TUNED[(n, k)]
     bm = 16 if m <= 16 else 32 if m <= 32 else 64 if m <= 64 else 128
     tiles_n = triton.cdiv(n, bn)
-    if split > 1:
-        assert counters is not None and counters.numel() >= tiles_n
+    if split > 1 and (
+        counters is None
+        or counters.dtype != torch.int32
+        or counters.device != a.device
+        or not counters.is_contiguous()
+        or counters.numel() < tiles_n
+    ):
+        raise ValueError(
+            f"(N, K) = ({n}, {k}) splits K, so counters must be a contiguous int32 "
+            f"tensor of at least {tiles_n} zeros on {a.device}"
+        )
     out = torch.empty((m, n), dtype=out_dtype, device=a.device)
     ws = (
         torch.empty((split, m, n), dtype=torch.float32, device=a.device)
