@@ -8,6 +8,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <stdint.h>
 #include <string>
@@ -203,6 +204,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     const SeqLensT* __restrict__ seq_lens,
     int16_t* __restrict__ lru_slots,
     const int32_t* __restrict__ num_real_reqs,
+    int64_t* __restrict__ miss_list,
+    int32_t* __restrict__ miss_count,
     int64_t buffer_stride_0,
     int64_t host_stride,
     int64_t lru_slot_stride_0,
@@ -211,6 +214,9 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t page_size,
     int64_t item_size_bytes) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
+  // Host->device copies are NOT done here: this block-per-request kernel emits
+  // (src_loc, dst_loc) pairs to miss_list[bid] and the count to miss_count[bid];
+  // copy_misses_kernel then spreads the copies over many blocks (see below).
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
   constexpr int NUM_TOKEN_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
@@ -226,6 +232,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
       req_top_k_device_locs[i] = -1;
     }
+    if (tid == 0) miss_count[bid] = 0;
     return;
   }
 
@@ -258,6 +265,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       }
       req_top_k_device_locs[i] = device_loc;
     }
+    if (tid == 0) miss_count[bid] = 0;
     return;
   }
 
@@ -508,14 +516,48 @@ __global__ void load_cache_to_device_buffer_kernel(
 #endif
   }
 
-  // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
-  for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
+  // Emit the miss list for copy_misses_kernel: one (src host loc, dst device
+  // loc) pair per miss. Doing the copies here would cap memory-level
+  // parallelism at NUM_WARPS dependent host reads per request.
+  int64_t* req_miss_list = miss_list + static_cast<int64_t>(bid) * (2 * NUM_TOP_K);
+  if (tid == 0) miss_count[bid] = total_misses;
+  for (int miss_idx = tid; miss_idx < total_misses; miss_idx += BLOCK_SIZE) {
     const int32_t miss_token = s_top_k_tokens[miss_idx];
     const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
+    req_miss_list[2 * miss_idx] = req_host_cache_locs[miss_token];
+    req_miss_list[2 * miss_idx + 1] = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
+  }
+}
 
-    const int64_t src_loc = req_host_cache_locs[miss_token];
-    const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
+/// \brief Copy the missed KV items listed by load_cache_to_device_buffer_kernel.
+///
+/// Grid = bs * blocks_per_req blocks; each warp copies one item at a time, so up
+/// to blocks_per_req * NUM_WARPS host reads are in flight per request instead of
+/// NUM_WARPS. Addressing mirrors the original in-kernel copy (generic linear or
+/// DSv4 page-padded layout).
+template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout>
+__global__ void copy_misses_kernel(
+    const int64_t* __restrict__ miss_list,
+    const int32_t* __restrict__ miss_count,
+    const void* __restrict__ host_cache_k,
+    const void* __restrict__ host_cache_v,
+    void* __restrict__ device_buffer_k,
+    void* __restrict__ device_buffer_v,
+    int32_t blocks_per_req,
+    int64_t miss_list_stride,
+    int64_t item_size_bytes) {
+  constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+  const int bid = blockIdx.x / blocks_per_req;
+  const int sub = blockIdx.x % blocks_per_req;
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  const int warp_id = threadIdx.x / WARP_SIZE;
+  const int total_misses = miss_count[bid];
+  const int64_t* req_miss_list = miss_list + static_cast<int64_t>(bid) * miss_list_stride;
+  const int stride = blocks_per_req * NUM_WARPS;
 
+  for (int miss_idx = sub * NUM_WARPS + warp_id; miss_idx < total_misses; miss_idx += stride) {
+    const int64_t src_loc = req_miss_list[2 * miss_idx];
+    const int64_t dst_loc = req_miss_list[2 * miss_idx + 1];
     if constexpr (IsDsv4Layout) {
 #ifdef USE_ROCM
       // ROCm path: host cache and device buffer both use the page-padded C4
@@ -583,6 +625,18 @@ void load_cache_to_device_buffer(
 
   // Generic lambda: int32/int64 kernel variants are compiled for both
   // seq_lens and req_pool_indices; the correct combo is selected at runtime.
+  // Workspace: per request, NUM_TOP_K (src, dst) int64 pairs + an int32 count.
+  const size_t miss_list_bytes = static_cast<size_t>(bs) * NUM_TOP_K * 2 * sizeof(int64_t);
+  const size_t miss_count_bytes = static_cast<size_t>(bs) * sizeof(int32_t);
+  auto workspace = alloc_workspace_tensor(miss_list_bytes + miss_count_bytes, top_k_tokens.device());
+  auto* miss_list = static_cast<int64_t*>(workspace.data_ptr());
+  auto* miss_count = reinterpret_cast<int32_t*>(static_cast<char*>(workspace.data_ptr()) + miss_list_bytes);
+  // Copy kernel: up to 64 blocks per request, but never more warps than misses can use.
+  constexpr int COPY_BLOCK_SIZE = 256;
+  constexpr int COPY_WARPS = COPY_BLOCK_SIZE / WARP_SIZE;
+  const int32_t blocks_per_req =
+      static_cast<int32_t>(std::min<int64_t>(64, div_ceil(int64_t(NUM_TOP_K), int64_t(COPY_WARPS))));
+
   auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr, const auto* req_pool_indices_ptr) {
     constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
 #ifndef USE_ROCM
@@ -605,12 +659,25 @@ void load_cache_to_device_buffer(
         seq_lens_ptr,
         static_cast<int16_t*>(lru_slots.data_ptr()),
         static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        miss_list,
+        miss_count,
         buffer_stride_0,
         host_stride,
         lru_slot_stride_0,
         top_k_tokens_stride,
         top_k_device_locs_stride,
         page_size,
+        item_size_bytes);
+    LaunchKernel(bs * blocks_per_req, COPY_BLOCK_SIZE, device)(
+        copy_misses_kernel<COPY_BLOCK_SIZE, IsMLA, IsDsv4Layout>,
+        static_cast<const int64_t*>(miss_list),
+        static_cast<const int32_t*>(miss_count),
+        host_cache_k.data_ptr(),
+        (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
+        device_buffer_k.data_ptr(),
+        (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
+        blocks_per_req,
+        static_cast<int64_t>(2 * NUM_TOP_K),
         item_size_bytes);
   };
 
