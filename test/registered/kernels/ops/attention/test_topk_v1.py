@@ -4,9 +4,10 @@
 radix select first bins scores by the high byte of their ordered FP16 value and
 stashes the threshold bin in shared memory (8192 entries). These tests put the
 threshold bin on both sides of that capacity, with strictly higher values
-emitted before it, ties at the cutoff, and clusters that only separate at a
-deeper FP32 key byte. They cover runtime ``topk`` values, the ``seq_len <= topk``
-path, strided scores, and both the page-table mapped and raw outputs.
+emitted before it, ties at the cutoff, and clusters that only separate in one
+of the lower three FP32 key bytes. They cover runtime ``topk`` values, the
+``seq_len <= topk`` path, score rows padded past ``seq_lens``, a noncontiguous
+score view, and both the page-table mapped and raw outputs.
 
 Selections are compared with ``torch.topk`` as value multisets: any subset of
 values tied at the cutoff is a valid selection, but indices must be distinct
@@ -65,11 +66,17 @@ def _byte_depth_clusters(depth: int, per_side: int, gen) -> torch.Tensor:
     return keys.to(torch.int32).view(torch.float32)
 
 
-def _run_and_check(rows: list[torch.Tensor], topk: int, stride_pad: int = 0):
+def _run_and_check(
+    rows: list[torch.Tensor], topk: int, stride_pad: int = 0, view_pad: int = 0
+):
     gen = _generator(topk)
     batch = len(rows)
     stride = max(row.numel() for row in rows) + stride_pad
     # Pad with +inf so any read past ``seq_lens`` would corrupt the selection.
+    # ``view_pad`` passes a column slice whose row stride exceeds its width.
+    storage = torch.full(
+        (batch, stride + view_pad), float("inf"), dtype=torch.float32, device="cuda"
+    )
     scores = torch.full((batch, stride), float("inf"), dtype=torch.float32)
     for i, row in enumerate(rows):
         scores[i, : row.numel()] = row
@@ -81,8 +88,11 @@ def _run_and_check(rows: list[torch.Tensor], topk: int, stride_pad: int = 0):
 
     out_page = torch.full((batch, topk), -7, dtype=torch.int32, device="cuda")
     out_raw = torch.full((batch, topk), -7, dtype=torch.int32, device="cuda")
+    scores_view = storage[:, :stride]
+    scores_view.copy_(scores)
+    assert scores_view.is_contiguous() == (view_pad == 0)
     topk_transform_paged(
-        scores.cuda(),
+        scores_view,
         seq_lens.cuda(),
         page_table.cuda(),
         out_page,
@@ -162,14 +172,14 @@ def test_cutoff_ties(topk):
 
 
 @pytest.mark.parametrize("topk", TOPKS)
-def test_clusters_separating_at_each_key_byte(topk):
+def test_clusters_separating_at_lower_key_bytes(topk):
     gen = _generator(4)
     rows = [_byte_depth_clusters(depth, STASH_ENTRIES + 1, gen) for depth in (16, 8, 0)]
     _run_and_check(rows, topk)
 
 
 @pytest.mark.parametrize("topk", TOPKS)
-def test_short_and_random_rows_with_strided_scores(topk):
+def test_short_and_random_rows_with_padded_and_strided_scores(topk):
     gen = _generator(5)
     rows = [
         torch.rand(1, generator=gen),
@@ -180,6 +190,7 @@ def test_short_and_random_rows_with_strided_scores(topk):
         torch.randn(40000, generator=gen),
     ]
     _run_and_check(rows, topk, stride_pad=PAGE_SIZE + 3)
+    _run_and_check(rows, topk, view_pad=PAGE_SIZE + 5)
 
 
 if __name__ == "__main__":
