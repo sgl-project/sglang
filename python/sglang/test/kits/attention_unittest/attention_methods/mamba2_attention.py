@@ -453,6 +453,7 @@ class MockMamba2ModelRunner(ModelRunner):
             enable_alt_stream=False,
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.is_draft_worker = False
         self.init_kv_index_translator()
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
@@ -460,7 +461,6 @@ class MockMamba2ModelRunner(ModelRunner):
         self.is_hybrid_swa = False
         self.sliding_window_size = None
         self.use_mla_backend = False
-        self.is_draft_worker = False
         self._kernel_warmed_up = True
 
     @property

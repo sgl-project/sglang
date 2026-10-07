@@ -307,6 +307,7 @@ class MockMLAModelRunner(ModelRunner):
             enable_memory_saver=False,
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.is_draft_worker = False
         self.init_kv_index_translator()
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
@@ -314,7 +315,6 @@ class MockMLAModelRunner(ModelRunner):
         self.is_hybrid_swa = False
         self.sliding_window_size = None
         self.use_mla_backend = True
-        self.is_draft_worker = False
         self._kernel_warmed_up = True
         # Runner-mode helpers mutate speculative graph sizes after construction.
         self.graph_shared_output = GraphSharedOutput(
