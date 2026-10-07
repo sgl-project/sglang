@@ -37,7 +37,9 @@ pub(super) fn apply_tool_constraint(
     tools: &[ToolDefinition],
     parallel_tool_calls: Option<bool>,
 ) -> Result<(), String> {
-    match tool_constraint(parser, tool_choice, tools, parallel_tool_calls)? {
+    let constraint = tool_constraint(parser, tool_choice, tools, parallel_tool_calls)
+        .map_err(|error| error.to_string())?;
+    match constraint {
         Some(ToolConstraint::StructuralTag(tag)) => sampling.structural_tag = Some(tag),
         Some(ToolConstraint::JsonSchema(schema)) => sampling.json_schema = Some(schema),
         None => {}

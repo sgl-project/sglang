@@ -11,7 +11,6 @@ use dynamo_protocols::types::{
 };
 
 use super::ChatToolCallDelta;
-use super::names::dynamo_tool_parser_name;
 use crate::ProcessorError;
 
 /// Collect top-level and dynamic system-message tools without moving their
@@ -53,6 +52,16 @@ fn definition(function: FunctionObject) -> ToolDefinition {
     }
 }
 
+/// Map SGLang tool-parser aliases onto Dynamo's tool-parser names.
+pub fn dynamo_tool_parser_name(parser: &str) -> &str {
+    match parser {
+        "llama3" => "llama3_json",
+        "qwen" => "qwen25",
+        "glm" | "glm45" => "glm47",
+        other => other,
+    }
+}
+
 /// The sampling constraint a `tool_choice` turns into.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolConstraint {
@@ -80,7 +89,7 @@ pub fn tool_constraint(
     tool_choice: &ToolChoice,
     tools: &[ToolDefinition],
     parallel_tool_calls: Option<bool>,
-) -> Result<Option<ToolConstraint>, String> {
+) -> Result<Option<ToolConstraint>, ProcessorError> {
     if *tool_choice == ToolChoice::None {
         return Ok(None);
     }
@@ -90,9 +99,7 @@ pub fn tool_constraint(
     if let ToolChoice::Named(name) = tool_choice
         && !tools.iter().any(|tool| &tool.name == name)
     {
-        return Err(format!(
-            "tool named \"{name}\" in tool_choice is not present in tools"
-        ));
+        return Err(format!("tool named \"{name}\" in tool_choice is not present in tools").into());
     }
 
     let Some(parser) = parser else {
@@ -126,7 +133,7 @@ pub fn tool_constraint(
                 schema_mode: StructuralTagSchemaMode::Auto,
                 starts_in_reasoning: false,
             })
-            .map_err(|error| error.to_string())?
+            .map_err(|error| ProcessorError::InvalidRequest(error.to_string()))?
     {
         return Ok(Some(ToolConstraint::StructuralTag(tag.to_string())));
     }
@@ -207,6 +214,14 @@ mod tests {
     }
 
     #[test]
+    fn tool_parser_aliases() {
+        assert_eq!(dynamo_tool_parser_name("llama3"), "llama3_json");
+        assert_eq!(dynamo_tool_parser_name("qwen"), "qwen25");
+        assert_eq!(dynamo_tool_parser_name("glm45"), "glm47");
+        assert_eq!(dynamo_tool_parser_name("deepseekv4"), "deepseekv4");
+    }
+
+    #[test]
     fn required_and_named_choices_build_a_call_array_schema() {
         let tools = [tool("get_weather", false), tool("get_time", false)];
         let schema = json_schema(
@@ -235,6 +250,7 @@ mod tests {
             panic!("expected a structural tag");
         };
         let tag: serde_json::Value = serde_json::from_str(&tag).unwrap();
+        assert_eq!(tag["type"], "structural_tag");
         assert_eq!(tag["format"]["type"], "triggered_tags");
         assert_eq!(tag["format"]["at_least_one"], false);
         assert_eq!(
@@ -259,24 +275,26 @@ mod tests {
             Ok(None)
         );
         // Validation runs even without a parser.
-        assert!(
-            tool_constraint(None, &ToolChoice::Required, &[], None)
+        let error = |parser, choice, tools| {
+            tool_constraint(parser, choice, tools, None)
                 .unwrap_err()
-                .contains("required")
-        );
+                .to_string()
+        };
+        assert!(error(None, &ToolChoice::Required, &[]).contains("required"));
         let missing = ToolChoice::Named("missing".into());
-        assert!(
-            tool_constraint(None, &missing, &tools, None)
-                .unwrap_err()
-                .contains("missing")
-        );
-        let error = tool_constraint(Some("not-a-parser"), &ToolChoice::Auto, &tools, None);
-        assert!(error.unwrap_err().contains("not supported"));
+        assert!(error(None, &missing, &tools).contains("missing"));
+        assert!(error(Some("not-a-parser"), &ToolChoice::Auto, &tools).contains("not supported"));
     }
 
     #[test]
     fn openai_tool_choices_map_to_dynamo() {
         assert_eq!(dynamo_tool_choice(&None), ToolChoice::Auto);
+        let wire = |value| serde_json::from_value(serde_json::json!(value)).unwrap();
+        assert_eq!(dynamo_tool_choice(&Some(wire("none"))), ToolChoice::None);
+        assert_eq!(
+            dynamo_tool_choice(&Some(wire("required"))),
+            ToolChoice::Required
+        );
         let named = serde_json::from_value(serde_json::json!(
             {"type": "function", "function": {"name": "get_weather"}}
         ))

@@ -21,13 +21,14 @@ use serde::de::DeserializeOwned;
 
 use crate::ProcessorError;
 
-mod names;
 mod reasoning;
 mod tools;
 
-pub use self::names::dynamo_tool_parser_name;
 pub use self::reasoning::{ReasoningStreamSplitter, split_reasoning};
-pub use self::tools::{ToolConstraint, chat_tool_definitions, dynamo_tool_choice, tool_constraint};
+pub use self::tools::{
+    ToolConstraint, chat_tool_definitions, dynamo_tool_choice, dynamo_tool_parser_name,
+    tool_constraint,
+};
 use self::tools::{post_tool_terminal_markers, tool_call_delta};
 
 /// Engine-neutral terminal reason understood by chat response processing.
@@ -199,12 +200,8 @@ impl ChatResponseProcessor {
 
                 let choice = &mut self.choices[decoded.choice];
                 let index = decoded.choice as u32;
-                let token_ids = decoded
-                    .token_ids
-                    .iter()
-                    .filter_map(|&id| u32::try_from(id).ok())
-                    .collect::<Vec<_>>();
-                let (reasoning_text, normal_text) = choice.reasoning.split(&decoded.text, &token_ids);
+                let (reasoning_text, normal_text) =
+                    choice.reasoning.split(&decoded.text, &decoded.token_ids);
                 let mut remaining_logprobs = decoded.logprobs;
                 let mut emitted = Vec::with_capacity(3);
                 if !reasoning_text.is_empty() {
