@@ -118,18 +118,47 @@ def test_matches_unfused_and_fp64(m, k, decode, device_sm):
         torch.testing.assert_close(a, r.reshape(m, -1), rtol=1e-4, atol=1e-5)
 
 
+# A 2056-row batch takes BLOCK_M=32; its subsets take 8 (1 and 8 rows), 16 (9 and
+# 2048 rows) and 32 (2049 rows), so a row's bits must not depend on the row tile.
+BATCH_ROWS = 2056
+SUBSETS = (
+    [0],
+    [BATCH_ROWS - 1],
+    list(range(8)),
+    list(range(9)),
+    list(range(2048)),
+    list(range(2049)),
+    list(range(0, BATCH_ROWS, 7)),
+)
+
+
+@pytest.mark.parametrize("device_sm", [100, 120])
 @pytest.mark.parametrize("decode", [False, True])
-def test_batch_invariant_and_deterministic(decode):
+def test_batch_invariant_and_deterministic(decode, device_sm):
+    assert {mhc._block_m_for(len(rows)) for rows in SUBSETS} == {8, 16, 32}
+    assert mhc._block_m_for(BATCH_ROWS) == 32
+    expected = (
+        (
+            mhc._hc_mix_reduce_sinkhorn_vec_kernel
+            if device_sm == 120
+            else mhc._hc_mix_reduce_sinkhorn_kernel
+        ),
+        160 if decode and device_sm == 120 else 80,
+    )
     w, scale, base = _params()
-    x = _x(300)
-    full = _fused(x, w, scale, base, decode)
-    for a, b in zip(full, _fused(x, w, scale, base, decode)):
+    x = _x(BATCH_ROWS)
+    full, picked = _fused_as(device_sm, x, w, scale, base, decode)
+    assert picked == expected
+    again, picked = _fused_as(device_sm, x, w, scale, base, decode)
+    assert picked == expected
+    for a, b in zip(full, again):
         assert torch.equal(a, b)
-    for rows in ([0], [299], list(range(8)), list(range(0, 300, 7))):
+    for rows in SUBSETS:
         idx = torch.tensor(rows, device="cuda")
-        sub = _fused(x[idx].contiguous(), w, scale, base, decode)
+        sub, picked = _fused_as(device_sm, x[idx].contiguous(), w, scale, base, decode)
+        assert picked == expected, len(rows)
         for a, b in zip(sub, full):
-            assert torch.equal(a, b[idx]), rows
+            assert torch.equal(a, b[idx]), len(rows)
 
 
 if __name__ == "__main__":

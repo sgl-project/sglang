@@ -2340,7 +2340,8 @@ def _num_slices_for(k: int, decode: bool = False) -> int:
     assert k % _HC_MIX_BLOCK_K == 0, k
     choices = _HC_MIX_SLICE_CHOICES
     if decode and get_platform().device_sm == 120:
-        # More slices fill the SMs at decode batch sizes; prefill does not gain.
+        # More slices fill the SMs at decode batch sizes. 160 is limited to SM120
+        # decode/verify, the only mode measured with it; prefill keeps the default.
         choices = (160,) + choices
     for n in choices:
         if blocks % n == 0:
