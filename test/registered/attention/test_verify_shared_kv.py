@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.attention.decode_attention import decode_attention_fwd
 from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
 from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
 from sglang.srt.layers.attention.triton_backend import (
@@ -72,9 +73,10 @@ class TestVerifySharedKV(CustomTestCase):
         l_ext=4,
         atol=BF16_ATOL,
         rtol=BF16_RTOL,
+        prefix_lens=(512, 2048),
     ):
         inputs = _build_inputs(
-            prefix_lens=[512, 2048],
+            prefix_lens=list(prefix_lens),
             l_ext=l_ext,
             h_q=h_q,
             h_kv=h_kv,
@@ -159,6 +161,116 @@ class TestVerifySharedKV(CustomTestCase):
             rtol=FP8_RTOL,
         )
 
+    def test_minimax_m3_tp4_shape(self):
+        # MiniMax-M3 dense layers and its EAGLE3 draft at TP4: 16 local query
+        # heads on one KV head, head_dim 128, uneven long prefixes.
+        self._run_parity(
+            head_dim=128,
+            v_head_dim=128,
+            h_q=16,
+            prefix_lens=(1, 77, 4099, 70001, 199999),
+        )
+
+    @unittest.skipIf(
+        get_hip_version()[:2] == (7, 0),
+        "Triton 3.4 on ROCm 7.0 aborts gfx950 fp8 KV tl.dot "
+        "(triton-lang/triton#8278). Remove once the image uses Triton >= 3.6.",
+    )
+    def test_minimax_m3_fp8_kv_cache(self):
+        self._run_parity(
+            head_dim=128,
+            v_head_dim=128,
+            h_q=16,
+            cache_dtype=torch.float8_e4m3fn,
+            k_scale=0.5,
+            v_scale=0.25,
+            atol=FP8_ATOL,
+            rtol=FP8_RTOL,
+            prefix_lens=[3000 + 37 * i for i in range(24)],
+        )
+
+    def _run_decode_parity(self, seq_lens, cache_dtype, kv_scale, atol, rtol):
+        # Decode through the grouped-head kernel: one query row per request
+        # whose token is already the last page-table entry, trimmed from the
+        # prefix by kv_len_adjust=-1. Reference: the per-head decode kernel
+        # over the full page table.
+        h_q, head_dim = 16, 128
+        bs = len(seq_lens)
+        q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = _build_inputs(
+            prefix_lens=seq_lens,
+            l_ext=1,
+            h_q=h_q,
+            head_dim=head_dim,
+            v_head_dim=head_dim,
+        )
+        last = (kv_indptr[1:] - 1).long()
+        k_buffer[last] = k / kv_scale
+        v_buffer[last] = v / kv_scale
+        k_buffer = k_buffer.to(cache_dtype)
+        v_buffer = v_buffer.to(cache_dtype)
+        scale = head_dim**-0.5
+
+        reference = torch.empty_like(q)
+        max_kv_splits = 16
+        decode_attention_fwd(
+            q,
+            k_buffer,
+            v_buffer,
+            reference,
+            kv_indptr,
+            kv_indices,
+            torch.empty(bs, h_q, max_kv_splits, head_dim, device=q.device),
+            torch.empty(bs, h_q, max_kv_splits, device=q.device),
+            torch.full((bs,), max_kv_splits, dtype=torch.int32, device=q.device),
+            max_kv_splits,
+            scale,
+            kv_scale,
+            kv_scale,
+        )
+        actual = torch.empty_like(q)
+        ran = verify_shared_kv_fwd(
+            q,
+            k,
+            v,
+            actual,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            None,
+            True,
+            None,
+            1,
+            kv_scale,
+            kv_scale,
+            sm_scale=scale,
+            max_bs=bs,
+            kv_len_adjust=-1,
+        )
+        self.assertTrue(ran)
+        torch.testing.assert_close(actual, reference, atol=atol, rtol=rtol)
+
+    def test_minimax_m3_decode(self):
+        # Includes 1-token requests, whose trimmed prefix is empty.
+        self._run_decode_parity(
+            [1, 5, 2048, 20001, 199999], torch.bfloat16, 1.0, BF16_ATOL, BF16_RTOL
+        )
+
+    @unittest.skipIf(
+        get_hip_version()[:2] == (7, 0),
+        "Triton 3.4 on ROCm 7.0 aborts gfx950 fp8 KV tl.dot "
+        "(triton-lang/triton#8278). Remove once the image uses Triton >= 3.6.",
+    )
+    def test_minimax_m3_decode_fp8_kv_cache(self):
+        self._run_decode_parity(
+            [1] + [3000 + 37 * i for i in range(23)],
+            torch.float8_e4m3fn,
+            2.0,
+            FP8_ATOL,
+            FP8_RTOL,
+        )
+
     def test_kimi_k3_absorbed_mla_shape(self):
         self._run_parity(head_dim=576, v_head_dim=512)
 
@@ -236,6 +348,18 @@ class TestVerifySharedKV(CustomTestCase):
                 model_config("LlamaForCausalLM"), 1, False, True
             )
         )
+        for architecture in (
+            "MiniMaxM3SparseForConditionalGeneration",
+            "LlamaForCausalLMEagle3",
+        ):
+            self.assertTrue(
+                _should_use_verify_shared_kv(model_config(architecture), 1, False, True)
+            )
+            self.assertFalse(
+                _should_use_verify_shared_kv(
+                    model_config(architecture, local_kv_heads=2), 1, False, True
+                )
+            )
         self.assertTrue(
             _should_use_verify_shared_kv(
                 model_config("KimiK3ForConditionalGeneration"), 1, True, False

@@ -13,8 +13,10 @@ from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
+    _hf_arch,
     is_dspark_draft,
     is_kimi_k3,
+    is_minimax_sparse,
     is_qwen3_5,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -92,9 +94,17 @@ def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv
         return is_kimi_k3(model_config.hf_config)
     if is_dspark_draft(model_config.hf_config):
         return use_verify_splitkv
+    # GQA models whose local query heads all share one TP-local KV head:
+    # Qwen3.5, the MiniMax-M3 dense layers and its Llama EAGLE3 draft.
+    hf_config = model_config.hf_config
+    if not (
+        is_qwen3_5(hf_config)
+        or is_minimax_sparse(hf_config)
+        or _hf_arch(hf_config) == "LlamaForCausalLMEagle3"
+    ):
+        return False
     return (
         use_verify_splitkv
-        and is_qwen3_5(model_config.hf_config)
         and model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
@@ -232,13 +242,20 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5
-        # GQA with exactly one TP-local KV head.
+        # The grouped-head verify kernel is tuned for Kimi-K3 MLA and GQA with
+        # exactly one TP-local KV head (Qwen3.5, MiniMax-M3 and its EAGLE3 draft).
         self.use_verify_shared_kv = _should_use_verify_shared_kv(
             model_runner.model_config,
             self.topk,
             self.use_mla,
             self.use_verify_splitkv,
+        )
+        # Decode is a verify with one query row per request whose token is
+        # already in the page table, so the same GQA shapes reuse that kernel.
+        self._decode_shared_kv_qo_indptr = (
+            torch.arange(max_bs + 1, dtype=torch.int32, device=model_runner.device)
+            if self.use_verify_shared_kv and not self.use_mla
+            else None
         )
         # TODO: this logic should be fixed in non-hip platform
         self.is_hip_dspark_draft = (
@@ -1773,7 +1790,9 @@ class TritonAttnBackend(AttentionBackend):
         # sliding-window / ragged / topk>1), so we fall through to
         # extend_attention_fwd below. Correctness is never at risk.
         # Route target-verify to the grouped-head kernel when eligible, else the
-        # per-head split-KV kernel.
+        # per-head split-KV kernel. The v2 draft-extend has the same shape (a
+        # constant-length causal chain per request over a prefix-only
+        # kv_indices), so it takes the same path.
         if self.use_verify_shared_kv:
             verify_fwd = self.verify_shared_kv_fwd
         elif self.use_verify_splitkv:
@@ -1783,7 +1802,10 @@ class TritonAttnBackend(AttentionBackend):
         if (
             verify_fwd is not None
             and score_mod is None
-            and forward_batch.forward_mode.is_target_verify()
+            and (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
             and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k.contiguous(),
@@ -2370,6 +2392,42 @@ class TritonAttnBackend(AttentionBackend):
             )
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
+
+        # Grouped-head decode: one query row per request; kv_len_adjust=-1
+        # drops the new token from the prefix so it is attended to only once,
+        # as the extend row.
+        if (
+            self._decode_shared_kv_qo_indptr is not None
+            and score_mod is None
+            and k is not None
+            and v is not None
+            and q.shape[0] < self._decode_shared_kv_qo_indptr.shape[0]
+            and self.verify_shared_kv_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self._decode_shared_kv_qo_indptr[: q.shape[0] + 1],
+                kv_indptr,
+                kv_indices,
+                None,
+                True,
+                None,
+                1,
+                k_descale,
+                v_descale,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                sliding_window_size=layer.sliding_window_size,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+                max_bs=self.req_to_token_pool.size,
+                kv_len_adjust=-1,
+            )
+        ):
+            return o
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

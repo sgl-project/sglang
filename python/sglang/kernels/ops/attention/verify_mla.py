@@ -29,9 +29,26 @@ DEFAULT_NUM_WARPS = 8
 _BLOCK_CONFIG = {
     # head_dim: (BLOCK_H, BLOCK_N, num_warps)
     256: (4, 64, 8),  # Qwen3.5 TP2 / TP4 / TP8
+    # MiniMax-M3 dense layers / EAGLE3 draft at TP4: 16 query heads on one
+    # TP-local KV head. One 16-head block reads each K/V tile once (four 4-head
+    # blocks read it 4x); with the split budget below, 24 x ~190K-token fp8
+    # verify takes 0.41 ms vs 2.3 ms with the default config on MI355X.
+    128: (16, 128, 4),
     576: (4, 64, 8),  # K3 MLA (kv_lora_rank 512 + qk_rope 64)
     64: (4, 256, 4),  # K3 GQA (dspark draft attention)
 }
+
+
+# head_dim: (target stage-1 programs, max splits). More splits than the
+# default budget are needed for long-context decode-sized batches (24 x 195K
+# tokens gave 5 splits, i.e. 39K keys per program, under the 512 budget).
+_SPLIT_CONFIG = {
+    128: (4096, 64),
+}
+
+
+def split_config(head_dim):
+    return _SPLIT_CONFIG.get(head_dim, (TARGET_PROGRAMS, MAX_N_SPLITS))
 
 
 def block_config(head_dim):
@@ -92,6 +109,7 @@ def _verify_mla_prefix_stage1(
     BLOCK_DPE: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KV_LEN_ADJUST: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     head_block = tl.program_id(1)
@@ -101,7 +119,12 @@ def _verify_mla_prefix_stage1(
     R: tl.constexpr = BLOCK_H * L_EXT
 
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
-    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
+    # KV_LEN_ADJUST trims the prefix range: a decode step whose page table
+    # already holds the token being generated passes -1, so that token is
+    # attended to only as the single extend row.
+    cur_batch_seq_len = (
+        tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx + KV_LEN_ADJUST
+    )
     active = _active_splits(cur_batch_seq_len, num_splits, BLOCK_N)
 
     # skip idle workgroups
@@ -210,7 +233,9 @@ def _verify_mla_prefix_stage1(
         )
         tl.store(
             Att_Out + o_row[:, None] + offs_dv[None, :],
-            (acc / e_sum[:, None]).to(Att_Out.dtype.element_ty),
+            (acc / tl.where(e_sum > 0, e_sum, 1.0)[:, None]).to(
+                Att_Out.dtype.element_ty
+            ),
             mask=row_mask[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
         )
         lse_row = tl.reshape(
@@ -259,6 +284,7 @@ def _verify_mla_combine_stage2(
     KV_GROUP_NUM: tl.constexpr,
     HAS_KV_HEADS: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    KV_LEN_ADJUST: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -278,7 +304,11 @@ def _verify_mla_combine_stage2(
     mask_l = offs_l < l_ext
 
     # ---- (a) combine prefix splits (online logsumexp over active splits) ---
-    seqlen = tl.load(kv_indptr + cur_batch + 1) - tl.load(kv_indptr + cur_batch)
+    seqlen = (
+        tl.load(kv_indptr + cur_batch + 1)
+        - tl.load(kv_indptr + cur_batch)
+        + KV_LEN_ADJUST
+    )
     active = _active_splits(seqlen, num_splits, BLOCK_N)
 
     m = tl.zeros([L_EXT], dtype=tl.float32) - float("inf")
@@ -305,12 +335,15 @@ def _verify_mla_combine_stage2(
             other=0.0,
         ).to(tl.float32)
         new_m = tl.maximum(m, lse_s)
-        alpha = tl.exp(m - new_m)
-        beta = tl.exp(lse_s - new_m)
+        # An empty prefix (decode with KV_LEN_ADJUST on a 1-token request)
+        # leaves every split at -inf; keep the weights finite (0) instead of NaN.
+        safe_m = tl.where(new_m == float("-inf"), 0.0, new_m)
+        alpha = tl.exp(m - safe_m)
+        beta = tl.exp(lse_s - safe_m)
         acc = acc * alpha[:, None] + o_s * beta[:, None]
         l_acc = l_acc * alpha + beta
         m = new_m
-    o_prefix = acc / l_acc[:, None]
+    o_prefix = acc / tl.where(l_acc > 0, l_acc, 1.0)[:, None]
     lse_prefix = m + tl.log(l_acc)
 
     # ---- (b) draft-draft causal attention (L_EXT x L_EXT) -----------------
@@ -389,8 +422,12 @@ class VerifyMLA:
         block_n=DEFAULT_BLOCK_N,
         num_warps=DEFAULT_NUM_WARPS,
         kv_group_num=None,
+        target_programs=TARGET_PROGRAMS,
+        max_splits=MAX_N_SPLITS,
     ):
         self.h_q = h_q
+        self.target_programs = target_programs
+        self.max_splits = max_splits
         # MLA is the h_kv == 1 case (kv_group_num == h_q); a GQA draft passes a
         # smaller group. block_h must divide it so a head block maps to one KV
         # head -- can_handle enforces that before this is constructed.
@@ -417,12 +454,12 @@ class VerifyMLA:
         self.max_bs = max_bs
         # bf16 partials (halves scratch traffic vs fp32); lse stays fp32.
         self.att_out = torch.empty(
-            (max_bs, self.h_q, MAX_N_SPLITS, self.l_pad, self.v_head_dim),
+            (max_bs, self.h_q, self.max_splits, self.l_pad, self.v_head_dim),
             dtype=torch.bfloat16,
             device=self.device,
         )
         self.att_lse = torch.empty(
-            (max_bs, self.h_q, MAX_N_SPLITS, self.l_pad),
+            (max_bs, self.h_q, self.max_splits, self.l_pad),
             dtype=torch.float32,
             device=self.device,
         )
@@ -432,8 +469,8 @@ class VerifyMLA:
             self._alloc(max_bs)
 
     def _num_splits(self, bs):
-        budget = TARGET_PROGRAMS // max(1, bs * self.n_head_blocks)
-        return max(1, min(MAX_N_SPLITS, budget))
+        budget = self.target_programs // max(1, bs * self.n_head_blocks)
+        return max(1, min(self.max_splits, budget))
 
     def _run_prefix_kernel(
         self,
@@ -448,6 +485,7 @@ class VerifyMLA:
         sm_scale,
         k_scale,
         v_scale,
+        kv_len_adjust=0,
     ):
         grid = (bs, self.n_head_blocks, num_splits)
         _verify_mla_prefix_stage1[grid](
@@ -488,6 +526,7 @@ class VerifyMLA:
             BLOCK_DPE=max(1, triton.next_power_of_2(self.pe_dim)),
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
             BLOCK_N=self.block_n,
+            KV_LEN_ADJUST=kv_len_adjust,
             num_warps=self.num_warps,
             num_stages=1,
             **_AMD_LAUNCH_KWARGS,
@@ -505,6 +544,7 @@ class VerifyMLA:
         kv_indptr,
         sm_scale,
         is_causal=True,
+        kv_len_adjust=0,
     ):
         grid = (bs, self.h_q)
         _verify_mla_combine_stage2[grid](
@@ -542,6 +582,7 @@ class VerifyMLA:
             KV_GROUP_NUM=self.kv_group_num,
             HAS_KV_HEADS=self.has_kv_heads,
             IS_CAUSAL=is_causal,
+            KV_LEN_ADJUST=kv_len_adjust,
             num_warps=4,
             num_stages=1,
         )
@@ -561,6 +602,7 @@ class VerifyMLA:
         k_scale=1.0,
         v_scale=1.0,
         is_causal=True,
+        kv_len_adjust=0,
     ):
         if o_out is None:
             o_out = torch.empty(
@@ -583,6 +625,7 @@ class VerifyMLA:
             sm_scale,
             k_scale,
             v_scale,
+            kv_len_adjust=kv_len_adjust,
         )
         self._run_combine_kernel(
             bs,
@@ -595,6 +638,7 @@ class VerifyMLA:
             kv_indptr,
             sm_scale,
             is_causal=is_causal,
+            kv_len_adjust=kv_len_adjust,
         )
         return o_out
 
@@ -607,6 +651,7 @@ def _get_vmla(max_bs, h_q, head_dim, v_head_dim, l_ext, device, kv_group_num=Non
     vk = _VMLA_CACHE.get(key)
     if vk is None:
         block_h, block_n, num_warps = block_config(head_dim)
+        target_programs, max_splits = split_config(head_dim)
         if (
             kv_group_num is not None
             and kv_group_num < h_q  # i.e. h_kv > 1, so the offset is live
@@ -627,6 +672,8 @@ def _get_vmla(max_bs, h_q, head_dim, v_head_dim, l_ext, device, kv_group_num=Non
             block_n=block_n,
             num_warps=num_warps,
             kv_group_num=kv_group_num,
+            target_programs=target_programs,
+            max_splits=max_splits,
         )
         _VMLA_CACHE[key] = vk
     else:
@@ -746,6 +793,7 @@ def verify_shared_kv_fwd(
     window_kv_offsets=None,
     xai_temperature_len=-1,
     max_bs=None,
+    kv_len_adjust=0,
 ):
     """
     Grouped-head drop-in for extend_attention_fwd on a topk==1 target-verify
@@ -815,5 +863,6 @@ def verify_shared_kv_fwd(
         k_scale=k_scale,
         v_scale=v_scale,
         is_causal=is_causal,
+        kv_len_adjust=kv_len_adjust,
     )
     return True
