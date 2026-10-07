@@ -34,6 +34,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             get_prefix_hash_values=Mock(return_value=["h0", "h1"]),
             query_storage_hit_length=Mock(return_value=2),
             prefetch_from_storage=Mock(side_effect=register_prefetch),
+            prefix_device_indices=Mock(return_value=torch.tensor([10, 11])),
         )
         harness = SimpleNamespace(
             scheduler=SimpleNamespace(enable_decode_hicache=True),
@@ -47,7 +48,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             cache_salt="tenant-a",
         )
         result = SimpleNamespace(
-            device_indices=torch.tensor([10, 11]),
+            device_prefix_len=2,
             host_hit_length=2,
             last_device_node=11,
             last_host_node=22,

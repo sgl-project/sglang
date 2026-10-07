@@ -13,8 +13,6 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
-import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
@@ -52,16 +50,13 @@ class TestZeroMatchResult(unittest.TestCase):
         match = tree.match_prefix(
             MatchPrefixParams(key=RadixKey(token_ids=array("q", [1, 2, 3, 9])))
         )
-        self.assertGreater(len(match.device_indices), 0)
+        self.assertGreater(match.device_prefix_len, 0)
         zeroed = zero_match_result(tree, match)
-        self.assertEqual(int(zeroed.device_indices.numel()), 0)
+        self.assertEqual(int(zeroed.device_prefix_len), 0)
         self.assertIs(zeroed.last_device_node, tree.root_node)
         self.assertIs(zeroed.last_host_node, tree.root_node)
         self.assertIs(zeroed.best_match_node, tree.root_node)
         self.assertEqual(zeroed.host_hit_length, 0)
-        # dtype/device preserved (slice-not-allocate).
-        self.assertEqual(zeroed.device_indices.dtype, match.device_indices.dtype)
-        self.assertEqual(zeroed.device_indices.device, match.device_indices.device)
 
     def test_chunk_cache_is_passthrough(self):
         class _StubChunkCache:
@@ -69,7 +64,7 @@ class TestZeroMatchResult(unittest.TestCase):
                 return False
 
         original = MatchResult(
-            device_indices=torch.empty((0,), dtype=torch.int64),
+            device_prefix_len=0,
             last_device_node=None,
             last_host_node=None,
             best_match_node=None,
@@ -86,7 +81,7 @@ class TestMatchKvCacheForceMiss(unittest.TestCase):
 
             def match_prefix(self, params):
                 return MatchResult(
-                    device_indices=torch.empty((0,), dtype=torch.int64),
+                    device_prefix_len=0,
                     last_device_node=None,
                     last_host_node=None,
                     best_match_node=None,
