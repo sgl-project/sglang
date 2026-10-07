@@ -9,11 +9,9 @@ diffusion models.
 """
 
 import atexit
-import functools
 import json
 import mmap
 import os
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -23,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Sequence, Union
 
 import imageio
+import imageio_ffmpeg
 import numpy as np
 import torch
 from PIL import Image
@@ -294,28 +293,9 @@ def _pick_audio_sample_rate(
     return selected_sr
 
 
-@functools.lru_cache(maxsize=1)
-def _system_ffmpeg_with_libx264() -> Optional[str]:
-    ffmpeg_on_path = shutil.which("ffmpeg")
-    if not ffmpeg_on_path:
-        return None
-    try:
-        encoders = subprocess.run(
-            [ffmpeg_on_path, "-hide_banner", "-encoders"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return ffmpeg_on_path if "libx264" in encoders else None
-
-
 def _resolve_ffmpeg_exe() -> str:
-    ffmpeg_exe = _system_ffmpeg_with_libx264()
-    if ffmpeg_exe is None:
-        raise RuntimeError("video output requires ffmpeg with libx264 on PATH")
-    return ffmpeg_exe
+    # keep the pinned encoder binary: x264 upgrades change lossy video pixels
+    return imageio_ffmpeg.get_ffmpeg_exe()
 
 
 # ffmpeg's implicit libx264 default is `medium`. On diffusion output `fast` is

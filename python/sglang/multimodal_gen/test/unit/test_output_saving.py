@@ -1,3 +1,5 @@
+import shutil
+
 import numpy as np
 import pytest
 import torch
@@ -318,7 +320,9 @@ def test_multiple_videos_use_parallel_direct_save_with_serial_fallback(
     assert serial_calls[0]["save_file_path"] == paths[1]
 
 
-def test_video_output_requires_system_ffmpeg(monkeypatch):
-    monkeypatch.setattr(output_utils, "_system_ffmpeg_with_libx264", lambda: None)
-    with pytest.raises(RuntimeError, match="requires ffmpeg with libx264 on PATH"):
-        output_utils._resolve_ffmpeg_exe()
+def test_video_output_preserves_pinned_encoder(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda _: "/system/ffmpeg")
+    monkeypatch.setattr(
+        output_utils.imageio_ffmpeg, "get_ffmpeg_exe", lambda: "/pinned/ffmpeg"
+    )
+    assert output_utils._resolve_ffmpeg_exe() == "/pinned/ffmpeg"

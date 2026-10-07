@@ -178,11 +178,9 @@ def test_saved_video_decodes_to_every_frame(tmp_path):
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
 @pytest.mark.parametrize("with_audio", [False, True])
 @pytest.mark.parametrize("compression", [10, 100])
-def test_materialized_video_uses_system_ffmpeg(
-    tmp_path, monkeypatch, with_audio, compression
-):
+def test_materialized_video_uses_ffmpeg(tmp_path, monkeypatch, with_audio, compression):
     def reject_imageio(*args, **kwargs):
-        raise AssertionError("video output must use system ffmpeg")
+        raise AssertionError("video output must use ffmpeg directly")
 
     monkeypatch.setattr(output_utils.imageio, "mimsave", reject_imageio)
     rng = np.random.default_rng(3)
