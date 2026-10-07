@@ -53,6 +53,11 @@ class CacheRequestOutcome(Enum):
     ABORT = auto()
 
 
+class MambaCowAllocError(RuntimeError):
+    """No Mamba slot is free for a matched prefix's copy-on-write, even after
+    eviction. Prefill admission catches it and leaves the request queued."""
+
+
 @runtime_checkable
 class PrefixCacheTrait(Protocol):
     req_to_token_pool: ReqToTokenPool

@@ -290,7 +290,10 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestOutcome,
+    MambaCowAllocError,
+)
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     discard_kv_cache_backup,
@@ -4055,22 +4058,29 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
-            req.init_next_round_input(self.tree_cache)
-            if self.enable_hicache_storage and (
-                self._prefetch_after_device_hit_loss(req)
-            ):
-                continue
-            if (
-                self.enable_hicache_storage
-                and buffer_pipeline is not None
-                and not buffer_pipeline.prepare_staged_prefetch(req)
-            ):
-                continue
-            res = adder.add_one_req(
-                req,
-                has_chunked_req=(self.chunked_req is not None),
-                truncation_align_size=self.truncation_align_size,
-            )
+            try:
+                req.init_next_round_input(self.tree_cache)
+            except MambaCowAllocError:
+                # Mamba capacity can shrink after an earlier refusal (e.g. decode
+                # consumes a shared pool), so a prefix hit may find no slot for
+                # its state copy. Refuse admission and keep the request queued.
+                res = AddReqResult.NO_TOKEN
+            else:
+                if self.enable_hicache_storage and (
+                    self._prefetch_after_device_hit_loss(req)
+                ):
+                    continue
+                if (
+                    self.enable_hicache_storage
+                    and buffer_pipeline is not None
+                    and not buffer_pipeline.prepare_staged_prefetch(req)
+                ):
+                    continue
+                res = adder.add_one_req(
+                    req,
+                    has_chunked_req=(self.chunked_req is not None),
+                    truncation_align_size=self.truncation_align_size,
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
