@@ -101,18 +101,14 @@ class MiMoV2MTPLayer(nn.Module):
         self.is_layer_sparse = False
         is_next_layer_sparse = False
 
-        if is_dense_ffn_fully_dp():
-            mlp_tp_rank, mlp_tp_size = 0, 1
-        else:
-            mlp_tp_rank, mlp_tp_size = None, None
+        mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
         self.mlp = MiMoV2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
-            tp_rank=mlp_tp_rank,
-            tp_size=mlp_tp_size,
+            parallel_group=mlp_parallel_group,
             reduce_results=False,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
