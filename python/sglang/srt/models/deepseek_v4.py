@@ -669,6 +669,25 @@ def _apply_gguf_grouped_wo_a(
     return torch.stack(group_outputs, dim=1)
 
 
+def _materialize_cp_unified_fp8_kv(
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    forward_batch: ForwardBatch,
+    stream: Optional[Any],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Gather a two-pool unified-KV pair in global logical-token order.
+
+    E8M0 scales live inline in the noPE bytes, so both halves travel as one raw
+    byte row and the CP permutation cannot separate scales, noPE and RoPE.
+    """
+    nope_bytes = k_nope.view(torch.uint8)
+    rope_bytes = k_rope.view(torch.uint8)
+    packed = torch.cat((nope_bytes, rope_bytes), dim=-1)
+    packed = cp_materialize_global_token_order(packed, forward_batch, stream)
+    nope, rope = packed.split((nope_bytes.shape[-1], rope_bytes.shape[-1]), dim=-1)
+    return nope.contiguous().view(k_nope.dtype), rope.contiguous().view(k_rope.dtype)
+
+
 if TYPE_CHECKING:
     from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
         Fp8GridActivation,
@@ -2242,20 +2261,6 @@ class MQALayer(MqaAttentionBase):
                 "SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY=1, or run with "
                 "SGLANG_DSV4_UNIFIED_KV_FP8=0."
             )
-        if (
-            unified
-            and is_unified_kv_fp8()
-            and is_cp_active(forward_batch)
-            and not forward_batch.forward_mode.is_decode_or_idle()
-        ):
-            # The gather hands back bf16 kv in global token order *after*
-            # norm+RoPE, so packing would have to move ahead of it and re-derive
-            # RoPE from global-order positions. Whether the CP path has those
-            # ready is unverified, so refuse instead of packing the wrong order.
-            raise NotImplementedError(
-                "fp8 two-pool unified_kv does not support DSA prefill CP "
-                "(SGLANG_DSV4_UNIFIED_KV_FP8=1 with cp_size > 1)."
-            )
 
         tp_slice, q_padded, q_out, q_rope = slice(None), None, None, None
         k_nope, k_rope = None, None
@@ -2376,6 +2381,12 @@ class MQALayer(MqaAttentionBase):
                 q_rope_out=q_rope,
                 k_nope_out=k_nope,
                 k_rope_out=k_rope,
+            )
+
+        if unified_fp8_prefill and is_cp_active(forward_batch):
+            # kv is the packed noPE half the fused prefill store left on the kv slot.
+            kv, k_rope = _materialize_cp_unified_fp8_kv(
+                kv, k_rope, forward_batch, torch.cuda.current_stream()
             )
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
@@ -2621,7 +2632,7 @@ class MQALayer(MqaAttentionBase):
             and not should_skip_mlp_all_reduce()
         )
         o, _ = self.wo_b(
-            o if isinstance(o, Mxfp8SwizzledInput) else o.flatten(1),
+            o.flatten(1) if isinstance(o, torch.Tensor) else o,
             skip_all_reduce=defer_all_reduce,
         )
         if defer_all_reduce:
@@ -4065,9 +4076,12 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                     cp_all_tokens=cp_extend,
                 )
+                # Only multimodal placeholders become image_token_id, so a text-only
+                # batch skips this full-residual where.
                 if (
                     self.config.model_type == "deepseek_v41"
                     and self.config.vision_n_layers > 0
+                    and forward_batch.contains_mm_inputs()
                 ):
                     hidden_states = torch.where(
                         (input_ids == self.config.image_token_id)[:, None, None],
@@ -4244,7 +4258,9 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            from sglang.kernels.ops.layernorm.mhc import hc_broadcast
+
+            hidden_states = hc_broadcast(hidden_states, self.hc_mult)
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]

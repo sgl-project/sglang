@@ -194,11 +194,12 @@ class KVIndexTranslator:
         out: torch.Tensor,
         kv_start_idx: Optional[torch.Tensor] = None,
         sliding_window: bool = False,
+        token_mapping: Optional[torch.Tensor] = None,
     ) -> bool:
         """Fill ``out``'s CSR rows with the ids a paged wrapper plans over, and
         report whether they came out translated.
 
-        Non-unified: the historical gather straight from ``req_to_token``.
+        Non-unified: gather from ``req_to_token``, optionally through ``token_mapping``.
         Unified: one fused gather-and-translate, so no caller needs a
         ``[bs, max_pages]`` rectangle to repack from -- ``out`` holds one id per
         resident token, a length the pool bounds.
@@ -206,8 +207,8 @@ class KVIndexTranslator:
         ``sliding_window`` selects the swa sub-pool's own id space, built from
         VIRTUAL ids and never chained through full-physical. A ``False`` return
         means the ids are still VIRTUAL: the DCP path defers translation to
-        ``translate_dcp_read_ids``, and a static SWA pool maps the full ids
-        through its own full->swa table.
+        ``translate_dcp_read_ids``. A static SWA pool can pass its full->swa
+        table as ``token_mapping`` to fuse that translation into the gather.
         """
         # `seq_lens` sizes the batch: a caller may hold a wider req_pool_indices
         # (the padded graph buffer), and the extra lanes have no length to bound.
@@ -228,8 +229,9 @@ class KVIndexTranslator:
                 out,
                 self.req_to_token.stride(0),
                 ENTRY_PAGE_SIZE=1,
+                token_mapping=token_mapping,
             )
-            return False
+            return token_mapping is not None
 
         if sliding_window:
             assert self._swa_v2p_table is not None, (
