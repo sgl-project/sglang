@@ -253,6 +253,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 )
             extra_config["dram_page_size"] = dram_page_size
 
+        # TODO: `tp_rank` is the rank in the cache TP group but `tp_size` is the
+        # full TP width, and no `dp_rank` is set, unlike
+        # `HiCacheController._generate_storage_config`. Aligning the
+        # storage-config producers changes persisted storage keys, so it waits
+        # for a storage-key format change.
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
             tp_size=get_parallel().tp_size,

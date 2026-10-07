@@ -629,7 +629,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
             self.assertEqual(consumer.finish_external_linker_loads([req]), [req])
             self.assertEqual(req.discard_output_reason.status_code, 503)
             self.assertTrue(req.skip_radix_cache_insert)
-            release_kv_cache(req, consumer, is_insert=False)
+            release_kv_cache(req, consumer, checkpoint=False)
             self.assertFalse(req.kv.holds_kv)
             self.assertTrue(req.kv.is_kv_released)
             self.assertEqual((full_free(), swa_free()), (before[0] + 2, before[1] + 2))

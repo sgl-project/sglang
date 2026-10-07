@@ -1,6 +1,7 @@
 """Tests for deferred chunked-prefill aborts."""
 
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -41,6 +42,8 @@ class _FakeReq:
 
 def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched = Scheduler.__new__(Scheduler)
+    sched.enable_continuous_input_polling = False
+    sched.result_queue = deque()
     sched.chunked_req = chunked_req
     sched._pending_chunked_abort_req = pending_req
     sched.waiting_queue = []

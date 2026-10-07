@@ -133,8 +133,11 @@ def _qwen_norm_out(
     scale, shift = torch.chunk(emb, 2, dim=1)
     if (
         _QWEN_NORM_OUT.disabled
+        or not hidden_states.is_cuda
         or not is_plain_layer_norm(norm_out.norm, hidden_states.shape[-1])
-        or not can_use_fused_layernorm_modulate(hidden_states, scale, shift)
+        or not can_use_fused_layernorm_modulate(
+            hidden_states.dtype, hidden_states.shape[-1]
+        )
     ):
         return (
             norm_out.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
@@ -996,8 +999,8 @@ class QwenImageCrossAttention(nn.Module):
                     prefix=f"{prefix}.to_added_qkv",
                 )
                 if self._unquantized_added_qkv_is_packed:
-                    # Packing changes BF16 GEMM reduction association. Keep it
-                    # off for lossless and mount it at extra-high or high.
+                    # Packing changes BF16 GEMM reduction association, so it
+                    # is off at exact and mounts at lossless or high.
                     mark_qwen_image_added_qkv_site(self)
             else:
                 self.add_q_proj = ColumnParallelLinear(

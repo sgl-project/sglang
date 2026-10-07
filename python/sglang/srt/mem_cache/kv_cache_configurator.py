@@ -34,7 +34,10 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
 )
-from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_mamba_tracking_slots,
+    get_req_to_token_extra_context_len,
+)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -134,6 +137,18 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
 _is_npu = is_npu()
 
 
+def _pd_prefill_skips_mamba_spec_state() -> bool:
+    # Prefill never runs TARGET_VERIFY, so the plain hybrid req pool skips the
+    # verify-only snapshots; role-switch and unified-memory pools still allocate them.
+    disagg = get_disagg()
+    return (
+        disagg.disaggregation_mode == "prefill"
+        and not disagg.enable_pd_role_switch
+        and not get_memory().enable_unified_memory
+        and not _is_npu
+    )
+
+
 def unified_fp8_for_dsv4_pool(*, is_draft_worker: bool, spec_algorithm) -> bool:
     """Per-pool fp8 layout. DSpark draft writers scatter bf16, so that pool
     stays a bf16 ring; MTP/EAGLE NextN follows the env."""
@@ -179,9 +194,6 @@ def mm_runtime_reservation_gb(
 # which the decode-time drop does not shrink.
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
 MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP = 1
-MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
-MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
-MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER = 1
 
 
@@ -723,6 +735,7 @@ class KVCacheConfigurator:
             max_num_reqs=max_num_reqs,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
+            enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
@@ -835,6 +848,7 @@ class KVCacheConfigurator:
             max_num_reqs=max_num_reqs,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
+            enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
@@ -927,6 +941,7 @@ class KVCacheConfigurator:
             swa_max_total_num_tokens=swa_max_total_num_tokens,
             total_bytes=total_bytes,
             enable_memory_saver=get_exec().features.enable_memory_saver,
+            post_capture_active=self.post_capture_kv_active,
             need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
             # Overlap mode: same wait_stream(forward_stream) rationale as
             # `_init_unified_mamba_pools`.
@@ -1148,12 +1163,9 @@ class KVCacheConfigurator:
             enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
             enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
             **self._get_ple_req_pool_kwargs(),
-            # A PD prefill server never runs TARGET_VERIFY, so skip the
-            # verify-only per-draft-token state snapshots (see the draft-head
-            # case above: None => the pool skips SpeculativeState).
             speculative_num_draft_tokens=(
                 None
-                if get_disagg().disaggregation_mode == "prefill" and not _is_npu
+                if _pd_prefill_skips_mamba_spec_state()
                 else max_speculative_num_draft_tokens()
             ),
             speculative_eagle_topk=get_spec().speculative_eagle_topk,
@@ -2173,6 +2185,7 @@ class KVCacheConfigurator:
                     swa_allocator = token_to_kv_pool_allocator.logical_attn_allocator
                 else:
                     swa_allocator = token_to_kv_pool_allocator
+                assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
                 uses_unified_virtual_ids = isinstance(
                     swa_allocator, UnifiedSWAAllocatorBase
                 )
@@ -2193,7 +2206,6 @@ class KVCacheConfigurator:
                     identity_mapping[-1] = -1
                     token_to_kv_pool.register_mapping(identity_mapping)
                 elif not uses_unified_virtual_ids:
-                    assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
                     token_to_kv_pool.register_mapping(
                         swa_allocator.full_to_swa_index_mapping
                     )
@@ -2265,18 +2277,15 @@ class KVCacheConfigurator:
 
         additional_ratio = 0
         if get_exec().mamba.enable_mamba_extra_buffer:
-            # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
-            # Lazy mode saves 1 slot (2 → 1) for overlap; non-overlap already uses 1.
-            if not get_schedule().disable_overlap_schedule:
-                if get_exec().mamba.enable_mamba_extra_buffer_lazy:
-                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY
-                else:
-                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
-            else:
+            if get_schedule().disable_overlap_schedule:
                 assert not get_exec().mamba.enable_mamba_extra_buffer_lazy, (
                     "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
                 )
-                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
+            additional_ratio = get_mamba_tracking_slots(
+                extra_buffer=True,
+                overlap=not get_schedule().disable_overlap_schedule,
+                lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+            )
         elif skip_decode_lock:
             # no_buffer under skip: add the base drop back so effective stays 3,
             # the prefill->decode peak needs ~3 slots/req and this leaf-only mode
@@ -2483,6 +2492,11 @@ class KVCacheConfigurator:
         extra_per_slot = replayssm_ring_per_slot + int(
             self.extra_mamba_cache_bytes_per_req * pp_layer_scale
         )
+        reserves_spec_state = (
+            has_spec_dec
+            and not replayssm_active
+            and not _pd_prefill_skips_mamba_spec_state()
+        )
         if has_spec_dec:
             assert get_spec().speculative_num_draft_tokens is not None
             assert get_schedule().max_running_requests is not None
@@ -2496,8 +2510,8 @@ class KVCacheConfigurator:
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot, see memory_pool.py). Skipped under replayssm
-            # (no intermediate_ssm allocated).
-            if has_spec_dec and not replayssm_active:
+            # and on PD prefill (no intermediate_ssm allocated).
+            if reserves_spec_state:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     get_schedule().max_running_requests // self.attn_dp_size,
@@ -2520,8 +2534,8 @@ class KVCacheConfigurator:
                 // self.attn_dp_size,
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
-            # pool's padding slot). Skipped under replayssm.
-            if has_spec_dec and not replayssm_active:
+            # pool's padding slot). Skipped under replayssm and on PD prefill.
+            if reserves_spec_state:
                 intermediate_size = (
                     stage_per_req
                     * (get_schedule().max_mamba_cache_size + 1)
@@ -2542,7 +2556,7 @@ class KVCacheConfigurator:
             )
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
-            if has_spec_dec and not replayssm_active:
+            if reserves_spec_state:
                 ratio = self._calculate_mamba_ratio()
                 D = get_spec().speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
