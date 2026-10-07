@@ -85,7 +85,27 @@ def handle_gpu_memory_settings(server_args: Any):
     # GPU-dependent capacity defaults
     # ------------------------------------------------------------------
 
-    if gpu_mem is not None:
+    from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
+    if (
+        cfg.device == "mps"
+        and not use_mlx()
+        and envs.SGLANG_ENABLE_MLX_WHOLE_REGION.get()
+    ):
+        from sglang.srt.hardware_backend.mlx.region_config import (
+            fill_mps_region_ladders,
+        )
+
+        if cfg.chunked_prefill_size is None:
+            declare_resolution(
+                server_args,
+                "_handle_gpu_memory_settings",
+                chunked_prefill_size=4096,
+            )
+        fill_mps_region_ladders(
+            cuda_graph_config, max_total_tokens=cfg.max_total_tokens
+        )
+    elif gpu_mem is not None:
         if gpu_mem < 20 * 1024:
             # T4, 4080
             # (chunked_prefill_size 2k, max_bs 8)

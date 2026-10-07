@@ -53,7 +53,9 @@ def reshape_and_cache_flash(
     )
 
 
-__all__ = ["reshape_and_cache_flash"]
+__all__ = [
+    "reshape_and_cache_flash",
+]
 
 
 # Other Triton kernels migrated into this group (from attention/mem_cache

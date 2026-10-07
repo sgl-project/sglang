@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 from typing import Any
@@ -55,22 +56,33 @@ def handle_attention_backend_compatibility(server_args: Any):
     # Torch native and flex attention backends
     attention_backend = resolved_view(server_args).attention_backend
     if attention_backend == "torch_native":
-        logger.warning(
-            "Cuda graph is disabled because of using torch native attention backend"
-        )
-        declare_resolution(
-            server_args,
-            "_handle_attention_backend_compatibility",
-            cuda_graph_config=with_phase(
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
+        if (
+            cfg.device == "mps"
+            and not use_mlx()
+            and envs.SGLANG_ENABLE_MLX_WHOLE_REGION.get()
+        ):
+            from sglang.srt.hardware_backend.mlx.region_config import (
+                apply_mps_region_backends,
+            )
+
+            config = copy.deepcopy(cfg.cuda_graph_config)
+            apply_mps_region_backends(
+                config, getattr(server_args, "_cuda_graph_config_locked", set())
+            )
+        else:
+            logger.warning(
+                "Cuda graph is disabled because of using torch native attention backend"
+            )
+            config = with_phase(
                 cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
-            ),
-        )
+            )
+            config = with_phase(config, Phase.PREFILL, backend=Backend.DISABLED)
         declare_resolution(
             server_args,
             "_handle_attention_backend_compatibility",
-            cuda_graph_config=with_phase(
-                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-            ),
+            cuda_graph_config=config,
         )
 
     if attention_backend == "flex_attention":

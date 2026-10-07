@@ -408,7 +408,7 @@ def capture_cuda_graphs(
         capture_time=0,
     )
     if capture_decode_cuda_graph:
-        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
+        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu", "mps"):
             decode = capture_decode_graph(model_runner=model_runner)
         elif (
             current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
@@ -421,6 +421,36 @@ def capture_cuda_graphs(
             memory_usage_gb=0,
             capture_time=0,
         )
+
+    if (
+        capture_decode_cuda_graph
+        and model_runner.device == "mps"
+        and decode.runner is not None
+    ):
+        # One exported region serves both phases, but explicit phase disables
+        # must keep their eager paths and capture memory must be counted once.
+        if not check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
+            prefill = GraphCapture(
+                runner=decode.runner,
+                memory_phase=prefill.memory_phase,
+                memory_usage_gb=(
+                    decode.memory_usage_gb
+                    if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+                    else 0
+                ),
+                capture_time=(
+                    decode.capture_time
+                    if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+                    else 0
+                ),
+            )
+        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+            decode = GraphCapture(
+                runner=None,
+                memory_phase=decode.memory_phase,
+                memory_usage_gb=0,
+                capture_time=0,
+            )
 
     if finalize:
         finalize_cuda_graph_capture(model_runner)
@@ -482,6 +512,11 @@ def capture_prefill_graph(
         # extend branch falls through to the eager path).
         if not model_runner.is_draft_worker:
             return result(eager_runner)
+        return result(None)
+
+    if model_runner.device == "mps":
+        # The region is constructed through the decode factory and shared into
+        # the prefill slot after capture, including prefill-only configurations.
         return result(None)
 
     # Draft models skip here during __init__; the eagle worker calls
@@ -691,7 +726,10 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     if model_runner.device != "cpu" and check_cuda_graph_backend(
         Phase.DECODE, Backend.DISABLED
     ):
-        return no_capture
+        if model_runner.device != "mps" or check_cuda_graph_backend(
+            Phase.PREFILL, Backend.DISABLED
+        ):
+            return no_capture
     if model_runner.device == "cpu" and not get_flags().capture.enable_torch_compile:
         return no_capture
 
@@ -734,6 +772,10 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
                 "xpu": XPUGraphRunner,
             },
         )
+        if model_runner.device == "mps":
+            from sglang.srt.hardware_backend.mlx.region_runner import MlxRegionRunner
+
+            graph_runners["mps"] = MlxRegionRunner
         runner = graph_runners[model_runner.device](model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
