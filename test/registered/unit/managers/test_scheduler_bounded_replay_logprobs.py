@@ -42,10 +42,10 @@ def _scheduler():
     return scheduler
 
 
-def _admit(*, bounded_replay, logprob_start_len, token_ids_logprob=None):
+def _admit(*, bounded_replay, logprob_start_len, token_ids_logprob=None, session=None):
     scheduler = _scheduler()
     recv_req = MagicMock(
-        session_params=None,
+        session_params=None if session is None else SimpleNamespace(id="sid"),
         session_id=None,
         input_embeds=None,
         bootstrap_port=1,
@@ -61,7 +61,15 @@ def _admit(*, bounded_replay, logprob_start_len, token_ids_logprob=None):
         return_logprob=True,
         return_sampling_mask=False,
         is_prefill_only=False,
+        session=session,
+        finished_reason=None,
     )
+    if session is not None:
+        # Session requests come from Session.create_req, not the Req constructor.
+        session.create_req = MagicMock(return_value=req)
+        scheduler.session_controller = MagicMock()
+        scheduler.session_controller.__contains__.return_value = True
+        scheduler.session_controller.get.return_value = session
     with (
         get_context().override_server_args(
             enable_decoder_swa_bounded_replay=bounded_replay
@@ -108,6 +116,20 @@ class TestBoundedReplayPromptLogprobs(CustomTestCase):
                     token_ids_logprob=token_ids_logprob,
                 )
                 req.set_finish_with_abort.assert_not_called()
+
+    def test_streaming_session_keeps_output_logprobs(self):
+        # A streaming session drops logprob_start_len when the request is
+        # scheduled and returns only output logprobs, so it is not rejected.
+        session = SimpleNamespace(streaming=True, close_on_finish=False)
+        req = _admit(bounded_replay=True, logprob_start_len=0, session=session)
+        session.create_req.assert_called_once()
+        req.set_finish_with_abort.assert_not_called()
+
+    def test_non_streaming_session_prompt_logprobs_rejected(self):
+        session = SimpleNamespace(streaming=False, close_on_finish=False)
+        req = _admit(bounded_replay=True, logprob_start_len=0, session=session)
+        session.create_req.assert_called_once()
+        self._assert_rejected(req)
 
     def test_prompt_logprobs_admitted_without_bounded_replay(self):
         req = _admit(bounded_replay=False, logprob_start_len=0)

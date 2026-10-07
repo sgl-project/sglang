@@ -3097,6 +3097,9 @@ class Scheduler(
             and req.return_logprob
             and req.logprob_start_len != -1
             and req.logprob_start_len < len(req.origin_input_ids)
+            # Req.init_next_round_input drops logprob_start_len for streaming
+            # sessions, which then return only output logprobs.
+            and not (req.session is not None and req.session.streaming)
         ):
             # Bounded replay runs the late layers only over each request's last
             # SWA window, so prompt-token logprobs are never computed; the model
