@@ -181,7 +181,9 @@ class TestShortestPrefillFirst(CustomTestCase):
         continuation = self.make_req("continuation", 16384)
         waiting = [self.make_req("a", 512), self.make_req("b", 1024)]
         self.assertEqual(
-            self.policy.shortest_prefill_chunk_limit(continuation, waiting, 4096, 256),
+            self.policy.shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256, 0
+            ),
             2560,
         )
 
@@ -189,13 +191,13 @@ class TestShortestPrefillFirst(CustomTestCase):
         continuation = self.make_req("continuation", 16384)
         self.assertEqual(
             self.policy.shortest_prefill_chunk_limit(
-                continuation, [self.make_req("short", 257)], 4096, 256
+                continuation, [self.make_req("short", 257)], 4096, 256, 0
             ),
             3584,
         )
         self.assertEqual(
             self.policy.shortest_prefill_chunk_limit(
-                continuation, [self.make_req("short", 3840)], 4096, 256
+                continuation, [self.make_req("short", 3840)], 4096, 256, 0
             ),
             256,
         )
@@ -211,7 +213,7 @@ class TestShortestPrefillFirst(CustomTestCase):
             with self.subTest(budget=budget, waiting=[req.rid for req in waiting]):
                 self.assertIsNone(
                     self.policy.shortest_prefill_chunk_limit(
-                        continuation, waiting, budget, 256
+                        continuation, waiting, budget, 256, 0
                     )
                 )
 
@@ -223,7 +225,45 @@ class TestShortestPrefillFirst(CustomTestCase):
                 [self.make_req("short", 512)],
                 4096,
                 256,
+                0,
             )
+        )
+
+    def test_reserve_tokens_cap_shortest_prefill_reservation(self):
+        continuation = self.make_req("continuation", 16384)
+        waiting = [self.make_req("a", 512), self.make_req("b", 1024)]
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256, 1024
+            ),
+            3584,
+        )
+
+    def test_reserve_tokens_apply_to_other_policies(self):
+        self.policy.policy = CacheAwarePolicy.LPM
+        continuation = self.make_req("continuation", 16384)
+        waiting = [self.make_req("a", 512), self.make_req("b", 1024)]
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256, 2048
+            ),
+            2560,
+        )
+
+    def test_reserve_tokens_skip_waiting_requests_that_do_not_fit(self):
+        self.policy.policy = CacheAwarePolicy.LPM
+        continuation = self.make_req("continuation", 16384)
+        waiting = [
+            self.make_req("too-large", 2048),
+            self.make_req("short", 512),
+            self.make_req("longer-than-continuation", 16384),
+            self.make_req("tail", 256),
+        ]
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256, 1024
+            ),
+            3328,
         )
 
 
