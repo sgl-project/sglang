@@ -34,22 +34,24 @@ class TestTailMetadataReplay(CustomTestCase):
             prefix_lens=(0, 0),
             extend_lens=(256, 256),
         )
-        fixture = build_dsv4_attention_fixture(self, case, max_context_len=512)
+        fixture = build_dsv4_attention_fixture(
+            self, case, max_context_len=1024, swa_size=2048
+        )
         self.addCleanup(fixture.runner._server_args_override.restore)
         backend = fixture.backend
         backend.enable_decoder_swa_bounded_replay = True
         eager = fixture.forward_batch
 
-        def batch(rows):
+        def batch(rows, prefix=0):
             return _make_forward_batch(
-                replace(case, prefix_lens=(0,) * len(rows), extend_lens=rows),
+                replace(case, prefix_lens=(prefix,) * len(rows), extend_lens=rows),
                 fixture.runner,
-                max_context_len=512,
+                max_context_len=1024,
                 device="cuda",
             )
 
         capture_batch = batch((512,))
-        capture_batch.max_seq_len_override = 512
+        capture_batch.max_seq_len_override = 1024
         with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
             backend.init_forward_metadata(eager)
             self.assertEqual(
@@ -68,19 +70,26 @@ class TestTailMetadataReplay(CustomTestCase):
             with torch.cuda.graph(graph):
                 output.copy_(slots)
 
-            for rows, tail_rows in [
-                ((44,), list(range(44))),
-                ((24, 24), list(range(48))),
-                ((80,), list(range(80))),
-                ((256,), list(range(128, 256))),
-                ((320, 160), list(range(192, 320)) + list(range(352, 480))),
+            for rows, prefix, tail_rows in [
+                ((44,), 0, list(range(44))),
+                ((24, 24), 0, list(range(48))),
+                ((80,), 0, list(range(80))),
+                ((127,), 0, list(range(127))),
+                ((128,), 128, list(range(128))),
+                ((129,), 0, list(range(1, 129))),
+                ((256,), 0, list(range(128, 256))),
+                ((320, 160), 0, list(range(192, 320)) + list(range(352, 480))),
+                ((44,), 512, list(range(44))),
+                ((24, 24), 256, list(range(48))),
+                ((511,), 0, list(range(383, 511))),
+                ((512,), 0, list(range(384, 512))),
             ] * 4:
-                with self.subTest(rows=rows):
+                with self.subTest(rows=rows, prefix=prefix):
                     backend.init_forward_metadata(eager)
                     self.assertIsNotNone(backend.tail_forward_metadata)
-                    live = batch(rows)
+                    live = batch(rows, prefix)
                     static = copy.copy(live)
-                    static.max_seq_len_override = 512
+                    static.max_seq_len_override = 1024
                     static.out_cache_loc = torch.nn.functional.pad(
                         live.out_cache_loc, (0, 512 - sum(rows))
                     )
@@ -90,6 +99,10 @@ class TestTailMetadataReplay(CustomTestCase):
                     self.assertEqual(
                         backend.tail_forward_metadata.late_layer_tail.extend_seq_lens_cpu,
                         [min(n, 128) for n in rows],
+                    )
+                    torch.testing.assert_close(
+                        backend.tail_forward_metadata.late_layer_tail.positions,
+                        live.positions[tail_rows],
                     )
                     published = BlockIds(
                         torch.arange(sum(rows), device="cuda").view(-1, 1),
