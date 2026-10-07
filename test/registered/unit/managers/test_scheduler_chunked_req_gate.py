@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -43,7 +42,7 @@ def _make_req(
     req.skip_radix_cache_insert = False
     req.finished_reason = None
     req.last_node = None
-    req.lock_receipt = DecLockRefParams()
+    req.lock = None
     req.session = None
     req.return_logprob = False
     req.logprob_start_len = -1

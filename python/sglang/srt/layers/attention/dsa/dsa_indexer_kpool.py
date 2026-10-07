@@ -421,7 +421,7 @@ class IndexerKPool(MultiPlatformOp):
                         max_req = int(active_req.max().item())
                         min_loc = int(active_write_loc.min().item())
                         max_loc = int(active_write_loc.max().item())
-                        max_page = max_loc // int(pool.slots_per_page)
+                        max_page = max_loc // int(pool.index_page_size)
                         if (
                             min_chunk < 0
                             or max_chunk >= key.shape[0]
@@ -439,7 +439,7 @@ class IndexerKPool(MultiPlatformOp):
                                 f"{key.shape=}, {gate_score.shape=}, {tail_k_buf.shape=}, "
                                 f"{pool.get_index_k_with_scale_buffer(layer_id=layer_id).shape=}, "
                                 f"{min_chunk=}, {max_chunk=}, {min_req=}, {max_req=}, "
-                                f"{min_loc=}, {max_loc=}, {pool.slots_per_page=}"
+                                f"{min_loc=}, {max_loc=}, {pool.index_page_size=}"
                             )
                 if not tails.is_empty:
                     tail_chunk_max = tails.chunk_src.to(torch.long) + torch.clamp(
@@ -523,7 +523,7 @@ class IndexerKPool(MultiPlatformOp):
                 )
 
             pool_start_id = first_pos // kpool
-            page_size = get_token_to_kv_pool().page_size
+            page_size = attn_metadata.page_size
             use_returned_compressed = return_compressed and (
                 not write_cache or pool_start_id == 0
             )
@@ -778,7 +778,7 @@ class IndexerKPool(MultiPlatformOp):
         return topk_from_pooled_history_logits(
             logits=logits,
             group_lengths=pool_lens,
-            pool_size=self.index_kpool,
+            kpool=self.index_kpool,
             topk=self.index_topk,
             page_table=page_table,
             topk_offsets=topk_offsets,
@@ -805,9 +805,14 @@ class IndexerKPool(MultiPlatformOp):
         if plan is not None and plan.pool_seqlens_per_q is not None:
             pool_seqlens = plan.pool_seqlens_per_q[: seqlens_32.shape[0]]
             pool_context_lens = pool_seqlens.contiguous().view(-1, 1)
-            pool_block_tables = build_pooled_page_table_64(
-                block_tables, self.index_kpool
-            ).contiguous()
+            pool_block_tables = attn_metadata.pooled_real_page_table
+            if (
+                pool_block_tables is None
+                or attn_metadata.pooled_index_kpool != self.index_kpool
+            ):
+                pool_block_tables = build_pooled_page_table_64(
+                    block_tables, self.index_kpool
+                ).contiguous()
             pool_schedule_metadata = plan.pool_schedule_metadata
             if pool_schedule_metadata is None and build_schedule_metadata:
                 pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
@@ -955,7 +960,7 @@ class IndexerKPool(MultiPlatformOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = pool.index_page_size
         # DeepGEMM paged-MQA requires 64-token pages.
         assert page_size == 64, "only support page size 64"
 
@@ -1240,10 +1245,11 @@ class IndexerKPool(MultiPlatformOp):
             and forward_batch.extend_seq_lens_cpu is not None
         )
 
-        pool_size = self.index_kpool
-        page_size = get_token_to_kv_pool().page_size
+        kpool = self.index_kpool
+        page_size = metadata.attn_metadata.page_size
+        index_page_size = get_token_to_kv_pool().index_page_size
         token_nums = q_fp8.shape[0]
-        tail_pool = pool_size - 1
+        tail_pool = kpool - 1
         topk_result = torch.empty(
             (token_nums, self.index_topk + tail_pool),
             device=q_fp8.device,
@@ -1272,7 +1278,7 @@ class IndexerKPool(MultiPlatformOp):
                 continue
 
             seq_len = int(forward_batch.seq_lens_cpu[i].item())
-            pool_seq_len = seq_len // pool_size
+            pool_seq_len = seq_len // kpool
             req_pool_idx = int(forward_batch.req_pool_indices[i].item())
             if (
                 cache_write_stream is not None
@@ -1287,7 +1293,7 @@ class IndexerKPool(MultiPlatformOp):
             local_seqlens = seq_lens_expanded[q_slice]
             if pooled_seq_lens_expanded is None:
                 local_pool_lens = torch.div(
-                    local_seqlens, pool_size, rounding_mode="floor"
+                    local_seqlens, kpool, rounding_mode="floor"
                 ).to(torch.int32)
             else:
                 local_pool_lens = pooled_seq_lens_expanded[q_slice]
@@ -1355,9 +1361,11 @@ class IndexerKPool(MultiPlatformOp):
                             token_page_table = block_tables[
                                 i, :num_token_pages
                             ].contiguous()
-                            pool_pages = (curr_pool_start + page_size - 1) // page_size
+                            pool_pages = (
+                                curr_pool_start + index_page_size - 1
+                            ) // index_page_size
                             pooled_page_table = build_pooled_page_table_64(
-                                token_page_table, pool_size
+                                token_page_table, kpool
                             )[:pool_pages].contiguous()
                         k_u8 = torch.empty(
                             (pool_seq_len, self.head_dim),
@@ -1395,9 +1403,11 @@ class IndexerKPool(MultiPlatformOp):
                         token_page_table = block_tables[
                             i, :num_token_pages
                         ].contiguous()
-                        pool_pages = (pool_seq_len + page_size - 1) // page_size
+                        pool_pages = (
+                            pool_seq_len + index_page_size - 1
+                        ) // index_page_size
                         pooled_page_table = build_pooled_page_table_64(
-                            token_page_table, pool_size
+                            token_page_table, kpool
                         )[:pool_pages].contiguous()
                     seq_len_t = torch.tensor(
                         [pool_seq_len], dtype=torch.int32, device=q_fp8.device
@@ -1494,7 +1504,7 @@ class IndexerKPool(MultiPlatformOp):
 
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
-        page_size = get_token_to_kv_pool().page_size
+        page_size = get_token_to_kv_pool().index_page_size
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
