@@ -294,6 +294,13 @@ class SamplingParams:
     # The base __post_init__ will apply them when height/width are not provided.
     _default_height: ClassVar[int | None] = None
     _default_width: ClassVar[int | None] = None
+    # Fewest denoising steps the model's schedule accepts. Warmup requests are
+    # clamped to it, so a generic 1-step warmup stays a valid request.
+    min_num_inference_steps: ClassVar[int] = 1
+
+    # A prompt-free pipeline (e.g. a text-free SR / video-to-video DiT) sets this to
+    # ``True`` so the multipart video-generation route does not require ``prompt``.
+    prompt_optional: ClassVar[bool] = False
 
     height: int | None = None
     width: int | None = None
@@ -1444,6 +1451,42 @@ class SamplingParams:
                 "The first/last frames of the video become the conditioning "
                 "frames for the generated output."
             ),
+        )
+        # Kandinsky6 video super-resolution (ignored by other models)
+        add_argument(
+            "--sr-resolution-scale",
+            type=float,
+            help="Kandinsky6 SR total upscale factor: 2, 4 or 2.25 (default: 2.25).",
+        )
+        add_argument(
+            "--sr-num-steps",
+            type=int,
+            help="Kandinsky6 SR Euler grid points (>= 2, default: 5); ignored by "
+            "pi-Flow checkpoints.",
+        )
+        add_argument(
+            "--sr-tiles-batch-size",
+            type=int,
+            help="Kandinsky6 SR: number of tiles denoised together (default: 1).",
+        )
+        add_argument(
+            "--sr-tile-min-overlap",
+            type=float,
+            help="Kandinsky6 SR: minimum tile overlap fraction in [0, 1) "
+            "(default: 0.2).",
+        )
+        add_argument(
+            "--sr-target-resolution",
+            type=str,
+            help="Kandinsky6 SR delivery resolution: hd, fullhd, 2k or WxH; the "
+            "result is only ever downscaled to it (default: keep the SR size).",
+        )
+        add_argument(
+            "--sr-target-resize-mode",
+            type=str,
+            choices=["fit", "exact"],
+            help="Kandinsky6 SR: 'fit' keeps the aspect ratio inside the target "
+            "resolution, 'exact' resizes to it exactly (default: fit).",
         )
         add_argument(
             "--action-mode",

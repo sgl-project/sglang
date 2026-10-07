@@ -11,10 +11,12 @@ is exercised as the real method, no mock. The refresh-throttle tests inject
 `load_snapshot_reader` and `_last_refresh_time` on top of those.
 """
 
+import threading
 import time
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import msgspec.structs
 
@@ -29,6 +31,7 @@ from sglang.srt.managers.data_parallel_controller import (
     LoadBalanceMethod,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -62,6 +65,97 @@ def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],
     )
+
+
+class TestLocalKvEventSources(CustomTestCase):
+    @staticmethod
+    def _source(rank, block_size=64):
+        return {
+            "dp_rank": rank,
+            "endpoint": f"tcp://127.0.0.1:{5557 + rank}",
+            "topic": "kv",
+            "block_size": block_size,
+        }
+
+    def test_scheduler_reports_logical_block_size_or_no_source(self):
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.scheduler_components.kv_events_publisher import (
+            SchedulerKvEventsPublisher,
+        )
+
+        component = SchedulerKvEventsPublisher.__new__(SchedulerKvEventsPublisher)
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.max_total_num_tokens = 64
+        scheduler.max_req_input_len = 32
+        scheduler.startup_time = {}
+        scheduler.page_size = 64
+        scheduler.kv_events_publisher = component
+        publisher = MagicMock()
+        publisher.describe_local_source.return_value = self._source(4, 256)
+        for owned_publisher, expected in (
+            (publisher, [self._source(4, 256)]),
+            (None, []),
+        ):
+            with (
+                self.subTest(has_publisher=owned_publisher is not None),
+                get_context().override_server_args(grpc_port=50051, dcp_size=4),
+            ):
+                component.kv_event_publisher = owned_publisher
+                self.assertEqual(
+                    scheduler.get_init_info()["kv_event_sources"], expected
+                )
+        publisher.describe_local_source.assert_called_once_with(256)
+
+    def test_controller_collects_all_scheduler_sources(self):
+        from sglang.srt.managers import data_parallel_controller as module
+
+        controller = DataParallelController.__new__(DataParallelController)
+        controller.env_lock = threading.Lock()
+        controller.scheduler_procs = []
+        controller.local_kv_event_sources = []
+        controller.run_scheduler_process_func = MagicMock()
+        # TP8/DP4 over two nodes: this follower's four schedulers own ranks 2,3.
+        readers = [
+            MagicMock(
+                recv=MagicMock(
+                    return_value={
+                        "max_total_num_tokens": 64,
+                        "max_req_input_len": 32,
+                        "kv_event_sources": sources,
+                    }
+                )
+            )
+            for sources in ([self._source(2)], [], [self._source(3)], [])
+        ]
+        with (
+            get_context().override_server_args(
+                tp_size=8,
+                dp_size=4,
+                enable_dp_attention=True,
+                nnodes=2,
+                node_rank=1,
+                pp_size=1,
+                attn_cp_size=1,
+            ),
+            patch.object(module.mp, "Process"),
+            patch.object(
+                module.mp,
+                "Pipe",
+                side_effect=[(reader, MagicMock()) for reader in readers],
+            ),
+            patch.object(module.PortArgs, "init_new", return_value=MagicMock()),
+            patch.object(module.TorchMemorySaverAdapter, "create"),
+            patch.object(module.numa_utils, "configure_subprocess"),
+            patch.object(
+                module, "maybe_reindex_device_id", return_value=nullcontext(0)
+            ),
+        ):
+            controller.launch_tensor_parallel_group(
+                MagicMock(), MagicMock(), 0, None, [7000, 7001, 7002, 7003]
+            )
+        self.assertEqual(
+            controller.local_kv_event_sources, [self._source(2), self._source(3)]
+        )
 
 
 class TestDPBudgetUpdateBudget(CustomTestCase):
