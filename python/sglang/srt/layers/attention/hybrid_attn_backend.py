@@ -25,14 +25,6 @@ if TYPE_CHECKING:
 class HybridAttnBackend(AttentionBackend):
     """Support different backends for prefill and decode."""
 
-    @property
-    def reads_kv_index_table(self) -> bool:
-        return any(
-            getattr(backend, "reads_kv_index_table", True)
-            for backend in (self.prefill_backend, self.decode_backend)
-            if backend is not None
-        )
-
     def __init__(
         self,
         model_runner: ModelRunner,

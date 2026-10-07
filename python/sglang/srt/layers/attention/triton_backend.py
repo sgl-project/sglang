@@ -142,8 +142,6 @@ class ForwardMetadata:
 
 
 class TritonAttnBackend(AttentionBackend):
-    # The kernels gather from CSR streams.
-    reads_kv_index_table = False
     # CUDA-graph replay rebuilds metadata from preallocated kv_indptr/kv_indices
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = False

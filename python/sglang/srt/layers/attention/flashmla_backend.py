@@ -59,7 +59,6 @@ class FlashMLADecodeMetadata:
 
 
 class FlashMLABackend(FlashInferMLAAttnBackend):
-    reads_kv_index_table = True  # the kernels read a block table
     # Decode/verify/draft-extend metadata is built device-side and the
     # tree-mask scratch is preallocated, so no seq_lens_cpu / seq_lens_sum
     # D2H is needed. Prefill (EXTEND) goes through the FlashInferMLA parent,

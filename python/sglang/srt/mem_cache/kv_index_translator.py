@@ -28,9 +28,11 @@ its own physical ids; this runner's translator names each one its forwards
 touch with an `IdSpace` (`space`). An iteration's write window is translated
 once per sub-pool, by the iteration's `KVLocPlan` (`plan`, `own_plan`). A read
 is translated once on its way to the kernel that consumes it, by the readers
-below and nowhere else: the plan builds and shares a page table over its rows
-only when a reader of those rows reads the table form (`table_is_read`), and
-otherwise each reader translates in its own gather. A backend never
+below and nowhere else. A page table over the plan's rows exists only once a
+reader that reads the table form asks for it (`copy_page_table`, `read_table`)
+-- built into that reader's own capture-stable table when it has one -- and
+then every later reader of the iteration takes it; until then each reader
+translates in its own gather, straight into its own buffer. A backend never
 translates; it asks for the sub-pool it indexes (`write_ids`, and the readers
 below, by `IdSpaceKind`), and the readers answer "what do I gather from, and
 which row is mine?" with a `KVIndexTable`:
@@ -46,10 +48,9 @@ which row is mine?" with a `KVIndexTable`:
 
 Backends call their own copy a *page table* (fa3) or a *block table*
 (trtllm); here it is the **index table**. `read_source` hands a gather kernel
-its source, `pack_read_stream` gathers a CSR stream (from the shared table, or
-translating straight into the stream; the table's first reader gets its stream
-from the launch that builds the table), and `copy_page_table` / `read_table`
-hand a page-table kernel the shared table.
+its source, `pack_read_stream` gathers a CSR stream (from the table, or
+translating straight into the stream), and `copy_page_table` / `read_table`
+hand a page-table kernel the table, building it on first use.
 
 Converting only ever rewrites the page number and keeps the in-page offset, so
 one page-granular table serves both kinds of consumer: a block-table backend
@@ -65,7 +66,6 @@ DCP index kernels select them.
 from __future__ import annotations
 
 import functools
-import weakref
 from typing import Dict, Optional
 
 import msgspec
@@ -76,7 +76,6 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 )
 from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table,
-    build_kv_read_table_and_stream,
     build_kv_read_table_packed,
 )
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
@@ -120,53 +119,6 @@ class KVIndexTable(msgspec.Struct, frozen=True):
     v2p: Optional[torch.Tensor] = None
 
 
-class KVReadStream(msgspec.Struct, frozen=True):
-    """A CSR stream a paged wrapper plans over: ``seq_lens[b]`` ids of lane
-    ``b`` from ``kv_start_idx[b]``, landing at ``indptr[b]`` in ``out``."""
-
-    seq_lens: torch.Tensor
-    indptr: torch.Tensor
-    out: torch.Tensor
-    kv_start_idx: Optional[torch.Tensor]
-
-
-class _TranslatorRegistry:
-    """This process's live translators: a plan asks the ones that read its rows
-    whether any of them reads its table (`table_is_read`).
-
-    `generation` changes whenever an answer could: a translator is built or
-    collected, or one learns its backends. An answer cached under an older
-    generation is stale.
-    """
-
-    def __init__(self):
-        self._refs: Dict[int, weakref.ref] = {}
-        self.generation = 0
-
-    def add(self, translator: KVIndexTranslator) -> None:
-        key = id(translator)
-
-        def collected(ref, key=key):
-            if self._refs.get(key) is ref:
-                del self._refs[key]
-                self.changed()
-
-        self._refs[key] = weakref.ref(translator, collected)
-        self.changed()
-
-    def changed(self) -> None:
-        self.generation += 1
-
-    def __iter__(self):
-        for ref in list(self._refs.values()):
-            translator = ref()
-            if translator is not None:
-                yield translator
-
-
-_TRANSLATORS = _TranslatorRegistry()
-
-
 class KVIndexTranslator:
     """Built once per ModelRunner."""
 
@@ -183,12 +135,6 @@ class KVIndexTranslator:
         self.req_to_token = req_to_token
         self.page_size = page_size
         self.device = device
-        # Whether this runner's backends read a page table (None until they
-        # are bound), and, per sub-pool, the answer for every runner of these
-        # rows (`table_is_read`), cached.
-        self._reads_table: Optional[bool] = None
-        self._table_read: Dict[IdSpaceKind, tuple] = {}
-        _TRANSLATORS.add(self)
 
         is_unified_target = (
             isinstance(
@@ -391,24 +337,22 @@ class KVIndexTranslator:
         *,
         rows: Optional[int],
         previous: Optional[KVIndexTable],
-        stream: Optional[KVReadStream] = None,
         into: Optional[torch.Tensor] = None,
     ) -> KVIndexTable:
         """A plan's page table in one sub-pool (`KVLocPlan.read_table` builds
-        through here): the passthrough where its reads stay virtual, else one
-        build over ``[0, seq_lens + read_extent)`` through its page table.
-        Rows past the plan's batch (a captured graph's padded lanes) read the
-        sink; a second, wider request copies the built rows instead of
-        building them again. ``stream``, from the reader the build is for, is
-        packed from the same gather. ``into``, a reader's own capture-stable
-        table, is built in place when it is wide enough, and then serves the
-        plan's other readers: no table of the plan's own, no copy."""
+        through here), for the reader that asked for it: the passthrough where
+        its reads stay virtual, else one build over ``[0, seq_lens +
+        read_extent)`` through its page table. Rows past the plan's batch (a
+        captured graph's padded lanes) read the sink; a second, wider request
+        copies the built rows instead of building them again. ``into``, the
+        reader's own capture-stable table, is built in place when it is wide
+        enough, and then serves the plan's other readers: no table of the
+        plan's own, no copy."""
         if space.read_v2p is None:
             return self._passthrough_table(plan.req_pool_indices)
         bs = int(plan.req_pool_indices.numel())
         rows = max(bs, rows or 0)
         if previous is not None:
-            assert stream is None, "a stream is packed by the table's first build"
             out = torch.zeros(
                 (rows, previous.ids.shape[1]), dtype=torch.int32, device=self.device
             )
@@ -430,35 +374,19 @@ class KVIndexTranslator:
                 # A fresh table: the build writes every column of the batch's
                 # rows, the sink past each row's live prefix included.
                 out = torch.empty((rows, width), dtype=torch.int32, device=self.device)
-            if stream is not None:
-                build_kv_read_table_and_stream(
-                    req_to_token=self.req_to_token,
-                    req_pool_indices=plan.req_pool_indices,
-                    seq_lens=plan.seq_lens,
-                    v2p=space.read_v2p,
-                    page_size=self.page_size,
-                    max_pages=width,
-                    out=out,
-                    stream_lens=stream.seq_lens,
-                    stream_indptr=stream.indptr,
-                    stream_out=stream.out,
-                    stream_kv_start_idx=stream.kv_start_idx,
-                    seq_len_delta=plan.read_extent,
-                )
-            else:
-                if rows > bs:
-                    out[bs:].zero_()
-                build_kv_read_table(
-                    req_to_token=self.req_to_token,
-                    req_pool_indices=plan.req_pool_indices,
-                    seq_lens=plan.seq_lens,
-                    v2p=space.read_v2p,
-                    page_size=self.page_size,
-                    max_pages=width,
-                    out=out,
-                    zero_tail=True,
-                    seq_len_delta=plan.read_extent,
-                )
+            if rows > bs:
+                out[bs:].zero_()
+            build_kv_read_table(
+                req_to_token=self.req_to_token,
+                req_pool_indices=plan.req_pool_indices,
+                seq_lens=plan.seq_lens,
+                v2p=space.read_v2p,
+                page_size=self.page_size,
+                max_pages=width,
+                out=out,
+                zero_tail=True,
+                seq_len_delta=plan.read_extent,
+            )
         return KVIndexTable(
             ids=out,
             row_ids=self._rows[:rows],
@@ -483,15 +411,15 @@ class KVIndexTranslator:
     ) -> KVIndexTable:
         """Where lane ``b``'s ids in the ``kind`` sub-pool are gathered from,
         for a gather kernel that takes a row source. On a translating runner,
-        the plan's shared table when a reader of these rows reads the table
-        form anyway (lane ``b`` is the plan's row ``b``, padded lanes reading
-        the sink): one translation for every reader. Otherwise the virtual
-        `req_to_token` rows with the sub-pool's page table, which the kernel's
-        own gather applies, so no table is built. ``req_to_token`` as it is
-        on a pass-through runner (a static pool, or DCP)."""
+        the plan's table when a table reader has had it built this iteration
+        (lane ``b`` is the plan's row ``b``, padded lanes reading the sink):
+        nothing translates again. Otherwise the virtual `req_to_token` rows
+        with the sub-pool's page table, which the kernel's own gather applies,
+        so no table is built for it. ``req_to_token`` as it is on a
+        pass-through runner (a static pool, or DCP)."""
         if not self._reads_translated(kind):
             return self._passthrough_table(req_pool_indices)
-        if plan.has_read_table(kind) or self.table_is_read(kind):
+        if plan.has_read_table(kind):
             return self._plan_table(plan, kind=kind, rows=bs)
         return KVIndexTable(
             ids=self.req_to_token,
@@ -524,14 +452,13 @@ class KVIndexTranslator:
         *,
         kind: IdSpaceKind,
         rows: Optional[int] = None,
-        stream: Optional[KVReadStream] = None,
         into: Optional[torch.Tensor] = None,
     ):
         assert plan.is_read_by(self), (
             "a translating reader must read through the plan of its own "
             "req_to_token rows"
         )
-        return plan.read_table(kind=kind, rows=rows, stream=stream, into=into)
+        return plan.read_table(kind=kind, rows=rows, into=into)
 
     def _passthrough_table(self, req_pool_indices: torch.Tensor) -> KVIndexTable:
         return KVIndexTable(
@@ -555,48 +482,37 @@ class KVIndexTranslator:
         token_mapping: Optional[torch.Tensor] = None,
     ) -> bool:
         """Fill ``out``'s CSR rows with the ids in the ``kind`` sub-pool a paged
-        wrapper plans over and report whether they are physical: one gather
-        from `read_source`. A ``False`` return means the ids are still VIRTUAL
-        full-attention ids (a static pool, or DCP), for the caller to finish.
-        A static SWA pool can pass its full->swa table as ``token_mapping`` to
-        fuse that translation into the gather."""
+        wrapper plans over and report whether they are physical: packed from
+        the plan's table when a table reader has had it built this iteration,
+        else gathered and translated straight into ``out``. A ``False`` return
+        means the ids are still VIRTUAL full-attention ids (a static pool, or
+        DCP), for the caller to finish. A static SWA pool can pass its
+        full->swa table as ``token_mapping`` to fuse that translation into the
+        gather."""
         bs = int(seq_lens.numel())
         if self._reads_translated(kind) and not plan.has_read_table(kind):
-            if not self.table_is_read(kind):
-                # No reader of these rows reads the table: this stream alone,
-                # gathered and translated straight into `out`.
-                assert plan.is_read_by(self), (
-                    "a translating reader must read through the plan of its "
-                    "own req_to_token rows"
-                )
-                # `seq_lens` sizes the batch: a caller may hold a wider
-                # req_pool_indices (a padded graph buffer), whose extra lanes
-                # have no length to bound.
-                build_kv_read_table_packed(
-                    req_to_token=self.req_to_token,
-                    req_pool_indices=req_pool_indices[:bs],
-                    seq_lens=seq_lens,
-                    v2p=self.space(kind).read_v2p,
-                    indptr=indptr,
-                    page_size=self.page_size,
-                    max_tokens=out.numel(),
-                    out=out,
-                    kv_start_idx=kv_start_idx,
-                )
-                return True
-            # The plan's first reader, and a reader of these rows reads the
-            # table: the build that makes it packs this stream from the same
-            # gather.
-            self._plan_table(
-                plan,
-                kind=kind,
-                rows=bs,
-                stream=KVReadStream(
-                    seq_lens=seq_lens,
-                    indptr=indptr,
-                    out=out,
-                    kv_start_idx=kv_start_idx,
-                ),
+            # No table this iteration: this stream alone, from one gather.
+            assert plan.is_read_by(self), (
+                "a translating reader must read through the plan of its own "
+                "req_to_token rows"
+            )
+            # `seq_lens` sizes the batch: a caller may hold a wider
+            # req_pool_indices (a padded graph buffer), whose extra lanes have
+            # no length to bound. Every lane with a length has a row.
+            assert req_pool_indices.numel() >= bs, (
+                f"pack_read_stream: {bs} stream lanes, "
+                f"{req_pool_indices.numel()} request rows"
+            )
+            build_kv_read_table_packed(
+                req_to_token=self.req_to_token,
+                req_pool_indices=req_pool_indices[:bs],
+                seq_lens=seq_lens,
+                v2p=self.space(kind).read_v2p,
+                indptr=indptr,
+                page_size=self.page_size,
+                max_tokens=out.numel(),
+                out=out,
+                kv_start_idx=kv_start_idx,
             )
             return True
         # Here the plan holds the table, or this runner reads pass-through:
@@ -666,44 +582,12 @@ class KVIndexTranslator:
         """
         return self._full_v2p_table
 
-    def table_is_read(self, kind: IdSpaceKind) -> bool:
-        """Whether a runner that reads the ``kind`` sub-pool of these
-        `req_to_token` rows reads the page-table form itself (a page-table
-        kernel: `reads_kv_index_table`). Only then does a plan share one
-        translated table across the iteration's readers -- that reader needs
-        the table anyway. Readers of streams and row gathers alone each
-        translate in their own gather, so no table is built for them. A runner
-        whose backends are not bound yet counts as one that reads it."""
-        generation = _TRANSLATORS.generation
-        cached = self._table_read.get(kind)
-        if cached is not None and cached[0] == generation:
-            return cached[1]
-        value = any(
-            t._reads_table is not False
-            for t in _TRANSLATORS
-            if t.req_to_token is self.req_to_token and t._reads_translated(kind)
-        )
-        self._table_read[kind] = (generation, value)
-        return value
-
     def bind_and_verify_backends(self, backends) -> None:
-        """Boot: make every reachable backend carry THIS translator, and learn
-        whether any of them reads a page table (`reads_kv_index_table`).
+        """Boot: make every reachable backend carry THIS translator.
 
         Model-layer producers read it off `get_attn_backend()`, so an unset
         attribute is an unreachable hook, not "no translation needed".
         """
-        # Every `AttentionBackend` declares `reads_kv_index_table`; what lacks
-        # it is a multi-step draft container, whose index kernel gathers rows
-        # (`read_source`) and translates in its own gather when no table is
-        # shared: not a table reader. Its step backends are bound alongside.
-        reads_table = any(
-            getattr(backend, "reads_kv_index_table", False)
-            for backend in backends
-            if backend is not None
-        )
-        self._reads_table = bool(self._reads_table) or reads_table
-        _TRANSLATORS.changed()
         for backend in backends:
             if backend is None:
                 continue

@@ -212,8 +212,6 @@ class FlashInferMhaChunkKVRunner:
 class FlashInferMLAAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
-    # The paged wrappers plan over CSR streams.
-    reads_kv_index_table = False
     # kv_indptr/qo_indptr are preallocated at (padded max bs + 1), where the
     # padding only covers MLP-sync alignment; an extend batch can never carry
     # more seqs than the req pool.

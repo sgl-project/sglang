@@ -30,16 +30,11 @@ Two delivery forms over that one formula:
                 which the pool bounds, where a page table's width is bounded
                 only by `max_context_len`.
 
-`build_kv_read_table_and_stream` delivers both from one gather: a fresh table
-and the stream of the same rows, each page translated once, for a table's
-first reader that plans over a stream.
-
 PREFIX-ONLY per row by default: nothing past the row's live prefix is written,
 so a caller-owned buffer keeps what it had there -- which is what lets a
 captured cuda-graph buffer be refreshed in place. Readers bound themselves by
 `cache_seqlens` and never look past the prefix. A fresh (`torch.empty`) table
-asks for the sink past the prefix instead (`zero_tail`, and the table of
-`build_kv_read_table_and_stream`).
+asks for the sink past the prefix instead (`zero_tail`).
 
 A `-1` in `req_to_token` and a freed (`-1`) v2p row both clamp to entry 0, the
 reserved padding slot, so a kernel dereferences padding, not a wild address.
@@ -63,10 +58,6 @@ _NUM_WARPS = 8
 # Enough blocks to fill the device without oversubscribing the item loop;
 # measured on H100 over bs 1..256 x seq 1k..128k, flat within ~10% either side.
 _TARGET_BLOCKS = 1024
-# Pages per trip inside a stream's window, at least: below it a large page
-# size leaves each trip a few pages' worth of work (B200, ps 64, bs 1..256 x
-# seq 2k..128k: 64 pages within ~2 us of the best tile everywhere).
-_MIN_WINDOW_PAGES = 64
 
 
 @triton.jit
@@ -180,121 +171,6 @@ def build_kv_read_indices_kernel(
 
 
 # As above, and the row counts too, which follow the batch size.
-@triton.jit(
-    do_not_specialize=[
-        "live_rows",
-        "stream_rows",
-        "table_stride",
-        "page_stride",
-        "seq_len_delta",
-        "max_pages",
-    ]
-)
-def build_kv_read_table_and_stream_kernel(
-    req_to_token_ptr,  # in: [max_reqs, max_context] -- VIRTUAL token ids
-    req_pool_indices_ptr,  # in: [live_rows] -- req_to_token row per batch lane
-    seq_lens_ptr,  # in: [live_rows] -- live TOKENS per row
-    v2p_ptr,  # in: [num_pages + 1] int64 -- virtual->physical page table
-    table_ptr,  # out: [rows, table_stride] int32 PAGE TABLE
-    stream_lens_ptr,  # in: [stream_rows] -- TOKENS per stream row
-    stream_starts_ptr,  # in: [stream_rows + 1] -- CSR row starts
-    stream_kv_start_ptr,  # in: [stream_rows] or null -- first token of the window
-    stream_ptr,  # out: TOKEN STREAM
-    live_rows,  # runtime: rows past it read the sink
-    stream_rows,  # runtime: rows that also emit a stream
-    req_stride,  # runtime: req_to_token row stride (elements)
-    table_stride,  # runtime: page table row stride (elements)
-    item_stride,  # runtime: pages one program advances per trip, outside
-    page_stride,  # runtime: the same inside the stream's window
-    seq_len_delta,  # runtime: added to every live row's prefix (table only)
-    max_pages,  # runtime: table width; every column is written
-    PAGE_SIZE: tl.constexpr,
-    PAGE_TILE: tl.constexpr,  # PAGE_SIZE rounded up to a power of two
-    STREAM_INT64: tl.constexpr,
-    BLOCK: tl.constexpr,  # pages per trip outside the window
-    BLOCK_PAGES: tl.constexpr,  # pages per trip inside it
-):
-    """A fresh PAGE TABLE, every column of every row (the sink past a row's
-    live prefix, and for whole rows past ``live_rows``), and the TOKEN STREAM
-    a paged wrapper plans over, from one gather: each page's entry is
-    translated once, stored in the table, and expanded to its tokens in the
-    stream."""
-    bid = tl.program_id(0)
-    live = bid < live_rows
-    req = tl.load(req_pool_indices_ptr + bid, mask=live, other=0).to(tl.int64)
-    seqlen = tl.load(seq_lens_ptr + bid, mask=live, other=0) + seq_len_delta
-    n_pages = tl.where(
-        live, tl.minimum((seqlen + PAGE_SIZE - 1) // PAGE_SIZE, max_pages), 0
-    )
-    row_in = req_to_token_ptr + req * req_stride
-    row_table = table_ptr + bid.to(tl.int64) * table_stride
-    # The stream's window, in tokens and in pages; rows past `stream_rows`
-    # emit none.
-    has_stream = bid < stream_rows
-    kv_start = 0
-    if stream_kv_start_ptr:
-        kv_start = tl.load(stream_kv_start_ptr + bid, mask=has_stream, other=0).to(
-            tl.int32
-        )
-    kv_end = kv_start + tl.load(stream_lens_ptr + bid, mask=has_stream, other=0)
-    row_stream = stream_ptr + tl.load(
-        stream_starts_ptr + bid, mask=has_stream, other=0
-    ).to(tl.int64)
-    first_page = kv_start // PAGE_SIZE
-    end_page = tl.where(has_stream, (kv_end + PAGE_SIZE - 1) // PAGE_SIZE, 0)
-    # Pages outside the stream's window: the table only, in wide blocks.
-    for start in range(tl.program_id(1) * BLOCK, max_pages, item_stride):
-        page = start + tl.arange(0, BLOCK)
-        outside = (page < max_pages) & ((page < first_page) | (page >= end_page))
-        in_table = page < n_pages
-        load_mask = live & in_table & outside
-        tok = tl.load(
-            row_in + page.to(tl.int64) * PAGE_SIZE, mask=load_mask, other=0
-        ).to(tl.int64)
-        # Triton's `//` truncates toward zero, so `-1 // ps` is 0 for ps > 1 but
-        # -1 at ps == 1, which would read one element BEFORE `v2p`.
-        vpage = tl.where(tok < 0, 0, tok // PAGE_SIZE)
-        entry = tl.maximum(tl.load(v2p_ptr + vpage, mask=load_mask, other=0), 0)
-        tl.store(
-            row_table + page, tl.where(in_table, entry, 0).to(tl.int32), mask=outside
-        )
-
-    # Pages inside it: each entry lands in the table and, one row of PAGE_SIZE
-    # tokens per page, in the stream.
-    offs = tl.arange(0, PAGE_TILE)
-    for start in range(
-        first_page + tl.program_id(1) * BLOCK_PAGES, end_page, page_stride
-    ):
-        page = start + tl.arange(0, BLOCK_PAGES)
-        inside = page < end_page
-        in_table = page < n_pages
-        load_mask = live & inside
-        tok = tl.load(
-            row_in + page.to(tl.int64) * PAGE_SIZE, mask=load_mask, other=0
-        ).to(tl.int64)
-        vpage = tl.where(tok < 0, 0, tok // PAGE_SIZE)
-        entry = tl.maximum(tl.load(v2p_ptr + vpage, mask=load_mask, other=0), 0)
-        tl.store(
-            row_table + page,
-            tl.where(in_table, entry, 0).to(tl.int32),
-            mask=inside & (page < max_pages),
-        )
-        pos = page[:, None] * PAGE_SIZE + offs[None, :]
-        stream_mask = (
-            inside[:, None]
-            & (offs[None, :] < PAGE_SIZE)
-            & (pos >= kv_start)
-            & (pos < kv_end)
-        )
-        value = entry[:, None] * PAGE_SIZE + offs[None, :]
-        if STREAM_INT64:
-            tl.store(row_stream + (pos - kv_start), value, mask=stream_mask)
-        else:
-            tl.store(
-                row_stream + (pos - kv_start), value.to(tl.int32), mask=stream_mask
-            )
-
-
 def _launch(
     *,
     req_to_token: torch.Tensor,
@@ -423,123 +299,6 @@ def build_kv_read_table(
         zero_tail=zero_tail,
     )
     return out
-
-
-def build_kv_read_table_and_stream(
-    *,
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    v2p: torch.Tensor,
-    page_size: int,
-    max_pages: int,
-    out: torch.Tensor,
-    stream_lens: torch.Tensor,
-    stream_indptr: torch.Tensor,
-    stream_out: torch.Tensor,
-    stream_kv_start_idx: Optional[torch.Tensor] = None,
-    seq_len_delta: int = 0,
-) -> None:
-    """A fresh PAGE TABLE and a TOKEN STREAM over the same rows, in one launch.
-
-    Every column ``[:max_pages]`` of every row of ``out`` is written: each
-    row's live prefix over ``seq_lens + seq_len_delta``, the sink past it, and
-    the sink across the rows past the batch (a captured graph's padded lanes)
-    -- what a ``torch.empty`` table needs. Stream lane ``b`` is row ``b``:
-    ``stream_lens[b]`` tokens from ``stream_kv_start_idx[b]`` land at
-    ``stream_indptr[b]``, as in `build_kv_read_table_packed`, and lanes past
-    the batch read the sink. For the first reader of a table that wants the
-    stream form: one gather, each page translated once, serves both.
-    """
-    live = int(req_pool_indices.numel())
-    rows = int(out.shape[0])
-    stream_rows = int(stream_lens.numel())
-    assert out.dtype == torch.int32 and out.dim() == 2 and out.stride(1) == 1, (
-        f"build_kv_read_table_and_stream: out must be a packed 2-D int32 "
-        f"table, got {out.dtype} {tuple(out.shape)} stride {tuple(out.stride())}"
-    )
-    assert out.shape[1] >= max_pages and rows >= max(live, stream_rows), (
-        f"build_kv_read_table_and_stream: out {tuple(out.shape)} cannot hold "
-        f"(rows={max(live, stream_rows)}, max_pages={max_pages})"
-    )
-    assert stream_indptr.numel() > stream_rows, (
-        f"build_kv_read_table_and_stream: indptr holds {stream_indptr.numel()} "
-        f"entries, need {stream_rows + 1}"
-    )
-    assert (max_pages - 1) * page_size < req_to_token.shape[1], (
-        f"build_kv_read_table_and_stream: max_pages={max_pages} x ps={page_size} "
-        f"exceeds req_to_token width {req_to_token.shape[1]}"
-    )
-    if rows == 0 or max_pages == 0:
-        return
-
-    if not req_to_token.is_cuda:
-        build_kv_read_table(
-            req_to_token=req_to_token,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            v2p=v2p,
-            page_size=page_size,
-            max_pages=max_pages,
-            out=out,
-            seq_len_delta=seq_len_delta,
-            zero_tail=True,
-        )
-        out[live:, :max_pages] = 0
-        for b in range(stream_rows):
-            n = int(stream_lens[b])
-            pos = torch.arange(n, device=req_to_token.device) + (
-                0 if stream_kv_start_idx is None else int(stream_kv_start_idx[b])
-            )
-            entry = (
-                _entries(
-                    req_to_token=req_to_token,
-                    req=int(req_pool_indices[b]),
-                    page_cols=pos // page_size,
-                    v2p=v2p,
-                    page_size=page_size,
-                )
-                if b < live
-                else torch.zeros_like(pos)
-            )
-            start = int(stream_indptr[b])
-            stream_out[start : start + n] = (entry * page_size + pos % page_size).to(
-                stream_out.dtype
-            )
-        return
-
-    # Inside the stream's window a program's tile is BLOCK_PAGES pages of
-    # PAGE_TILE tokens each; outside it, _BLOCK_ITEMS pages of the table.
-    page_tile = triton.next_power_of_2(page_size)
-    block_pages = max(_MIN_WINDOW_PAGES, _BLOCK_ITEMS // page_tile)
-    item_programs = min(
-        triton.cdiv(_TARGET_BLOCKS, rows), triton.cdiv(max_pages, block_pages)
-    )
-    build_kv_read_table_and_stream_kernel[(rows, item_programs)](
-        req_to_token,
-        req_pool_indices,
-        seq_lens,
-        v2p,
-        out,
-        stream_lens,
-        stream_indptr,
-        stream_kv_start_idx,
-        stream_out,
-        live,
-        stream_rows,
-        req_to_token.stride(0),
-        out.stride(0),
-        item_programs * _BLOCK_ITEMS,
-        item_programs * block_pages,
-        seq_len_delta,
-        max_pages,
-        PAGE_SIZE=page_size,
-        PAGE_TILE=page_tile,
-        STREAM_INT64=stream_out.dtype == torch.int64,
-        BLOCK=_BLOCK_ITEMS,
-        BLOCK_PAGES=block_pages,
-        num_warps=_NUM_WARPS,
-    )
 
 
 def build_kv_read_table_packed(

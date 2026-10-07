@@ -23,13 +23,15 @@ the iteration's forwards are in flight.
     writes   `write_ids`    the iteration's write window, translated once per
                             sub-pool, here; every writer binds it
     reads    `read_table`   the rows' page table over [0, seq_lens + extent),
-                            built here only when a reader of these rows reads
-                            the table form, and then shared by every reader
+                            built when a reader that reads the table form asks
+                            for it, and then shared by every later reader
 
 A read is translated exactly once on its way to the kernel that consumes it,
 and only by the translator's read primitives (`KVIndexTranslator`): from the
-shared table when there is one, otherwise in the reader's own gather, straight
-into the reader's own buffer -- so no table is built that no reader needs. A
+table once a reader that reads the table form has had it built (into its own
+capture-stable table when it has one), otherwise in the reader's own gather,
+straight into the reader's own buffer -- so no table is built that no reader
+asked for. A
 consumer never translates and never sees which kind of pool it reads.
 
 A sub-pool is named by its `IdSpace`: how it maps the iteration's virtual ids,
@@ -58,7 +60,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv_index_translator import (
         KVIndexTable,
         KVIndexTranslator,
-        KVReadStream,
     )
 
 
@@ -314,33 +315,29 @@ class KVLocPlan:
         *,
         kind: IdSpaceKind = IdSpaceKind.FULL,
         rows: Optional[int] = None,
-        stream: Optional[KVReadStream] = None,
         into: Optional[torch.Tensor] = None,
     ) -> KVIndexTable:
         """The rows' page table in the ``kind`` sub-pool over ``[0, seq_lens +
-        read_extent)``, built on first use and shared by every reader of the
-        iteration. ``rows`` past the plan's batch (a captured graph's padded
+        read_extent)``, built when a reader that reads the table form first asks
+        for it, and then shared by every later reader of the iteration. ``rows`` past the plan's batch (a captured graph's padded
         lanes) are appended reading the sink, by copying, never by translating
         again; a reader that asks for ``rows`` gets exactly that many, a view of
         a table a wider reader built. On a sub-pool whose reads stay virtual
         (static, or DCP, where the producing kernel selects this rank's share)
-        it is the `req_to_token` passthrough. ``stream`` is the first reader's
-        CSR stream (no table yet), packed from the gather that builds the
-        table; ``into``, the first reader's own capture-stable table, built in
-        place to serve as the plan's for this iteration."""
+        it is the `req_to_token` passthrough. ``into``, the first reader's own
+        capture-stable table, is built in place to serve as the plan's for this
+        iteration."""
         space = self._source.space(kind)
         table = self._read_tables.get(space.key)
         if table is None or (
             table.is_translated and rows is not None and table.ids.shape[0] < rows
         ):
             table = self._source.build_iteration_table(
-                self, space, rows=rows, previous=table, stream=stream, into=into
+                self, space, rows=rows, previous=table, into=into
             )
             self._read_tables[space.key] = table
         else:
-            assert stream is None and into is None, (
-                "a stream or a destination goes to the table's first build"
-            )
+            assert into is None, "a destination goes to the table's first build"
         if rows is not None and table.ids.shape[0] > rows:
             # Built wider, for a captured graph's padded lanes: this reader's
             # kernels size their batch by the table's rows.

@@ -61,11 +61,6 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
-    # Whether this backend reads an iteration's KV ids as a page table
-    # (`KVIndexTranslator.read_source` / `read_table` / `copy_page_table`), not
-    # only as CSR streams: a plan builds its table alongside its first stream
-    # only when a runner reading its rows does. Unknown means it does.
-    reads_kv_index_table: bool = True
     # Compute / KV-cache dtype. Only backends that need them (MLA/MHA fp8
     # fuse-rope checks) set these in __init__; declared here as None so callers
     # can read them off ANY backend — including hybrid wrappers that don't set

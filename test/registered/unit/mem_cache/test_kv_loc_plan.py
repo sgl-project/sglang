@@ -41,7 +41,6 @@
   python -m pytest test/registered/unit/mem_cache/test_kv_loc_plan.py -v
 """
 
-import gc
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -82,6 +81,38 @@ def _reference(req_to_token, rows, lens, v2p, width):
         for c in range(min(-(-int(lens[b]) // _PS), width)):
             out[b, c] = max(int(v2p[int(req_to_token[row, c * _PS]) // _PS]), 0)
     return out
+
+
+class _HostStreamGather:
+    """`create_flashinfer_kv_indices_triton` on the host, for these CPU tests:
+    lane ``b``'s ids from row ``row_ids[b]`` of the source, packed at
+    ``indptr[b]``."""
+
+    def __getitem__(self, grid):
+        return self
+
+    def __call__(
+        self,
+        ids,
+        row_ids,
+        seq_lens,
+        indptr,
+        kv_start_idx,
+        out,
+        row_stride,
+        ENTRY_PAGE_SIZE=1,
+        token_mapping=None,
+    ):
+        assert row_stride == ids.stride(0)
+        for b in range(int(seq_lens.numel())):
+            start = 0 if kv_start_idx is None else int(kv_start_idx[b])
+            pos = torch.arange(start, start + int(seq_lens[b]))
+            entry = ids[int(row_ids[b]), pos // ENTRY_PAGE_SIZE].to(torch.int64)
+            tok = entry * ENTRY_PAGE_SIZE + pos % ENTRY_PAGE_SIZE
+            if token_mapping is not None:
+                tok = token_mapping[tok]
+            lo = int(indptr[b])
+            out[lo : lo + int(seq_lens[b])] = tok.to(out.dtype)
 
 
 class _FakeKVCache:
@@ -336,63 +367,73 @@ class TestKVLocPlan(unittest.TestCase):
         self.assertTrue(torch.equal(verify.out_cache_loc, plan.write_physical))
         self.assertIs(extend.out_cache_loc, verify.out_cache_loc)
 
-    def test_the_first_stream_reader_builds_the_table_in_the_same_launch(self):
-        builds, fused = [], []
+    def test_a_stream_read_before_a_table_reader_builds_no_table(self):
+        """A stream read before any table reader is gathered and translated
+        straight into its buffer. The table reader that comes next builds the
+        table into its own capture-stable buffer -- the iteration's only table
+        -- and a stream read after it packs from that table."""
+        builds, packed = [], []
         real_build = kv_index_translator.build_kv_read_table
-        real_fused = kv_index_translator.build_kv_read_table_and_stream
+        real_packed = kv_index_translator.build_kv_read_table_packed
 
         def counting_build(**kwargs):
-            builds.append(kwargs["v2p"])
+            builds.append(kwargs["out"])
             return real_build(**kwargs)
 
-        def counting_fused(**kwargs):
-            fused.append(kwargs["v2p"])
-            return real_fused(**kwargs)
+        def counting_packed(**kwargs):
+            packed.append(kwargs["out"])
+            return real_packed(**kwargs)
 
         bs = int(self.rpi.numel())
-        # A captured wrapper's lanes: the batch's, then one padded lane.
-        lens = torch.tensor([3, 2, 1], dtype=torch.int64)
-        indptr = torch.tensor([0, 3, 5, 6], dtype=torch.int32)
-        out = torch.full((8,), -7, dtype=torch.int32)
+        lens = torch.tensor([3, 2], dtype=torch.int64)
+        indptr = torch.tensor([0, 3, 5], dtype=torch.int32)
+        captured = torch.full((bs + 1, 8), 7, dtype=torch.int32)
         with (
             patch.object(kv_index_translator, "build_kv_read_table", counting_build),
             patch.object(
-                kv_index_translator, "build_kv_read_table_and_stream", counting_fused
+                kv_index_translator, "build_kv_read_table_packed", counting_packed
+            ),
+            patch.object(
+                kv_index_translator,
+                "create_flashinfer_kv_indices_triton",
+                _HostStreamGather(),
             ),
         ):
             plan = self._plan(read_extent=1)
-            self.assertTrue(
-                self.fused_draft.pack_read_stream(
-                    plan,
-                    req_pool_indices=self.rpi,
-                    seq_lens=lens,
-                    indptr=indptr,
-                    out=out,
+
+            def stream():
+                out = torch.full((6,), -7, dtype=torch.int32)
+                self.assertTrue(
+                    self.fused_draft.pack_read_stream(
+                        plan,
+                        req_pool_indices=self.rpi,
+                        seq_lens=lens,
+                        indptr=indptr,
+                        out=out,
+                    )
                 )
+                return out
+
+            first = stream()
+            self.assertEqual(len(packed), 1)
+            self.assertFalse(plan.has_read_table())
+            self.target.copy_page_table(plan, out=captured)
+            self.assertEqual([t.data_ptr() for t in builds], [captured.data_ptr()])
+            self.assertEqual(
+                plan.read_table(rows=bs + 1).ids.data_ptr(), captured.data_ptr()
             )
-            table = plan.read_table(rows=bs + 1)
-        # One launch for the full space's table and stream; nothing read the
-        # sliding-window table, so nothing built it.
-        self.assertEqual(fused, [self.allocator.full_v2p_page_table])
-        self.assertEqual(builds, [])
-        self.assertTrue(plan.has_read_table())
-        self.assertFalse(plan.has_read_table(_SWA))
+            after = stream()
+            # Packed from the captured table: nothing gathered or built again.
+            self.assertEqual(len(packed), 1)
+            self.assertEqual(len(builds), 1)
         for b in range(bs):
             row = self.req_to_token[int(self.rpi[b]), : int(lens[b])].to(torch.int64)
             want = self.allocator.translate_write_loc(row)
-            got = out[int(indptr[b]) : int(indptr[b + 1])].to(torch.int64)
+            got = first[int(indptr[b]) : int(indptr[b + 1])].to(torch.int64)
             self.assertTrue(torch.equal(got, want))
-        self.assertEqual(int(out[5]), 0)  # the padded lane reads the sink
-        self.assertTrue(bool((out[6:] == -7).all()))
-        reference = _reference(
-            self.req_to_token,
-            self.rpi,
-            self.seq_lens + 1,
-            self.allocator.full_v2p_page_table,
-            table.ids.shape[1],
-        )
-        self.assertTrue(torch.equal(table.ids[:bs], reference))
-        self.assertEqual(int(table.ids[bs:].abs().sum()), 0)
+        self.assertTrue(torch.equal(after, first))
+        self.assertEqual(int(first[5]), -7)  # past the stream: untouched
+        self.assertFalse(plan.has_read_table(_SWA))
 
     def test_a_verify_reads_the_window_it_writes(self):
         def own_plan(mode, spec_info):
@@ -423,14 +464,12 @@ class TestKVLocPlan(unittest.TestCase):
         self.assertEqual(own_plan(ForwardMode.DECODE, None).read_extent, 0)
 
     def test_a_stream_only_iteration_builds_no_table(self):
-        """A plan shares a table only when a reader of its rows reads the
-        table form itself. Readers of streams and row gathers alone -- one
-        runner, or a target and a draft over the same rows -- each translate
-        in their own gather: no table, with or without host lengths. A runner
-        that reads tables brings the shared build back, which every reader then
-        takes, and its going away takes it out again; a table read after a
-        stream-only one still gets its table."""
-        calls = {"packed": 0, "fused": 0, "table": 0}
+        """A plan builds a table only when a reader asks for the table form.
+        Readers of streams and row gathers -- one runner, or a target and a
+        draft over the same rows -- each translate in their own gather: no
+        table, with or without host lengths. Once a table reader has the table
+        built, every later reader takes it."""
+        calls = {"packed": 0, "table": 0}
 
         def counting(name, real):
             def wrapped(**kwargs):
@@ -440,13 +479,13 @@ class TestKVLocPlan(unittest.TestCase):
             return wrapped
 
         def stream_only_backend():
-            return SimpleNamespace(kv_index_translator=None, reads_kv_index_table=False)
+            return SimpleNamespace(kv_index_translator=None)
 
         # A runner of rows no other translator here reads.
         self.req_to_token = self.req_to_token.clone()
         solo = self._translator(self.allocator.get_kvcache())
         # A multi-step draft container is bound with its step backends and
-        # reads nothing itself.
+        # carries the runner's translator too.
         container = SimpleNamespace(kv_index_translator=None)
         solo.bind_and_verify_backends([container, stream_only_backend()])
         self.assertIs(container.kv_index_translator, solo)
@@ -467,19 +506,19 @@ class TestKVLocPlan(unittest.TestCase):
             ),
             patch.object(
                 kv_index_translator,
-                "build_kv_read_table_and_stream",
-                counting("fused", kv_index_translator.build_kv_read_table_and_stream),
+                "build_kv_read_table",
+                counting("table", kv_index_translator.build_kv_read_table),
             ),
             patch.object(
                 kv_index_translator,
-                "build_kv_read_table",
-                counting("table", kv_index_translator.build_kv_read_table),
+                "create_flashinfer_kv_indices_triton",
+                _HostStreamGather(),
             ),
         ):
             plan = self._plan(solo, read_extent=1)
             out = torch.full((6,), -7, dtype=torch.int32)
             self.assertTrue(pack(solo, plan, out))
-            self.assertEqual(calls, {"packed": 1, "fused": 0, "table": 0})
+            self.assertEqual(calls, {"packed": 1, "table": 0})
             self.assertFalse(plan.has_read_table())
             for b in range(bs):
                 row = self.req_to_token[int(self.rpi[b]), : int(lens[b])]
@@ -510,7 +549,6 @@ class TestKVLocPlan(unittest.TestCase):
             # draft): still no table -- each translates its own gather.
             peer = self._translator(self.draft_pool)
             peer.bind_and_verify_backends([stream_only_backend()])
-            self.assertFalse(solo.table_is_read(_FULL))
             for seq_lens_cpu in (self.seq_lens.clone(), None):
                 both = solo.plan(
                     req_pool_indices=self.rpi,
@@ -528,26 +566,20 @@ class TestKVLocPlan(unittest.TestCase):
                 self.assertIs(src.ids, self.req_to_token)
                 self.assertIs(src.v2p, solo.space(_FULL).read_v2p)
                 self.assertFalse(both.has_read_table())
-            self.assertEqual(calls, {"packed": 5, "fused": 0, "table": 1})
+            self.assertEqual(calls, {"packed": 5, "table": 1})
 
-            # A runner of these rows that reads the table form (a page-table
-            # draft backend): the first stream reader builds the shared table
-            # in its own launch, and the others read it.
-            table_reader = self._translator(self.draft_pool)
-            table_reader.bind_and_verify_backends(
-                [SimpleNamespace(kv_index_translator=None, reads_kv_index_table=True)]
-            )
-            self.assertTrue(solo.table_is_read(_FULL))
+            # A table reader asks for the table: built once, and the readers
+            # after it take it rather than translating again.
             shared = self._plan(solo, read_extent=1)
-            pack(solo, shared, torch.empty(6, dtype=torch.int32))
-            self.assertEqual(calls["fused"], 1)
-            self.assertTrue(shared.has_read_table())
+            table = shared.read_table(rows=bs)
+            self.assertEqual(calls["table"], 2)
             src = peer.read_source(shared, req_pool_indices=self.rpi, bs=bs)
             self.assertIsNone(src.v2p)
-            self.assertIs(src.ids, shared.read_table(rows=bs).ids)
-            # The drafts have no sliding-window sub-pool: that one the target
-            # alone reads, so its stream still comes alone.
-            self.assertFalse(solo.table_is_read(_SWA))
+            self.assertIs(src.ids, table.ids)
+            pack(solo, shared, torch.empty(6, dtype=torch.int32))
+            self.assertEqual(calls, {"packed": 5, "table": 2})
+            # Nothing asked for the sliding-window table: its stream comes
+            # alone.
             solo.pack_read_stream(
                 shared,
                 req_pool_indices=self.rpi,
@@ -558,11 +590,6 @@ class TestKVLocPlan(unittest.TestCase):
             )
             self.assertEqual(calls["packed"], 6)
             self.assertFalse(shared.has_read_table(_SWA))
-
-            # The table reader goes away: no shared table again.
-            del table_reader
-            gc.collect()
-            self.assertFalse(solo.table_is_read(_FULL))
 
     def test_a_captured_first_reader_holds_the_table(self):
         """When the plan's first reader is a captured table, the table is built
@@ -656,9 +683,14 @@ class TestKVLocPlan(unittest.TestCase):
             device=_DEV,
         )
         self.assertFalse(plan.is_read_by(compact))
+        # Before a table reader asks, the fused draft's row gather translates
+        # in its own kernel; after, it reads the plan's table.
+        src = self.fused_draft.read_source(plan, req_pool_indices=self.rpi, bs=2)
+        self.assertIs(src.v2p, self.target.space(_FULL).read_v2p)
+        self.assertFalse(plan.has_read_table())
+        table = plan.read_table(rows=2)
         self.assertIs(
-            self.fused_draft.read_source(plan, req_pool_indices=self.rpi, bs=2),
-            plan.read_table(rows=2),
+            self.fused_draft.read_source(plan, req_pool_indices=self.rpi, bs=2), table
         )
         passthrough = self.private_draft.read_source(
             plan, req_pool_indices=self.rpi, bs=2
