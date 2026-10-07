@@ -530,6 +530,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft:
             return
         capture_decode_cuda_graph = self._decode_graph_allowed
+        # The bs=32 draft graph captures, then faults on the first real
+        # proposal. Run this draft eagerly until that replay is fixed.
+        if getattr(self, "_draft_mla_no_dcp", False):
+            capture_decode_cuda_graph = False
         available_mem = self._tp_sync.available_memory_gb(
             SpecTpSyncSite.DSPARK_MEM,
             self.device,
