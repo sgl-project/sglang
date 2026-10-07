@@ -256,6 +256,7 @@ class TestFusedDraftDecision(CustomTestCase):
         target_backends=("triton", "triton"),
         dcp_size=1,
         hicache=False,
+        retraction_backup=None,
     ):
         from sglang.srt.configs.model_config import AttentionArch
         from sglang.srt.mem_cache import kv_cache_configurator as kvc
@@ -297,6 +298,13 @@ class TestFusedDraftDecision(CustomTestCase):
         )
         with (
             patch.object(kvc, "get_memory", return_value=memory),
+            patch.object(
+                kvc,
+                "get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_decode_retraction_backup=retraction_backup
+                ),
+            ),
             patch.object(kvc, "get_spec", return_value=spec),
             patch.object(
                 kvc,
@@ -380,6 +388,15 @@ class TestFusedDraftDecision(CustomTestCase):
         declined = self._decide(algorithm="DSPARK", hicache=True)
         self.assertIsNone(declined.placement)
         self.assertIn("--enable-hierarchical-cache", declined.declined)
+
+    def test_host_pool_retraction_keeps_the_private_pool(self):
+        """Host-pool decode retraction builds the draft's host pool off its
+        own device pool too; DSPARK with it keeps the private pool."""
+        declined = self._decide(algorithm="DSPARK", retraction_backup="host_pool")
+        self.assertIsNone(declined.placement)
+        self.assertIn(
+            "--disaggregation-decode-retraction-backup=host_pool", declined.declined
+        )
 
 
 class TestMambaHostPrivateDraftRefused(CustomTestCase):

@@ -609,8 +609,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         assert _mc.is_hybrid_swa or mambaish_config(_mc) is not None, (
             "--enable-unified-memory + EAGLE/EAGLE3 requires a unified "
             "target (hybrid-SWA or a mamba hybrid): the draft's KV lives "
-            "fused inside the full-attention page envelope (or falls back "
-            "to a private pool over the unified virtual id space)."
+            "fused inside the full-attention page envelope."
         )
         # The target verifies on its own pages: the MLA family on an MLA host.
         eagle_allowed = (
@@ -675,13 +674,13 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "compaction so pending H2D physical reservations remain stable."
         )
     assert not (
-        cfg.speculative_algorithm is not None
+        cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
         and cfg.disaggregation_decode_retraction_backup == "host_pool"
     ), (
-        "--enable-unified-memory with a draft model does not support "
-        "--disaggregation-decode-retraction-backup=host_pool: it builds the "
-        "draft's host pool off a device pool of its own, which a draft fused "
-        "into the target's entries does not have."
+        "--enable-unified-memory + EAGLE/EAGLE3 does not support "
+        "--disaggregation-decode-retraction-backup=host_pool: the backup builds "
+        "the draft's host pool off a device pool of its own, and an EAGLE draft "
+        "on the unified pool lives fused in the target's pages, without one."
     )
     assert not (
         cfg.speculative_algorithm in ("EAGLE", "EAGLE3")

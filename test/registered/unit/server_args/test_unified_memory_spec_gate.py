@@ -360,15 +360,18 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
                     _accepts(None, is_hybrid_swa=False, fields={**pd_decode, **extra})
                 )
 
-    def test_host_pool_retraction_refused_with_a_fused_draft(self):
-        """The host-pool retraction backup builds host pools off the draft's
-        device pool, and a fused draft view has no transfer surface. Without a
-        draft the backup is not this gate's to refuse."""
-        for algorithm in ("EAGLE", "EAGLE3", "DFLASH", "DSPARK"):
+    def test_host_pool_retraction_refused_with_an_eagle_draft(self):
+        """The host-pool retraction backup builds the draft's host pool off
+        its device pool, which an EAGLE draft, always fused on the unified
+        pool, does not have. Without a draft the backup is not this gate's to
+        refuse, and with DFLASH or DSPARK it declines draft fusion instead."""
+        for algorithm in ("EAGLE", "EAGLE3"):
             with self.subTest(algorithm=algorithm):
                 self.assertTrue(_accepts(algorithm))
                 self.assertFalse(_accepts(algorithm, retraction_backup="host_pool"))
-        self.assertTrue(_accepts(None, retraction_backup="host_pool"))
+        for algorithm in (None, "DFLASH", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                self.assertTrue(_accepts(algorithm, retraction_backup="host_pool"))
 
     def test_dspark_arm_unchanged(self):
         """The EAGLE addition must not perturb DSPARK: its MLA verify set

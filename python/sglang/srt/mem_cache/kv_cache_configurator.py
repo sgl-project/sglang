@@ -965,9 +965,10 @@ class KVCacheConfigurator:
         (hybrid-SWA or mamba hybrid, either full-pool kind), an EAGLE-family
         or DFLASH/DSPARK algorithm whose draft config was loaded at target
         boot. It declines, keeping the draft's private pool, for a non-MHA
-        draft, a draft backend off the translated MHA rails, DCP, HiCache, or
-        an explicit draft KV dtype unlike the host's; `place_fused_draft` then
-        admits or declines the draft's layer kinds."""
+        draft, a draft backend off the translated MHA rails, DCP, HiCache,
+        host-pool decode retraction, or an explicit draft KV dtype unlike the
+        host's; `place_fused_draft` then admits or declines the draft's layer
+        kinds."""
         from sglang.srt.mem_cache.layout.fused_draft import (
             FusedDraftDecision,
             draft_kv_profile,
@@ -1035,15 +1036,20 @@ class KVCacheConfigurator:
                     "rows, but the replicated draft reads every token"
                 )
             )
-        # HiCache builds the draft's host pool off its own device pool, which a
-        # fused draft does not have. The external linker and host-pool
-        # retraction would too; the gate refuses the linker on the unified
-        # pool and host-pool retraction with any draft.
+        # HiCache and host-pool retraction build the draft's host pool off its
+        # own device pool, which a fused draft does not have. The external
+        # linker would too; the gate refuses it on the unified pool.
         if get_memory().enable_hierarchical_cache:
+            host_pool_flag = "--enable-hierarchical-cache"
+        elif get_disagg().disaggregation_decode_retraction_backup == "host_pool":
+            host_pool_flag = "--disaggregation-decode-retraction-backup=host_pool"
+        else:
+            host_pool_flag = None
+        if host_pool_flag is not None:
             return FusedDraftDecision(
                 declined=(
-                    "--enable-hierarchical-cache builds the draft's host pool "
-                    "off a device pool of its own"
+                    f"{host_pool_flag} builds the draft's host pool off a device "
+                    "pool of its own"
                 )
             )
         profile = draft_kv_profile(
