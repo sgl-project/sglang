@@ -346,6 +346,9 @@ class AiterAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        # Captured at init. The process-wide flag is flipped for the K3 MLA
+        # draft only; the target keeps the value it saw when it was built.
+        self.use_mla_ps_kernel = False
 
         self.dcp_world_size = get_parallel().attn_dcp_size
         self.mla_dcp_decode_backend = (
@@ -611,6 +614,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.max_split_per_batch = 64
 
             self.fix_max_split_per_batch = self.max_split_per_batch
+            self.use_mla_ps_kernel = bool(_use_mla_ps_kernel)
 
     def pad_heads(self, x: torch.Tensor, padded: int) -> torch.Tensor:
         num_head = x.shape[1]
@@ -668,7 +672,7 @@ class AiterAttnBackend(AttentionBackend):
         Matches main's ``_use_mla_ps_kernel and dcp_world_size <= 1`` when ASM
         is off. DCP ASM needs the same buffers with fast_mode scheduling.
         """
-        return (_use_mla_ps_kernel and self.dcp_world_size <= 1) or (
+        return (self.use_mla_ps_kernel and self.dcp_world_size <= 1) or (
             self.use_mla_dcp_asm and self.dcp_world_size > 1
         )
 
@@ -1895,7 +1899,7 @@ class AiterAttnBackend(AttentionBackend):
                     TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
                 )
 
-                if _use_mla_ps_kernel:
+                if self.use_mla_ps_kernel:
                     max_seqlen_qo = num_draft_tokens
                     (
                         work_metadata,
@@ -2013,7 +2017,7 @@ class AiterAttnBackend(AttentionBackend):
                         (max_kv_len + self.dcp_world_size - 1) // self.dcp_world_size,
                     )
 
-                if _use_mla_ps_kernel and self.dcp_world_size <= 1:
+                if self.use_mla_ps_kernel and self.dcp_world_size <= 1:
                     max_seqlen_qo = draft_num
                     (
                         work_metadata,
@@ -2454,7 +2458,7 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         # if self.use_mla and (_use_mla_ps_kernel or self.kv_cache_dtype == fp8_dtype):
-        if self.use_mla and (_use_mla_ps_kernel or self.use_mla_dcp_asm):
+        if self.use_mla and (self.use_mla_ps_kernel or self.use_mla_dcp_asm):
             # for persistent mla_decode_fwd
             max_seqlen_qo = (
                 1 if self.num_draft_tokens is None else self.num_draft_tokens
@@ -2762,7 +2766,7 @@ class AiterAttnBackend(AttentionBackend):
 
             if self.use_mla:
                 max_q_len = self.num_draft_tokens
-                if _use_mla_ps_kernel and self.dcp_world_size <= 1:
+                if self.use_mla_ps_kernel and self.dcp_world_size <= 1:
                     num_kv_splits = self.max_split_per_batch
 
                     self.make_mla_meta_data(
@@ -2892,7 +2896,7 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
             max_q_len = num_tokens_per_req
 
-            if self.use_mla and _use_mla_ps_kernel:
+            if self.use_mla and self.use_mla_ps_kernel:
                 num_kv_splits = self.max_split_per_batch
 
                 self.make_mla_meta_data(

@@ -490,8 +490,25 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         if not self._hosts_draft:
             return
-        with draft_pp_context(), self._draft_context():
-            self._draft_worker.init_attention_backends()
+        # The c16 server leaves SGLANG_AITER_MLA_PERSIST=0 so the target stays
+        # on the DCP ASM kernel. The K3 draft is non-DCP MLA with qlen 3; the
+        # non-persistent qseqlen4 kernel reads a fourth query row and faults.
+        # Turn persistent on only while this draft backend is built. Forwards
+        # read the flag stored on that backend.
+        persist_restore = None
+        if getattr(self, "_draft_mla_no_dcp", False):
+            import sglang.srt.layers.attention.aiter_backend as _aiter_backend
+
+            persist_restore = _aiter_backend._use_mla_ps_kernel
+            _aiter_backend._use_mla_ps_kernel = True
+        try:
+            with draft_pp_context(), self._draft_context():
+                self._draft_worker.init_attention_backends()
+        finally:
+            if persist_restore is not None:
+                import sglang.srt.layers.attention.aiter_backend as _aiter_backend
+
+                _aiter_backend._use_mla_ps_kernel = persist_restore
         self._target_hidden_projection_enabled = _configure_target_hidden_projection(
             target_model=self.target_worker.model_runner.model,
             draft_model=self.draft_model,
