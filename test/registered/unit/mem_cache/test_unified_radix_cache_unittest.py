@@ -76,11 +76,17 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
     SWARebuild,
 )
+from sglang.srt.mem_cache.unified_cache.component_factory import (
+    DEFAULT_COMPONENT_FACTORY_KEYS,
+)
 from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
     TreeComponent,
+)
+from sglang.srt.mem_cache.unified_cache.components.registry import (
+    get_python_tree_component,
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
@@ -97,7 +103,6 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     EvictDeviceNextNodeResult,
 )
 from sglang.srt.mem_cache.unified_radix_cache import (
-    COMPONENT_REGISTRY,
     UnifiedLRUList,
     UnifiedRadixCache,
     UnifiedTreeNode,
@@ -246,7 +251,7 @@ def _drop_hicache_atexit_pin(cache):
 
 
 class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
-    def test_component_registry_override_is_instance_local(self):
+    def test_legacy_class_override_is_instance_local(self):
         params = CacheInitParams(
             req_to_token_pool=ReqToTokenPool(
                 size=2,
@@ -264,7 +269,12 @@ class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
         cache = UnifiedRadixCache(params=params)
 
         self.assertIsInstance(cache.components[ComponentType.FULL], _FakeFullComponent)
-        self.assertIsNot(COMPONENT_REGISTRY[ComponentType.FULL], _FakeFullComponent)
+        self.assertIsNot(
+            get_python_tree_component(
+                DEFAULT_COMPONENT_FACTORY_KEYS[ComponentType.FULL]
+            ),
+            _FakeFullComponent,
+        )
 
 
 class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
@@ -9190,7 +9200,9 @@ del _cfg, _name
 
 def _component_with_cache(component_type, cache):
     """A registry component instance bound to a (mock) cache and its tree_core."""
-    component = object.__new__(COMPONENT_REGISTRY[component_type])
+    component = object.__new__(
+        get_python_tree_component(DEFAULT_COMPONENT_FACTORY_KEYS[component_type])
+    )
     component.cache = cache
     component.tree_core = cache.tree_core
     return component

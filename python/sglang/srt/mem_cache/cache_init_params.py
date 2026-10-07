@@ -53,7 +53,7 @@ class CacheInitParams:
 
     tree_components: Optional[tuple[ComponentType, ...]] = None
     component_registry_override: Optional[
-        dict[ComponentType, str | type[TreeComponent]]
+        dict[ComponentType, ComponentType | str | type[TreeComponent]]
     ] = None
     tree_core_backend: Optional[str] = dataclasses.field(default=None, kw_only=True)
 

@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyAssertionError, PyKeyError, PyRuntimeError, PyValueError};
@@ -11,8 +11,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tch::{Device, Kind, Tensor};
 
-use crate::components::registry::ComponentRegistry;
-use crate::components::{ComponentSet, ComponentType, FULL, MAMBA, SWA};
+use crate::components::bindings::{ComponentBindingKey, TreeComponentBinding};
+use crate::components::{ComponentSet, ComponentType, FULL, MAMBA, SWA, TreeComponent};
 use crate::node::ChildKeyType;
 use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError};
 use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
@@ -27,7 +27,7 @@ use crate::unified_tree_core::{
 /// Translate only Rust panics; ordinary Python errors pass through unchanged.
 /// Keep this boundary outside the whole binding call so its MutexGuard unwinds
 /// and poisons the core before the panic is caught. A poisoned core stays unusable.
-fn catch_native_panic<T>(operation: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
+pub(crate) fn catch_native_panic<T>(operation: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
     match catch_unwind(AssertUnwindSafe(operation)) {
         Ok(result) => result,
         Err(payload) => {
@@ -507,7 +507,7 @@ pub struct TreeCoreInitParamsBinding {
 
 impl TreeCoreInitParamsBinding {
     /// Convert into the tree core's construction params.
-    fn to_cache_init_params(&self) -> PyResult<CacheInitParams> {
+    pub(crate) fn to_cache_init_params(&self) -> PyResult<CacheInitParams> {
         Ok(CacheInitParams {
             eviction_policy: self.eviction_policy.clone(),
             slru_protected_threshold: self.slru_protected_threshold,
@@ -996,13 +996,28 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     /// Build a tree core for the given component types from the cache's
     /// init params.
     fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self> {
-        Self::with_component_overrides(init_params, component_types, Vec::new())
+        Self::construct(init_params, component_types, None)
     }
 
-    fn with_component_overrides(
+    fn with_components(
         init_params: &TreeCoreInitParamsBinding,
         component_types: Vec<u8>,
-        component_overrides: Vec<(u8, String)>,
+        components: Vec<PyRef<'_, TreeComponentBinding>>,
+    ) -> PyResult<Self>
+    where
+        K: ComponentBindingKey,
+    {
+        let components = components
+            .iter()
+            .map(|component| K::component_from_binding(component))
+            .collect::<PyResult<Vec<_>>>()?;
+        Self::construct(init_params, component_types, Some(components))
+    }
+
+    fn construct(
+        init_params: &TreeCoreInitParamsBinding,
+        component_types: Vec<u8>,
+        components: Option<Vec<Arc<dyn TreeComponent<K> + Send + Sync>>>,
     ) -> PyResult<Self> {
         let component_types = component_types
             .into_iter()
@@ -1043,13 +1058,12 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let params = init_params.to_cache_init_params()?;
         let device = params.device;
         let page_size = params.page_size;
-        let component_overrides = component_overrides
-            .into_iter()
-            .map(|(ct, name)| Ok((parse_component_type(ct)?, name)))
-            .collect::<PyResult<Vec<_>>>()?;
-        let core =
-            UnifiedTreeCore::with_component_overrides(params, component_types, component_overrides)
-                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let core = if let Some(components) = components {
+            UnifiedTreeCore::with_components(params, component_types, components)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?
+        } else {
+            UnifiedTreeCore::new(params, component_types)
+        };
         Ok(TreeCoreBinding {
             core: Mutex::new(core),
             device,
@@ -2726,19 +2740,19 @@ macro_rules! tree_core_binding {
                 })
             }
 
-            /// Construct native component drivers from the native name registry.
+            /// Construct a tree from native component handles in component-type order.
             #[staticmethod]
-            fn with_component_overrides(
+            fn with_components(
                 init_params: &TreeCoreInitParamsBinding,
                 component_types: Vec<u8>,
-                component_overrides: Vec<(u8, String)>,
+                components: Vec<PyRef<'_, TreeComponentBinding>>,
             ) -> PyResult<Self> {
                 catch_native_panic(|| {
                     Ok($name {
-                        inner: TreeCoreBinding::with_component_overrides(
+                        inner: TreeCoreBinding::with_components(
                             init_params,
                             component_types,
-                            component_overrides,
+                            components,
                         )?,
                     })
                 })
@@ -3980,21 +3994,11 @@ fn get_hash_str(
     })
 }
 
-/// Names and component types compiled into the native component registry.
-#[pyfunction]
-fn registered_component_names() -> HashMap<String, u8> {
-    ComponentRegistry::<Vec<i64>>::default()
-        .registered_names()
-        .into_iter()
-        .map(|(name, ct)| (name, component_type_to_u8(ct)))
-        .collect()
-}
-
 fn register_mem_cache_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TlruFloatConfigBinding>()?;
     m.add_function(wrap_pyfunction!(get_hash_str, m)?)?;
-    m.add_function(wrap_pyfunction!(registered_component_names, m)?)?;
     m.add_class::<TreeCoreInitParamsBinding>()?;
+    m.add_class::<TreeComponentBinding>()?;
     m.add_class::<MatchParamsBinding>()?;
     m.add_class::<InsertParamsBinding>()?;
     m.add_class::<MatchResultBinding>()?;

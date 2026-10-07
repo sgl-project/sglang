@@ -340,10 +340,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             )
             raise ValueError(f"Rust TreeCore does not support components: {names}")
         from sglang.srt.mem_cache.rust_tree_core.component_registry import (
-            resolve_rust_component_overrides,
+            create_rust_tree_component,
+            resolve_rust_component_factories,
+        )
+        from sglang.srt.mem_cache.unified_cache.component_factory import (
+            TreeComponentArgument,
         )
 
-        component_overrides = resolve_rust_component_overrides(params)
+        component_factories = resolve_rust_component_factories(params)
         # Validate the same constructor options as Python before passing the
         # configured eviction parameters to the native strategy.
         eviction_strategy = get_eviction_strategy(
@@ -428,12 +432,21 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         binding_class = self._binding_class()
         component_types = [int(component) for component in self.tree_components]
-        self._binding = (
-            binding_class.with_component_overrides(
-                binding_params, component_types, component_overrides
+        components = [
+            create_rust_tree_component(
+                factory,
+                TreeComponentArgument(
+                    component_type,
+                    params,
+                    native_init_params=binding_params,
+                    native_bindings=self._bindings,
+                    is_bigram=self.is_eagle,
+                ),
             )
-            if component_overrides
-            else binding_class(binding_params, component_types)
+            for component_type, factory in component_factories.items()
+        ]
+        self._binding = binding_class.with_components(
+            binding_params, component_types, components
         )
         self.kv_events = _RustKVCacheEventRecorder(
             self._binding, params.enable_kv_cache_events

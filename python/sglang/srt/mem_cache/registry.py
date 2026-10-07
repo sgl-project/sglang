@@ -181,14 +181,16 @@ def create_unified_radix_cache(
             C128SidecarComponent,
         )
         from sglang.srt.mem_cache.unified_cache.components.registry import (
+            get_python_tree_component,
             register_python_tree_component,
         )
 
         tree_components.append(ComponentType.C128)
-        register_python_tree_component("c128_sidecar", C128SidecarComponent)
+        if get_python_tree_component("c128_sidecar") is None:
+            register_python_tree_component("c128_sidecar", C128SidecarComponent)
         params.component_registry_override = {
-            **(params.component_registry_override or {}),
             ComponentType.C128: "c128_sidecar",
+            **(params.component_registry_override or {}),
         }
 
     params.tree_components = tuple(tree_components)
@@ -197,14 +199,17 @@ def create_unified_radix_cache(
             MlxAuxiliaryStateComponent,
         )
         from sglang.srt.mem_cache.unified_cache.components.registry import (
+            get_python_tree_component,
             register_python_tree_component,
         )
 
-        register_python_tree_component(
-            "mlx_auxiliary_state", MlxAuxiliaryStateComponent
-        )
+        if get_python_tree_component("mlx_auxiliary_state") is None:
+            register_python_tree_component(
+                "mlx_auxiliary_state", MlxAuxiliaryStateComponent
+            )
         params.component_registry_override = {
-            ComponentType.MAMBA: "mlx_auxiliary_state"
+            ComponentType.MAMBA: "mlx_auxiliary_state",
+            **(params.component_registry_override or {}),
         }
     cache = (cache_class or UnifiedRadixCache)(params)
     if (

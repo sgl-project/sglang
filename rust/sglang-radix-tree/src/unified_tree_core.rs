@@ -8,8 +8,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use tch::{Device, Kind, Tensor};
 
-use crate::components::registry::{ComponentRegistry, ComponentRegistryError};
-use crate::components::{self, ComponentSet, TreeComponent};
+use crate::components::{self, ComponentInitError, ComponentSet, TreeComponent};
 use crate::components::{
     BASE_COMPONENT_TYPE, ComponentType, FULL, MAMBA, NUM_COMPONENT_TYPES, SWA,
 };
@@ -801,31 +800,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         });
     }
 
-    pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self {
-        Self::with_component_overrides(params, component_types, Vec::new())
-            .expect("built-in component registration is valid")
-    }
-
-    /// Construct native drivers by name, retaining defaults for unlisted components.
-    pub fn with_component_overrides(
-        params: CacheInitParams,
-        component_types: Vec<ComponentType>,
-        component_overrides: Vec<(ComponentType, String)>,
-    ) -> Result<Self, ComponentRegistryError> {
-        Self::with_component_registry(
-            params,
-            component_types,
-            component_overrides,
-            &ComponentRegistry::default(),
-        )
-    }
-
-    pub(crate) fn with_component_registry(
-        params: CacheInitParams,
-        component_types: Vec<ComponentType>,
-        component_overrides: Vec<(ComponentType, String)>,
-        registry: &ComponentRegistry<K>,
-    ) -> Result<Self, ComponentRegistryError> {
+    fn validate_init_params(params: &CacheInitParams, component_types: &[ComponentType]) {
         assert!(
             !component_types.is_empty(),
             "at least one component type is required"
@@ -835,25 +810,58 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             "the base (Full) component is required"
         );
         assert!(params.page_size >= 1, "page_size must be at least 1");
-        let mut overrides = HashMap::new();
-        for (component_type, name) in component_overrides {
-            if !component_types.contains(&component_type) {
-                return Err(ComponentRegistryError::InactiveComponent(component_type));
-            }
-            if overrides.insert(component_type, name).is_some() {
-                return Err(ComponentRegistryError::DuplicateOverride(component_type));
-            }
-        }
+    }
+
+    pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self {
+        Self::validate_init_params(&params, &component_types);
         let components = component_types
             .iter()
-            .map(|&ct| {
-                let name = overrides
-                    .get(&ct)
-                    .map(String::as_str)
-                    .unwrap_or_else(|| ComponentRegistry::<K>::default_name(ct));
-                registry.create(name, ct, &params)
+            .map(|ct| -> Arc<dyn TreeComponent<K> + Send + Sync> {
+                match ct {
+                    ComponentType::Full => Arc::new(components::FullComponent),
+                    ComponentType::Swa => Arc::new(components::SwaComponent::new(&params)),
+                    ComponentType::Mamba => Arc::new(components::MambaComponent::new(&params)),
+                }
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect();
+        Self::with_components(params, component_types, components)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Construct a tree from native drivers in component-type order.
+    pub fn with_components(
+        params: CacheInitParams,
+        component_types: Vec<ComponentType>,
+        components: Vec<Arc<dyn TreeComponent<K> + Send + Sync>>,
+    ) -> Result<Self, ComponentInitError> {
+        Self::validate_init_params(&params, &component_types);
+        let mut configured = HashSet::new();
+        for &component_type in &component_types {
+            if !configured.insert(component_type) {
+                return Err(ComponentInitError::DuplicateComponent(component_type));
+            }
+        }
+        let mut supplied = HashSet::new();
+        for component in &components {
+            let component_type = component.component_type();
+            if !component_types.contains(&component_type) {
+                return Err(ComponentInitError::InactiveComponent(component_type));
+            }
+            if !supplied.insert(component_type) {
+                return Err(ComponentInitError::DuplicateComponent(component_type));
+            }
+        }
+        for &component_type in &component_types {
+            if !supplied.contains(&component_type) {
+                return Err(ComponentInitError::MissingComponent(component_type));
+            }
+        }
+        for (&expected, component) in component_types.iter().zip(&components) {
+            let actual = component.component_type();
+            if actual != expected {
+                return Err(ComponentInitError::ComponentTypeMismatch { expected, actual });
+            }
+        }
         let arena = NodeArena::new(component_types.clone(), params.page_size);
         let mut tree_core = UnifiedTreeCore {
             arena,

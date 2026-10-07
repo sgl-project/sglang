@@ -2,41 +2,65 @@
 
 from __future__ import annotations
 
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from typing import Callable
+
+from sglang.srt.mem_cache.unified_cache.component_factory import TreeComponentArgument
 from sglang.srt.mem_cache.unified_cache.components.base import TreeComponent
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 
-COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
-    ComponentType.FULL: FullComponent,
-    ComponentType.MAMBA: MambaComponent,
-    ComponentType.SWA: SWAComponent,
-}
-_PYTHON_TREE_COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {}
+PythonTreeComponentFactory = (
+    type[TreeComponent] | Callable[[TreeComponentArgument], TreeComponent]
+)
+_PYTHON_TREE_COMPONENT_REGISTRY: dict[str, PythonTreeComponentFactory] = {}
 
 
-def register_python_tree_component(name: str, component: type[TreeComponent]) -> None:
-    """Register a Python component under a backend-independent name."""
+def register_python_tree_component(
+    name: str, factory: PythonTreeComponentFactory, replace: bool = False
+) -> None:
+    """Register a component factory for subsequently constructed caches."""
     if not name.strip():
         raise ValueError("Python component name must be non-empty")
-    if not isinstance(component, type) or not issubclass(component, TreeComponent):
-        raise TypeError("Python components must inherit TreeComponent")
-    if not isinstance(getattr(component, "component_type", None), ComponentType):
-        raise TypeError("Python components must declare their component_type")
+    if not callable(factory):
+        raise TypeError("Python component factories must be callable")
     existing = _PYTHON_TREE_COMPONENT_REGISTRY.get(name)
-    if existing is not None and existing is not component:
+    if existing is not None and existing is not factory and not replace:
         raise ValueError(f"Python component {name!r} is already registered")
-    _PYTHON_TREE_COMPONENT_REGISTRY[name] = component
+    _PYTHON_TREE_COMPONENT_REGISTRY[name] = factory
 
 
-def get_python_tree_component(name: str) -> type[TreeComponent] | None:
+def get_python_tree_component(name: str) -> PythonTreeComponentFactory | None:
     return _PYTHON_TREE_COMPONENT_REGISTRY.get(name)
 
 
-def registered_python_tree_components() -> dict[str, type[TreeComponent]]:
+def registered_python_tree_components() -> dict[str, PythonTreeComponentFactory]:
     return dict(_PYTHON_TREE_COMPONENT_REGISTRY)
 
 
-for _component_type, _component in COMPONENT_REGISTRY.items():
-    register_python_tree_component(_component_type.name.lower(), _component)
+def create_python_tree_component(
+    factory: PythonTreeComponentFactory, args: TreeComponentArgument
+) -> TreeComponent:
+    """Construct and validate a Python component from a class or factory."""
+    if isinstance(factory, type) and issubclass(factory, TreeComponent):
+        if factory.component_type != args.component_type:
+            raise ValueError(
+                f"Python component factory has kind {factory.component_type.name}, "
+                f"expected {args.component_type.name}"
+            )
+        component = factory(args.cache, args.params)
+    else:
+        component = factory(args)
+    if not isinstance(component, TreeComponent):
+        raise TypeError("Python component factories must return a TreeComponent")
+    if component.component_type != args.component_type:
+        raise ValueError(
+            f"Python component factory returned {component.component_type.name}, "
+            f"expected {args.component_type.name}"
+        )
+    return component
+
+
+register_python_tree_component("full", FullComponent)
+register_python_tree_component("swa", SWAComponent)
+register_python_tree_component("mamba", MambaComponent)

@@ -71,9 +71,6 @@ from sglang.srt.mem_cache.unified_cache.components import (  # noqa: F401
     SWAComponent,
     TreeComponent,
 )
-from sglang.srt.mem_cache.unified_cache.components.registry import (  # noqa: F401
-    COMPONENT_REGISTRY,
-)
 from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )

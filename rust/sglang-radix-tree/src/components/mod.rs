@@ -14,12 +14,29 @@ use crate::unified_tree_core::{
 
 mod full;
 mod mamba;
-pub mod registry;
 mod swa;
+
+#[cfg(feature = "python-extension")]
+pub(crate) mod bindings;
 
 pub use full::FullComponent;
 pub use mamba::MambaComponent;
 pub use swa::SwaComponent;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ComponentInitError {
+    #[error("component {0:?} is not enabled")]
+    InactiveComponent(ComponentType),
+    #[error("duplicate component type {0:?}")]
+    DuplicateComponent(ComponentType),
+    #[error("missing component {0:?}")]
+    MissingComponent(ComponentType),
+    #[error("component has type {actual:?}, expected {expected:?}")]
+    ComponentTypeMismatch {
+        expected: ComponentType,
+        actual: ComponentType,
+    },
+}
 
 /// Whether `node_id` holds the component's data on `target`, checking its
 /// device or host slot.
