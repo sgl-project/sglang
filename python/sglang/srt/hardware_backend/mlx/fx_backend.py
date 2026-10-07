@@ -30,7 +30,7 @@ def _make_mlx_export_executor(
     example_inputs: tuple[Any, ...],
     *,
     mode: str,
-) -> Callable[..., torch.Tensor]:
+) -> Callable[..., Any]:
     """Lower one admitted strict serving export to MLX plus deferred KV commit."""
 
     import mlx.core as mx
@@ -119,6 +119,7 @@ def _make_mlx_export_executor(
     out_cache_position = ServingForwardArg.OUT_CACHE_LOC
     prefix_lens_position = ServingForwardArg.EXTEND_PREFIX_LENS
     debug_attention = envs.SGLANG_DEBUG_MLX_EXPORT_ATTENTION.get()
+    output_count = len(exported_program.graph_signature.output_specs)
     prefill_batch_size = example_inputs[ServingForwardArg.REQ_POOL_INDICES].shape[0]
 
     def make_mlx_graph(prefill_attention: str):
@@ -266,24 +267,24 @@ def _make_mlx_export_executor(
             *attr_views,
             device="mps",
         )
-        expected_results = 7 if debug_attention else 3
+        expected_results = output_count + (6 if debug_attention else 2)
         if len(results) != expected_results:
             raise RuntimeError(
-                "MLX graph expected logits, optional debug attention, and two KV "
+                "MLX graph expected model outputs, optional debug attention, and two KV "
                 f"deltas; got {len(results)}"
             )
+        model_outputs = results[:output_count]
         if debug_attention:
             (
-                logits,
                 all_attention,
                 first_query,
                 first_key,
                 first_value,
                 new_k,
                 new_v,
-            ) = results
+            ) = results[output_count:]
         else:
-            logits, new_k, new_v = results
+            new_k, new_v = results[output_count:]
         if envs.SGLANG_DEBUG_MLX_KV_DELTAS.get():
             # new_k/new_v are zero-copy views of MLX-owned buffers; MLX may
             # reuse those buffers on the next region run, so a stash held
@@ -308,11 +309,9 @@ def _make_mlx_export_executor(
             num_kv_heads=spec.num_kv_heads,
             head_dim=spec.head_dim,
         )
-        return (
-            (logits, all_attention, first_query, first_key, first_value)
-            if debug_attention
-            else logits
-        )
+        if debug_attention:
+            return (*model_outputs, all_attention, first_query, first_key, first_value)
+        return model_outputs[0] if output_count == 1 else model_outputs
 
     return execute
 
@@ -320,7 +319,7 @@ def _make_mlx_export_executor(
 def make_mlx_decode_export_executor(
     exported_program: Any,
     example_inputs: tuple[Any, ...],
-) -> Callable[..., torch.Tensor]:
+) -> Callable[..., Any]:
     """Build the single-region MLX executor for one decode export bucket."""
     return _make_mlx_export_executor(exported_program, example_inputs, mode="decode")
 
@@ -328,7 +327,7 @@ def make_mlx_decode_export_executor(
 def make_mlx_prefill_export_executor(
     exported_program: Any,
     example_inputs: tuple[Any, ...],
-) -> Callable[..., torch.Tensor]:
+) -> Callable[..., Any]:
     """Build the single-region MLX executor for one packed Radix prefill bucket."""
     return _make_mlx_export_executor(exported_program, example_inputs, mode="prefill")
 

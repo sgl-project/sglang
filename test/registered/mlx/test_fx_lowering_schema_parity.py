@@ -92,10 +92,45 @@ _RECIPES: dict[str, dict] = {
     "tanh": dict(args=lambda: (_t(4, 4),)),
     "rsqrt": dict(args=lambda: (_positive(4, 4),)),
     "index_select": dict(args=lambda: (_t(5, 6), 1, _indices(3, 6))),
-    "index_first_axis": dict(
+    "index_integer": dict(
         args=lambda: (_t(5, 6), [_indices(3, 5)]),
-        extra=[lambda: ((_t(5, 6), [torch.tensor([-1, 0, 2])]), {})],
+        extra=[
+            lambda: ((_t(5, 6), [torch.tensor([-1, 0, 2])]), {}),
+            lambda: (
+                (_t(5, 6), [torch.tensor([0, 2, -1]), torch.tensor([1, -1, 3])]),
+                {},
+            ),
+        ],
         rejects=[lambda: ((_t(5, 6), [None, _indices(3, 6)]), {})],
+    ),
+    "arange_integer": dict(
+        args=lambda: (5,),
+        pools={"dtype": [torch.int32, torch.int64]},
+        exclude={"pin_memory"},
+        extra=[lambda: ((0,), {})],
+    ),
+    "full": dict(
+        args=lambda: ([2, 3], 2.0),
+        pools={"dtype": [torch.float32, torch.int64]},
+        exclude={"pin_memory"},
+        extra=[lambda: (([2, 3], 4), {}), lambda: (([2, 3], True), {})],
+    ),
+    "amax": dict(
+        args=lambda: (_t(3, 4), [-1]),
+        extra=[lambda: ((_t(3, 4), []), {}), lambda: ((_t(2, 3, 4), [0, 2]), {})],
+    ),
+    "logsumexp": dict(
+        args=lambda: (_t(3, 4), [-1]),
+        extra=[lambda: ((_t(3, 4) + 10000, [-1]), {})],
+    ),
+    "isinf": dict(
+        args=lambda: (torch.tensor([float("inf"), -float("inf"), float("nan"), 0.0]),),
+    ),
+    "where_scalar_self": dict(args=lambda: (torch.tensor([True, False]), 0.0, _t(2))),
+    "log_softmax": dict(
+        args=lambda: (_t(3, 4), -1),
+        pools={"dtype": [torch.float32]},
+        extra=[lambda: ((_t(3, 4) + 10000, -1), {})],
     ),
     "cumsum": dict(
         args=lambda: (_t(3, 4), 1),

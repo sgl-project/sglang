@@ -104,12 +104,15 @@ _SERVING_ARGS = (
     None,
     None,
     None,
+    None,
+    None,
 )
 
 
 def _make_wrapper(hidden_states: torch.Tensor, lm_head_weight: torch.Tensor):
     model = _make_model(hidden_states, lm_head_weight)
     forward_batch = SimpleNamespace(
+        return_logprob=False,
         forward_mode=ForwardMode.DECODE,
         seq_lens_sum=_NUM_TOKENS,
         extend_num_tokens=None,
@@ -227,6 +230,7 @@ class TestServingBoundaryLogitsParity(CustomTestCase):
                 )
                 model = _make_model(hidden, weight)
                 batch = SimpleNamespace(
+                    return_logprob=False,
                     forward_mode=ForwardMode.EXTEND,
                     seq_lens_sum=sum(lengths) + sum(prefixes),
                     extend_num_tokens=_NUM_TOKENS,

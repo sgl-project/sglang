@@ -142,6 +142,8 @@ def _extend_batch(**overrides):
         encoder_lens=None,
         capture_hidden_mode=CaptureHiddenMode.NULL,
         return_logprob=False,
+        extend_logprob_start_lens_cpu=None,
+        extend_seq_lens_cpu=None,
         input_embeds=None,
         replace_embeds=None,
         input_ids=torch.zeros(300, dtype=torch.int64),
@@ -595,15 +597,22 @@ class TestServingForwardArgLayout(CustomTestCase):
         )
 
     def test_tuple_position_matches_member_value_and_field_name(self):
-        # Sampling indices are an explicit argument derived by the runner;
-        # all other positions come directly from ForwardBatch fields.
+        # Sampling indices are supplied explicitly; prompt-score tensors are
+        # derived only when requested. Other positions come from batch fields.
         batch = SimpleNamespace(
-            **{arg.name.lower(): arg.name.lower() for arg in ServingForwardArg}
+            return_logprob=False,
+            **{arg.name.lower(): arg.name.lower() for arg in ServingForwardArg},
         )
         args = serving_forward_args(batch, batch.sampling_indices)
         self.assertEqual(len(args), len(ServingForwardArg))
         for arg in ServingForwardArg:
-            self.assertEqual(args[arg.value], arg.name.lower())
+            if arg in (
+                ServingForwardArg.LOGPROB_PRUNED_INDICES,
+                ServingForwardArg.LOGPROB_TOKEN_IDS,
+            ):
+                self.assertIsNone(args[arg.value])
+            else:
+                self.assertEqual(args[arg.value], arg.name.lower())
 
 
 class TestRegionLadders(CustomTestCase):

@@ -105,11 +105,44 @@ class MlxFxLoweringRegistry:
                 return self._functions.get(torch.ops.aten.mul.Tensor)
             if node.target is torch.ops.aten.index.Tensor:
                 indices = node.args[1]
-                if len(indices) != 1 or indices[0] is None:
+                if len(indices) not in (1, 2) or any(
+                    index is None for index in indices
+                ):
                     return None
-                value = indices[0].meta.get("val")
-                if value is None or value.dtype not in (torch.int32, torch.int64):
+                values = [index.meta.get("val") for index in indices]
+                if any(
+                    value is None or value.dtype not in (torch.int32, torch.int64)
+                    for value in values
+                ):
                     return None
+                if len(indices) == 2 and (
+                    node.args[0].meta["val"].ndim != 2
+                    or any(value.ndim != 1 for value in values)
+                    or values[0].shape != values[1].shape
+                ):
+                    return None
+            if node.target is torch.ops.aten.arange.default:
+                if (
+                    len(node.args) != 1
+                    or type(node.args[0]) is not int
+                    or node.args[0] < 0
+                    or node.kwargs.get("dtype") not in (None, torch.int32, torch.int64)
+                ):
+                    return None
+            if (
+                node.target
+                in (
+                    torch.ops.aten.logsumexp.default,
+                    torch.ops.aten.log_softmax.int,
+                )
+                and node.args[0].meta["val"].dtype != torch.float32
+            ):
+                # These recipes cover the shared processor's FP32 scoring.
+                return None
+            if node.target is torch.ops.aten.log_softmax.int and _arg(
+                node.args, node.kwargs, 2, "dtype"
+            ) not in (None, torch.float32):
+                return None
             if node.target is torch.ops.higher_order.auto_functionalized_v2:
                 custom_target = node.args[0]
                 lowering = self._functions.get(custom_target)
@@ -471,14 +504,82 @@ def _lower_index_select(mx, args, kwargs):
     return mx.take(args[0], args[2], axis=args[1])
 
 
-@_lowering("index_first_axis", aten=(torch.ops.aten.index.Tensor,))
-def _lower_index_first_axis(mx, args, kwargs):
+@_lowering("index_integer", aten=(torch.ops.aten.index.Tensor,))
+def _lower_index_integer(mx, args, kwargs):
     indices = args[1]
-    if len(indices) != 1 or indices[0] is None or indices[0].dtype == mx.bool_:
+    if len(indices) not in (1, 2) or any(
+        index is None or index.dtype == mx.bool_ for index in indices
+    ):
         raise UnsupportedMlxFxGraphError(
-            "only integer first-axis indexing is supported"
+            "only integer first-axis or paired matrix indexing is supported"
         )
+    if len(indices) == 2:
+        if args[0].ndim != 2 or any(index.ndim != 1 for index in indices):
+            raise UnsupportedMlxFxGraphError(
+                "paired indices require a matrix and vectors"
+            )
+        if indices[0].shape != indices[1].shape:
+            raise UnsupportedMlxFxGraphError("paired indices must have equal shapes")
+        return args[0][tuple(indices)]
     return mx.take(args[0], indices[0], axis=0)
+
+
+@_lowering("arange_integer", aten=(torch.ops.aten.arange.default,))
+def _lower_arange_integer(mx, args, kwargs):
+    return mx.arange(args[0], dtype=_mlx_dtype(kwargs.get("dtype") or torch.int64, mx))
+
+
+@_lowering("full", aten=(torch.ops.aten.full.default,))
+def _lower_full(mx, args, kwargs):
+    fill = args[1]
+    inferred = (
+        torch.bool
+        if isinstance(fill, bool)
+        else (torch.int64 if isinstance(fill, int) else torch.float32)
+    )
+    return mx.full(
+        tuple(args[0]), fill, dtype=_mlx_dtype(kwargs.get("dtype") or inferred, mx)
+    )
+
+
+@_lowering("amax", aten=(torch.ops.aten.amax.default,))
+def _lower_amax(mx, args, kwargs):
+    dims = _arg(args, kwargs, 1, "dim", ())
+    return mx.max(
+        args[0],
+        axis=tuple(dims) if dims else None,
+        keepdims=_arg(args, kwargs, 2, "keepdim", False),
+    )
+
+
+@_lowering("logsumexp", aten=(torch.ops.aten.logsumexp.default,))
+def _lower_logsumexp(mx, args, kwargs):
+    dims = _arg(args, kwargs, 1, "dim", ())
+    return mx.logsumexp(
+        args[0],
+        axis=tuple(dims) if dims else None,
+        keepdims=_arg(args, kwargs, 2, "keepdim", False),
+    )
+
+
+@_lowering("isinf", aten=(torch.ops.aten.isinf.default,))
+def _lower_isinf(mx, args, kwargs):
+    return mx.isinf(args[0])
+
+
+@_lowering("where_scalar_self", aten=(torch.ops.aten.where.ScalarSelf,))
+def _lower_where_scalar_self(mx, args, kwargs):
+    return mx.where(args[0], mx.array(args[1], dtype=args[2].dtype), args[2])
+
+
+@_lowering("log_softmax", aten=(torch.ops.aten.log_softmax.int,))
+def _lower_log_softmax(mx, args, kwargs):
+    value, axis = args[:2]
+    dtype = _arg(args, kwargs, 2, "dtype")
+    if dtype not in (None, torch.float32) or value.dtype != mx.float32:
+        raise UnsupportedMlxFxGraphError("log-softmax scoring requires FP32")
+    shifted = value - mx.max(value, axis=axis, keepdims=True)
+    return shifted - mx.logsumexp(shifted, axis=axis, keepdims=True)
 
 
 @_lowering("cumsum", aten=(torch.ops.aten.cumsum.default,))

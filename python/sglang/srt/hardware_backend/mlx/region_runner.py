@@ -4,8 +4,8 @@ The region executor is a pure function over Torch-owned serving state: it
 reads the KV pool through zero-copy views and returns logits through the
 shared processor. It commits the step's K/V delta through the Torch-side
 Metal commit. Torch owns processor semantics, scheduling, pools and sampling;
-this runner replaces decode, single-request prefill and fresh uniform packed
-prefill.
+this runner replaces decode, single-request prefill (including bounded prompt
+scoring) and fresh uniform packed prefill.
 
 Executors are exported per padded shape bucket -- decode batch sizes and
 prefill token counts -- and reused for every later batch the bucket covers,
@@ -327,7 +327,27 @@ class MlxRegionRunner(BaseRunner):
             [("decode", batch_size) for batch_size in self._decode_batch_sizes]
             + [("extend", bucket) for bucket in self._prefill_token_buckets]
             + self._packed_prefill_keys()
+            + self._logprob_prefill_keys()
         )
+
+    def _logprob_prefill_keys(self) -> list[tuple]:
+        """Score at most one shared LM-head chunk in each bounded region.
+
+        Larger prefill buckets retain eager scoring, whose chunked lifetime
+        bounds vocabulary-sized intermediates. No scoring layout adds a key.
+        """
+        processor = getattr(
+            getattr(self.model_runner.model, "logits_processor", None),
+            "input_logprob_processor",
+            None,
+        )
+        if processor is None:
+            return []
+        return [
+            ("extend_logprob", bucket)
+            for bucket in self._prefill_token_buckets
+            if bucket <= processor.logprobs_chunk_size
+        ]
 
     def _packed_prefill_keys(self) -> list[tuple]:
         """Reuse both ladders without exceeding the prefill token cap.
@@ -411,6 +431,18 @@ class MlxRegionRunner(BaseRunner):
         """
         device = self.model_runner.device
         mode, size = key[:2]
+        if mode == "extend_logprob":
+            return dataclasses.replace(
+                self._synthetic_batch(("extend", size)),
+                return_logprob=True,
+                extend_seq_lens_cpu=[size],
+                extend_logprob_start_lens_cpu=[0],
+                extend_input_logprob_token_ids_gpu=torch.zeros(
+                    size, dtype=torch.int64, device=device
+                ),
+                top_logprobs_nums=[0],
+                token_ids_logprobs=[None],
+            )
         if mode == "decode":
             zeros = torch.zeros(size, dtype=torch.int64, device=device)
             return ForwardBatch(
@@ -496,14 +528,13 @@ class MlxRegionRunner(BaseRunner):
         # DLLM variants whose semantics the exported graph does not carry.
         if mode != ForwardMode.EXTEND:
             return None
-        if forward_batch.return_logprob:
-            # Prompt logprobs need the full LogitsProcessor machinery.
-            return None
         if (
             forward_batch.input_embeds is not None
             or forward_batch.replace_embeds is not None
         ):
             return None
+        if forward_batch.return_logprob:
+            return self._prompt_logprob_key(forward_batch)
         if forward_batch.batch_size != 1:
             lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
             prefixes = getattr(forward_batch, "extend_prefix_lens_cpu", None)
@@ -531,6 +562,40 @@ class MlxRegionRunner(BaseRunner):
             )
         return self._bucket_key(
             "extend", forward_batch.input_ids.shape[0], self._prefill_token_buckets
+        )
+
+    def _prompt_logprob_key(self, batch: ForwardBatch) -> Optional[tuple]:
+        """Admit one ordinary request with tensor-only prompt-score outputs."""
+        length = batch.input_ids.numel()
+        starts = batch.extend_logprob_start_lens_cpu
+        if (
+            length == 0
+            or batch.batch_size != 1
+            or batch.extend_seq_lens_cpu != [length]
+            or batch.extend_num_tokens != length
+            or not starts
+            or len(starts) != 1
+            or not 0 <= starts[0] <= length
+            or batch.top_logprobs_nums != [0]
+            or batch.token_ids_logprobs != [None]
+            or batch.multi_item_delimiter_indices is not None
+            or batch.token_indices_to_pool is not None
+        ):
+            return None
+        count = length - starts[0]
+        if count == 0:
+            return self._bucket_key("extend", length, self._prefill_token_buckets)
+        labels = batch.extend_input_logprob_token_ids_gpu
+        if (
+            labels is None
+            or labels.ndim != 1
+            or labels.numel() != count
+            or labels.dtype != torch.int64
+            or labels.device != batch.input_ids.device
+        ):
+            return None
+        return next(
+            (key for key in self._logprob_prefill_keys() if key[1] >= length), None
         )
 
     @staticmethod
@@ -566,9 +631,20 @@ class MlxRegionRunner(BaseRunner):
                 forward_batch, key[1], key[2]
             )
             logits = executor.execute(*serving_forward_args(padded, sampling_indices))
-        elif key[0] == "extend":
+        elif key[0] in ("extend", "extend_logprob"):
             padded = self._pad_extend_batch(forward_batch, key[1])
-            logits = executor.execute(*serving_forward_args(padded))
+            result = executor.execute(*serving_forward_args(padded))
+            if key[0] == "extend_logprob":
+                logits, input_logprobs = result
+                count = (
+                    forward_batch.extend_num_tokens
+                    - forward_batch.extend_logprob_start_lens_cpu[0]
+                )
+                return LogitsProcessorOutput(
+                    next_token_logits=logits,
+                    input_token_logprobs=input_logprobs[:count],
+                )
+            logits = result
         else:
             padded = self._pad_decode_batch(forward_batch, key[1])
             logits = executor.execute(*serving_forward_args(padded))
@@ -755,7 +831,7 @@ class MlxRegionRunner(BaseRunner):
             export_batch, sampling_indices = self._pad_packed_extend_batch(
                 forward_batch, key[1], key[2]
             )
-        elif key[0] == "extend":
+        elif key[0] in ("extend", "extend_logprob"):
             export_batch = self._pad_extend_batch(forward_batch, key[1])
         else:
             export_batch = self._pad_decode_batch(forward_batch, key[1])

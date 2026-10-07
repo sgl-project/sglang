@@ -151,6 +151,17 @@ class ServingForwardExportWrapper(torch.nn.Module):
         super().__init__()
         self.model = model
         self.forward_mode = forward_batch.forward_mode
+        self.return_input_logprob = (
+            forward_batch.return_logprob
+            and forward_batch.extend_logprob_start_lens_cpu is not None
+            and any(
+                length > start
+                for length, start in zip(
+                    forward_batch.extend_seq_lens_cpu,
+                    forward_batch.extend_logprob_start_lens_cpu,
+                )
+            )
+        )
         self.seq_lens_sum = forward_batch.seq_lens_sum
         self.extend_num_tokens = forward_batch.extend_num_tokens
         self.global_num_token_non_padded_cpu = (
@@ -186,7 +197,9 @@ class ServingForwardExportWrapper(torch.nn.Module):
         extend_start_loc: Optional[torch.Tensor],
         num_token_non_padded: Optional[torch.Tensor],
         sampling_indices: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+        logprob_pruned_indices: Optional[torch.Tensor],
+        logprob_token_ids: Optional[torch.Tensor],
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
             batch_size=req_pool_indices.shape[0],
@@ -224,9 +237,20 @@ class ServingForwardExportWrapper(torch.nn.Module):
             extend_seq_lens=extend_seq_lens,
             extend_last_token_indices=sampling_indices,
         )
-        return self.model.logits_processor(
+        if self.return_input_logprob:
+            capacity = logprob_pruned_indices.shape[0]
+            metadata.extend_return_logprob = True
+            metadata.extend_seq_lens_cpu = [capacity]
+            metadata.extend_logprob_start_lens_cpu = [0]
+            metadata.extend_logprob_pruned_lens_cpu = [capacity]
+            metadata.extend_logprob_pruned_indices = logprob_pruned_indices
+            metadata.extend_input_logprob_token_ids_gpu = logprob_token_ids
+        result = self.model.logits_processor(
             input_ids, hidden_states, self.model.lm_head, metadata
-        ).next_token_logits
+        )
+        if self.return_input_logprob:
+            return result.next_token_logits, result.input_token_logprobs
+        return result.next_token_logits
 
 
 class ServingForwardArg(IntEnum):
@@ -248,6 +272,8 @@ class ServingForwardArg(IntEnum):
     EXTEND_START_LOC = 7
     NUM_TOKEN_NON_PADDED = 8
     SAMPLING_INDICES = 9
+    LOGPROB_PRUNED_INDICES = 10
+    LOGPROB_TOKEN_IDS = 11
 
 
 def serving_forward_args(
@@ -261,7 +287,27 @@ def serving_forward_args(
     build the tuple through this function, whose layout follows
     :class:`ServingForwardArg`. Packed prefill passes sampling indices
     separately so segment padding cannot change the last real token's row.
+    Single-request prompt scoring carries fixed-capacity live row indices
+    and target IDs; host score starts never become export constants.
     """
+    logprob_indices = logprob_token_ids = None
+    if forward_batch.return_logprob and forward_batch.extend_logprob_start_lens_cpu:
+        assert forward_batch.batch_size == 1
+        start = forward_batch.extend_logprob_start_lens_cpu[0]
+        length = forward_batch.extend_num_tokens
+        if start < length:
+            capacity = forward_batch.input_ids.numel()
+            logprob_indices = (
+                torch.arange(
+                    capacity, dtype=torch.int64, device=forward_batch.input_ids.device
+                )
+                .add(start)
+                .clamp_max(length - 1)
+            )
+            labels = forward_batch.extend_input_logprob_token_ids_gpu
+            logprob_token_ids = torch.nn.functional.pad(
+                labels, (0, capacity - labels.numel())
+            )
     values = {
         ServingForwardArg.INPUT_IDS: forward_batch.input_ids,
         ServingForwardArg.POSITIONS: forward_batch.positions,
@@ -273,6 +319,8 @@ def serving_forward_args(
         ServingForwardArg.EXTEND_START_LOC: forward_batch.extend_start_loc,
         ServingForwardArg.NUM_TOKEN_NON_PADDED: forward_batch.num_token_non_padded,
         ServingForwardArg.SAMPLING_INDICES: sampling_indices,
+        ServingForwardArg.LOGPROB_PRUNED_INDICES: logprob_indices,
+        ServingForwardArg.LOGPROB_TOKEN_IDS: logprob_token_ids,
     }
     ordered: list[Any] = [None] * len(ServingForwardArg)
     for arg in ServingForwardArg:

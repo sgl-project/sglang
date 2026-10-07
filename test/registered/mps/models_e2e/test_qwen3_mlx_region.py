@@ -1,5 +1,6 @@
 """Compare the exported region with the standard Torch-owned MPS server."""
 
+import math
 import os
 import tempfile
 import unittest
@@ -54,6 +55,8 @@ class TestQwen3MlxRegion(CustomTestCase):
                     "4096",
                     "--context-length",
                     "2048",
+                    "--chunked-prefill-size",
+                    "512",
                     "--decode-log-interval",
                     "1",
                     "--cuda-graph-bs-decode",
@@ -69,17 +72,22 @@ class TestQwen3MlxRegion(CustomTestCase):
             )
             try:
 
-                def generate(text, *, input_ids=False):
+                def generate(text, *, input_ids=False, logprob_start=None):
+                    payload = {
+                        "input_ids" if input_ids else "text": text,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "ignore_eos": True,
+                            "max_new_tokens": 8,
+                        },
+                    }
+                    if logprob_start is not None:
+                        payload.update(
+                            return_logprob=True, logprob_start_len=logprob_start
+                        )
                     response = requests.post(
                         f"{DEFAULT_URL_FOR_TEST}/generate",
-                        json={
-                            "input_ids" if input_ids else "text": text,
-                            "sampling_params": {
-                                "temperature": 0,
-                                "ignore_eos": True,
-                                "max_new_tokens": 8,
-                            },
-                        },
+                        json=payload,
                         timeout=120,
                     )
                     response.raise_for_status()
@@ -124,13 +132,43 @@ class TestQwen3MlxRegion(CustomTestCase):
                     [item["output_ids"] for item in packed],
                     [item["output_ids"] for item in packed_warm],
                 )
+                scored = []
+
+                def score(ids, start):
+                    result = generate(ids, input_ids=True, logprob_start=start)
+                    values = result["meta_info"]["input_token_logprobs"]
+                    self.assertEqual([row[1] for row in values], ids[start:])
+                    self.assertIsNone(values[0][0])
+                    self.assertTrue(all(math.isfinite(row[0]) for row in values[1:]))
+                    scored.append(result["output_ids"])
+                    return result
+
+                requests.post(
+                    f"{DEFAULT_URL_FOR_TEST}/flush_cache", timeout=30
+                ).raise_for_status()
+                score(packed_inputs[0], 0)
+                requests.post(
+                    f"{DEFAULT_URL_FOR_TEST}/flush_cache", timeout=30
+                ).raise_for_status()
+                suffix = score(packed_inputs[0], 80)
+                requests.post(
+                    f"{DEFAULT_URL_FOR_TEST}/flush_cache", timeout=30
+                ).raise_for_status()
+                generate(packed_inputs[0], input_ids=True)
+                cached_suffix = score(packed_inputs[0], 80)
+                self.assertGreater(cached_suffix["meta_info"]["cached_tokens"], 0)
+                self.assertEqual(suffix["output_ids"], cached_suffix["output_ids"])
+                requests.post(
+                    f"{DEFAULT_URL_FOR_TEST}/flush_cache", timeout=30
+                ).raise_for_status()
+                score(packed_inputs[0] * 9, 0)
             finally:
                 kill_process_tree(process.pid, wait_timeout=30)
                 process.wait(timeout=5)
             log.seek(0)
             output = log.read()
         if enabled:
-            self.assertIn("exported 7/7 shapes at startup", output)
+            self.assertIn("exported 9/9 shapes at startup", output)
             self.assertNotIn("MLX region export failed", output)
             self.assertNotIn("MLX region warm-up execution failed", output)
             self.assertNotIn("MLX region disabled for this model", output)
@@ -142,11 +180,18 @@ class TestQwen3MlxRegion(CustomTestCase):
             self.assertRegex(
                 output, r"Decode batch[^\n]+#running-req: 3[^\n]+cuda graph: True"
             )
+            self.assertRegex(
+                output, r"Prefill batch[^\n]+#new-token: 512[^\n]+cuda graph: True"
+            )
+            self.assertRegex(
+                output, r"Prefill batch[^\n]+#cached-token: 80[^\n]+cuda graph: True"
+            )
         return (
             [cold["output_ids"], warm["output_ids"]]
             + [item["output_ids"] for item in batch]
             + [item["output_ids"] for item in packed]
             + [item["output_ids"] for item in packed_warm]
+            + scored
         )
 
     def test_region_matches_eager_and_reuses_torch_radix_cache(self):

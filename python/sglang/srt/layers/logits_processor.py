@@ -350,6 +350,11 @@ class LogitsMetadata:
     # between requests. Ordinary contiguous batches derive these from lengths.
     extend_last_token_indices: Optional[torch.Tensor] = None
 
+    # Fixed-capacity single-request scoring. The caller supplies live hidden
+    # rows (including trailing padding); the last row also supplies sampling
+    # logits. Output padding is removed by the caller after graph execution.
+    extend_logprob_pruned_indices: Optional[torch.Tensor] = None
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         # MLP-sync may turn an idle rank into a dummy EXTEND for DP prefill
@@ -680,6 +685,32 @@ class LogitsProcessor(nn.Module):
             sample_indices = None
             input_logprob_indices = None
 
+        elif (
+            logits_metadata.forward_mode.is_extend()
+            and logits_metadata.extend_return_logprob
+            and logits_metadata.extend_logprob_pruned_indices is not None
+        ):
+            indices = logits_metadata.extend_logprob_pruned_indices
+            assert len(logits_metadata.extend_seq_lens_cpu) == 1
+            pruned_states = hidden_states[indices]
+            if hidden_states_before_norm is not None:
+                pruned_states_before_norm = hidden_states_before_norm[indices]
+            if aux_hidden_states is not None:
+                aux_pruned_states = (
+                    aux_hidden_states[indices]
+                    if isinstance(aux_hidden_states, torch.Tensor)
+                    else [hidden[indices] for hidden in aux_hidden_states]
+                )
+            capacity = indices.shape[0]
+            sample_indices = torch.full(
+                (1,), capacity - 1, dtype=torch.int64, device=hidden_states.device
+            )
+            input_logprob_indices = torch.arange(
+                capacity, dtype=torch.int64, device=hidden_states.device
+            )
+            logits_metadata.sample_indices_cpu = [capacity - 1]
+            logits_metadata.input_logprob_indices_cpu = list(range(capacity))
+            token_to_seq_idx = [0] * capacity
         elif (
             logits_metadata.forward_mode.is_extend()
             and not logits_metadata.extend_return_logprob

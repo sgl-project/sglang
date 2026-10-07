@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from sglang.srt.hardware_backend.mlx.export_validation import (
+    ServingForwardArg,
     ServingForwardExportWrapper,
     serving_forward_args,
 )
@@ -141,7 +142,7 @@ def test_captured_processor_matches_contiguous_serving(device, mode, scale, fp32
         # Reuse the captured graph with changed live last-token positions.
         if mode == "extend_batch":
             changed = list(args)
-            changed[-1] = indices - 1
+            changed[ServingForwardArg.SAMPLING_INDICES] = indices - 1
             ref = graph(*changed)
             torch.testing.assert_close(
                 execute(*changed).cpu(), ref.cpu(), atol=0.008, rtol=0.03

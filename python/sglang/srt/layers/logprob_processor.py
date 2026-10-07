@@ -664,10 +664,16 @@ class InputLogprobProcessor:
             # These outputs must survive graph replay. Allocate them outside
             # borrowing, then consume and release chunk_logits in the next scope.
             if i == 0:
-                sampled_logits = torch.empty(
-                    (sample_indices.shape[0], chunk_logits.shape[1]),
-                    dtype=chunk_logits.dtype,
-                    device=chunk_logits.device,
+                # A single chunk can gather the final output directly. Besides
+                # avoiding an allocation/copy, this keeps capture functional.
+                sampled_logits = (
+                    chunk_logits[sample_indices]
+                    if num_chunks == 1
+                    else torch.empty(
+                        (sample_indices.shape[0], chunk_logits.shape[1]),
+                        dtype=chunk_logits.dtype,
+                        device=chunk_logits.device,
+                    )
                 )
                 if borrow_logprob_memory:
                     token_logprobs = torch.empty(
@@ -684,7 +690,7 @@ class InputLogprobProcessor:
             # Fill the sampled logits whose rows fall in this chunk.
             s_lo = bisect.bisect_left(sample_indices_cpu, start_idx)
             s_hi = bisect.bisect_left(sample_indices_cpu, end_idx)
-            if s_hi > s_lo:
+            if num_chunks > 1 and s_hi > s_lo:
                 sampled_logits[s_lo:s_hi] = chunk_logits[
                     sample_indices[s_lo:s_hi] - start_idx
                 ]
