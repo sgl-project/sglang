@@ -515,7 +515,13 @@ class TestMinFreeSlotsDelayerWithPrefillDelayer(unittest.TestCase):
             prefill_max_requests=8,
             disable_overlap_schedule=False,
         )
-        parallel = SimpleNamespace(dp_size=1, enable_dp_attention=False, attn_tp_size=1)
+        parallel = SimpleNamespace(
+            num_dp_ranks=1,
+            attn_dp_enabled=False,
+            attn_cp_size=1,
+            attn_tp_size=1,
+            tp_group=SimpleNamespace(cpu_group=None, device_group=None, device="cpu"),
+        )
 
         def gather_local_rank(output, local, group):
             output.copy_(local)
@@ -531,7 +537,6 @@ class TestMinFreeSlotsDelayerWithPrefillDelayer(unittest.TestCase):
             ),
         ):
             delayer = PrefillDelayer(
-                cpu_group=None,
                 max_delay_passes=self.PREFILL_DELAYER_MAX_DELAY_PASSES,
                 token_usage_low_watermark=None,
                 debug_log_enabled=False,
