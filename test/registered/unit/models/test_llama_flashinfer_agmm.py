@@ -377,9 +377,7 @@ class PreparedBindingTests(unittest.TestCase):
             calls = []
             launches = []
 
-            def prepare(
-                inp, w, group, *, backend="auto", max_rows=None, verbose=False
-            ):
+            def prepare(inp, w, group, *, backend="auto", max_rows=None, verbose=False):
                 calls.append((inp, w, group, backend, max_rows, verbose))
 
                 def launch(current):
@@ -404,9 +402,7 @@ class PreparedBindingTests(unittest.TestCase):
                 route._prepared_qkv(second, qkv, group), ("output", second)
             )
             self.assertEqual(len(calls), 1)
-            self.assertEqual(
-                calls[0][3:], ("auto", route._topology.local_rows, False)
-            )
+            self.assertEqual(calls[0][3:], ("auto", route._topology.local_rows, False))
             self.assertEqual(launches, [first, second])
 
             other_weight = FakeSourceWeight(route._topology.packed_qkv_n)
@@ -417,9 +413,7 @@ class PreparedBindingTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             self.assertIs(calls[1][1], other_weight.packed)
 
-            short = types.SimpleNamespace(
-                shape=(route._topology.local_rows - 1, 8192)
-            )
+            short = types.SimpleNamespace(shape=(route._topology.local_rows - 1, 8192))
             with self.assertRaisesRegex(RuntimeError, "differ from the bound topology"):
                 route._prepared_qkv(short, qkv, group)
             self.assertEqual(len(calls), 2)
