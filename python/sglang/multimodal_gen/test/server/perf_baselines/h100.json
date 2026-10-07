@@ -1546,9 +1546,9 @@
             "expected_avg_denoise_ms": 118.58,
             "expected_median_denoise_ms": 109.14,
             "load_peak_vram_mb": 43920.0,
-            "runtime_peak_vram_mb": 57528.0,
+            "runtime_peak_vram_mb": 63002,
             "load_peak_allocated_mb": 43411.0,
-            "runtime_peak_allocated_mb": 54736.0,
+            "runtime_peak_allocated_mb": 59478,
             "estimated_full_test_time_s": 100.4
         },
         "wan2_2_ti2v_5b": {
@@ -2923,9 +2923,9 @@
             "expected_avg_denoise_ms": 520.0,
             "expected_median_denoise_ms": 494.9,
             "load_peak_vram_mb": 46278.0,
-            "runtime_peak_vram_mb": 49390.0,
+            "runtime_peak_vram_mb": 58099,
             "load_peak_allocated_mb": 45460.0,
-            "runtime_peak_allocated_mb": 47725.0,
+            "runtime_peak_allocated_mb": 54333,
             "estimated_full_test_time_s": 167.9
         },
         "ltx_2.3_two_stage_t2v_2gpus": {
@@ -2985,13 +2985,13 @@
             "expected_avg_denoise_ms": 158.2,
             "expected_median_denoise_ms": 145.66,
             "load_peak_vram_mb": 47234.0,
-            "runtime_peak_vram_mb": 59544.0,
+            "runtime_peak_vram_mb": 64663,
             "load_peak_allocated_mb": 46411.0,
-            "runtime_peak_allocated_mb": 56951.0,
+            "runtime_peak_allocated_mb": 61195,
             "estimated_full_test_time_s": 186.0
         },
         "ltx_2_5_diffusion_decoder_2gpus": {
-            "expected_load_ms": 28133.24,
+            "expected_load_ms": 45000.0,
             "stages_ms": {
                 "InputValidationStage": 0.05,
                 "TextEncodingStage": 634.13,
@@ -3017,11 +3017,11 @@
             "expected_e2e_ms": 10141.6,
             "expected_avg_denoise_ms": 261.79,
             "expected_median_denoise_ms": 257.25,
-            "load_peak_vram_mb": 1906,
-            "runtime_peak_vram_mb": 69546,
-            "warmup_peak_vram_mb": 28396,
-            "load_peak_allocated_mb": 1876.14,
-            "runtime_peak_allocated_mb": 48399,
+            "load_peak_vram_mb": 46391,
+            "runtime_peak_vram_mb": 74617,
+            "warmup_peak_vram_mb": 57920,
+            "load_peak_allocated_mb": 46357,
+            "runtime_peak_allocated_mb": 73466,
             "estimated_full_test_time_s": 545.1
         },
         "ltx_2_3_two_stage_ti2v_2gpus": {
@@ -3081,9 +3081,9 @@
             "expected_avg_denoise_ms": 250.16,
             "expected_median_denoise_ms": 242.79,
             "load_peak_vram_mb": 47234.0,
-            "runtime_peak_vram_mb": 60286.0,
+            "runtime_peak_vram_mb": 66398,
             "load_peak_allocated_mb": 46411.0,
-            "runtime_peak_allocated_mb": 56951.0,
+            "runtime_peak_allocated_mb": 61235,
             "estimated_full_test_time_s": 101.4
         },
         "longlive2_t2v": {
@@ -3227,9 +3227,9 @@
             "expected_avg_denoise_ms": 802.06,
             "expected_median_denoise_ms": 747.62,
             "load_peak_vram_mb": 56048.0,
-            "runtime_peak_vram_mb": 59804.0,
+            "runtime_peak_vram_mb": 74105,
             "load_peak_allocated_mb": 55239.0,
-            "runtime_peak_allocated_mb": 57444.0,
+            "runtime_peak_allocated_mb": 69024,
             "estimated_full_test_time_s": 363.2
         },
         "qwen_image_t2i_cache_dit_scm_config_diffusers_1gpu": {
