@@ -37,6 +37,13 @@ impl Responder {
         }
     }
 
+    /// Whether the OpenAI stream has ended, so the rest of `/generate` can be dropped.
+    pub fn done(&self) -> bool {
+        match self {
+            Self::Completion(responder) => responder.done(),
+        }
+    }
+
     /// A `/generate` response with an error status.
     pub fn rejected(body: &[u8]) -> Option<Reply> {
         wire::engine_error_reply(body)

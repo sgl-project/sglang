@@ -10,6 +10,7 @@ use axum::Router;
 use serde_json::{json, Value};
 use sgl_router::discovery::WorkerMode;
 use sgl_router::state::kv_events::HashTree;
+use std::time::Duration;
 use tower::ServiceExt;
 
 use crate::common::cache_aware_fixture::{openai_router, radix_router, MODEL};
@@ -70,6 +71,28 @@ async fn streamed_generate_frames_become_completion_chunks() {
     assert_eq!(chunk(1)["choices"][0]["text"], "k");
     assert_eq!(chunk(1)["choices"][0]["finish_reason"], "stop");
     assert_eq!(events[2], "[DONE]");
+}
+
+/// Python ends the stream at an aborted choice, without waiting for the others.
+#[tokio::test]
+async fn an_aborted_choice_ends_the_stream_at_once() {
+    let abort = "data: {\"index\":1,\"text\":\"\",\"meta_info\":{\"id\":\"r\",\
+        \"finish_reason\":{\"type\":\"abort\",\"message\":\"OOM\",\"status_code\":503}}}\n\n";
+    let pending = "data: {\"text\":\"o\",\"meta_info\":{\"id\":\"r\",\"finish_reason\":null}}\n\n";
+    let frames = [vec![abort], vec![pending; 20], vec!["data: [DONE]\n\n"]].concat();
+    let engine = MockWorker::start_slow_stream(frames, Duration::from_millis(100)).await;
+    let app = openai_router(&[(&engine, WorkerMode::Plain)]);
+
+    let request = json!({"model": MODEL, "prompt": "hi", "n": 2, "stream": true});
+    let reply = tokio::time::timeout(Duration::from_secs(1), complete(&app, request));
+    let (status, body) = reply.await.expect("the stream outlived the abort");
+    assert_eq!(status, StatusCode::OK);
+    let events = parse_sse_data(&body);
+    assert_eq!(
+        serde_json::from_str::<Value>(&events[0]).unwrap()["error"]["code"],
+        503
+    );
+    assert_eq!(events[1..], ["[DONE]"]);
 }
 
 #[tokio::test]
