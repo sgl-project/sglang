@@ -361,6 +361,27 @@ class DiffusionTestCase:
         ):
             raise ValueError(f"{self.id}: request warmup requires non-realtime metrics")
 
+        # A consistency golden records one path, and these were recorded on the
+        # reference one, so the case asks for it by name instead of inheriting
+        # whichever level is the server default. Without this the check would
+        # answer two questions at once -- "did the code regress" and "how far
+        # is the default level from the goldens" -- and spend its whole budget
+        # on the second: the default's own drift already sits at SSIM 0.91
+        # against goldens whose threshold is 0.92. A case that names a level
+        # keeps it; refreshing the goldens onto the default level is what
+        # removes the pin.
+        # Replaces rather than mutates: several cases share one module-level
+        # sampling-params instance.
+        if self.run_consistency_check and "quality" not in self.sampling_params.extras:
+            object.__setattr__(
+                self,
+                "sampling_params",
+                replace(
+                    self.sampling_params,
+                    extras={**self.sampling_params.extras, "quality": "exact"},
+                ),
+            )
+
         has_startup_lora = self.server_args.lora_path is not None
         has_dynamic_lora = self.server_args.dynamic_lora_path is not None
         has_second_lora = self.server_args.second_lora_path is not None
