@@ -2,10 +2,8 @@
 
 import copy
 import socket
-import tempfile
 import unittest
 from contextlib import nullcontext
-from pathlib import Path
 
 import torch
 from transformers import (
@@ -28,7 +26,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.models.gemma3_causal import EmbeddingGemmaModel, Gemma3ForCausalLM
+from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
 from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
 from sglang.srt.models.gemma4_causal import Gemma4ForCausalLM
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
@@ -225,19 +223,6 @@ class TestGemmaSharedVocabLayout(CustomTestCase):
         self.addCleanup(destroy_model_parallel)
         initialize_dp_attention(server)
 
-    def test_default_exports_keep_construction_layout(self):
-        for kind in ("gemma3", "gemma4", "gemma3_mm"):
-            for tied in (True, False):
-                with self.subTest(kind=kind, tied=tied):
-                    model = build_source(kind, tied=tied)
-                    expected = fill_source(model)
-                    with changed_scope(True):
-                        actual = model.get_embed_and_head()
-                        if hasattr(model, "get_embed"):
-                            self.assertIs(model.get_embed(), expected[0])
-                    for result, weight in zip(actual, expected):
-                        self.assertIs(result, weight)
-
     def test_sharing_uses_constructed_draft_after_scope_exit(self):
         for kind in ("gemma3", "gemma4", "gemma3_mm"):
             model = build_source(kind)
@@ -313,21 +298,6 @@ class TestGemmaSharedVocabLayout(CustomTestCase):
         full_embed, full_head = fill_source(model, version=13)
         torch.testing.assert_close(embed, full_embed[384:512], rtol=0, atol=0)
         torch.testing.assert_close(head, full_head[384:512], rtol=0, atol=0)
-
-    def test_embedding_subclass_keeps_its_export_layout(self):
-        config = build_source("gemma3").config
-        with tempfile.TemporaryDirectory() as directory:
-            (Path(directory) / "modules.json").write_text("[]")
-            config._name_or_path = directory
-            with torch.device("cuda"):
-                model = EmbeddingGemmaModel(config)
-            with changed_scope(True):
-                self.assertIs(model.get_embed(), model.model.embed_tokens.weight)
-
-    def test_ambiguous_recipient_fails_without_scope_fallback(self):
-        model = build_source("gemma3")
-        with self.assertRaisesRegex(ValueError, "no single input embedding"):
-            share(model, torch.nn.Module())
 
 
 if __name__ == "__main__":

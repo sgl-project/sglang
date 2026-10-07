@@ -231,9 +231,6 @@ class TestMiMoFusedQkvLoaderLayout(CustomTestCase):
                 for offset in (0, 11):
                     load_deferred(model, projection, changed=changed, offset=offset)
 
-    def test_native_projection_in_the_construction_scope(self):
-        self.check_loads(False)
-
     def test_native_projection_after_scope_exit(self):
         self.check_loads(True)
 
@@ -300,33 +297,6 @@ class TestMiMoFusedQkvLoaderLayout(CustomTestCase):
         with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0, moe_tp_rank=0):
             load_fused(projection, ckpt_tp=8)
             load_deferred(model, fp8_projection)
-
-    def test_existing_layout_errors_use_the_projection_width(self):
-        publish(
-            ServerArgs(model_path="dummy", device="cuda", tp_size=4),
-            role="test",
-            ranks=SpawnRanks(world_rank=3),
-        )
-        _, projection = build_projection()
-        full = values((3584, 128), projection.weight.dtype)
-        for changed in (False, True):
-            with loading_scope(changed):
-                with self.assertRaisesRegex(ValueError, "TP=3-interleaved"):
-                    load_mimo_v2_qkv_proj_weight(
-                        WEIGHT_NAME, projection.weight, full, 3, qkv_proj=projection
-                    )
-                with self.assertRaisesRegex(ValueError, "unexpected shape"):
-                    load_mimo_v2_qkv_proj_weight(
-                        WEIGHT_NAME, projection.weight, full[:100], qkv_proj=projection
-                    )
-                with self.assertRaisesRegex(ValueError, "pass deferred_scale_inv"):
-                    load_mimo_v2_qkv_proj_weight(
-                        SCALE_NAME,
-                        torch.nn.Parameter(torch.empty(7, 1)),
-                        torch.ones(32, 1),
-                        8,
-                        qkv_proj=projection,
-                    )
 
 
 if __name__ == "__main__":

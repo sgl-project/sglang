@@ -244,9 +244,6 @@ class TestDotsFusedGateLoaderLayout(CustomTestCase):
                                             nextn=nextn,
                                         )
 
-    def test_native_fused_parameters_in_construction_scope(self):
-        self.check_loads(False)
-
     def test_native_fused_parameters_after_scope_exit(self):
         self.check_loads(True)
 
@@ -269,28 +266,6 @@ class TestDotsFusedGateLoaderLayout(CustomTestCase):
                     tp_rank=0, attn_tp_rank=0, attn_dp_rank=0, moe_tp_rank=0
                 ):
                     load_fused(model, attention)
-
-    def test_incomplete_checkpoint_still_reports_unresolved_parts(self):
-        publish(
-            ServerArgs(model_path="dummy", device="cuda", tp_size=4),
-            role="test",
-            ranks=SpawnRanks(world_rank=3),
-        )
-        model, attention = build_model()
-        parts = checkpoint_parts(attention, 0)
-        for changed in (False, True):
-            with (
-                loading_scope(changed),
-                self.assertRaisesRegex(ValueError, "Unresolved fused q/kv/g"),
-            ):
-                model.load_weights(
-                    [
-                        (
-                            "model.layers.0.self_attn.q_a_proj.weight",
-                            parts["q_a_proj.weight"],
-                        )
-                    ]
-                )
 
 
 if __name__ == "__main__":

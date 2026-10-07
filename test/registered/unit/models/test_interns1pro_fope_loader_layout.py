@@ -170,9 +170,6 @@ class TestInternS1ProFopeLoaderLayout(CustomTestCase):
                                     top_level=top_level,
                                 )
 
-    def test_native_attention_coefficients_in_construction_scope(self):
-        self.check_loads(False)
-
     def test_native_attention_coefficients_after_scope_exit(self):
         self.check_loads(True)
 

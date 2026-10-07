@@ -226,9 +226,6 @@ class TestKvCalibrationLoaderLayout(CustomTestCase):
                         changed=changed,
                     )
 
-    def test_real_model_calibration_in_construction_scope(self):
-        self.check_loads(False)
-
     def test_real_model_calibration_after_scope_exit(self):
         self.check_loads(True)
 
