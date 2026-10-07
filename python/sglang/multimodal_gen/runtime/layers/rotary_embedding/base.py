@@ -85,6 +85,34 @@ class RotaryEmbedding(CustomOp):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
+    def _apply_cos_sin(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        q_rot = query[..., : self.rotary_dim]
+        q_pass = query[..., self.rotary_dim :]
+        k_rot = key[..., : self.rotary_dim]
+        k_pass = key[..., self.rotary_dim :]
+
+        q_rotated = _apply_rotary_emb(
+            q_rot,
+            cos,
+            sin,
+            is_neox_style=self.is_neox_style,
+            interleaved=not self.is_neox_style,
+        )
+        k_rotated = _apply_rotary_emb(
+            k_rot,
+            cos,
+            sin,
+            is_neox_style=self.is_neox_style,
+            interleaved=not self.is_neox_style,
+        )
+        return self._combine_rotated_and_pass(q_rotated, k_rotated, q_pass, k_pass)
+
     def _combine_rotated_and_pass(
         self,
         q_rotated: torch.Tensor,
@@ -413,26 +441,7 @@ class RotaryEmbedding(CustomOp):
 
             # Direct DiT-style call: same batch/seq broadcast reasoning as
             # forward_npu's cos/sin path.
-            q_rot = query[..., : self.rotary_dim]
-            q_pass = query[..., self.rotary_dim :]
-            k_rot = key[..., : self.rotary_dim]
-            k_pass = key[..., self.rotary_dim :]
-
-            q_rotated = _apply_rotary_emb(
-                q_rot,
-                cos,
-                sin,
-                is_neox_style=self.is_neox_style,
-                interleaved=not self.is_neox_style,
-            )
-            k_rotated = _apply_rotary_emb(
-                k_rot,
-                cos,
-                sin,
-                is_neox_style=self.is_neox_style,
-                interleaved=not self.is_neox_style,
-            )
-            return self._combine_rotated_and_pass(q_rotated, k_rotated, q_pass, k_pass)
+            return self._apply_cos_sin(query, key, cos, sin)
 
         if query.dim() != 4 or key.dim() != 4:
             raise ValueError(
