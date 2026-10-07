@@ -212,9 +212,9 @@ The vision encoder runs without CP. Image and video embeddings are inserted into
 Use a build that includes [GLM-5.3-Flash prefill CP support](https://github.com/sgl-project/sglang/pull/42044); a build with only the original GLM-5.3-Flash model support is not sufficient. This recipe is for standalone serving on Linux with NVIDIA CUDA and four B200 GPUs.
 </Note>
 
-The following command uses **DSA CP4, KDA TP4, and MoE TP4**, matching the `TestGLM53FlashB200ContextParallel` accuracy and image-input tests. It leaves attention DP at its default of 1 and speculative decoding off. Use this command directly rather than appending CP flags to the DP-Attention or disaggregated deployment recipes above.
+The following command uses **DSA CP4, KDA TP4, and MoE TP4 with native MTP**, matching the `TestGLM53FlashB200ContextParallel` accuracy and image-input tests. It leaves attention DP at its default of 1. Use this command directly rather than appending CP flags to the DP-Attention or disaggregated deployment recipes above.
 
-<Accordion title="Prefill CP4 with KDA and MoE TP4 (4x B200)">
+<Accordion title="Prefill CP4 with KDA and MoE TP4, plus MTP (4x B200)">
 
 ```bash Command
 sglang serve \
@@ -225,6 +225,10 @@ sglang serve \
   --cp-strategy interleave \
   --moe-dense-tp-size 4 \
   --ep-size 1 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
   --dsa-prefill-backend trtllm \
   --dsa-decode-backend trtllm \
   --kv-cache-dtype fp8_e4m3 \
@@ -242,12 +246,13 @@ Key settings:
 - `--enable-prefill-cp --cp-strategy interleave` enables token-interleaved DSA prefill. Zigzag is not the strategy for this recipe.
 - `--tp-size 4 --attn-cp-size 4` uses four ranks in total, not sixteen. With attention DP1, DSA attention TP is 1; KDA partitions its heads across the full TP4 group. SGLang automatically resolves `cp_tp_group_sharing` for this model, so CP and KDA TP reuse the same group. No additional flag is needed; TP and CP sizes must match.
 - `--ep-size 1 --moe-dense-tp-size 4` keeps the MoE and dense FFNs on TP4 instead of expert parallelism or per-rank dense computation.
+- `--speculative-algorithm EAGLE` uses the checkpoint's native MTP layer, with 5 steps, top-k 1, and 6 draft tokens here. Draft prefill uses the same interleaved token layout as the target; target verification and draft decode do not use prefill CP. Omit the four `--speculative-*` arguments to serve without MTP.
 - Do not add `--language-only` when serving images or videos. Send text and multimodal requests to the usual API on port 30000.
 
 KDA retains the same head partition during prefill and decode so its recurrent state stays compatible across phases. DSA KV/index caches and KPool tail state remain replicated: this mode distributes prefill computation, not the persistent DSA cache footprint. It does not enable DSA cache LayerSplit.
 
 <Warning>
-This GLM-5.3-Flash CP/TP-sharing recipe does not support attention DP, speculative decoding, decode context parallelism, mixed prefill/decode chunks, MoE DP, or DSA cache LayerSplit. PD disaggregation is also unsupported because its state transfer does not yet preserve KDA head ownership across CP ranks. The encoder-disaggregation recipe in §3.4 is not covered by this recipe's acceptance tests. These restrictions do not apply to ordinary non-CP serving or to other models' CP implementations.
+This GLM-5.3-Flash CP/TP-sharing recipe supports native MTP with top-k 1, but not separate draft checkpoints, EAGLE3, or DFlash. It does not support attention DP, decode context parallelism, mixed prefill/decode chunks, MoE DP, or DSA cache LayerSplit. PD disaggregation is also unsupported because its state transfer does not yet preserve KDA head ownership across CP ranks. The encoder-disaggregation recipe in §3.4 is not covered by this recipe's acceptance tests. These restrictions do not apply to ordinary non-CP serving or to other models' CP implementations.
 </Warning>
 
 Measure prefill latency on your target prompt lengths and concurrency before choosing CP: KDA's all-gather and reduce-scatter add communication. Keep the TRT-LLM DSA and FP8 KV pairing in this B200 recipe, and size both memory pools as described in [Configuration tips](#size-both-memory-pools).

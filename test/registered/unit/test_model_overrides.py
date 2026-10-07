@@ -255,6 +255,32 @@ class TestCpTpGroupSharing(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, error):
                     self.resolve(**options)
 
+    def test_sharing_supports_native_mtp(self):
+        for algorithm in ("EAGLE", "NEXTN", "eagle", "nextn"):
+            for draft_path in (None, "dummy"):
+                with self.subTest(algorithm=algorithm, draft_path=draft_path):
+                    args = self.resolve(
+                        speculative_algorithm=algorithm,
+                        speculative_draft_model_path=draft_path,
+                        speculative_num_steps=5,
+                        speculative_eagle_topk=1,
+                        speculative_num_draft_tokens=6,
+                    )
+                    self.assertTrue(resolution_result(args, "cp_tp_group_sharing"))
+
+    def test_sharing_rejects_non_native_or_tree_drafts(self):
+        for options in (
+            {"speculative_algorithm": "EAGLE3"},
+            {
+                "speculative_algorithm": "EAGLE",
+                "speculative_draft_model_path": "separate-draft",
+            },
+            {"speculative_algorithm": "EAGLE", "speculative_eagle_topk": 2},
+        ):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(ValueError, "native MTP.*top-k 1"):
+                    self.resolve(**options)
+
 
 class TestModelOverridableWhitelist(CustomTestCase):
     def test_whitelist_derivation_from_annotated_metadata(self):

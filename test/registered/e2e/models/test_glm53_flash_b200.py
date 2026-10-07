@@ -1,8 +1,8 @@
 """B200 per-commit coverage for the GLM-5.3-Flash serving recipes.
 
-Runs the Low Latency, DFlash2, High Throughput, and Prefill CP recipes on four B200
-GPUs. All recipes must retain GSM8K accuracy; the Low Latency recipe also
-checks EAGLE speculative acceptance and single-request decode performance.
+Runs the Low Latency, DFlash2, High Throughput, and Prefill CP + MTP recipes on
+four B200 GPUs. All recipes must retain GSM8K accuracy; CP + MTP also checks
+speculative acceptance, and Low Latency checks single-request decode performance.
 """
 
 import base64
@@ -144,7 +144,7 @@ class TestGLM53FlashB200ContextParallel(
     gsm8k_num_examples = 500
     gsm8k_num_shots = 20
     server_args = [
-        *COMMON_SERVER_ARGS,
+        *TestGLM53FlashB200LowLatency.server_args,
         "--enable-prefill-cp",
         "--cp-strategy",
         "interleave",
@@ -157,6 +157,16 @@ class TestGLM53FlashB200ContextParallel(
         "--moe-dense-tp-size",
         "4",
     ]
+
+    def test_gsm8k(self):
+        super().test_gsm8k()
+        # Require the metric as well as the floor: an accuracy pass alone must
+        # not hide disabled MTP or a draft whose tokens are mostly rejected.
+        response = requests.get(self.base_url + "/server_info", timeout=30)
+        response.raise_for_status()
+        self.assertGreater(
+            response.json()["internal_states"][0]["avg_spec_accept_length"], 4.0
+        )
 
     def test_image_input(self):
         # Color is supplied only by the image: the prompt cannot substitute for
