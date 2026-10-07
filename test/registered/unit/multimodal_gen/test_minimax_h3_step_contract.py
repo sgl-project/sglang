@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.timestep_preparation import (
     MiniMaxH3TimestepPreparationStage,
 )
+from sglang.multimodal_gen.runtime.server_args import server_args as server_args_module
 from sglang.multimodal_gen.tools import (
     build_minimax_h3_adaln_cache,
     fuse_minimax_h3_pdd_heads,
@@ -46,6 +47,15 @@ from sglang.multimodal_gen.tools import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+
+
+@pytest.fixture(autouse=True)
+def global_server_args(monkeypatch):
+    monkeypatch.setattr(
+        server_args_module,
+        "_global_server_args",
+        SimpleNamespace(comfyui_mode=False),
+    )
 
 
 @pytest.fixture
@@ -180,7 +190,7 @@ def test_offline_adaln_builder_prepares_one_plan_per_transition(steps, mode):
     assert all(plan.numel() > 0 for plan in plans)
 
 
-def test_fused_pdd_config_and_warmup_match_head_count(tmp_path):
+def test_fused_pdd_config_and_warmup_match_head_count(tmp_path, admission):
     heads = {
         name: torch.ones(32, 2, 3) if name.endswith("weight") else torch.ones(32, 2)
         for name in (
@@ -207,9 +217,10 @@ def test_fused_pdd_config_and_warmup_match_head_count(tmp_path):
     ):
         preparation = MiniMaxH3TimestepPreparationStage()
     serving = _request(8)
+    admission.forward(serving, SimpleNamespace(minimax_h3_adaln_online=False))
     preparation.forward(serving, SimpleNamespace())
     for steps in (1, 2, 8):
-        warmup = _request(8).copy_as_warmup(steps)
+        warmup = serving.copy_as_warmup(steps)
         preparation.forward(warmup, SimpleNamespace())
         assert len(warmup.timesteps) == steps
         for modality, schedule in warmup.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY].items():
@@ -233,4 +244,4 @@ def test_fused_pdd_config_and_warmup_match_head_count(tmp_path):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, *sys.argv[1:]]))
+    sys.exit(pytest.main([__file__, "-v"]))
