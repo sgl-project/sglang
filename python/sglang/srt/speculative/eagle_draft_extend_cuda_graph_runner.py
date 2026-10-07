@@ -247,8 +247,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 vocab_size = self.model_runner.model_config.vocab_size
 
             next_token_logits_buffer = (
-                self.model_runner.graph_shared_output.get_logits_buffer(
-                    vocab_size, rows=self.max_bs
+                None
+                if getattr(self.model_runner.model, "draft_head_tp", None) is not None
+                else (
+                    self.model_runner.graph_shared_output.get_logits_buffer(
+                        vocab_size, rows=self.max_bs
+                    )
                 )
             )
 
@@ -376,7 +380,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         num_correct_drafts = buffers.num_correct_drafts[:bs]
         num_accept_tokens = buffers.num_accept_tokens[:bs]
         select_index = buffers.select_index[:bs]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:bs]
+        next_token_logits_buffer = (
+            buffers.next_token_logits_buffer[:bs]
+            if buffers.next_token_logits_buffer is not None
+            else None
+        )
 
         # The worker samples only the last accepted row from each request.
         # Keep the full tree width for the draft forward, but run the lm_head
@@ -425,6 +433,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
             out_cache_loc_is_physical=True,
+            mtp_draft_head_tp=getattr(self.model_runner.model, "draft_head_tp", None)
+            is not None,
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -676,7 +686,16 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             self._publish_read_done(in_graph=False)
 
         out = LogitsProcessorOutput(
-            next_token_logits=out.next_token_logits[:raw_bs],
+            next_token_logits=(
+                out.next_token_logits[:raw_bs]
+                if out.next_token_logits is not None
+                else None
+            ),
+            draft_topk_index=(
+                out.draft_topk_index[:raw_bs].clone()
+                if out.draft_topk_index is not None
+                else None
+            ),
             # CUDA graph replay reuses its captured output storage. These states
             # survive into the next draft step, so detach them from that buffer.
             hidden_states=out.hidden_states[:raw_bs].clone(),

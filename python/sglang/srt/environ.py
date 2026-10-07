@@ -255,6 +255,7 @@ class DsparkFoldedSampling(IntEnum):
 
 
 class Envs:
+    SGLANG_MTP_DRAFT_HEAD_TP = EnvBool(False)
     # Organization principles for this registry:
     # - Put every field in exactly one topical section. Prefer an existing
     #   section; add a new one only when no current section is a clear fit.

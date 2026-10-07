@@ -352,6 +352,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
 
+        if envs.SGLANG_MTP_DRAFT_HEAD_TP.get():
+            from sglang.srt.layers.mtp_head_tp import configure_draft_head_tp
+
+            configure_draft_head_tp(self.draft_runner.model, self.hot_token_id)
+
     def _resolve_shared_embed_and_head(self):
         target_runner = self.target_worker.model_runner
         return resolve_draft_embed_and_head(
@@ -784,7 +789,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_inf(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
-                if needs_draft_probs:
+                if logits_output.draft_topk_index is not None:
+                    topk_index = logits_output.draft_topk_index
+                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                    forward_batch.positions.add_(1)
+                    if draft_tokens_topk1 is not None:
+                        draft_tokens_topk1[:, i + 1 : i + 2].copy_(topk_index)
+                elif needs_draft_probs:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
@@ -819,8 +830,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_oob(
                     topk_index,
                     0,
-                    logits_output.next_token_logits.shape[-1],
-                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                    self.draft_runner.model_config.vocab_size,
+                    f"draft_forward step {i}: topk_index OOB",
                 )
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
@@ -1156,7 +1167,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 ]
         # Selected-row top-k remains worker-owned for both graph and eager
         # paths; the graph runner only moves the row selection before lm_head.
-        if get_spec().speculative_use_rejection_sampling:
+        if draft_logits_output.draft_topk_index is not None:
+            ret_topk_index = draft_logits_output.draft_topk_index
+            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            ret_draft_probs = None
+        elif get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,

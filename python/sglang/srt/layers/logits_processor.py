@@ -219,6 +219,7 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    draft_topk_index: Optional[torch.Tensor] = None
 
     # Original flattened token indices when only a subset of hidden rows is captured.
     hidden_states_token_indices: Optional[torch.Tensor] = None
@@ -516,6 +517,7 @@ class LogitsProcessor(nn.Module):
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
         aux_hidden_states: Optional[AuxHiddenStates] = None,
         hidden_states_before_norm: Optional[torch.Tensor] = None,
+        draft_head_tp=None,
     ) -> LogitsProcessorOutput:
         # Extract MIS / setwise indices before ForwardBatch → LogitsMetadata conversion
         multi_item_delimiter_indices = None
@@ -592,6 +594,18 @@ class LogitsProcessor(nn.Module):
             logits_metadata,
         )
         del hidden_states
+
+        if draft_head_tp is not None:
+            assert not logits_metadata.extend_return_logprob and sample_indices is None
+            return LogitsProcessorOutput(
+                next_token_logits=None,
+                hidden_states=hidden_states_to_store,
+                draft_topk_index=draft_head_tp(
+                    pruned_states,
+                    lm_head.weight,
+                    draft_nan_sentinel=logits_metadata.forward_mode.is_decode(),
+                ),
+            )
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.

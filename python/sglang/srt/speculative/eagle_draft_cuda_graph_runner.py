@@ -460,6 +460,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.DECODE,
             out_cache_loc_is_physical=True,
+            mtp_draft_head_tp=getattr(self.model_runner.model, "draft_head_tp", None)
+            is not None,
             batch_size=num_seqs,
             input_ids=None,
             req_pool_indices=req_pool_indices,

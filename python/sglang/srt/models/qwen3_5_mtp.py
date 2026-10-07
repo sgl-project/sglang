@@ -154,6 +154,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
 
         self.logits_processor = LogitsProcessor(config)
+        self.draft_head_tp = None
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -255,7 +256,13 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             exit_stack.close()
 
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            draft_head_tp=(
+                self.draft_head_tp if forward_batch.mtp_draft_head_tp else None
+            ),
         )
 
     def load_weights(
