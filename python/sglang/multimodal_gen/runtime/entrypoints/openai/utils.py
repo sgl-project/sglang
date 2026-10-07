@@ -4,6 +4,7 @@ import dataclasses
 import inspect
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -33,7 +34,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.common import parse_size
-from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
+from sglang.multimodal_gen.runtime.utils.image_io import (
+    ensure_path_within_root,
+    save_base64_image_to_path,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     log_batch_completion,
@@ -214,6 +218,17 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
 
     # pop HTTP-layer params that aren't SamplingParams fields
     output_quality = kwargs.pop("output_quality", None)
+    request_data_type = kwargs.pop("request_data_type", None)
+    if request_data_type is not None:
+        try:
+            kwargs["task_type"] = server_args.pipeline_config.resolve_task_type(
+                kwargs.get("task_type"),
+                data_type=request_data_type,
+                has_image=bool(kwargs.get("image_path")),
+                has_video=bool(kwargs.get("video_path")),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     has_explicit_compression = kwargs.get("output_compression") is not None
 
@@ -240,12 +255,15 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
     kwargs.setdefault("save_output", True)
 
-    sampling_params = SamplingParams.from_user_sampling_params_args(
-        model_path=server_args.model_path,
-        server_args=server_args,
-        request_id=request_id,
-        **kwargs,
-    )
+    try:
+        sampling_params = SamplingParams.from_user_sampling_params_args(
+            model_path=server_args.model_path,
+            server_args=server_args,
+            request_id=request_id,
+            **kwargs,
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # resolve output_quality → output_compression with the correct data_type.
     # SamplingParams.__post_init__ may have resolved with the wrong data_type
@@ -285,14 +303,33 @@ def resolve_sampling_params_cls(server_args: Any) -> type[SamplingParams]:
     return sampling_params_cls
 
 
+def sanitize_upload_filename(filename: str, fallback: str) -> str:
+    name = os.path.basename((filename or "").replace("\\", "/"))
+    if not name or name in {".", ".."}:
+        name = fallback
+
+    stem, ext = os.path.splitext(name)
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
+    safe_ext = re.sub(r"[^A-Za-z0-9.]+", "", ext)
+    if not safe_stem:
+        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", fallback).strip("._") or "upload"
+    return f"{safe_stem}{safe_ext}"
+
+
 async def save_image_to_path(
     image: Union[UploadFile, bytes, str],
     target_path: str,
     *,
     prefer_remote_source: bool = False,
+    uploads_root: str | None = None,
 ) -> str:
+    if uploads_root is not None:
+        target_path = ensure_path_within_root(target_path, uploads_root)
     input_path = await _maybe_url_image(
-        image, target_path, prefer_remote_source=prefer_remote_source
+        image,
+        target_path,
+        prefer_remote_source=prefer_remote_source,
+        uploads_root=uploads_root,
     )
     if input_path is None:
         input_path = await _save_upload_to_path(image, target_path)
@@ -331,6 +368,7 @@ async def _maybe_url_image(
     target_path: str,
     *,
     prefer_remote_source: bool = False,
+    uploads_root: str | None = None,
 ) -> str | None:
     if not isinstance(img_url, str):
         return None
@@ -341,19 +379,25 @@ async def _maybe_url_image(
         if prefer_remote_source:
             return img_url
         # download image from URL and persist on disk
-        input_path = await _save_url_image_to_path(img_url, target_path)
+        input_path = await _save_url_image_to_path(
+            img_url, target_path, uploads_root=uploads_root
+        )
         return input_path
     elif img_url.startswith("data:image"):
         if prefer_remote_source:
             return img_url
         # encode image base64 url and persist on disk
-        input_path = save_base64_image_to_path(img_url, target_path)
+        input_path = save_base64_image_to_path(
+            img_url, target_path, uploads_root=uploads_root
+        )
         return input_path
     else:
         raise ValueError("Unsupported image url format")
 
 
-async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
+async def _save_url_image_to_path(
+    image_url: str, target_path: str, *, uploads_root: str | None = None
+) -> str:
     """Download image from URL and save to target path."""
 
     def _is_retryable_download_error(error: Exception) -> bool:
@@ -419,6 +463,8 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
                             )
                         target_path = f"{target_path}{ext}"
 
+                    if uploads_root is not None:
+                        target_path = ensure_path_within_root(target_path, uploads_root)
                     with open(target_path, "wb") as f:
                         f.write(response.content)
 
@@ -480,6 +526,7 @@ async def process_generation_batch(
                 audio=result.audio,
                 audio_sample_rate=result.audio_sample_rate,
                 output_compression=batch.output_compression,
+                x264_preset=batch.x264_preset,
                 enable_frame_interpolation=batch.enable_frame_interpolation,
                 frame_interpolation_exp=batch.frame_interpolation_exp,
                 frame_interpolation_scale=batch.frame_interpolation_scale,
