@@ -502,6 +502,7 @@ class ResponseTemplateReasoningDetector:
         tools: list[dict[str, Any]],
         parallel_tool_calls: bool = True,
         message_start: bool = False,
+        undeclared_names: bool = False,
     ) -> dict[str, Any] | None:
         """A structural tag for JSON framed as the answer, after the reasoning
         or, at the `message_start`, from the first token, or `None` to apply the
@@ -563,6 +564,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
 
     response_template: dict | None = None
     constrains_every_turn = False
+    forwards_unknown_tools = False
 
     def __init__(
         self,
@@ -606,6 +608,16 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
             for event in adapter.parse(text)
         )
 
+    def _forward_unknown_tools(self) -> bool:
+        return self.forwards_unknown_tools or envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+
+    def admits_undeclared_tools(self) -> bool:
+        """Whether grammars may let automatic calls name undeclared tools."""
+        return (
+            self._forward_unknown_tools()
+            and envs.SGLANG_TOOL_STRICT_LEVEL.get() < ToolStrictLevel.FUNCTION
+        )
+
     def _to_tool_call_item(
         self, value: Any, tool_indices: dict[str, int], tool_index: int
     ) -> ToolCallItem | None:
@@ -623,7 +635,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
 
         if name not in tool_indices:
             logger.warning("Model attempted to call undefined function: %s", name)
-            if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+            if not self._forward_unknown_tools():
                 return None
 
         if not isinstance(arguments, str):
@@ -728,7 +740,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         pending_calls: list[ToolCallItem] = []
 
         def on_open(name: str) -> bool:
-            if name not in tool_indices and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+            if name not in tool_indices and not self._forward_unknown_tools():
                 return False
             self._emit_tool_name(name, pending_calls)
             return True

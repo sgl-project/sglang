@@ -85,6 +85,7 @@ class BeamReasoningDetector(ResponseTemplateReasoningDetector):
         tools: list[dict[str, Any]],
         parallel_tool_calls: bool = True,
         message_start: bool = False,
+        undeclared_names: bool = False,
     ) -> dict[str, Any] | None:
         if not self.think_end_token or self._content_field is None:
             return None
@@ -97,4 +98,5 @@ class BeamReasoningDetector(ResponseTemplateReasoningDetector):
             answer_format={"type": "json_schema", "json_schema": json_schema},
             message_start=self._message_start if message_start else None,
             grammar_requires_reasoning=True,
+            undeclared_names=undeclared_names,
         )
