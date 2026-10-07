@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import token_req_indices
 from sglang.srt.layers.engram import EngramHasher
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -174,6 +175,51 @@ class TestTokenReqIndicesCompactVerify(CustomTestCase):
             token_req_indices(uniform, num_tokens=12),
             token_req_indices(dense, num_tokens=12),
         )
+
+
+class TestCapturedVariantsReadStagedLayout(CustomTestCase):
+    """DeepSeek-V4.1 captures each verify token tier once per attention variant.
+    Replay stages the live lengths into the tier's registered layout, and both
+    lookups must see them from the graphs of every variant."""
+
+    def test_every_variant_maps_tokens_to_live_requests(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        num_tokens, num_slots = 12, 8
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = True
+        runner.max_bs = num_slots
+        runner.captured_req_width = WIDTH
+        runner.capture_num_tokens = [WIDTH, 2 * WIDTH, 4 * WIDTH, 8 * WIDTH]
+        runner.device = "cpu"
+        runner._captured_ragged_layouts = {}
+        with envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.override(False):
+            captured = {
+                variant: runner._capture_ragged_verify_layout(num_tokens)
+                for variant in ("candidate_unfiltered", "candidate_filtered")
+            }
+
+        # Live step: request slot 7 verifies 6 tokens and slot 9 verifies 1.
+        lens = [6, 1]
+        total = sum(lens)
+        live = packed_layout(lens, num_tokens, "cpu")
+        runner._stage_ragged_verify_layout(live, num_tokens)
+        slots = torch.tensor([7, 9] + [0] * (num_slots - len(lens)))
+        h = make_hasher("cpu", 8)
+        ids, positions = packed_inputs(lens, num_tokens, "cpu")
+        eager = h(ids, verify_batch(slots[: len(lens)], positions, live))
+        for variant, layout in captured.items():
+            with self.subTest(variant=variant):
+                batch = verify_batch(slots, positions, layout)
+                self.assertEqual(
+                    token_req_indices(batch, num_tokens=num_tokens)[:total].tolist(),
+                    [7] * 6 + [9],
+                )
+                torch.testing.assert_close(
+                    h(ids, batch)[:total], eager[:total], rtol=0, atol=0
+                )
 
 
 if __name__ == "__main__":
