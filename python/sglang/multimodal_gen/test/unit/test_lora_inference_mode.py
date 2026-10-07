@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
@@ -102,3 +103,43 @@ def test_lora_merge_unmerge_handles_inference_base_weight():
     assert not layer.merged
     assert not layer.base_layer.weight.is_inference()
     assert torch.allclose(layer.base_layer.weight, base_weight)
+
+
+class _AtenMulCounter(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.count = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func.overloadpacket is torch.ops.aten.mul:
+            self.count += 1
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize("kind", ["linear", "replicated"])
+@pytest.mark.parametrize("runtime_scale", [None, 1.0, 0.5])
+def test_unit_request_lora_scale_adds_no_delta_multiply(kind, runtime_scale):
+    """An unmerged LoRA forward at runtime scale 1.0 multiplies the delta once.
+
+    Every LoRA linear runs per denoising step, so an extra elementwise kernel
+    per call slows LoRA stages (LTX-2 refinement by ~6%).
+    """
+    base = (
+        ReplicatedLinear(4, 3, bias=False)
+        if kind == "replicated"
+        else nn.Linear(4, 3, bias=False)
+    )
+    layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2)
+    layer.set_lora_weights(
+        torch.ones(2, 4), torch.ones(3, 2), strength=0.5, merge_weights=False
+    )
+    x = torch.ones(2, 4)
+    counter = _AtenMulCounter()
+    if runtime_scale is None:
+        with counter:
+            layer(x)
+    else:
+        batch = SimpleNamespace(runtime_lora_scale=runtime_scale)
+        with set_forward_context(0, None, forward_batch=batch), counter:
+            layer(x)
+    assert counter.count == (1 if runtime_scale in (None, 1.0) else 2)

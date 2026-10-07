@@ -181,7 +181,9 @@ class BaseLayerWithLoRA(nn.Module):
             delta = delta * (
                 self.lora_alpha / self.lora_rank  # type: ignore
             )  # type: ignore
-        delta = delta * self.strength * runtime_lora_scale
+        delta = delta * self.strength
+        if runtime_lora_scale != 1.0:
+            delta = delta * runtime_lora_scale
         out, output_bias = self.base_layer(x)
         out = out + delta.to(dtype=out.dtype)
         return self._add_lora_output_offset(out), output_bias
@@ -716,7 +718,9 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
                 delta_parallel = delta_parallel * (
                     self.lora_alpha / self.lora_rank  # type: ignore
                 )  # type: ignore
-            delta_parallel = delta_parallel * self.strength * runtime_lora_scale
+            delta_parallel = delta_parallel * self.strength
+            if runtime_lora_scale != 1.0:
+                delta_parallel = delta_parallel * runtime_lora_scale
             output_parallel = output_parallel + delta_parallel.to(
                 dtype=output_parallel.dtype
             )
@@ -861,7 +865,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
                 delta_parallel = delta_parallel * (
                     self.lora_alpha / self.lora_rank  # type: ignore
                 )  # type: ignore
-            delta_parallel = delta_parallel * self.strength * runtime_lora_scale
+            delta_parallel = delta_parallel * self.strength
+            if runtime_lora_scale != 1.0:
+                delta_parallel = delta_parallel * runtime_lora_scale
             output_parallel = output_parallel + delta_parallel.to(
                 dtype=output_parallel.dtype
             )
@@ -939,7 +945,9 @@ class LinearWithLoRA(BaseLayerWithLoRA):
                 delta = delta * (
                     self.lora_alpha / self.lora_rank  # type: ignore
                 )  # type: ignore
-            delta = delta * self.strength * runtime_lora_scale
+            delta = delta * self.strength
+            if runtime_lora_scale != 1.0:
+                delta = delta * runtime_lora_scale
             # nn.Linear.forward() returns a single tensor, not a tuple
             out = self.base_layer(x)
             out = out + delta.to(dtype=out.dtype)
