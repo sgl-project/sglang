@@ -20,6 +20,20 @@ class WindowLayout(msgspec.Struct, frozen=True):
     commit_mask: torch.Tensor
     size: int
 
+    def leading_rows(self, num_rows: int) -> "WindowLayout":
+        """The layout of the live queries; a prefill CUDA graph pads the rest."""
+        if num_rows == self.pos.numel():
+            return self
+        return msgspec.structs.replace(
+            self,
+            req=self.req[:num_rows],
+            pos=self.pos[:num_rows],
+            write_loc=self.write_loc[:num_rows],
+            indices=self.indices[:num_rows],
+            lengths=self.lengths[:num_rows],
+            commit_mask=self.commit_mask[:num_rows],
+        )
+
     def copy_(self, other: "WindowLayout") -> None:
         # Captured copy kernels read these tensors by address, so a graph replay
         # must refresh their contents in place, not rebind the object.
@@ -61,7 +75,10 @@ def window_layout(
     capacity: int = 256,
     floor: Optional[torch.Tensor] = None,
     num_groups: Optional[int] = None,
+    padded_rows: Optional[int] = None,
 ):
+    """padded_rows is set for the prefill CUDA graph, which pads the layout to that
+    many query rows past the live ones in req and pos."""
     n = pos.numel()
     if n == 0:
         raise ValueError("request-window layout needs at least one query")
@@ -107,6 +124,26 @@ def window_layout(
     history_loc = torch.arange(history_rows, device=device)
 
     commit_mask = (group_last - offset) < capacity
+    if padded_rows is not None and padded_rows > n:
+        # Padding rows write the workspace past the live rows and commit nowhere.
+        padding = padded_rows - n
+        zeros = req.new_zeros(padding)
+        req, pos = torch.cat([req, zeros]), torch.cat([pos, zeros])
+        write_loc = torch.cat(
+            [
+                write_loc,
+                torch.arange(
+                    history_rows + n,
+                    history_rows + padded_rows,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+            ]
+        )
+        indices = torch.cat([indices, indices.new_full((padding, window), -1)])
+        lengths = torch.cat([lengths, lengths.new_zeros(padding)])
+        commit_mask = torch.cat([commit_mask, commit_mask.new_zeros(padding)])
+        n = padded_rows
     return WindowLayout(
         req,
         pos,

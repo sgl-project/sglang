@@ -198,5 +198,35 @@ class TestDecoderBoundedReplayPrefillGraph(CustomTestCase):
             )
 
 
+class TestEncoderBoundedReplayPrefillGraph(CustomTestCase):
+    @override_platform(is_hip=False, is_npu=False, is_musa=False, is_cuda=True)
+    def test_only_the_breakable_prefill_graph_is_admitted(self):
+        """Only the breakable graph pads the request windows to captured rows and
+        re-activates them at replay."""
+
+        def args(backend):
+            return _cp_args(
+                "DeepseekV41ForCausalLM",
+                "deepseek_v41",
+                enable_prefill_cp=False,
+                enable_encoder_swa_bounded_replay=True,
+                max_running_requests=16,
+                chunked_prefill_size=8192,
+                cuda_graph_config=with_phase(
+                    default_cuda_graph_config(), Phase.PREFILL, backend=backend
+                ),
+            )
+
+        for backend in (Backend.DISABLED, Backend.BREAKABLE):
+            with self.subTest(backend=backend):
+                validate_deepseek_v41_features(args(backend))
+        for backend in (Backend.FULL, Backend.TC_PIECEWISE):
+            with (
+                self.subTest(backend=backend),
+                self.assertRaisesRegex(ValueError, "other than breakable"),
+            ):
+                validate_deepseek_v41_features(args(backend))
+
+
 if __name__ == "__main__":
     unittest.main()

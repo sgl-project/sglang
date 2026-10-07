@@ -235,8 +235,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 ),
             ),
             (
-                "prefill CUDA graphs",
-                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+                "prefill CUDA graphs other than breakable",
+                cfg.cuda_graph_config.prefill.backend
+                not in (Backend.DISABLED, Backend.BREAKABLE),
+            ),
+            (
+                "the prefill CUDA graph on ROCm",
+                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+                and get_platform().is_hip,
             ),
             ("DP attention", attn_dp_enabled_of(cfg)),
             ("context parallelism", cfg.attn_cp_size > 1),
@@ -312,8 +318,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     if (
         prefill_graph.backend != Backend.DISABLED
         and prefill_graph.max_seq_len is None
-        # Decoder bounded replay runs the indexer at a graph break, not captured.
+        # Bounded replay runs the indexer at a graph break, not captured.
         and not cfg.enable_decoder_swa_bounded_replay
+        and not cfg.enable_encoder_swa_bounded_replay
     ):
         # The captured low-ratio indexer scores a static context width; 16k
         # keeps it inside the candidate window at under 1 ms per layer.
