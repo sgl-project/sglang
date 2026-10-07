@@ -45,12 +45,12 @@ const ADMISSION_PENDING: u8 = 0;
 const ADMISSION_ACCEPTED: u8 = 1;
 const ADMISSION_CANCELLED: u8 = 2;
 
-/// Cancellation-safe ownership handoff between a frontend call and Intake.
+/// Cancellation-safe ownership handoff between a core call and Intake.
 ///
 /// A bounded `send_async` can enqueue a request and wake its sender without the
 /// sender being polled again. If that task is then cancelled, this token decides
 /// exactly one outcome: either Intake observes the prior cancellation and drops
-/// the request, or the frontend observes prior admission and emits an abort.
+/// the request, or the core observes prior admission and emits an abort.
 #[derive(Clone)]
 pub struct RequestAdmission {
     state: Arc<AtomicU8>,
@@ -91,7 +91,7 @@ impl RequestAdmission {
 /// cannot be tangled up with an abort still in flight for the original.
 #[derive(Clone, Debug)]
 pub enum AbortSource {
-    /// From an in-flight frontend call drop. Owns the release.
+    /// From an in-flight core call drop. Owns the release.
     Guard(Rid),
     /// From a detokenizer terminal path. Aborts the scheduler work.
     Detok(Rid),
