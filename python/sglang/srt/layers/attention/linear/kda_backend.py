@@ -414,6 +414,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self.prefill_graph_max_seqs = envs.SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS.get()
         # Needed by the extra_buffer track path: _init_track_conv_indices reads
         # conv_states_shape[-1] as the conv window length (kernel_size - 1).
         # The KDA pool stores conv states as [kernel-1, dim] — transposed vs
@@ -554,22 +555,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
     def prefill_graph_extend_active(self) -> bool:
         return self.prefill_graph_metadata is not None
 
-    def prefill_graph_max_seqs(self) -> int:
-        return envs.SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS.get()
-
     def init_prefill_graph_metadata(
         self, forward_batch: ForwardBatch
     ) -> KDAPrefillGraphMetadata:
         cache_indices = self._prefill_graph_cache_indices(forward_batch)
         meta = KDAPrefillGraphMetadata.allocate(
             num_tokens=forward_batch.positions.shape[0],
-            max_seqs_cap=self.prefill_graph_max_seqs(),
-            # Same predicate that gives the prefill runner its track buffers:
-            # any replay of this bucket may carry prefix-cache snapshots.
-            track=(
-                get_exec().mamba.enable_mamba_extra_buffer
-                and not get_memory().disable_radix_cache
-            ),
+            max_seqs_cap=self.prefill_graph_max_seqs,
+            # Any replay of this bucket may carry prefix-cache snapshots (the
+            # extra buffer is only on with the radix cache).
+            track=get_exec().mamba.enable_mamba_extra_buffer,
             cache_index_dtype=cache_indices.dtype,
             device=self.device,
         )

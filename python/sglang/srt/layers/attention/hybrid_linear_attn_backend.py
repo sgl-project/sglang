@@ -73,6 +73,10 @@ class MambaAttnBackendBase(AttentionBackend):
     # else — update_mamba_state_after_mtp_verify keys the fused branch on it.
     accept_lens_pool: Optional[torch.Tensor] = None
 
+    # Most sequences the prefill graph tables hold (larger batches replay no
+    # graph); set at init by backends whose supports_prefill_graph_extend holds.
+    prefill_graph_max_seqs: int
+
     def __init__(self, model_runner: ModelRunner):
         self.validate_mis_support(model_runner.server_args)
         super().__init__()
@@ -122,10 +126,6 @@ class MambaAttnBackendBase(AttentionBackend):
     def prefill_graph_extend_active(self) -> bool:
         """Whether the extend being captured or replayed runs on those tables."""
         return False
-
-    def prefill_graph_max_seqs(self) -> int:
-        """Most sequences those tables hold; larger batches replay no graph."""
-        raise NotImplementedError()
 
     def init_prefill_graph_metadata(self, forward_batch: ForwardBatch):
         raise NotImplementedError()
@@ -1211,7 +1211,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
         if self.use_captured_forward_metadata_for_breakable_cuda_graph:
             self.prefill_cuda_graph_max_batch_size = (
-                linear_attn_backend.prefill_graph_max_seqs()
+                linear_attn_backend.prefill_graph_max_seqs
             )
             logger.info(
                 "Breakable prefill CUDA graphs capture the %s extend.",

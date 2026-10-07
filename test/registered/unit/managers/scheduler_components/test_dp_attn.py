@@ -376,8 +376,9 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         self.assertTrue(runner.can_replay_locally.call_args.kwargs["is_mixed"])
 
     def test_batch_over_captured_metadata_bound_votes_eager(self):
-        """A batch over the captured attention metadata's request bound votes
-        eager, so no dp rank replays while another falls back at forward time."""
+        """An extend or mixed batch over the captured attention metadata's
+        request bound votes eager, so no dp rank replays while another falls
+        back at forward time."""
         runner_cls = dp_attn.PrefillCudaGraphRunner
         runner = Mock(spec=runner_cls)
         runner.enable_lora = False
@@ -385,6 +386,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         runner._qwen_bcg_hc_sidechannel = False
         runner._is_full_backend = False
         runner._captured_attn_metadata_max_bs = 2
+        runner.prefer_eager_mixed_prefill = False
         runner.prefill_backend_name = Backend.BREAKABLE
         runner.has_mha_companion_layers = False
         runner._has_uncapturable_chunked_prefix.return_value = False
@@ -395,9 +397,9 @@ class TestPrefillCudaGraphVote(CustomTestCase):
             runner_cls.can_replay_locally(self=runner, **kwargs)
         )
 
-        def vote(batch_size):
+        def vote(mode, batch_size):
             batch = SimpleNamespace(
-                forward_mode=ForwardMode.EXTEND,
+                forward_mode=mode,
                 extend_num_tokens=48,
                 multimodal_inputs=None,
                 input_embeds=None,
@@ -415,8 +417,11 @@ class TestPrefillCudaGraphVote(CustomTestCase):
                 model_config=object(),
             )
 
-        self.assertTrue(vote(2))
-        self.assertFalse(vote(3))
+        # Mixed batches (--enable-mixed-chunk) count their decode rows too.
+        for mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            with self.subTest(mode=mode):
+                self.assertTrue(vote(mode, batch_size=2))
+                self.assertFalse(vote(mode, batch_size=3))
 
     @patch.object(dp_attn, "get_parallel")
     @patch.object(dp_attn, "all_gather_single")
