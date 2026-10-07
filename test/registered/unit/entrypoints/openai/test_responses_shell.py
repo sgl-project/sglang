@@ -135,7 +135,7 @@ def test_beam_shell_call_and_client_result_continuation(
     raw = (
         "<|channel|>analysis<|message|>Run it.<|end|>"
         "<|start|>assistant to=bash<|channel|>analysis <|constrain|>xml<|message|>"
-        f'<rfl:parameter name="command">{command}</rfl:parameter><|call|>'
+        f'<rfl:parameter name="command">\n{command}\n</rfl:parameter><|call|>'
     )
     engines = []
 
@@ -343,7 +343,7 @@ def test_concurrent_shell_and_function_requests_keep_separate_translation(
     raw = (
         "<|channel|>analysis<|message|>Run it.<|end|>"
         "<|start|>assistant to=bash<|channel|>analysis <|constrain|>xml<|message|>"
-        '<rfl:parameter name="command">pwd</rfl:parameter><|call|>'
+        '<rfl:parameter name="command">\npwd\n</rfl:parameter><|call|>'
     )
 
     async def run():
@@ -413,7 +413,7 @@ def test_truncated_shell_history_can_be_continued(shell_serving, stream):
     raw = (
         "<|channel|>analysis<|message|>Run.<|end|>"
         "<|start|>assistant to=bash<|channel|>analysis <|constrain|>xml<|message|>"
-        '<rfl:parameter name="command">pw'
+        '<rfl:parameter name="command">\npw'
     )
 
     async def generate(*args):
@@ -462,7 +462,7 @@ def test_native_shell_and_client_function_use_separate_declarations(
     }
 
     def call(name):
-        return f'<|start|>assistant to={name}<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="command">pwd</rfl:parameter><|call|>'
+        return f'<|start|>assistant to={name}<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="command">\npwd\n</rfl:parameter><|call|>'
 
     async def generate(*args):
         raw = "<|channel|>analysis<|message|>Run.<|end|>"
