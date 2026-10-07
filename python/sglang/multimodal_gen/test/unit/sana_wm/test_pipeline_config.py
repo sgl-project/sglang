@@ -1522,7 +1522,7 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
                 stage = SanaWMRefinerDecodingStage(vae=vae)
                 batch = SimpleNamespace(
                     latents=torch.empty(1, 128, 4, 2, 2),
-                    sampling_params=SimpleNamespace(quality="default"),
+                    sampling_params=SanaWMSamplingParams(),
                     extra={"sana_wm_refiner_applied": applied},
                     return_trajectory_decoded=False,
                     trajectory_timesteps=None,
