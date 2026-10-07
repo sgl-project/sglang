@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 import torch
@@ -8,12 +9,24 @@ import torch
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
+from sglang.kernels.ops.speculative.dspark.markov_walk import (
+    MARKOV_RANK,
+    MAX_BS,
+    MAX_STEPS,
+    MarkovWalker,
+)
 from sglang.srt.environ import DsparkFoldedSampling, envs
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.models.dspark import VanillaMarkov
+from sglang.srt.runtime_context import get_disagg
+from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
+    block_accept_estimate_enabled,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     select_draft_hidden_without_anchor,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
+from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +103,36 @@ class DsparkDraftSampler:
                 dtype=_base_logits_dtype(model),
                 device=device,
             )
+        self._markov_walker: Optional[MarkovWalker] = None
+        self._zero_temperature = None
+        # Rows below this may still be non-greedy from the last sampling batch.
+        self._sampling_rows_hi = 0
+
+    def attach_int8_markov_walker(self, walker: MarkovWalker) -> None:
+        """Route every graph bucket the walker supports through it; must run
+        before capture, the branch in __call__ is fixed per captured bucket."""
+        assert walker.gamma == self.gamma, (walker.gamma, self.gamma)
+        walker.warmup(corrected_out=self.corrected_out)
+        if self.folded_sampling:
+            # The kernel skips greedy rows, and the mixed-batch verifier
+            # softmaxes every row: they must hold finite values, not torch.empty.
+            self.corrected_out.zero_()
+            self._zero_temperature = self.temperatures.new_zeros(())
+        self.markov_head._derived_weight_cache_error = (
+            "Online weight updates are not supported with "
+            "SGLANG_DSPARK_OPT_INT8_MARKOV_WALK=1: the draft walks an int8 copy "
+            "of the markov head made at startup. Restart without it to update "
+            "weights online."
+        )
+        self._markov_walker = walker
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before
         the draft graph replay that consumes them."""
         if not self.folded_sampling:
             return
+        if self._markov_walker is not None:
+            self._clear_stale_sampling_rows(bs=bs, sampling_info=sampling_info)
         if sampling_info is None:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
@@ -106,6 +143,14 @@ class DsparkDraftSampler:
             out=self.temperatures[:bs],
         )
         self.greedy_mask[:bs].copy_((sampling_info.top_ks <= 1).view(-1)[:bs])
+
+    def _clear_stale_sampling_rows(self, *, bs: int, sampling_info) -> None:
+        # The graph walks the padded bucket but staging writes [:bs]; a stale
+        # non-greedy pad row would make the int8 kernel sample it for nothing.
+        if self._sampling_rows_hi > bs:
+            self.greedy_mask[bs : self._sampling_rows_hi].fill_(True)
+        all_greedy = sampling_info is None or sampling_info.is_all_greedy
+        self._sampling_rows_hi = 0 if all_greedy else bs
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.query_token_num
@@ -121,7 +166,46 @@ class DsparkDraftSampler:
         base_logits, confidence_tap = self.model.compute_base_logits(model_hidden)
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.query_token_num)[:, 0]
+        # bs is the padded graph bucket, a Python int: fixed per captured graph.
+        if self._markov_walker is not None and self._markov_walker.supports(bs):
+            draft_tokens = self._walk_int8(base_logits=base_logits, anchor=anchor)
+        else:
+            draft_tokens = self._walk_stock(
+                base_logits=base_logits, anchor=anchor, sample_hidden=sample_hidden
+            )
+        if self.confidence_out is not None:
+            confidence = self.confidence_fn(
+                draft_hidden=sample_hidden,
+                anchor_tokens=anchor,
+                draft_tokens=draft_tokens,
+                confidence_tap=confidence_tap,
+            )
+            self.confidence_out[:bs].copy_(confidence)
 
+    def _walk_int8(self, *, base_logits, anchor) -> torch.Tensor:
+        bs = base_logits.shape[0]
+        n = bs * self.gamma
+        temps, corrected = None, None
+        if self.folded_sampling:
+            # Kernel greedy is T <= 0; sglang marks greedy rows by top_k <= 1.
+            temps = self._markov_walker.temps_buf[:bs]
+            torch.where(
+                self.greedy_mask[:bs],
+                self._zero_temperature,
+                self.temperatures[:bs],
+                out=temps,
+            )
+            corrected = self.corrected_out[:n]
+        return self._markov_walker.walk(
+            base_logits=base_logits,
+            anchor=anchor,
+            temps=temps,
+            tokens_out=self.out[:n],
+            corrected_out=corrected,
+        )
+
+    def _walk_stock(self, *, base_logits, anchor, sample_hidden) -> torch.Tensor:
+        bs = base_logits.shape[0]
         # Fused greedy fast path: only valid for the greedy (non-sampling) fold.
         # Gated/RNN subclasses return None (hidden-state-dependent bias); fall
         # through to the block sampler below.
@@ -174,14 +258,7 @@ class DsparkDraftSampler:
                 )
 
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
-        if self.confidence_out is not None:
-            confidence = self.confidence_fn(
-                draft_hidden=sample_hidden,
-                anchor_tokens=anchor,
-                draft_tokens=draft_tokens,
-                confidence_tap=confidence_tap,
-            )
-            self.confidence_out[:bs].copy_(confidence)
+        return draft_tokens
 
 
 def _resolve_folded_sampling(
@@ -224,8 +301,10 @@ def maybe_build_draft_sampler(
     max_bs: int,
     device,
     tp_rank: int,
+    tp_size: int,
     tp_sync: SpecTpSync,
     available_memory_gb: float,
+    seed: int,
     confidence_fn=None,
     out=None,
 ) -> Optional[DsparkDraftSampler]:
@@ -243,6 +322,20 @@ def maybe_build_draft_sampler(
         return _eager("no compute_base_logits")
     if getattr(draft_model, "markov_head", None) is None:
         return _eager("no markov head")
+    walk_started = time.perf_counter()
+    markov_walker = None
+    if envs.SGLANG_DSPARK_OPT_INT8_MARKOV_WALK.get():
+        markov_walker = _maybe_build_int8_markov_walker(
+            draft_model=draft_model,
+            gamma=gamma,
+            max_bs=max_bs,
+            device=device,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            seed=seed,
+        )
+    if markov_walker is not None:
+        available_memory_gb -= markov_walker.memory_bytes() / (1 << 30)
     folded_sampling = _resolve_folded_sampling(
         model=draft_model,
         gamma=gamma,
@@ -256,7 +349,7 @@ def maybe_build_draft_sampler(
             "DSpark draft proposal (%s) folded into the draft cuda graph.",
             "greedy + sampling" if folded_sampling else "greedy only",
         )
-    return DsparkDraftSampler(
+    draft_sampler = DsparkDraftSampler(
         model=draft_model,
         gamma=gamma,
         max_bs=max_bs,
@@ -266,3 +359,110 @@ def maybe_build_draft_sampler(
         out=out,
         folded_sampling=folded_sampling,
     )
+    if markov_walker is not None:
+        _attach_int8_markov_walker(
+            draft_sampler=draft_sampler,
+            walker=markov_walker,
+            tp_rank=tp_rank,
+            started=walk_started,
+        )
+    return draft_sampler
+
+
+def _log_int8_markov_walk_off(*, tp_rank: int, reason: str) -> None:
+    if tp_rank == 0:
+        logger.warning(
+            "SGLANG_DSPARK_OPT_INT8_MARKOV_WALK ignored, the draft keeps the stock "
+            "markov walk (reason=%s).",
+            reason,
+        )
+
+
+def _int8_markov_walk_unsupported_reason(
+    *, draft_model, gamma: int, tp_size: int, device
+) -> Optional[str]:
+    """None when the int8 kernels compute this drafter's stock walk, up to the
+    int8 weights and bf16 rounding."""
+    if tp_size > 1:
+        return f"tp_size={tp_size}, the kernels run on a single rank"
+    if get_disagg().enable_pdmux:
+        return "pdmux partitions the SMs the cooperative grid needs"
+    if not is_cuda() or torch.cuda.get_device_capability(device) != (9, 0):
+        return "needs sm_90"
+    if block_accept_estimate_enabled():
+        return "the block-accept estimator reads greedy rows' corrected logits"
+    head = draft_model.markov_head
+    # Exact type: subclasses quantize W2 or feed hidden states into the bias.
+    if type(head) is not VanillaMarkov:
+        return f"markov head is {type(head).__name__}, not VanillaMarkov"
+    if head.markov_rank != MARKOV_RANK:
+        return f"markov_rank={head.markov_rank}, the kernels need {MARKOV_RANK}"
+    lm_head = draft_model.lm_head
+    if not isinstance(lm_head, VocabParallelEmbedding):
+        return f"lm_head is {type(lm_head).__name__}"
+    vocab = int(lm_head.org_vocab_size)
+    if head.vocab_size != vocab:
+        return f"markov vocab {head.vocab_size} != lm_head vocab {vocab}"
+    if lm_head.num_embeddings_padded != vocab:
+        # The kernels read base logits with row stride V, not a cropped slice.
+        return f"lm_head vocab is padded to {lm_head.num_embeddings_padded}"
+    logits_dtype = _base_logits_dtype(draft_model)
+    if logits_dtype != torch.bfloat16:
+        return f"base logits are {logits_dtype}, the kernels take bf16"
+    if not 1 <= gamma <= MAX_STEPS:
+        return f"gamma={gamma} outside [1, {MAX_STEPS}]"
+    return None
+
+
+def _maybe_build_int8_markov_walker(
+    *,
+    draft_model,
+    gamma: int,
+    max_bs: int,
+    device,
+    tp_rank: int,
+    tp_size: int,
+    seed: int,
+) -> Optional[MarkovWalker]:
+    reason = _int8_markov_walk_unsupported_reason(
+        draft_model=draft_model, gamma=gamma, tp_size=tp_size, device=device
+    )
+    if reason is not None:
+        _log_int8_markov_walk_off(tp_rank=tp_rank, reason=reason)
+        return None
+    head = draft_model.markov_head
+    try:
+        return MarkovWalker(
+            w1=head.markov_w1.weight.detach(),
+            w2=head.markov_w2.weight.detach(),
+            gamma=gamma,
+            max_bs=min(max_bs, MAX_BS),
+            device=device,
+            seed=seed,
+        )
+    # A JIT build failure, V % 8 != 0 or a V too large for the SM count.
+    except Exception as e:
+        _log_int8_markov_walk_off(tp_rank=tp_rank, reason=f"{type(e).__name__}: {e}")
+        return None
+
+
+def _attach_int8_markov_walker(
+    *, draft_sampler: DsparkDraftSampler, walker: MarkovWalker, tp_rank: int, started
+) -> None:
+    try:
+        draft_sampler.attach_int8_markov_walker(walker)
+    except Exception as e:
+        reason = f"warmup failed: {type(e).__name__}: {e}"
+        _log_int8_markov_walk_off(tp_rank=tp_rank, reason=reason)
+        return
+    if tp_rank == 0:
+        logger.info(
+            "DSpark int8 markov walk on: kernels %s for bs <= %d (larger graph "
+            "buckets keep the stock walk), gamma=%d, %.0f MiB resident, ready "
+            "in %.1f s.",
+            "i8s" if walker.weights.big_vocab else "i8/i8b/i8s",
+            walker.max_bs,
+            walker.gamma,
+            walker.memory_bytes() / (1 << 20),
+            time.perf_counter() - started,
+        )

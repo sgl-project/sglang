@@ -188,6 +188,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
+        self._target_tp_size = get_parallel().tp_size
         with draft_pp_context(), self._draft_context():
             bundle = build_draft_tp_worker(
                 server_args=server_args,
@@ -523,8 +524,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
             tp_rank=self._target_tp_rank,
+            tp_size=self._target_tp_size,
             tp_sync=self._tp_sync,
             available_memory_gb=available_memory_gb,
+            seed=self.target_worker.random_seed,
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor
                 if self._verify_planner.carries_confidence
