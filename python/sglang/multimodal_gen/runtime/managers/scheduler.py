@@ -3,13 +3,16 @@
 # SPDX-License-Identifier: Apache-2.0
 import dataclasses
 import pickle
+import threading
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
-from typing import Any, Iterator, List
+from typing import Any, Callable, Iterator, List
 
+import msgspec
 import zmq
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -80,6 +83,20 @@ logger = init_logger(__name__)
 
 _MAX_RECV_REQS_PER_POLL = 1024
 _BATCH_METRICS_LOG_INTERVAL = 5
+# Each pending finalize pins one request's output tensor on the GPU; arbitrary,
+# picked to bound that memory while still hiding one save behind one forward.
+_MAX_INFLIGHT_FINALIZES = 2
+
+
+class _DeferredOutput(msgspec.Struct):
+    """Forward result whose materialization and reply run off the event loop.
+
+    Never crosses the IPC boundary: the finalize thread runs finalize() and
+    then replies with the inner OutputBatch itself.
+    """
+
+    output_batch: OutputBatch
+    finalize: Callable[[], None]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -93,6 +110,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     It listens for external requests via ZMQ and coordinates with other workers.
     This class does NOT manage worker processes.
     """
+
+    # instances built without __init__ (tests) still get a lock for the socket
+    _socket_lock = threading.Lock()
 
     metrics: DiffusionMetrics | None = None
 
@@ -188,6 +208,19 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         # Maximum consecutive errors before terminating the event loop
         self._max_consecutive_errors = 3
         self._consecutive_error_count = 0
+
+        self._async_output_save = server_args.async_output_save and isinstance(
+            self.worker, GPUWorker
+        )
+        self._finalize_executor: ThreadPoolExecutor | None = None
+        self._inflight_finalizes: deque[Future] = deque()
+        # The finalize thread replies on the event loop's ROUTER socket, and a
+        # zmq socket must never be used by two threads at once.
+        self._socket_lock = threading.Lock()
+        if self._async_output_save:
+            self._finalize_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="sgl-diffusion-finalize"
+            )
 
         self._init_disagg_state(server_args, local_rank)
 
@@ -286,6 +319,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     ):
         """Dispatch generation requests, merging compatible requests when allowed."""
         reqs = self._normalize_generation_reqs(reqs)
+        if self._async_output_save:
+            # Reserve capacity before any forward allocates another output.
+            # The single finalize worker completes futures in FIFO order.
+            while len(self._inflight_finalizes) >= _MAX_INFLIGHT_FINALIZES:
+                self._inflight_finalizes.popleft().result()
+            self._reap_finalizes()
         if self.worker.is_sleeping():
             raise RuntimeError(
                 "Server is sleeping. Call resume_memory_occupation first."
@@ -312,6 +351,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 )
 
             if len(reqs) == 1 or not allow_dynamic_batching:
+                if self._async_output_save and len(reqs) == 1:
+                    return self._execute_forward_with_deferred_save(reqs)
                 return self.worker.execute_forward(reqs)
 
             if self.server_args.pipeline_config.supports_native_grouped_requests():
@@ -788,8 +829,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 ):
                     payload = pickle.dumps(output_batch)
 
-                with self._record_return_stage(
-                    output_batch, "Scheduler.return_result.send"
+                with (
+                    self._record_return_stage(
+                        output_batch, "Scheduler.return_result.send"
+                    ),
+                    self._socket_lock,
                 ):
                     self.receiver.send_multipart([identity, b"", payload])
 
@@ -825,6 +869,66 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             self.return_result(output_batch, identity, should_not_return=False)
         else:
             self.return_result(output_batch, identity, should_not_return=is_warmup)
+
+    def _execute_forward_with_deferred_save(
+        self, reqs: list[Req]
+    ) -> OutputBatch | _DeferredOutput:
+        output = self.worker.execute_forward(reqs, defer_finalize=True)
+        finalize = self.worker.take_deferred_finalize()
+        if finalize is None:
+            return output
+        assert isinstance(output, OutputBatch)
+        return _DeferredOutput(output_batch=output, finalize=finalize)
+
+    def _submit_deferred_reply(
+        self,
+        *,
+        item: tuple[bytes | None, Any],
+        deferred: _DeferredOutput,
+    ) -> None:
+        assert self._finalize_executor is not None
+        future = self._finalize_executor.submit(
+            self._finalize_and_reply, item=item, deferred=deferred
+        )
+        self._inflight_finalizes.append(future)
+
+    def _finalize_and_reply(
+        self,
+        *,
+        item: tuple[bytes | None, Any],
+        deferred: _DeferredOutput,
+    ) -> None:
+        """Runs on the finalize thread; must never raise.
+
+        Replies as soon as the output is saved instead of waiting for the event
+        loop, which may be inside the next request's forward for its whole length.
+        """
+        try:
+            deferred.finalize()
+        except Exception as e:
+            logger.error("Deferred output finalize failed: %s", e, exc_info=True)
+            deferred.output_batch.error = f"Deferred output finalize failed: {e}"
+            # never ship device tensors through the reply path
+            deferred.output_batch.output = None
+            deferred.output_batch.audio = None
+        try:
+            self._return_item_result(item, deferred.output_batch)
+        except zmq.ZMQError as e:
+            logger.error(f"ZMQ error sending deferred reply: {e}")
+        except Exception as e:
+            logger.error("Deferred reply failed: %s", e, exc_info=True)
+
+    def _reap_finalizes(self) -> None:
+        while self._inflight_finalizes and self._inflight_finalizes[0].done():
+            self._inflight_finalizes.popleft()
+
+    def _drain_deferred_replies(self) -> None:
+        if not self._async_output_save:
+            return
+        while self._inflight_finalizes:
+            self._inflight_finalizes.popleft().result()
+        if self._finalize_executor is not None:
+            self._finalize_executor.shutdown(wait=True)
 
     def _return_results_sequentially(
         self,
@@ -1018,6 +1122,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     output_batch.audio, start, end, total_items
                 ),
                 audio_sample_rate=output_batch.audio_sample_rate,
+                fps=output_batch.fps,
                 action_pred=self._slice_batched_value(
                     output_batch.action_pred, start, end, total_items
                 ),
@@ -1206,13 +1311,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if self.receiver is not None:
             try:
                 recv_reqs: list[tuple[bytes, Any]] = []
-                while len(recv_reqs) < _MAX_RECV_REQS_PER_POLL:
-                    try:
-                        # Accept valid REQ envelopes only, ignore malformed/probe frames.
-                        parts = self.receiver.recv_multipart(zmq.NOBLOCK)
-                    except zmq.Again:
-                        break
-
+                received: list[list[bytes]] = []
+                with self._socket_lock:
+                    while len(received) < _MAX_RECV_REQS_PER_POLL:
+                        try:
+                            received.append(self.receiver.recv_multipart(zmq.NOBLOCK))
+                        except zmq.Again:
+                            break
+                for parts in received:
+                    # Accept valid REQ envelopes only, ignore malformed/probe frames.
                     try:
                         identity, payload = parts[0], parts[-1]
                         reqs = pickle.loads(payload) if len(parts) > 2 else []
@@ -1275,7 +1382,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if self.receiver is not None:
             logger.debug("Driver scheduler of dp replica %d listening", self.dp_replica)
 
+        release_cache_if_idle = getattr(self.worker, "release_cache_if_idle", None)
+        if release_cache_if_idle is not None:
+            self.worker.defer_cache_release = True
+
         while self._running:
+            self._reap_finalizes()
+
             # Update queue depth for metrics
             if self._disagg_metrics:
                 self._disagg_metrics.update_queue_depth(len(self.waiting_queue))
@@ -1318,14 +1431,30 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             # 2: execute, make sure a reply is always sent
             items = self.get_next_batch_to_run()
             if not items:
+                if (
+                    release_cache_if_idle is not None
+                    and not self.waiting_queue
+                    and not self._inflight_finalizes
+                ):
+                    release_cache_if_idle()
                 if self.waiting_queue and self._dynamic_batching_enabled():
                     oldest_ts = self.waiting_queue[0][2]
                     elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
                     remaining_ms = max(0, self._batching_delay_s * 1000.0 - elapsed_ms)
                     if remaining_ms > 0 and self.receiver is not None:
-                        self._poller.poll(timeout=remaining_ms)
+                        with self._socket_lock:
+                            self._poller.poll(timeout=remaining_ms)
                     elif remaining_ms > 0:
                         time.sleep(remaining_ms / 1000.0)
+                elif self._inflight_finalizes:
+                    # An idle hot spin convoys the finalize thread: each of its
+                    # short GIL-holding ops waits a full switch interval, which
+                    # turns a sub-second save into minutes. Yield instead.
+                    if self.receiver is not None:
+                        with self._socket_lock:
+                            self._poller.poll(timeout=1)
+                    else:
+                        time.sleep(0.001)
                 continue
 
             if self.metrics is not None:
@@ -1383,7 +1512,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             # 3. return results
             try:
                 for item, output_batch in zip(items, output_batches, strict=True):
-                    self._return_item_result(item, output_batch)
+                    if isinstance(output_batch, _DeferredOutput):
+                        self._submit_deferred_reply(item=item, deferred=output_batch)
+                    else:
+                        self._return_item_result(item, output_batch)
             except zmq.ZMQError as e:
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")
@@ -1393,6 +1525,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     for _, req in items:
                         self.metrics.finish(id(req), error=True)
 
+        self._drain_deferred_replies()
         self._log_batch_metrics_summary()
 
         if self.receiver is not None:

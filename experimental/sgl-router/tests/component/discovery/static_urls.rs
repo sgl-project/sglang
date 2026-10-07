@@ -137,6 +137,8 @@ async fn static_urls_pd_role_resolved_end_to_end() {
             decode_policy: Default::default(),
             dp_aware: false,
             bucket_config: None,
+            reorg_buckets: None,
+            reorg_admission: Default::default(),
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,

@@ -1201,6 +1201,8 @@ TWO_GPU_CASES = [
             ulysses_degree=1,
             ring_degree=2,
         ),
+        # Keeps the pre-rename spelling of "lossless" so the compatibility
+        # alias is covered end to end; the case id is also a perf-baseline key.
         replace(T2I_sampling_params, extras={"quality": "extra-high"}),
         run_component_accuracy_check=False,
         run_models_api_check=False,

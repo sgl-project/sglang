@@ -360,7 +360,7 @@ class FastH3SamplingParams(MiniMaxH3SamplingParams):
     """FastH3 8-Step V2: nine sigma points, i.e. eight DiT forwards on the trained rungs."""
 
     num_inference_steps: int = 9
-    quality: str = "extra-high"
+    quality: str = "lossless"
 
     def _validate(self) -> None:
         super()._validate()

@@ -61,6 +61,9 @@ def test_fasth3_sampling_defaults_and_task_rejection() -> None:
     params = FastH3SamplingParams(prompt="p")
     assert params.num_inference_steps == 9
     assert params.guidance_scale == 1.0
+    assert params.quality == "lossless"
+    assert FastH3SamplingParams(prompt="p", quality="extra-high").quality == "lossless"
+    assert FastH3SamplingParams(prompt="p", quality="exact").quality == "exact"
 
     with pytest.raises(ValueError, match="exactly nine sigma grid points"):
         FastH3SamplingParams(prompt="p", num_inference_steps=50)

@@ -841,8 +841,8 @@ class CudaPlatformBase(Platform):
         """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image /
         MiniMax-H3 VAE decoder fast paths.
 
-        Requests with quality="extra-high" or "high" run the fast paths; the
-        "lossless" default runs the original module path bit-for-bit. See
+        Requests with quality="lossless" or "high" run the fast paths; the
+        "exact" default runs the original module path bit-for-bit. See
         flux2_vae_cuda_opt and wan_vae_cuda_opt for details.
         """
         try:

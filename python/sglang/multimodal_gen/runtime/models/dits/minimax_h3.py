@@ -7,14 +7,15 @@ contract accepts packed inference keyword arguments and returns packed logits.
 
 from __future__ import annotations
 
+import itertools
 import math
 import os
 from collections import defaultdict
-from collections.abc import Iterable, Iterator
-from typing import Any, Callable
+from collections.abc import Callable, Iterable, Iterator
+from typing import Any
 
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.distributed.tensor import DTensor
 
 from sglang.kernels.ops.activation.activation import (
@@ -756,10 +757,7 @@ def _minimax_h3_attention_core_impl(
                 and impl._sparse_ready(q, k)
                 and any(
                     stop - start >= impl.schedule.min_seq_len
-                    for start, stop in zip(
-                        cu_seqlens_host[:-1],
-                        cu_seqlens_host[1:],
-                    )
+                    for start, stop in itertools.pairwise(cu_seqlens_host)
                 )
             )
             if sparse_will_run and subblock_sparse_query_block_mask is None:
@@ -842,17 +840,20 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        # Official safetensors interleave Q/K/V by head. Comfy BF16, Comfy
-        # convrot int8, and GGUF already store [q_all, k_all, v_all].
-        skip_grouped_reorder = not getattr(arch, "qkv_checkpoint_grouped", True)
-        checkpoint_qkv_is_native = quant_config is not None and (
-            quant_config.get_name() == "gguf"
-            or quant_config.checkpoint_uses_native_qkv_layout
-        )
-        checkpoint_qkv_is_native = (
-            checkpoint_qkv_is_native or arch.checkpoint_uses_diffusers_layout
-        )
-        if not skip_grouped_reorder and not checkpoint_qkv_is_native:
+        # explicit layout overrides checkpoint metadata and quantization inference
+        if arch.checkpoint_qkv_layout is not None:
+            checkpoint_qkv_is_native = arch.checkpoint_qkv_layout == "native"
+        else:
+            checkpoint_qkv_is_native = quant_config is not None and (
+                quant_config.get_name() == "gguf"
+                or quant_config.checkpoint_uses_native_qkv_layout
+            )
+            checkpoint_qkv_is_native = (
+                checkpoint_qkv_is_native
+                or arch.checkpoint_uses_diffusers_layout
+                or not arch.qkv_checkpoint_grouped
+            )
+        if not checkpoint_qkv_is_native:
             self._install_qkv_weight_loader(arch)
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
@@ -1043,7 +1044,7 @@ class MiniMaxH3Attention(nn.Module):
             else tuple(int(item) for item in cu_seqlens.tolist())
         )
         out = torch.empty_like(x)
-        for sequence_start, sequence_stop in zip(bounds[:-1], bounds[1:]):
+        for sequence_start, sequence_stop in itertools.pairwise(bounds):
             if sequence_start == sequence_stop:
                 continue
             keys = key[sequence_start:sequence_stop].unsqueeze(0)
@@ -1728,18 +1729,18 @@ def _reject_adaln_lora(names: list[str]) -> None:
 
 
 class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin):
-    _aliases = [
+    _aliases = (
         "MiniMaxH3Transformer3DModel",
         "MiniMaxH3PrunedTransformer3DModel",
-    ]
-    _fsdp_shard_conditions = [is_block]
+    )
+    _fsdp_shard_conditions = (is_block,)
     # refine_prompt_embeds drives a forward pass outside __call__.
     _fsdp_forward_methods = ("refine_prompt_embeds",)
     # parameters mix fp32 (patch projections, timestep embedder, and output
     # heads) with bf16 blocks; FSDP must gather in each parameter's own dtype
     _fsdp_mixed_dtype_params = True
     mps_stream_non_layer_weights = True
-    _compile_conditions = [is_block]
+    _compile_conditions = (is_block,)
     param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping

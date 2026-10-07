@@ -4,9 +4,9 @@
 Fuses each decoder attention block's per-head QK RMSNorm + NeoX RoPE into one
 in-place launch over the strided Q/K views of the QKV buffer and runs the
 block's attention on cuDNN SDPA. Forwards are bound once at VAE load and
-dispatch on a decode-scoped :class:`VaeFastPathGate`: ``quality="extra-high"``
+dispatch on a decode-scoped :class:`VaeFastPathGate`: ``quality="lossless"``
 and ``"high"`` take the fast path (rounding-level differences), the
-``"lossless"`` default runs the original module path bit-for-bit. Install is
+``"exact"`` runs the original module path bit-for-bit. Install is
 all-or-nothing and fail-closed.
 """
 

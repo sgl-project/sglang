@@ -95,7 +95,7 @@ for the baseline; the B200/B300 quantization measurements and H200 Cache-DiT
 quality audit do not establish coverage on Grace Blackwell.
 
 GB300 end-to-end coverage currently includes single-host FL2VA text-to-video
-with audio, native precision, eager execution, and `quality="lossless"`.
+with audio, native precision, eager execution, and `quality="exact"`.
 Ref2VA and multi-host commands remain **Unverified**. See the
 [GB300 measurements](#gb300-single-host) for the tested workload.
 
@@ -348,7 +348,7 @@ their [usual meanings](#4-generate-video-and-audio), including `conditions: []`
 for `t2va` and keyframes for `fl2va`.
 
 Start with `quality: "lossless"` and the standard 50-point schedule. Here
-`lossless` disables additional request-time approximations; it does not undo
+`exact` disables additional request-time approximations; it does not undo
 INT8 quantization, pruning, or fine-tuning. The author's recommended Ref2V
 Turbo LoRA is a separate optional adapter, not an automatically inferred
 4-step schedule. Reference fidelity can differ from the official model; see
@@ -704,10 +704,11 @@ refer to files visible inside the SGLang server environment.
 
 ## 5. LoRA recipes
 
-H3 accepts both native fused adapters and standard Diffusers/PEFT adapters.
-Native adapters target modules such as `blocks.*.attn.qkv_proj`; PEFT adapters
-may instead provide separate `to_q`, `to_k`, and `to_v` projections and the
-`default` adapter namespace. SGLang normalizes both layouts.
+H3 accepts native fused adapters, standard Diffusers/PEFT adapters, and Kohya
+`lora_unet_blocks_*` exports from `networks.lora_minimax_h3`. Native adapters
+target modules such as `blocks.*.attn.qkv_proj`; PEFT adapters may instead
+provide separate `to_q`, `to_k`, and `to_v` projections and the `default`
+adapter namespace. SGLang normalizes all three layouts.
 
 The following pinned FL2VA adapters have distinct purposes:
 
@@ -716,13 +717,18 @@ The following pinned FL2VA adapters have distinct purposes:
 | Recommended speed/quality balance | [`larryvrh/MiniMax-H3-Turbo-Lora`](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora), `minimax_h3_turbo_v4_step600_ema.safetensors` | `num_inference_steps: 9` (8 denoiser evaluations), `lora_scale: 1.0` | None |
 | Most aggressive speed preset (standard PEFT layout) | [`lightx2v/Minimax-h3-Turbo`](https://huggingface.co/lightx2v/Minimax-h3-Turbo), `minimax_h3_fl2v_turbo_4step_v0.1.safetensors` | `num_inference_steps: 5` (4 denoiser evaluations), `lora_scale: 1.0`, `lora_alpha: 8` | None |
 | Realistic people style | [`fal/MiniMax-H3-Realism-People-LoRA`](https://huggingface.co/fal/MiniMax-H3-Realism-People-LoRA), `h3-realism-people-t2v-i2v-r2v.safetensors` | Keep the normal `num_inference_steps: 50` schedule; start with `lora_scale: 0.7` | Include `r34l1sm` in the prompt |
+| Spatial and physics | [`Jojocodex/minimax-h3-spatial-physics-lora`](https://huggingface.co/Jojocodex/minimax-h3-spatial-physics-lora), `wushu_spatial_physics_clean_3000_pruned.safetensors` | Keep the normal `num_inference_steps: 50` schedule; start with `lora_scale: 0.4` | None. Describe collisions, stacking, and gravity-consistent motion in the prompt |
+| Wushu action | [`Jojocodex/minimax-h3-wushu-action-lora`](https://huggingface.co/Jojocodex/minimax-h3-wushu-action-lora), `wushu_action_h3_lora_v5_3000_pruned.safetensors` | Keep the normal `num_inference_steps: 50` schedule; start with `lora_scale: 0.8` | Put `wushu_action` at the start of the prompt |
+| Camera motion | [`Jojocodex/minimax-h3-yunjing-lora`](https://huggingface.co/Jojocodex/minimax-h3-yunjing-lora), `camera_motion_h3_lora_v1_3000_pruned.safetensors` | Keep the normal `num_inference_steps: 50` schedule; start with `lora_scale: 0.8` | Put `camera motion` at the start of the prompt |
+| Looping sketch anime | [`Inner-Reflections/MiniMax-H3-Looping-Sketch-Anime`](https://huggingface.co/Inner-Reflections/MiniMax-H3-Looping-Sketch-Anime), `minimax_h3_looping_sketch_anime_v1.safetensors` | Keep the normal `num_inference_steps: 50` schedule; start with `lora_scale: 1.0` | Include the author's hand-drawn sketch style phrase in the prompt |
+| 3D-to-real detail slider | [`siraxe/3d_to_real_detail_slider_H3`](https://huggingface.co/siraxe/3d_to_real_detail_slider_H3), `3d_to_real_H3_detail_slider_bf16.safetensors` | Keep the normal `num_inference_steps: 50` schedule; start with `lora_scale: 1.0` | None. Sweep the scale; this is a slider, not a fixed style |
 
 The H3 request field controls the number of sigma grid points, including the
 terminal zero; the denoising loop therefore runs one fewer model evaluation.
 This is why an adapter described as 8-step uses `9`, and a 4-step adapter uses
 `5`, in the request.
 
-All three use the same launch shape. Pinning the filename is required for
+Every recipe uses the same launch shape. Pinning the filename is required for
 repositories that publish multiple revisions, and is also recommended for a
 reproducible single-file recipe:
 
@@ -872,8 +878,8 @@ eight distilled DiT evaluations on the checkpoint's trained rungs
 shifted once per modality, as FastVideo runs them). Any other step count is
 rejected. The trained sparsity 0.8 is the default; `--attention-backend-config
 '{"VSA_sparsity": ...}'` overrides it. FastH3 requests default to
-`quality: "extra-high"`, which fuses the VAE decoder's per-head QK RMSNorm and
-RoPE and runs its attention on cuDNN SDPA; `quality: "lossless"` keeps the
+`quality: "lossless"`, which fuses the VAE decoder's per-head QK RMSNorm and
+RoPE and runs its attention on cuDNN SDPA; `quality: "exact"` keeps the
 reference decoder kernels. At every quality level FastH3 decodes each GPU's
 spatial VAE tiles as one batch rather than one at a time, which changes GEMM
 shapes and so the output at rounding level; base MiniMax-H3 decodes tile by
@@ -1005,20 +1011,20 @@ done
 `quality` is a cumulative request-scoped optimization parameter with three
 levels:
 
-- `"lossless"` (default): the exact reference path. Output is bit-exact
+- `"exact"`: the exact reference path. Output is bit-exact
   against the reference implementation and the CI ground truth.
-- `"extra-high"`: includes the global fusion-only tier but does not enable
+- `"lossless"` (default): includes the global fusion-only tier but does not enable
   Cache-DiT or another approximate optimization. The denoise path is the same
-  as `lossless`; VAE decode fuses the ViT decoder's per-head QK RMSNorm and
+  as `exact`; VAE decode fuses the ViT decoder's per-head QK RMSNorm and
   RoPE into one launch and runs its attention on cuDNN SDPA (rounding-level
   differences only).
 - `"high"`: the audited accelerated path. Quality is guaranteed (the audited
   Cache-DiT configuration measures SSIM 0.931 / PSNR 28.16 dB against
-  `lossless`), but output is no longer bit-identical to the reference.
+  `exact`), but output is no longer bit-identical to the reference.
 
 One resident server serves all three levels; a `quality: "high"` request
 mounts its audited Cache-DiT policy at the batch boundary, and a later
-`quality: "lossless"` or `quality: "extra-high"` request removes the hooks
+`quality: "exact"` or `quality: "lossless"` request removes the hooks
 before denoising.
 
 Start the validated server once:
@@ -1043,10 +1049,25 @@ Then choose a request level:
 
 <Tabs>
 
+<Tab title="exact">
+
+Native denoising and VAE decode with no feature-cache approximation or
+quality-gated VAE fusions.
+
+```json Request field
+{
+  "quality": "exact"
+}
+```
+
+</Tab>
+
 <Tab title="lossless (default)">
 
-Native denoising with no feature-cache approximation. This is the default;
-omitting the field is equivalent.
+The global fusion-only tier. It does not enable MiniMax-H3 Cache-DiT and
+follows the same H3 denoise path as `exact`; only the VAE decoder's fused
+QK RMSNorm + RoPE and cuDNN SDPA attention differ.
+Omitting the field selects this level.
 
 ```json Request field
 {
@@ -1056,24 +1077,10 @@ omitting the field is equivalent.
 
 </Tab>
 
-<Tab title="extra-high">
-
-The global fusion-only tier. It does not enable MiniMax-H3 Cache-DiT and
-follows the same H3 denoise path as `lossless`; only the VAE decoder's fused
-QK RMSNorm + RoPE and cuDNN SDPA attention differ.
-
-```json Request field
-{
-  "quality": "extra-high"
-}
-```
-
-</Tab>
-
 <Tab title="high">
 
 The audited accelerated path. Use it when you can trade bit-exactness for
-latency while keeping output closest to the same-seed lossless trajectory.
+latency while keeping output closest to the same-seed exact trajectory.
 
 ```json Request field
 {
@@ -1087,10 +1094,10 @@ latency while keeping output closest to the same-seed lossless trajectory.
 
 The measured trade-off is:
 
-| `quality` | Mean <br />inference <br />latency | Speedup | SSIM vs <br />lossless | PSNR vs <br />lossless | Expected <br />trade-off |
+| `quality` | Mean <br />inference <br />latency | Speedup | SSIM vs <br />exact | PSNR vs <br />exact | Expected <br />trade-off |
 | --- | ---: | ---: | ---: | ---: | --- |
-| `lossless` | 75.10 s | 1.00× | 1.000 | exact | Native reference path |
-| `extra-high` | Not separately measured | — | Same H3 denoise path | Same H3 denoise path | Fusion-only tier; VAE decode fuses QK RMSNorm + RoPE and uses cuDNN SDPA (rounding-level differences) |
+| `exact` | 75.10 s | 1.00× | 1.000 | exact | Native reference path |
+| `lossless` | Not separately measured | — | Same H3 denoise path | Same H3 denoise path | Fusion-only tier; VAE decode fuses QK RMSNorm + RoPE and uses cuDNN SDPA (rounding-level differences) |
 | `high` | 53.70 s | 1.40× | 0.931 | 28.16 dB | Smallest same-seed visual change |
 
 These numbers use 1344×768, 124-frame, 24 fps T2VA with 50 inference steps,
@@ -1099,7 +1106,7 @@ video flow shift 12, audio flow shift 3, and three fixed prompt/seed pairs on
 and a moving close-up portrait. `inference_time_s` is averaged across the three
 prompts; the quiet-scene point is itself the mean of two repeats.
 
-SSIM and PSNR compare decoded, frame-aligned output with the `lossless`
+SSIM and PSNR compare decoded, frame-aligned output with the `exact`
 result for the same prompt and seed. They measure trajectory deviation, not
 absolute perceptual quality: the `high` path can produce a different but
 still plausible realization. It also changes the joint audio-video denoise
@@ -1118,7 +1125,7 @@ name, for example `sglang generate --quality high`.
 For manually tuned Cache-DiT experiments outside that validated path, omit
 the request `quality` field and set `--enable-cache-dit` or the
 process-wide `SGLANG_CACHE_DIT_*` defaults. Any explicit `quality`, including
-`"lossless"` and `"extra-high"`, takes H3 off the generic Cache-DiT path. The
+`"exact"` and `"lossless"`, takes H3 off the generic Cache-DiT path. The
 24 GB layerwise recipe above can use the same switch; skipped blocks are
 not streamed.
 
@@ -1503,7 +1510,7 @@ Dynamic cuDNN/FA attention, and eager execution. The model was downloaded by
 `sglang serve` from `MiniMaxAI/MiniMax-H3`.
 
 The workload uses the builder's cat-band prompt, FL2VA T2VA, a 5-second request
-at a 768-pixel short edge, 50 inference steps, `quality="lossless"`, one output,
+at a 768-pixel short edge, 50 inference steps, `quality="exact"`, one output,
 and seed 1101. Every MP4 contained video and audio and passed a full decode check.
 
 | First full request after server warmup | Following three requests | Warm median |

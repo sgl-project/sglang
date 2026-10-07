@@ -348,7 +348,7 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
         raise ValueError(
             'quality="high" is audited only for the base MiniMax-H3 50-step '
             "4xH200 deployment; FastH3 has no audited high-quality deployment. "
-            'Use the default quality="extra-high", or "lossless".'
+            'Use quality="exact", or the default "lossless".'
         )
 
     def validate_server_args(self, server_args) -> None:
