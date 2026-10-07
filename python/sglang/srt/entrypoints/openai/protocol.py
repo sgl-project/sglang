@@ -45,6 +45,7 @@ from openai.types.responses import ResponseOutputMessage as OpenAIResponseOutput
 from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
+    ResponseStreamEvent,
     ResponseTextConfig,
 )
 from openai.types.responses.easy_input_message_param import EasyInputMessageParam
@@ -2324,6 +2325,23 @@ class ResponsesResponse(BaseModel):
             user=request.user,
             metadata=request.metadata or {},
         )
+
+
+class ResponsesLifecycleEvent(BaseModel):
+    """Response lifecycle event using SGLang's public response schema."""
+
+    type: Literal[
+        "response.created",
+        "response.in_progress",
+        "response.completed",
+        "response.incomplete",
+        "response.failed",
+    ]
+    response: ResponsesResponse
+    sequence_number: int = -1
+
+
+ResponsesStreamEvent: TypeAlias = Union[ResponseStreamEvent, ResponsesLifecycleEvent]
 
 
 class RequestResponseMetadata(BaseModel):
