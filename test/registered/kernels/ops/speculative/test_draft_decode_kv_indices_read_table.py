@@ -18,8 +18,10 @@ table. On a static pool that is `req_to_token` itself (token-granular, and the
 emitted ids must stay byte-identical to the historical raw copy); on the
 unified pool it is the iteration plan's page table, whose entries are already
 physical pages, and the kernel rebuilds token ids as `entry * ps + pos % ps`.
-Pinned here: over a physical page table the kernel emits exactly the ids
-`translate_kv_loc` would give the raw virtual ones, and the same kv_indptr.
+With no table shared that iteration it reads the virtual rows and maps them
+through the page table in its own gather. Pinned here: over a physical page
+table, and over virtual rows with the page table, the kernel emits exactly the
+ids `translate_kv_loc` would give the raw virtual ones, and the same kv_indptr.
 
     python -m pytest test/registered/kernels/ops/speculative/test_draft_decode_kv_indices_read_table.py -v
 """
@@ -37,7 +39,7 @@ _SENTINEL = -7
 
 
 def _run_kernel(
-    *, table, entry_page_size, seq_lens, positions, num_steps, topk, page_size
+    *, table, entry_page_size, seq_lens, positions, num_steps, topk, page_size, v2p=None
 ):
     from sglang.kernels.ops.speculative.cache_locs import (
         generate_draft_decode_kv_indices,
@@ -66,6 +68,8 @@ def _run_kernel(
         next_power_of_2(bs),
         page_size,
         ENTRY_PAGE_SIZE=entry_page_size,
+        v2p=v2p,
+        TRANSLATE=v2p is not None,
     )
     return kv_indices, kv_indptr
 
@@ -97,6 +101,10 @@ class TestDraftDecodeKVIndicesReadTable(CustomTestCase):
         )
         raw, raw_indptr = _run_kernel(table=req_to_token, entry_page_size=1, **common)
         out, out_indptr = _run_kernel(table=table, entry_page_size=page_size, **common)
+        # No shared table: the virtual rows, translated in the kernel's gather.
+        gathered, gathered_indptr = _run_kernel(
+            table=req_to_token, entry_page_size=1, v2p=v2p, **common
+        )
 
         torch.testing.assert_close(raw_indptr, out_indptr, rtol=0, atol=0)
         written = raw != _SENTINEL
@@ -104,6 +112,8 @@ class TestDraftDecodeKVIndicesReadTable(CustomTestCase):
         virt = raw[written]
         expected = v2p[virt // page_size] * page_size + virt % page_size
         torch.testing.assert_close(out[written], expected, rtol=0, atol=0)
+        torch.testing.assert_close(gathered_indptr, out_indptr, rtol=0, atol=0)
+        torch.testing.assert_close(gathered, out, rtol=0, atol=0)
 
     def test_page_size_one(self):
         if not torch.cuda.is_available():

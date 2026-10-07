@@ -1283,6 +1283,8 @@ class FlashInferMLAMultiStepDraftBackend:
             next_power_of_2(bs),
             self.page_size,
             ENTRY_PAGE_SIZE=src.entry_page_size,
+            v2p=src.v2p,
+            TRANSLATE=src.v2p is not None,
         )
 
         assert forward_batch.spec_info is not None

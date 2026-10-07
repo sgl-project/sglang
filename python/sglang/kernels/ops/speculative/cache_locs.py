@@ -79,15 +79,38 @@ def assign_draft_cache_locs_contiguous(
 
 
 @triton.jit
-def _load_token_ids(row_ptr, pos, mask, ENTRY_PAGE_SIZE: tl.constexpr):
-    """The token ids at positions ``pos`` of one row of a read table: the row
+def _translate_token_ids(ids, v2p, mask, page_size: tl.constexpr):
+    """Virtual token ids -> physical ones through the page-level v2p table,
+    as `translate_kv_loc` does. A negative id maps to the page-0 sink instead
+    of loading before `v2p`."""
+    i64 = ids.to(tl.int64)
+    vpage = tl.where(i64 < 0, 0, i64 // page_size)
+    phys = tl.load(v2p + vpage, mask=mask, other=0)
+    return tl.where(i64 < 0, 0, tl.maximum(phys * page_size + i64 % page_size, 0))
+
+
+@triton.jit
+def _load_token_ids(
+    row_ptr,
+    pos,
+    mask,
+    v2p,
+    page_size: tl.constexpr,
+    ENTRY_PAGE_SIZE: tl.constexpr,
+    TRANSLATE: tl.constexpr,
+):
+    """The token ids at positions ``pos`` of one row of a read source: the row
     itself on a token-granular table, ``entry * ps + pos % ps`` on the
-    unified pool's page-granular one (its entries are physical pages)."""
+    unified pool's page-granular one (its entries are physical pages); with
+    ``TRANSLATE``, virtual rows mapped through ``v2p`` on the way out (no
+    shared table this iteration)."""
     if ENTRY_PAGE_SIZE == 1:
         ids = tl.load(row_ptr + pos, mask=mask)
     else:
         entry = tl.load(row_ptr + pos // ENTRY_PAGE_SIZE, mask=mask, other=0)
         ids = entry.to(tl.int64) * ENTRY_PAGE_SIZE + pos % ENTRY_PAGE_SIZE
+    if TRANSLATE:
+        ids = _translate_token_ids(ids, v2p, mask, page_size)
     return ids
 
 
@@ -112,6 +135,9 @@ def generate_draft_decode_kv_indices(
     sink_size: tl.constexpr = 0,
     NUM_STEPS: tl.constexpr = 0,
     ENTRY_PAGE_SIZE: tl.constexpr = 1,
+    # The source's page table (`KVIndexTable.v2p`), applied with TRANSLATE.
+    v2p=None,
+    TRANSLATE: tl.constexpr = False,
 ):
     # window_size > 0 restricts the draft (not the target) to sink_size prefix
     # tokens + the most-recent window_size; window_size == 0 is the identity.
@@ -168,7 +194,9 @@ def generate_draft_decode_kv_indices(
                 copy_offset,
                 recent_start + copy_offset - s_eff,
             )
-            data = _load_token_ids(token_pool_ptr, src, mask, ENTRY_PAGE_SIZE)
+            data = _load_token_ids(
+                token_pool_ptr, src, mask, v2p, page_size, ENTRY_PAGE_SIZE, TRANSLATE
+            )
             tl.store(kv_ptr + copy_offset, data, mask=mask)
             copy_offset += BLOCK_SIZE
     else:
@@ -180,7 +208,9 @@ def generate_draft_decode_kv_indices(
                 copy_offset,
                 recent_start + copy_offset - s_eff,
             )
-            data = _load_token_ids(token_pool_ptr, src, mask, ENTRY_PAGE_SIZE)
+            data = _load_token_ids(
+                token_pool_ptr, src, mask, v2p, page_size, ENTRY_PAGE_SIZE, TRANSLATE
+            )
             tl.store(kv_ptr + copy_offset, data, mask=mask)
 
     # Extension entries and kv_indptr belong to token block 0 alone; other
@@ -192,7 +222,10 @@ def generate_draft_decode_kv_indices(
                 token_pool_ptr,
                 seq_len + topk_id * num_steps + tl.arange(0, iter_upper),
                 extend_offset < iters,
+                v2p,
+                page_size,
                 ENTRY_PAGE_SIZE,
+                TRANSLATE,
             )
         else:
             prefix_len = seq_len
@@ -210,7 +243,10 @@ def generate_draft_decode_kv_indices(
                 token_pool_ptr,
                 start + extend_offset,
                 extend_offset < iters,
+                v2p,
+                page_size,
                 ENTRY_PAGE_SIZE,
+                TRANSLATE,
             )
 
         tl.store(

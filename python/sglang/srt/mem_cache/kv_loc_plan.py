@@ -11,25 +11,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""One scheduler iteration's KV slot ids, translated once per sub-pool.
+"""One scheduler iteration's KV slot ids, per sub-pool.
 
 Under the unified pool a KV slot has a virtual id (what the scheduler allocates
 and `req_to_token` stores) and, in each sub-pool of the pool, a physical id
 (what that sub-pool's kernels index). Every forward of one iteration -- the
-target's, and a fused draft's, which lives in the target's pages -- reads and
-writes the same slots through the same tables, and compaction does not move a
-page while the iteration's forwards are in flight. So each id is translated
-once per sub-pool, here, and every consumer reads the result:
+target's, and a fused draft's, which lives in the target's pages -- writes the
+same slots and reads the same rows, and compaction does not move a page while
+the iteration's forwards are in flight.
 
-    writes   `write_ids`      the iteration's write window
-    reads    `read_table`     the rows' page table over [0, seq_lens + extent)
+    writes   `write_ids`    the iteration's write window, translated once per
+                            sub-pool, here; every writer binds it
+    reads    `read_table`   the rows' page table over [0, seq_lens + extent),
+                            built here only when a reader of these rows reads
+                            the table form, and then shared by every reader
+
+A read is translated exactly once on its way to the kernel that consumes it,
+and only by the translator's read primitives (`KVIndexTranslator`): from the
+shared table when there is one, otherwise in the reader's own gather, straight
+into the reader's own buffer -- so no table is built that no reader needs. A
+consumer never translates and never sees which kind of pool it reads.
 
 A sub-pool is named by its `IdSpace`: how it maps the iteration's virtual ids,
-and the page table its reads go through. A consumer never translates. It asks
-the plan for ids in the space it indexes -- its runner's translator holds one
-per sub-pool its pool has (`KVIndexTranslator.space`) -- and the plan derives
-each space's ids on first use. A space that indexes virtual ids as they are (a
-static pool's, a private draft pool's) costs nothing.
+and the page table its reads go through. A consumer asks for ids in the space
+it indexes -- its runner's translator holds one per sub-pool its pool has
+(`KVIndexTranslator.space`) -- and the plan derives each space's write ids on
+first use. A space that indexes virtual ids as they are (a static pool's, a
+private draft pool's) costs nothing.
 
 Who builds the plan: `ForwardBatch.init_new` for a forward that is the only one
 in its iteration; a speculative worker, once per iteration, as soon as the

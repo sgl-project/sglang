@@ -2453,6 +2453,8 @@ class FlashInferMultiStepDraftBackend:
             self.draft_window_size,
             self.draft_sink_size,
             ENTRY_PAGE_SIZE=src.entry_page_size,
+            v2p=src.v2p,
+            TRANSLATE=src.v2p is not None,
         )
 
         assert forward_batch.spec_info is not None

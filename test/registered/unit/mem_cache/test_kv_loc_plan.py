@@ -423,12 +423,13 @@ class TestKVLocPlan(unittest.TestCase):
         self.assertEqual(own_plan(ForwardMode.DECODE, None).read_extent, 0)
 
     def test_a_stream_only_iteration_builds_no_table(self):
-        """When nothing else in the iteration would read the plan's table --
-        one runner reads these rows, and through streams only -- the first
-        stream reader gets its stream alone: one gather of its rows, no table.
-        A second runner of the same rows, or one that reads tables, brings the
-        shared build back, and its going away takes it out again; a table read
-        after a stream-only one still gets its table."""
+        """A plan shares a table only when a reader of its rows reads the
+        table form itself. Readers of streams and row gathers alone -- one
+        runner, or a target and a draft over the same rows -- each translate
+        in their own gather: no table, with or without host lengths. A runner
+        that reads tables brings the shared build back, which every reader then
+        takes, and its going away takes it out again; a table read after a
+        stream-only one still gets its table."""
         calls = {"packed": 0, "fused": 0, "table": 0}
 
         def counting(name, real):
@@ -491,16 +492,48 @@ class TestKVLocPlan(unittest.TestCase):
             plan.read_table()
             self.assertEqual(calls["table"], 1)
 
-            # Another runner of the same rows (a draft): the shared build.
+            # Another stream reader of the same rows (a fused flashinfer
+            # draft): still no table -- each translates its own gather.
             peer = self._translator(self.draft_pool)
             peer.bind_and_verify_backends([stream_only_backend()])
+            self.assertFalse(solo.table_is_read(_FULL))
+            for seq_lens_cpu in (self.seq_lens.clone(), None):
+                both = solo.plan(
+                    req_pool_indices=self.rpi,
+                    seq_lens=self.seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    write_virtual=self.window,
+                    read_extent=1,
+                )
+                pack(solo, both, torch.empty(6, dtype=torch.int32))
+                pack(peer, both, torch.empty(6, dtype=torch.int32))
+                # The draft's row gather gets the virtual rows and the page
+                # table, translated in its own kernel.
+                src = peer.read_source(both, req_pool_indices=self.rpi, bs=bs)
+                self.assertTrue(src.is_translated)
+                self.assertIs(src.ids, self.req_to_token)
+                self.assertIs(src.v2p, solo.space(_FULL).read_v2p)
+                self.assertFalse(both.has_read_table())
+            self.assertEqual(calls, {"packed": 5, "fused": 0, "table": 1})
+
+            # A runner of these rows that reads the table form (a page-table
+            # draft backend): the first stream reader builds the shared table
+            # in its own launch, and the others read it.
+            table_reader = self._translator(self.draft_pool)
+            table_reader.bind_and_verify_backends(
+                [SimpleNamespace(kv_index_translator=None, reads_kv_index_table=True)]
+            )
+            self.assertTrue(solo.table_is_read(_FULL))
             shared = self._plan(solo, read_extent=1)
             pack(solo, shared, torch.empty(6, dtype=torch.int32))
             self.assertEqual(calls["fused"], 1)
             self.assertTrue(shared.has_read_table())
-            # The draft has no sliding-window sub-pool: that one the target
+            src = peer.read_source(shared, req_pool_indices=self.rpi, bs=bs)
+            self.assertIsNone(src.v2p)
+            self.assertIs(src.ids, shared.read_table(rows=bs).ids)
+            # The drafts have no sliding-window sub-pool: that one the target
             # alone reads, so its stream still comes alone.
-            self.assertFalse(solo.table_is_read_again(_SWA))
+            self.assertFalse(solo.table_is_read(_SWA))
             solo.pack_read_stream(
                 shared,
                 req_pool_indices=self.rpi,
@@ -509,13 +542,13 @@ class TestKVLocPlan(unittest.TestCase):
                 out=torch.empty(6, dtype=torch.int32),
                 kind=_SWA,
             )
-            self.assertEqual(calls["packed"], 2)
+            self.assertEqual(calls["packed"], 6)
             self.assertFalse(shared.has_read_table(_SWA))
 
-            # The draft goes away: the target reads its rows alone again.
-            del peer
+            # The table reader goes away: no shared table again.
+            del table_reader
             gc.collect()
-            self.assertFalse(solo.table_is_read_again(_FULL))
+            self.assertFalse(solo.table_is_read(_FULL))
 
     def test_a_captured_first_reader_holds_the_table(self):
         """When the plan's first reader is a captured table, the table is built

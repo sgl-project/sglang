@@ -4702,6 +4702,8 @@ class AiterMultiStepDraftBackend:
             # its 128-wide program instead of the token-block specialization.
             NUM_STEPS=self.speculative_num_steps if num_token_blocks > 1 else 0,
             ENTRY_PAGE_SIZE=src.entry_page_size,
+            v2p=src.v2p,
+            TRANSLATE=src.v2p is not None,
         )
 
         for i in range(self.speculative_num_steps - 1):
