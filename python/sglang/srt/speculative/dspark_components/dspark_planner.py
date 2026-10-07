@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 import msgspec
 import torch
@@ -20,6 +20,7 @@ from sglang.srt.managers.overlap_utils import (
     ResolvedConfidence,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
@@ -67,7 +68,7 @@ class VerifyWindow(msgspec.Struct, frozen=True):
     verify_cache_loc_2d: torch.Tensor
     # The iteration's plan of `verify_cache_loc`: the draft block, the verify
     # and the target-hidden KV writes all take their ids from it.
-    kv_loc_plan: Any
+    kv_loc_plan: KVLocPlan
 
 
 class DSparkVerifyPlanner:
