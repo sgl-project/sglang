@@ -89,7 +89,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
 )
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -1260,6 +1260,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            # Noncausal decision checkpoints let full attention see the whole prompt.
+            attn_type=(
+                AttentionType.DECODER
+                if getattr(config, "is_causal", True)
+                else AttentionType.ENCODER_ONLY
+            ),
             prefix=f"{prefix}.attn",
             quant_config=quant_config,
         )
