@@ -1632,10 +1632,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             {"disable_overlap_schedule": True},
         )
 
-        # dllm: guarded on the algorithm and the current value
+        # dllm: overlap stays on only for FDFO + LowConfidence
         def _view(**kw):
             defaults = dict(
-                dllm_algorithm="LowConfidence", disable_overlap_schedule=False
+                dllm_algorithm="LowConfidence",
+                disable_overlap_schedule=False,
+                dllm_fdfo=True,
             )
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
@@ -1644,8 +1646,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(
             _dllm_overlap_disable(_view(disable_overlap_schedule=True)), {}
         )
+        self.assertEqual(_dllm_overlap_disable(_view()), {})
         self.assertEqual(
-            _dllm_overlap_disable(_view()), {"disable_overlap_schedule": True}
+            _dllm_overlap_disable(_view(dllm_fdfo=False)),
+            {"disable_overlap_schedule": True},
+        )
+        self.assertEqual(
+            _dllm_overlap_disable(_view(dllm_algorithm="JointThreshold")),
+            {"disable_overlap_schedule": True},
         )
 
         # embeddings sparse head: keyed on the env var being set
