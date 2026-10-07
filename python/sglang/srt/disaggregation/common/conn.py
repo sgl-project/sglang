@@ -466,7 +466,8 @@ class CommonKVManager(BaseKVManager):
         the first layerwise forward; idempotent."""
         if getattr(self, "_layerwise_initialized", False):
             return
-        device = self.kv_args.kv_data_ptrs[0].device
+        from sglang.srt.platforms import current_platform
+        device = torch.device(current_platform.device_type, self.kv_args.gpu_id)
         self._transfer_stream = create_device_stream(device)
         self._layerwise_device = device
         self._layerwise_initialized = True
