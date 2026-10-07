@@ -39,6 +39,7 @@ class MHCState:
     hc_post: Callable
     hc_ffn_post_pre: Optional[Callable] = None
     hc_attn_post_pre: Optional[Callable] = None
+    hc_attn_pre_quant: Optional[Callable] = None
     defer_ffn_update: bool = False
     # The last layer's write-back also contracts the streams into the hidden
     # states the layer stack hands on.
@@ -121,15 +122,54 @@ class MHCState:
                 and forward_batch.forward_mode.is_extend_without_speculative(),
             )
             if fused is not None:
-                hidden_states, residual, self.h_res, self.h_post, norm_fused = fused
+                if len(fused) == 6:
+                    (
+                        hidden_states,
+                        residual,
+                        self.h_res,
+                        self.h_post,
+                        norm_fused,
+                        prequant,
+                    ) = fused
+                else:
+                    hidden_states, residual, self.h_res, self.h_post, norm_fused = fused
+                    prequant = None
                 producer.clear_coefficients()
                 if out_norm is not None and not norm_fused:
                     hidden_states = out_norm(hidden_states)
-                return hidden_states, residual
+                return (
+                    hidden_states
+                    if prequant is None
+                    else (hidden_states, prequant[0], prequant[1]),
+                    residual,
+                )
 
         hidden_states = producer.apply_post(hidden_states, residual)
         producer.clear_coefficients()
         residual = hidden_states
+        is_prefill = (
+            forward_batch is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        )
+        if (
+            self.hc_attn_pre_quant is not None
+            and is_prefill
+            and hidden_states.shape[0] != 0
+        ):
+            quantized = self.hc_attn_pre_quant(
+                hidden_states, out_norm_weight, out_norm_eps
+            )
+            if quantized is not None:
+                (
+                    hidden_states,
+                    self.h_res,
+                    self.h_post,
+                    norm_fused,
+                    prequant,
+                ) = quantized
+                if out_norm is not None and not norm_fused:
+                    hidden_states = out_norm(hidden_states)
+                return (hidden_states, prequant[0], prequant[1]), residual
         hidden_states, self.h_res, self.h_post, norm_fused = self.hc_attn_pre(
             hidden_states, out_norm_weight, out_norm_eps
         )

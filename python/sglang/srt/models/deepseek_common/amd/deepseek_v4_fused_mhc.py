@@ -264,7 +264,8 @@ def try_aiter_fused_mhc_post_pre(
     norm_eps: Optional[float],
     force_fused: bool = False,
     w_preshuffle_bf16: bool = False,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
+    return_quant: bool = False,
+) -> Optional[Tuple]:
     """Fused mhc_post + next-layer mhc_pre via the aiter HIP kernel.
 
     Returns ``(next_residual, layer_input, post_mix, comb_mix, norm_applied)`` or
@@ -285,6 +286,9 @@ def try_aiter_fused_mhc_post_pre(
 
     try:
         from aiter.ops.mhc import mhc_fused_post_pre
+
+        if return_quant:
+            from aiter.ops.mhc import mhc_fused_post_pre_quant
     except Exception as err:
         if not _AITER_MHC_IMPORT_WARNED:
             logger.warning("aiter fused mHC is unavailable, falling back: %s", err)
@@ -298,23 +302,51 @@ def try_aiter_fused_mhc_post_pre(
         norm_kwargs["norm_eps"] = norm_eps if norm_eps is not None else rms_eps
 
     try:
-        post_mix, comb_mix, layer_input_out, next_residual = mhc_fused_post_pre(
-            layer_input=layer_input,
-            residual_in=residual,
-            post_layer_mix=post,
-            comb_res_mix=comb,
-            fn=hc_fn,
-            hc_scale=hc_scale,
-            hc_base=hc_base,
-            rms_eps=rms_eps,
-            hc_pre_eps=hc_eps,
-            hc_sinkhorn_eps=hc_eps,
-            hc_post_mult_value=hc_post_mult,
-            sinkhorn_repeat=sinkhorn_iters,
-            force_fused=force_fused,
-            w_preshuffle_bf16=w_preshuffle_bf16,
-            **norm_kwargs,
-        )
+        if return_quant:
+            if norm_weight is None or not force_fused or not w_preshuffle_bf16:
+                return None
+            (
+                post_mix,
+                comb_mix,
+                layer_input_out,
+                quant_out,
+                quant_scale,
+                next_residual,
+            ) = mhc_fused_post_pre_quant(
+                layer_input=layer_input,
+                residual_in=residual,
+                post_layer_mix=post,
+                comb_res_mix=comb,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                norm_weight=norm_weight,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_eps,
+                hc_sinkhorn_eps=hc_eps,
+                hc_post_mult_value=hc_post_mult,
+                sinkhorn_repeat=sinkhorn_iters,
+                norm_eps=norm_eps if norm_eps is not None else rms_eps,
+                w_preshuffle_bf16=True,
+            )
+        else:
+            post_mix, comb_mix, layer_input_out, next_residual = mhc_fused_post_pre(
+                layer_input=layer_input,
+                residual_in=residual,
+                post_layer_mix=post,
+                comb_res_mix=comb,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_eps,
+                hc_sinkhorn_eps=hc_eps,
+                hc_post_mult_value=hc_post_mult,
+                sinkhorn_repeat=sinkhorn_iters,
+                force_fused=force_fused,
+                w_preshuffle_bf16=w_preshuffle_bf16,
+                **norm_kwargs,
+            )
     except Exception as err:
         logger.warning(
             "aiter fused mHC kernel failed, disabling fallback path: %s", err
@@ -323,13 +355,63 @@ def try_aiter_fused_mhc_post_pre(
         return None
 
     post_out = post_mix.squeeze(-1) if post_mix.ndim == 3 else post_mix
-    return (
+    result = (
         next_residual,
         layer_input_out,
         post_out,
         comb_mix,
         norm_weight is not None,
     )
+    return result if not return_quant else (*result, (quant_out, quant_scale))
+
+
+def try_aiter_mhc_pre_quant(
+    residual: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    hc_post_mult: float,
+    sinkhorn_iters: int,
+    norm_eps: Optional[float],
+) -> Optional[Tuple]:
+    global _AITER_MHC_FUSED_POST_PRE_RUNTIME_DISABLED, _AITER_MHC_IMPORT_WARNED
+
+    if (
+        _AITER_MHC_FUSED_POST_PRE_RUNTIME_DISABLED
+        or not _is_aiter_gfx95_mhc_available()
+        or residual.shape[0] == 0
+    ):
+        return None
+    try:
+        from aiter.ops.mhc import mhc_pre_quant
+    except Exception as err:
+        if not _AITER_MHC_IMPORT_WARNED:
+            logger.warning("aiter quantized mHC pre is unavailable: %s", err)
+            _AITER_MHC_IMPORT_WARNED = True
+        return None
+
+    try:
+        post_mix, comb_mix, layer_input, quant_out, quant_scale = mhc_pre_quant(
+            residual=residual,
+            fn=hc_fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            norm_weight=norm_weight,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_eps,
+            hc_sinkhorn_eps=hc_eps,
+            hc_post_mult_value=hc_post_mult,
+            sinkhorn_repeat=sinkhorn_iters,
+            norm_eps=norm_eps if norm_eps is not None else rms_eps,
+        )
+    except Exception as err:
+        logger.warning("aiter quantized mHC pre failed, falling back: %s", err)
+        return None
+    post_out = post_mix.squeeze(-1) if post_mix.ndim == 3 else post_mix
+    return layer_input, post_out, comb_mix, True, (quant_out, quant_scale)
 
 
 def try_mhc_fused_post_pre_boundary(
@@ -351,7 +433,8 @@ def try_mhc_fused_post_pre_boundary(
     is_gfx95_supported_flag: bool,
     force_fused: bool = False,
     w_preshuffle_bf16: bool = False,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
+    return_quant: bool = False,
+) -> Optional[Tuple]:
     """Dispatch the fused mHC post+pre across the attn/MoE boundary.
 
     Preference order (first available wins): aiter HIP kernel, then the Triton
@@ -378,10 +461,11 @@ def try_mhc_fused_post_pre_boundary(
         norm_eps,
         force_fused,
         w_preshuffle_bf16,
+        return_quant,
     )
     if aiter_result is not None:
         return aiter_result
-    if w_preshuffle_bf16:
+    if w_preshuffle_bf16 or return_quant:
         # Packed hi/lo weights are an AITER-only layout. Returning None lets the
         # caller run the ordinary FP32 unfused boundary if AITER is unavailable.
         return None
@@ -423,7 +507,8 @@ def apply_mhc_post_pre_boundary(
     fn_transpose: bool,
     force_fused: bool = False,
     w_preshuffle_bf16: bool = False,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
+    return_quant: bool = False,
+) -> Optional[Tuple]:
     # Try the aiter/Triton fused post+pre kernels first; if neither fires,
     # fall back to the TileLang fused kernel, else return None so the caller
     # runs the unfused hc_post + hc_pre sequence.
@@ -446,6 +531,7 @@ def apply_mhc_post_pre_boundary(
         _is_gfx95_supported,
         force_fused,
         w_preshuffle_bf16,
+        return_quant,
     )
     if fused is not None:
         return fused

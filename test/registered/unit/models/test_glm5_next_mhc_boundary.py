@@ -23,6 +23,8 @@ def _layer(mock_packer=True):
         hc_eps=1e-6,
         hc_sinkhorn_iters=20,
     )
+    layer.is_linear_attn = False
+    layer.self_attn = Mock()
     for stage in ("attn", "ffn"):
         setattr(
             layer,
@@ -121,6 +123,76 @@ def test_glm53_small_decode_keeps_fp32_fusion(mock_apply):
     assert kwargs["w_preshuffle_bf16"] is False
 
 
+@patch("sglang.srt.models.glm5_next._use_aiter_gfx95", True)
+@patch("sglang.srt.models.glm5_next.apply_mhc_post_pre_boundary")
+def test_glm53_attn_boundary_returns_prequant_for_capable_consumer(mock_apply):
+    layer = _layer()
+    layer.is_linear_attn = True
+    layer.self_attn.can_consume_mhc_prequant.return_value = True
+    hidden, residual, h_res, h_post, norm_weight = _inputs(4096)
+    prequant = (
+        torch.empty(4096, 4096, device="meta", dtype=torch.float8_e4m3fn),
+        torch.empty(4096, 1, device="meta", dtype=torch.float32),
+    )
+    mock_apply.return_value = (
+        residual.view(4096, 4, 4096),
+        hidden,
+        h_post.view(4096, 4),
+        h_res.view(4096, 4, 4),
+        True,
+        prequant,
+    )
+    result = layer.hc_attn_post_pre(
+        hidden, residual, h_res, h_post, norm_weight, 1e-6, True
+    )
+    assert result[-1] is prequant
+    assert mock_apply.call_args.kwargs["return_quant"] is True
+
+
+@patch("sglang.srt.models.glm5_next._use_aiter_gfx95", True)
+@patch("sglang.srt.models.glm5_next.apply_mhc_post_pre_boundary")
+def test_glm53_attn_boundary_keeps_bf16_without_capable_consumer(mock_apply):
+    layer = _layer()
+    layer.is_linear_attn = True
+    layer.self_attn = SimpleNamespace()
+    hidden, residual, h_res, h_post, norm_weight = _inputs(4096)
+    mock_apply.return_value = (
+        residual.view(4096, 4, 4096),
+        hidden,
+        h_post.view(4096, 4),
+        h_res.view(4096, 4, 4),
+        True,
+    )
+    result = layer.hc_attn_post_pre(
+        hidden, residual, h_res, h_post, norm_weight, 1e-6, True
+    )
+    assert len(result) == 5
+    assert mock_apply.call_args.kwargs["return_quant"] is False
+
+
+@patch("sglang.srt.models.glm5_next._use_aiter_gfx95", True)
+@patch("sglang.srt.models.glm5_next.try_aiter_mhc_pre_quant")
+def test_glm53_attn_pre_quant_uses_capable_consumer(mock_quant):
+    layer = _layer()
+    layer.is_linear_attn = True
+    layer.self_attn.can_consume_mhc_prequant.return_value = True
+    layer_input = object()
+    post = torch.empty(1024, 4, device="meta")
+    comb = torch.empty(1024, 4, 4, device="meta")
+    prequant = ("fp8", "scale")
+    mock_quant.return_value = (layer_input, post, comb, True, prequant)
+    result = layer.hc_attn_pre_quant(
+        torch.empty(1024, 4 * 4096, device="meta"),
+        torch.empty(4096, device="meta"),
+        1e-6,
+    )
+    assert result[0] is layer_input
+    assert result[1].shape == (1024, 16)
+    assert result[2].shape == (1024, 4)
+    assert result[3:] == (True, prequant)
+    mock_quant.assert_called_once()
+
+
 def test_glm53_packed_weight_caches_track_parameter_versions():
     layer = _layer(mock_packer=False)
     pack = Mock(
@@ -187,6 +259,34 @@ def test_cross_layer_mhc_consumes_producer_coefficients_once():
     assert consumer.h_res == "next_comb" and consumer.h_post == "next_post"
     producer_post.assert_not_called()
     assert consumer_fused.call_args.kwargs["is_prefill"] is True
+
+
+def test_cross_layer_mhc_returns_optional_prequant():
+    producer = MHCState(4, Mock(), Mock(), Mock())
+    consumer = MHCState(
+        4,
+        Mock(),
+        Mock(),
+        Mock(),
+        hc_attn_post_pre=Mock(
+            return_value=(
+                "bf16",
+                "residual",
+                "comb",
+                "post",
+                True,
+                ("fp8", "scale"),
+            )
+        ),
+    )
+    producer.h_res, producer.h_post = "producer_comb", "producer_post"
+    result = consumer.update_and_read_attn_input(
+        producer,
+        torch.empty(4, 4096, device="meta"),
+        torch.empty(4, 4 * 4096, device="meta"),
+        forward_batch=_forward_batch(),
+    )
+    assert result == (("bf16", "fp8", "scale"), "residual")
 
 
 def test_cross_layer_mhc_fallback_preserves_post_then_pre_order():
