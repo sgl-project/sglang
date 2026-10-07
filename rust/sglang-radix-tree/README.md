@@ -106,18 +106,18 @@ from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.registry import register_python_tree_component
 
 
-def python_full(args: PythonTreeComponentArgument):
+def python_full_component_factory(args: PythonTreeComponentArgument):
     return FullComponent(args.cache, args.params)
 
 
-def native_full(args: TreeComponentArgument):
+def full_component_factory(args: TreeComponentArgument):
     return args.native_bindings.TreeComponentBinding.full(
         args.native_init_params, args.is_bigram
     )
 
 
-register_python_tree_component("custom_full", python_full)
-register_tree_component("custom_full", native_full)
+register_python_tree_component("custom_full", python_full_component_factory)
+register_tree_component("custom_full", full_component_factory)
 ```
 
 Register the Python counterpart first: a full cache always needs Python cache orchestration hooks, including with a Rust tree core. A Python-only name selects Python before the native extension is loaded. Direct `RustUnifiedTreeCore` construction does not require Python cache hooks.
