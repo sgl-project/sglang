@@ -1,6 +1,6 @@
 """Rebuild the trailing SWA window of a cached DeepSeek-V4 prefix by replaying
 its last ``swa_recompute_len`` tokens. The replay reads compressed and indexer
-state from the cache and writes only SWA rows."""
+entries from the cache and writes only SWA rows and the 4x compressor state."""
 
 from copy import copy
 from typing import List, Optional
