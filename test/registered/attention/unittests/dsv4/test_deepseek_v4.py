@@ -1185,6 +1185,19 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         self.assertIs(dst.unified, keep)  # refreshed in place, not swapped
         self.assertEqual(dst.unified.swa_loc.tolist(), [1, 1, 1, 1])
 
+    def test_tail_refresh_layers_follow_index_sources(self):
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            _tail_refresh_layers,
+        )
+
+        # DeepSeek-V4.1-Flash: 2 SWA, 18 ratio-2, 20 ratio-1 layers, then 3 draft stages.
+        ratios = [0, 0] + [2] * 18 + [1] * 20 + [0, 0, 0]
+        sources = [2, 8, 14, 20, 24, 28, 32, 36]
+        self.assertEqual(_tail_refresh_layers(ratios, sources), frozenset(sources))
+        self.assertIsNone(_tail_refresh_layers([0, 4, 128, 4], ()))  # V4: every layer
+        with self.assertRaisesRegex(AssertionError, "across ratios"):
+            _tail_refresh_layers(ratios, [2, 8, 14, 24])  # ratio-1 block starts at 20
+
     def test_uniform_qmeta_floors_padded_requests_at_q_len(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
 
