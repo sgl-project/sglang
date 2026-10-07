@@ -304,7 +304,11 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             )
 
     prefill_graph = cfg.cuda_graph_config.prefill
-    if prefill_graph.backend != Backend.DISABLED and prefill_graph.max_seq_len is None:
+    if (
+        prefill_graph.backend != Backend.DISABLED
+        and prefill_graph.max_seq_len is None
+        and not cfg.enable_decoder_swa_bounded_replay
+    ):
         # The captured low-ratio indexer scores a static context width; 16k
         # keeps it inside the candidate window at under 1 ms per layer.
         declare_resolution(
@@ -320,11 +324,19 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
 
     if cfg.enable_decoder_swa_bounded_replay:
-        # Late layers see a per-request tail slice, not the captured prefill shape.
         incompatible = (
             (
-                "the prefill CUDA graph",
-                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+                "full or piecewise prefill CUDA graphs",
+                prefill_graph.backend not in (Backend.DISABLED, Backend.BREAKABLE),
+            ),
+            (
+                "breakable prefill graphs outside CUDA",
+                prefill_graph.backend == Backend.BREAKABLE
+                and not get_platform().is_cuda,
+            ),
+            (
+                "breakable prefill graphs with context parallelism",
+                prefill_graph.backend == Backend.BREAKABLE and cfg.attn_cp_size > 1,
             ),
             # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
             ("DP attention", attn_dp_enabled_of(cfg)),

@@ -48,7 +48,7 @@ class TestTailMetadataReplay(CustomTestCase):
                 device="cuda",
             )
 
-        capture_batch = batch((128,))
+        capture_batch = batch((512,))
         capture_batch.max_seq_len_override = 512
         with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
             backend.init_forward_metadata(eager)
@@ -59,14 +59,22 @@ class TestTailMetadataReplay(CustomTestCase):
             captured = backend.init_forward_metadata_for_breakable_cuda_graph_capture(
                 capture_batch
             )
-            self.assertIsNone(backend.tail_forward_metadata)
+            self.assertEqual(
+                backend.tail_forward_metadata.late_layer_tail.extend_seq_lens_cpu, [128]
+            )
             slots = captured.core_attn_metadata.raw_out_loc
             output = torch.empty_like(slots)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 output.copy_(slots)
 
-            for rows in [(44,), (24, 24), (80,)] * 4:
+            for rows, tail_rows in [
+                ((44,), list(range(44))),
+                ((24, 24), list(range(48))),
+                ((80,), list(range(80))),
+                ((256,), list(range(128, 256))),
+                ((320, 160), list(range(192, 320)) + list(range(352, 480))),
+            ] * 4:
                 with self.subTest(rows=rows):
                     backend.init_forward_metadata(eager)
                     self.assertIsNotNone(backend.tail_forward_metadata)
@@ -74,12 +82,15 @@ class TestTailMetadataReplay(CustomTestCase):
                     static = copy.copy(live)
                     static.max_seq_len_override = 512
                     static.out_cache_loc = torch.nn.functional.pad(
-                        live.out_cache_loc, (0, 128 - sum(rows))
+                        live.out_cache_loc, (0, 512 - sum(rows))
                     )
                     backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
                         captured, live, static_forward_batch=static
                     )
-                    self.assertIsNone(backend.tail_forward_metadata)
+                    self.assertEqual(
+                        backend.tail_forward_metadata.late_layer_tail.extend_seq_lens_cpu,
+                        [min(n, 128) for n in rows],
+                    )
                     published = BlockIds(
                         torch.arange(sum(rows), device="cuda").view(-1, 1),
                         list(rows),
@@ -89,6 +100,10 @@ class TestTailMetadataReplay(CustomTestCase):
                         graph.replay()
                     self.assertIs(
                         backend.forward_metadata.candidate_metadata, published
+                    )
+                    torch.testing.assert_close(
+                        backend.tail_forward_metadata.candidate_metadata.blocks,
+                        published.blocks[tail_rows],
                     )
                     self.assertIs(captured.core_attn_metadata.raw_out_loc, slots)
                     torch.testing.assert_close(
