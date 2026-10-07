@@ -639,7 +639,8 @@ class QSAIndexer(MultiPlatformOp):
         forward_batch,
         indexer_metadata,
     ) -> torch.Tensor:
-        # Share the orchestration; individual operators select Torch on NPU.
+        # Reuse the indexer flow; CUDA-only fast paths are guarded, and
+        # individual operators dispatch to their NPU implementations.
         return self.forward_cuda(
             hidden_states, positions, forward_batch, indexer_metadata
         )
