@@ -451,8 +451,7 @@ def _collect_image_span_requests(
 
 def _owner_span_encoder(data_embedding_func: DataEmbeddingFunc, device: torch.device):
     def encode(items: List[MultimodalDataItem]):
-        if not _can_skip_pre_embed_feature_move(data_embedding_func):
-            _move_items_to_device(items, device)
+        _move_items_to_device(items, device, data_embedding_func)
         return data_embedding_func(items)
 
     return encode
