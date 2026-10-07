@@ -7,8 +7,9 @@ agree; this pins the slice offsets, the tail view the split path still reads,
 and the fact that the strided f_a slice is a legal input to the f_b GEMM and
 to the fused decode kernel's shape gate.
 
-The two paths run different GEMM kernels (N=6288 has no tuned aiter config,
-N=6144 does), so they agree to bf16 rounding, not bitwise.
+The two paths run different GEMMs. The FP8 decode path packs the 6288-row
+merge out to N=6400 so it hits the tuned aiter row; this test checks the
+BF16 view layout, which stays 6288.
 """
 
 import unittest

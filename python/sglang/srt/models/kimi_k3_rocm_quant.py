@@ -50,6 +50,16 @@ def _k3_channel_fp8_to_bf16(module: nn.Module, weight: torch.Tensor) -> torch.Te
     )
 
 
+# aiter's Kimi-K3 table tunes the fused in-proj as N=6400, K=7168 (flydsl,
+# which the profiler records as kernel_gemm_0). The logical merge is 6288
+# rows at TP=8: 6144 + f_a(128) + b(12) + 4. The next multiple of 64 is 6336,
+# and that shape is not in the table, so the GEMM falls through to the
+# default CK kernel. Padding the packed weight out to 6400 hits the tuned row.
+_KDA_INPROJ_TUNED_N = 6400
+_KDA_INPROJ_WIDE_N = 6144
+_KDA_INPROJ_K = 7168
+
+
 def _k3_kda_inproj_channel_fp8_scales(
     self_attn: nn.Module,
 ) -> Optional[list[torch.Tensor]]:
@@ -57,11 +67,16 @@ def _k3_kda_inproj_channel_fp8_scales(
 
     Quark stores self_attn.* as [out, in] e4m3 plus an [out] fp32 scale --
     already the PTPC layout -- so the merge can reuse them instead of
-    re-quantizing a dequantized copy."""
+    re-quantizing a dequantized copy.
+
+    ``do_fuse_qkvbfg`` stays false whenever the loader passed a quant config
+    (the MXFP4 experts). The three attention weights are still dense BF16 in
+    the checkpoint and online FP8 has already given them channel scales, so
+    the merge does not depend on that flag.
+    """
     if not (
-        _k3_ptpc_fp8
+        (_k3_ptpc_fp8 or envs.SGLANG_ROCM_K3_PTPC_FP8.get())
         and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()
-        and self_attn.do_fuse_qkvbfg
         and self_attn.use_full_rank_gate
     ):
         return None
@@ -97,10 +112,23 @@ def _k3_merge_kda_inproj_fp8(self_attn: nn.Module) -> bool:
     sizes = [weight.shape[0] for weight in weights]
     # Same 8-row pad as the BF16 merge: it keeps every fused-output row
     # 16-byte aligned for the vectorized consumers of the split slices.
-    pad = (-sum(sizes)) % 8
+    logical = sum(sizes)
+    pad = (-logical) % 8
     if pad:
         weights.append(weights[0].new_zeros((pad, weights[0].shape[1])))
         scales.append(scales[0].new_ones(pad))
+        logical += pad
+    wide_n, k = weights[0].shape
+    if (
+        wide_n == _KDA_INPROJ_WIDE_N
+        and k == _KDA_INPROJ_K
+        and logical < _KDA_INPROJ_TUNED_N
+    ):
+        extra = _KDA_INPROJ_TUNED_N - logical
+        weights.append(weights[0].new_zeros((extra, k)))
+        scales.append(scales[0].new_ones(extra))
+        pad += extra
+        logical = _KDA_INPROJ_TUNED_N
     (
         self_attn._qkvgbfa_fp8_w,
         self_attn._qkvgbfa_fp8_s,
@@ -117,6 +145,13 @@ def _k3_merge_kda_inproj_fp8(self_attn: nn.Module) -> bool:
         weights[0].shape[1],
     )
     _k3_prepare_f_b_tiny_gemm(self_attn)
+    _k3_log_once(
+        "kda_inproj_fp8",
+        "K3 KDA in-proj packed as one PTPC GEMM (logical rows %d, packed N=%d, K=%d)",
+        sum(self_attn._qkvgbfa_sizes),
+        logical,
+        weights[0].shape[1],
+    )
     return True
 
 
