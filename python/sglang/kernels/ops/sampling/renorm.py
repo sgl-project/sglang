@@ -96,6 +96,23 @@ def _apply_pivot(probs: torch.Tensor, pivots: torch.Tensor) -> torch.Tensor:
     return torch.where(normalizer > 0, kept / normalizer, torch.zeros_like(kept))
 
 
+def restore_rows_above_host_top_k(
+    probs: torch.Tensor,
+    renormalized: torch.Tensor,
+    top_ks: torch.Tensor,
+    max_top_k: int | None,
+) -> torch.Tensor:
+    """Keep host-declared unbounded rows bitwise unchanged."""
+    if max_top_k is None or max_top_k <= 0:
+        return renormalized
+    bounded_width = min(int(max_top_k), probs.shape[1])
+    return torch.where(
+        (top_ks > bounded_width).unsqueeze(1),
+        probs,
+        renormalized,
+    )
+
+
 def top_k_renorm_probs_torch(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
@@ -113,7 +130,8 @@ def top_k_renorm_probs_torch(
     top_ks = per_row_threshold(top_k, probs=probs, dtype=torch.int64).clamp(
         1, vocab_size
     )
-    return _apply_pivot(probs, top_k_pivots(probs, top_ks, max_top_k=max_top_k))
+    renormalized = _apply_pivot(probs, top_k_pivots(probs, top_ks, max_top_k=max_top_k))
+    return restore_rows_above_host_top_k(probs, renormalized, top_ks, max_top_k)
 
 
 def top_p_renorm_probs_torch(

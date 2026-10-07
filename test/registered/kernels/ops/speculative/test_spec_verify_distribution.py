@@ -242,10 +242,12 @@ class TestPortableSpecRenorm(CustomTestCase):
             device=self.device,
         )
         top_ks = torch.tensor([2, TOP_K_ALL], dtype=torch.int32, device=self.device)
-        renorm = top_k_renorm_probs_torch(probs, top_ks, max_top_k=2)
+        with patch.object(torch, "topk", wraps=torch.topk) as topk:
+            renorm = top_k_renorm_probs_torch(probs, top_ks, max_top_k=2)
 
+        self.assertEqual(topk.call_args.args[1], 2)
         self.assertEqual(torch.count_nonzero(renorm[0]).item(), 2)
-        torch.testing.assert_close(renorm[1], probs[1])
+        torch.testing.assert_close(renorm[1], probs[1], rtol=0, atol=0)
 
     def test_top_p_per_row_and_zero_mass(self):
         from sglang.kernels.ops.sampling.renorm import top_p_renorm_probs_torch

@@ -18,6 +18,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.sampling.renorm import (
     per_row_threshold,
+    restore_rows_above_host_top_k,
     top_k_pivots,
     top_p_pivots,
 )
@@ -115,7 +116,10 @@ def top_k_renorm_probs_triton(
     top_ks = per_row_threshold(top_k, probs=probs, dtype=torch.int64).clamp(
         1, probs.shape[1]
     )
-    return apply_pivot_triton(probs, top_k_pivots(probs, top_ks, max_top_k=max_top_k))
+    renormalized = apply_pivot_triton(
+        probs, top_k_pivots(probs, top_ks, max_top_k=max_top_k)
+    )
+    return restore_rows_above_host_top_k(probs, renormalized, top_ks, max_top_k)
 
 
 def top_p_renorm_probs_triton(
