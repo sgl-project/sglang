@@ -75,7 +75,6 @@ def test_text_mlp_uses_single_rank_when_intermediate_size_is_not_tp_divisible(
 ):
     monkeypatch.setattr(qwen2_5vl, "Qwen2_5_VLAttention", lambda *_args: nn.Identity())
     monkeypatch.setattr(qwen2_5vl, "_tp_world_size", lambda: 3)
-    monkeypatch.setattr(qwen2_5vl, "_tp_rank", lambda: 2)
     config = SimpleNamespace(
         hidden_size=16,
         intermediate_size=25,

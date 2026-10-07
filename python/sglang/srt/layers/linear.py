@@ -58,6 +58,20 @@ logger = logging.getLogger(__name__)
 LinearParallelGroup = Literal["tp", "attn_tp", "replicated"]
 
 
+def resolve_linear_parallel_group(
+    parallel_group: LinearParallelGroup,
+) -> Tuple[int, int]:
+    """Freeze a group's weight partition in the current construction scope."""
+    if parallel_group == "replicated":
+        return 0, 1
+    if parallel_group not in ("tp", "attn_tp"):
+        raise ValueError(f"Unknown linear parallel_group: {parallel_group!r}")
+    parallel = get_parallel()
+    if parallel_group == "attn_tp":
+        return parallel.attn_tp_rank, parallel.attn_tp_size
+    return parallel.tp_rank, parallel.tp_size
+
+
 def _resolve_linear_partition(
     parallel_group: Optional[LinearParallelGroup],
     tp_rank: Optional[int],
@@ -74,14 +88,7 @@ def _resolve_linear_partition(
             raise ValueError(
                 "parallel_group cannot be combined with tp_rank or tp_size"
             )
-        if parallel_group == "replicated":
-            return 0, 1
-        if parallel_group not in ("tp", "attn_tp"):
-            raise ValueError(f"Unknown linear parallel_group: {parallel_group!r}")
-        parallel = get_parallel()
-        if parallel_group == "attn_tp":
-            return parallel.attn_tp_rank, parallel.attn_tp_size
-        return parallel.tp_rank, parallel.tp_size
+        return resolve_linear_parallel_group(parallel_group)
     if tp_rank is None:
         tp_rank = get_parallel().tp_rank
     if tp_size is None:
