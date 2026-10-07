@@ -9,14 +9,14 @@ from fastapi.responses import ORJSONResponse
 
 from sglang.srt.utils.auth import AuthLevel, auth_level
 from sglang.srt.weight_sync.gpu_delta.io import (
-    AbortWeightsDeltaReqInput,
-    ApplyWeightsDeltaReqInput,
-    ClearWeightsDeltaStateReqInput,
-    GetWeightsDeltaInfoReqInput,
-    GetWeightsDeltaStatusReqInput,
-    PrepareWeightsDeltaReqInput,
-    ResumeWeightsDeltaReqInput,
-    UpdateWeightsFromDeltaReqInput,
+    AbortGpuDeltaReqInput,
+    ApplyGpuDeltaReqInput,
+    ClearGpuDeltaStateReqInput,
+    GetGpuDeltaInfoReqInput,
+    GetGpuDeltaStatusReqInput,
+    PrepareGpuDeltaReqInput,
+    ResumeGpuDeltaReqInput,
+    UpdateWeightsFromGpuDeltaReqInput,
 )
 
 
@@ -30,58 +30,58 @@ def register_gpu_delta_routes(app: FastAPI, get_global_state: Callable):
             status_code=HTTPStatus.OK if content["success"] else HTTPStatus.CONFLICT,
         )
 
-    @app.post("/update_weights_from_delta")
+    @app.post("/update_weights_from_gpu_delta")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def update_weights_from_delta(
-        obj: Annotated[UpdateWeightsFromDeltaReqInput, Body()],
+    async def update_weights_from_gpu_delta(
+        obj: Annotated[UpdateWeightsFromGpuDeltaReqInput, Body()],
     ):
         return await dispatch(obj)
 
-    @app.post("/clear_weights_delta_state")
+    @app.post("/clear_gpu_delta_state")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def clear_weights_delta_state(
-        obj: Annotated[ClearWeightsDeltaStateReqInput, Body()],
+    async def clear_gpu_delta_state(
+        obj: Annotated[ClearGpuDeltaStateReqInput, Body()],
     ):
         return await dispatch(obj)
 
-    @app.post("/get_weights_delta_info")
+    @app.post("/get_gpu_delta_info")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def get_weights_delta_info(
-        obj: Annotated[GetWeightsDeltaInfoReqInput, Body()],
+    async def get_gpu_delta_info(
+        obj: Annotated[GetGpuDeltaInfoReqInput, Body()],
     ):
         return await dispatch(obj)
 
-    @app.post("/prepare_weights_delta")
+    @app.post("/prepare_gpu_delta")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def prepare_weights_delta(
-        obj: Annotated[PrepareWeightsDeltaReqInput, Body()],
+    async def prepare_gpu_delta(
+        obj: Annotated[PrepareGpuDeltaReqInput, Body()],
     ):
         return await dispatch(obj)
 
-    @app.post("/get_weights_delta_status")
+    @app.post("/get_gpu_delta_status")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def get_weights_delta_status(
-        obj: Annotated[GetWeightsDeltaStatusReqInput, Body()],
+    async def get_gpu_delta_status(
+        obj: Annotated[GetGpuDeltaStatusReqInput, Body()],
     ):
         return await dispatch(obj)
 
-    @app.post("/apply_weights_delta")
+    @app.post("/apply_gpu_delta")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def apply_weights_delta(
-        obj: Annotated[ApplyWeightsDeltaReqInput, Body()],
+    async def apply_gpu_delta(
+        obj: Annotated[ApplyGpuDeltaReqInput, Body()],
     ):
         return await dispatch(obj)
 
-    @app.post("/resume_weights_delta")
+    @app.post("/resume_gpu_delta")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def resume_weights_delta(
-        obj: Annotated[ResumeWeightsDeltaReqInput, Body()],
+    async def resume_gpu_delta(
+        obj: Annotated[ResumeGpuDeltaReqInput, Body()],
     ):
         return await dispatch(obj)
 
-    @app.post("/abort_weights_delta")
+    @app.post("/abort_gpu_delta")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def abort_weights_delta(
-        obj: Annotated[AbortWeightsDeltaReqInput, Body()],
+    async def abort_gpu_delta(
+        obj: Annotated[AbortGpuDeltaReqInput, Body()],
     ):
         return await dispatch(obj)

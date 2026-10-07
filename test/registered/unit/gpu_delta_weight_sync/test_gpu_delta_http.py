@@ -15,15 +15,15 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.utils.auth import AuthLevel, add_api_key_middleware
 from sglang.srt.weight_sync.gpu_delta.http import register_gpu_delta_routes
 from sglang.srt.weight_sync.gpu_delta.io import (
-    AbortWeightsDeltaReqInput,
-    ApplyWeightsDeltaReqInput,
-    ClearWeightsDeltaStateReqInput,
-    DeltaWeightsReqOutput,
-    GetWeightsDeltaInfoReqInput,
-    GetWeightsDeltaStatusReqInput,
-    PrepareWeightsDeltaReqInput,
-    ResumeWeightsDeltaReqInput,
-    UpdateWeightsFromDeltaReqInput,
+    AbortGpuDeltaReqInput,
+    ApplyGpuDeltaReqInput,
+    ClearGpuDeltaStateReqInput,
+    GetGpuDeltaInfoReqInput,
+    GetGpuDeltaStatusReqInput,
+    GpuDeltaReqOutput,
+    PrepareGpuDeltaReqInput,
+    ResumeGpuDeltaReqInput,
+    UpdateWeightsFromGpuDeltaReqInput,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -68,15 +68,15 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
     ]
     cases = [
         (
-            "update_weights_from_delta",
-            UpdateWeightsFromDeltaReqInput,
+            "update_weights_from_gpu_delta",
+            UpdateWeightsFromGpuDeltaReqInput,
             {"manifest_path": "/immutable/manifest.json"},
         ),
-        ("clear_weights_delta_state", ClearWeightsDeltaStateReqInput, {}),
-        ("get_weights_delta_info", GetWeightsDeltaInfoReqInput, {"engine_id": "e0"}),
+        ("clear_gpu_delta_state", ClearGpuDeltaStateReqInput, {}),
+        ("get_gpu_delta_info", GetGpuDeltaInfoReqInput, {"engine_id": "e0"}),
         (
-            "prepare_weights_delta",
-            PrepareWeightsDeltaReqInput,
+            "prepare_gpu_delta",
+            PrepareGpuDeltaReqInput,
             session
             | {
                 "manifest_path": "/immutable/manifest.json",
@@ -88,18 +88,18 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
                 "participants": [],
             },
         ),
-        ("get_weights_delta_status", GetWeightsDeltaStatusReqInput, session),
+        ("get_gpu_delta_status", GetGpuDeltaStatusReqInput, session),
         (
-            "apply_weights_delta",
-            ApplyWeightsDeltaReqInput,
+            "apply_gpu_delta",
+            ApplyGpuDeltaReqInput,
             session,
         ),
         (
-            "resume_weights_delta",
-            ResumeWeightsDeltaReqInput,
+            "resume_gpu_delta",
+            ResumeGpuDeltaReqInput,
             session,
         ),
-        ("abort_weights_delta", AbortWeightsDeltaReqInput, session),
+        ("abort_gpu_delta", AbortGpuDeltaReqInput, session),
     ]
     for name, request_type, payload in cases:
         route = next(route for route in app.routes if route.path == f"/{name}")
@@ -118,16 +118,16 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
         received = msgpack_decode(msgpack_encode(calls[-1]))
         assert type(received) is request_type
         assert received == calls[-1]
-    response = DeltaWeightsReqOutput(
+    response = GpuDeltaReqOutput(
         success=True, message="", participant=receipts[0], rid="control-reply"
     )
     received = msgpack_decode(msgpack_encode(response))
-    assert type(received) is DeltaWeightsReqOutput and received == response
+    assert type(received) is GpuDeltaReqOutput and received == response
     assert len(calls) == len(cases)
 
     # A real scheduler failure retains the same typed HTTP route and response.
     reply.update(success=False, message="delta payload checksum failed")
-    result = client.post("/get_weights_delta_status", json={"session_id": "p"})
+    result = client.post("/get_gpu_delta_status", json={"session_id": "p"})
     assert result.status_code == 409 and result.json() == reply
     assert len(calls) == len(cases) + 1
 

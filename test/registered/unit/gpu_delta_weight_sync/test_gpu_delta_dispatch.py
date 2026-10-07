@@ -76,19 +76,17 @@ def test_update_owns_pause_fence_retract_and_resume_order(monkeypatch):
         deadline = time.monotonic() + 2
         while session.status()["state"] == "PREPARING" and time.monotonic() < deadline:
             time.sleep(0.001)
-        result = wrapped(io.ApplyWeightsDeltaReqInput(session_id="p", rid="apply-rid"))
+        result = wrapped(io.ApplyGpuDeltaReqInput(session_id="p", rid="apply-rid"))
         assert result.rid == "apply-rid" and scheduler._engine_paused
         assert result.success and events == ["fence", "retract", "flush", "apply"]
-        result = wrapped(io.ResumeWeightsDeltaReqInput(session_id="p"))
+        result = wrapped(io.ResumeGpuDeltaReqInput(session_id="p"))
         assert result.success and result.participant["state"] == "RESUMED"
         assert events[4:6] == [("version", "1"), "resume"]
         assert not scheduler._engine_paused
-        cleared = wrapped(io.ClearWeightsDeltaStateReqInput())
+        cleared = wrapped(io.ClearGpuDeltaStateReqInput())
         assert cleared.success and cleared.participant["version"] == 1
         assert events[6:] == ["release", "close"]
-        released = wrapped(
-            io.ReleaseWeightsDeltaCacheReqInput(owner_rank_ids=["original"])
-        )
+        released = wrapped(io.ReleaseGpuDeltaCacheReqInput(owner_rank_ids=["original"]))
         assert released.success and released.participant["state"] == "CLEARED"
         assert not scheduler._engine_paused
     finally:

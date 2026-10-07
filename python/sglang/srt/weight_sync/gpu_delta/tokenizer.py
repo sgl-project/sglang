@@ -9,16 +9,16 @@ import orjson
 
 from sglang.srt.runtime_context import get_serving
 from sglang.srt.weight_sync.gpu_delta.io import (
-    AbortWeightsDeltaReqInput,
-    ApplyWeightsDeltaReqInput,
-    ClearWeightsDeltaStateReqInput,
-    DeltaWeightsReqOutput,
-    GetWeightsDeltaInfoReqInput,
-    GetWeightsDeltaStatusReqInput,
-    PrepareWeightsDeltaReqInput,
-    ReleaseWeightsDeltaCacheReqInput,
-    ResumeWeightsDeltaReqInput,
-    UpdateWeightsFromDeltaReqInput,
+    AbortGpuDeltaReqInput,
+    ApplyGpuDeltaReqInput,
+    ClearGpuDeltaStateReqInput,
+    GetGpuDeltaInfoReqInput,
+    GetGpuDeltaStatusReqInput,
+    GpuDeltaReqOutput,
+    PrepareGpuDeltaReqInput,
+    ReleaseGpuDeltaCacheReqInput,
+    ResumeGpuDeltaReqInput,
+    UpdateWeightsFromGpuDeltaReqInput,
 )
 from sglang.srt.weight_sync.gpu_delta.session import GpuDeltaCommunicator
 
@@ -32,25 +32,25 @@ class GpuDeltaTokenizerControl:
             manager._dispatch_to_scheduler, fan_out
         )
         manager._result_dispatcher += TypeBasedDispatcher(
-            [(DeltaWeightsReqOutput, self.communicator.handle_recv)]
+            [(GpuDeltaReqOutput, self.communicator.handle_recv)]
         )
 
     async def request(self, obj):
         if isinstance(
-            obj, (UpdateWeightsFromDeltaReqInput, ClearWeightsDeltaStateReqInput)
+            obj, (UpdateWeightsFromGpuDeltaReqInput, ClearGpuDeltaStateReqInput)
         ):
             try:
-                if isinstance(obj, UpdateWeightsFromDeltaReqInput):
+                if isinstance(obj, UpdateWeightsFromGpuDeltaReqInput):
                     return await self._load(obj.manifest_path, obj.release_state)
                 return await self._clear()
             except Exception as exc:
                 return {"success": False, "message": str(exc), "participants": []}
-        if isinstance(obj, (ApplyWeightsDeltaReqInput, ResumeWeightsDeltaReqInput)):
+        if isinstance(obj, (ApplyGpuDeltaReqInput, ResumeGpuDeltaReqInput)):
             async with self.manager.is_pause_cond:
-                if isinstance(obj, ApplyWeightsDeltaReqInput):
+                if isinstance(obj, ApplyGpuDeltaReqInput):
                     self.manager.is_pause = True
                 result = await self._request(obj)
-                if isinstance(obj, ResumeWeightsDeltaReqInput) and result["success"]:
+                if isinstance(obj, ResumeGpuDeltaReqInput) and result["success"]:
                     self.manager._update_weight_version_if_provided(
                         str(result["participants"][0]["target_version"])
                     )
@@ -67,7 +67,7 @@ class GpuDeltaTokenizerControl:
         if manifest["base_version"] != 0:
             raise ValueError("standalone delta loading requires an HF-base publication")
         described = await self._request(
-            GetWeightsDeltaInfoReqInput(engine_id="standalone-" + uuid.uuid4().hex)
+            GetGpuDeltaInfoReqInput(engine_id="standalone-" + uuid.uuid4().hex)
         )
         if not described["success"]:
             return described
@@ -79,7 +79,7 @@ class GpuDeltaTokenizerControl:
                 "standalone delta loading requires freshly loaded base weights"
             )
         session_id = uuid.uuid4().hex
-        prepare = PrepareWeightsDeltaReqInput(
+        prepare = PrepareGpuDeltaReqInput(
             session_id=session_id,
             manifest_path=str(path),
             manifest_sha256=hashlib.sha256(content).hexdigest(),
@@ -96,15 +96,15 @@ class GpuDeltaTokenizerControl:
         try:
             result = await asyncio.wait_for(self._prepare(prepare), timeout=1800)
         except BaseException:
-            await self._request(AbortWeightsDeltaReqInput(session_id=session_id))
+            await self._request(AbortGpuDeltaReqInput(session_id=session_id))
             raise
         if not result["success"]:
-            await self._request(AbortWeightsDeltaReqInput(session_id=session_id))
+            await self._request(AbortGpuDeltaReqInput(session_id=session_id))
             return result
-        result = await self.request(ApplyWeightsDeltaReqInput(session_id=session_id))
+        result = await self.request(ApplyGpuDeltaReqInput(session_id=session_id))
         if not result["success"]:
             return result
-        result = await self.request(ResumeWeightsDeltaReqInput(session_id=session_id))
+        result = await self.request(ResumeGpuDeltaReqInput(session_id=session_id))
         if not result["success"]:
             return result
         return await self._clear() if release_state else result
@@ -116,12 +116,12 @@ class GpuDeltaTokenizerControl:
         ):
             await asyncio.sleep(0.05)
             result = await self._request(
-                GetWeightsDeltaStatusReqInput(session_id=request.session_id)
+                GetGpuDeltaStatusReqInput(session_id=request.session_id)
             )
         return result
 
     async def _clear(self):
-        result = await self._request(ClearWeightsDeltaStateReqInput())
+        result = await self._request(ClearGpuDeltaStateReqInput())
         if not result["success"]:
             return result
         owners = {}
@@ -133,7 +133,7 @@ class GpuDeltaTokenizerControl:
                     identity["rank_id"],
                 )
         return await self._request(
-            ReleaseWeightsDeltaCacheReqInput(owner_rank_ids=list(owners.values()))
+            ReleaseGpuDeltaCacheReqInput(owner_rank_ids=list(owners.values()))
         )
 
     async def _request(self, obj):

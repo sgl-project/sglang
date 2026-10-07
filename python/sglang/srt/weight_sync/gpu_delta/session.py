@@ -283,14 +283,14 @@ def with_gpu_delta_controls(scheduler, dispatcher):
     control = GpuDeltaSchedulerControl(scheduler)
     dispatcher += TypeBasedDispatcher(
         [
-            (delta_io.GetWeightsDeltaInfoReqInput, control.handle),
-            (delta_io.ClearWeightsDeltaStateReqInput, control.handle),
-            (delta_io.ReleaseWeightsDeltaCacheReqInput, control.handle),
-            (delta_io.PrepareWeightsDeltaReqInput, control.handle),
-            (delta_io.GetWeightsDeltaStatusReqInput, control.handle),
-            (delta_io.ApplyWeightsDeltaReqInput, control.handle),
-            (delta_io.AbortWeightsDeltaReqInput, control.handle),
-            (delta_io.ResumeWeightsDeltaReqInput, control.handle),
+            (delta_io.GetGpuDeltaInfoReqInput, control.handle),
+            (delta_io.ClearGpuDeltaStateReqInput, control.handle),
+            (delta_io.ReleaseGpuDeltaCacheReqInput, control.handle),
+            (delta_io.PrepareGpuDeltaReqInput, control.handle),
+            (delta_io.GetGpuDeltaStatusReqInput, control.handle),
+            (delta_io.ApplyGpuDeltaReqInput, control.handle),
+            (delta_io.AbortGpuDeltaReqInput, control.handle),
+            (delta_io.ResumeGpuDeltaReqInput, control.handle),
         ]
     )
     return dispatcher
@@ -336,7 +336,7 @@ class GpuDeltaSchedulerControl:
         runner = scheduler.tp_worker.model_runner
         # Reuse the ordinary updater's exclusions: shared IPC weights may belong
         # to other engines, and untracked derived caches would retain old values.
-        runner.weight_updater._assert_weight_cache_inactive("apply_weights_delta")
+        runner.weight_updater._assert_weight_cache_inactive("apply_gpu_delta")
         error = _unsupported_derived_weight_cache_error(runner.model)
         if error is not None:
             raise ValueError(error)
@@ -377,15 +377,15 @@ class GpuDeltaSchedulerControl:
         from sglang.srt.managers import io_struct as io
 
         try:
-            if isinstance(request, delta_io.GetWeightsDeltaInfoReqInput):
+            if isinstance(request, delta_io.GetGpuDeltaInfoReqInput):
                 receipt = self._describe(request.engine_id)
-            elif isinstance(request, delta_io.ClearWeightsDeltaStateReqInput):
+            elif isinstance(request, delta_io.ClearGpuDeltaStateReqInput):
                 receipt = (
                     self.session.clear()
                     if self.session is not None
                     else {"identity": None, "state": "CLEARED"}
                 )
-            elif isinstance(request, delta_io.ReleaseWeightsDeltaCacheReqInput):
+            elif isinstance(request, delta_io.ReleaseGpuDeltaCacheReqInput):
                 receipt = (
                     self.session.release_cache(
                         self.session.identity["rank_id"] in request.owner_rank_ids
@@ -393,7 +393,7 @@ class GpuDeltaSchedulerControl:
                     if self.session is not None
                     else {"identity": None, "state": "CLEARED"}
                 )
-            elif isinstance(request, delta_io.PrepareWeightsDeltaReqInput):
+            elif isinstance(request, delta_io.PrepareGpuDeltaReqInput):
                 receipt = self.session.prepare(
                     {
                         "session_id": request.session_id,
@@ -406,9 +406,9 @@ class GpuDeltaSchedulerControl:
                         "participants": request.participants,
                     }
                 )
-            elif isinstance(request, delta_io.GetWeightsDeltaStatusReqInput):
+            elif isinstance(request, delta_io.GetGpuDeltaStatusReqInput):
                 receipt = self.session.status()
-            elif isinstance(request, delta_io.ApplyWeightsDeltaReqInput):
+            elif isinstance(request, delta_io.ApplyGpuDeltaReqInput):
                 self.scheduler._engine_paused = True
                 receipt = self.session.apply(
                     self.scheduler.device_module.synchronize,
@@ -417,7 +417,7 @@ class GpuDeltaSchedulerControl:
                     ),
                     lambda: self.scheduler.flush_cache(empty_cache=False),
                 )
-            elif isinstance(request, delta_io.ResumeWeightsDeltaReqInput):
+            elif isinstance(request, delta_io.ResumeGpuDeltaReqInput):
 
                 def resume(version):
                     self.scheduler.record_weight_version_change(str(version))
@@ -426,12 +426,12 @@ class GpuDeltaSchedulerControl:
                     )
 
                 receipt = self.session.resume(resume)
-            elif isinstance(request, delta_io.AbortWeightsDeltaReqInput):
+            elif isinstance(request, delta_io.AbortGpuDeltaReqInput):
                 receipt = self.session.abort(request.session_id)
             else:
                 raise ValueError("unknown delta operation")
             success = receipt["state"] not in {"FAILED", "POISONED"}
-            return delta_io.DeltaWeightsReqOutput(
+            return delta_io.GpuDeltaReqOutput(
                 rid=request.rid,
                 success=success,
                 message=receipt.get("message", ""),
@@ -444,6 +444,6 @@ class GpuDeltaSchedulerControl:
             }
             if self.session is not None and self.session._session is not None:
                 receipt = self.session.status()
-            return delta_io.DeltaWeightsReqOutput(
+            return delta_io.GpuDeltaReqOutput(
                 rid=request.rid, success=False, message=str(exc), participant=receipt
             )

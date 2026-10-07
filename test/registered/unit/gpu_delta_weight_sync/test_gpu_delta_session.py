@@ -307,7 +307,7 @@ def test_unsafe_weight_caches_reject_before_plan_or_session_creation(
     )
 
     def check_shared(op):
-        assert op == "apply_weights_delta"
+        assert op == "apply_gpu_delta"
         calls.append("shared")
         if cache == "shared IPC":
             raise RuntimeError(cache)
