@@ -91,7 +91,8 @@ class ReadoutManager(TokenizerManagerScoreMixin):
             hf_config=SimpleNamespace(
                 architectures=["Qwen3_5ForConditionalGeneration"],
                 model_type="qwen3_5",
-            )
+            ),
+            decision_config=None,
         )
         self.is_generation = True
         self.context_len = 8192
