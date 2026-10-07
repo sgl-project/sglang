@@ -1384,9 +1384,8 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 )
             row_masks[name] = (rows, per_channel)
 
-        # Keep one native call with the complete, re-iterable input. Only FP8
-        # parameter writes are deferred; model-level cross-key logic and non-FP8
-        # loads (including tied embeddings) execute in their original order.
+        # Defer only FP8 writes so one native call preserves cross-key lookups
+        # and the order of non-FP8 loads, including tied embeddings.
         writes = collections.defaultdict(list)
         native_loaders = {}
         for name in row_masks:
