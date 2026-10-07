@@ -499,7 +499,8 @@ class ResponseTemplateReasoningDetector:
         self,
         json_schema: Any,
         *,
-        tool_names: list[str],
+        tools: list[dict[str, Any]],
+        parallel_tool_calls: bool = True,
         message_start: bool = False,
     ) -> dict[str, Any] | None:
         """A structural tag for JSON framed as the answer, after the reasoning

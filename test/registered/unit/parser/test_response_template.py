@@ -703,7 +703,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
         call starts."""
         detector = BeamReasoningDetector(response_template=DELIMITED_TEMPLATE)
         call = '<call:get_weather>{"days": 3}</call>'
-        declared = ["get_weather"]
+        declared = [_tool().model_dump()]
         cases = [
             (declared, '<answer>{"a": 1}', True),
             (declared, '<answer>{"a": 1}</answer>', False),
@@ -712,24 +712,21 @@ class TestResponseTemplateAdapters(CustomTestCase):
             (declared, call, True),
             ([], call, False),
             (declared, "<call:get_time>{}</call>", False),
-            # An answer after the calls is JSON too; a call's own text is not.
-            (declared, call + '<answer>{"a": 1}', True),
-            (declared, call + '<answer>{"a": 1}</answer>', False),
-            (declared, call + "<answer>not json", False),
+            (declared, call + '<answer>{"a": 1}', False),
             (declared, '<call:get_weather>{"city": "<answer>Paris"}</call>', True),
         ]
 
         self.assertEqual(detector.think_end_token, "</think>")
-        for tool_names, text, expected in cases:
-            with self.subTest(tool_names=tool_names, text=text):
+        for tools, text, expected in cases:
+            with self.subTest(tools=tools, text=text):
                 tag = detector.json_answer_structural_tag(
-                    {"type": "object"}, tool_names=tool_names
+                    {"type": "object"}, tools=tools
                 )
                 grammar = Grammar.from_structural_tag(json.dumps(tag))
                 self.assertIs(_is_grammar_accept_string(grammar, text), expected)
         with self.assertRaisesRegex(ValueError, "cannot be encoded"):
             detector.json_answer_structural_tag(
-                {"type": "object"}, tool_names=["get weather"]
+                {"type": "object"}, tools=[_tool("get weather").model_dump()]
             )
 
     def test_message_start_call_opens_as_the_parser_opens_it(self):

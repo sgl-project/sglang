@@ -1190,6 +1190,37 @@ class ServingChatTestCase(CustomTestCase):
                         expected,
                     )
 
+    def test_json_answer_holds_strict_calls_and_their_count(self):
+        """Calls instead of a JSON answer must keep the strictness and count the tools
+        ask for."""
+        self._use_delimited_response_template("beam")
+        strict = copy.deepcopy(_WEATHER_TOOL)
+        strict["function"]["strict"] = True
+        call = '<call:get_weather>{"city": "Paris"}</call>'
+        json_object = {"response_format": {"type": "json_object"}}
+        for fields, text, admitted in (
+            ({"tools": [strict]}, call, True),
+            ({"tools": [strict]}, call.replace('"Paris"', "1"), False),
+            ({"tools": [strict]}, call.replace("get_weather", "delete_all"), False),
+            ({"tools": [_WEATHER_TOOL], "parallel_tool_calls": False}, call, True),
+            (
+                {"tools": [_WEATHER_TOOL], "parallel_tool_calls": False},
+                call + call,
+                False,
+            ),
+        ):
+            adapted, _ = self._convert_rendered_as(
+                "<assistant>", **fields, **json_object
+            )
+            grammar = Grammar.from_structural_tag(
+                adapted.sampling_params["structural_tag"]
+            )
+            with self.subTest(fields=fields, text=text):
+                self.assertIs(
+                    _is_grammar_accept_string(grammar, "<think>Hm</think>" + text),
+                    admitted,
+                )
+
     def test_other_output_constraints_reject_constrained_automatic_calls(self):
         """A client grammar must not silently drop the strictness or count of the tag it
         replaces."""
@@ -1200,14 +1231,7 @@ class ServingChatTestCase(CustomTestCase):
             "type": "structural_tag",
             "format": {"type": "regex", "pattern": ".*"},
         }
-        json_object = {"response_format": {"type": "json_object"}}
         for tool, fields, error in (
-            (strict, json_object, "before a JSON answer"),
-            (
-                _WEATHER_TOOL,
-                {"parallel_tool_calls": False, **json_object},
-                "before a JSON answer",
-            ),
             (strict, {"regex": ".*"}, "another output constraint"),
             (
                 _WEATHER_TOOL,

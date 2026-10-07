@@ -4,7 +4,7 @@ from typing import Any
 
 from sglang.srt.function_call.response_template_structural_tag import (
     answer_rest_structural_tag,
-    json_answer_structural_tag,
+    tool_call_structural_tag,
 )
 from sglang.srt.parser.chat_parsing.response_parser import ResponseParser
 from sglang.srt.parser.response_template import (
@@ -82,17 +82,19 @@ class BeamReasoningDetector(ResponseTemplateReasoningDetector):
         self,
         json_schema: Any,
         *,
-        tool_names: list[str],
+        tools: list[dict[str, Any]],
+        parallel_tool_calls: bool = True,
         message_start: bool = False,
     ) -> dict[str, Any] | None:
         if not self.think_end_token or self._content_field is None:
             return None
-        return json_answer_structural_tag(
-            self._content_field,
-            json_schema,
+        return tool_call_structural_tag(
             self._tool_field,
-            tool_names,
-            thinking=self._thinking_field,
+            tools,
+            parallel_tool_calls=parallel_tool_calls,
+            thinking=self._thinking_field if message_start else None,
+            answer=self._content_field,
+            answer_format={"type": "json_schema", "json_schema": json_schema},
             message_start=self._message_start if message_start else None,
             grammar_requires_reasoning=True,
         )

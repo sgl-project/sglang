@@ -599,7 +599,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                             if self.tool_call_parser and request.tool_choice != "none"
                             else []
                         ),
-                        tool_call_constraint=processed_messages.tool_call_constraint,
                         template_tool_call_grammar=(
                             processed_messages.template_tool_call_grammar
                         ),

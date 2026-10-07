@@ -8,7 +8,6 @@ from xgrammar import Grammar
 from xgrammar.testing import _is_grammar_accept_string
 
 from sglang.srt.function_call.response_template_structural_tag import (
-    json_answer_structural_tag,
     supports_tool_call_structural_tag,
     tool_call_structural_tag,
 )
@@ -261,16 +260,6 @@ class TestToolCallStructuralTag(CustomTestCase):
         for name, template, tool, derivable in cases:
             with self.subTest(name):
                 self.assertIs(_build(template, tools=[tool]) is not None, derivable)
-
-        for close, derivable in [(["}</call>", "</call>"], False), ("</call>", True)]:
-            with self.subTest(close=close):
-                template = copy.deepcopy(ANSWER_TEMPLATE)
-                template["fields"]["tool_calls"]["close"] = close
-                fields = load_response_template(template).fields
-                tag = json_answer_structural_tag(
-                    fields["content"], {"type": "object"}, fields["tool_calls"], ["f"]
-                )
-                self.assertIs(tag is not None, derivable)
 
     def test_non_literal_thinking_delimiters_return_none(self):
         template = copy.deepcopy(TEMPLATE)

@@ -1326,7 +1326,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     if self._tool_call_parsing_active(request)
                     else []
                 ),
-                tool_call_constraint=processed_messages.tool_call_constraint,
                 template_tool_call_grammar=processed_messages.template_tool_call_grammar,
                 message_start_tool_call_constraint=(
                     processed_messages.message_start_tool_call_constraint
@@ -1340,14 +1339,12 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         *,
         tools: List[Tool],
-        tool_call_constraint: ToolCallConstraint | None = None,
         template_tool_call_grammar: bool = False,
         message_start_tool_call_constraint: ToolCallConstraint | None = None,
     ) -> None:
         """Give response-template parsers the rendered assistant prefill.
 
-        `tools` are the tools whose calls the tool-call parser reads, and
-        `tool_call_constraint` is the one the request's tools asked for."""
+        `tools` are the tools whose calls the tool-call parser reads."""
         prefix = adapted_request.text
         if not isinstance(prefix, str) and adapted_request.input_ids:
             prefix = self.tokenizer_manager.tokenizer.decode(
@@ -1425,33 +1422,39 @@ class OpenAIServingChat(OpenAIServingBase):
                 and isinstance(detector, ResponseTemplateReasoningDetector)
             ):
                 json_schema = json.loads(sampling_params["json_schema"])
-                # Calls before the answer take the template's framing, which
+                # Calls instead of the answer take the template's framing, which
                 # only a response-template tool parser reads.
                 tool_detector = FunctionCallParser.ToolCallParserEnum.get(
                     self.tool_call_parser
                 )
-                tool_names = (
-                    [tool.function.name for tool in tools]
-                    if tool_detector is not None
+                tool_dicts = []
+                if (
+                    tools
+                    and tool_detector is not None
                     and issubclass(tool_detector, ResponseTemplateToolDetector)
-                    else []
-                )
-                if tool_names and tool_call_constraint is not None:
-                    # The response format replaced the tools' constraint, so
-                    # nothing would hold these calls to it.
-                    raise ValueError(
-                        "cannot enforce strict tools or parallel_tool_calls=False "
-                        "with automatic tool choice before a JSON answer for this "
-                        "response template"
+                ):
+                    parser = FunctionCallParser(
+                        tools,
+                        self.tool_call_parser,
+                        tokenizer=self.tokenizer_manager.tokenizer,
                     )
+                    tool_dicts = [
+                        tool.model_dump() for tool in parser.structural_tag_tools()
+                    ]
+                parallel_tool_calls = request.parallel_tool_calls is not False
                 from_start = detector.starts_message(prefix)
                 tag = detector.json_answer_structural_tag(
-                    json_schema, tool_names=tool_names, message_start=from_start
+                    json_schema,
+                    tools=tool_dicts,
+                    parallel_tool_calls=parallel_tool_calls,
+                    message_start=from_start,
                 )
                 if tag is None and from_start:
                     from_start = False
                     tag = detector.json_answer_structural_tag(
-                        json_schema, tool_names=tool_names
+                        json_schema,
+                        tools=tool_dicts,
+                        parallel_tool_calls=parallel_tool_calls,
                     )
                 if tag is not None:
                     sampling_params["structural_tag"] = json.dumps(tag)

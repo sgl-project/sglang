@@ -740,12 +740,18 @@ def _names_function_by_opener(field: ResponseTemplateField) -> bool:
 
 
 def _reply_format(
-    answer: ResponseTemplateField, message_start: list[str] | None
+    answer: ResponseTemplateField,
+    message_start: list[str] | None,
+    content: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Free text in the `answer` field, or `None` if it cannot be derived."""
+    """The `answer` field holding `content`, or free text if not given, or
+    `None` if it cannot be derived."""
     openers, closers = _openers(answer, message_start), _closers(answer)
     if not openers or closers is None:
         return None
+    if content is not None:
+        # The parser serves all text after the answer opener as the content.
+        return _sequence(_const_strings(openers), content)
     return _sequence(_const_strings(openers), *_answer_text(closers))
 
 
@@ -780,29 +786,31 @@ def supports_tool_call_structural_tag(
 
 
 def tool_call_structural_tag(
-    field: ResponseTemplateField,
+    field: ResponseTemplateField | None,
     tools: list[dict[str, Any]],
     *,
     parallel_tool_calls: bool,
     thinking: ResponseTemplateField | None = None,
     answer: ResponseTemplateField | None = None,
+    answer_format: dict[str, Any] | None = None,
     message_start: list[str] | None = None,
     grammar_requires_reasoning: bool = False,
 ) -> dict[str, Any] | None:
     """Derive native calls, respecting strict arguments, count and reasoning.
 
-    Without tools, derive only the `answer`, if given. Raises `ValueError` for
+    An `answer` field lets the model answer instead, in `answer_format` if
+    given; without tools, only the answer is derived. Raises `ValueError` for
     names the template cannot encode."""
     if not tools and answer is not None:
 
         def reply(start: list[str] | None) -> list[dict[str, Any]] | None:
-            format = _reply_format(answer, start)
+            format = _reply_format(answer, start, answer_format)
             return None if format is None else [format]
 
         return _structural_tag(
             reply, thinking, message_start, grammar_requires_reasoning
         )
-    if not tools or not _names_function_by_opener(field):
+    if not tools or field is None or not _names_function_by_opener(field):
         return None
     opener = _split_group(field.open_re.pattern, "name")
     closer_literals = _closers(field)
@@ -847,78 +855,12 @@ def tool_call_structural_tag(
             # EOS can terminate a call without writing its closer.
             elements.append(_optional(closers))
         if answer is not None:
-            reply = _reply_format(answer, start)
+            reply = _reply_format(answer, start, answer_format)
             if reply is None:
                 return None
             elements = [_one_of([_sequence(*elements), reply])]
         return elements
 
-    return _structural_tag(output, thinking, message_start, grammar_requires_reasoning)
-
-
-def json_answer_structural_tag(
-    answer: ResponseTemplateField,
-    json_schema: Any,
-    tool_field: ResponseTemplateField | None = None,
-    tool_names: list[str] | None = None,
-    *,
-    thinking: ResponseTemplateField | None = None,
-    message_start: list[str] | None = None,
-    grammar_requires_reasoning: bool = False,
-) -> dict[str, Any] | None:
-    """Derive a JSON answer with optional calls to declared tools before it.
-
-    Raises `ValueError` for names the template cannot encode."""
-    closers = _closers(answer)
-    if closers is None:
-        return None
-    opener = call_closers = None
-    if tool_field is not None and tool_names and _names_function_by_opener(tool_field):
-        opener = _split_group(tool_field.open_re.pattern, "name")
-        call_closers = _closers(tool_field)
-        # The arguments are any text, so their end must not spell a closer.
-        if call_closers and _spells_closer(tuple(call_closers), (_TEXT_PIECE,)):
-            return None
-    if opener is not None:
-        for name in tool_names:
-            if not re.fullmatch(opener[1], name):
-                raise ValueError(f"tool name {name!r} cannot be encoded in tool calls")
-
-    def json_reply(start: list[str] | None) -> dict[str, Any] | None:
-        openers = _openers(answer, start)
-        if not openers:
-            return None
-        # The parser serves all text after the answer opener as JSON.
-        return _sequence(
-            _const_strings(openers), {"type": "json_schema", "json_schema": json_schema}
-        )
-
-    def call(start: list[str] | None) -> dict[str, Any]:
-        # The parser reads back only calls to the declared tools.
-        names = "|".join(map(_escape, tool_names))
-        pattern = _call_opener(opener, f"(?:{names})", start)
-        # The arguments may hold the answer opener, but not the call closer.
-        arguments = {"type": "any_text", "excludes": call_closers}
-        return _sequence({"type": "regex", "pattern": pattern}, arguments)
-
-    def output(start: list[str] | None) -> list[dict[str, Any]] | None:
-        reply = json_reply(start)
-        if reply is None:
-            return None
-        if opener is None or call_closers is None:
-            return [reply]
-        calls = [call(start)]
-        if call_closers:
-            closer = _const_strings(call_closers)
-            if tool_field.repeats:
-                calls.append({"type": "star", "content": _sequence(closer, call(None))})
-            after = json_reply(None)
-            ending = _sequence(closer, _optional(after)) if after else closer
-            calls.append(_optional(ending))
-        return [_one_of([reply, _sequence(*calls)])]
-
-    if message_start is None:
-        thinking = None
     return _structural_tag(output, thinking, message_start, grammar_requires_reasoning)
 
 
