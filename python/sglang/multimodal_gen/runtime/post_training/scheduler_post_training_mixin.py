@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, List
+from typing import Any, Callable, List
 
 import torch.distributed as dist
 
@@ -9,34 +9,42 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 
 
 class SchedulerPostTrainingMixin:
-    def _run_on_all_ranks(self, op, req) -> OutputBatch:
-        """Run a weight-group op that every rank joins; fail if any rank failed."""
-        # Every rank must reach the all-gather, so a raising rank reports a failure.
+    def _run_on_all_ranks(
+        self, worker_op: Callable[[Any], tuple[bool, str]], req: Any
+    ) -> OutputBatch:
+        """Every rank joins the all-gather, even one whose op raised, and the
+        request succeeds only if every rank succeeded."""
         try:
-            result = op(req)
-        except Exception as exc:
-            result = False, f"{type(exc).__name__}: {exc}"
+            own_result = worker_op(req)
+        except Exception as e:
+            own_result = False, f"{type(e).__name__}: {e}"
+
         world = get_world_group()
-        results = [None] * world.world_size
-        dist.all_gather_object(results, result, group=world.cpu_group)
-        for rank, (success, message) in enumerate(results):
-            if not success:
-                message = f"Rank {rank}: {message}"
-                return OutputBatch(
-                    output={"success": False, "message": message}, error=message
-                )
-        return OutputBatch(output={"success": True, "message": result[1]})
+        all_results = [None] * world.world_size
+        dist.all_gather_object(all_results, own_result, group=world.cpu_group)
+
+        failures = [
+            f"Rank {rank}: {message}"
+            for rank, (success, message) in enumerate(all_results)
+            if not success
+        ]
+        if failures:
+            return OutputBatch(
+                output={"success": False, "message": failures[0]}, error=failures[0]
+            )
+        _, message = own_result
+        return OutputBatch(output={"success": True, "message": message})
 
     def _handle_init_weights_update_group(self, reqs: List[Any]) -> OutputBatch:
         return self._run_on_all_ranks(self.worker.init_weights_update_group, reqs[0])
-
-    def _handle_destroy_weights_update_group(self, reqs: List[Any]) -> OutputBatch:
-        return self._run_on_all_ranks(self.worker.destroy_weights_update_group, reqs[0])
 
     def _handle_update_weights_from_distributed(self, reqs: List[Any]) -> OutputBatch:
         return self._run_on_all_ranks(
             self.worker.update_weights_from_distributed, reqs[0]
         )
+
+    def _handle_destroy_weights_update_group(self, reqs: List[Any]) -> OutputBatch:
+        return self._run_on_all_ranks(self.worker.destroy_weights_update_group, reqs[0])
 
     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
         req = reqs[0]

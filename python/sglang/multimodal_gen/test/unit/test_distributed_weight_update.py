@@ -32,7 +32,13 @@ def test_collective_request_reaches_dp_replicas_concurrently():
             )
 
         client._forward_one = forward
-        req = InitWeightsUpdateGroupReqInput("127.0.0.1", 12345, 1, 3, "update")
+        req = InitWeightsUpdateGroupReqInput(
+            master_address="127.0.0.1",
+            master_port=12345,
+            rank_offset=1,
+            world_size=3,
+            group_name="update",
+        )
         result = await asyncio.wait_for(client.forward(req), timeout=2)
         assert set(entered) == {"a", "b"}
         assert result.error == "rank failure"

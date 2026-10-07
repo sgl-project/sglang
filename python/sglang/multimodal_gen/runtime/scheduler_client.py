@@ -52,8 +52,8 @@ logger = init_logger(__name__)
 # replica at once; a sequential fan-out would deadlock.
 _COLLECTIVE_REQ_TYPES = (
     InitWeightsUpdateGroupReqInput,
-    DestroyWeightsUpdateGroupReqInput,
     UpdateWeightsFromDistributedReqInput,
+    DestroyWeightsUpdateGroupReqInput,
 )
 
 # Control ops mutate replica state (weights, LoRA, memory, shutdown), so with

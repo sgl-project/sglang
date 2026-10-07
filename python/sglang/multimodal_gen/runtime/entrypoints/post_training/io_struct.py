@@ -128,11 +128,6 @@ class InitWeightsUpdateGroupReqInput:
 
 
 @dataclass
-class DestroyWeightsUpdateGroupReqInput:
-    group_name: str
-
-
-@dataclass
 class UpdateWeightsFromDistributedReqInput:
     names: list[str]
     dtypes: list[str]
@@ -142,3 +137,8 @@ class UpdateWeightsFromDistributedReqInput:
     weight_update_mode: str | None = None
     lora_alpha: int | None = None
     lora_rank: int | None = None
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqInput:
+    group_name: str

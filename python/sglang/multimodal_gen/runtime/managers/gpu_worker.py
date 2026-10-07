@@ -248,7 +248,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.server_args = server_args
         self.metrics = init_metrics(server_args, rank)
         self.pipeline: ComposedPipelineBase = None
-        self._model_update_group = {}
+        self._weights_update_groups: dict[str, torch.distributed.ProcessGroup] = {}
 
         self.init_device_and_model()
         load_snapshot = None if current_platform.is_cpu() else capture_memory_snapshot()

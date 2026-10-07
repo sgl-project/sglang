@@ -37,74 +37,77 @@ if TYPE_CHECKING:
     )
 
 
+_SENDER_RANK = 0
+
+
 def _normalize_gpu_uuid(uuid: str) -> str:
     # NVML prefixes uuids with "GPU-"/"MIG-"; torch device properties do not.
     return uuid.removeprefix("MIG-").removeprefix("GPU-").lower()
+
+
+def _receive_broadcast_weights(
+    req: UpdateWeightsFromDistributedReqInput, group: dist.ProcessGroup
+) -> list[tuple[str, torch.Tensor]]:
+    named_tensors = [
+        (
+            name,
+            torch.empty(
+                shape, dtype=getattr(torch, dtype), device=torch.cuda.current_device()
+            ),
+        )
+        for name, dtype, shape in zip(req.names, req.dtypes, req.shapes, strict=True)
+    ]
+    handles = [
+        dist.broadcast(tensor, src=_SENDER_RANK, group=group, async_op=True)
+        for _, tensor in named_tensors
+    ]
+    for handle in handles:
+        handle.wait()
+    return named_tensors
 
 
 class GPUWorkerPostTrainingMixin:
     def init_weights_update_group(
         self, req: InitWeightsUpdateGroupReqInput
     ) -> tuple[bool, str]:
-        world = get_world_group()
-        if req.group_name in self._model_update_group:
+        if req.group_name in self._weights_update_groups:
             return False, f"Group {req.group_name} already exists"
-        if req.rank_offset + world.world_size > req.world_size:
+        engine_world = get_world_group()
+        if req.rank_offset + engine_world.world_size > req.world_size:
             return False, "Engine ranks exceed the update group size"
-        self._model_update_group[req.group_name] = init_custom_process_group(
+        dist_timeout = self.server_args.dist_timeout
+        self._weights_update_groups[req.group_name] = init_custom_process_group(
             backend=req.backend,
             init_method=NetworkAddress(req.master_address, req.master_port).to_tcp(),
             world_size=req.world_size,
-            rank=req.rank_offset + world.rank_in_group,
+            rank=req.rank_offset + engine_world.rank_in_group,
             group_name=req.group_name,
-            timeout=(
-                timedelta(seconds=self.server_args.dist_timeout)
-                if self.server_args.dist_timeout is not None
-                else None
-            ),
+            timeout=None if dist_timeout is None else timedelta(seconds=dist_timeout),
         )
         return True, "Initialized weight update group"
-
-    def destroy_weights_update_group(
-        self, req: DestroyWeightsUpdateGroupReqInput
-    ) -> tuple[bool, str]:
-        group = self._model_update_group.pop(req.group_name, None)
-        if group is not None:
-            dist.destroy_process_group(group)
-        return True, "Destroyed weight update group"
 
     def update_weights_from_distributed(
         self, req: UpdateWeightsFromDistributedReqInput
     ) -> tuple[bool, str]:
-        if req.group_name not in self._model_update_group:
+        group = self._weights_update_groups.get(req.group_name)
+        if group is None:
             return False, f"Unknown weight update group {req.group_name}"
-        group = self._model_update_group[req.group_name]
-        weights = [
-            (
-                name,
-                torch.empty(
-                    shape,
-                    dtype=getattr(torch, dtype),
-                    device=torch.cuda.current_device(),
-                ),
-            )
-            for name, dtype, shape in zip(
-                req.names, req.dtypes, req.shapes, strict=True
-            )
-        ]
-        handles = [
-            dist.broadcast(weight, src=0, group=group, async_op=True)
-            for _, weight in weights
-        ]
-        for handle in handles:
-            handle.wait()
+        named_tensors = _receive_broadcast_weights(req, group)
         return WeightsUpdater(self.pipeline).update_weights_from_tensor(
-            named_tensors=weights,
+            named_tensors=named_tensors,
             target_modules=req.target_modules,
             weight_update_mode=req.weight_update_mode,
             lora_alpha=req.lora_alpha,
             lora_rank=req.lora_rank,
         )
+
+    def destroy_weights_update_group(
+        self, req: DestroyWeightsUpdateGroupReqInput
+    ) -> tuple[bool, str]:
+        group = self._weights_update_groups.pop(req.group_name, None)
+        if group is not None:
+            dist.destroy_process_group(group)
+        return True, "Destroyed weight update group"
 
     def update_weights_from_disk(
         self,

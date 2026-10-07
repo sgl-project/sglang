@@ -207,38 +207,36 @@ async def resume_memory_occupation():
     return orjson_response(payload, status_code=200 if success else 400)
 
 
-async def _forward_weight_group_request(request: Request, request_type):
+async def _parse_and_forward(request: Request, request_type: type):
     try:
         req = msgspec.convert(await request.json(), type=request_type)
-    except (ValueError, TypeError) as exc:
-        return orjson_response({"success": False, "message": str(exc)}, status_code=400)
+    except (ValueError, TypeError) as e:
+        return orjson_response({"success": False, "message": str(e)}, status_code=400)
+
     try:
         response = await async_scheduler_client.forward(req)
-    except Exception as exc:
-        return orjson_response({"success": False, "message": str(exc)}, status_code=500)
+    except Exception as e:
+        return orjson_response({"success": False, "message": str(e)}, status_code=500)
+
     if response.output is None:
         return orjson_response(
             {"success": False, "message": response.error}, status_code=500
         )
-    return orjson_response(
-        response.output, status_code=200 if response.output["success"] else 400
-    )
+
+    result = response.output
+    return orjson_response(result, status_code=200 if result["success"] else 400)
 
 
 @router.post("/init_weights_update_group")
 async def init_weights_update_group(request: Request):
-    return await _forward_weight_group_request(request, InitWeightsUpdateGroupReqInput)
-
-
-@router.post("/destroy_weights_update_group")
-async def destroy_weights_update_group(request: Request):
-    return await _forward_weight_group_request(
-        request, DestroyWeightsUpdateGroupReqInput
-    )
+    return await _parse_and_forward(request, InitWeightsUpdateGroupReqInput)
 
 
 @router.post("/update_weights_from_distributed")
 async def update_weights_from_distributed(request: Request):
-    return await _forward_weight_group_request(
-        request, UpdateWeightsFromDistributedReqInput
-    )
+    return await _parse_and_forward(request, UpdateWeightsFromDistributedReqInput)
+
+
+@router.post("/destroy_weights_update_group")
+async def destroy_weights_update_group(request: Request):
+    return await _parse_and_forward(request, DestroyWeightsUpdateGroupReqInput)

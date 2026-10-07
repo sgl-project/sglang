@@ -172,8 +172,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             ),
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
             InitWeightsUpdateGroupReqInput: self._handle_init_weights_update_group,
-            DestroyWeightsUpdateGroupReqInput: self._handle_destroy_weights_update_group,
             UpdateWeightsFromDistributedReqInput: self._handle_update_weights_from_distributed,
+            DestroyWeightsUpdateGroupReqInput: self._handle_destroy_weights_update_group,
             ReleaseMemoryOccupationReqInput: self._handle_release_memory_occupation,
             ResumeMemoryOccupationReqInput: self._handle_resume_memory_occupation,
         }
