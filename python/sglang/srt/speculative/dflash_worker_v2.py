@@ -1962,8 +1962,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            # `_append_target_hidden_to_draft_kv_by_loc` translated these ids
-            # to physical (identity on a plain pool, physical by allocation).
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
                 KVWriteLoc(ctx_cache_loc, physical=True),
@@ -2003,9 +2001,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                     attn.v_scale,
                 )
             else:
-                # `_append_target_hidden_to_draft_kv_by_loc` translated these
-                # ids to physical (identity on a plain pool, physical by
-                # allocation).
                 token_to_kv_pool.set_kv_buffer(
                     attn,
                     KVWriteLoc(ctx_cache_loc, physical=True),
