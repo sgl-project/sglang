@@ -1,19 +1,14 @@
-"""Config fields of the ``spec`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``spec`` bag, which is what ``get_spec()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``spec`` namespace."""
 
 from __future__ import annotations
 
-import dataclasses
+import argparse
 from typing import (
     Literal,
     Optional,
 )
+
+import msgspec
 
 from sglang.srt.arg_groups.arg_utils import (
     A,
@@ -26,8 +21,7 @@ from sglang.srt.arg_groups.choices import (
 )
 
 
-@dataclasses.dataclass
-class Spec:
+class Spec(msgspec.Struct):
     """Namespace ``spec``."""
 
     _NS_PATH = "spec"
@@ -46,6 +40,10 @@ class Spec:
             aliases=["--speculative-draft-model"],
         ),
     ] = None
+    speculative_boundary_reduction: A[
+        Literal["ar", "rs", "rsv", "rs+rsv"],
+        Arg(no_cli=True, resolvable=True),
+    ] = "rs+rsv"
     speculative_draft_model_revision: A[
         Optional[str],
         "The specific draft model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.",
@@ -119,6 +117,11 @@ class Spec:
     speculative_use_rejection_sampling: A[
         bool, "Use rejection sampling for speculative decoding (requires topk=1)."
     ] = False
+    speculative_use_block_verification: A[
+        bool,
+        "Use block verification for EAGLE/EAGLE3/NEXTN on CUDA or ROCm "
+        "(requires topk=1).",
+    ] = False
     speculative_token_map: A[
         Optional[str],
         "The path of the draft model's small vocab table.",
@@ -160,7 +163,11 @@ class Spec:
     ] = None
     speculative_draft_window_size: A[
         Optional[int],
-        "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). Default is full attention/context.",
+        "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`), DFLASH, and the built-in EAGLE/MTP draft-decode path on the Triton and FlashInfer draft backends; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). For the built-in EAGLE/MTP draft, each draft-decode step attends to a --speculative-draft-sink-size sink plus the most recent N tokens, leaving the target verify pass unchanged; it is ignored (with a warning) if the draft model has a native sliding window of its own. Default is full attention/context.",
+    ] = None
+    speculative_draft_sink_size: A[
+        Optional[int],
+        "Number of leading 'attention sink' tokens the draft always attends to, in addition to the --speculative-draft-window-size recent window (StreamingLLM-style). Honored only by the built-in EAGLE/MTP draft-decode path on the Triton and FlashInfer draft backends; the Llama EAGLE-3 and DFLASH windows ignore it. 0/unset => pure recent window. Requires --speculative-draft-window-size.",
     ] = None
     speculative_moe_runner_backend: A[
         Optional[str],
@@ -188,6 +195,21 @@ class Spec:
                 "ascend_tp",
             ],
             resolvable=True,
+        ),
+    ] = None
+    speculative_enable_w4a4_mxfp4_megamoe: A[
+        Optional[bool],
+        Arg(
+            help="Whether the draft model's MXFP4 MegaMoE layers use the W4A4 "
+            "mxf4xmxf4 MMA type (see --enable-w4a4-mxfp4-megamoe). Pass "
+            "--no-speculative-enable-w4a4-mxfp4-megamoe to keep the draft on "
+            "fp8xfp4 (W4A8) while the target runs W4A4. Same as "
+            "--enable-w4a4-mxfp4-megamoe if unset. A draft that runs MXFP4 "
+            "MegaMoE with a different MMA type from the target may allocate an "
+            "additional MegaMoE symmetric buffer after the KV pool is sized; "
+            "lower --mem-fraction-static if CUDA-graph capture runs out of "
+            "memory.",
+            action=argparse.BooleanOptionalAction,
         ),
     ] = None
     speculative_draft_model_quantization: A[

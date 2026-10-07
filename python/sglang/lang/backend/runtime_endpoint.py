@@ -6,6 +6,8 @@ import warnings
 from typing import Dict, List, Optional, Union
 
 import aiohttp
+import msgspec
+import msgspec.structs
 import requests
 
 from sglang.lang.backend.base_backend import BaseBackend
@@ -383,7 +385,12 @@ class Runtime:
         # Pre-allocate a port before building the config, so the config is born
         # with the port this runtime will serve on.
         requested_port = kwargs.pop(
-            "port", ServerArgs.__dataclass_fields__["port"].default
+            "port",
+            next(
+                f.default
+                for f in msgspec.structs.fields(ServerArgs)
+                if f.name == "port"
+            ),
         )
         for port in range(requested_port, 40000):
             if is_port_available(port):

@@ -7,12 +7,12 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -40,8 +40,9 @@ def _make_req(
     req.host_hit_length = 0
     req.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
     req.skip_radix_cache_insert = False
+    req.finished_reason = None
     req.last_node = None
-    req.lock_receipt = DecLockRefParams()
+    req.lock = None
     req.session = None
     req.return_logprob = False
     req.logprob_start_len = -1
@@ -77,10 +78,15 @@ def _make_chunk_cache(req_to_token_pool) -> ChunkCache:
 def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s = Scheduler.__new__(Scheduler)
     s.scheduler_stage_metrics = None
+    s.disaggregation_mode = DisaggregationMode.NULL
     s.dllm_config = None
     s.dllm_manager = None
     s.enable_hisparse = False
     s.enable_fpm = False
+    # Exercise the unconditional scheduler-loop HiCache event-drain point.
+    s.enable_hierarchical_cache = True
+    s.enable_hicache_storage = False
+    s.enable_unified_cache_external_linker = False
     s.last_batch = None
     s.require_mlp_sync = False
     s.spec_algorithm = MagicMock()
@@ -104,6 +110,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
         side_effect=lambda batch, **_: batch
     )
     s.update_running_batch = MagicMock(side_effect=lambda batch: batch)
+    tree_cache.check_hicache_events = MagicMock()
     s.tree_cache = tree_cache
     s.chunked_req = chunked_req
     s._pending_chunked_abort_req = None
@@ -111,7 +118,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
 
 
 class TestStashGatePreservesPrefixIndices(CustomTestCase):
-    """Consumer side: real ChunkCache.cache_unfinished_req mutates
+    """Consumer side: real ChunkCache.checkpoint mutates
     req.prefix_indices iff stash actually runs, so prefix_indices content
     is the bug-detection signal. The stash gate is content-based:
     `fill_len > len(prefix_indices)` means there is freshly computed KV to
