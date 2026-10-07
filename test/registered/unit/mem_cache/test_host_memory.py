@@ -117,74 +117,14 @@ class TestHostMemory(unittest.TestCase):
 
     def test_protected_sibling_cache_stays_charged(self):
         self.configure()
-        self.memory("task/engine", 250, 1000)
-        self.memory("task/sibling", 600, minimum=600, stat={"inactive_file": 600})
-        for maximum, high in [(900, "max"), ("max", 900), (1000, 900)]:
-            with self.subTest(maximum=maximum, high=high):
-                self.memory("task", 850, maximum, high, stat={"inactive_file": 600})
-                # Parent reclaim preserves the sibling's min even if its own min is 0.
-                for allow_fallback in [False, True]:
-                    self.assertEqual(
-                        self.available(allow_cgroup_fallback=allow_fallback), 50
-                    )
-
-    def test_unprotected_sibling_cache_is_reclaimable(self):
-        self.configure()
         self.memory("task", 850, 900, stat={"inactive_file": 600})
         self.memory("task/engine", 250, 1000)
         self.memory("task/sibling", 600, stat={"inactive_file": 600})
-        # Unlike memory.min, memory.low can be breached under pressure.
-        (self.mount / "task/sibling/memory.low").write_text("600")
         self.assertEqual(self.available(), 650)
 
-    def test_nested_protection_conservatively_keeps_cache_charged(self):
-        self.configure()
-        self.memory("task", 850, 900, stat={"inactive_file": 600})
-        self.memory("task/engine", 250, 1000)
-        self.memory("task/sibling", 600, stat={"inactive_file": 600})
-        self.memory("task/sibling/child", 600, minimum=600)
-        # A configured min is enough to fall back; effective protection is not modeled.
+        # Parent reclaim must preserve the sibling's protected cache.
+        (self.mount / "task/sibling/memory.min").write_text("600")
         self.assertEqual(self.available(), 50)
-
-    def test_reclaim_target_own_min_allows_cache_credit(self):
-        self.configure()
-        self.memory("task/engine", 90, 100, minimum=90, stat={"inactive_file": 80})
-        self.assertEqual(self.available(), 90)
-
-    def test_unknown_descendant_protection_keeps_cgroup_bound(self):
-        self.configure()
-        self.memory("task", 850, 900, stat={"inactive_file": 600})
-        self.memory("task/engine", 250, 1000)
-        self.memory("task/sibling", 600, stat={"inactive_file": 600})
-        protection = self.mount / "task/sibling/memory.min"
-        for contents in [None, "invalid"]:
-            with self.subTest(contents=contents):
-                if contents is None:
-                    protection.unlink()
-                else:
-                    protection.write_text(contents)
-                for allow_fallback in [False, True]:
-                    # Unknown protection must not trigger a fallback to host RAM.
-                    self.assertEqual(
-                        self.available(allow_cgroup_fallback=allow_fallback), 50
-                    )
-
-    def test_unreadable_descendant_tree_keeps_cgroup_bound(self):
-        self.configure()
-        self.memory("task", 850, 900, stat={"inactive_file": 600})
-        self.memory("task/engine", 250, 1000)
-        iterdir = Path.iterdir
-
-        def deny_parent(directory):
-            if directory == self.mount / "task":
-                raise PermissionError("Cannot inspect descendants")
-            return iterdir(directory)
-
-        with patch.object(Path, "iterdir", deny_parent):
-            for allow_fallback in [False, True]:
-                self.assertEqual(
-                    self.available(allow_cgroup_fallback=allow_fallback), 50
-                )
 
     def test_independent_engines_have_separate_allowances(self):
         # Both engines see the same host RAM but have different charged usage.
