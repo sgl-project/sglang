@@ -63,8 +63,8 @@ def test_hardware_allocator_uses_effective_settings(
 @pytest.mark.parametrize(
     "name,algorithm,options_type,reserved_offset",
     [
-        ("snappy-zstd", "Snappy", codec._SnappyOptions, 8),
-        ("lz4-zstd", "LZ4", codec._Lz4Options, 16),
+        ("snappy", "Snappy", codec._SnappyOptions, 8),
+        ("lz4", "LZ4", codec._Lz4Options, 16),
     ],
 )
 @pytest.mark.parametrize("sorting", ["0", "1"])
@@ -78,7 +78,7 @@ def test_codec_abi_and_frozen_hardware_options(
     assert options_type.backend.offset == 0
     assert options_type.sort_before_hw_decompress.offset == 4
     assert options_type.reserved.offset == reserved_offset
-    if name == "lz4-zstd":
+    if name == "lz4":
         assert options_type.data_type.offset == 8
         assert options_type.bitshuffle_mode.offset == 12
     monkeypatch.setenv("GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS", sorting)
@@ -127,7 +127,7 @@ def test_codec_abi_and_frozen_hardware_options(
     monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
     monkeypatch.setattr(codec, "_require_hardware_allocator", admissions.append)
     decoder = codec.NvcompDecoder(torch.device("cuda", 0), name)
-    assert decoder.codec == name and decoder.backend == "hardware"
+    assert decoder.inner_codec == name and decoder.backend == "hardware"
     assert decoder.maximum_chunk_bytes == 4 << 20
     assert admissions == [decoder.device]
     assert decoder._options.backend == 1
@@ -186,7 +186,7 @@ def test_workspace_query_cache_uses_exact_geometry_and_preserves_failure(monkeyp
     decoder = object.__new__(codec.NvcompDecoder)
     decoder.device = torch.device("cuda", 0)
     decoder.backend = "hardware"
-    decoder.codec = "snappy-zstd"
+    decoder.inner_codec = "snappy"
     decoder._options = codec._SnappyOptions()
     decoder._temporary_sizes = {}
     calls, fail = [], True
@@ -215,7 +215,7 @@ def test_workspace_query_cache_uses_exact_geometry_and_preserves_failure(monkeyp
     assert calls == [(2, 20, 30), (2, 20, 31), (2, 20, 31)]
 
 
-@pytest.mark.parametrize("name", ["snappy-zstd", "lz4-zstd"])
+@pytest.mark.parametrize("name", ["snappy", "lz4"])
 @pytest.mark.parametrize("stages", [2, 3, 4])
 def test_host_input_plans_split_output_and_status_slots(monkeypatch, name, stages):
     # CPU-backed device views exercise the actual slab construction and C ABI
@@ -266,7 +266,7 @@ def test_host_input_plans_split_output_and_status_slots(monkeypatch, name, stage
     decoder = object.__new__(codec.NvcompDecoder)
     decoder.device = device
     decoder.backend = "hardware"
-    decoder.codec = name
+    decoder.inner_codec = name
     decoder.maximum_chunk_bytes = 4 << 20
     decoder._algorithm, options_type = codec._DECOMPRESS_OPTIONS[name]
     decoder._options = options_type()

@@ -28,6 +28,7 @@ import time
 import uuid
 from pathlib import Path
 
+import numpy as np
 import orjson
 
 from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation
@@ -168,6 +169,7 @@ def _read_verify_payloads(
             manifest["tensors"],
             {name: record["nbytes"] for name, record in definitions.items()},
             manifest["frame_bytes"],
+            manifest["codec"],
         )
         return time.perf_counter() - started
 
@@ -232,23 +234,26 @@ def _tensor_layout(entries):
     return layout, size
 
 
-_DECODE_METRICS = (
+_PREPARE_METRICS = (
     "host_rank_outer_zstd_validate_s",
     "host_rank_outer_zstd_worker_decode_sum_s",
     "host_rank_outer_zstd_encoded_bytes",
     "host_rank_outer_zstd_decoded_bytes",
     "host_rank_outer_zstd_tensors",
     "host_rank_outer_zstd_frames",
+    "host_rank_encoded_copy_worker_sum_s",
+    "host_rank_encoded_copy_bytes",
+    "host_rank_encoded_copy_tensors",
 )
 
 
-def _decode_group(jobs, destination, files, pool):
-    metrics = {name: 0 for name in _DECODE_METRICS}
+def _decode_zstd_group(jobs, destination, files, pool):
+    metrics = {name: 0 for name in _PREPARE_METRICS}
     for entry, record in jobs:
         outer = entry["outer"]
         offset, length = outer["encoded_offset"], outer["encoded_bytes"]
         start, count = record["offset"], record["nbytes"]
-        validate_s, decode_s = pool.decode(
+        validate_s, decode_s = pool.decode_zstd(
             files[outer["file"]][offset : offset + length],
             outer["frames"],
             destination[start : start + count],
@@ -262,9 +267,37 @@ def _decode_group(jobs, destination, files, pool):
     return metrics
 
 
-def _decode_arena(destination, layout, files, entries, pool, metrics):
+def _copy_group(jobs, destination, files, pool):
+    metrics = {name: 0 for name in _PREPARE_METRICS}
+    for entry, record in jobs:
+        outer = entry["outer"]
+        length = outer["encoded_bytes"]
+        started = time.perf_counter()
+        # One GIL-releasing copy per tensor, directly between retained maps.
+        np.copyto(
+            np.frombuffer(
+                destination, dtype=np.uint8, count=length, offset=record["offset"]
+            ),
+            np.frombuffer(
+                files[outer["file"]],
+                dtype=np.uint8,
+                count=length,
+                offset=outer["encoded_offset"],
+            ),
+        )
+        metrics["host_rank_encoded_copy_worker_sum_s"] += time.perf_counter() - started
+        metrics["host_rank_encoded_copy_bytes"] += length
+        metrics["host_rank_encoded_copy_tensors"] += 1
+    return metrics
+
+
+def _prepare_arena(destination, layout, files, entries, pool, metrics, codec):
     started = time.perf_counter()
     jobs, futures, error = [], [], None
+    if codec == "lz4":
+        worker, phase = _copy_group, "host_rank_encoded_copy_s"
+    else:
+        worker, phase = _decode_zstd_group, "host_rank_outer_zstd_decode_s"
     try:
         for entry in entries:
             record = layout.get(entry["name"])
@@ -283,7 +316,7 @@ def _decode_arena(destination, layout, files, entries, pool, metrics):
         for index in range(count):
             futures.append(
                 pool.executor.submit(
-                    _decode_group, jobs[index::count], destination, files, pool
+                    worker, jobs[index::count], destination, files, pool
                 )
             )
     except BaseException as exc:  # noqa: BLE001 - drain submitted jobs before re-raise
@@ -291,12 +324,14 @@ def _decode_arena(destination, layout, files, entries, pool, metrics):
     for future in futures:
         try:
             partial = future.result()
-            for key in _DECODE_METRICS:
+            for key in _PREPARE_METRICS:
                 metrics[key] += partial[key]
         except BaseException as exc:  # noqa: BLE001 - drain peers before re-raise
             if error is None:
                 error = exc
-    metrics["host_rank_outer_zstd_decode_s"] = time.perf_counter() - started
+    metrics["host_rank_outer_zstd_decode_s"] = 0.0
+    metrics["host_rank_encoded_copy_s"] = 0.0
+    metrics[phase] = time.perf_counter() - started
     if error is not None:
         raise error
 
@@ -315,7 +350,7 @@ def _map_files(directory, encoded, definitions):
             else memoryview(b"")
         )
         position = end
-    # Each view owns its mmap. Failed decode tracebacks may retain drained views;
+    # Each view owns its mmap. Failed preparation tracebacks may retain drained views;
     # their mapping must remain valid until those last references are released.
     return files
 
@@ -415,6 +450,7 @@ class HostArena:
         expected = {
             "manifest_path": str(publication),
             "manifest_sha256": manifest_sha256,
+            "codec": manifest["codec"],
             "session_id": metadata["session_id"],
             "base_version": metadata["base_version"],
             "target_version": metadata["target_version"],
@@ -550,8 +586,8 @@ class HostArena:
         timings.update(metrics)
         return index, files
 
-    def decode_local(self, index, files, local_entries, pool, timings):
-        """Decode local entries; the caller retains file views until this returns."""
+    def prepare_local(self, index, files, local_entries, pool, timings):
+        """Prepare local payloads; the caller retains file views until this returns."""
         metrics = {
             name: 0
             for name in (
@@ -559,7 +595,7 @@ class HostArena:
                 "host_rank_allocation_calls",
                 "host_rank_allocation_bytes",
                 "host_rank_mapping_reused",
-                *_DECODE_METRICS,
+                *_PREPARE_METRICS,
             )
         }
         layout_started = time.perf_counter()
@@ -576,23 +612,24 @@ class HostArena:
         layout, size = _tensor_layout(entries)
         metrics["host_rank_layout_s"] = time.perf_counter() - layout_started
         self._reserve_rank_arena(size, metrics)
-        decode_started = time.perf_counter()
-        _decode_arena(
+        prepare_started = time.perf_counter()
+        _prepare_arena(
             self.mapping if self.mapping is not None else memoryview(b""),
             layout,
             files,
             entries,
             pool,
             metrics,
+            index["publication"]["codec"],
         )
-        metrics["host_rank_decode_call_s"] = time.perf_counter() - decode_started
+        metrics["host_rank_prepare_call_s"] = time.perf_counter() - prepare_started
         metrics.update(
             host_rank_arena_bytes=size,
             host_rank_capacity_bytes=self.capacity["capacity"],
             host_rank_capacity_generation=self.capacity["generation"],
             host_rank_cpu_workers=pool.workers,
         )
-        snapshot = HostDecodedSnapshot(
+        snapshot = HostPreparedSnapshot(
             self,
             index
             | {"tensors": layout, "arena_bytes": size, "rank_arena": self.capacity},
@@ -608,7 +645,7 @@ class HostArena:
         self.capacity = None
 
 
-class HostDecodedSnapshot:
+class HostPreparedSnapshot:
     """One publication's local views, retaining backend-owned DE host storage."""
 
     def __init__(self, arena, index):

@@ -147,7 +147,7 @@ class GpuDeltaBackend:
             read_canonical_checkpoint_inventory,
         )
         from sglang.srt.weight_sync.gpu_delta.payload import (
-            OuterZstdPool,
+            HostPayloadPool,
             configured_cpu_workers,
         )
 
@@ -165,7 +165,7 @@ class GpuDeltaBackend:
             raise ValueError("direct GPU deltas require an explicit CUDA device")
         from sglang.srt.weight_sync.gpu_delta.host import HostArena
 
-        self.outer_pool = OuterZstdPool(configured_cpu_workers())
+        self.payload_pool = HostPayloadPool(configured_cpu_workers())
         self.host_arena = HostArena(identity["engine_id"], self.device.index)
         self.decoders = {}
         self.apply_stream = self.de_stream = None
@@ -192,7 +192,7 @@ class GpuDeltaBackend:
                 raise
 
     def close(self):
-        self.outer_pool.close()
+        self.payload_pool.close()
         self.host_arena.close()
 
 
@@ -429,22 +429,22 @@ class PreparedDelta:
             path,
             manifest_sha256,
             manifest,
-            backend.outer_pool,
+            backend.payload_pool,
             self.timings,
             metadata,
         )
         release_started = time.perf_counter()
-        # READY admission drained global validation; local decode only needs this rank.
+        # READY admission drained global validation; local preparation only needs this rank.
         entries = {name: entries[name] for name in local_names}
         del manifest, content
         self.timings["host_rank_metadata_release_s"] = (
             time.perf_counter() - release_started
         )
-        self.host_snapshot = backend.host_arena.decode_local(
+        self.host_snapshot = backend.host_arena.prepare_local(
             index,
             files,
             [entries[name] for name in local_names],
-            backend.outer_pool,
+            backend.payload_pool,
             self.timings,
         )
         self.timings["host_rank_prepare_body_s"] = time.perf_counter() - payload_started
@@ -552,9 +552,10 @@ class PreparedDelta:
             )
         self.workspace = self.decode_plan = None
         if self.static_plans:
-            if self.codec not in backend.decoders:
-                backend.decoders[self.codec] = NvcompDecoder(self.device, self.codec)
-            decoder = backend.decoders[self.codec]
+            inner_codec = self.codec.removesuffix("-zstd")
+            if inner_codec not in backend.decoders:
+                backend.decoders[inner_codec] = NvcompDecoder(self.device, inner_codec)
+            decoder = backend.decoders[inner_codec]
             with torch.cuda.stream(self.de_stream):
                 self.decode_plan = decoder.prepare_batches(
                     frame_table,

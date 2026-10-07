@@ -80,9 +80,9 @@ must agree. Skipping trusts payload contents without SHA authentication; manifes
 SHA, file identity/size, path, frame-range and decode checks remain in force.
 After encoded-cache READY admission drains global validation, the caller keeps
 only its rank's entries and releases the global manifest before local arena
-planning and decode. Encoded file views remain owned until all decode jobs drain;
+planning and payload preparation. Encoded file views remain owned until all jobs drain;
 failed preparation never authorizes cache reuse.
-Each rank unwraps only its local tensors directly into its own retained, original
+Each rank prepares only its local tensors directly in its own retained, original
 DE-capable host allocation for CPU and GPU access.
 Preparation packs each publication's frames into one contiguous numeric table of
 input offsets, encoded sizes, decoded sizes and output offsets. Vectorized checks
@@ -199,21 +199,34 @@ has no distributed collectives, and shared IPC weight storage is excluded.
 The `GPU_DELTA_*` environment variables below are development/debug knobs,
 not a stable user-facing configuration API.
 
-Each immutable publication manifest selects its `codec` (`snappy-zstd` or
-`lz4-zstd`). The receiver authenticates the manifest and chooses the decoder during
+Each immutable publication manifest selects its `codec` (`snappy-zstd`, `lz4-zstd` or
+`lz4`). The receiver authenticates the manifest and chooses the decoder during
 preparation; it does not select or freeze a codec from its environment. A stream can start with LZ4 and continue
 with Snappy without changing its canonical plan or committed version sequence.
-The backend caches native decoders by codec during preparation; capability,
+The backend caches native decoders by inner algorithm (`snappy` or `lz4`) during preparation; capability,
 alignment and temporary-size admission stays outside the serving pause. Raw
 scalar/vector targets bypass inner decompression and retain overwrite semantics;
 compressed matrix masks retain XOR semantics.
 
-Protocol 4 carries the selected `codec` and explicit `frame_bytes` (64 KiB, 1 MiB or
+The opt-in plain `lz4` codec retains the same raw LZ4 inner blocks and hardware
+DE/apply path but omits outer Zstd. Its existing outer descriptor has an empty
+`frames` list and equal `encoded_bytes`/`decoded_bytes`, exactly covering the
+aligned packed inner arena. It does not add a wire version, request flag or
+fallback. Each local matrix is copied once from the shared encoded cache into
+its original private DE-capable host arena by the existing CPU worker pool.
+NumPy copies contiguous byte views without an intermediate full buffer; there
+is no per-inner-frame copy or cross-process DE allocation sharing. Raw targets,
+zero-frame omission, immutable-file/hash policy, cache release and drain rules
+are unchanged. Plain and wrapped LZ4 reuse one persistent native decoder.
+Defaults remain Snappy for ordinary updates and LZ4-Zstd for initial sync in Miles.
+Plain-LZ4 native qualification and matched performance measurements are pending.
+
+Protocol 4 carries the selected `codec` and explicit `frame_bytes` (64 KiB, 512 KiB, 1 MiB or
 4 MiB; default 1 MiB). Matrix frames contain only input/output offsets and lengths, without
-redundant codec/file fields. Each natural tensor's outer descriptor names one
-immutable owner file and independent Zstd chunks of at most 1 MiB output, exactly
+redundant codec/file fields. For wrapped codecs, each natural tensor's outer descriptor
+names one immutable owner file and independent Zstd chunks of at most 1 MiB output, exactly
 covering its aligned inner-codec arena. LZ4 uses raw byte blocks with bitshuffle
-disabled. The sender computes both the inner codec and outer Zstd on GPU; the receiver unwraps Zstd on CPU directly into each rank's original host arena,
+disabled. The wrapped codecs compute the inner codec and outer Zstd on GPU; the receiver unwraps Zstd on CPU directly into each rank's original host arena,
 then decodes model-layer batches
 directly from host for in-place apply. Natural tensor boundaries remain unchanged
 in the publication format.
@@ -224,7 +237,7 @@ there is no frame splitting or software fallback. Outer Zstd stays at 1 MiB.
 There is no GPU outer decoder, legacy protocol or automatic fallback.
 
 `GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS=0` (default) or `1` selects nvCOMP
-hardware chunk sorting once when the decoder is constructed, for either codec.
+hardware chunk sorting once when the decoder is constructed, for either inner algorithm.
 Sorting executes inside the paused decode call; preparation does not sort or
 reorder the frames. The codec extension and sorting options await native GPU
 qualification and matched benchmarks; existing Snappy results do not measure LZ4.
@@ -347,18 +360,18 @@ sum is additive with the enclosing wall span, which also includes scheduling and
 same prefix) count shared work once. `host_encoded_cache_skip_payload_hash` reports
 the cached policy on every rank; skipped SHA worker time, hash bytes and hash files
 are zero, including on the creator. All reads and frame validation drain before
-READY or failure returns; rank allocation and local decode start only after both
+READY or failure returns; rank allocation and local payload preparation start only after both
 pass. `host_encoded_cache_wait_s` isolates the
 cache mutex wait. `host_encoded_cache_build_s` repeats the cached build duration
 on followers and must not be summed across ranks. `host_rank_prepare_s` includes
-cache access, global-metadata release, rank allocation and local outer decode,
+cache access, global-metadata release, rank allocation and local payload preparation,
 including the final encoded-file view release.
 `host_encoded_cache_access_s` covers encoded admission through cache mutex release,
 including wait/build/attachment. `host_rank_layout_s` covers local tensor ordering
-and arena-offset planning before allocation. `host_rank_decode_call_s` includes
-the outer-decode call and cleanup of its local jobs/results on return.
+and arena-offset planning before allocation. `host_rank_prepare_call_s` includes
+the local copy or Zstd call and cleanup of its jobs/results on return.
 `host_rank_metadata_release_s` covers narrowing entries and dropping the global
-manifest/content after READY. `host_rank_prepare_body_s` ends after local decode
+manifest/content after READY. `host_rank_prepare_body_s` ends after local preparation
 returns its snapshot, before the caller releases encoded-file views. These timers
 are nested within preparation; caller-minus-body includes the final mapping
 release and timing bookkeeping.
@@ -411,3 +424,10 @@ background preparation and post-resume cleanup. Open or failed intervals retain
 null `resumed_ns` and `blocked_s`. Resume responses carry the completed receipts,
 so measurement needs no extra synchronization or status RPC. This measures
 scheduler blocking, not GPU idle time, HTTP latency or first-token recovery.
+
+Plain LZ4 reports `host_rank_encoded_copy_s` for the enclosing local arena fill
+(including raw copies/job dispatch/drain), plus `host_rank_encoded_copy_worker_sum_s`,
+`host_rank_encoded_copy_bytes` and `host_rank_encoded_copy_tensors` for matrix
+copies only. Outer-Zstd counters are zero for plain LZ4; plain-copy counters are
+zero for wrapped codecs. Worker sums overlap and must not be added to enclosing
+wall time. `host_rank_prepare_call_s` measures the inclusive local fill for all three codecs.

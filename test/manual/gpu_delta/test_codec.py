@@ -53,7 +53,7 @@ def _encode(values, codec, offsets=None):
     return payload, frames
 
 
-@pytest.mark.parametrize("codec", ["snappy-zstd", "lz4-zstd"])
+@pytest.mark.parametrize("codec", ["snappy-zstd", "lz4-zstd", "lz4"])
 @pytest.mark.parametrize("sort_chunks", ["0", "1"])
 @pytest.mark.parametrize("stages", [2, 3, 4])
 def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
@@ -61,7 +61,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
 ):
     monkeypatch.setenv("GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS", sort_chunks)
     device = torch.device("cuda", 0)
-    decoder = NvcompDecoder(device, codec)
+    decoder = NvcompDecoder(device, codec.removesuffix("-zstd"))
     # Full 4 MiB nonzero frame, 1 MiB zero frame, and a partial final frame.
     values = [
         [bytes(1 << 20), bytes(range(256)) * 16384, bytes(range(253)) * 3],
@@ -261,7 +261,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
 
 def test_rejects_frame_range_before_decode():
     device = torch.device("cuda", 0)
-    decoder = NvcompDecoder(device, "snappy-zstd")
+    decoder = NvcompDecoder(device, "snappy")
     allocation = HostAllocation(256, device.index)
     host = torch.frombuffer(allocation.view, dtype=torch.uint8)[:256]
     decoded = tuple(

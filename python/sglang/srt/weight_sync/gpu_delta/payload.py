@@ -24,13 +24,13 @@ def validate_codec(manifest):
     if (
         type(manifest.get("protocol_version")) is not int
         or manifest["protocol_version"] != 4
-        or manifest.get("codec") not in {"snappy-zstd", "lz4-zstd"}
+        or manifest.get("codec") not in {"snappy-zstd", "lz4-zstd", "lz4"}
         or "codec_profile" in manifest
         or type(manifest.get("frame_bytes")) is not int
         or manifest["frame_bytes"] not in {1 << 16, 1 << 19, 1 << 20, 4 << 20}
     ):
         raise ValueError(
-            "GPU delta requires protocol 4 with a snappy-zstd or lz4-zstd codec"
+            "GPU delta requires protocol 4 with a snappy-zstd, lz4-zstd or lz4 codec"
         )
 
 
@@ -78,7 +78,7 @@ def _reject_overlapping_ranges(ranges):
             end = stop
 
 
-def validate_outer_entries(entries, files, frame_bytes):
+def validate_outer_entries(entries, files, frame_bytes, codec):
     """Bound reconstructed spans before allocation, including foreign EP tensors."""
     ranges = {name: [] for name in files}
     for entry in entries:
@@ -109,8 +109,12 @@ def validate_outer_entries(entries, files, frame_bytes):
             or size <= 0
             or start + count > files[name]
         ):
-            raise ValueError("outer Zstd descriptor exceeds immutable payload")
-        _validate_outer_frames(outer)
+            raise ValueError("outer descriptor exceeds immutable payload")
+        if codec == "lz4":
+            if outer["frames"] != [] or count != size:
+                raise ValueError("plain LZ4 requires an exact unwrapped inner arena")
+        else:
+            _validate_outer_frames(outer)
         end = decoded_end = 0
         for frame in frames:
             offset = frame["encoded_offset"]
@@ -212,17 +216,17 @@ def configured_cpu_workers():
     return value
 
 
-class OuterZstdPool:
+class HostPayloadPool:
     """Reusable bounded CPU workers; no CUDA work or shared decoder contexts."""
 
     def __init__(self, workers):
         self.workers = workers
         self.executor = ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="gpu-delta-zstd"
+            max_workers=workers, thread_name_prefix="gpu-delta-payload"
         )
         self.local = threading.local()
 
-    def decode(self, payload, chunks, destination):
+    def decode_zstd(self, payload, chunks, destination):
         import zstandard as zstd
 
         if not hasattr(self.local, "decoder"):

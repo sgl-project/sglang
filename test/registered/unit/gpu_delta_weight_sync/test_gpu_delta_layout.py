@@ -43,13 +43,13 @@ def _bytes(tensor):
 def cpu_host_snapshot(backend, metadata, directory):
     """Real outer decode and file checks with CPU-only host allocation backing."""
     from sglang.srt.weight_sync.gpu_delta import host as host
-    from sglang.srt.weight_sync.gpu_delta.payload import OuterZstdPool
+    from sglang.srt.weight_sync.gpu_delta.payload import HostPayloadPool
 
     backend.identity = {"engine_id": "cpu-engine", "host_cache_id": "cpu-host"}
     metadata["host_tensor_names"] = {
         "cpu-host": sorted({binding.name for binding in backend.layout.bindings})
     }
-    backend.outer_pool = OuterZstdPool(2)
+    backend.payload_pool = HostPayloadPool(2)
     backend.host_arena = host.HostArena("cpu-engine", 0)
     backend.apply_stream = backend.de_stream = None
     backend.decoders = {}
@@ -81,7 +81,7 @@ def cpu_host_snapshot(backend, metadata, directory):
             yield
     finally:
         backend.host_arena.close()
-        backend.outer_pool.close()
+        backend.payload_pool.close()
 
 
 class TestCanonicalPlanCache(unittest.TestCase):
@@ -953,7 +953,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         output_offset,
                     ) in frames:
                         data = host[input_offset : input_offset + encoded_bytes]
-                        if self.codec == "snappy-zstd":
+                        if self.codec == "snappy":
                             assert data[0] == decoded_bytes
                             assert data[1] == (decoded_bytes - 1) << 2
                             payload = data[2:]
@@ -1018,13 +1018,13 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     prepared.timings["host_rank_prepare_body_s"],
                     prepared.timings["host_rank_metadata_release_s"]
                     + prepared.timings["host_encoded_cache_access_s"]
-                    + prepared.timings["host_rank_decode_call_s"],
+                    + prepared.timings["host_rank_prepare_call_s"],
                 )
                 self.assertEqual(prepared.timings["host_rank_outer_zstd_tensors"], 8)
                 self.assertEqual(prepared.timings["host_rank_outer_zstd_frames"], 8)
                 self.assertEqual(streams.call_count, 2)
                 self.assertEqual(events.call_count, 2 * stages + 2)
-                self.assertEqual(list(backend.decoders), ["lz4-zstd"])
+                self.assertEqual(list(backend.decoders), ["lz4"])
                 self.assertEqual(slots, [])
                 self.assertFalse(any(row[0] == "wait_stream" for row in operations))
                 self.assertFalse(any(row[0] == "bind_outputs" for row in operations))
@@ -1136,7 +1136,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 # Alternate codecs on the same plan and version stream. These
                 # identical masks XOR away, then back; the LZ4 decoder is reused.
                 canonical_plan = backend._canonical_plan
-                for version, codec in ((2, "snappy-zstd"), (3, "lz4-zstd")):
+                for version, codec in ((2, "snappy-zstd"), (3, "lz4"), (4, "lz4-zstd")):
                     prepared.release_and_close()
                     metadata.update(
                         session_id=f"cpu-{version}",
@@ -1149,8 +1149,12 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     for record, entry in zip(records, entries):
                         size = entry["nbytes"]
                         inner = literal(size, codec)
-                        blob = zstd.ZstdCompressor().compress(inner)
-                        if entry["name"] == "foreign":
+                        blob = (
+                            inner
+                            if codec == "lz4"
+                            else zstd.ZstdCompressor().compress(inner)
+                        )
+                        if entry["name"] == "foreign" and codec != "lz4":
                             blob = b"not-a-zstd-frame"
                         blobs[entry["name"]] = blob
                         path.with_name(record["name"]).write_bytes(blob)
@@ -1162,8 +1166,17 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         entry["outer"].update(
                             encoded_bytes=len(blob), decoded_bytes=len(inner)
                         )
-                        entry["outer"]["frames"][0].update(
-                            encoded_bytes=len(blob), decoded_bytes=len(inner)
+                        entry["outer"]["frames"] = (
+                            []
+                            if codec == "lz4"
+                            else [
+                                dict(
+                                    encoded_offset=0,
+                                    encoded_bytes=len(blob),
+                                    decoded_offset=0,
+                                    decoded_bytes=len(inner),
+                                )
+                            ]
                         )
                     content = json.dumps(manifest).encode()
                     path.write_bytes(content)
@@ -1180,7 +1193,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                                 metadata,
                             )
                         path.write_bytes(content)
-                        self.assertEqual(list(backend.decoders), ["lz4-zstd"])
+                        self.assertEqual(list(backend.decoders), ["lz4"])
                     prepared = layout.PreparedDelta(
                         backend,
                         path,
@@ -1201,8 +1214,8 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 self.assertEqual(
                     [row for row in operations if row[0] == "decoder_created"],
                     [
-                        ("decoder_created", "lz4-zstd"),
-                        ("decoder_created", "snappy-zstd"),
+                        ("decoder_created", "lz4"),
+                        ("decoder_created", "snappy"),
                     ],
                 )
                 self.assertEqual(streams.call_count, 2)
@@ -1210,7 +1223,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 # its corrupt payload must still fail before model writes.
                 prepared.host_snapshot.mark_reusable()
                 prepared.host_snapshot.close()
-                metadata["session_id"] = "cpu-4"
+                metadata["session_id"] = "cpu-5"
                 metadata["base_version"] = metadata["target_version"]
                 metadata["target_version"] += 1
                 manifest.update(

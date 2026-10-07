@@ -1,4 +1,4 @@
-"""Shared verified encoded bytes, rank-local decode, and failure lifetimes."""
+"""Shared verified encoded bytes, rank-local payload preparation, and failure lifetimes."""
 
 import hashlib
 import json
@@ -13,10 +13,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import zstandard as zstd
 
 from sglang.srt.weight_sync.gpu_delta import host as host
-from sglang.srt.weight_sync.gpu_delta.payload import OuterZstdPool
+from sglang.srt.weight_sync.gpu_delta.payload import HostPayloadPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -112,6 +113,7 @@ def fixture(directory):
     (directory / "owner.bin").write_bytes(blob)
     (directory / "foreign.bin").write_bytes(foreign)
     manifest = {
+        "codec": "snappy-zstd",
         "frame_bytes": 1 << 20,
         "files": [
             {
@@ -140,7 +142,7 @@ def prepare_snapshot(arena, path, digest, manifest, entries, pool, timings, meta
     index, files = arena.prepare_encoded(
         path, digest, manifest, pool, timings, metadata
     )
-    return arena.decode_local(index, files, entries, pool, timings)
+    return arena.prepare_local(index, files, entries, pool, timings)
 
 
 def fake_fallocate(fd, offset, length):
@@ -172,7 +174,7 @@ def metadata(version=1, engine="a"):
 
 
 def _child(root, path, digest, manifest, names, barrier, output):
-    pool, arena = OuterZstdPool(2), host.HostArena("a", 0)
+    pool, arena = HostPayloadPool(2), host.HostArena("a", 0)
     try:
         with patch.object(host, "_cache_base", return_value=Path(root)):
             identity = host.host_cache_id("a")
@@ -221,7 +223,7 @@ class TestHostSnapshot(unittest.TestCase):
         ):
             replacement.start()
             self.addCleanup(replacement.stop)
-        self.pool = OuterZstdPool(2)
+        self.pool = HostPayloadPool(2)
         self.addCleanup(self.pool.close)
 
     def arena(self, engine="a"):
@@ -277,7 +279,9 @@ class TestHostSnapshot(unittest.TestCase):
             patch.object(
                 host, "validate_outer_entries", side_effect=delayed_validation
             ),
-            patch.object(self.pool, "decode", wraps=self.pool.decode) as decode,
+            patch.object(
+                self.pool, "decode_zstd", wraps=self.pool.decode_zstd
+            ) as decode,
         ):
             builder = threading.Thread(target=build)
             builder.start()
@@ -304,7 +308,8 @@ class TestHostSnapshot(unittest.TestCase):
         self.assertEqual(metrics["host_encoded_cache_hash_files"], 2)
         self.assertEqual(metrics["host_encoded_cache_skip_payload_hash"], 0)
         self.assertGreaterEqual(
-            metrics["host_rank_decode_call_s"], metrics["host_rank_outer_zstd_decode_s"]
+            metrics["host_rank_prepare_call_s"],
+            metrics["host_rank_outer_zstd_decode_s"],
         )
         self.assertGreaterEqual(
             metrics["host_encoded_cache_access_s"], metrics["host_encoded_cache_wait_s"]
@@ -436,7 +441,9 @@ class TestHostSnapshot(unittest.TestCase):
 
         with (
             patch.object(host, "_read_verify_payload", side_effect=blocked_peer),
-            patch.object(self.pool, "decode", wraps=self.pool.decode) as decode,
+            patch.object(
+                self.pool, "decode_zstd", wraps=self.pool.decode_zstd
+            ) as decode,
         ):
             thread = threading.Thread(target=build)
             thread.start()
@@ -590,7 +597,9 @@ class TestHostSnapshot(unittest.TestCase):
             patch.object(
                 host, "_read_verify_payload", side_effect=delayed_read
             ) as read,
-            patch.object(self.pool, "decode", wraps=self.pool.decode) as decode,
+            patch.object(
+                self.pool, "decode_zstd", wraps=self.pool.decode_zstd
+            ) as decode,
         ):
             builder = threading.Thread(target=build)
             builder.start()
@@ -690,11 +699,11 @@ class TestHostSnapshot(unittest.TestCase):
     def test_local_decode_does_not_hold_engine_encoded_cache_lock(self):
         path, digest, manifest, expected = fixture(self.root)
         first, follower, other = self.arena(), self.arena(), self.arena("b")
-        slow_pool = OuterZstdPool(2)
+        slow_pool = HostPayloadPool(2)
         self.addCleanup(slow_pool.close)
         entered, release = threading.Event(), threading.Event()
         snapshots, errors = [], []
-        decode = slow_pool.decode
+        decode = slow_pool.decode_zstd
 
         def blocked_decode(*args):
             entered.set()
@@ -718,7 +727,7 @@ class TestHostSnapshot(unittest.TestCase):
             except BaseException as error:
                 errors.append(error)
 
-        with patch.object(slow_pool, "decode", side_effect=blocked_decode):
+        with patch.object(slow_pool, "decode_zstd", side_effect=blocked_decode):
             thread = threading.Thread(target=build_first)
             thread.start()
             try:
@@ -859,11 +868,15 @@ class TestHostSnapshot(unittest.TestCase):
             )
 
 
-def decode_fixture():
+def decode_fixture(codec):
     blob, entries, expected = bytearray(), [], {}
     for i in range(97):
         value = bytes([i % 251]) * (31 + i * 31)
-        encoded = zstd.ZstdCompressor(write_checksum=True).compress(value)
+        encoded = (
+            value
+            if codec == "lz4"
+            else zstd.ZstdCompressor(write_checksum=True).compress(value)
+        )
         blob.extend(bytes(-len(blob) % 16))
         start = len(blob)
         blob.extend(encoded)
@@ -881,7 +894,9 @@ def decode_fixture():
                     "encoded_offset": start,
                     "encoded_bytes": len(encoded),
                     "decoded_bytes": len(value),
-                    "frames": [
+                    "frames": []
+                    if codec == "lz4"
+                    else [
                         {
                             "encoded_offset": 0,
                             "encoded_bytes": len(encoded),
@@ -909,20 +924,30 @@ def decode_fixture():
     return entries, layout, size, {"payload": memoryview(bytes(blob))}, expected
 
 
-def test_bounded_jobs_decode_raw_and_compressed_bytes_exactly():
-    entries, layout, size, files, expected = decode_fixture()
+@pytest.mark.parametrize("codec", ["snappy-zstd", "lz4"])
+def test_bounded_jobs_decode_raw_and_compressed_bytes_exactly(codec):
+    entries, layout, size, files, expected = decode_fixture(codec)
     destination = bytearray(size)
-    metrics = {name: 0 for name in host._DECODE_METRICS}
-    pool = OuterZstdPool(2)
+    metrics = {name: 0 for name in host._PREPARE_METRICS}
+    pool = HostPayloadPool(2)
     try:
-        with patch.object(
-            pool.executor, "submit", wraps=pool.executor.submit
-        ) as submit:
-            host._decode_arena(
-                memoryview(destination), layout, files, entries, pool, metrics
+        with (
+            patch.object(pool.executor, "submit", wraps=pool.executor.submit) as submit,
+            patch.object(pool, "decode_zstd", wraps=pool.decode_zstd) as decode,
+        ):
+            host._prepare_arena(
+                memoryview(destination), layout, files, entries, pool, metrics, codec
             )
         assert submit.call_count == 4 * pool.workers
-        assert metrics["host_rank_outer_zstd_tensors"] == 97
+        assert metrics["host_rank_outer_zstd_tensors"] == (0 if codec == "lz4" else 97)
+        assert metrics["host_rank_encoded_copy_tensors"] == (
+            97 if codec == "lz4" else 0
+        )
+        if codec == "lz4":
+            decode.assert_not_called()
+            assert metrics["host_rank_encoded_copy_bytes"] == sum(
+                len(v) for k, v in expected.items() if k != "raw"
+            )
         for name, row in layout.items():
             assert (
                 destination[row["offset"] : row["offset"] + row["nbytes"]]
@@ -932,7 +957,8 @@ def test_bounded_jobs_decode_raw_and_compressed_bytes_exactly():
         pool.close()
 
 
-def test_failed_tensor_drains_other_groups_before_releasing_views():
+@pytest.mark.parametrize("codec", ["snappy-zstd", "lz4"])
+def test_failed_tensor_drains_other_groups_before_releasing_views(codec):
     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
     attempted, errors = [], []
 
@@ -963,24 +989,30 @@ def test_failed_tensor_drains_other_groups_before_releasing_views():
     ]
     layout = {str(i): {"offset": i, "nbytes": 1} for i in range(20)}
     pool = SimpleNamespace(
-        workers=2, executor=ThreadPoolExecutor(max_workers=2), decode=decode
+        workers=2, executor=ThreadPoolExecutor(max_workers=2), decode_zstd=decode
     )
 
     def run():
         try:
-            host._decode_arena(
+            host._prepare_arena(
                 memoryview(bytearray(20)),
                 layout,
                 {"p": memoryview(bytes(range(20)))},
                 entries,
                 pool,
-                {name: 0 for name in host._DECODE_METRICS},
+                {name: 0 for name in host._PREPARE_METRICS},
+                codec,
             )
         except ValueError as error:
             errors.append(str(error))
         finally:
             finished.set()
 
+    def copy(destination, source):
+        decode(memoryview(source), None, memoryview(destination))
+
+    copy_patch = patch.object(host.np, "copyto", side_effect=copy)
+    copy_patch.start()
     thread = threading.Thread(target=run)
     thread.start()
     assert entered.wait(5)
@@ -988,6 +1020,7 @@ def test_failed_tensor_drains_other_groups_before_releasing_views():
     release.set()
     thread.join(5)
     pool.executor.shutdown(wait=True)
+    copy_patch.stop()
     assert finished.is_set() and errors == ["intentional bad frame"]
     assert sorted(attempted) == [i for i in range(20) if i not in {8, 16}]
 

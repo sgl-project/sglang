@@ -39,8 +39,8 @@ class _Lz4Options(ctypes.Structure):
 
 
 _DECOMPRESS_OPTIONS = {
-    "snappy-zstd": ("Snappy", _SnappyOptions),
-    "lz4-zstd": ("LZ4", _Lz4Options),
+    "snappy": ("Snappy", _SnappyOptions),
+    "lz4": ("LZ4", _Lz4Options),
 }
 _MAX_FRAME_BYTES = 4 << 20
 _INT64_MAX = np.iinfo(np.int64).max
@@ -110,14 +110,14 @@ class NvcompDecoder:
     decoder, algorithm substitution or software fallback.
     """
 
-    def __init__(self, device: torch.device, codec: str):
+    def __init__(self, device: torch.device, inner_codec: str):
         self.device = torch.device(device)
         if self.device.type != "cuda" or self.device.index is None:
             raise ValueError("Delta decoder requires an explicit CUDA device")
-        if codec not in _DECOMPRESS_OPTIONS:
-            raise ValueError("GPU delta codec must be snappy-zstd or lz4-zstd")
-        self.codec = codec
-        self._algorithm, options_type = _DECOMPRESS_OPTIONS[codec]
+        if inner_codec not in _DECOMPRESS_OPTIONS:
+            raise ValueError("GPU delta inner codec must be snappy or lz4")
+        self.inner_codec = inner_codec
+        self._algorithm, options_type = _DECOMPRESS_OPTIONS[inner_codec]
         sorting = os.environ.get("GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS", "0")
         if sorting not in {"0", "1"}:
             raise ValueError("GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS must be 0 or 1")
@@ -133,7 +133,7 @@ class NvcompDecoder:
         # Explicit backend selection: DEFAULT can silently select software.
         self._options.backend = 1
         self._options.sort_before_hw_decompress = int(sorting)
-        if codec == "lz4-zstd":
+        if self._algorithm == "LZ4":
             self._options.data_type = 0  # NVCOMP_TYPE_CHAR
             self._options.bitshuffle_mode = 0  # NVCOMP_BITSHUFFLE_NONE
         self.maximum_chunk_bytes = _require_hardware_device(
@@ -181,7 +181,7 @@ class NvcompDecoder:
     def _check(self, status):
         if status != 0:
             raise RuntimeError(
-                f"nvCOMP {self.codec}/{self.backend} failed: status={status}"
+                f"nvCOMP {self.inner_codec}/{self.backend} failed: status={status}"
             )
 
     def temporary_bytes(self, geometry: tuple[int, int, int]) -> int:

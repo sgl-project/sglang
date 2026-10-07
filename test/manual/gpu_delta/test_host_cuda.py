@@ -1,6 +1,6 @@
-"""Two engines verify encoded files once and decode into private rank DE arenas.
+"""Two engines verify encoded files once and prepare private rank DE arenas.
 
-Manual-only: Linux, two Blackwell CUDA GPUs, Torch, Snappy and Zstandard are required.
+Manual-only: Linux, two Blackwell CUDA GPUs, Torch, Snappy, LZ4 and Zstandard are required.
 The test barriers coordinate the oracle only; production preparation has no
 collectives. Both 4- and 8-worker rank pools exercise the same exact bytes.
 """
@@ -14,13 +14,14 @@ import random
 import tempfile
 from pathlib import Path
 
+import lz4.block
 import numpy as np
 import pytest
 import snappy
 import zstandard as zstd
 
 
-def _publication(directory, version, repeat):
+def _publication(directory, version, repeat, codec):
     expected = {
         f"tensor-{i}": random.Random(i + version).randbytes(256 * repeat)
         for i in range(8)
@@ -30,10 +31,18 @@ def _publication(directory, version, repeat):
     for name, value in expected.items():
         blob.extend(bytes((-len(blob)) % 16))
         start = len(blob)
-        inner = value if name == "raw" else snappy.compress(value)
+        inner = (
+            value
+            if name == "raw"
+            else (
+                snappy.compress(value)
+                if codec == "snappy-zstd"
+                else lz4.block.compress(value, store_size=False)
+            )
+        )
         encoded, outer_frames = bytearray(), []
-        if name == "raw":
-            encoded.extend(value)
+        if name == "raw" or codec == "lz4":
+            encoded.extend(inner)
         else:
             for offset in range(0, len(inner), 1 << 20):
                 chunk = inner[offset : offset + (1 << 20)]
@@ -82,7 +91,8 @@ def _publication(directory, version, repeat):
         entries.append(entry)
     (directory / "owner.bin").write_bytes(blob)
     manifest = {
-        "frame_bytes": 1 << 20,
+        "codec": codec,
+        "frame_bytes": (1 << 19) if version < 3 else (1 << 20),
         "files": [
             {
                 "name": "owner.bin",
@@ -103,7 +113,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
     from sglang.srt.weight_sync.gpu_delta import host as host
     from sglang.srt.weight_sync.gpu_delta import memory as memory
     from sglang.srt.weight_sync.gpu_delta.codec import NvcompDecoder
-    from sglang.srt.weight_sync.gpu_delta.payload import OuterZstdPool
+    from sglang.srt.weight_sync.gpu_delta.payload import HostPayloadPool
 
     os.environ["GPU_DELTA_HOST_CACHE_DIR"] = cache
     # Exercise the exact capacity-growth algorithm with small oracle tensors.
@@ -111,7 +121,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
     host._CAPACITY_ALIGNMENT = 1 << 20
     torch.cuda.set_device(rank % 2)
     device = torch.device("cuda", rank % 2)
-    pool, arena = OuterZstdPool(workers), host.HostArena(engine, device.index)
+    pool, arena = HostPayloadPool(workers), host.HostArena(engine, device.index)
     stream = torch.cuda.Stream(device=device)
     records = []
     try:
@@ -133,6 +143,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
             barrier.wait(timeout=90)
             metrics = {}
             manifest = json.loads(Path(path).read_text())
+            codec = manifest["codec"]
             index, files = arena.prepare_encoded(
                 path,
                 digest,
@@ -143,7 +154,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
             )
             entries = [entry for entry in manifest["tensors"] if entry["name"] in names]
             del manifest
-            snapshot = arena.decode_local(index, files, entries, pool, metrics)
+            snapshot = arena.prepare_local(index, files, entries, pool, metrics)
             del files
             source = arena.tensor
             frames, offsets, size = [], {}, 0
@@ -165,7 +176,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                     )
                 )
                 size += len(expected[name])
-            decoder = NvcompDecoder(device, "snappy-zstd")
+            decoder = NvcompDecoder(device, codec.removesuffix("-zstd"))
             table = np.asarray(frames, dtype=np.int64).T.copy()
             plan = decoder.prepare_batches(table, [len(frames)], source, stream)
             decoded = [
@@ -240,10 +251,12 @@ def test_two_engines_reuse_host_de_capacity_and_grow(workers):
     ) as directory:
         root = Path(directory)
         publications = []
-        for version, repeat in enumerate((1024, 512, 4096), 1):
+        for version, repeat in enumerate((2048, 1024, 4096), 1):
             version_dir = root / str(version)
             version_dir.mkdir()
-            path, digest, expected = _publication(version_dir, version, repeat)
+            path, digest, expected = _publication(
+                version_dir, version, repeat, ("lz4", "snappy-zstd", "lz4")[version - 1]
+            )
             publications.append((str(path), digest, expected))
         barriers, output = [context.Barrier(2), context.Barrier(2)], context.Queue()
         processes = [
@@ -299,10 +312,12 @@ def test_two_engines_reuse_host_de_capacity_and_grow(workers):
                     )
                     == 1
                 )
-                assert (
-                    sum(row["metrics"]["host_rank_outer_zstd_tensors"] for row in rows)
-                    == 8
-                )
+                assert sum(
+                    row["metrics"]["host_rank_outer_zstd_tensors"] for row in rows
+                ) == (8 if version == 1 else 0)
+                assert sum(
+                    row["metrics"]["host_rank_encoded_copy_tensors"] for row in rows
+                ) == (0 if version == 1 else 8)
                 assert sum(
                     row["metrics"]["host_rank_allocation_calls"] for row in rows
                 ) == (0 if version == 1 else 2)
