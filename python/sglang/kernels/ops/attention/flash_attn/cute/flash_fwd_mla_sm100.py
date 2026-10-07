@@ -397,7 +397,6 @@ class FlashAttentionMLAForwardSm100:
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         mValue: Optional[cute.Tensor] = None,
-        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
         # fmt: on
