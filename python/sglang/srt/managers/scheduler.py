@@ -294,6 +294,7 @@ from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     discard_kv_cache_backup,
+    free_chunked_swa_before_plan,
     release_kv_cache,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -3917,6 +3918,21 @@ class Scheduler(
             prefill_tile_block_m = attn_backend.extend_attention_block_m
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
+
+        if (
+            self.chunked_req is not None
+            and envs.SGLANG_SWA_EVICT_BEFORE_CHUNK_PLAN.get()
+            and self.dllm_config is None
+            and self.disaggregation_mode == DisaggregationMode.NULL
+        ):
+            # The adder sizes the next chunk from the SWA pool's free count, so the
+            # slots this request no longer needs have to be back in it first.
+            free_chunked_swa_before_plan(
+                self.chunked_req,
+                enable_overlap=self.enable_overlap,
+                tree_cache=self.tree_cache,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            )
 
         adder = PrefillAdder(
             self.page_size,
