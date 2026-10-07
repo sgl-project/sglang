@@ -374,7 +374,7 @@ class PreparedDelta:
             metadata,
         )
         release_started = time.perf_counter()
-        # READY admission drained global validation; local preparation only needs this rank.
+        # READY admission drained file reads/hashes; keep only this rank's entries.
         entries = {name: entries[name] for name in local_names}
         del manifest, content
         self.timings["host_rank_metadata_release_s"] = (

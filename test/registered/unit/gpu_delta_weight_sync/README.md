@@ -26,11 +26,11 @@ canonical name mutation, unequal Q/KV-A fusion, indexer fusion and numeric norm
 replacement, static draft exclusions, and MLA derived views. `bindings.py` owns
 ordinary dense TP/vocabulary slicing, FlashInfer CuTe DSL NVFP4 W4A16 physical
 layouts, alpha/scale refresh views, and generic consumer identity snapshots.
-`layout.py` owns canonical plans and the unchanged DE/apply pipeline. A new model
+`layout.py` owns canonical plans and DE/apply scheduling. A new model
 family supplies startup bindings and derived views through the same small mapping
 interface; no GDN/KDA mapping or additional serving backend is implemented here.
 
-Descriptions identify the admitted dense and MoE storage contracts in `layouts`.
+Descriptions list the backend's dense and MoE storage contracts in `layouts`.
 The rank layout digest binds these contracts and the canonical tensor views.
 The artificial independent mapping in the CPU suite tests the extension boundary,
 not a newly qualified model.
@@ -78,18 +78,14 @@ workers inherit the same policy. Miles publishes `payload_checksum_format="none"
 and null file checksums when skipping; a receiver with hashing enabled rejects
 that publication before allocating payload storage. The receiver can also skip
 verification of a hashed publication. Each rank caches this setting when its
-HostArena is created. The encoded
-cache index and READY token bind the policy, and all ranks in the original cohort
-must agree. Skipping trusts payload contents without SHA authentication; manifest
-SHA, file identity/size, path, exact Zstd output and native decode checks remain in force.
-Miles constructs per-tensor offsets and frame coverage; the receiver does not
-rescan those descriptors in a separate executor task. After encoded-cache READY
-admission drains all file reads and hashes, the caller keeps only its rank's
-entries and releases the global manifest before local arena
-planning and payload preparation. Encoded file views remain owned until all jobs drain;
-failed preparation never authorizes cache reuse.
-Each rank prepares only its local tensors directly in its own retained, original
-DE-capable host allocation for CPU and GPU access.
+HostArena is created. The encoded cache index and READY token bind the policy
+across the original cohort. Skipping trusts payload contents without SHA authentication; manifest SHA,
+file identity/size, path, exact Zstd output and native decode checks remain.
+Miles owns per-tensor offsets and frame coverage. After all file tasks drain and
+READY admission succeeds, each rank drops the global manifest and foreign entries,
+then prepares its local payloads in its original DE-capable host allocation.
+Encoded file views remain owned until all local jobs drain; failed preparation
+never authorizes cache reuse.
 Preparation packs each publication's frames into one contiguous numeric table of
 input offsets, encoded sizes, decoded sizes and output offsets. Vectorized checks
 also derive workspace geometry and per-slot output bounds. Static layer membership
@@ -101,8 +97,8 @@ it prepares small GPU metadata/workspace and raw-target inputs, but never
 allocates large decoded-mask slots or runs DE/model application.
 There is no staging selector or full-publication HBM copy. Every retained changed
 matrix frame uses the selected inner codec, including inputs whose
-compressed representation expands; there is no raw-frame fallback. Once every
-original rank reports `PREPARED`, Miles fans out
+compressed representation expands; there is no raw-frame fallback. Once an
+engine's original ranks report `PREPARED`, Miles sends that engine
 `update_weights_from_delta`. Each local handler closes generation admission,
 pauses scheduling, fences existing readers, retracts requests, flushes caches and
 applies the delta. It returns `APPLIED` only after GPU completion and decoder
@@ -135,20 +131,16 @@ batch. One nvCOMP call handles all retained frames in a batch. Slot reuse waits
 for its previous apply event, including consumption of that slot's size/status
 rows. Temporary DE workspace is shared because DE submissions are ordered.
 
-The large decoded-mask slots are allocated only after scheduler pause and
-its reader fence. Preparation already allocates the small nvCOMP temporary
-workspace, per-slot status/size rows and descriptor slabs, and uploads immutable
-input metadata and raw targets on feature-owned streams. Relative output offsets,
-slot bounds, metadata views and status-validation callbacks are also prepared here,
-without launching decode or apply. Temporary CPU frame and raw-packing plans are
-not retained after preparation; the decode plan keeps the host/GPU buffer leases
-and metadata needed for execution. After pause, actual output pointers are checked
-and uploaded; scratch-dependent apply setup and first-use tuning remain paused.
-Slots are allocated once per update, reused across layers, and
-released after completion before resume. The
-PyTorch native caching allocator may reuse their storage; the feature retains no
-large HBM lease during normal rollout. Host arena capacity and static CPU plans
-remain persistent.
+Preparation allocates small nvCOMP workspace, per-slot status/size rows and
+descriptor slabs, and uploads input metadata and raw targets on feature-owned
+streams. It also prepares relative output offsets, slot bounds and status-check
+callbacks. Temporary frame and raw-packing plans are then released; the decode
+plan retains the buffer leases and execution metadata.
+After scheduler pause and its reader fence, decoded-mask slots are allocated and
+checked, output pointers are uploaded, and scratch-dependent apply setup/tuning
+runs. Slots are reused across layers and released before resume. PyTorch may
+cache their storage, but the feature retains no large HBM lease during rollout.
+Host arena capacity and static CPU plans remain persistent.
 Preparation records the omitted frame gaps and tails. Only those byte ranges are
 zeroed before decode; a fully covered batch skips zeroing. One device kernel checks
 all decoded sizes/statuses and ORs failures into the sticky apply gate.
@@ -205,46 +197,40 @@ has no distributed collectives, and shared IPC weight storage is excluded.
 The `GPU_DELTA_*` environment variables below are development/debug knobs,
 not a stable user-facing configuration API.
 
-Each immutable publication manifest selects its `codec` (`snappy-zstd`, `lz4-zstd` or
-`lz4`). The receiver authenticates the manifest and chooses the decoder during
-preparation; it does not select or freeze a codec from its environment. A stream can start with LZ4 and continue
-with Snappy without changing its canonical plan or committed version sequence.
-The backend caches native decoders by inner algorithm (`snappy` or `lz4`) during preparation; capability,
-alignment and temporary-size admission stays outside the serving pause. Raw
+Each authenticated publication selects `snappy-zstd`, `lz4-zstd` or plain `lz4`.
+The receiver chooses the decoder during preparation, independently of its
+environment. A stream can change codec without changing its canonical plan or
+committed version sequence. Native decoders are cached by inner algorithm
+(`snappy` or `lz4`); capability, alignment and workspace admission occur before pause. Raw
 scalar/vector targets bypass inner decompression and retain overwrite semantics;
 compressed matrix masks retain XOR semantics.
 
 The opt-in plain `lz4` codec retains the same raw LZ4 inner blocks and hardware
 DE/apply path but omits outer Zstd. Its existing outer descriptor has an empty
 `frames` list and equal `encoded_bytes`/`decoded_bytes`, exactly covering the
-aligned packed inner arena. It does not add a wire version, request flag or
-fallback. Each local matrix is copied once from the shared encoded cache into
-its original private DE-capable host arena by the existing CPU worker pool.
+aligned packed inner arena. Each local matrix is copied once from the shared
+encoded cache into its original private DE-capable host arena by the CPU worker pool.
 NumPy copies contiguous byte views without an intermediate full buffer; there
 is no per-inner-frame copy or cross-process DE allocation sharing. Raw targets,
-zero-frame omission, immutable-file/hash policy, cache release and drain rules
-are unchanged. Plain and wrapped LZ4 reuse one persistent native decoder.
-Defaults remain Snappy for ordinary updates and LZ4-Zstd for initial sync in Miles.
+zero-frame omission, hash policy and cache lifecycle follow the same contract
+for all codecs. Plain and wrapped LZ4 share one native decoder. Miles defaults
+to `snappy-zstd` for ordinary updates and `lz4-zstd` for initial sync.
 Three-codec native and full-model receiver matrices are qualified on B300; the
 learned-update E2E is a separate, earlier source scope.
 
 The manifest carries the selected `codec` and explicit positive integer `frame_bytes`
 up to 4 MiB (default 1 MiB). Actual encoded/decoded sizes and pointer alignment
-must satisfy the hardware decoder's limits. Matrix frames contain only
-input/output offsets and lengths, without
-redundant codec/file fields. For wrapped codecs, each natural tensor's outer descriptor
-names one immutable owner file and independent Zstd chunks of at most 1 MiB output, exactly
-covering its aligned inner-codec arena. LZ4 uses raw byte blocks with bitshuffle
-disabled. The wrapped codecs compute the inner codec and outer Zstd on GPU; the receiver unwraps Zstd on CPU directly into each rank's original host arena,
-then decodes model-layer batches
-directly from host for in-place apply. Natural tensor boundaries remain unchanged
-in the publication format.
+must satisfy the hardware decoder's limits. Matrix frames contain input/output
+offsets and lengths. For wrapped codecs, each natural tensor's outer descriptor
+names one owner file and independent Zstd chunks of at most 1 MiB output covering
+its aligned inner arena. Both compression stages run on GPU; the receiver unwraps
+Zstd on CPU into each rank's original host arena, then DE reads layer batches
+from that arena for in-place apply. LZ4 uses raw byte blocks with bitshuffle
+disabled. Every codec preserves natural tensor boundaries.
 The decoder caches the device's hardware operation limit and rejects a frame if
 its actual compressed or decoded length exceeds that limit. A 4 MiB frame whose
 compressed representation expands beyond a 4 MiB device limit is rejected;
-there is no frame splitting or software fallback. Outer Zstd stays at 1 MiB.
-Each publication selects its codec and frame size. There is no GPU outer decoder
-or automatic fallback.
+there is no frame splitting or software fallback. There is no GPU outer decoder.
 
 `GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS=0` (default) or `1` selects nvCOMP
 hardware chunk sorting once when the decoder is constructed, for either inner algorithm.
@@ -261,8 +247,9 @@ nvCOMP's calling-stream wait or guarantee lower pause latency.
 
 `GPU_DELTA_CPU_WORKERS` defaults to 32 (bounded to 1–32) per rank.
 Each rank uses reusable workers with independent Zstd contexts. Local tensors
-are grouped into at most four times as many tasks as workers, preserving strict
-per-frame checks and direct writes into the rank arena. Two EP4 engines therefore
+are grouped into at most four times as many tasks as workers. Wrapped codecs
+check exact Zstd output lengths while writing directly into the rank arena;
+plain LZ4 copies each tensor's inner arena. Two EP4 engines therefore
 have up to eight pools of 32 decode workers. Workers touch only CPU buffers;
 CUDA setup remains on each rank's preparation thread.
 
@@ -282,8 +269,8 @@ digest instead of copying and comparing the static metadata on every update.
 Immutable binding and derived-image
 storage keys are cached, while each publication remaps its fresh frame offsets
 and omitted-byte ranges in one pass. Frames and payloads remain
-publication-specific. Private arena index/state records use `orjson`; atomic
-replacement and canonical namespace/publication digests are unchanged.
+publication-specific. Private arena index/state records use `orjson`, atomic
+replacement and canonical namespace/publication digests.
 
 One creator per engine-host reads and SHA-256 checks owner files in parallel
 using its existing CPU pool. Each task copies into its disjoint retained tmpfs slice and
@@ -316,7 +303,7 @@ failure cannot release a publication. Late old releases cannot release newer
 bytes. BUILDING is recorded before overwrite; failed or aborted publications
 remain nonreusable. Retained encoded files require explicit cleanup.
 
-Canonical rank-0/rank-1 tensors instead negotiate `raw_bytes`: complete target
+Canonical scalars and vectors use `raw_bytes`: complete target
 values with no XOR, frames or compression envelope. Unchanged values omit their
 payload. Preparation packs changed local scalars/vectors into one aligned pinned
 arena, uploads it and performs any BF16-to-FP32 norm conversion during
@@ -330,9 +317,10 @@ packed path rather than being split into layer batches.
 
 Preparation reports manifest loading/parsing (`host_manifest_read_parse_s`), plan
 validation (`host_plan_validate_s`), local tensor planning (`host_tensor_prepare_s`)
-and full preparation (`host_prepare_s`). Local planning releases the global manifest
-and foreign entries after file verification and before local payload preparation;
-that release is included in both spans.
+and full preparation (`host_prepare_s`). Global manifest/foreign-entry release
+precedes local payload preparation and tensor planning. Its
+`host_rank_metadata_release_s` interval is included in `host_rank_prepare_s` and
+`host_prepare_s`, not `host_tensor_prepare_s`.
 `host_metadata_prepare_s` covers small GPU input setup and
 status-callback preparation, including its own stream waits (`host_metadata_wait_s`).
 `paused_setup_host_s` includes decoded-slot allocation, output-pointer binding and
@@ -341,8 +329,8 @@ uploads, and scratch-dependent apply setup; `paused_apply_tune_s` isolates cold 
 and scratch release, but the scheduler's full `blocked_s` remains the pause metric.
 
 `de_host_input_bytes` counts compressed bytes read directly by DE. `h2d_bytes`
-counts explicit raw-target and metadata transfers; it no longer counts an encoded
-Snappy copy. These are different traffic categories, not a throughput estimate.
+counts explicit raw-target and metadata transfers. Compressed frames are read
+directly by DE; these traffic categories are not a throughput estimate.
 `decode_stages` reports the configured depth; `decoded_buffers` counts actual slots.
 `decoded_scratch_bytes` is their total allocation;
 `decoder_workspace_bytes` is temporary DE workspace. Neither is peak HBM usage.
@@ -382,19 +370,21 @@ returns its snapshot, before the caller releases encoded-file views. These timer
 are nested within preparation; caller-minus-body includes the final mapping
 release and timing bookkeeping.
 
-`host_plan_cache_reused` reports whether the canonical plan was already admitted.
-Every publication authenticates its manifest and retains the admitted plan digest;
-Miles owns the unchanged static definitions and each publication's payload offsets
-and frame coverage. Native frame geometry and decode status checks remain in force.
-No old manifest or payload is retained in the plan cache.
+`host_plan_cache_reused` reports reuse of the admitted canonical digest; no old
+manifest or payload is retained. Native frame geometry and decode-status checks
+still apply to each publication.
 
-Each rank reports `host_rank_outer_zstd_decode_s` for CPU task submission/join
-wall time, including raw copies. `host_rank_outer_zstd_worker_decode_sum_s`
-sums worker durations, not critical-path time. Miles supplies nvCOMP-produced
-Zstd frames; the receiver decodes them directly without a Python header/block
-pre-scan. Native CPU decode errors and exact bounded output lengths still fail
-preparation before GPU application. The same prefix's `encoded_bytes`, `decoded_bytes`, `tensors` and `frames`
-count that rank's local outer decode work. Rank arenas report
+For wrapped codecs, `host_rank_outer_zstd_decode_s` measures CPU task submission
+through joining, including raw copies. `host_rank_outer_zstd_worker_decode_sum_s`
+sums overlapping worker durations. `host_rank_outer_zstd_{encoded_bytes,decoded_bytes,tensors,frames}`
+counts local Zstd work. Miles supplies nvCOMP-produced frames; the
+receiver relies on native CPU decode errors and exact output lengths, without a
+Python header/block pre-scan.
+Plain LZ4 instead reports `host_rank_encoded_copy_s` for local arena fill, including
+raw copies and job dispatch/drain. `host_rank_encoded_copy_{worker_sum_s,bytes,tensors}`
+counts matrix copies only. Inactive codec counters are zero. Worker sums must not
+be added to enclosing wall time. `host_rank_prepare_call_s` measures the inclusive
+local fill for all three codecs. Rank arenas report
 `host_rank_{arena_bytes,capacity_bytes,capacity_generation,mapping_reused}` and
 `host_rank_allocation_{s,calls,bytes}`. Shared encoded storage separately reports
 `host_encoded_cache_capacity_{bytes,generation}` and creator-only
@@ -418,8 +408,8 @@ Admission also reuses the ordinary updater's shared CUDA IPC weight-cache and
 HPC-Ops derived-weight-cache exclusions before creating a delta plan or session.
 
 The paired Miles feature contains `tests/manual/gpu_delta/bench_gpu_delta.py`, which launches
-one EP8 or two EP4 engines and measures the snappy-zstd contract using persistent
-altered checkpoint and publications. `GPU_DELTA_TIMING=1` enables
+one EP8 or two EP4 engines and measures the selected publication codec using a
+persistent altered checkpoint and publications. `GPU_DELTA_TIMING=1` enables
 phase events without synchronizing every tensor; correctness comparisons stay
 outside timed updates.
 
@@ -432,10 +422,3 @@ background preparation and post-resume cleanup. Open or failed intervals retain
 null `resumed_ns` and `blocked_s`. Resume responses carry the completed receipts,
 so measurement needs no extra synchronization or status RPC. This measures
 scheduler blocking, not GPU idle time, HTTP latency or first-token recovery.
-
-Plain LZ4 reports `host_rank_encoded_copy_s` for the enclosing local arena fill
-(including raw copies/job dispatch/drain), plus `host_rank_encoded_copy_worker_sum_s`,
-`host_rank_encoded_copy_bytes` and `host_rank_encoded_copy_tensors` for matrix
-copies only. Outer-Zstd counters are zero for plain LZ4; plain-copy counters are
-zero for wrapped codecs. Worker sums overlap and must not be added to enclosing
-wall time. `host_rank_prepare_call_s` measures the inclusive local fill for all three codecs.

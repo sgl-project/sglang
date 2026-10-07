@@ -13,8 +13,8 @@
 
 """Verified engine-host encoded cache and rank-owned direct-DE host arenas.
 
-Encoded publication files are shared through tmpfs. Every scheduler
-decodes its local tensors into its own original CUDA HOST_NUMA allocation.
+Encoded publication files are shared through tmpfs. Each scheduler unwraps Zstd
+or copies plain LZ4 into its own original CUDA HOST_NUMA allocation.
 """
 
 import fcntl
@@ -447,8 +447,8 @@ class HostArena:
         }
         waiting = time.perf_counter()
         directory.mkdir(mode=0o700, exist_ok=True)
-        # Only encoded-cache construction is serialized. Rank-local Zstd and
-        # CUDA host allocation occur afterward, without holding this mutex.
+        # Only encoded-cache construction is serialized. Rank-local payload
+        # preparation and CUDA host allocation run after releasing this mutex.
         with (directory / ".lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             metrics["host_encoded_cache_wait_s"] = time.perf_counter() - waiting

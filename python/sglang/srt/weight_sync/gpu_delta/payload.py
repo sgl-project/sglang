@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Miles codec admission and parallel CPU decoding into rank-owned host arenas."""
+"""Miles codec admission and reusable workers for rank-local payload preparation."""
 
 import os
 import threading
