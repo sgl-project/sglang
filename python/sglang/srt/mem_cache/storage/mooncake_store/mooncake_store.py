@@ -977,49 +977,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         exist_result = self._batch_exist(all_key_strs) if is_set else None
         for host_pool, host_indices, key_strs, key_multiplier, start in buffer_requests:
-            object_indices = list(range(len(key_strs)))
-            if exist_result is not None:
-                # Only pages the store is missing need per-layer addresses. Zero
-                # placeholders keep result and group offsets aligned for the rest.
-                missing_pages = [
-                    page
-                    for page in range(len(key_strs) // key_multiplier)
-                    if any(
-                        state != 1
-                        for state in exist_result[
-                            start + page * key_multiplier : start
-                            + (page + 1) * key_multiplier
-                        ]
-                    )
-                ]
-                if not missing_pages:
-                    all_ptrs.extend([0] * len(key_strs))
-                    all_sizes.extend([0] * len(key_strs))
-                    continue
-                if len(missing_pages) * key_multiplier < len(key_strs):
-                    # Metadata generation consumes CPU indices anyway, so select
-                    # the logical pages there rather than uploading a new index.
-                    page_size = host_pool.page_size or 1
-                    host_indices = host_indices.detach().to(device="cpu")
-                    host_indices = host_indices.reshape(-1, page_size)[
-                        missing_pages
-                    ].reshape(-1)
-                    object_indices = [
-                        page * key_multiplier + component
-                        for page in missing_pages
-                        for component in range(key_multiplier)
-                    ]
-            selected_keys = [key_strs[i] for i in object_indices]
-            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
-            if len(ptr_list) != len(selected_keys):
-                ptr_list, element_size_list = self._pack_multi_buffer_meta(
-                    selected_keys, ptr_list, element_size_list
-                )
-            pool_ptrs = [0] * len(key_strs)
-            pool_sizes = [0] * len(key_strs)
-            for index, ptr, size in zip(object_indices, ptr_list, element_size_list):
-                pool_ptrs[index] = ptr
-                pool_sizes[index] = size
+            pool_ptrs, pool_sizes = self._build_pool_buffer_meta(
+                host_pool=host_pool,
+                host_indices=host_indices,
+                key_strs=key_strs,
+                key_multiplier=key_multiplier,
+                exist_states=(
+                    exist_result[start : start + len(key_strs)]
+                    if exist_result is not None
+                    else None
+                ),
+            )
             all_ptrs.extend(pool_ptrs)
             all_sizes.extend(pool_sizes)
 
@@ -1060,6 +1028,57 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_multiplier=key_multiplier,
             )
         return results
+
+    def _build_pool_buffer_meta(
+        self,
+        host_pool: HostKVCache,
+        host_indices: torch.Tensor,
+        key_strs: List[str],
+        key_multiplier: int,
+        exist_states: Optional[List[int]],
+    ) -> Tuple[List[Any], List[Any]]:
+        # Only pages the store is missing need per-layer addresses. Zero
+        # placeholders keep result and group offsets aligned for the rest.
+        object_indices = list(range(len(key_strs)))
+        if exist_states is not None:
+            missing_pages = [
+                page
+                for page in range(len(key_strs) // key_multiplier)
+                if any(
+                    state != 1
+                    for state in exist_states[
+                        page * key_multiplier : (page + 1) * key_multiplier
+                    ]
+                )
+            ]
+            if not missing_pages:
+                return [0] * len(key_strs), [0] * len(key_strs)
+            if len(missing_pages) * key_multiplier < len(key_strs):
+                # Metadata generation consumes CPU indices anyway, so select
+                # the logical pages there rather than uploading a new index.
+                page_size = host_pool.page_size or 1
+                host_indices = host_indices.detach().to(device="cpu")
+                host_indices = host_indices.reshape(-1, page_size)[
+                    missing_pages
+                ].reshape(-1)
+                object_indices = [
+                    page * key_multiplier + component
+                    for page in missing_pages
+                    for component in range(key_multiplier)
+                ]
+
+        selected_keys = [key_strs[i] for i in object_indices]
+        ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+        if len(ptr_list) != len(selected_keys):
+            ptr_list, element_size_list = self._pack_multi_buffer_meta(
+                selected_keys, ptr_list, element_size_list
+            )
+        pool_ptrs = [0] * len(key_strs)
+        pool_sizes = [0] * len(key_strs)
+        for index, ptr, size in zip(object_indices, ptr_list, element_size_list):
+            pool_ptrs[index] = ptr
+            pool_sizes[index] = size
+        return pool_ptrs, pool_sizes
 
     def batch_get_v2(
         self,

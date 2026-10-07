@@ -566,6 +566,59 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             ],
         )
 
+    def test_v2_partly_stored_multi_object_page_puts_only_missing_objects(self):
+        """A page with some objects stored must put the rest with their own pointers."""
+
+        class RecordingKVDraftPool:
+            page_size = 1
+
+            def __init__(self):
+                self.kv_buffer = torch.empty((128,), dtype=torch.uint8)
+                self.meta_calls = []
+
+            def get_page_buffer_meta(self, indices):
+                self.meta_calls.append(indices.tolist())
+                ptrs, sizes = [], []
+                for i in indices:
+                    ptrs.extend([5000 + int(i) * 10, 5001 + int(i) * 10])
+                    sizes.extend([8, 8])
+                return ptrs, sizes
+
+        store, fake_store = _make_store(extra_backend_tag="tag")
+        draft_pool = RecordingKVDraftPool()
+        store.register_mem_host_pool_v2(draft_pool, PoolName.DRAFT)
+        fake_store.existing_keys.update(
+            {"tag_page0_0_draft_k", "tag_page1_0_draft_k", "tag_page1_0_draft_v"}
+        )
+
+        results = store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    keys=["page0", "page1", "page2"],
+                    host_indices=torch.tensor([5, 6, 7]),
+                )
+            ]
+        )
+
+        self.assertEqual(results[PoolName.DRAFT], [True, True, True])
+        self.assertEqual(draft_pool.meta_calls, [[5, 7]])
+        self.assertEqual(len(fake_store.batch_put_calls), 1)
+        call = fake_store.batch_put_calls[0]
+        self.assertEqual(
+            call["keys"],
+            ["tag_page0_0_draft_v", "tag_page2_0_draft_k", "tag_page2_0_draft_v"],
+        )
+        self.assertEqual(call["ptrs"], [5051, 5070, 5071])
+        self.assertEqual(
+            call["args"][0].group_ids,
+            [
+                "sglang-hicache:tag_page0",
+                "sglang-hicache:tag_page2",
+                "sglang-hicache:tag_page2",
+            ],
+        )
+
     def test_model_names_isolate_the_same_logical_key(self):
         store_a, fake_store_a = _make_store(
             enable_group_semantics=False, model_name="org/model-a"
