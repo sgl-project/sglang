@@ -817,14 +817,32 @@ class GroupCoordinator:
         residual_inp_: torch.Tensor,
         weight_: torch.Tensor,
         eps: float,
+        *,
+        use_1stage: Optional[bool] = None,
+        residual_out: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
+        num_norm_rows: int = -1,
+        skip_residual: bool = False,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator. ROCm/HIP Only"""
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
 
-        # Prefer communicator-native fused API when provided.
-        if hasattr(ca_comm, "fused_allreduce_rmsnorm"):
+        # Prefer communicator-native fused API when provided, unless the
+        # caller asked for an explicit 1-stage/2-stage choice or K3 kernel
+        # options that the native API does not expose.
+        k3_opts = (
+            residual_out is not None
+            or out is not None
+            or num_norm_rows >= 0
+            or skip_residual
+        )
+        if (
+            use_1stage is None
+            and not k3_opts
+            and hasattr(ca_comm, "fused_allreduce_rmsnorm")
+        ):
             try:
                 return ca_comm.fused_allreduce_rmsnorm(
                     input_, residual_inp_, weight_, eps
@@ -842,11 +860,23 @@ class GroupCoordinator:
         # prefill batches fall through to the 2-stage kernel instead of
         # hitting a runtime error.  AITER's C++ dispatch already gates
         # which hidden_dims have valid 1-stage support.
-        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+        if use_1stage is not None:
+            use_1stage_ar = use_1stage
+        elif envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         else:
             total_bytes = input_.numel() * input_.element_size()
             use_1stage_ar = total_bytes <= 128 * 1024
+
+        fused_kwargs = {}
+        if residual_out is not None:
+            fused_kwargs["residual_out"] = residual_out
+        if out is not None:
+            fused_kwargs["out"] = out
+        if num_norm_rows >= 0:
+            fused_kwargs["num_norm_rows"] = num_norm_rows
+        if skip_residual:
+            fused_kwargs["skip_residual"] = skip_residual
 
         if (
             getattr(ca_comm, "_IS_CAPTURING", False)
@@ -862,6 +892,10 @@ class GroupCoordinator:
                 eps=eps,
                 registered=False,
                 use_1stage=use_1stage_ar,
+                res_out=residual_out,
+                out=out,
+                num_norm_rows=num_norm_rows,
+                skip_residual=skip_residual,
             )
         fused_outputs = ca_comm.custom_fused_ar_rms(
             input_,
@@ -869,6 +903,7 @@ class GroupCoordinator:
             weight_,
             eps,
             use_1stage_ar,
+            **fused_kwargs,
         )
         return fused_outputs
 

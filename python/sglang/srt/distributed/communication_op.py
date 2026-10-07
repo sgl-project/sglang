@@ -33,14 +33,34 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     residual_inp_: torch.Tensor,
     weight_: torch.Tensor,
     eps: float,
+    *,
+    use_1stage: Optional[bool] = None,
+    residual_out: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    num_norm_rows: int = -1,
+    skip_residual: bool = False,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Fused TP all-reduce + RMSNorm.
 
     Policy and backend selection are owned by GroupCoordinator:
     it may dispatch to communicator-native fused APIs, custom fused kernels,
     or return None so callers can run generic fallback paths.
+
+    ``use_1stage`` overrides the 128 KiB 1-stage/2-stage heuristic when set.
+    ``residual_out`` / ``out`` / ``num_norm_rows`` / ``skip_residual`` are
+    forwarded to the AITER custom kernel when the custom-fused path is used.
     """
-    return get_tp_group().fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
+    return get_tp_group().fused_allreduce_rmsnorm(
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        use_1stage=use_1stage,
+        residual_out=residual_out,
+        out=out,
+        num_norm_rows=num_norm_rows,
+        skip_residual=skip_residual,
+    )
 
 
 def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
