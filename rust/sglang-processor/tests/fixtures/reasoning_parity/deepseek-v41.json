@@ -1,0 +1,2601 @@
+{
+ "parser": "deepseek-v41",
+ "inputs": [
+  {
+   "chunks": [
+    "Let me think",
+    " about it",
+    "</think>",
+    "Paris",
+    " is"
+   ]
+  },
+  {
+   "chunks": [
+    "Let me think</th",
+    "ink>Answer"
+   ]
+  },
+  {
+   "chunks": [
+    "</think>",
+    "Answer only"
+   ]
+  },
+  {
+   "chunks": [
+    "<think>",
+    "reason",
+    "</think>",
+    "done"
+   ]
+  },
+  {
+   "chunks": [
+    "reasoning\n\n",
+    "<｜DSM",
+    "L｜tool_calls>",
+    "rest"
+   ]
+  },
+  {
+   "chunks": [
+    "mention ",
+    "<｜DSML｜tool_calls>",
+    " inline",
+    "</think>",
+    "ans"
+   ]
+  },
+  {
+   "chunks": [
+    "cut off mid reasoning"
+   ]
+  },
+  {
+   "chunks": [
+    "cut </thi"
+   ]
+  },
+  {
+   "chunks": [
+    "ends at\n<｜DSM"
+   ]
+  },
+  {
+   "chunks": [
+    "a",
+    "b",
+    "c",
+    "</think>"
+   ]
+  },
+  {
+   "chunks": [
+    "",
+    "x",
+    "",
+    "</think>",
+    "",
+    "y"
+   ]
+  },
+  {
+   "chunks": [
+    "reason",
+    "</think>",
+    "line1\n",
+    "<think>not reasoning</think>"
+   ]
+  },
+  {
+   "chunks": [
+    "思考中",
+    "……",
+    "</think>",
+    "答案"
+   ]
+  },
+  {
+   "chunks": [
+    "reasoning\n\n",
+    "<｜DSM",
+    "L｜ calls>",
+    "rest"
+   ]
+  },
+  {
+   "chunks": [
+    "mention ",
+    "<｜DSML｜ calls>",
+    " inline",
+    "</think>",
+    "ans"
+   ]
+  },
+  {
+   "chunks": [
+    "ends at\n<｜DSML｜ ca"
+   ]
+  },
+  {
+   "chunks": [
+    "plan\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+   ]
+  },
+  {
+   "chunks": [
+    "plan\n",
+    "<",
+    "｜DSML｜",
+    " calls",
+    ">\n<｜DSML｜ invoke name=\"f\"/>"
+   ]
+  },
+  {
+   "chunks": [
+    "thought",
+    "</think>",
+    "\n\n<｜DSML｜ calls>\n"
+   ]
+  }
+ ],
+ "cases": [
+  {
+   "chunks": [
+    "Let me think",
+    " about it",
+    "</think>",
+    "Paris",
+    " is"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "Let me think",
+     ""
+    ],
+    [
+     " about it",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "Paris"
+    ],
+    [
+     "",
+     " is"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "Let me think about it",
+    "Paris is"
+   ]
+  },
+  {
+   "chunks": [
+    "Let me think",
+    " about it",
+    "</think>",
+    "Paris",
+    " is"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "Let me think about it",
+     ""
+    ],
+    [
+     "",
+     "Paris"
+    ],
+    [
+     "",
+     " is"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "Let me think about it",
+    "Paris is"
+   ]
+  },
+  {
+   "chunks": [
+    "Let me think",
+    " about it",
+    "</think>",
+    "Paris",
+    " is"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "Let me think"
+    ],
+    [
+     "",
+     " about it"
+    ],
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     "Paris"
+    ],
+    [
+     "",
+     " is"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "Let me think about it</think>Paris is"
+   ]
+  },
+  {
+   "chunks": [
+    "Let me think",
+    " about it",
+    "</think>",
+    "Paris",
+    " is"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "Let me think"
+    ],
+    [
+     "",
+     " about it"
+    ],
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     "Paris"
+    ],
+    [
+     "",
+     " is"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "Let me think about it</think>Paris is"
+   ]
+  },
+  {
+   "chunks": [
+    "Let me think</th",
+    "ink>Answer"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "Let me think",
+     ""
+    ],
+    [
+     "",
+     "Answer"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "Let me think",
+    "Answer"
+   ]
+  },
+  {
+   "chunks": [
+    "Let me think</th",
+    "ink>Answer"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "Let me think",
+     "Answer"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "Let me think",
+    "Answer"
+   ]
+  },
+  {
+   "chunks": [
+    "Let me think</th",
+    "ink>Answer"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "Let me think</th"
+    ],
+    [
+     "",
+     "ink>Answer"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "Let me think</think>Answer"
+   ]
+  },
+  {
+   "chunks": [
+    "Let me think</th",
+    "ink>Answer"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "Let me think</th"
+    ],
+    [
+     "",
+     "ink>Answer"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "Let me think</think>Answer"
+   ]
+  },
+  {
+   "chunks": [
+    "</think>",
+    "Answer only"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "Answer only"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "Answer only"
+   ]
+  },
+  {
+   "chunks": [
+    "</think>",
+    "Answer only"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "Answer only"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "Answer only"
+   ]
+  },
+  {
+   "chunks": [
+    "</think>",
+    "Answer only"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     "Answer only"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "</think>Answer only"
+   ]
+  },
+  {
+   "chunks": [
+    "</think>",
+    "Answer only"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     "Answer only"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "</think>Answer only"
+   ]
+  },
+  {
+   "chunks": [
+    "<think>",
+    "reason",
+    "</think>",
+    "done"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "reason",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "done"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "reason",
+    "done"
+   ]
+  },
+  {
+   "chunks": [
+    "<think>",
+    "reason",
+    "</think>",
+    "done"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "reason",
+     ""
+    ],
+    [
+     "",
+     "done"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "reason",
+    "done"
+   ]
+  },
+  {
+   "chunks": [
+    "<think>",
+    "reason",
+    "</think>",
+    "done"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "reason",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "done"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "reason",
+    "done"
+   ]
+  },
+  {
+   "chunks": [
+    "<think>",
+    "reason",
+    "</think>",
+    "done"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "reason",
+     ""
+    ],
+    [
+     "",
+     "done"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "reason",
+    "done"
+   ]
+  },
+  {
+   "chunks": [
+    "reasoning\n\n",
+    "<｜DSM",
+    "L｜tool_calls>",
+    "rest"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "reasoning\n\n",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "<｜DSML｜tool_calls>",
+     ""
+    ],
+    [
+     "rest",
+     ""
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "reasoning\n\n<｜DSML｜tool_calls>rest",
+    ""
+   ]
+  },
+  {
+   "chunks": [
+    "reasoning\n\n",
+    "<｜DSM",
+    "L｜tool_calls>",
+    "rest"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "reasoning\n\n<｜DSML｜tool_calls>rest",
+     ""
+    ]
+   ],
+   "unary": [
+    "reasoning\n\n<｜DSML｜tool_calls>rest",
+    ""
+   ]
+  },
+  {
+   "chunks": [
+    "reasoning\n\n",
+    "<｜DSM",
+    "L｜tool_calls>",
+    "rest"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "reasoning\n\n"
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "<｜DSML｜tool_calls>"
+    ],
+    [
+     "",
+     "rest"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "reasoning\n\n<｜DSML｜tool_calls>rest"
+   ]
+  },
+  {
+   "chunks": [
+    "reasoning\n\n",
+    "<｜DSM",
+    "L｜tool_calls>",
+    "rest"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "reasoning\n\n"
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "<｜DSML｜tool_calls>"
+    ],
+    [
+     "",
+     "rest"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "reasoning\n\n<｜DSML｜tool_calls>rest"
+   ]
+  },
+  {
+   "chunks": [
+    "mention ",
+    "<｜DSML｜tool_calls>",
+    " inline",
+    "</think>",
+    "ans"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "mention ",
+     ""
+    ],
+    [
+     "<｜DSML｜tool_calls>",
+     ""
+    ],
+    [
+     " inline",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "ans"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "mention <｜DSML｜tool_calls> inline",
+    "ans"
+   ]
+  },
+  {
+   "chunks": [
+    "mention ",
+    "<｜DSML｜tool_calls>",
+    " inline",
+    "</think>",
+    "ans"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "mention <｜DSML｜tool_calls> inline",
+     ""
+    ],
+    [
+     "",
+     "ans"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "mention <｜DSML｜tool_calls> inline",
+    "ans"
+   ]
+  },
+  {
+   "chunks": [
+    "mention ",
+    "<｜DSML｜tool_calls>",
+    " inline",
+    "</think>",
+    "ans"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "mention "
+    ],
+    [
+     "",
+     "<｜DSML｜tool_calls>"
+    ],
+    [
+     "",
+     " inline"
+    ],
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     "ans"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "mention <｜DSML｜tool_calls> inline</think>ans"
+   ]
+  },
+  {
+   "chunks": [
+    "mention ",
+    "<｜DSML｜tool_calls>",
+    " inline",
+    "</think>",
+    "ans"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "mention "
+    ],
+    [
+     "",
+     "<｜DSML｜tool_calls>"
+    ],
+    [
+     "",
+     " inline"
+    ],
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     "ans"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "mention <｜DSML｜tool_calls> inline</think>ans"
+   ]
+  },
+  {
+   "chunks": [
+    "cut off mid reasoning"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "cut off mid reasoning",
+     ""
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "cut off mid reasoning",
+    ""
+   ]
+  },
+  {
+   "chunks": [
+    "cut off mid reasoning"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "cut off mid reasoning",
+     ""
+    ]
+   ],
+   "unary": [
+    "cut off mid reasoning",
+    ""
+   ]
+  },
+  {
+   "chunks": [
+    "cut off mid reasoning"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "cut off mid reasoning"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "cut off mid reasoning"
+   ]
+  },
+  {
+   "chunks": [
+    "cut off mid reasoning"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "cut off mid reasoning"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "cut off mid reasoning"
+   ]
+  },
+  {
+   "chunks": [
+    "cut </thi"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "cut ",
+     ""
+    ],
+    [
+     "</thi",
+     ""
+    ]
+   ],
+   "unary": [
+    "cut </thi",
+    ""
+   ]
+  },
+  {
+   "chunks": [
+    "cut </thi"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "cut </thi",
+     ""
+    ]
+   ],
+   "unary": [
+    "cut </thi",
+    ""
+   ]
+  },
+  {
+   "chunks": [
+    "cut </thi"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "cut </thi"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "cut </thi"
+   ]
+  },
+  {
+   "chunks": [
+    "cut </thi"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "cut </thi"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "cut </thi"
+   ]
+  },
+  {
+   "chunks": [
+    "ends at\n<｜DSM"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "ends at\n",
+     ""
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "ends at\n",
+    ""
+   ]
+  },
+  {
+   "chunks": [
+    "ends at\n<｜DSM"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "ends at\n",
+     ""
+    ]
+   ],
+   "unary": [
+    "ends at\n",
+    ""
+   ]
+  },
+  {
+   "chunks": [
+    "ends at\n<｜DSM"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "ends at\n<｜DSM"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "ends at\n<｜DSM"
+   ]
+  },
+  {
+   "chunks": [
+    "ends at\n<｜DSM"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "ends at\n<｜DSM"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "ends at\n<｜DSM"
+   ]
+  },
+  {
+   "chunks": [
+    "a",
+    "b",
+    "c",
+    "</think>"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "a",
+     ""
+    ],
+    [
+     "b",
+     ""
+    ],
+    [
+     "c",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "abc",
+    ""
+   ]
+  },
+  {
+   "chunks": [
+    "a",
+    "b",
+    "c",
+    "</think>"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "abc",
+     ""
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "abc",
+    ""
+   ]
+  },
+  {
+   "chunks": [
+    "a",
+    "b",
+    "c",
+    "</think>"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "a"
+    ],
+    [
+     "",
+     "b"
+    ],
+    [
+     "",
+     "c"
+    ],
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "abc</think>"
+   ]
+  },
+  {
+   "chunks": [
+    "a",
+    "b",
+    "c",
+    "</think>"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "a"
+    ],
+    [
+     "",
+     "b"
+    ],
+    [
+     "",
+     "c"
+    ],
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "abc</think>"
+   ]
+  },
+  {
+   "chunks": [
+    "",
+    "x",
+    "",
+    "</think>",
+    "",
+    "y"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "x",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "y"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "x",
+    "y"
+   ]
+  },
+  {
+   "chunks": [
+    "",
+    "x",
+    "",
+    "</think>",
+    "",
+    "y"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "x",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "y"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "x",
+    "y"
+   ]
+  },
+  {
+   "chunks": [
+    "",
+    "x",
+    "",
+    "</think>",
+    "",
+    "y"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "x"
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "y"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "x</think>y"
+   ]
+  },
+  {
+   "chunks": [
+    "",
+    "x",
+    "",
+    "</think>",
+    "",
+    "y"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "x"
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "y"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "x</think>y"
+   ]
+  },
+  {
+   "chunks": [
+    "reason",
+    "</think>",
+    "line1\n",
+    "<think>not reasoning</think>"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "reason",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "line1\n"
+    ],
+    [
+     "not reasoning",
+     ""
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "reason",
+    "line1\n<think>not reasoning</think>"
+   ]
+  },
+  {
+   "chunks": [
+    "reason",
+    "</think>",
+    "line1\n",
+    "<think>not reasoning</think>"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "reason",
+     ""
+    ],
+    [
+     "",
+     "line1\n"
+    ],
+    [
+     "not reasoning",
+     ""
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "reason",
+    "line1\n<think>not reasoning</think>"
+   ]
+  },
+  {
+   "chunks": [
+    "reason",
+    "</think>",
+    "line1\n",
+    "<think>not reasoning</think>"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "reason"
+    ],
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     "line1\n"
+    ],
+    [
+     "not reasoning",
+     ""
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "reason",
+    "line1\n<think>not reasoning</think>"
+   ]
+  },
+  {
+   "chunks": [
+    "reason",
+    "</think>",
+    "line1\n",
+    "<think>not reasoning</think>"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "reason"
+    ],
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     "line1\n"
+    ],
+    [
+     "not reasoning",
+     ""
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "reason",
+    "line1\n<think>not reasoning</think>"
+   ]
+  },
+  {
+   "chunks": [
+    "思考中",
+    "……",
+    "</think>",
+    "答案"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "思考中",
+     ""
+    ],
+    [
+     "……",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "答案"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "思考中……",
+    "答案"
+   ]
+  },
+  {
+   "chunks": [
+    "思考中",
+    "……",
+    "</think>",
+    "答案"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "思考中……",
+     ""
+    ],
+    [
+     "",
+     "答案"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "思考中……",
+    "答案"
+   ]
+  },
+  {
+   "chunks": [
+    "思考中",
+    "……",
+    "</think>",
+    "答案"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "思考中"
+    ],
+    [
+     "",
+     "……"
+    ],
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     "答案"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "思考中……</think>答案"
+   ]
+  },
+  {
+   "chunks": [
+    "思考中",
+    "……",
+    "</think>",
+    "答案"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "思考中"
+    ],
+    [
+     "",
+     "……"
+    ],
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     "答案"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "思考中……</think>答案"
+   ]
+  },
+  {
+   "chunks": [
+    "reasoning\n\n",
+    "<｜DSM",
+    "L｜ calls>",
+    "rest"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "reasoning\n\n",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "<｜DSML｜ calls>"
+    ],
+    [
+     "",
+     "rest"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "reasoning\n\n",
+    "<｜DSML｜ calls>rest"
+   ]
+  },
+  {
+   "chunks": [
+    "reasoning\n\n",
+    "<｜DSM",
+    "L｜ calls>",
+    "rest"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "reasoning\n\n",
+     "<｜DSML｜ calls>"
+    ],
+    [
+     "",
+     "rest"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "reasoning\n\n",
+    "<｜DSML｜ calls>rest"
+   ]
+  },
+  {
+   "chunks": [
+    "reasoning\n\n",
+    "<｜DSM",
+    "L｜ calls>",
+    "rest"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "reasoning\n\n"
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "<｜DSML｜ calls>"
+    ],
+    [
+     "",
+     "rest"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "reasoning\n\n<｜DSML｜ calls>rest"
+   ]
+  },
+  {
+   "chunks": [
+    "reasoning\n\n",
+    "<｜DSM",
+    "L｜ calls>",
+    "rest"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "reasoning\n\n"
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "<｜DSML｜ calls>"
+    ],
+    [
+     "",
+     "rest"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "reasoning\n\n<｜DSML｜ calls>rest"
+   ]
+  },
+  {
+   "chunks": [
+    "mention ",
+    "<｜DSML｜ calls>",
+    " inline",
+    "</think>",
+    "ans"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "mention ",
+     ""
+    ],
+    [
+     "<｜DSML｜ calls>",
+     ""
+    ],
+    [
+     " inline",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "ans"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "mention <｜DSML｜ calls> inline",
+    "ans"
+   ]
+  },
+  {
+   "chunks": [
+    "mention ",
+    "<｜DSML｜ calls>",
+    " inline",
+    "</think>",
+    "ans"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "mention <｜DSML｜ calls> inline",
+     ""
+    ],
+    [
+     "",
+     "ans"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "mention <｜DSML｜ calls> inline",
+    "ans"
+   ]
+  },
+  {
+   "chunks": [
+    "mention ",
+    "<｜DSML｜ calls>",
+    " inline",
+    "</think>",
+    "ans"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "mention "
+    ],
+    [
+     "",
+     "<｜DSML｜ calls>"
+    ],
+    [
+     "",
+     " inline"
+    ],
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     "ans"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "mention <｜DSML｜ calls> inline</think>ans"
+   ]
+  },
+  {
+   "chunks": [
+    "mention ",
+    "<｜DSML｜ calls>",
+    " inline",
+    "</think>",
+    "ans"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "mention "
+    ],
+    [
+     "",
+     "<｜DSML｜ calls>"
+    ],
+    [
+     "",
+     " inline"
+    ],
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     "ans"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "mention <｜DSML｜ calls> inline</think>ans"
+   ]
+  },
+  {
+   "chunks": [
+    "ends at\n<｜DSML｜ ca"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "ends at\n",
+     ""
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "ends at\n",
+    ""
+   ]
+  },
+  {
+   "chunks": [
+    "ends at\n<｜DSML｜ ca"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "ends at\n",
+     ""
+    ]
+   ],
+   "unary": [
+    "ends at\n",
+    ""
+   ]
+  },
+  {
+   "chunks": [
+    "ends at\n<｜DSML｜ ca"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "ends at\n<｜DSML｜ ca"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "ends at\n<｜DSML｜ ca"
+   ]
+  },
+  {
+   "chunks": [
+    "ends at\n<｜DSML｜ ca"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "ends at\n<｜DSML｜ ca"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "ends at\n<｜DSML｜ ca"
+   ]
+  },
+  {
+   "chunks": [
+    "plan\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "plan\n\n",
+     "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "plan\n\n",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+   ]
+  },
+  {
+   "chunks": [
+    "plan\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "plan\n\n",
+     "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "plan\n\n",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+   ]
+  },
+  {
+   "chunks": [
+    "plan\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "plan\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "plan\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+   ]
+  },
+  {
+   "chunks": [
+    "plan\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "plan\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "plan\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+   ]
+  },
+  {
+   "chunks": [
+    "plan\n",
+    "<",
+    "｜DSML｜",
+    " calls",
+    ">\n<｜DSML｜ invoke name=\"f\"/>"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "plan\n",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\"/>"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "plan\n",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\"/>"
+   ]
+  },
+  {
+   "chunks": [
+    "plan\n",
+    "<",
+    "｜DSML｜",
+    " calls",
+    ">\n<｜DSML｜ invoke name=\"f\"/>"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "plan\n",
+     "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\"/>"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "plan\n",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\"/>"
+   ]
+  },
+  {
+   "chunks": [
+    "plan\n",
+    "<",
+    "｜DSML｜",
+    " calls",
+    ">\n<｜DSML｜ invoke name=\"f\"/>"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "plan\n"
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\"/>"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "plan\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\"/>"
+   ]
+  },
+  {
+   "chunks": [
+    "plan\n",
+    "<",
+    "｜DSML｜",
+    " calls",
+    ">\n<｜DSML｜ invoke name=\"f\"/>"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "plan\n"
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\"/>"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "plan\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\"/>"
+   ]
+  },
+  {
+   "chunks": [
+    "thought",
+    "</think>",
+    "\n\n<｜DSML｜ calls>\n"
+   ],
+   "force": true,
+   "stream": true,
+   "steps": [
+    [
+     "thought",
+     ""
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "",
+     "\n\n<｜DSML｜ calls>\n"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "thought",
+    "\n\n<｜DSML｜ calls>\n"
+   ]
+  },
+  {
+   "chunks": [
+    "thought",
+    "</think>",
+    "\n\n<｜DSML｜ calls>\n"
+   ],
+   "force": true,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     ""
+    ],
+    [
+     "thought",
+     ""
+    ],
+    [
+     "",
+     "\n\n<｜DSML｜ calls>\n"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "thought",
+    "\n\n<｜DSML｜ calls>\n"
+   ]
+  },
+  {
+   "chunks": [
+    "thought",
+    "</think>",
+    "\n\n<｜DSML｜ calls>\n"
+   ],
+   "force": false,
+   "stream": true,
+   "steps": [
+    [
+     "",
+     "thought"
+    ],
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     "\n\n<｜DSML｜ calls>\n"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "thought</think>\n\n<｜DSML｜ calls>\n"
+   ]
+  },
+  {
+   "chunks": [
+    "thought",
+    "</think>",
+    "\n\n<｜DSML｜ calls>\n"
+   ],
+   "force": false,
+   "stream": false,
+   "steps": [
+    [
+     "",
+     "thought"
+    ],
+    [
+     "",
+     "</think>"
+    ],
+    [
+     "",
+     "\n\n<｜DSML｜ calls>\n"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "unary": [
+    "",
+    "thought</think>\n\n<｜DSML｜ calls>\n"
+   ]
+  }
+ ]
+}
