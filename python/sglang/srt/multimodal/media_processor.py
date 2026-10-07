@@ -533,6 +533,31 @@ class MultimodalProcessorMixin:
             assert isinstance(prompt, str)
             prompt_str = prompt
 
+        images, videos, audios = await self._load_media_lists(
+            image_data,
+            video_data,
+            audio_data,
+            audio_sample_rate=audio_sample_rate,
+            discard_alpha_channel=discard_alpha_channel,
+        )
+
+        return BaseMultiModalProcessorOutput(
+            images=images,
+            audios=audios,
+            videos=videos,
+            input_text=prompt_str,
+            input_ids=input_ids,
+        )
+
+    async def _load_media_lists(
+        self,
+        image_data: Optional[list],
+        video_data: Optional[list],
+        audio_data: Optional[list],
+        *,
+        audio_sample_rate: Optional[int],
+        discard_alpha_channel: bool,
+    ) -> Tuple[List[Any], List[Any], List[Any]]:
         futures: List[Tuple[Modality, int, concurrent.futures.Future]] = []
 
         modalities_data = [
@@ -591,11 +616,4 @@ class MultimodalProcessorMixin:
             len(videos),
             len(audios),
         )
-
-        return BaseMultiModalProcessorOutput(
-            images=images,
-            audios=audios,
-            videos=videos,
-            input_text=prompt_str,
-            input_ids=input_ids,
-        )
+        return images, videos, audios
