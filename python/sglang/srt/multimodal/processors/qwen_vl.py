@@ -798,6 +798,68 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             mrope_position_delta,
         )
 
+    def _compute_mrope_positions(
+        self,
+        ret,
+        mm_items,
+        input_ids,
+        *,
+        image_data,
+        video_data,
+        second_per_grid_ts,
+        audio_feature_lengths,
+    ):
+        image_grid_thw = self._get_grid_from_output_or_items(
+            ret, mm_items, "image_grid_thw", Modality.IMAGE, image_data
+        )
+        video_grid_thw = self._get_grid_from_output_or_items(
+            ret,
+            mm_items,
+            "video_grid_thw",
+            Modality.VIDEO,
+            video_data,
+        )
+
+        mrope_result = self._get_precomputed_mrope_from_output(ret)
+        if mrope_result is None:
+            if (
+                video_grid_thw is None
+                and second_per_grid_ts is None
+                and audio_feature_lengths is None
+            ):
+                mrope_result = self._compute_image_only_mrope_positions_from_offsets(
+                    input_len=input_ids.numel(),
+                    mm_items=mm_items,
+                    dtype=input_ids.dtype,
+                    device=input_ids.device,
+                )
+        if mrope_result is None:
+            mrope_result = MRotaryEmbedding.get_rope_index(
+                spatial_merge_size=self._spatial_merge_size,
+                image_token_id=self.mm_tokens.image_token_id,
+                video_token_id=self.mm_tokens.video_token_id,
+                vision_start_token_id=self.vision_start_token_id,
+                model_type=self.model_type,
+                tokens_per_second=self._tokens_per_second,
+                # use the expanded token ids
+                input_ids=input_ids.unsqueeze(0),
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                use_audio_in_video=False,
+                audio_seqlens=audio_feature_lengths,
+                audio_token_id=getattr(self.hf_config, "audio_token_id", None),
+                audio_start_token_id=self.audio_start_token_id,
+                position_id_per_seconds=getattr(
+                    self.hf_config, "position_id_per_seconds", None
+                ),
+            )
+
+        mrope_positions, mrope_position_delta = mrope_result
+        if mrope_positions.ndim == 3:
+            mrope_positions = mrope_positions.squeeze(1)
+        return mrope_positions, mrope_position_delta
+
     async def _process_mm_data_uncached(
         self,
         image_data: List[Union[str, bytes]],
@@ -897,55 +959,15 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             padded_input_ids = list(padded_input_ids)
 
         video_data = request_obj.video_data
-        image_grid_thw = self._get_grid_from_output_or_items(
-            ret, mm_items, "image_grid_thw", Modality.IMAGE, image_data
-        )
-        video_grid_thw = self._get_grid_from_output_or_items(
+        mrope_positions, mrope_position_delta = self._compute_mrope_positions(
             ret,
             mm_items,
-            "video_grid_thw",
-            Modality.VIDEO,
-            video_data,
+            input_ids,
+            image_data=image_data,
+            video_data=video_data,
+            second_per_grid_ts=second_per_grid_ts,
+            audio_feature_lengths=audio_feature_lengths,
         )
-
-        mrope_result = self._get_precomputed_mrope_from_output(ret)
-        if mrope_result is None:
-            if (
-                video_grid_thw is None
-                and second_per_grid_ts is None
-                and audio_feature_lengths is None
-            ):
-                mrope_result = self._compute_image_only_mrope_positions_from_offsets(
-                    input_len=input_ids.numel(),
-                    mm_items=mm_items,
-                    dtype=input_ids.dtype,
-                    device=input_ids.device,
-                )
-        if mrope_result is None:
-            mrope_result = MRotaryEmbedding.get_rope_index(
-                spatial_merge_size=self._spatial_merge_size,
-                image_token_id=self.mm_tokens.image_token_id,
-                video_token_id=self.mm_tokens.video_token_id,
-                vision_start_token_id=self.vision_start_token_id,
-                model_type=self.model_type,
-                tokens_per_second=self._tokens_per_second,
-                # use the expanded token ids
-                input_ids=input_ids.unsqueeze(0),
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                second_per_grid_ts=second_per_grid_ts,
-                use_audio_in_video=False,
-                audio_seqlens=audio_feature_lengths,
-                audio_token_id=getattr(self.hf_config, "audio_token_id", None),
-                audio_start_token_id=self.audio_start_token_id,
-                position_id_per_seconds=getattr(
-                    self.hf_config, "position_id_per_seconds", None
-                ),
-            )
-
-        mrope_positions, mrope_position_delta = mrope_result
-        if mrope_positions.ndim == 3:
-            mrope_positions = mrope_positions.squeeze(1)
         get_rope_index_time = time.perf_counter()
         logger.debug(
             f"[QwenVLProcessor Perf] {rid=}, "
