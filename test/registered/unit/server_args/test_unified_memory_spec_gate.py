@@ -24,8 +24,8 @@ backend constraints:
     verify family must not leak into this arm.
   * EAGLE/EAGLE3: unified targets only (hybrid-SWA or mamba hybrids, either
     full-pool kind) -- the draft's KV lives fused inside the full pool's
-    page envelope (`DenseDraftRegion`), with an automatic private-pool
-    fallback when no region resolves. The target's verify set follows the
+    page envelope (`DenseDraftRegion`), and a draft that does not fuse is
+    refused at boot. The target's verify set follows the
     host kind: the audited verify set on an MLA host, `triton` /
     `flashinfer` / `fa3` on an MHA host, and an unresolved backend is
     refused. The draft worker (its backend resolves separately: explicit

@@ -14,9 +14,10 @@
 """`place_fused_draft`: which host/draft pairs fuse, and where each runner's
 layers land.
 
-Every decline is the private-pool fallback, so a wrong answer never fails
-the boot -- it silently changes what the draft binds and what the boot solve
-prices. Pinned:
+A decline keeps a DFLASH or DSPARK draft on its private pool (a DFLASH draft
+on a mamba host is refused instead), and refuses an EAGLE draft at boot. A
+wrong answer for a draft that keeps its pool silently changes what it binds
+and what the boot solve prices. Pinned:
   - a replicated head under multi-layer EAGLE gets one lane RANGE per runner
     (one shared region would let the runners clobber each other's KV);
   - a per-depth head serves one depth per runner and needs one runner per
