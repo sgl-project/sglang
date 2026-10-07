@@ -3426,9 +3426,9 @@ class DeepseekV4AttnBackend(
                     # candidate source hands its block table to the consumers.
                     out = _bcg_prefill_graph_full_topk(layer, x, q_lora, pos)
                     if layer.indexer.is_candidate_source:
-                        self.forward_metadata.candidate_metadata[layer.compress_ratio] = (
-                            self.prefill_candidates.bind_prefill_graph_table(out)
-                        )
+                        self.forward_metadata.candidate_metadata[
+                            layer.compress_ratio
+                        ] = self.prefill_candidates.bind_prefill_graph_table(out)
             return
         if run_compressor and layer.compressor is not None:
             self._low_ratio_compress(layer, x, req, pos, forward_batch)

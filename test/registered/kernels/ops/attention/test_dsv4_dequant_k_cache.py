@@ -13,10 +13,12 @@ import torch
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     NOPE_ROPE_BYTES,
     PADDED_SCALE_PER_TOKEN,
-    dequantize_k_cache_paged,
-    dequantize_k_cache_paged_ref,
+    dequantize_k_cache_paged_dsv4,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.deepseek_v4.k_cache_reference import (
+    dequantize_k_cache_paged_ref,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -59,7 +61,7 @@ class TestDSV4DequantKCachePaged(CustomTestCase):
             dtype=table_dtype,
             device=self.device,
         )
-        got = dequantize_k_cache_paged(cache, table, page_size, out=out)
+        got = dequantize_k_cache_paged_dsv4(cache, table, page_size, out=out)
         want = dequantize_k_cache_paged_ref(cache, table, page_size)
         torch.testing.assert_close(got, want, atol=0, rtol=0, equal_nan=True)
         if out is not None:
@@ -79,7 +81,10 @@ class TestDSV4DequantKCachePaged(CustomTestCase):
         # freshly allocated destination.
         num_tokens, page_size = 777, 256
         workspace = torch.full(
-            (num_tokens + 512, 1, 512), float("nan"), dtype=torch.bfloat16, device="cuda"
+            (num_tokens + 512, 1, 512),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device="cuda",
         )
         self._check(num_tokens, page_size, out=workspace[:num_tokens])
         # Rows past the slice stay untouched.
