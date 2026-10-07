@@ -51,7 +51,7 @@ class BeamToolAdapter(ResponseToolAdapter):
         return request.chat_template_kwargs
 
     def template_kwargs(self, request):
-        """Render built-ins in the system block; the template adds wire prefixes."""
+        """Pass built-ins separately for the template's system tool block."""
         if not self.builtins:
             return request.chat_template_kwargs
         tools = request.tools or []
@@ -137,8 +137,7 @@ class BeamToolAdapter(ResponseToolAdapter):
                 "type": "function_call",
                 "id": call.id,
                 "call_id": call.call_id,
-                # History retains its native recipient even without a declaration.
-                "name": "refl.bash",
+                "name": "bash",
                 "arguments": json.dumps({"command": call.action.commands[0]}),
                 "status": call.status,
             }

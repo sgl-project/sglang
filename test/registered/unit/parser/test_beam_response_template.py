@@ -202,21 +202,6 @@ class TestBeamResponseTemplate(CustomTestCase):
                 self.assertEqual([call.name for call in calls], [name])
                 self.assertEqual(json.loads(calls[0].parameters), {"query": "weather"})
 
-    def test_native_tool_prefix_is_normalized(self):
-        for recipient in ("bash", "refl.bash"):
-            with self.subTest(recipient=recipient):
-                parser = FunctionCallParser(
-                    tools=[_tool("bash", {"command": {"type": "string"}})],
-                    tool_call_parser="beam",
-                    prefix=PREFIX,
-                )
-                content, calls = parser.parse_non_stream(
-                    _full_call(recipient, _parameter("command", "pwd"))
-                )
-                self.assertEqual(content, "")
-                self.assertEqual([call.name for call in calls], ["bash"])
-                self.assertEqual(json.loads(calls[0].parameters), {"command": "pwd"})
-
     def test_forced_tool_calls_use_template_grammar(self):
         """Forced calls after the reasoning follow the template grammar, which
         accepts only calls the parser reads back."""

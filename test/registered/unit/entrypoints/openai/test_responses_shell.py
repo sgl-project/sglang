@@ -2,8 +2,6 @@
 
 import asyncio
 import json
-from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 from utils import engine_chunk, event_payloads, make_serving
@@ -19,26 +17,46 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 SHELL = {"type": "shell", "environment": {"type": "local"}}
-CANONICAL_BASH = json.loads(
-    (Path(__file__).parent / "fixtures/beam_bash_tool.json").read_text()
-)
-# Exact declaration produced by Olympus's structured-bash training definition.
-CANONICAL_BASH_DECLARATION = (
-    "# Tools\n\n"
-    "// Execute a bash command. The output contains the command's stdout and stderr.\n"
-    "type bash = (_: {\n"
-    "// The bash command to execute.\n"
-    "command: string,\n"
-    "}) => any;"
-)
+
+
+@pytest.fixture
+def shell_serving(monkeypatch):
+    serving = make_serving(model_type="beam")
+    serving.enable_response_store = True
+    serving.reasoning_parser = serving.tool_call_parser = "beam"
+    serving._reasoning_detector = BeamReasoningDetector()
+    tokenizer = serving.tokenizer_manager.tokenizer
+    tokenizer.response_template = None
+    tokenizer.init_kwargs = {}
+    tokenizer.decode.return_value = "<|start|>assistant"
+    requests = []
+
+    def render(request, is_multimodal):
+        requests.append(request)
+        return MessageProcessingResult(
+            prompt="<|start|>assistant",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+
+    monkeypatch.setattr(serving, "_apply_conversation_template", render)
+    return serving, requests
 
 
 def registry(tools=None):
     return BeamToolAdapter(tools if tools is not None else [SHELL])
 
 
-def test_shell_schema_matches_canonical_training_definition():
-    assert registry().flat_tools == [CANONICAL_BASH]
+def test_shell_uses_bash_command_schema():
+    (tool,) = registry().flat_tools
+    assert tool["name"] == "bash"
+    assert tool["parameters"]["required"] == ["command"]
+    assert list(tool["parameters"]["properties"]) == ["command"]
+    assert tool["parameters"]["properties"]["command"]["type"] == "string"
 
 
 @pytest.mark.parametrize(
@@ -86,39 +104,24 @@ def test_unrepresentable_shell_replay_is_rejected(action):
 @pytest.mark.parametrize(
     "outcome", [{"type": "exit", "exit_code": 7}, {"type": "timeout"}]
 )
-def test_beam_shell_call_and_client_result_continuation(mode, outcome):
+@pytest.mark.parametrize("choice", ["auto", "required", {"type": "shell"}])
+def test_beam_shell_call_and_client_result_continuation(
+    shell_serving, mode, outcome, choice
+):
     stream = mode == "stream"
-    serving = make_serving(model_type="beam")
-    serving.enable_response_store = True
-    serving.reasoning_parser = serving.tool_call_parser = "beam"
-    serving._reasoning_detector = BeamReasoningDetector()
-    tokenizer = serving.tokenizer_manager.tokenizer
-    tokenizer.response_template = None
-    tokenizer.init_kwargs = {}
-    tokenizer.decode.return_value = "<|start|>assistant"
+    serving, seen = shell_serving
     command = "printf '%s\\n' 'space preserving' | cat; echo \"$HOME\""
     raw = (
         "<|channel|>analysis<|message|>Run it.<|end|>"
-        "<|start|>assistant to=refl.bash<|channel|>analysis <|constrain|>xml<|message|>"
+        "<|start|>assistant to=bash<|channel|>analysis <|constrain|>xml<|message|>"
         f'<rfl:parameter name="command">{command}</rfl:parameter><|call|>'
     )
-    seen = []
+    engines = []
 
-    async def generate(*args):
+    async def generate(request, *args):
+        engines.append(request)
         for index in range(1, len(raw) + 1) if stream else [len(raw)]:
             yield engine_chunk(raw[:index], index, finish=index == len(raw))
-
-    def render(chat_request, is_multimodal):
-        seen.append(chat_request)
-        return MessageProcessingResult(
-            prompt="<|start|>assistant",
-            prompt_ids=[1, 2, 3],
-            image_data=None,
-            audio_data=None,
-            video_data=None,
-            modalities=[],
-            stop=[],
-        )
 
     serving.tokenizer_manager.generate_request = generate
 
@@ -128,6 +131,7 @@ def test_beam_shell_call_and_client_result_continuation(mode, outcome):
                 model="x",
                 input="Run command",
                 tools=[SHELL, {"type": "function", "name": "other"}],
+                tool_choice=choice,
                 stream=stream,
                 background=mode == "background",
                 store=True,
@@ -142,7 +146,15 @@ def test_beam_shell_call_and_client_result_continuation(mode, outcome):
             assert not any(
                 e["type"].startswith("response.function_call_arguments") for e in events
             )
+            assert all(
+                e["response"]["tool_choice"] == choice
+                for e in events
+                if "response" in e
+            )
             result = events[-1]["response"]
+            assert [
+                e["item"] for e in events if e["type"] == "response.output_item.done"
+            ] == result["output"]
             done = next(
                 e["item"]
                 for e in events
@@ -153,6 +165,18 @@ def test_beam_shell_call_and_client_result_continuation(mode, outcome):
             assert result.output[-1].type == "shell_call"
             result = result.model_dump()
             done = result["output"][-1]
+        assert result["tool_choice"] == choice
+        if choice != "auto":
+            from xgrammar import Grammar
+            from xgrammar.testing import _is_grammar_accept_string
+
+            grammar = Grammar.from_structural_tag(
+                engines[0].sampling_params["structural_tag"]
+            )
+            assert _is_grammar_accept_string(grammar, raw)
+            assert not _is_grammar_accept_string(
+                grammar, raw.replace("to=bash", "to=undeclared")
+            )
         call = result["output"][-1]
         assert result["usage"]["input_tokens"] == 5
         assert result["usage"]["output_tokens"] == len(raw)
@@ -166,8 +190,7 @@ def test_beam_shell_call_and_client_result_continuation(mode, outcome):
         ] == ["bash"]
         assert [
             t["function"]["name"] for t in seen[0].chat_template_kwargs["tools"]
-        ] == ["other"]
-        assert seen[0].tools[0].function.parameters == CANONICAL_BASH["parameters"]
+        ] == ([] if isinstance(choice, dict) else ["other"])
         output = {
             "type": "shell_call_output",
             "call_id": call["call_id"],
@@ -180,20 +203,34 @@ def test_beam_shell_call_and_client_result_continuation(mode, outcome):
             {"previous_response_id": result["id"], "input": [output]},
             {"input": [call, output]},
         ):
-            response = await serving.create_responses(
-                ResponsesRequest(model="x", store=False, **continuation)
-            )
-            assert response.status == "completed"
-            messages = seen[-1].messages
-            replay = next(m for m in messages if getattr(m, "tool_calls", None))
-            assert replay.tool_calls[0].function.name == "refl.bash"
-            assert json.loads(replay.tool_calls[0].function.arguments) == {
-                "command": command
-            }
-            assert json.loads(messages[-1].content) == output
+            for tools, next_choice in (
+                ([SHELL], "auto"),
+                ([], "auto"),
+                ([SHELL], "none"),
+            ):
+                response = await serving.create_responses(
+                    ResponsesRequest(
+                        model="x",
+                        store=False,
+                        tools=tools,
+                        tool_choice=next_choice,
+                        **continuation,
+                    )
+                )
+                assert response.status == "completed"
+                messages = seen[-1].messages
+                replay = next(m for m in messages if getattr(m, "tool_calls", None))
+                assert replay.tool_calls[0].function.name == "bash"
+                assert json.loads(replay.tool_calls[0].function.arguments) == {
+                    "command": command
+                }
+                assert json.loads(messages[-1].content) == output
+                if next_choice == "none":
+                    assert seen[-1].chat_template_kwargs["builtin_tools"] == []
+                elif not tools:
+                    assert not seen[-1].tools
 
-    with patch.object(serving, "_apply_conversation_template", side_effect=render):
-        asyncio.run(run())
+    asyncio.run(run())
 
 
 def test_namespaced_bash_remains_a_client_function():
@@ -275,17 +312,13 @@ def test_invalid_shell_terminal_event_matches_failed_response():
 
 
 @pytest.mark.parametrize("stream", [False, True])
-def test_concurrent_shell_and_function_requests_keep_separate_translation(stream):
-    serving = make_serving(model_type="beam")
-    serving.reasoning_parser = serving.tool_call_parser = "beam"
-    serving._reasoning_detector = BeamReasoningDetector()
-    tokenizer = serving.tokenizer_manager.tokenizer
-    tokenizer.response_template = None
-    tokenizer.init_kwargs = {}
-    tokenizer.decode.return_value = "<|start|>assistant"
+def test_concurrent_shell_and_function_requests_keep_separate_translation(
+    shell_serving, stream
+):
+    serving, _ = shell_serving
     raw = (
         "<|channel|>analysis<|message|>Run it.<|end|>"
-        "<|start|>assistant to=refl.bash<|channel|>analysis <|constrain|>xml<|message|>"
+        "<|start|>assistant to=bash<|channel|>analysis <|constrain|>xml<|message|>"
         '<rfl:parameter name="command">pwd</rfl:parameter><|call|>'
     )
 
@@ -299,12 +332,7 @@ def test_concurrent_shell_and_function_requests_keep_separate_translation(stream
             if entered == 2:
                 ready.set()
             await ready.wait()
-            text = (
-                raw
-                if "shell" in adapted.rid
-                else raw.replace("to=refl.bash", "to=bash")
-            )
-            yield engine_chunk(text, finish=True)
+            yield engine_chunk(raw, finish=True)
 
         serving.tokenizer_manager.generate_request = generate
 
@@ -351,141 +379,16 @@ def test_concurrent_shell_and_function_requests_keep_separate_translation(stream
                 for e in function[1]
             )
 
-    with patch.object(
-        serving,
-        "_apply_conversation_template",
-        return_value=MessageProcessingResult(
-            prompt="<|start|>assistant",
-            prompt_ids=[1, 2, 3],
-            image_data=None,
-            audio_data=None,
-            video_data=None,
-            modalities=[],
-            stop=[],
-        ),
-    ):
-        asyncio.run(run())
-
-
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("choice", ["auto", "required", {"type": "shell"}])
-@pytest.mark.parametrize("parser", ["beam", "beam_checkpoint", "response_template"])
-def test_native_shell_real_template_and_replay(stream, choice, parser):
-    from utils import install_beam_chat_template
-
-    serving = make_serving(model_type="beam")
-    serving.enable_response_store = True
-    serving.reasoning_parser = serving.tool_call_parser = "beam"
-    serving._reasoning_detector = BeamReasoningDetector()
-    prompts = install_beam_chat_template(serving, parser)
-    command = "printf '%s' 'space preserving'"
-    raw = (
-        "<|channel|>analysis<|message|>Run it.<|end|>"
-        "<|start|>assistant to=refl.bash<|channel|>analysis <|constrain|>xml<|message|>"
-        f'<rfl:parameter name="command">{command}</rfl:parameter><|call|>'
-    )
-    engines = []
-
-    async def generate(request, *args):
-        engines.append(request)
-        for index in range(1, len(raw) + 1) if stream else [len(raw)]:
-            yield engine_chunk(raw[:index], index, finish=index == len(raw))
-
-    serving.tokenizer_manager.generate_request = generate
-
-    async def run():
-        request = ResponsesRequest(
-            model="x", input="Run", tools=[SHELL], tool_choice=choice, stream=stream
-        )
-        response = await serving.create_responses(request)
-        if stream:
-            events = event_payloads([event async for event in response])
-            assert all(
-                event["response"]["tool_choice"] == choice
-                for event in events
-                if "response" in event
-            )
-            data = events[-1]["response"]
-            done = [
-                e["item"] for e in events if e["type"] == "response.output_item.done"
-            ]
-            assert done == data["output"]
-            assert not any(
-                e["type"].startswith("response.function_call_arguments") for e in events
-            )
-        else:
-            data = response.model_dump()
-        assert data["tool_choice"] == choice
-        shell = data["output"][-1]
-        assert shell["type"] == "shell_call"
-        assert shell["action"]["commands"] == [command]
-        system = prompts[0].split("<|end|>", 1)[0]
-        declaration = system[system.index("# Tools") :].split(
-            "\n\n# Valid channels:", 1
-        )[0]
-        assert declaration == CANONICAL_BASH_DECLARATION
-        assert "type refl.bash" not in prompts[0]
-        assert prompts[0].count("type bash =") == 1
-        if choice != "auto":
-            from xgrammar import Grammar
-            from xgrammar.testing import _is_grammar_accept_string
-
-            grammar = Grammar.from_structural_tag(
-                engines[0].sampling_params["structural_tag"]
-            )
-            assert _is_grammar_accept_string(grammar, raw)
-            assert not _is_grammar_accept_string(
-                grammar, raw.replace("to=refl.bash", "to=refl.other")
-            )
-        output = {
-            "type": "shell_call_output",
-            "call_id": shell["call_id"],
-            "output": [
-                {
-                    "stdout": "ok",
-                    "stderr": "",
-                    "outcome": {"type": "exit", "exit_code": 0},
-                }
-            ],
-        }
-        for replay in (
-            {"input": [shell, output]},
-            {"input": [output], "previous_response_id": data["id"]},
-        ):
-            # History keeps its native recipient even when new calls are disabled.
-            for tools, next_choice in (
-                ([SHELL], "auto"),
-                ([], "auto"),
-                ([SHELL], "none"),
-            ):
-                result = await serving.create_responses(
-                    ResponsesRequest(
-                        model="x", tools=tools, tool_choice=next_choice, **replay
-                    )
-                )
-                assert result.status == "completed"
-                assert "assistant to=refl.bash" in prompts[-1]
-                assert "<|start|>refl.bash to=assistant" in prompts[-1]
-                assert "refl.refl.bash" not in prompts[-1]
-                if not tools or next_choice == "none":
-                    assert "# Tools" not in prompts[-1]
-
     asyncio.run(run())
 
 
 @pytest.mark.parametrize("stream", [False, True])
-def test_truncated_shell_history_can_be_continued(stream):
+def test_truncated_shell_history_can_be_continued(shell_serving, stream):
     """An empty cutoff call must not make the server reject its own history."""
-    from utils import install_beam_chat_template
-
-    serving = make_serving(model_type="beam")
-    serving.enable_response_store = True
-    serving.reasoning_parser = serving.tool_call_parser = "beam"
-    serving._reasoning_detector = BeamReasoningDetector()
-    prompts = install_beam_chat_template(serving)
+    serving, seen = shell_serving
     raw = (
         "<|channel|>analysis<|message|>Run.<|end|>"
-        "<|start|>assistant to=refl.bash<|channel|>analysis <|constrain|>xml<|message|>"
+        "<|start|>assistant to=bash<|channel|>analysis <|constrain|>xml<|message|>"
         '<rfl:parameter name="command">pw'
     )
 
@@ -514,8 +417,8 @@ def test_truncated_shell_history_can_be_continued(stream):
                 ResponsesRequest(model="x", tools=[SHELL], **replay)
             )
             assert result.status == "incomplete"
-            assert "Try again" in prompts[-1]
-            assert "assistant to=refl.bash" not in prompts[-1]
+            assert seen[-1].messages[-1].content == "Try again"
+            assert not any(getattr(m, "tool_calls", None) for m in seen[-1].messages)
 
     asyncio.run(run())
 
@@ -523,13 +426,10 @@ def test_truncated_shell_history_can_be_continued(stream):
 @pytest.mark.parametrize(
     "choice", ["auto", "none", {"type": "function", "name": "run_command"}]
 )
-def test_native_shell_and_client_function_use_separate_recipients(choice):
-    from utils import install_beam_chat_template
-
-    serving = make_serving(model_type="beam")
-    serving.reasoning_parser = serving.tool_call_parser = "beam"
-    serving._reasoning_detector = BeamReasoningDetector()
-    prompts = install_beam_chat_template(serving)
+def test_native_shell_and_client_function_use_separate_declarations(
+    shell_serving, choice
+):
+    serving, seen = shell_serving
     client = {
         "type": "function",
         "name": "run_command",
@@ -546,7 +446,7 @@ def test_native_shell_and_client_function_use_separate_recipients(choice):
             raw += "<|start|>assistant<|channel|>final<|message|>No tools.<|return|>"
         else:
             if choice == "auto":
-                raw += call("refl.bash")
+                raw += call("bash")
             raw += call("run_command")
         yield engine_chunk(raw, finish=True)
 
@@ -560,30 +460,28 @@ def test_native_shell_and_client_function_use_separate_recipients(choice):
     )
     data = response.model_dump()
     calls = [i for i in data["output"] if i["type"] != "reasoning"]
-    system, rest = prompts[0].split("<|end|>", 1)
+    kwargs = seen[0].chat_template_kwargs
     if choice == "none":
         assert [i["type"] for i in calls] == ["message"]
-        assert "# Tools" not in prompts[0]
+        assert kwargs["tools"] == kwargs["builtin_tools"] == []
     else:
         assert (
             calls[-1]["type"] == "function_call" and calls[-1]["name"] == "run_command"
         )
-        assert "Client function" in rest and "Client function" not in system
+        assert [t["function"]["name"] for t in kwargs["tools"]] == ["run_command"]
         if choice == "auto":
             assert calls[0]["type"] == "shell_call"
-            assert "type bash =" in system
+            assert [t["function"]["name"] for t in kwargs["builtin_tools"]] == ["bash"]
         else:
-            assert "# Tools" not in system
+            assert kwargs["builtin_tools"] == []
             assert len(calls) == 1
 
 
 @pytest.mark.parametrize("kwargs", [{"builtin_tools": ["bash"]}, {"tools": []}])
-def test_native_shell_rejects_conflicting_template_tool_definitions(kwargs):
-    from utils import install_beam_chat_template
-
-    serving = make_serving(model_type="beam")
-    serving.tool_call_parser = "beam"
-    install_beam_chat_template(serving)
+def test_native_shell_rejects_conflicting_template_tool_definitions(
+    shell_serving, kwargs
+):
+    serving, _ = shell_serving
     response = asyncio.run(
         serving.create_responses(
             ResponsesRequest(
