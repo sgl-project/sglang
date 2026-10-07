@@ -139,6 +139,73 @@ class _IntraSpy:
 _TRUE_LENS = object()
 
 
+def _copy(t):
+    """A copy with the same strides (a strided view stays strided)."""
+    return torch.empty_strided(
+        t.size(), t.stride(), dtype=t.dtype, device=t.device
+    ).copy_(t)
+
+
+def _copy_inputs(inputs):
+    """Independent tensors for one call: chunk_kda writes its output into a
+    contiguous ``v`` and the final states into the pool, so two calls on the
+    same tensors would see each other's results."""
+    return {
+        name: _copy(value) if isinstance(value, torch.Tensor) else value
+        for name, value in inputs.items()
+    }
+
+
+def _standard_gate_inputs(device, *, seq_len=BLOCK + 64, num_heads=8):
+    """Strong decay without lower_bound: every token decays the state by
+    2**-20 (raw gate 0, A_log = log(20), no bias: 20 * ln(2) nats per token),
+    q = k = e0, beta = 0.5, a zero initial state and v zero except at token 7.
+    The exact output is scale * beta = 0.0625 at token 7 and
+    scale * beta * (1 - beta) * 2**-20 (about 3e-8) at token 8."""
+    shape = (1, seq_len, num_heads, HEAD_DIM)
+    q = torch.zeros(shape, dtype=torch.bfloat16, device=device)
+    q[..., 0] = 1
+    v = torch.zeros(shape, dtype=torch.bfloat16, device=device)
+    v[0, 7] = 1
+    return dict(
+        q=q,
+        k=q.clone(),
+        v=v,
+        g=torch.zeros(shape, dtype=torch.bfloat16, device=device),
+        beta=torch.full(shape[:-1], 0.5, dtype=torch.bfloat16, device=device),
+        A_log=torch.full((num_heads,), math.log(20.0), device=device),
+        dt_bias=torch.zeros(num_heads * HEAD_DIM, device=device),
+        pool=torch.zeros(3, num_heads, HEAD_DIM, HEAD_DIM, device=device),
+        cache_indices=torch.tensor([1], dtype=torch.int32, device=device),
+        cu_seqlens=torch.tensor([0, seq_len], dtype=torch.int32, device=device),
+        seq_lens=[seq_len],
+    )
+
+
+def _reference_standard_gate(inputs, num_tokens):
+    """fp32 token-by-token KDA recurrence (no lower_bound, single sequence)
+    on the CPU for the first ``num_tokens`` tokens: decay the state by
+    exp(-exp(A_log) * softplus(g + dt_bias)) per key, apply the delta rule
+    with l2-normalized q and k, and read out scale * q^T S."""
+    q = torch.nn.functional.normalize(inputs["q"][0, :num_tokens].float().cpu(), dim=-1)
+    k = torch.nn.functional.normalize(inputs["k"][0, :num_tokens].float().cpu(), dim=-1)
+    v = inputs["v"][0, :num_tokens].float().cpu()
+    beta = inputs["beta"][0, :num_tokens].float().cpu()
+    num_heads, dim = q.shape[1], q.shape[2]
+    gate = -inputs["A_log"].float().cpu().exp()[:, None] * torch.nn.functional.softplus(
+        inputs["g"][0, :num_tokens].float().cpu()
+        + inputs["dt_bias"].float().cpu().view(num_heads, dim)
+    )
+    state = inputs["pool"][inputs["cache_indices"][0]].float().cpu().clone()
+    out = torch.empty_like(v)
+    for t in range(num_tokens):
+        state = state * gate[t].exp()[..., None]
+        delta = v[t] - torch.einsum("hk,hkv->hv", k[t], state)
+        state = state + beta[t][:, None, None] * k[t][..., None] * delta[:, None, :]
+        out[t] = dim**-0.5 * torch.einsum("hk,hkv->hv", q[t], state)
+    return out
+
+
 def _run(
     block,
     inputs,
@@ -206,7 +273,7 @@ class _Checks:
         blocked = torch.full_like(reference, torch.nan)
         _run(
             0,
-            inputs,
+            _copy_inputs(inputs),
             kernel=kernel,
             return_intermediate_states=True,
             track_state=reference,
@@ -214,7 +281,7 @@ class _Checks:
         )
         _run(
             BLOCK,
-            inputs,
+            _copy_inputs(inputs),
             kernel=kernel,
             return_intermediate_states=True,
             track_state=blocked,
@@ -234,6 +301,11 @@ class _Checks:
         if not torch.equal(got, want):
             diff = (got.float() - want.float()).abs().max().item()
             self.fail(f"{what}: max |diff| = {diff}")
+
+    def assertInputsUnchanged(self, inputs, original):
+        for name, value in inputs.items():
+            if isinstance(value, torch.Tensor):
+                self.assertSame(value, original[name], f"input {name}")
 
     def assertUntouched(self, pool, inputs):
         untouched = [
@@ -259,20 +331,23 @@ class TestKdaExtendBlocked(CustomTestCase, _Checks):
         return_intermediate_states=False,
         lower_bound=-5.0,
     ):
+        original = _copy_inputs(inputs)
         o_ref, h_ref, pool_ref = _run(
             0,
-            inputs,
+            _copy_inputs(inputs),
             return_intermediate_states=return_intermediate_states,
             lower_bound=lower_bound,
         )
         spy = _ChunkKdaSpy(kda_triton.chunk_kda)
         o_blk, h_blk, pool_blk = _run(
             block,
-            inputs,
+            _copy_inputs(inputs),
             return_intermediate_states=return_intermediate_states,
             kernel=spy,
             lower_bound=lower_bound,
         )
+        self.assertNotEqual(o_blk.data_ptr(), o_ref.data_ptr())
+        self.assertInputsUnchanged(inputs, original)
         # Blocking happened: the exact plan, and every call within the block.
         self.assertEqual(spy.tokens, calls)
         self.assertTrue(all(t <= block for t in spy.tokens))
@@ -381,33 +456,13 @@ class TestKdaExtendBlocked(CustomTestCase, _Checks):
                 self.assertEqual(intra.fused, [False, False, False])
 
     def test_standard_gate_large_decay_matches_unblocked(self):
-        # Without lower_bound the gate decay is unbounded. Here every token
-        # decays the state by 2**-20 (raw gate 0, A_log = log(20), no bias:
-        # 20 * ln(2) nats), q = k = e0 and v is zero except at token 7, so the
-        # exact output at token 8 is scale * beta * (1 - beta) * 2**-20, about
-        # 3e-8. The fused intra-chunk variant clamps each token's gate offset
-        # within a 16-token sub-chunk to +-126 (log2), which turns that decay
-        # into 1 and gives 0.03125. The 2048-token block alone would pick the
-        # fused variant (32 * 8 = 256); it must run the single call's.
-        seq_len, heads = BLOCK + 64, 8
-        shape = (1, seq_len, heads, HEAD_DIM)
-        q = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
-        q[..., 0] = 1
-        v = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
-        v[0, 7] = 1
-        inputs = dict(
-            q=q,
-            k=q.clone(),
-            v=v,
-            g=torch.zeros(shape, dtype=torch.bfloat16, device="cuda"),
-            beta=torch.full(shape[:-1], 0.5, dtype=torch.bfloat16, device="cuda"),
-            A_log=torch.full((heads,), math.log(20.0), device="cuda"),
-            dt_bias=torch.zeros(heads * HEAD_DIM, device="cuda"),
-            pool=torch.zeros(3, heads, HEAD_DIM, HEAD_DIM, device="cuda"),
-            cache_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
-            cu_seqlens=torch.tensor([0, seq_len], dtype=torch.int32, device="cuda"),
-            seq_lens=[seq_len],
-        )
+        # The fused intra-chunk variant clamps each token's gate offset within
+        # a 16-token sub-chunk to +-126 (log2). With a 2**-20 decay per token
+        # that turns the decay between tokens 7 and 8 into 1, giving 0.03125 at
+        # token 8 instead of about 3e-8. The single call over 2112 tokens with
+        # 8 heads runs the non-fused variant (33 * 8 = 264 > 256); the
+        # 2048-token block alone would pick the fused one (32 * 8 = 256).
+        inputs = _standard_gate_inputs("cuda")
         _, o_blk = self._compare(
             inputs,
             BLOCK,
@@ -415,8 +470,13 @@ class TestKdaExtendBlocked(CustomTestCase, _Checks):
             return_intermediate_states=True,
             lower_bound=None,
         )
-        self.assertLess(o_blk[0, 8:].float().abs().max().item(), 1e-6)
-        self.assertGreater(o_blk[0, 7].float().abs().min().item(), 1e-2)
+        # The values, not only the agreement: the fp32 recurrence.
+        torch.testing.assert_close(
+            o_blk[0, :CHUNK].float().cpu(),
+            _reference_standard_gate(inputs, CHUNK),
+            atol=1e-6,
+            rtol=1e-2,
+        )
 
 
 class _FakeChunkKda:
@@ -535,18 +595,24 @@ class TestKdaExtendBlockedPlan(CustomTestCase, _Checks):
                 self.assertEqual(_extend_block_tokens(), want)
 
     def _plan(self, inputs, block, *, return_intermediate_states=True):
+        original = _copy_inputs(inputs)
         ref = _FakeChunkKda()
         o_ref, h_ref, pool_ref = _run(
-            0, inputs, return_intermediate_states=return_intermediate_states, kernel=ref
+            0,
+            _copy_inputs(inputs),
+            return_intermediate_states=return_intermediate_states,
+            kernel=ref,
         )
         self.assertEqual(len(ref.calls), 1)
         fake = _FakeChunkKda()
         o_blk, h_blk, pool_blk = _run(
             block,
-            inputs,
+            _copy_inputs(inputs),
             return_intermediate_states=return_intermediate_states,
             kernel=fake,
         )
+        self.assertNotEqual(o_blk.data_ptr(), o_ref.data_ptr())
+        self.assertInputsUnchanged(inputs, original)
         self.assertSame(o_blk, o_ref, "output")
         self.assertSame(pool_blk, pool_ref, "pool")
         self.assertUntouched(pool_blk, inputs)
@@ -673,13 +739,20 @@ class TestKdaExtendBlockedPlan(CustomTestCase, _Checks):
         # decision for the whole extend. The single call decides for itself.
         cases = [
             # 8 heads: 33 chunks * 8 = 264, while a 2048-token block is 256.
-            ([BLOCK + 64], [1], 8, [BLOCK, 64], False),
+            (
+                "8 heads",
+                _int_inputs([BLOCK + 64], [1], num_heads=8),
+                [BLOCK, 64],
+                False,
+            ),
+            # The GPU standard-gate regression's inputs (contiguous v, which
+            # chunk_kda overwrites with its output), same plan.
+            ("standard gate", _standard_gate_inputs("cpu"), [BLOCK, 64], False),
             # 1 head: 1 + 32 + 33 + 65 = 131 chunks.
-            (SEQ_LENS, SLOT_INDICES, 1, CALLS, True),
+            ("1 head", _int_inputs(SEQ_LENS, SLOT_INDICES), CALLS, True),
         ]
-        for lens, slots, heads, calls, fused in cases:
-            with self.subTest(lens=lens, heads=heads):
-                inputs = _int_inputs(lens, slots, num_heads=heads)
+        for name, inputs, calls, fused in cases:
+            with self.subTest(name):
                 fake = self._plan(inputs, BLOCK)
                 self.assertEqual([c["tokens"] for c in fake.calls], calls)
                 self.assertEqual(
@@ -688,6 +761,16 @@ class TestKdaExtendBlockedPlan(CustomTestCase, _Checks):
                 single = _FakeChunkKda()
                 _run(0, inputs, kernel=single)
                 self.assertEqual([c["fuse_intra"] for c in single.calls], [None])
+
+    def test_standard_gate_reference_values(self):
+        # The expected values the GPU standard-gate regression checks against.
+        ref = _reference_standard_gate(_standard_gate_inputs("cpu"), 16)
+        torch.testing.assert_close(ref[7], torch.full_like(ref[7], 0.0625))
+        torch.testing.assert_close(
+            ref[8], torch.full_like(ref[8], 0.125 * 0.25 * 2.0**-20), rtol=1e-4, atol=0
+        )
+        self.assertEqual(ref[:7].abs().max().item(), 0.0)
+        self.assertLess(ref[9:].abs().max().item(), 1e-12)
 
     def test_within_block_is_single_call(self):
         inputs = _int_inputs([64, 128], [1, 2])
