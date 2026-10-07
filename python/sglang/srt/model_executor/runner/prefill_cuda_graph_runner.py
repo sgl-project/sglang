@@ -611,6 +611,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.use_captured_attn_metadata = model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         else:
             self.use_captured_attn_metadata = False
+        self._captured_attn_metadata_max_bs = (
+            model_runner.attn_backend.prefill_cuda_graph_max_batch_size
+            if self.use_captured_attn_metadata
+            else None
+        )
         self.attn_metadata_buffers: Optional[Dict[ShapeKey, object]] = (
             {} if self.use_captured_attn_metadata else None
         )
@@ -1270,6 +1275,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
         if self._is_full_backend and batch_size > self._capture_req_slots:
+            return False
+        if (
+            self._captured_attn_metadata_max_bs is not None
+            and batch_size > self._captured_attn_metadata_max_bs
+        ):
             return False
         # LoRA replays need prepare_lora_batch's static metadata. lora_manager
         # keeps LoRA prefill eager on every rank under dp attention, so the

@@ -554,12 +554,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
     def prefill_graph_extend_active(self) -> bool:
         return self.prefill_graph_metadata is not None
 
-    def can_run_prefill_graph_extend(self, forward_batch: ForwardBatch) -> bool:
-        return (
-            forward_batch.extend_seq_lens_cpu is not None
-            and len(forward_batch.extend_seq_lens_cpu) == forward_batch.batch_size
-            and forward_batch.batch_size <= envs.SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS.get()
-        )
+    def prefill_graph_max_seqs(self) -> int:
+        return envs.SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS.get()
 
     def init_prefill_graph_metadata(
         self, forward_batch: ForwardBatch
@@ -567,7 +563,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         cache_indices = self._prefill_graph_cache_indices(forward_batch)
         meta = KDAPrefillGraphMetadata.allocate(
             num_tokens=forward_batch.positions.shape[0],
-            max_seqs_cap=envs.SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS.get(),
+            max_seqs_cap=self.prefill_graph_max_seqs(),
             # Same predicate that gives the prefill runner its track buffers:
             # any replay of this bucket may carry prefix-cache snapshots.
             track=(

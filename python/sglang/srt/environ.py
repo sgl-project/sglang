@@ -1492,8 +1492,8 @@ class Envs:
     # breaking the graph at every KDA layer (layers/attention/linear/
     # kda_prefill_graph.py); this kill-switch restores the eager break.
     SGLANG_DISABLE_KDA_PREFILL_GRAPH_EXTEND = EnvBool(False)
-    # Sequences a captured KDA extend bucket accepts; larger prefill batches
-    # run eagerly. Bounds the padded grids and per-bucket scratch.
+    # Sequences a captured KDA extend bucket accepts; a larger prefill batch on
+    # any dp rank runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
 
     # ===================================================================

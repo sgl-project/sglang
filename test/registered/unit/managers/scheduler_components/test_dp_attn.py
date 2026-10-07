@@ -12,6 +12,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX  # noqa: E402
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
+from sglang.srt.model_executor.cuda_graph_config import Backend  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.observability.metrics_collector import DPBalanceStats  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
@@ -373,6 +374,49 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         self.assertTrue(vote)
         runner.can_replay_locally.assert_called_once()
         self.assertTrue(runner.can_replay_locally.call_args.kwargs["is_mixed"])
+
+    def test_batch_over_captured_metadata_bound_votes_eager(self):
+        """A batch over the captured attention metadata's request bound votes
+        eager, so no dp rank replays while another falls back at forward time."""
+        runner_cls = dp_attn.PrefillCudaGraphRunner
+        runner = Mock(spec=runner_cls)
+        runner.enable_lora = False
+        runner.max_context_size = None
+        runner._qwen_bcg_hc_sidechannel = False
+        runner._is_full_backend = False
+        runner._captured_attn_metadata_max_bs = 2
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner.has_mha_companion_layers = False
+        runner._has_uncapturable_chunked_prefix.return_value = False
+        runner.max_num_tokens = 64
+        runner.capture_num_tokens = [64]
+        runner._pad_to_bucket = runner_cls._pad_to_bucket
+        runner.can_replay_locally.side_effect = lambda **kwargs: (
+            runner_cls.can_replay_locally(self=runner, **kwargs)
+        )
+
+        def vote(batch_size):
+            batch = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                extend_num_tokens=48,
+                multimodal_inputs=None,
+                input_embeds=None,
+                replace_embeds=None,
+                prefix_lens=[0] * batch_size,
+                return_logprob=False,
+                batch_size=lambda: batch_size,
+            )
+            return dp_attn._local_prefill_cuda_graph_vote(
+                local_batch=batch,
+                prefill_graph_runner=runner,
+                coordinated_prefill=True,
+                breakable_prefill=True,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                model_config=object(),
+            )
+
+        self.assertTrue(vote(2))
+        self.assertFalse(vote(3))
 
     @patch.object(dp_attn, "get_parallel")
     @patch.object(dp_attn, "all_gather_single")

@@ -123,7 +123,8 @@ class MambaAttnBackendBase(AttentionBackend):
         """Whether the extend being captured or replayed runs on those tables."""
         return False
 
-    def can_run_prefill_graph_extend(self, forward_batch: ForwardBatch) -> bool:
+    def prefill_graph_max_seqs(self) -> int:
+        """Most sequences those tables hold; larger batches replay no graph."""
         raise NotImplementedError()
 
     def init_prefill_graph_metadata(self, forward_batch: ForwardBatch):
@@ -1209,6 +1210,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             and not full_attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
         if self.use_captured_forward_metadata_for_breakable_cuda_graph:
+            self.prefill_cuda_graph_max_batch_size = (
+                linear_attn_backend.prefill_graph_max_seqs()
+            )
             logger.info(
                 "Breakable prefill CUDA graphs capture the %s extend.",
                 type(linear_attn_backend).__name__,
@@ -1274,16 +1278,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             and not mode.is_draft_extend_v2()
         )
 
-    def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
-        if not self.full_attn_backend.can_run_prefill_cuda_graph(forward_batch):
-            return False
-        if (
-            self.use_captured_forward_metadata_for_breakable_cuda_graph
-            and self._is_plain_extend(forward_batch)
-        ):
-            return self.linear_attn_backend.can_run_prefill_graph_extend(forward_batch)
-        return True
-
     def linear_extend_in_graph(self) -> bool:
         """Whether the linear layers of the prefill being captured run inside
         the graph (no eager break)."""
@@ -1296,10 +1290,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         if not self._is_plain_extend(forward_batch):
             if not forward_batch.forward_mode.is_draft_extend_v2():
                 self.linear_attn_backend.init_forward_metadata(forward_batch)
-            return None
-        if not self.linear_attn_backend.can_run_prefill_graph_extend(forward_batch):
-            # This bucket keeps the eager break at each linear layer.
-            self.linear_attn_backend.init_forward_metadata(forward_batch)
             return None
         return self.linear_attn_backend.init_prefill_graph_metadata(forward_batch)
 

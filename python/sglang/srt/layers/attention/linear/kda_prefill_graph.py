@@ -12,7 +12,8 @@ For each bucket this module allocates static tables sized by the bucket's
 bounds:
 
 * ``max_seqs`` sequences (``min(bucket, cap)``; batches with more sequences run
-  eagerly, see ``KDAAttnBackend.can_run_prefill_graph_extend``),
+  eagerly, through the runner's replay vote on
+  ``AttentionBackend.prefill_cuda_graph_max_batch_size``),
 * ``max_chunks = cdiv(bucket, 64) + max_seqs`` delta-rule chunks,
 * ``max_conv_blocks = cdiv(bucket, 8) + max_seqs`` conv blocks.
 

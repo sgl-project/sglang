@@ -555,8 +555,8 @@ def _recompute_w_u_fwd_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
 
-    # Graph-safe varlen: padded chunk_indices rows point past their sequence
-    # (see kda_prefill_graph.py); they must not compute or write anything.
+    # Padded chunk_indices rows (kda_prefill_graph.py) start past T, where every
+    # store below is masked; this early exit only skips their wasted work.
     if i_t * BT >= T:
         return
 
@@ -803,8 +803,8 @@ def chunk_gla_fwd_kernel_o(
         i_tg = i_b * NT + i_t
         bos, eos = i_b * T, i_b * T + T
 
-    # Graph-safe varlen: padded chunk_indices rows point past their sequence
-    # (see kda_prefill_graph.py); they must not compute or write anything.
+    # Padded chunk_indices rows (kda_prefill_graph.py) start past T, where every
+    # store below is masked; this early exit only skips their wasted work.
     if i_t * BT >= T:
         return
 
@@ -984,8 +984,8 @@ def kda_gate_chunk_cumsum_vector_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
 
-    # Graph-safe varlen: padded chunk_indices rows point past their sequence
-    # (see kda_prefill_graph.py); they must not compute or write anything.
+    # Padded chunk_indices rows (kda_prefill_graph.py) start past T, where every
+    # store below is masked; this early exit only skips their wasted work.
     if i_t * BT >= T:
         return
 
