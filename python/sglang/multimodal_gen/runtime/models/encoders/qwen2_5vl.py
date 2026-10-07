@@ -854,31 +854,7 @@ class Qwen2_5_VLModel(QwenVLModelBase):
             ).unsqueeze(1)
             return position_ids, mrope_position_deltas
         else:
-            if attention_mask is not None:
-                position_ids = attention_mask.long().cumsum(-1) - 1
-                position_ids.masked_fill_(attention_mask == 0, 1)
-                position_ids = (
-                    position_ids.unsqueeze(0)
-                    .expand(3, -1, -1)
-                    .to(attention_mask.device)
-                )
-                max_position_ids = position_ids.max(0, keepdim=False)[0].max(
-                    -1, keepdim=True
-                )[0]
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
-            else:
-                position_ids = (
-                    torch.arange(input_ids.shape[1], device=input_ids.device)
-                    .view(1, 1, -1)
-                    .expand(3, input_ids.shape[0], -1)
-                )
-                mrope_position_deltas = torch.zeros(
-                    [input_ids.shape[0], 1],
-                    device=input_ids.device,
-                    dtype=input_ids.dtype,
-                )
-
-            return position_ids, mrope_position_deltas
+            return self._get_text_rope_index(input_ids, attention_mask)
 
     def get_video_features(
         self,

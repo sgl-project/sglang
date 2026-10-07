@@ -6,7 +6,7 @@ from torch import nn
 
 
 class QwenVLModelBase(nn.Module):
-    """Shared text-embedding access and multimodal placeholder validation."""
+    """Shared text positions, embedding access and multimodal placeholder validation."""
 
     def get_input_embeddings(self):
         return self.language_model.embed_tokens
@@ -19,6 +19,31 @@ class QwenVLModelBase(nn.Module):
 
     def get_decoder(self):
         return self.language_model
+
+    def _get_text_rope_index(self, input_ids, attention_mask):
+        if attention_mask is not None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            position_ids = (
+                position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
+            )
+            max_position_ids = position_ids.max(0, keepdim=False)[0].max(
+                -1, keepdim=True
+            )[0]
+            mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+        else:
+            position_ids = (
+                torch.arange(input_ids.shape[1], device=input_ids.device)
+                .view(1, 1, -1)
+                .expand(3, input_ids.shape[0], -1)
+            )
+            mrope_position_deltas = torch.zeros(
+                [input_ids.shape[0], 1],
+                device=input_ids.device,
+                dtype=input_ids.dtype,
+            )
+
+        return position_ids, mrope_position_deltas
 
     def get_placeholder_mask(
         self,
