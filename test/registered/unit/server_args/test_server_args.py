@@ -4142,19 +4142,20 @@ class TestDeepseekV41VisionPrefillCPArgs(CustomTestCase):
                 dict(prefill_backend=Backend.BREAKABLE, lock_prefill_backend=True),
                 "runs eager prefill",
             ),
-            (
-                dict(
-                    speculative_algorithm="DSPARK",
-                    enable_decoder_swa_bounded_replay=True,
-                ),
-                "DSpark.*decoder-swa-bounded-replay",
-            ),
         ):
             args = self._args(
                 max_running_requests=4, chunked_prefill_size=128, **overrides
             )
             with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
                 handle_model_specific_adjustments(args)
+
+    def test_dspark_decoder_replay_with_vision_cp_is_accepted(self):
+        validate_deepseek_v41_features(
+            self._args(
+                speculative_algorithm="DSPARK",
+                enable_decoder_swa_bounded_replay=True,
+            )
+        )
 
     def test_text_zigzag_and_default_prefill_graph_are_accepted(self):
         validate_deepseek_v41_features(

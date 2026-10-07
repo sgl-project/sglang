@@ -73,6 +73,7 @@ from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
+    cp_relayout_tail_input_ids,
     is_cp_active,
 )
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
@@ -4053,12 +4054,18 @@ class DeepseekV4Model(nn.Module):
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
+                if tail.cp_metadata is not None:
+                    input_ids_global = cp_relayout_tail_input_ids(
+                        input_ids_global,
+                        forward_batch.attn_cp_metadata,
+                        tail.cp_metadata,
+                        tail.output_token_indices,
+                    )
+                else:
+                    input_ids_global = tail.rows(input_ids_global)
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 state = state.take_rows(tail.rows)
-                input_ids, input_ids_global = (
-                    tail.rows(input_ids),
-                    tail.rows(input_ids_global),
-                )
+                input_ids = tail.rows(input_ids)
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
@@ -4771,7 +4778,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             ),
         )
         if tail is not None:
-            output.hidden_states_token_indices = tail.token_indices
+            output.hidden_states_token_indices = tail.output_token_indices
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
