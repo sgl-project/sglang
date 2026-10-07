@@ -50,6 +50,20 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     (
+        "diffusion.residual_gate_fp32",
+        KernelBackend.TRITON,
+        "modulate.residual_gate_fp32:residual_gate_fp32",
+        _CUDA,
+        "Residual gating with separate FP32 product and sum rounding.",
+    ),
+    (
+        "diffusion.matrix_rope",
+        KernelBackend.TRITON,
+        "rope.matrix_rope:apply_matrix_rope",
+        _CUDA,
+        "Interleaved FP32 matrix RoPE with separate product and sum rounding.",
+    ),
+    (
         "diffusion.fp8_rowwise",
         KernelBackend.TRITON,
         "quantization.fp8_rowwise_triton:fp8_rowwise",
@@ -590,6 +604,8 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
+    "apply_matrix_rope": "rope.matrix_rope",
+    "residual_gate_fp32": "modulate.residual_gate_fp32",
     "can_use_fp8_rowwise": "quantization.fp8_rowwise_triton",
     "fp8_rowwise": "quantization.fp8_rowwise_triton",
     "fused_gelu_tanh_cat": "activation.gelu_tanh_cat_jit",
@@ -626,6 +642,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
+    "can_use_fused_rmsnorm_modulation": "norm.rmsnorm_scale_shift_bitexact",
     "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "fused_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",
     "fused_scale_residual_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",

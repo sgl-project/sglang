@@ -142,7 +142,10 @@ pub struct ServerArgs {
     #[arg(long)]
     pub worker_api_key: Option<String>,
 
-    /// Per-request upstream timeout in seconds.
+    /// Upstream timeout in seconds: the whole response of a non-streaming request,
+    /// the response headers of a streaming one. SGLang's chat endpoint sends those
+    /// headers with the first token, so for streaming chat this bounds time to
+    /// first token, queueing included. Must be greater than zero.
     #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
     pub request_timeout_secs: u64,
     /// Maximum silence between upstream stream chunks, in seconds.
