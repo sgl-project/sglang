@@ -64,6 +64,10 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.lora.classification_head import (
+    ClassificationLease,
+    reject_static_classification_adapter,
+)
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -747,9 +751,54 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.lora_ref_cache: Dict[str, LoRARef] = {}
         # Preserve the adapter ID across incomplete cleanup retries.
         self.pending_lora_unloads: Dict[str, str] = {}
+        # Heads and immutable snapshots follow runtime IDs, never reusable names.
+        self.classification_heads = {}
+        self.classification_snapshots = {}
+        # Fast tokenizers mutate truncation/padding state. Clone lazily for the
+        # first classifier text request, leaving generation-only servers alone.
+        self.classification_tokenizer = None
+        self.classification_tokenizer_lock = threading.Lock()
         if get_lora().lora_paths is not None:
             for lora_ref in get_lora().lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
+                reject_static_classification_adapter(lora_ref.lora_path)
+
+    def _validate_classification_runtime(self):
+        if get_serving().tokenizer_worker_num != 1:
+            raise ValueError("LoRA classification requires tokenizer-worker-num=1")
+        if get_parallel().nnodes != 1:
+            raise ValueError("LoRA classification requires a single-node engine")
+        if get_parallel().pp_size != 1:
+            raise ValueError(
+                "LoRA classification does not support pipeline parallelism"
+            )
+        if not self.is_generation:
+            raise ValueError("LoRA classification heads require a generation engine")
+        # These decoders expose final-normalized token states through LAST.
+        # Other architectures may expose pre-norm or auxiliary states instead.
+        architectures = self.model_config.hf_config.architectures or []
+        if not architectures or architectures[0] not in {
+            "LlamaForCausalLM",
+            "Qwen2ForCausalLM",
+            "Qwen3ForCausalLM",
+        }:
+            raise ValueError(
+                "LoRA classification requires a Llama, Qwen2 or Qwen3 decoder"
+            )
+        if get_model().load_format not in ("auto", "safetensors", "fastsafetensors"):
+            raise ValueError("LoRA classification requires safetensors weight loading")
+        if get_spec().speculative_algorithm is not None:
+            raise ValueError(
+                "LoRA classification does not support speculative decoding"
+            )
+        if get_disagg().disaggregation_mode != "null":
+            raise ValueError(
+                "LoRA classification does not support disaggregated serving"
+            )
+        if not get_server_return_hidden_states_mode().need_capture():
+            raise ValueError(
+                "LoRA classification requires --return-hidden-states-mode last"
+            )
 
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
         # PD Disaggregation
@@ -860,6 +909,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        *,
+        classification_lease: Optional[ClassificationLease] = None,
     ):
         self.auto_create_handle_loop()
 
@@ -904,6 +955,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             async with self.model_update_lock.reader_lock:
                 await self._validate_and_resolve_lora(obj)
+                if classification_lease is not None:
+                    await classification_lease.acquire(obj)
 
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
@@ -1832,7 +1885,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Schedule at most one LoRA release per state, returning the new task if any."""
         if state.lora_released:
             return None
-        if not (self.enable_lora and state.obj.lora_path):
+        if not (self.enable_lora and state.obj.lora_path and state.obj.lora_id):
             return None
         state.lora_released = True
         task = asyncio.create_task(self.lora_registry.release(state.obj.lora_id))

@@ -1,0 +1,210 @@
+---
+title: "Multiclass LoRA classification"
+description: "RFC: serve PEFT classifier heads and generation adapters on one decoder backbone."
+---
+
+<Note>
+This is a proposed serving interface. The artifact manifest and CPU execution
+path need maintainer agreement, GPU accuracy results, and performance measurements
+before this feature is ready for general use.
+</Note>
+
+You can attach several multiclass LoRA classifiers to one generation engine.
+Each adapter supplies its own linear head, class names, and text preprocessing.
+Requests to `/v1/classify` select `base-model:adapter-name`; chat and completions
+continue to use the base model or an ordinary generation LoRA.
+
+The existing [native classification model mode](/docs/supported-models/classify_models)
+continues to serve dedicated sequence-classification models.
+
+## Initial scope
+
+The prototype supports dense Llama, Qwen2, and Qwen3 causal decoders with a saved
+PEFT `score` or `classifier` linear head. It requires a single-node generation
+engine, one tokenizer worker, DP=1, PP=1, dynamic adapter loading, and LAST hidden-state
+capture. The reproducible GPU test uses Linux, NVIDIA CUDA, TP=1, and float16.
+TP>1 numerical validation is pending.
+
+Adapters use standard uniform-rank LoRA and an unchanged base vocabulary. DoRA,
+rsLoRA, rank/alpha patterns, trained decoder biases, MoE parameter adapters,
+tokenizer extensions, multi-label heads, speculative decoding, and disaggregated
+serving are outside this prototype. Unsupported classifier bundles fail to load.
+
+## Export a classifier
+
+Save a PEFT `LORA` / `SEQ_CLS` adapter with `safe_serialization=True`. Include the
+linear head through `modules_to_save=["score"]` or `["classifier"]`. Use the
+training model's `config.json` for `hidden_size` and `id2label`:
+
+```bash
+python -m sglang.srt.lora.classification_export ADAPTER_DIR \
+  --model-config TRAINING_MODEL_CONFIG_JSON \
+  --max-length 512 --add-special-tokens
+```
+
+Choose `--no-add-special-tokens` if training did not insert special tokens.
+Export to a fresh directory for every version; the command refuses to overwrite
+an existing manifest and leaves the PEFT weights and adapter config unchanged.
+Use the same base weights as training: the manifest binds the adapter artifacts
+and metadata, but does not fingerprint or verify the base model's weights.
+
+The resulting directory contains:
+
+```text
+adapter_config.json
+adapter_model.safetensors
+classification_config.json
+```
+
+`classification_config.json` is a proposed version-1 sidecar. It declares:
+
+| Field | Meaning |
+| --- | --- |
+| `problem_type` | `single_label_classification` |
+| `num_labels`, `hidden_size` | Exact dimensions of the linear head |
+| `id2label` | Unique, nonempty class names indexed by contiguous JSON string keys |
+| `pooling` | `last`, without L2 normalization |
+| `max_length` | Positive token limit, with right truncation |
+| `add_special_tokens` | Explicit tokenizer policy for raw text |
+| `head` | Exact `weight_key` and optional matching `bias_key` in safetensors |
+| `artifacts` | SHA256 hashes of both PEFT files |
+
+PEFT tensors retain their standard names, such as
+`base_model.model.score.weight`. The manifest supplies metadata that an adapter
+checkpoint alone does not bind to a particular serving version. It does not
+introduce another tensor format. Legacy separate `.pt` heads and label mappings
+require offline conversion; the server does not accept a metadata overlay.
+
+Text inputs are raw training text, without a chat template. Token-ID inputs are
+already tokenized and receive no extra special tokens. Both are right-truncated.
+Submit unpadded inputs: any retained token equal to the base model's configured
+`pad_token_id` is rejected, including a literal padding token in text. This avoids
+confusing LAST capture with HF's last-non-padding pooling rule.
+
+## Run the public example
+
+Run these commands from the repository root with SGLang, PEFT, and Transformers
+installed. They create a small random Llama locally, two classifier heads with
+two and three classes, and a generation adapter. No model downloads or tokens
+are required. These are correctness fixtures, not trained classifiers.
+
+```bash
+python examples/runtime/lora_classification.py create /tmp/classifiers
+
+python -m sglang.launch_server \
+  --model-path /tmp/classifiers/base --served-model-name tiny-classifier \
+  --enable-lora --lora-target-modules o_proj --max-lora-rank 4 \
+  --max-loras-per-batch 4 --return-hidden-states-mode last --tp 1 \
+  --dtype float16 --attention-backend torch_native --lora-backend triton \
+  --disable-cuda-graph --context-length 64 --max-total-tokens 512
+```
+
+In another terminal, run the independent HF/PEFT reference and HTTP checks:
+
+```bash
+python examples/runtime/lora_classification.py check \
+  --base-dir /tmp/classifiers/base --url http://127.0.0.1:30000
+```
+
+The check loads and unloads adapters, compares probabilities and labels, checks
+prompt-token usage and right truncation, and exercises base and LoRA chat,
+streaming, and repeated requests. Its float16-versus-float32 probability tolerance
+is `atol=rtol=0.003`. It cleans up the adapters it loaded.
+
+You can also use the existing [dynamic LoRA APIs](/docs/advanced_features/lora):
+
+```bash
+curl -f http://127.0.0.1:30000/load_lora_adapter \
+  -H 'Content-Type: application/json' \
+  -d '{"lora_name":"classifier-2","lora_path":"/tmp/classifiers/classifier-2"}'
+
+curl -f http://127.0.0.1:30000/v1/classify \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"tiny-classifier:classifier-2","input":["billing","please help shipping"]}'
+
+curl -f http://127.0.0.1:30000/unload_lora_adapter \
+  -H 'Content-Type: application/json' -d '{"lora_name":"classifier-2"}'
+```
+
+Each response item has `index`, `label`, `probs`, and `num_classes`. Usage reports
+the submitted prompt tokens and zero completion tokens. Unknown adapters,
+missing heads, invalid hidden states, and empty inputs return errors; they never
+fall back to base-model classification.
+
+## Publication and request lifetime
+
+The loader copies and verifies a complete local bundle before asking the backend
+to load it. The CPU head becomes available only after every backend reply reports
+success. A partial failure retains cleanup state; retry `/unload_lora_adapter`
+before loading that name again.
+
+Heads and snapshots are keyed by unique runtime adapter IDs. Each classification
+request holds an additional reference until its CPU work finishes, including
+after client cancellation. Unload waits for that reference. Reloading a name
+validates a fresh snapshot; changing source files cannot alter an in-flight head.
+
+The tokenizer is cloned lazily on the first classifier text request. CPU
+tokenization and head computation run outside the event loop. Generation-only
+servers do not clone the tokenizer or load classifier heads.
+
+## Execution and performance questions
+
+Classification uses the existing generation prefill path with `max_new_tokens=0`
+and per-request LAST capture, then runs the linear head on CPU in the saved head
+dtype and softmax in FP32. It does not generate completion tokens. The current
+causal-model logits processor can still compute vocabulary logits during that
+prefill; this prototype does not remove the LM-head cost. Hidden-state transport,
+CPU work, and globally enabled capture also need measurement.
+
+The benchmark harness sends a fixed number of token IDs, constrains generation
+length, and runs classification, streaming generation, and a 50:50 mixed workload:
+
+```bash
+# Load classifier-2 first using the dynamic API shown above.
+python benchmark/lora_classification/bench_serving.py \
+  --url http://127.0.0.1:30000 --base-model tiny-classifier \
+  --classifier-model tiny-classifier:classifier-2 \
+  --phase all --input-tokens 4 --output-tokens 4 --token-id 6 \
+  --concurrency 8 --requests 100 --repeat 3 > mixed.json
+```
+
+The tiny fixture only checks benchmark operation. For performance decisions, use
+a representative public base and compatible trained adapters, recording hardware,
+software versions, dtype, ranks, context length, cache settings, and concurrency.
+Keep input length within each classifier's manifest limit.
+
+Compare the same generation workload in three fresh-server configurations:
+
+1. Generation without classifiers or hidden-state capture.
+2. Generation with LAST capture enabled, before loading a classifier.
+3. Generation, classification, and mixed traffic after loading the heads.
+
+Use `--phase generation` for the first two configurations; no classifier model is
+required. Save each JSON result. Repeat with the ordinary generation LoRA as
+`--base-model`. The harness reports errors, successful-request throughput,
+p50/p95/p99 latency, TTFT, output token throughput, and token intervals. It reports
+ITL only for adjacent single-token stream chunks and identifies batched chunks.
+Prompts repeat deliberately; record the radix-cache setting and also measure a
+fresh server with `--disable-radix-cache` if uncached behavior matters.
+
+Optional `--server-pid PID` samples server-tree CPU and RSS through psutil;
+`--gpu-index 0` samples device-wide memory through `nvidia-smi`. Use an otherwise
+idle GPU and include profiler traces when deciding whether the head should move
+to workers/GPU or the LM head should be bypassed.
+
+## Validation and RFC decisions
+
+Registered CPU tests cover immutable artifacts, lifecycle/cancellation, actual
+HTTP handler and tokenizer-manager logic with a substituted scheduler transport,
+and full HF/PEFT parity for Llama/Qwen2/Qwen3 with left and right reference padding.
+They do not validate SGLang's GPU kernels. The real-server CUDA test is:
+
+```bash
+python test/registered/lora/test_lora_classification.py
+```
+
+Before enabling broader use, review the sidecar schema versus alternatives in
+PEFT/model config, the CPU head placement, and the initial architecture/runtime
+restrictions. Run the CUDA test and the benchmark matrix on representative
+hardware. GPU numerical results and measured performance are pending; no
+zero-overhead or production-throughput claim is made here.

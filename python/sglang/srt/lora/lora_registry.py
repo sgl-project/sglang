@@ -174,6 +174,20 @@ class LoRARegistry:
                 cleanup.result()
             raise
 
+    async def retain(self, lora_id: str):
+        """Extend an existing request reference through CPU postprocessing.
+
+        The caller already owns a reference, so this remains valid after
+        unregister while the backend is waiting for in-flight requests.
+        """
+        async with self._registry_lock.reader_lock:
+            counter = self._counters.get(lora_id)
+            if counter is None or counter.value() <= 0:
+                raise ValueError(
+                    "Cannot retain a LoRA adapter without an active request"
+                )
+            await counter.increment(notify_all=False)
+
     async def release(self, lora_id: Union[str, List[str]]):
         """
         Decrements the usage counter for a LoRA adapter, indicating that it is no longer in use.

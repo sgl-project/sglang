@@ -16,6 +16,7 @@
 
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -97,13 +98,18 @@ class TestMergeLoRAUpdateResults(CustomTestCase):
             manager.lora_registry = LoRARegistry([original] if duplicate else [])
             manager.pending_lora_unloads = {}
             manager.lora_ref_cache = {}
+            manager.model_config = SimpleNamespace(hidden_size=4)
+            manager.classification_heads = {}
+            manager.classification_snapshots = {}
             replies = (
                 [_err("already loaded", {"a": "path"})]
                 if duplicate
                 else [_ok({"a": "path"}), _err("rank failed")]
             )
             manager.update_lora_adapter_communicator = AsyncMock(
-                side_effect=[replies, [_ok()]]
+                side_effect=(
+                    [[_ok()]] if duplicate and not from_tensors else [replies, [_ok()]]
+                )
             )
             if from_tensors:
                 request = LoadLoRAAdapterFromTensorsReqInput(
@@ -131,7 +137,10 @@ class TestMergeLoRAUpdateResults(CustomTestCase):
                 unload.lora_id, original.lora_id if duplicate else request.lora_id
             )
             manager.update_lora_adapter_communicator.assert_awaited_with(unload)
-            self.assertEqual(manager.update_lora_adapter_communicator.await_count, 2)
+            self.assertEqual(
+                manager.update_lora_adapter_communicator.await_count,
+                1 if duplicate and not from_tensors else 2,
+            )
             self.assertEqual(manager.lora_registry.get_all_adapters(), {})
             self.assertEqual(manager.pending_lora_unloads, {})
 

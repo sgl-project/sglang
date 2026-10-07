@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from contextlib import aclosing
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -16,7 +17,9 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
-from sglang.srt.managers.io_struct import EmbeddingReqInput
+from sglang.srt.lora.classification_head import ClassificationLease
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.runtime_context import get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -35,13 +38,14 @@ class OpenAIServingClassify(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
-        self.id2label = self._get_id2label_mapping()
+        self.is_generation = tokenizer_manager.is_generation
+        self.id2label = None if self.is_generation else self._get_id2label_mapping()
         self.model_name = (
             self.tokenizer_manager.served_model_name
             if self.tokenizer_manager.served_model_name
             else self.tokenizer_manager.model_path
         )
-        if not self.id2label:
+        if not self.is_generation and not self.id2label:
             raise ValueError("id2label mapping is missing")
 
     def _request_id_prefix(self) -> str:
@@ -51,7 +55,7 @@ class OpenAIServingClassify(OpenAIServingBase):
         self,
         request: ClassifyRequest,
         raw_request: Request = None,
-    ) -> tuple[EmbeddingReqInput, ClassifyRequest]:
+    ) -> tuple[Union[EmbeddingReqInput, GenerateReqInput], ClassifyRequest]:
         """Convert OpenAI embedding request to internal format"""
         prompt = request.input
 
@@ -67,6 +71,30 @@ class OpenAIServingClassify(OpenAIServingBase):
         else:
             # Other types (should not happen but handle gracefully)
             prompt_kwargs = {"input_ids": prompt}
+
+        if self.is_generation:
+            base_model, adapter = self._parse_model_parameter(request.model)
+            if (
+                base_model not in {self.model_name, self.tokenizer_manager.model_path}
+                or not adapter
+            ):
+                raise ValueError(
+                    f"Classification on this generation engine requires model='{self.model_name}:<adapter>'"
+                )
+            if get_serving().tokenizer_worker_num != 1:
+                raise ValueError("LoRA classification requires tokenizer-worker-num=1")
+            return (
+                GenerateReqInput(
+                    **prompt_kwargs,
+                    rid=request.rid,
+                    priority=request.priority,
+                    lora_path=adapter,
+                    sampling_params={"max_new_tokens": 0, "temperature": 0},
+                    return_hidden_states="last",
+                    stream=False,
+                ),
+                request,
+            )
 
         adapted_request = EmbeddingReqInput(
             **prompt_kwargs,
@@ -128,13 +156,17 @@ class OpenAIServingClassify(OpenAIServingBase):
 
     async def _handle_non_streaming_request(
         self,
-        adapted_request: EmbeddingReqInput,
+        adapted_request: Union[EmbeddingReqInput, GenerateReqInput],
         request: ClassifyRequest,
         raw_request: Request,
     ) -> Union[ClassifyResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming classification request."""
-        # Generate request ID
+        if self.is_generation:
+            return await self._handle_lora_classification(
+                adapted_request, request, raw_request
+            )
 
+        # Generate request ID
         try:
             ret = await self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -147,6 +179,39 @@ class OpenAIServingClassify(OpenAIServingBase):
 
         response = self._build_classify_response(ret)
         return response
+
+    async def _handle_lora_classification(self, adapted_request, request, raw_request):
+        lease = ClassificationLease(self.tokenizer_manager)
+        try:
+            async with aclosing(
+                self.tokenizer_manager.generate_request(
+                    adapted_request, raw_request, classification_lease=lease
+                )
+            ) as responses:
+                ret = await responses.__anext__()
+                # Exhaust the nonstreaming generator normally to release its
+                # model read lock, instead of leaving cleanup to garbage collection.
+                async for _ in responses:
+                    raise ValueError("Unexpected streaming classification response")
+            ret = ret if isinstance(ret, list) else [ret]
+            data = await lease.run_cpu(lease.head.classify, ret)
+            prompt_tokens = sum(
+                item.get("meta_info", {}).get("prompt_tokens", 0) for item in ret
+            )
+            return ClassifyResponse(
+                id=f"{self._request_id_prefix()}{uuid.uuid4().hex}",
+                created=int(time.time()),
+                model=request.model,
+                data=data,
+                usage={
+                    "prompt_tokens": prompt_tokens,
+                    "total_tokens": prompt_tokens,
+                    "completion_tokens": 0,
+                    "prompt_tokens_details": None,
+                },
+            )
+        finally:
+            await lease.close()
 
     def _build_classify_response(self, ret: List[Dict[str, Any]]) -> ClassifyResponse:
         request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
