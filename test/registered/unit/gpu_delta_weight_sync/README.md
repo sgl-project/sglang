@@ -70,38 +70,35 @@ curl -f -X POST http://localhost:30000/clear_gpu_delta_state \
   -H 'Content-Type: application/json' -d '{}'
 ```
 
-`update_weights_from_gpu_delta` requires `manifest_path` and committed base
-version 0. It supports a direct HF-base 0→V jump using existing describe, prepare,
-status, apply and resume controls internally. Successful load clears delta
-resources by default. Miles recovery passes `release_state=false` to retain the
-backend for following normal updates; the standalone path-only request keeps the
-default. `flush_cache=true` clears KV and multimodal preprocessing caches; a
-trusted caller that has already invalidated these may pass `false`. Reader fencing
-and request retraction still run. `abort_all_requests=false` preserves requests
-for requeue; `true` aborts them at the apply boundary, after preparation, with new
-admission closed. A pause already in effect at that boundary is preserved through
-commit and optional resource cleanup. The reply's `generation_paused` reports
-whether generation remains paused. A retained transaction leaves `resumed_ns`
-and `blocked_s` null in that case. Transaction state `RESUMED` means version committed and release queued, not
-that a pre-existing generation pause was lifted.
+`update_weights_from_gpu_delta` accepts an HF-base publication and a freshly
+loaded engine at version 0. It discovers current participants and composes
+prepare/status/apply/resume for the 0→V jump. After success, `release_state=true`
+(default) clears delta resources; Miles recovery passes `false` to retain the
+backend for subsequent staged updates. The supplied HF base must match the
+publication: names/shapes or dummy weights do not establish base-byte correctness.
 
-Staged `apply_gpu_delta` accepts the same `flush_cache` and `abort_all_requests`
-flags at its pause boundary. Prepare does not change serving or cache state.
-`resume_gpu_delta` normally reopens admission; the one-shot path passes `keep_pause=true` when preserving an earlier pause. The second endpoint
-also clears a separately managed update session. Neither endpoint changes model
-weights during cleanup. An uncertain apply/resume remains paused and requires restart; the loader never retries XOR or
-aborts after dispatching apply. A deployment must supply the actual HF base:
-matching names/shapes or dummy weights do not establish base-byte correctness.
+Both one-shot updates and staged `apply_gpu_delta` accept `flush_cache=true`
+and `abort_all_requests=false`. A trusted caller that has already invalidated KV
+and multimodal preprocessing caches may disable flushing. Reader fencing and
+request retraction still run. Optional abort runs at the apply boundary with new
+admission closed; otherwise requests remain available for requeue. Preparation
+does not pause generation or change cache state.
 
-Clear is allowed only while idle or after successful resume. It joins each rank's
-FIFO host-release work, closes payload workers/private DE host allocations, and
-drops decoder, stream and planning objects. Only after every rank acknowledges
-closure does one process per engine-host remove its shared encoded-cache cohort
-directory. Source publications and inference weights remain; committed version,
-process identity and small publication provenance survive. A later describe
-lazily recreates the backend at that version, so clearing cannot turn updated
-weights into version 0. Framework allocator/JIT caches are left alone. These
-endpoints use the same exclusive-controller contract as ordinary GPU-delta updates.
+One-shot updates preserve any pause in effect at the apply boundary, including a
+pause established during preparation. Internal `resume_gpu_delta(keep_pause=true)`
+commits the version and queues release without reopening generation. The reply
+reports `generation_paused=true` and null `resumed_ns`/`blocked_s`; `RESUMED` names
+the completed delta transaction. Staged resume reopens admission by default.
+Failed or uncertain apply/resume keeps admission closed and requires restart;
+there is no XOR retry, rollback or abort after apply dispatch.
+
+`clear_gpu_delta_state` is valid while idle or after successful resume. It drains
+each rank's FIFO release work, closes payload workers/private DE host allocations
+and drops decoder, stream and planning objects. After every rank acknowledges
+closure, one process per engine-host removes its shared encoded-cache directory.
+Model weights, source publications, committed version, process identity, small
+provenance and generation pause remain unchanged. A later describe recreates the
+backend at the retained version. Framework allocator/JIT caches are left alone.
 
 Layout algebra, allocator admission, protocol and session tests run in the
 existing `base-a-test-cpu` suite. The CUDA layout test runs in
@@ -262,8 +259,8 @@ is no per-inner-frame copy or cross-process DE allocation sharing. Raw targets,
 zero-frame omission, hash policy and cache lifecycle follow the same contract
 for all codecs. Plain and wrapped LZ4 share one native decoder. Miles defaults
 to `snappy-zstd` for ordinary updates and `lz4-zstd` for initial sync.
-Three-codec native and full-model receiver matrices are qualified on B300; the
-learned-update E2E is a separate, earlier source scope.
+Manual native and full-model receiver tests cover all three codecs on B300.
+Learned recovery/checkpoint and standalone deployment checks have separate scopes.
 
 The manifest carries the selected `codec` and explicit positive integer `frame_bytes`
 up to 4 MiB (default 1 MiB). Actual encoded/decoded sizes and pointer alignment
