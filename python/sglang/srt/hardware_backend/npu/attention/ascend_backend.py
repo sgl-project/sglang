@@ -29,6 +29,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.dcp.layout import (
     get_dcp_chain_spec_lens,
     get_dcp_lens,
@@ -1189,6 +1190,115 @@ class AscendAttnBackend(AttentionBackend):
         attn_output = attn_output.view(-1, num_heads * head_size)
         return attn_output
 
+    def prepare_dsa_cp_metadata(self, forward_batch: ForwardBatch) -> None:
+        if getattr(forward_batch, "dsa_cp_metadata_prepared", False):
+            return
+        if getattr(forward_batch, "attn_cp_metadata", None) is None:
+            return
+        if not forward_batch.forward_mode.is_context_parallel_extend():
+            return
+        if forward_batch.forward_mode.is_target_verify():
+            return
+
+        strategy = get_cp_strategy()
+        if strategy is None or strategy.cp_size <= 1:
+            return
+
+        fm = self.forward_metadata
+        global_positions = forward_batch.positions
+        if global_positions is None:
+            return
+
+        device = global_positions.device
+        num_tokens = int(global_positions.shape[0])
+        local_idx = strategy.local_q_indices(num_tokens, forward_batch).to(
+            device=device, dtype=torch.long
+        )
+        if local_idx.numel() > 0:
+            shard_bound = int(
+                getattr(forward_batch.attn_cp_metadata, "total_seq_lens", num_tokens)
+            )
+            local_idx = local_idx[local_idx < shard_bound]
+        local_positions = global_positions.index_select(0, local_idx)
+
+        from sglang.srt.layers.cp.padding import pad_local_rows
+
+        local_positions = pad_local_rows(
+            local_positions, forward_batch.attn_cp_metadata, dim=0
+        )
+
+        # Per-token request ids for the local rows: the Ascend paged-attention
+        # operators consume per-token block-table rows under CP (same
+        # convention as prepare_dsv4_cp_metadata).
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if extend_lens is None:
+            seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+            if seq_lens_cpu is not None:
+                extend_lens = seq_lens_cpu.tolist()
+            else:
+                extend_lens = [num_tokens]
+        extend_lens = [int(x) for x in extend_lens]
+        real_num_tokens = min(sum(extend_lens), num_tokens)
+
+        batch_ids_parts = []
+        for batch_id, length in enumerate(extend_lens):
+            if length <= 0:
+                continue
+            batch_ids_parts.append(
+                torch.full((length,), batch_id, dtype=torch.long, device=device)
+            )
+        if batch_ids_parts:
+            batch_ids = torch.cat(batch_ids_parts, dim=0)
+        else:
+            batch_ids = torch.empty(0, dtype=torch.long, device=device)
+        if batch_ids.shape[0] < num_tokens:
+            batch_ids = torch.cat(
+                [
+                    batch_ids,
+                    torch.zeros(
+                        num_tokens - batch_ids.shape[0],
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                ]
+            )
+        elif batch_ids.shape[0] > num_tokens:
+            batch_ids = batch_ids[:num_tokens]
+
+        local_batch_ids = batch_ids.index_select(0, local_idx)
+        valid_rows = local_idx < real_num_tokens
+        pad_rows = local_positions.shape[0] - local_batch_ids.shape[0]
+        if pad_rows > 0:
+            local_batch_ids = torch.cat(
+                [local_batch_ids, local_batch_ids.new_zeros(pad_rows)]
+            )
+            valid_rows = torch.cat([valid_rows, valid_rows.new_zeros(pad_rows)])
+
+        def _select_rows(table: Optional[torch.Tensor]):
+            if table is None:
+                return None
+            if local_batch_ids.numel() == 0:
+                return table.new_empty((0, *table.shape[1:]))
+            return table.index_select(0, local_batch_ids)
+
+        fm.block_tables = _select_rows(fm.block_tables)
+
+        local_t = int(local_positions.shape[0])
+        fm.actual_seq_lengths_q = torch.arange(
+            1, local_t + 1, dtype=torch.int32, device=device
+        )
+        # KV length seen by each local token = its global position + 1 (causal
+        # DSA); pad rows (position 0) stay at 1 so the sparse kernel sees a
+        # valid length for every row.
+        fm.actual_seq_lengths_kv = torch.where(
+            valid_rows,
+            local_positions.to(torch.int32) + 1,
+            torch.ones_like(local_positions, dtype=torch.int32),
+        ).clamp(min=1)
+
+        forward_batch.dsa_cp_local_positions = local_positions
+        forward_batch.dsa_cp_metadata_prepared = True
+
     def do_cp_balance_attn(
         self,
         q_nope,
@@ -1200,34 +1310,21 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_qlen,
         actual_seq_lengths_kv,
     ):
-        seq_len = q_nope.shape[0]
-        split_len = (seq_len + 1) // 2
-        q_nope_prev, q_nope_next = torch.split(q_nope, split_len, dim=0)
-        q_rope_prev, q_rope_next = torch.split(q_pe, split_len, dim=0)
-        q_nope_prev = q_nope_prev.contiguous()
-        q_nope_next = q_nope_next.contiguous()
-        q_rope_prev = q_rope_prev.contiguous()
-        q_rope_next = q_rope_next.contiguous()
+        # V2: Q is already sharded to local by the strategy; single sparse-attn
+        # call against the full (gathered) KV, no prev/next balance split.
         topk_indices = _expand_dsa_sparse_indices(topk_indices)
-        topk_indices_prev, topk_indices_next = torch.split(
-            topk_indices, split_len, dim=0
-        )
-
-        actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
-        actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
-
-        attn_out_prev, _, _ = torch_npu.npu_sparse_flash_attention(
-            query=q_nope_prev,
+        attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+            query=q_nope,
             key=k_nope,
             value=k_nope,
-            query_rope=q_rope_prev,
+            query_rope=q_pe,
             key_rope=k_pe,
-            sparse_indices=topk_indices_prev,
+            sparse_indices=topk_indices,
             scale_value=layer.scaling,
-            actual_seq_lengths_query=actual_seq_qlen_prev.to(
+            actual_seq_lengths_query=actual_seq_qlen.to(
                 device=q_nope.device, dtype=torch.int32
             ),
-            actual_seq_lengths_kv=actual_seq_lengths_kv_prev.to(
+            actual_seq_lengths_kv=actual_seq_lengths_kv.to(
                 device=q_nope.device, dtype=torch.int32
             ),
             block_table=self.forward_metadata.block_tables,
@@ -1238,29 +1335,7 @@ class AscendAttnBackend(AttentionBackend):
             attention_mode=2,
             return_softmax_lse=False,
         )
-        attn_out_next, _, _ = torch_npu.npu_sparse_flash_attention(
-            query=q_nope_next,
-            key=k_nope,
-            value=k_nope,
-            query_rope=q_rope_next,
-            key_rope=k_pe,
-            sparse_indices=topk_indices_next,
-            scale_value=layer.scaling,
-            actual_seq_lengths_query=actual_seq_qlen_next.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_kv=actual_seq_lengths_kv_next.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            block_table=self.forward_metadata.block_tables,
-            sparse_block_size=1,
-            layout_query="TND",
-            layout_kv="PA_BSND",
-            sparse_mode=3,
-            attention_mode=2,
-            return_softmax_lse=False,
-        )
-        return torch.cat([attn_out_prev, attn_out_next], dim=0)
+        return attn_out
 
     def do_cp_attn_fia(
         self,
