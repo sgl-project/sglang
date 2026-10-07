@@ -7,7 +7,7 @@ construction (incl. the trtllm combined tables) stays on the shared class.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Literal, Optional, Sequence, Tuple
 
 import torch
 
@@ -137,6 +137,27 @@ def _check_trtllm_query_rows(num_rows: int) -> None:
         )
 
 
+def _tail_refresh_layers(
+    compress_ratios: Sequence[int], index_source_layer_ids: Sequence[int]
+) -> Optional[frozenset]:
+    """Layers that must refresh the shared indexed tail; None means every indexed layer.
+
+    Layers without their own indexer reuse the last source's top-k, already in the table.
+    """
+    if not index_source_layer_ids:
+        return None
+    sources = frozenset(index_source_layer_ids)
+    prev_ratio = None
+    for layer_id, ratio in enumerate(compress_ratios):
+        if ratio in (1, 2, 4):
+            # A non-source layer must follow a source of its own ratio.
+            assert ratio == prev_ratio or layer_id in sources, (
+                f"indexed layer {layer_id} (ratio {ratio}) reuses top-k across ratios"
+            )
+            prev_ratio = ratio
+    return sources
+
+
 def _refresh_indexed_tail(
     core: DSV4AttnMetadata,
     compress_ratio: int,
@@ -255,6 +276,10 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         self.trtllm_eager_output_buffer: torch.Tensor | None = None
         # (buffer, rows, real rows) whose pad tail is already zero (kernel writes [:real]).
         self._padded_output_zeroed: Optional[tuple[int, int, int]] = None
+        cfg = model_runner.model_config.hf_text_config
+        self._tail_refresh_layers = _tail_refresh_layers(
+            cfg.compress_ratios, getattr(cfg, "index_source_layer_ids", ())
+        )
         # topk_v2 writes the c4 tail in place only when no ratio-1/2 layer shares the table.
         self.trtllm_topk_writes_table = (
             self.dsa_topk_backend.should_use_topk_v2()
@@ -383,6 +408,11 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             extra_indices=extra_indices,
         )
 
+    def _refreshes_tail(self, layer_id: int) -> bool:
+        return (
+            self._tail_refresh_layers is None or layer_id in self._tail_refresh_layers
+        )
+
     def _get_trtllm_bmm_scales(self, layer: RadixAttention) -> Tuple[float, float]:
         """Return host scales; KV uses the store path's fixed unit scale.
 
@@ -472,7 +502,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             assert sparse_topk_lens.shape[0] > bs, f"{sparse_topk_lens.shape=}"
             sparse_topk_lens = sparse_topk_lens[:bs]
 
-        if compress_ratio in (1, 2, 4):
+        if compress_ratio in (1, 2, 4) and self._refreshes_tail(layer.layer_id):
             _refresh_indexed_tail(
                 core_attn_metadata,
                 compress_ratio,
@@ -595,13 +625,14 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sparse_indices = core.trtllm_prefill_c4_indices
             sparse_topk_lens = core.trtllm_prefill_c4_lens
             assert sparse_indices is not None and sparse_topk_lens is not None
-            _refresh_indexed_tail(
-                core,
-                compress_ratio,
-                extra_indices,
-                sparse_indices,
-                sparse_topk_lens,
-            )
+            if self._refreshes_tail(layer.layer_id):
+                _refresh_indexed_tail(
+                    core,
+                    compress_ratio,
+                    extra_indices,
+                    sparse_indices,
+                    sparse_topk_lens,
+                )
 
         assert sparse_topk_lens is not None
 
