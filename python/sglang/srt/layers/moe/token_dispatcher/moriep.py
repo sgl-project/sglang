@@ -11,6 +11,7 @@ from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderNoop,
     get_global_expert_distribution_recorder,
 )
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -114,6 +115,15 @@ def _should_record_expert_distribution() -> bool:
     if torch.get_device_module().is_current_stream_capturing():
         return not isinstance(recorder, _ExpertDistributionRecorderNoop)
     return False
+
+
+def _record_local_expert_count(local_expert_count: torch.Tensor) -> None:
+    # The recorder tracks routed experts only; drop the per-rank fused shared
+    # expert slot that follows them.
+    num_routed = get_global_expert_location_metadata().num_local_physical_experts
+    get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+        local_expert_count[:num_routed]
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -1110,9 +1120,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPv1DispatcherImplBase):
         # mori local_expert_count is a GPU tensor; route it through the
         # low_latency hook only when the recorder is actually active.
         if record:
-            get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-                self.mori_op.local_expert_count
-            )
+            _record_local_expert_count(self.mori_op.local_expert_count)
 
         return (
             packed_recv_hidden,
@@ -1241,9 +1249,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPv1DispatcherImplBase):
         self.mori_op.dispatch_recv(call_local_expert_count=record)
 
         if record:
-            get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-                self.mori_op.local_expert_count
-            )
+            _record_local_expert_count(self.mori_op.local_expert_count)
 
         return MoriEPLLDispatchOutput(
             hidden_states=hidden_states,
@@ -1514,9 +1520,7 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
         # Count after dispatch and before combine (combine resets total_recv), on
         # the compute stream that already waited for the dispatch.
         if _should_record_expert_distribution():
-            get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-                self.mori_op.local_expert_count()
-            )
+            _record_local_expert_count(self.mori_op.local_expert_count())
         expert_output = None
         if self._direct_output:
             combine_in_view = getattr(self.mori_op, "combine_in_view", None)
