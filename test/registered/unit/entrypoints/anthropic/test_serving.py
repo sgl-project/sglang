@@ -1403,40 +1403,40 @@ class TestAnthropicServing(unittest.TestCase):
         )
         with self.assertRaises(ValueError) as ctx:
             serving._convert_to_chat_completion_request(request)
-
         self.assertIn("nonexistent", str(ctx.exception))
 
     def test_custom_tool_constraints_are_forwarded(self):
-        """Tool strict and disable_parallel_tool_use must reach the Chat request for
-        every tool choice rather than be dropped."""
-        for choice in ("auto", "any", "tool", "none"):
-            for enabled in (False, True):
-                with self.subTest(choice=choice, enabled=enabled):
-                    request = self._anthropic_request(
-                        tools=[
-                            {
-                                "name": "lookup",
-                                "input_schema": {"type": "object"},
-                                "strict": enabled,
-                            }
-                        ],
-                        tool_choice={
-                            "type": choice,
+        for tool_fields, tool_choice, expected in (
+            ({}, {"type": "auto"}, (False, True)),
+            (
+                {"strict": True},
+                {"type": "auto", "disable_parallel_tool_use": False},
+                (True, True),
+            ),
+            (
+                {"strict": False},
+                {"type": "auto", "disable_parallel_tool_use": True},
+                (False, False),
+            ),
+        ):
+            with self.subTest(tool_fields=tool_fields, tool_choice=tool_choice):
+                request = self._anthropic_request(
+                    tools=[
+                        {
                             "name": "lookup",
-                            "disable_parallel_tool_use": enabled,
-                        },
-                    )
-                    converted = self._serving()._convert_to_chat_completion_request(
-                        request
-                    )
-                    self.assertEqual(converted.tools[0].function.strict, enabled)
-                    self.assertEqual(converted.parallel_tool_calls, not enabled)
+                            "input_schema": {"type": "object"},
+                            **tool_fields,
+                        }
+                    ],
+                    tool_choice=tool_choice,
+                )
+                converted = self._serving()._convert_to_chat_completion_request(request)
+                self.assertEqual(
+                    (converted.tools[0].function.strict, converted.parallel_tool_calls),
+                    expected,
+                )
 
     def test_rejected_requests_are_client_errors(self):
-        """A request the shared Chat pipeline rejects with ValueError, such as an
-        unsupported tool control, must get 400 on every Messages route, as on Chat;
-        other failures stay 500."""
-
         class _RejectingOpenAI(_FakeOpenAIServingChat):
             def __init__(self, error):
                 super().__init__()

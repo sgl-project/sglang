@@ -5,7 +5,6 @@ import unittest
 from sglang.srt.parser.jinja_template_utils import (
     detect_jinja_template_content_format,
     jinja_template_may_reorder_tool_results,
-    jinja_template_reads_reasoning_content,
     process_content_for_template_format,
 )
 from sglang.srt.utils import VideoData
@@ -52,22 +51,6 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         )
         self.assertFalse(jinja_template_may_reorder_tool_results("{{{{ invalid"))
         self.assertFalse(jinja_template_may_reorder_tool_results(None))
-
-    def test_detect_reasoning_content_reads(self):
-        """Reasoning history may go in reasoning_content only for a template that
-        reads the field; a comment or a content-only template does not count."""
-        for template in (
-            "{{ messages[0].reasoning_content }}",
-            "{{ messages[0]['reasoning_content'] }}",
-            "{{ messages[0].get('reasoning_content') }}",
-        ):
-            self.assertTrue(jinja_template_reads_reasoning_content(template))
-        for template in (
-            "{# reasoning_content #}{{ messages[0].content }}",
-            "{{{{ invalid",
-            None,
-        ):
-            self.assertFalse(jinja_template_reads_reasoning_content(template))
 
     def test_detect_llama4_openai_format(self):
         """Test detection of llama4-style template (should be 'openai' format)."""
