@@ -57,9 +57,11 @@ setting and picks one per request.
 select_chat_formatter(&ChatFormatterOptions) -> (Option<ChatFormatter>, Option<String>)
 load_chat_formatter(tokenizer_config, model_path, model_type, chat_template) -> Result<ChatFormatter, TemplateError>
 ChatFormatter::render_prompt(&dyn OAIChatLikeRequest) -> Result<RenderedPrompt, TemplateError>
-ChatFormatter::render_request(&serde_json::Value) -> Result<(String, String), TemplateError>  // DeepSeek-V4
+ChatFormatter::render_request(serde_json::Value) -> Result<(String, String), TemplateError>  // DeepSeek-V4
 ChatFormatter::resolve_thinking(&mut kwargs, tools_enabled, named_tool_choice) -> Option<bool>
 ChatFormatter::stop_strs() -> Option<OneOrMany<String>>
+requested_effort(&body) -> Option<&Value>
+requested_thinking(&body) -> Option<bool>
 ```
 
 `select_chat_formatter` (`selection.rs`) picks a formatter from
@@ -85,7 +87,9 @@ with `encode_segments`.
 `task`, `continue_final_message` and the `reasoning` object, which
 `OAIChatLikeRequest` lacks. It returns the continuation prefix separately, since
 SGLang tokenizes it on its own. On a DeepSeek-V4 formatter, `render_prompt`
-rebuilds the body from the trait. The SGLang additions hook in as follows:
+rebuilds the body from the trait. `requested_effort` and `requested_thinking`
+(`reasoning.rs`) port `protocol.py`'s `reasoning` handling once, for the
+renderer and DeepSeek-V4 alike. The SGLang additions hook in as follows:
 
 | Code | Mirrors | Hook |
 |---|---|---|

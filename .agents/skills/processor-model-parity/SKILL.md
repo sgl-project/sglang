@@ -30,7 +30,7 @@ to `rust/sglang-processor/` unless they start with `python/`.
 
 No new test code: `tests/parity.rs` checks every fixture in the directory.
 
-`render_request(&Value, ..)` takes the SGLang request **body**, not Dynamo's
+`render_request(Value, ..)` takes the SGLang request **body**, not Dynamo's
 `OAIChatLikeRequest`, because Python reads fields the trait lacks (`task`,
 `continue_final_message`, the `reasoning` object). Pick the shape by how Python
 renders the model:
@@ -52,6 +52,7 @@ renders the model:
    between the HTTP body and `prompt_ids`, in order:
    - `protocol.py::ChatCompletionRequest.normalize_reasoning_inputs`: `reasoning`
      and `reasoning_effort` set the default `thinking` / `enable_thinking`.
+     Reuse `render/reasoning.rs` for this rather than porting it again.
    - `serving_chat._convert_to_internal_request`: `chat_template_kwargs.reasoning_effort`
      replaces the request effort; server `--default-chat-template-kwargs` merge in.
    - `chat_encoding.resolve_chat_encoding_spec`: which branch renders the model

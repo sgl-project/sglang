@@ -12,6 +12,7 @@ use thiserror::Error;
 mod legacy;
 mod loader;
 mod models;
+mod reasoning;
 mod selection;
 mod thinking;
 
@@ -21,6 +22,7 @@ pub use self::models::DeepSeekV4Profile;
 use self::models::{
     deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, render_deepseek_v4,
 };
+pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
 pub use self::thinking::ThinkingTemplates;
 
@@ -80,14 +82,22 @@ impl ChatFormatter {
                 render_oai(formatter, &TemplateArgsRequest { request, args })
             }
             ChatFormatter::DeepSeekV4(_) => {
-                let request = serde_json::json!({
-                    "messages": request.messages(),
+                // Typed messages serialize straight to JSON, skipping minijinja.
+                let messages = match request.typed_messages() {
+                    Some(messages) => serde_json::to_value(messages),
+                    None => serde_json::to_value(request.messages()),
+                }
+                .map_err(|error| TemplateError::Renderer {
+                    message: format!("failed to serialize messages: {error}"),
+                })?;
+                let mut body = serde_json::json!({
                     "tools": request.tools(),
                     "reasoning_effort": request.reasoning_effort(),
                     "chat_template_kwargs": request.chat_template_args(),
                     "continue_final_message": !request.should_add_generation_prompt(),
                 });
-                let (prompt, prefix) = self.render_request(&request)?;
+                body["messages"] = messages;
+                let (prompt, prefix) = self.render_request(body)?;
                 // SGLang tokenizes the prefix on its own and drops its leading BOS.
                 let prefix = prefix.strip_prefix(tokens::BOS).unwrap_or(&prefix);
                 Ok(RenderedPrompt::text(prompt + prefix))
@@ -100,7 +110,7 @@ impl ChatFormatter {
     /// `continue_final_message` prefix SGLang tokenizes separately.
     /// The body must be one SGLang's `ChatCompletionRequest` accepts; it is not
     /// re-validated. Only DeepSeek-V4 renders this way; others use [`Self::render_prompt`].
-    pub fn render_request(&self, request: &Value) -> Result<(String, String), TemplateError> {
+    pub fn render_request(&self, request: Value) -> Result<(String, String), TemplateError> {
         let ChatFormatter::DeepSeekV4(profile) = self else {
             return Err(TemplateError::Renderer {
                 message: "this formatter renders through render_prompt".into(),

@@ -1,9 +1,11 @@
 //! DeepSeek-V4 prompts as SGLang's `serving_chat.py` builds them, on Dynamo's V4 encoder.
 
 use dynamo_renderer::deepseek::v4::{self, ReasoningEffort, ThinkingMode};
+use serde::de::IgnoredAny;
 use serde_json::{Map, Value, json};
 
 use crate::model_files::resolve_model_file;
+use crate::render::reasoning::{requested_effort, requested_thinking};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeepSeekV4Profile {
@@ -15,18 +17,17 @@ pub enum DeepSeekV4Profile {
 /// `continue_final_message` prefix, which SGLang tokenizes separately.
 pub(crate) fn render(
     profile: DeepSeekV4Profile,
-    request: &Value,
+    mut request: Value,
 ) -> Result<(String, String), String> {
-    let mut messages = request["messages"]
-        .as_array()
-        .ok_or("messages must be an array")?
-        .iter()
-        .map(engine_message)
-        .collect::<Vec<_>>();
+    let Some(Value::Array(messages)) = request.get_mut("messages").map(Value::take) else {
+        return Err("messages must be an array".into());
+    };
+    let mut messages = messages.into_iter().map(engine_message).collect::<Vec<_>>();
     for message in &mut messages {
         flatten_content(message);
-        parse_tool_arguments(message)?;
+        check_tool_arguments(message)?;
     }
+    let request = &request;
     let mut prefix = String::new();
     if let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant")
         && let Some(content) = last["content"].as_str().map(str::to_owned)
@@ -54,6 +55,7 @@ pub(crate) fn render(
         message["task"] = task.clone();
     }
     // SGLang drops a later user's task when merging it into a user or tool-result turn.
+    // Workaround for ai-dynamo/frontend-crates#366; drop once dynamo-renderer includes it.
     for index in 1..messages.len() {
         if messages[index]["role"] == "user"
             && matches!(messages[index - 1]["role"].as_str(), Some("user" | "tool"))
@@ -85,37 +87,16 @@ pub(crate) fn render(
     Ok((prompt, prefix))
 }
 
-/// `serving_chat.py`: kwargs `thinking` wins, then any request effort (`!= "none"`),
-/// then `reasoning.enabled`, then `SGLANG_DEFAULT_THINKING`.
+/// `serving_chat.py`: kwargs `thinking` wins, then what `reasoning` and the
+/// effort imply, then `SGLANG_DEFAULT_THINKING`.
 pub(crate) fn thinking(request: &Value) -> bool {
     if let Some(thinking) = request["chat_template_kwargs"].get("thinking") {
         return minijinja::Value::from_serialize(thinking).is_true();
     }
-    let reasoning = &request["reasoning"];
-    if let Some(effort) = [
-        &reasoning["effort"],
-        &reasoning["reasoning_effort"],
-        &request["reasoning_effort"],
-    ]
-    .into_iter()
-    .find(|effort| !effort.is_null())
-    {
-        return effort != "none";
-    }
-    let enabled = match reasoning
-        .get("enabled")
-        .filter(|v| !v.is_null())
-        .or_else(|| reasoning.get("enable"))
-    {
-        Some(Value::String(enabled)) => {
-            ["1", "true", "yes", "y", "on"].contains(&enabled.trim().to_lowercase().as_str())
-        }
-        Some(enabled) => minijinja::Value::from_serialize(enabled).is_true(),
-        None => false,
-    };
-    enabled
-        || std::env::var("SGLANG_DEFAULT_THINKING")
+    requested_thinking(request).unwrap_or_else(|| {
+        std::env::var("SGLANG_DEFAULT_THINKING")
             .is_ok_and(|v| ["true", "1", "yes", "y"].contains(&v.to_lowercase().as_str()))
+    })
 }
 
 /// `encoding_dsv4.REASONING_EFFORT_PROFILES`: kwargs effort replaces the request
@@ -125,16 +106,11 @@ fn effort(
     request: &Value,
     fallback: Option<String>,
 ) -> Option<ReasoningEffort> {
-    let requested = [
-        &request["chat_template_kwargs"]["reasoning_effort"],
-        &request["reasoning"]["effort"],
-        &request["reasoning"]["reasoning_effort"],
-        &request["reasoning_effort"],
-    ]
-    .into_iter()
-    .find(|effort| !effort.is_null())
-    .map(|effort| effort.as_str().map(str::to_owned))
-    .unwrap_or(fallback);
+    let requested = Some(&request["chat_template_kwargs"]["reasoning_effort"])
+        .filter(|effort| !effort.is_null())
+        .or_else(|| requested_effort(request))
+        .map(|effort| effort.as_str().map(str::to_owned))
+        .unwrap_or(fallback);
     match (profile, requested.as_deref()) {
         (DeepSeekV4Profile::Official, Some("high")) | (DeepSeekV4Profile::Preview, Some("max")) => {
             Some(ReasoningEffort::High)
@@ -146,31 +122,32 @@ fn effort(
 
 /// The pydantic dump SGLang renders: roles lowercased, unknown and null fields
 /// dropped, `user` reduced to role and content, null content blanked.
-fn engine_message(message: &Value) -> Value {
-    let role = message["role"].as_str().unwrap_or_default().to_lowercase();
-    let mut out = Map::new();
-    if role != "user" {
-        for key in [
-            "role",
+fn engine_message(message: Value) -> Value {
+    let mut message = match message {
+        Value::Object(message) => message,
+        _ => Map::new(),
+    };
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_lowercase();
+    let kept: &[&str] = if role == "user" {
+        &["content"]
+    } else {
+        &[
             "content",
             "tool_call_id",
             "name",
             "reasoning_content",
             "tool_calls",
             "tools",
-        ] {
-            if let Some(value) = message.get(key).filter(|v| !v.is_null()) {
-                out.insert(key.into(), value.clone());
-            }
-        }
-    }
-    let content = match &message["content"] {
-        Value::Null => "".into(),
-        content => content.clone(),
+        ]
     };
-    out.insert("role".into(), role.into());
-    out.insert("content".into(), content);
-    out.into()
+    message.retain(|key, value| kept.contains(&key.as_str()) && !value.is_null());
+    message.insert("role".into(), role.into());
+    message.entry("content").or_insert_with(|| "".into());
+    message.into()
 }
 
 /// `process_content_for_template_format`: text parts joined with spaces.
@@ -187,32 +164,33 @@ fn flatten_content(message: &mut Value) {
 }
 
 /// `serving_chat.normalize_assistant_tool_call_arguments`: string arguments must
-/// parse to a JSON object; other values wait for the final-turn handling.
-fn parse_tool_arguments(message: &mut Value) -> Result<(), String> {
+/// be a JSON object; other values wait for the final-turn handling.
+fn check_tool_arguments(message: &mut Value) -> Result<(), String> {
     for arguments in tool_arguments(message) {
-        if let Some(text) = arguments.as_str() {
-            let parsed = serde_json::from_str::<Value>(text)
-                .map_err(|_| "assistant tool arguments must be valid JSON")?;
-            if !parsed.is_object() {
-                return Err("assistant tool arguments must be a JSON object".into());
-            }
-            *arguments = parsed;
+        if let Some(text) = arguments.as_str()
+            && (serde_json::from_str::<IgnoredAny>(text).is_err()
+                || !text.trim_start().starts_with('{'))
+        {
+            return Err("assistant tool arguments must be a JSON object".into());
         }
     }
     Ok(())
 }
 
 /// The messages the encoder sees: empty tool lists dropped, message tools dumped,
-/// and tool arguments serialized, since Dynamo takes them as JSON object text.
+/// and tool arguments as JSON object text, which Dynamo parses itself.
 fn normalize_messages(messages: &mut [Value]) -> Result<(), String> {
     for message in messages {
         for arguments in tool_arguments(message) {
-            if !arguments.is_object() {
-                return Err("assistant tool arguments must be a JSON object".into());
+            match arguments {
+                Value::String(_) => {}
+                Value::Object(_) => *arguments = arguments.to_string().into(),
+                _ => return Err("assistant tool arguments must be a JSON object".into()),
             }
-            *arguments = arguments.to_string().into();
         }
         let message = message.as_object_mut().ok_or("message must be an object")?;
+        // Empty lists: workaround for ai-dynamo/frontend-crates#366; drop once
+        // dynamo-renderer includes it.
         match message.get("tools").and_then(Value::as_array) {
             Some(tools) if tools.is_empty() => _ = message.remove("tools"),
             Some(tools) => _ = message.insert("tools".into(), normalize_tools(tools)?.into()),
