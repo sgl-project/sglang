@@ -16,7 +16,6 @@ from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
 
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
 from sglang.multimodal_gen.runtime.distributed import (
-    get_tp_rank,
     get_tp_world_size,
     model_parallel_is_initialized,
 )
@@ -81,6 +80,8 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLModelOutputWithPast,
 )
 
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
+
 logger = logging.getLogger(__name__)
 
 
@@ -137,12 +138,6 @@ def _tp_world_size() -> int:
     return get_tp_world_size()
 
 
-def _tp_rank() -> int:
-    if not model_parallel_is_initialized():
-        return 0
-    return get_tp_rank()
-
-
 def _linear_output(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
     output = linear(x)
     return output[0] if isinstance(output, tuple) else output
@@ -161,8 +156,7 @@ def _make_column_linear(
             out_features,
             bias=bias,
             gather_output=False,
-            tp_size=_tp_world_size(),
-            tp_rank=_tp_rank(),
+            parallel_group="tp" if model_parallel_is_initialized() else "replicated",
         )
     return ReplicatedLinear(in_features, out_features, bias=bias)
 
@@ -179,8 +173,7 @@ def _make_row_linear(
             in_features,
             out_features,
             bias=bias,
-            tp_size=_tp_world_size(),
-            tp_rank=_tp_rank(),
+            parallel_group="tp" if model_parallel_is_initialized() else "replicated",
         )
     return ReplicatedLinear(in_features, out_features, bias=bias)
 
@@ -358,8 +351,7 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             prefix=f"model.language_model.layers.{layer_idx}.mlp",
             fuse_gate_up=False,
-            tp_size=mlp_tp_size,
-            tp_rank=_tp_rank() if mlp_tp_size > 1 else 0,
+            parallel_group="tp" if mlp_tp_size > 1 else "replicated",
         )
         norm_kwargs = dict(
             eps=config.rms_norm_eps,
@@ -911,6 +903,7 @@ class Qwen2_5_VLModel(nn.Module):
         video_embeds = torch.split(video_embeds, split_sizes)
         return video_embeds
 
+    @cached_conditioning
     def get_image_features(
         self,
         pixel_values: torch.FloatTensor,

@@ -1,6 +1,7 @@
 import unittest
 from typing import Optional
 
+from sglang.srt.utils import is_cuda, is_flashinfer_available, is_hip
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
@@ -22,7 +23,7 @@ def _load_inquirer_pending_for_rid(t: ScriptedContext, rid: str) -> int:
     s = t.scheduler
     chunked = s.chunked_req
     if chunked is not None and chunked.rid == rid:
-        return chunked.seqlen - len(chunked.prefix_indices)
+        return chunked.seqlen - chunked.prefix_len
     for req in s.waiting_queue:
         if req.rid == rid:
             return req.seqlen
@@ -225,9 +226,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         )
         for _ in range(DEFAULT_MAX_STEPS):
             if r.is_chunking:
-                assert len(r.req.prefix_indices) <= r.req.kv.kv_committed_len, (
+                assert r.req.prefix_len <= r.req.kv.kv_committed_len, (
                     f"streaming-session chunked stash must stay bounded by "
-                    f"kv_committed_len; prefix_indices_len={len(r.req.prefix_indices)}, "
+                    f"kv_committed_len; prefix_indices_len={r.req.prefix_len}, "
                     f"kv_committed_len={r.req.kv.kv_committed_len}"
                 )
             if r.finished:
@@ -328,17 +329,17 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             if r.is_chunking and chunked is not None and chunked.rid == r.rid:
                 saw_chunking = True
                 pending = _load_inquirer_pending_for_rid(t, r.rid)
-                expected = chunked.seqlen - len(chunked.prefix_indices)
+                expected = chunked.seqlen - chunked.prefix_len
                 assert pending == expected, (
                     f"load_inquirer chunked contribution must equal the prefix-"
-                    f"subtracting formula seqlen - len(prefix_indices) = {expected}; "
+                    f"subtracting formula seqlen - prefix_len = {expected}; "
                     f"got {pending}"
                 )
                 assert pending <= chunked.seqlen, (
                     f"chunked contribution must never exceed its full seqlen "
                     f"{chunked.seqlen}; got {pending} — dual-queue dedup violated"
                 )
-                if len(chunked.prefix_indices) > 0:
+                if chunked.prefix_len > 0:
                     saw_dedup = pending < chunked.seqlen
             if r.finished:
                 break
@@ -372,11 +373,11 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                     "test requires an empty waiting_queue so the chunked req is "
                     f"the sole pending-token contributor; got {len(s.waiting_queue)}"
                 )
-                expected = chunked.seqlen - len(chunked.prefix_indices)
+                expected = chunked.seqlen - chunked.prefix_len
                 observed = s.load_inquirer._get_num_pending_tokens()
                 assert observed == expected, (
                     f"chunked contribution must equal remainder "
-                    f"seqlen - len(prefix_indices) = {expected}, got {observed}; "
+                    f"seqlen - prefix_len = {expected}, got {observed}; "
                     f"a value of {chunked.seqlen} would mean the committed prefix "
                     "is being double-counted"
                 )
@@ -406,9 +407,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                 r.is_chunking
                 and chunked is not None
                 and chunked.rid == r.rid
-                and chunked.extend_range.length > 0
+                and chunked.extend_len > 0
             ):
-                deduct = chunked.extend_range.length
+                deduct = chunked.extend_len
                 base = s.load_inquirer._get_num_pending_tokens()
                 deducted = s.load_inquirer._get_num_pending_tokens(chunk_deduct=deduct)
                 assert deducted == base - deduct, (
@@ -473,18 +474,15 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                 r.is_chunking
                 and r.chunks_done >= 1
                 and req is not None
-                and req.extend_range is not None
+                and req.extend_end is not None
             ):
                 saw_mid_chunk = True
-                assert (
-                    req.extend_range.end
-                    == len(req.prefix_indices) + req.extend_range.length
-                ), (
+                assert req.extend_end == req.prefix_len + req.extend_len, (
                     f"init_next_round_input must rebuild fill_ids to the committed "
                     f"prefix plus the in-flight chunk; "
-                    f"fill_ids_len={req.extend_range.end}, "
-                    f"prefix_indices_len={len(req.prefix_indices)}, "
-                    f"extend_input_len={req.extend_range.length}, "
+                    f"fill_ids_len={req.extend_end}, "
+                    f"prefix_indices_len={req.prefix_len}, "
+                    f"extend_input_len={req.extend_len}, "
                     f"chunks_done={r.chunks_done}"
                 )
             if r.finished:
@@ -755,6 +753,7 @@ class TestSpecialCaseNoChunking(ScriptedTestCase):
 DETERMINISTIC_ALIGN_SIZE = 4096
 
 
+@unittest.skipUnless(is_flashinfer_available(), "flashinfer is NVIDIA-only")
 class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DETERMINISTIC_ALIGN_SIZE,
@@ -778,11 +777,11 @@ class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
         page_size = 16
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
-            if r.is_chunking and r.req.extend_range is not None:
+            if r.is_chunking and r.req.extend_end is not None:
                 saw_chunking = True
-                assert r.req.extend_range.length % page_size == 0, (
+                assert r.req.extend_len % page_size == 0, (
                     f"deterministic chunk boundary must be page-aligned; "
-                    f"got extend_input_len={r.req.extend_range.length}, page_size={page_size}"
+                    f"got extend_input_len={r.req.extend_len}, page_size={page_size}"
                 )
             if r.finished:
                 break
@@ -791,6 +790,7 @@ class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
         assert saw_chunking, "test must observe the req mid-chunk at least once"
 
 
+@unittest.skipUnless(is_cuda() or is_hip(), "MHA host-pool movers are CUDA/ROCm only")
 class TestSpecialCaseHiCache(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,

@@ -25,6 +25,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.openai.prompt_enhancement import (
     maybe_enhance_prompt,
 )
@@ -44,6 +45,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
     request_extra_value,
     resolve_sampling_params_cls,
+    sanitize_upload_filename,
     save_image_to_path,
     temp_dir_if_disabled,
 )
@@ -291,6 +293,8 @@ async def generations(
         sampling = build_sampling_params(
             request_id,
             prompt=prompt,
+            task_type=request.task_type,
+            request_data_type=DataType.IMAGE,
             size=request.size,
             width=request.width,
             height=request.height,
@@ -419,6 +423,7 @@ async def edits(
     enhance_prompt: bool = Form(False),
     mask: Optional[UploadFile] = File(None),
     model: Optional[str] = Form(None),
+    task_type: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     response_format: Optional[str] = Form(None),
     size: Optional[str] = Form(None),
@@ -466,10 +471,12 @@ async def edits(
         try:
             for idx, img in enumerate(image_list):
                 filename = img.filename if hasattr(img, "filename") else f"image_{idx}"
+                safe_name = sanitize_upload_filename(filename, f"image_{idx}")
                 input_path = await save_image_to_path(
                     img,
-                    os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}"),
+                    os.path.join(uploads_dir, f"{request_id}_{idx}_{safe_name}"),
                     prefer_remote_source=server_args.input_save_path is None,
+                    uploads_root=uploads_dir,
                 )
                 input_paths.append(input_path)
         except Exception as e:
@@ -489,6 +496,8 @@ async def edits(
         sampling = build_sampling_params(
             request_id,
             prompt=prompt,
+            task_type=task_type,
+            request_data_type=DataType.IMAGE,
             size=size,
             num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
             output_file_name=f"{request_id}.{ext}",
