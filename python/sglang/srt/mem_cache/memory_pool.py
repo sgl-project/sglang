@@ -43,6 +43,7 @@ from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
+from sglang.kernels.ops.kvcache import reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
@@ -2870,8 +2871,6 @@ class MHATokenToKVPool(KVCache):
                 and self.store_dtype == self.dtype
                 and cache_k.dtype == cache_v.dtype == self.dtype == torch.bfloat16
             ):
-                from sglang.kernels.ops.kvcache import reshape_and_cache_flash
-
                 reshape_and_cache_flash(
                     cache_k,
                     cache_v,
