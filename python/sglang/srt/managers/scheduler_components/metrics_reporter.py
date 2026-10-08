@@ -90,6 +90,17 @@ def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
     return sum(req.seqlen for req in batch.reqs)
 
 
+def _prefill_attention_pairs(batch: ScheduleBatch) -> int:
+    """Causal query-key pairs: each chunk against its cached prefix, plus
+    the causal pairs within the chunk itself."""
+    return sum(
+        extend_len * prefix_len + extend_len * (extend_len + 1) // 2
+        for prefix_len, extend_len in zip(
+            batch.prefix_lens, batch.extend_lens, strict=True
+        )
+    )
+
+
 @dataclasses.dataclass
 class PrefillStats:
     """Stats for logging prefill batch metrics."""
@@ -604,14 +615,6 @@ class SchedulerMetricsReporter:
             num_attn_heads * head_dim * act_bytes * num_layers
         )
 
-    @staticmethod
-    def _prefill_attention_pairs(batch) -> float:
-        """Causal query-key pairs: each chunk against its cached prefix, plus
-        the causal pairs within the chunk itself."""
-        prefix_pairs = sum(c * p for c, p in zip(batch.extend_lens, batch.prefix_lens))
-        within_chunk_pairs = sum(c * (c + 1) / 2.0 for c in batch.extend_lens)
-        return float(prefix_pairs + within_chunk_pairs)
-
     def _estimate_prefill_perf(self, batch) -> Tuple[float, float, float]:
         if batch is None or batch.extend_lens is None:
             return 0.0, 0.0, 0.0
@@ -619,7 +622,7 @@ class SchedulerMetricsReporter:
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
-        context_product = self._prefill_attention_pairs(batch)
+        context_product = float(_prefill_attention_pairs(batch))
         flops = (
             tokens * self._linear_flops_per_token
             + self._attn_dot_flops_coeff * context_product
