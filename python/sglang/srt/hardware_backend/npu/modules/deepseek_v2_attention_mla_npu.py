@@ -386,10 +386,7 @@ def forward_dsa_prepare_npu(
 ):
     dynamic_scale = None
     # Resolved here so the core can read the cached plan back.
-    get_dsa_token_shard_plan(
-        forward_batch,
-        m.indexer.index_topk if m.indexer is not None else None,
-    )
+    get_dsa_token_shard_plan(forward_batch)
     mla_preprocess_used = (
         is_mla_preprocess_enabled()
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()

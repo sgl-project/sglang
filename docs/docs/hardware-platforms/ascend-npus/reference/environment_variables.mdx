@@ -38,6 +38,11 @@ This document provides a list of commonly used environment variables and aims to
       <td><code>true</code></td>
     </tr>
     <tr>
+      <td><code>SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD</code></td>
+      <td>In DSA prefill, each attention-TP rank computes sparse attention <br/> for every head on its own slice of the tokens, instead of <br/> its share of the heads for every token. Off under DCP.<br/> Set to <code>false</code> to keep the head split.</td>
+      <td><code>true</code></td>
+    </tr>
+    <tr>
       <td><code>SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT</code></td>
       <td>Disable casting model weight tensor to a specific NPU <br/> ACL format.</td>
       <td><code>false</code></td>

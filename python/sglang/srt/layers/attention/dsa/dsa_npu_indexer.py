@@ -68,7 +68,7 @@ def plan_indexer_query_shard(
 
     The token shard's partition, derived rather than recomputed: the token
     shard skips this top-k's all-gather on the strength of both picking the
-    same rows (W2), so they must not be two implementations.
+    same rows, so they must not be two implementations.
 
     Returns ``(start, rows, num_real, cum_query_lens, key_lens)``.
     """
@@ -117,11 +117,9 @@ class _IndexerQueryShard:
         self, topk_indices: torch.Tensor, num_tokens: int, forward_batch
     ) -> torch.Tensor:
         """Full-width top-k, or this rank's own rows when the token shard will
-        slice the gathered tensor straight back to them anyway (W2).
+        slice the gathered tensor straight back to them anyway.
 
-        Sets ``npu_indexer_topk_is_local`` so attention knows which it got. Rows
-        past ``num_real`` are zeroed to match ``dsa_token_shard_slice``'s
-        padding, keeping the result bitwise identical.
+        Sets ``npu_indexer_topk_is_local`` so attention knows which it got.
         """
         plan = get_dsa_token_shard_plan(forward_batch)
         local = plan is not None
@@ -140,11 +138,9 @@ class _IndexerQueryShard:
         # Every rank logs, so a grep counts ranks: the output is identical either
         # way, which makes this line the only evidence it ran.
         print_info_once(
-            "DSA token-shard W2: skipping the indexer top-k all-gather; each rank "
+            "DSA token-shard: skipping the indexer top-k all-gather; each rank "
             "keeps the rows it scored"
         )
-        if self.num_real < self.rows:
-            topk_indices[self.num_real :] = 0
         return topk_indices
 
 

@@ -29,7 +29,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_token_shard import (
-    dsa_token_shard_cumulative_lens,
+    dsa_token_shard_cumulative_query_lens,
     get_dsa_token_shard_plan,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
@@ -1379,7 +1379,7 @@ class AscendAttnBackend(AttentionBackend):
         dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
         dsa_token_shard_qlen = None
         if dsa_token_shard_plan is not None:
-            dsa_token_shard_qlen, _ = dsa_token_shard_cumulative_lens(
+            dsa_token_shard_qlen = dsa_token_shard_cumulative_query_lens(
                 forward_batch, dsa_token_shard_plan, q.device
             )
 

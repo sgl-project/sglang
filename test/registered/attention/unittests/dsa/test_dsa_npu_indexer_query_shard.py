@@ -11,6 +11,10 @@ reduce-scatter (``ForwardBatch.prepare_mlp_sync_batch``). An equality check
 would turn sharding off for every token count that is not already a multiple of
 attn_tp_size, so the gate admits any width in ``[total, rows * tp_size]``.
 
+When the DSA token shard runs, ``_IndexerQueryShard.resolve`` skips the top-k
+all-gather and keeps this rank's rows, but only if the token shard planned the
+same rows.
+
 Usage:
     python -m pytest test_dsa_npu_indexer_query_shard.py -v
     python test_dsa_npu_indexer_query_shard.py
@@ -18,13 +22,17 @@ Usage:
 
 import types
 import unittest
+from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
     _get_indexer_query_shard,
+    _IndexerQueryShard,
     plan_indexer_query_shard,
 )
+from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import plan_dsa_token_shard
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -121,6 +129,62 @@ class TestIndexerQueryShardGate(CustomTestCase):
         # More rows than the plan covers: the gathered top-k would come back
         # shorter than the query tensor.
         self.assertIsNone(_shard_for([989184], [10828], 16, 0, 10833))
+
+
+class TestLocalTopkWithTokenShard(CustomTestCase):
+    """Keeping the local top-k is right only when attention reads exactly these
+    rows. Without a token shard it reads full width; with a plan for other rows
+    every query gets another token's top-k, and no shape error catches it."""
+
+    def _resolve(self, prefix_lens, extend_lens, tp_size, tp_rank, plan_rank):
+        total = sum(extend_lens)
+        shard = _shard_for(
+            prefix_lens, extend_lens, tp_size, tp_rank, _ceil_align(total, tp_size)
+        )
+        plan = None
+        if plan_rank is not None:
+            seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+            plan = plan_dsa_token_shard(extend_lens, seq_lens, tp_size, plan_rank)
+        batch = types.SimpleNamespace(npu_dsa_token_shard_plan=plan)
+        topk = torch.arange(shard.rows * 4).reshape(shard.rows, 4)
+        gathered = []
+
+        def fake_gather(_shard, t, num_tokens):
+            # The real one is a collective.
+            gathered.append(True)
+            return t
+
+        with (
+            envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.override(True),
+            mock.patch.object(_IndexerQueryShard, "gather", fake_gather),
+        ):
+            out = shard.resolve(topk, total, batch)
+        return out, topk, batch.npu_indexer_topk_is_local, bool(gathered)
+
+    def test_gathers_without_a_token_shard(self):
+        _, _, local, gathered = self._resolve([0], [16384], 16, 3, plan_rank=None)
+        self.assertFalse(local)
+        self.assertTrue(gathered)
+
+    def test_keeps_its_rows_when_the_token_shard_planned_them(self):
+        for prefix_lens, extend_lens, tp_size in (
+            ([0], [16385], 16),
+            ([0, 2048, 4096], [5003, 4001, 6002], 16),
+            ([500], [17], 3),
+        ):
+            for tp_rank in range(tp_size):
+                with self.subTest(ext=extend_lens, tp=tp_size, rank=tp_rank):
+                    out, topk, local, gathered = self._resolve(
+                        prefix_lens, extend_lens, tp_size, tp_rank, tp_rank
+                    )
+                    self.assertTrue(local)
+                    self.assertFalse(gathered)
+                    self.assertIs(out, topk)
+
+    def test_gathers_when_the_token_shard_planned_other_rows(self):
+        _, _, local, gathered = self._resolve([0], [16384], 16, 3, plan_rank=5)
+        self.assertFalse(local)
+        self.assertTrue(gathered)
 
 
 if __name__ == "__main__":

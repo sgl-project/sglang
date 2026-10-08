@@ -17,9 +17,13 @@ Usage:
 """
 
 import itertools
+import types
 import unittest
 
+from sglang.srt.layers.attention.dsa.dsa_token_shard import _build_dsa_token_shard_plan
 from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import plan_dsa_token_shard
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -95,6 +99,28 @@ class TestDsaTokenShardPlan(CustomTestCase):
             plan_dsa_token_shard([5, 9], [105], 4, 0)
         with self.assertRaises(AssertionError):
             plan_dsa_token_shard([5], [105], 4, 4)
+
+
+class TestTokenShardRefusesDcp(CustomTestCase):
+    """DCP's DSA path all-gathers the query across the DCP group and expects
+    every token's head-sharded row; a token slice would be merged wrong."""
+
+    def _plan(self, dcp_enabled):
+        batch = types.SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=[16384],
+            extend_prefix_lens_cpu=[0],
+        )
+        with get_parallel().override(
+            attn_tp_size=16, attn_tp_rank=3, dcp_enabled=dcp_enabled
+        ):
+            return _build_dsa_token_shard_plan(batch)
+
+    def test_planned_without_dcp(self):
+        self.assertIsNotNone(self._plan(dcp_enabled=False))
+
+    def test_refused_under_dcp(self):
+        self.assertIsNone(self._plan(dcp_enabled=True))
 
 
 if __name__ == "__main__":

@@ -20,12 +20,11 @@ swap is undone after attention, before ``w_vc``. The KV write and the indexer
 stay full width.
 
 Composes with the indexer's query sharding
-(``SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING``): both pick the same rows,
-which ``test_dsa_token_shard_indexer_row_agreement.py`` pins.
+(``SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING``): the indexer derives its
+rows from this plan, so both pick the same rows.
 """
 
-from functools import lru_cache
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -35,48 +34,13 @@ from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
     cumulative,
     plan_dsa_token_shard,
 )
-from sglang.srt.layers.dcp.layout import dcp_crop_free_extend
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu, print_info_once
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-
-@lru_cache(maxsize=1)
-def _dsa_token_shard_flag() -> bool:
-    """Resolved once: it decides at model construction whether the full-head
-    RadixAttention exists, so it must not change mid-run. Not a module-level
-    read, which would run before any test could set it; tests call
-    ``reset_dsa_token_shard_flags()``."""
-    enabled = envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.get()
-    if enabled and envs.SGLANG_NPU_USE_MLAPO.get():
-        # MLAPO writes the KV cache itself, at a slot mapping this has already
-        # sliced. This defaults on, so it yields unless both were set.
-        if envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.is_set():
-            raise ValueError(
-                "SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD does not compose with "
-                "SGLANG_NPU_USE_MLAPO: the fused MLA preprocess writes the KV "
-                "cache at a slot mapping the token shard has already sliced."
-            )
-        enabled = False
-        print_info_once(
-            "DSA token-shard is off because SGLANG_NPU_USE_MLAPO is on. Unset "
-            "SGLANG_NPU_USE_MLAPO to get the sharded attention back"
-        )
-    return enabled
-
-
-@lru_cache(maxsize=1)
-def _dsa_token_shard_multi_request_flag() -> bool:
-    return envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_MULTI_REQUEST.get()
-
-
-def reset_dsa_token_shard_flags() -> None:
-    """Re-read the env flags. For tests; never call this while serving."""
-    _dsa_token_shard_flag.cache_clear()
-    _dsa_token_shard_multi_request_flag.cache_clear()
 
 
 def dsa_token_shard_enabled() -> bool:
@@ -85,15 +49,11 @@ def dsa_token_shard_enabled() -> bool:
     ``is_npu()``: ``deepseek_v2.py`` is shared by every backend, and a true
     answer builds an extra full-head ``RadixAttention`` only NPU ever uses.
     """
-    return _dsa_token_shard_flag() and is_npu() and get_parallel().attn_tp_size > 1
-
-
-def dsa_token_shard_multi_request_enabled() -> bool:
-    """Shard multi-request extends too, by passing full per-request KV lengths
-    with ``sparse_mode=0`` instead of shortening them -- lengths are cumulative,
-    so shortening one moves the next request's start. Safe only where the causal
-    crop is not load-bearing, which ``dcp_crop_free_extend`` decides."""
-    return _dsa_token_shard_multi_request_flag()
+    return (
+        envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.get()
+        and is_npu()
+        and get_parallel().attn_tp_size > 1
+    )
 
 
 # Distinguishes "no plan cached yet" from "cached, and it is None".
@@ -102,27 +62,23 @@ _MISSING = object()
 
 def get_dsa_token_shard_plan(
     forward_batch: "ForwardBatch",
-    index_topk: Optional[int] = None,
 ) -> Optional[DsaTokenShardPlan]:
     """This forward's token slice for this rank, or None. Cached on the batch.
 
     Extend only: decode is already fast under graph capture. Every refusal is
-    logged once -- the indexer-sharding bug this superseded cost four weeks
-    because its refusal was silent.
+    logged once, because a silent refusal looks the same as the feature running.
     """
-    if not _dsa_token_shard_flag():
+    if not envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.get():
         return None
     cached = getattr(forward_batch, "npu_dsa_token_shard_plan", _MISSING)
     if cached is not _MISSING:
         return cached
-    plan = _build_dsa_token_shard_plan(forward_batch, index_topk)
+    plan = _build_dsa_token_shard_plan(forward_batch)
     forward_batch.npu_dsa_token_shard_plan = plan
     return plan
 
 
-def _build_dsa_token_shard_plan(
-    forward_batch, index_topk=None
-) -> Optional[DsaTokenShardPlan]:
+def _build_dsa_token_shard_plan(forward_batch) -> Optional[DsaTokenShardPlan]:
     parallel = get_parallel()
     if parallel.attn_tp_size <= 1:
         print_info_once("DSA token-shard is off: attention TP size is 1")
@@ -134,14 +90,8 @@ def _build_dsa_token_shard_plan(
         print_info_once("DSA token-shard is off: DCP all-gathers the attention query")
         return None
 
-    mode = forward_batch.forward_mode
-    if not mode.is_extend():
-        return None
-    if mode.is_draft_extend_v2() or mode.is_target_verify():
-        print_info_once(
-            f"DSA token-shard is off for {mode}: the draft and verify paths carry "
-            "their own per-step sequence-length tables, which this does not build"
-        )
+    # The same modes the indexer query shard admits.
+    if forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED):
         return None
 
     if get_attn_tp_context().input_scattered:
@@ -166,21 +116,6 @@ def _build_dsa_token_shard_plan(
         parallel.attn_tp_size,
         parallel.attn_tp_rank,
     )
-    num_requests = sum(1 for n in extend_lens if n > 0)
-    # Evaluated even for one request: dcp_crop_free_extend caches its answer on
-    # the batch and the first caller's index_topk wins, and this is the caller
-    # that holds the real one.
-    lift_applies = _dsa_token_shard_multi_request_flag() and dcp_crop_free_extend(
-        forward_batch, index_topk
-    )
-    if num_requests > 1 and not lift_applies:
-        print_info_once(
-            f"DSA token-shard is off for multi-request extends ({num_requests} "
-            "requests here). SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_MULTI_REQUEST "
-            "lifts this"
-        )
-        return None
-
     if plan.num_tokens < parallel.attn_tp_size:
         print_info_once(
             f"DSA token-shard is off for batches under {parallel.attn_tp_size} "
@@ -198,24 +133,23 @@ def _build_dsa_token_shard_plan(
     return plan
 
 
-def dsa_token_shard_cumulative_lens(
+def dsa_token_shard_cumulative_query_lens(
     forward_batch: "ForwardBatch", plan: DsaTokenShardPlan, device: torch.device
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(cumulative query lens, cumulative key lens)`` as int32 device tensors,
-    built once per forward. Per layer it was 156 blocking H2D copies a forward."""
-    cached = getattr(forward_batch, "npu_dsa_token_shard_cu_lens", None)
+) -> torch.Tensor:
+    """Cumulative query lengths as an int32 device tensor, built once per
+    forward rather than per layer: each build is a blocking H2D copy."""
+    cached = getattr(forward_batch, "npu_dsa_token_shard_cu_query_lens", None)
     if cached is None:
-        cached = (
-            torch.tensor(cumulative(plan.query_lens), dtype=torch.int32, device=device),
-            torch.tensor(cumulative(plan.key_lens), dtype=torch.int32, device=device),
+        cached = torch.tensor(
+            cumulative(plan.query_lens), dtype=torch.int32, device=device
         )
-        forward_batch.npu_dsa_token_shard_cu_lens = cached
+        forward_batch.npu_dsa_token_shard_cu_query_lens = cached
     return cached
 
 
 def dsa_token_shard_slice(x: torch.Tensor, plan: DsaTokenShardPlan) -> torch.Tensor:
-    """This rank's ``plan.rows`` rows, zero-padded at the tail: every rank must
-    hand the all-to-all the same row count."""
+    """This rank's ``plan.rows`` rows, zero-padded at the tail to the row count
+    the query has after the all-to-all."""
     sliced = x[plan.local_start : plan.local_end]
     missing = plan.rows - sliced.shape[0]
     if missing <= 0:
@@ -257,8 +191,7 @@ def dsa_token_shard_restore_tokens(
 
     ``num_rows`` must be the width handed to the redistribute: a width that
     arrived padded must leave padded, or the next layer's KV write indexes a
-    narrower tensor than its slot map. Required, because defaulting it is what
-    broke this. Rows past ``num_tokens`` are zeroed -- the operator never wrote
+    narrower tensor than its slot map. Rows past ``num_tokens`` are zeroed -- the operator never wrote
     them, and untouched device memory can be NaN.
     """
     parallel = get_parallel()
