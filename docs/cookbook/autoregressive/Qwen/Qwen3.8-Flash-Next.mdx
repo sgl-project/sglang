@@ -225,93 +225,20 @@ Use this single-GPU, aggregated TP1/EP1 configuration for long-context, multi-tu
 
 This serving configuration comes from [InferenceX #3816](https://github.com/SemiAnalysisAI/InferenceX/pull/3816). [Run 37714835620, attempt 1](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/37714835620) passed concurrency 1, 2, 4, 8, 16, 32, 48 and 64 on commit `e67ca6fc9ecf4cd57f27654bda8a3e9059923820`. Its [matching GSM8K eval](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/37714835620/job/113109083376) used real verification and scored 97.35% on 1,319 questions.
 
-The throughput sweep used InferenceX's simulated acceptance; the command below uses normal MTP verification and does not claim those throughput numbers for production traffic.
+The throughput sweep used InferenceX's simulated acceptance; the generated command uses normal MTP verification and does not claim those throughput numbers for production traffic.
 
 #### Prerequisites and memory budget
 
 - Use a Linux ARM64 GB300 host with Docker, NVIDIA Container Toolkit, and a driver compatible with the image's CUDA 13.0 runtime. See [Docker installation](/docs/get-started/install#method-3-using-docker).
-- Reserve one GB300 GPU. The command selects GPU 0 and keeps TP, PP, DP and EP at 1.
+- Reserve one GB300 GPU. The recipe keeps TP, PP, DP and EP at 1.
 - Budget 224 GiB of CPU memory for the combined target/draft KV and Mamba HiCache host pool, plus approximately 48 GiB for the offloaded FP8 PLE table and additional headroom for checkpoint loading and host processes. `--hicache-size` sets the combined cache budget; it is separate from PLE weight offload. Keep sufficient free host memory for both.
-- The named Docker volume retains downloaded model files across restarts. The image digest and both target/draft checkpoint revisions are pinned to the validated configuration.
+- The Docker command mounts your Hugging Face cache to retain downloaded model files across restarts. The image digest and both target/draft checkpoint revisions are pinned to the validated configuration.
 
-#### Launch the server
+#### Generate the launch command
 
-<Accordion title="GB300 TP1 launch (Docker)">
+In the [Deployment panel](#deployment), select **GB300 → NVFP4 (NVDA) → Low Latency → Single Node**, and leave **PLE Offload** at **Auto** or **On**. The matched cell includes all five serving environment variables and the full argument set, including ReplaySSM, HiCache and pinned PLE offload. Choose **Docker** to use the pinned image, or **Python** for a matching local installation. Changing PLE Offload to **Off** produces an unverified configuration.
 
-```bash Command
-docker run --rm \
-  --gpus device=0 \
-  --network host \
-  --ipc host \
-  --ulimit memlock=-1 \
-  --mount type=volume,source=qwen38-model-cache,target=/root/.cache/huggingface \
-  -e PYTHONNOUSERSITE=1 \
-  -e PYTHONUNBUFFERED=1 \
-  -e NO_COLOR=1 \
-  -e SGLANG_TIMEOUT_KEEP_ALIVE=1800 \
-  -e SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE=0 \
-  lmsysorg/sglang:v0.5.21-cu130@sha256:1f176b3a1dd1205d2a462ab80ea9fc17769a32e53cb6f3c690efa2dc2c384977 \
-  sglang serve \
-  --model-path nvidia/Qwen3.8-Flash-Next-NVFP4 \
-  --served-model-name nvidia/Qwen3.8-Flash-Next-NVFP4 \
-  --revision fc694b54fb0174e0913e6adf86691ef85a4ead47 \
-  --speculative-draft-model-revision fc694b54fb0174e0913e6adf86691ef85a4ead47 \
-  --trust-remote-code \
-  --quantization modelopt_mixed \
-  --context-length 262144 \
-  --tensor-parallel-size 1 \
-  --pipeline-parallel-size 1 \
-  --data-parallel-size 1 \
-  --expert-parallel-size 1 \
-  --attention-backend trtllm_mha \
-  --linear-attn-prefill-backend flashinfer \
-  --linear-attn-decode-backend flashinfer \
-  --linear-attn-verify-backend triton \
-  --mamba-ssm-dtype bfloat16 \
-  --mamba-radix-cache-strategy extra_buffer_lazy \
-  --mamba-track-interval 256 \
-  --max-mamba-cache-size 480 \
-  --mem-fraction-static 0.88 \
-  --max-running-requests 96 \
-  --page-size 64 \
-  --chunked-prefill-size 16384 \
-  --max-prefill-tokens 16384 \
-  --moe-runner-backend flashinfer_trtllm \
-  --moe-a2a-backend none \
-  --disable-shared-experts-fusion \
-  --speculative-algorithm NEXTN \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --speculative-moe-runner-backend flashinfer_trtllm \
-  --enable-linear-replayssm-spec \
-  --cuda-graph-backend-prefill disabled \
-  --cuda-graph-backend-decode full \
-  --cuda-graph-max-bs-decode 96 \
-  --cuda-graph-bs-decode 1 2 4 8 16 24 32 40 48 56 64 72 80 88 96 \
-  --kv-cache-dtype bfloat16 \
-  --speculative-draft-kv-cache-dtype bfloat16 \
-  --enable-hierarchical-cache \
-  --hicache-size 224 \
-  --hicache-io-backend kernel \
-  --hicache-mem-layout page_first \
-  --hicache-write-policy write_back \
-  --ple-offload-embedding \
-  --ple-offload-backend pinned \
-  --enable-metrics \
-  --enable-cache-report \
-  --reasoning-parser auto \
-  --tokenizer-worker-num 1 \
-  --scheduler-recv-interval 1 \
-  --decode-log-interval 10 \
-  --stream-interval 20 \
-  --watchdog-timeout 1800 \
-  --random-seed 35 \
-  --host 0.0.0.0 \
-  --port 30000
-```
-
-</Accordion>
+The Docker wrapper comes from the shared command builder and is adapted from the validated Slurm/Enroot launch; it has not been run separately on a GB300 host. Use the command generated by the panel rather than a separate static copy.
 
 <Accordion title="Reference startup output">
 
