@@ -54,6 +54,7 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.dcp.dsa import dcp_localize_write_loc
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
@@ -4818,7 +4819,7 @@ class MLATokenToKVPool(KVCache):
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             set_mla_kv_buffer_triton_fp8_quant(
                 dst_buffer,
-                loc,
+                dcp_localize_write_loc(loc),
                 cache_k_nope,
                 cache_k_rope,
                 fp8_dtype,

@@ -762,6 +762,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Decode context parallel KV write mask.
     dcp_kv_mask: Optional[torch.Tensor] = None
+    # DSA + DCP prefill attends owned top-k slots + LSE merge, like decode.
+    dcp_owned_prefill: bool = False
+    # DSA + DCP gathered-KV prefill: each rank scores 1/W of the indexer rows.
+    dcp_split_indexer: bool = False
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None

@@ -983,6 +983,8 @@ def _sparse_mla_reduce_kernel(
     ACTIVE_SPLITS_POW2: tl.constexpr,
     D_CHUNK: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    lse_out_ptr=None,  # [seq, H] fp32 natural-log LSE; written when STORE_LSE
+    STORE_LSE: tl.constexpr = False,
 ):
     """Reduce split-K partials via log-space combine. grid=(seq, H, d_v_chunks)."""
     t = tl.program_id(0)
@@ -1028,6 +1030,11 @@ def _sparse_mla_reduce_kernel(
         out.to(tl.bfloat16),
         mask=d_mask,
     )
+    if STORE_LSE:
+        if dc == 0:
+            # Partials are base-2 over log2(e)-scaled scores; * ln(2) is base-e.
+            lse = (lse_max + tl.log2(tl.maximum(w_sum, 1.0e-30))) * 0.6931471805599453
+            tl.store(lse_out_ptr + t * H + h, lse)
 
 
 def _triton_sparse_mla_fwd_splitk(

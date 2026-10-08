@@ -1094,6 +1094,7 @@ class DeepseekMLARocmForwardMixin:
         """
         return (
             _use_aiter_gfx95
+            and not get_parallel().dcp_enabled  # DCP takes the gathered-Q path
             and self.current_attention_backend in ("dsa", "nsa")
             and (
                 get_exec().kernel.dsa_decode_backend in ("tilelang", "triton")

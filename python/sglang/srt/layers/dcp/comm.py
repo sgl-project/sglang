@@ -519,12 +519,19 @@ def dcp_a2a_lse_reduce(
         send_words[:, :, :, D // lpd],
     )
 
-    # Transport as raw bytes (uint8): the output may be fp8 (fp8 KV cache),
-    # which pynccl's dtype enum can't send; byte a2a is exact for equal chunks.
-    cp_group.all_to_all_single(
-        recv_combined.reshape(-1).view(torch.uint8),
-        send_combined.reshape(-1).view(torch.uint8),
-    )
+    if _is_hip and out_dtype in (torch.bfloat16, torch.float16):
+        # ROCm: RCCL a2a latency dominates small decode messages; the aiter
+        # custom all-gather is much faster even though it moves W x the bytes.
+        recv_combined = cp_group.all_gather(send_combined, dim=0).view(
+            (N,) + send_combined.shape
+        )[:, cp_group.rank_in_group]
+    else:
+        # Transport as raw bytes (uint8): the output may be fp8 (fp8 KV cache),
+        # which pynccl's dtype enum can't send; byte a2a is exact for equal chunks.
+        cp_group.all_to_all_single(
+            recv_combined.reshape(-1).view(torch.uint8),
+            send_combined.reshape(-1).view(torch.uint8),
+        )
 
     recv_output = recv_combined[:, :B, :, :D]
     recv_lse = recv_combined.view(torch.float32)[:, :B, :, D // lpd]

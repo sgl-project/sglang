@@ -423,11 +423,15 @@ class KVCacheConfigurator:
     # Note(kpham-sgl):
     # 1. A replicated draft indexes the allocator's virtual locs raw, so its pools
     #    span and page that space; the sharded target translates and stays per-rank.
+    #    A DSA draft runs under DCP itself and shards like the target.
     # 2. A pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
         dcp_size = get_parallel().attn_dcp_size
-        return dcp_size if (self.is_draft_worker and dcp_size > 1) else 1
+        replicated_draft = self.is_draft_worker and not is_deepseek_dsa(
+            self.model_config.hf_config
+        )
+        return dcp_size if (replicated_draft and dcp_size > 1) else 1
 
     @property
     def pool_page_size(self) -> int:
@@ -442,7 +446,7 @@ class KVCacheConfigurator:
             full_max_total_num_tokens = config.full_max_total_num_tokens
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
-        # Draft pools are replicated, not DCP-sharded, yet consume the shared
+        # Replicated draft pools are not DCP-sharded, yet consume the shared
         # allocator's virtual locs in [0, max_total * dcp_size) untranslated.
         loc_scale = self.loc_space_scale
         max_total_num_tokens *= loc_scale

@@ -95,11 +95,13 @@ def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
     return (
         forward_batch.forward_mode.is_decode()
         or forward_batch.forward_mode.is_target_verify()
+        or forward_batch.forward_mode.is_draft_extend_v2()
+        or forward_batch.dcp_owned_prefill
     )
 
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
-    return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
+    return attention_backend in {"flashmla", "cutedsl_mla", "aiter", "dsa", "nsa"}
 
 
 if _is_cuda:

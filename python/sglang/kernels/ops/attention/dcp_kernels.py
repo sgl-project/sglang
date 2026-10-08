@@ -193,6 +193,208 @@ def update_kv_lens_and_indices(
 
 
 # ---------------------------------------------------------------------------
+# Sparse (DSA) decode: this rank's share of a widened top-k slot table.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _dcp_compact_owned_slots_kernel(
+    table_ptr,  # [bs, topk] widened slots, -1 = invalid
+    out_ptr,  # [bs, topk] local rows, owned first, -1 tail
+    len_ptr,  # [bs] number of owned slots
+    table_stride,
+    topk: tl.constexpr,
+    TOPK_POW2: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+):
+    b = tl.program_id(0)
+    offs = tl.arange(0, TOPK_POW2)
+    in_range = offs < topk
+    slot = tl.load(table_ptr + b * table_stride + offs, mask=in_range, other=-1)
+    owned = (slot >= 0) & (slot % DCP_SIZE == DCP_RANK)
+    dst = tl.cumsum(owned.to(tl.int32), axis=0) - 1
+    n = tl.sum(owned.to(tl.int32), axis=0)
+    tl.store(out_ptr + b * topk + dst, (slot // DCP_SIZE).to(tl.int32), mask=owned)
+    tl.store(out_ptr + b * topk + offs, -1, mask=in_range & (offs >= n))
+    tl.store(len_ptr + b, n)
+
+
+def dcp_compact_owned_slots(
+    table: torch.Tensor, dcp_size: int, dcp_rank: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Widened [bs, topk] slot table -> (local rows packed to the front, counts).
+
+    Owner rule: slot % dcp_size == dcp_rank, local row = slot // dcp_size. Score
+    order is kept; the tail past each row's count is -1.
+    """
+    if table.stride(1) != 1:
+        table = table.contiguous()
+    bs, topk = table.shape
+    out = torch.empty((bs, topk), dtype=torch.int32, device=table.device)
+    lens = torch.empty((bs,), dtype=torch.int32, device=table.device)
+    if bs > 0:
+        _dcp_compact_owned_slots_kernel[(bs,)](
+            table,
+            out,
+            lens,
+            table.stride(0),
+            topk=topk,
+            TOPK_POW2=triton.next_power_of_2(topk),
+            DCP_SIZE=dcp_size,
+            DCP_RANK=dcp_rank,
+        )
+    return out, lens
+
+
+@triton.jit
+def _dcp_topk_pack_kernel(
+    logits_ptr,
+    idx_ptr,
+    len_ptr,
+    row_start_ptr,
+    send_ptr,
+    send_int_ptr,
+    logits_stride,
+    idx_stride,
+    rows,
+    topk: tl.constexpr,
+    BLOCK: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    HAS_ROW_START: tl.constexpr,
+):
+    b = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    in_range = offs < topk
+    idx = tl.load(idx_ptr + b * idx_stride + offs, mask=in_range, other=-1)
+    valid = (idx >= 0) & (idx < tl.load(len_ptr + b))
+    col = idx
+    if HAS_ROW_START:
+        col = idx + tl.load(row_start_ptr + b)
+    score = tl.load(
+        logits_ptr + b.to(tl.int64) * logits_stride + col,
+        mask=in_range & valid,
+        other=float("-inf"),
+    )
+    gid = tl.where(valid, idx * DCP_SIZE + DCP_RANK, -1)
+    tl.store(send_ptr + b.to(tl.int64) * topk + offs, score, mask=in_range)
+    tl.store(send_int_ptr + (rows + b).to(tl.int64) * topk + offs, gid, mask=in_range)
+
+
+def dcp_topk_pack(
+    logits: torch.Tensor,
+    local_idx: torch.Tensor,
+    local_lens: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+    row_starts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Local top-k -> [2, rows, topk] fp32 send plane: (score, global pos as int32 bits).
+
+    Invalid picks get score -inf and position -1; global pos = local * W + rank.
+    ``local_idx`` is relative to ``row_starts`` (packed prefill logits) when given.
+    """
+    rows, topk = local_idx.shape
+    send = torch.empty((2, rows, topk), dtype=torch.float32, device=logits.device)
+    if rows > 0:
+        block = min(1024, triton.next_power_of_2(topk))
+        _dcp_topk_pack_kernel[(rows, triton.cdiv(topk, block))](
+            logits,
+            local_idx,
+            local_lens,
+            row_starts if row_starts is not None else local_lens,
+            send,
+            send.view(torch.int32),
+            logits.stride(0),
+            local_idx.stride(0),
+            rows,
+            topk=topk,
+            BLOCK=block,
+            DCP_SIZE=dcp_size,
+            DCP_RANK=dcp_rank,
+            HAS_ROW_START=row_starts is not None,
+        )
+    return send
+
+
+@triton.jit
+def _dcp_topk_gather_scores_kernel(
+    recv_ptr,
+    scores_ptr,
+    rows,
+    topk: tl.constexpr,
+    BLOCK: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+):
+    b = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    in_range = col < DCP_SIZE * topk
+    src = col // topk
+    score = tl.load(
+        recv_ptr + (src * 2 * rows + b).to(tl.int64) * topk + col % topk,
+        mask=in_range,
+    )
+    tl.store(scores_ptr + b.to(tl.int64) * DCP_SIZE * topk + col, score, mask=in_range)
+
+
+@triton.jit
+def _dcp_topk_finalize_kernel(
+    recv_ptr,
+    recv_int_ptr,
+    pick_ptr,
+    out_ptr,
+    pick_stride,
+    rows,
+    topk: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    b = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    in_range = offs < topk
+    pick = tl.load(
+        pick_ptr + b.to(tl.int64) * pick_stride + offs, mask=in_range, other=-1
+    )
+    ok = in_range & (pick >= 0)
+    pick = tl.where(ok, pick, 0)
+    base = ((pick // topk) * 2 * rows + b).to(tl.int64) * topk + pick % topk
+    score = tl.load(recv_ptr + base, mask=ok, other=float("-inf"))
+    gid = tl.load(recv_int_ptr + base + rows * topk, mask=ok, other=-1)
+    tl.store(
+        out_ptr + b.to(tl.int64) * topk + offs,
+        tl.where(ok & (score > float("-inf")), gid, -1),
+        mask=in_range,
+    )
+
+
+def dcp_topk_merge(recv: torch.Tensor, dcp_size: int, topk_func) -> torch.Tensor:
+    """All-gathered [W * 2, rows, topk] send planes -> global top-k positions (-1 padded)."""
+    _, rows, topk = recv.shape
+    recv = recv.contiguous()
+    width = dcp_size * topk
+    scores = torch.empty((rows, width), dtype=torch.float32, device=recv.device)
+    out = torch.empty((rows, topk), dtype=torch.int32, device=recv.device)
+    if rows == 0:
+        return out
+    block = 1024
+    _dcp_topk_gather_scores_kernel[(rows, triton.cdiv(width, block))](
+        recv, scores, rows, topk=topk, BLOCK=block, DCP_SIZE=dcp_size
+    )
+    lens = torch.full((rows,), width, dtype=torch.int32, device=recv.device)
+    pick = topk_func(scores, lens, topk)
+    block = min(1024, triton.next_power_of_2(topk))
+    _dcp_topk_finalize_kernel[(rows, triton.cdiv(topk, block))](
+        recv,
+        recv.view(torch.int32),
+        pick,
+        out,
+        pick.stride(0),
+        rows,
+        topk=topk,
+        BLOCK=block,
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Partial-attention LSE correction (PR #14194, MLA path).
 # ---------------------------------------------------------------------------
 @triton.jit
