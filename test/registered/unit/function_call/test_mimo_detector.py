@@ -31,9 +31,7 @@ def make_search_tool() -> Tool:
 
 def mimo_call(name: str, **params: str) -> str:
     body = "".join(f"<parameter={k}>{v}</parameter>\n" for k, v in params.items())
-    return (
-        "<tool_call>\n" f"<function={name}>\n" f"{body}" "</function>\n" "</tool_call>"
-    )
+    return f"<tool_call>\n<function={name}>\n{body}</function>\n</tool_call>"
 
 
 class TestMiMoDetectorStringCoercion(unittest.TestCase):
