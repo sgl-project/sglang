@@ -49,7 +49,7 @@ enum BreakerOutcome {
     /// A real fault (5xx other than backpressure) → `record_failure`: count
     /// toward opening.
     Failure,
-    /// Backpressure or router-side stream expiry →
+    /// Backpressure or a router-side stream expiry or abort →
     /// `record_backpressure`: never opens the breaker and, while Closed, leaves
     /// an in-progress failure streak intact — but still resolves a half-open
     /// probe so a recovered-but-busy worker isn't wedged shut.
@@ -85,13 +85,13 @@ fn breaker_outcome(status: reqwest::StatusCode) -> BreakerOutcome {
     }
 }
 
-/// Router-side expiry says nothing about worker health. Preserve the existing
+/// Router-side expiry or abort says nothing about worker health. Preserve the existing
 /// treatment of completed streams and client disconnects; upstream faults,
 /// idle timeouts, and pump panics remain failures.
 fn stream_breaker_outcome(end: sse::StreamEnd) -> BreakerOutcome {
     use sse::StreamEndReason;
     match end.reason {
-        StreamEndReason::Expired => BreakerOutcome::Neutral,
+        StreamEndReason::Expired | StreamEndReason::Aborted => BreakerOutcome::Neutral,
         StreamEndReason::Completed | StreamEndReason::ClientDisconnect => BreakerOutcome::Success,
         StreamEndReason::UpstreamError
         | StreamEndReason::IdleTimeout
@@ -109,8 +109,10 @@ pub struct Proxy {
     /// is used only for workers whose `/server_info` reported `--enable-http2`
     /// on a cleartext URL.
     h2c_client: Client,
-    /// Wall-clock timeout applied to non-streaming upstream requests. Streaming
-    /// requests deliberately do not use this (long generations are valid).
+    /// Wall-clock timeout for a non-streaming upstream request, and for a
+    /// streaming one's response headers, which SGLang's chat endpoint sends with
+    /// the first token. A stream's body is not bounded by it
+    /// (long generations are valid), only by the idle and stale-request limits.
     pub request_timeout: Duration,
     /// Maximum silence between streamed upstream chunks; `None` waits forever.
     pub stream_idle_timeout: Option<Duration>,
@@ -134,7 +136,7 @@ fn build_client(protocol: WireProtocol) -> Result<Client, anyhow::Error> {
 
 impl Proxy {
     /// Build a proxy. `request_timeout` is the per-request wall-clock budget for
-    /// non-streaming forwards. Connect timeout is hard-coded to 5 s — even a
+    /// non-streaming forwards and for streaming response headers. Connect timeout is hard-coded to 5 s — even a
     /// streaming request fails fast at TCP setup if the worker is unreachable.
     ///
     /// WHY both clients up front: protocol is a per-worker property resolved
@@ -314,6 +316,7 @@ impl Proxy {
         on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
         on_stream_end: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>>,
         expiration: Option<CancellationToken>,
+        stream_abort: Option<CancellationToken>,
     ) -> Result<Response<Body>, ApiError> {
         let permit = breaker.acquire().ok_or_else(|| ApiError::BreakerOpen {
             worker: worker_url.to_string(),
@@ -333,10 +336,18 @@ impl Proxy {
             .header("accept", "text/event-stream");
         let mut abort =
             AbortOnDrop::new(self.client_for(protocol), &worker_url, headers, abort_rid);
-        let resp = req.send().await.map_err(|e| {
-            breaker.record_failure();
-            Self::classify_reqwest_error_for(worker_url.clone(), e, path)
-        })?;
+        // A worker that never answers is a fault, unlike a long stream once it answers.
+        let resp = match tokio::time::timeout(self.request_timeout, req.send()).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                breaker.record_failure();
+                return Err(Self::classify_reqwest_error_for(worker_url, e, path));
+            }
+            Err(_) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamTimeout { worker: worker_url });
+            }
+        };
         let status = resp.status();
         if !status.is_success() {
             abort.disarm();
@@ -410,6 +421,7 @@ impl Proxy {
             sse::StreamLimits {
                 idle_timeout: self.stream_idle_timeout,
                 expiration,
+                abort: stream_abort.filter(|_| status.is_success()),
             },
         );
         let mut out = Response::new(body);
@@ -495,6 +507,7 @@ mod tests {
                 "/chat",
                 &headers,
                 Bytes::new(),
+                None,
                 None,
                 None,
                 None,
@@ -604,6 +617,7 @@ mod tests {
                 None,
                 None,
                 expiration,
+                None,
             )
             .await
             .unwrap();
@@ -838,6 +852,7 @@ mod tests {
                     "/v1/chat/completions",
                     &headers,
                     Bytes::from_static(b"{}"),
+                    None,
                     None,
                     None,
                     None,

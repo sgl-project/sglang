@@ -12,9 +12,9 @@ import { config } from '/src/snippets/configs/Qwen/qwen-image-2.1.jsx';
 
 ## 1. Quick start
 
-Install the runtime dependencies with `uv pip install "sglang[diffusion]" --prerelease=allow`,
-then install this integration from its source checkout with
-`uv pip install -e "python[diffusion]"`. The picker uses `Qwen/Qwen-Image-2.1`;
+Use a nightly Docker image containing this integration, or install from source,
+following the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+Run the commands below inside that environment. The picker uses `Qwen/Qwen-Image-2.1`;
 you can also set a local checkpoint directory under **Variables**. The recipes
 target NVIDIA CUDA on Linux; the picker marks which single-GPU workloads have
 been verified with the full checkpoint.
@@ -187,9 +187,15 @@ text prompt; precomputed embeddings alone are insufficient.
 - **Memory:** use the hardware's recommended placement. **All components
   layerwise** also streams encoder and VAE blocks, trading transfers for lower
   device memory.
-- **VAE:** full-image decoding is the default. Tiling can change pixels near
-  boundaries. With two or more GPUs, **Spatial shard** distributes full-image
-  decoding without enabling tiling; floating-point rounding can still differ.
+- **VAE:** full-image decoding is the default except on AMD gfx1151 (Strix Halo).
+  Tiling can change pixels near boundaries. With two or more GPUs, **Spatial shard**
+  distributes full-image decoding without enabling tiling; floating-point
+  rounding can still differ.
+
+On gfx1151, VAE tiling defaults to enabled to avoid reported full-frame decode
+hangs at 896px and higher. Explicit CLI, pipeline config, and Python API settings
+take precedence: `--vae-tiling false` disables tiling but may encounter the hang.
+Defaults on NVIDIA CUDA and other platforms are unchanged.
 
 See the [performance guide](/docs/sglang-diffusion/performance-optimization)
 for shared runtime options.
@@ -208,8 +214,10 @@ features below. Functional checks do not establish quality for lossy settings.
   multi-rank roles remain unverified for this model.
 - **Quantized exports:** serialized FP8, native-name Q4_0 GGUF, and calibrated
   ModelOpt NVFP4 component exports were checked on B200, including TP2 with
-  encoder folding and separate offload checks. These results do not establish
-  support for arbitrary community exports, other GGUF types, or other hardware.
+  encoder folding and separate offload checks. A community ComfyUI-GGUF Q4_K_M
+  DiT, which also quantizes the projections outside the blocks, was checked for
+  text-to-image on one RTX 5090. These results do not establish support for
+  arbitrary community exports, other GGUF types, or other hardware.
   The NVFP4 export used six calibration requests; assess image and alpha quality
   on your workload.
 - **LoRA:** synthetic Diffusers-format adapters were checked on one B200 and
