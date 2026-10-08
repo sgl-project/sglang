@@ -58,6 +58,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
 from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
 )
+from sglang.srt.layers import dsv41_mhc_sp as mhc_sp
 from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
@@ -2764,8 +2765,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         self.attn_hc: Optional[mhc.HcSubLayer] = None
         self.ffn_hc: Optional[mhc.HcSubLayer] = None
-        self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
-        self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
+        self._hc_attn_tf32_stack = self._hc_ffn_tf32_stack = None
+        self._hc_attn_bf16_stack = self._hc_ffn_bf16_stack = None
         self._init_hyper_connections()
         self._next_layer: Optional[DeepseekV4DecoderLayer] = None
         self.local_boundary: Optional[mhc.HcNextBoundary] = None
@@ -2778,6 +2779,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 engram_layout,
                 quant_config=quant_config,
                 prefix=add_prefix("engram", prefix),
+                # The seam ends at this layer's attention input norm.
+                next_norm=self.input_layernorm,
             )
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
@@ -2819,8 +2822,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_attn_scale,
             self.hc_attn_base,
             self.input_layernorm,
-            self._hc_attn_tf32_parts,
-            self._hc_attn_bf16_parts,
+            self._hc_attn_tf32_stack,
+            self._hc_attn_bf16_stack,
         )
         self.ffn_hc = mhc.HcSubLayer(
             self.hc_cfg,
@@ -2828,8 +2831,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_scale,
             self.hc_ffn_base,
             self.post_attention_layernorm,
-            self._hc_ffn_tf32_parts,
-            self._hc_ffn_bf16_parts,
+            self._hc_ffn_tf32_stack,
+            self._hc_ffn_bf16_stack,
         )
 
     def _init_boundaries(self) -> None:
@@ -2861,8 +2864,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
         # The original FP32 parameters stay intact for small rows and invariant mode.
-        self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
-        self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
+        self._hc_attn_tf32_stack = self._hc_ffn_tf32_stack = None
+        self._hc_attn_bf16_stack = self._hc_ffn_bf16_stack = None
         if (
             self.hc_pre_from_prev_sublayer
             and (get_platform().is_sm100 or get_platform().is_sm90)
@@ -2873,32 +2876,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         ):
             from sglang.kernels.ops.layernorm.mhc import split_bf16_hc_weight
 
-            if get_platform().is_sm90:
-                # Hopper's compensated projection does not require DeepGEMM.
-                self._hc_attn_bf16_parts = split_bf16_hc_weight(self.hc_attn_fn.data)
-                self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
-            else:
+            self._hc_attn_bf16_stack = split_bf16_hc_weight(self.hc_attn_fn.data)
+            self._hc_ffn_bf16_stack = split_bf16_hc_weight(self.hc_ffn_fn.data)
+            # Hopper never takes the tf32 path, so it skips those splits; the
+            # runtime consumer calls the DeepGEMM fork's tf32_hc_prenorm_gemm.
+            if not get_platform().is_sm90:
                 from sglang.kernels.ops.layernorm.mhc import split_tf32_hc_weight
-                from sglang.srt.layers.deep_gemm_wrapper.configurer import (
-                    ENABLE_JIT_DEEPGEMM,
-                )
 
-                if ENABLE_JIT_DEEPGEMM:
-                    import deep_gemm
-
-                    if callable(getattr(deep_gemm, "tf32_hc_prenorm_gemm", None)):
-                        self._hc_attn_tf32_parts = split_tf32_hc_weight(
-                            self.hc_attn_fn.data
-                        )
-                        self._hc_ffn_tf32_parts = split_tf32_hc_weight(
-                            self.hc_ffn_fn.data
-                        )
-                        self._hc_attn_bf16_parts = split_bf16_hc_weight(
-                            self.hc_attn_fn.data
-                        )
-                        self._hc_ffn_bf16_parts = split_bf16_hc_weight(
-                            self.hc_ffn_fn.data
-                        )
+                self._hc_attn_tf32_stack = split_tf32_hc_weight(self.hc_attn_fn.data)
+                self._hc_ffn_tf32_stack = split_tf32_hc_weight(self.hc_ffn_fn.data)
         if self.hc_pre_from_prev_sublayer:
             self._init_hyper_connections()
         # The fuse gates and boundaries snapshot load-time facts; weight updates
@@ -3300,10 +3286,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         """The layer's two hyper-connections, each collapsing with the previous one's
         pre-mix. ``seam_open`` is False when the late-layer tail narrows the rows after
         this layer, so nothing precomputed for the next one would still describe it."""
+
         self._init_boundaries()
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
             stats_stream = self.hc_stats_stream
+        sp_rows = mhc_sp.get_active_rows()
+        use_sp = sp_rows is not None
 
         def run_attn_hc(state: mhc.HcState) -> mhc.HcState:
             assert self.attn_hc is not None
@@ -3323,7 +3312,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     positions=positions,
                     forward_batch=forward_batch,
                     x_quant=quantized[0] if quantized else None,
-                    defer_all_reduce=fuse_all_reduce_mhc,
+                    defer_all_reduce=use_sp or fuse_all_reduce_mhc,
                 )
             del x
             return mhc.run_attn_post(
@@ -3351,7 +3340,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 forward_batch,
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
-                return_moe_output=fuse_all_reduce_mhc,
+                return_moe_output=use_sp or fuse_all_reduce_mhc,
             )
             del x
             return mhc.run_moe_post(
@@ -4051,11 +4040,30 @@ class DeepseekV4Model(nn.Module):
         # gate excludes Engram/DSpark-capture layers and the model end.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
-        state = mhc.HcState(hidden_states)
+        sp_rows = mhc_sp.get_active_rows()
+        # Sharded, the entry state owes the first combine an all-gather.
+        state = mhc.HcState(
+            hidden_states,
+            None,
+            # TODO: eliminate first AG in mHC SP
+            mhc.HcSharded(sp_rows) if sp_rows is not None else None,
+        )
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
+                if sp_rows is not None:
+                    # The tail selects rows of the whole batch, which a sharded
+                    # residual cannot serve: the SP region ends here (the input
+                    # shortcut is dropped; the caller's scoped() restores the flag).
+                    state = mhc.HcState(
+                        mhc_sp.gather(state.residual, sp_rows),
+                        None
+                        if state.pre is None
+                        else mhc_sp.gather(state.pre, sp_rows),
+                    )
+                    sp_rows = None
+                    get_forward().set("sp_mhc_rows", None)
                 state = state.take_rows(tail.rows)
                 input_ids, input_ids_global = (
                     tail.rows(input_ids),
@@ -4064,32 +4072,58 @@ class DeepseekV4Model(nn.Module):
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
-            engram = self.layers[i].engram
+            engram: Optional[Engram] = self.layers[i].engram
             if engram is not None:
-                before_engram = state.residual
-                hidden_states = engram(
-                    state.residual,
-                    hash_ids[:, engram.layer_hash_index],
-                    forward_batch,
-                    cp_all_tokens=cp_extend,
-                )
-                # Only multimodal placeholders become image_token_id, so a text-only
-                # batch skips this full-residual where.
+                assert hash_ids is not None
+                layer_hash_ids = hash_ids[:, engram.layer_hash_index]
+                if sp_rows is not None:
+                    # The embed is per row; the sharded residual takes a row slice.
+                    layer_hash_ids = mhc_sp.shard(layer_hash_ids, sp_rows)
+                # Only multimodal placeholders become image_token_id, so a
+                # text-only batch skips the image mask inside engram.
+                ids = None
                 if (
                     self.config.model_type == "deepseek_v41"
                     and self.config.vision_n_layers > 0
                     and forward_batch.contains_mm_inputs()
                 ):
-                    hidden_states = torch.where(
-                        (input_ids == self.config.image_token_id)[:, None, None],
-                        before_engram,
-                        hidden_states,
+                    ids = (
+                        input_ids
+                        if sp_rows is None
+                        else mhc_sp.shard(input_ids, sp_rows)
                     )
-                state = state.with_residual(hidden_states)
+                plan = engram.get_fusion_plan(
+                    state.residual,
+                    state.pre,
+                    sp_rows=sp_rows,
+                    cp_all_tokens=cp_extend,
+                )
+                if plan is not None:
+                    # The attention entry short-circuits on HcNormed.
+                    hidden_states, normed = engram.fused_seam(
+                        state.residual,
+                        layer_hash_ids,
+                        forward_batch,
+                        plan=plan,
+                        pre=state.pre,
+                        ids=ids,
+                    )
+                    state = mhc.HcState(hidden_states, state.pre, mhc.HcNormed(normed))
+                else:
+                    hidden_states = engram(
+                        state.residual,
+                        layer_hash_ids,
+                        forward_batch,
+                        ids=ids,
+                        cp_all_tokens=cp_extend,
+                    )
+                    state = state.with_residual(hidden_states)
             if capture_dspark and i in self.dspark_layers_to_capture:
                 # The draft head reads the attention input of its target layers.
                 aux = state.residual
                 if tail is not None and i < self.late_layer_start:
+                    # A sharded aux cannot take the tail's global row select.
+                    assert sp_rows is None
                     aux = tail.rows(aux)
                 dspark_aux_hidden_states.append(aux.mean(dim=1))
             ctx = (
@@ -4250,6 +4284,18 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        total_rows = input_ids.shape[0]
+        sp_rows = (
+            total_rows
+            if self.hc_pre_from_prev_sublayer
+            and mhc_sp.can_use_sp(forward_batch.forward_mode, total_rows)
+            # CP selects rows of the whole batch, which a sharded residual
+            # cannot serve; the late-layer tail instead ends the SP region early.
+            and not is_cp_active(forward_batch)
+            else None
+        )
+        if sp_rows is not None:
+            mhc_sp.init_workspace()
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -4257,6 +4303,9 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = input_embeds
             from sglang.kernels.ops.layernorm.mhc import hc_broadcast
 
+            if sp_rows is not None:
+                # NOTE: we exchange the order of broadcast and sp-shard
+                hidden_states = mhc_sp.shard(hidden_states, sp_rows)
             hidden_states = hc_broadcast(hidden_states, self.hc_mult)
         else:
             assert pp_proxy_tensors is not None
@@ -4320,15 +4369,23 @@ class DeepseekV4Model(nn.Module):
         tail = None
         if self.hc_pre_from_prev_sublayer:
             assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
-            hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
-                positions,
-                hidden_states,
-                forward_batch,
-                input_ids,
-                input_ids_global,
-                capture_dspark,
-                dspark_aux_hidden_states,
-            )
+            with get_forward().scoped(sp_mhc_rows=sp_rows):
+                hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    input_ids,
+                    input_ids_global,
+                    capture_dspark,
+                    dspark_aux_hidden_states,
+                )
+            # With the tail active the loop already left the SP region.
+            if sp_rows is not None and tail is None:
+                hidden_states = mhc_sp.gather(hidden_states, sp_rows)
+                last_pre = mhc_sp.gather(last_pre, sp_rows)
+                dspark_aux_hidden_states = [
+                    mhc_sp.gather(aux, sp_rows) for aux in dspark_aux_hidden_states
+                ]
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
