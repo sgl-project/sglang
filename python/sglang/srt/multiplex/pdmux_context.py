@@ -22,6 +22,9 @@ class PDMuxConfig:
         default_factory=list
     )  # [prefill_sm, decode_sm, decode_bs_threshold]
     split_forward_token_budget: int = 65536
+    # Zero keeps token-budget-only splitting. A positive cap limits each
+    # prefill segment while any DP rank has decode work.
+    max_split_forward_layers: int = 0
     decode_bs_divisor: int = 36
     # Overlap mode: prefill keeps its green-context SM cap while decode runs on
     # plain full-device streams, so the two SM sets deliberately overlap and the
@@ -90,16 +93,24 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         previous_threshold = threshold
 
     split_forward_token_budget = raw.get("split_forward_token_budget", 65536)
+    max_split_forward_layers = raw.get("max_split_forward_layers", 0)
     decode_bs_divisor = raw.get("decode_bs_divisor", 36)
     if split_forward_token_budget <= 0:
         raise ValueError("split_forward_token_budget must be positive")
     if decode_bs_divisor <= 0:
         raise ValueError("decode_bs_divisor must be positive")
+    if (
+        not isinstance(max_split_forward_layers, int)
+        or isinstance(max_split_forward_layers, bool)
+        or max_split_forward_layers < 0
+    ):
+        raise ValueError("max_split_forward_layers must be a non-negative integer")
 
     return PDMuxConfig(
         sm_group_num=raw["sm_group_num"],
         manual_divisions=manual_divisions,
         split_forward_token_budget=split_forward_token_budget,
+        max_split_forward_layers=max_split_forward_layers,
         decode_bs_divisor=decode_bs_divisor,
         overlap_decode_full_sm=overlap_decode_full_sm,
     )

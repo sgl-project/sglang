@@ -11,7 +11,10 @@ slice computes logits. A prefill with no decode work executes its remaining laye
 in one call. With decode work, the slice budget divides by the maximum prefill
 token count across attention DP ranks, matching the `layer_split` path of
 `feat/pdmux-standard` at `17761860ccbc6cea53b0c3625fa0c89880b48f9e`.
-There is no additional layer-count cap.
+`max_split_forward_layers` defaults to `0`, preserving this token-budget-only
+policy. A positive value additionally caps each slice while any DP rank has
+decode work; for example, `2` submits at most two layers per slice. It does not
+limit a prefill when there is no global decode work.
 
 Example for a 132-SM GPU (adjust both counts to your actual GPU):
 
@@ -20,6 +23,7 @@ sm_group_num: 3
 manual_divisions:
   - [104, 28, 1]
 split_forward_token_budget: 8192
+max_split_forward_layers: 0
 overlap_decode_full_sm: false
 ```
 
