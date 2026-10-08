@@ -309,13 +309,12 @@ class DeepseekMLAForwardMixin:
             and self._can_fuse_bmm_into_attention(forward_batch)
         )
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
-        # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
+        # weights and skip the per-layer Q all-gather.
         q_replicate_active = (
             get_parallel().dcp_replicate_q_proj
             and is_dcp_mla_decode_phase(forward_batch)
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
-            and self.q_b_proj_qrep_weight is not None
         )
         if q_replicate_active:
             # force standard absorb so the full-head w_kc bmm runs
@@ -386,11 +385,7 @@ class DeepseekMLAForwardMixin:
                 k_nope = k_nope.unsqueeze(1)
                 if q_replicate_active:
                     # full-head Q from the gathered weight (skips Q all-gather)
-                    q = torch.nn.functional.linear(q, self.q_b_proj_qrep_weight).view(
-                        -1,
-                        self.num_local_heads * get_parallel().attn_dcp_size,
-                        self.qk_head_dim,
-                    )
+                    q = self.q_b_proj_replicated_forward(q)
                 else:
                     q = self.q_b_proj_forward(q)
 
@@ -456,13 +451,7 @@ class DeepseekMLAForwardMixin:
                         )
         else:
             if q_replicate_active:
-                q = torch.nn.functional.linear(
-                    hidden_states, self.q_b_proj_qrep_weight
-                ).view(
-                    -1,
-                    self.num_local_heads * get_parallel().attn_dcp_size,
-                    self.qk_head_dim,
-                )
+                q = self.q_b_proj_replicated_forward(hidden_states)
             else:
                 q = self.q_proj(hidden_states)[0].view(
                     -1, self.num_local_heads, self.qk_head_dim
@@ -486,10 +475,8 @@ class DeepseekMLAForwardMixin:
             )
         if q_replicate_active:
             # full-head absorb with the pre-gathered w_kc (q_nope already full-head)
-            q_nope_out = (
-                torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
-                .transpose(0, 1)
-                .contiguous()
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep).transpose(
+                0, 1
             )
         elif getattr(self, "_kimi_split_gguf_kv_b", False):
             from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf

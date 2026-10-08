@@ -2189,6 +2189,7 @@ class DeepseekV2AttentionMLA(
         # pre-CUDA-graph-capture by the model runner; None unless replicate is on.
         self.w_kc_qrep = None
         self.q_b_proj_qrep_weight = None
+        self.q_b_proj_qrep = None
 
         self.w_scale_k = None
         self.w_scale_v = None
@@ -2497,6 +2498,17 @@ class DeepseekV2AttentionMLA(
                 backend=self.fused_a_gemm_backend,
             )
         return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+
+    def q_b_proj_replicated_forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.q_b_proj_qrep is not None:
+            q = self.q_b_proj_qrep.quant_method.apply(self.q_b_proj_qrep, x)
+        else:
+            q = torch.nn.functional.linear(x, self.q_b_proj_qrep_weight)
+        return q.view(
+            -1,
+            self.num_local_heads * get_parallel().attn_dcp_size,
+            self.qk_head_dim,
+        )
 
     def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
         if self._use_min_latency_q_b_gemm is None:
