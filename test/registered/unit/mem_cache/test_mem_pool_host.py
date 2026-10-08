@@ -483,6 +483,8 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
             qk_rope_head_dim=64,
             index_head_dim=128,
             quant_block_size=128,
+            page_size=64,
+            index_page_size=64,
             skip_topk_layers=[False] * 5,
         )
 

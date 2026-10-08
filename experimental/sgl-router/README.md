@@ -254,6 +254,29 @@ In PD mode, decode is ranked by load only. The bootstrap room satisfies
 `room % prefill_dp_size == prefill_rank`, which is how a decode engine finds
 the prefill rank.
 
+### Retries
+
+`--retry-max-attempts N` (default 1, which disables retries; 3 is typical) lets
+a request that fails before any response reaches the client be sent again to a
+worker it has not tried yet. A failure is a transport error, an open circuit
+breaker, a 5xx, a 429, or a timeout: `--request-timeout-secs` bounds a whole
+non-streaming response, and a streaming one until its headers arrive. SGLang's
+chat endpoint sends those headers with the first token, so for streaming chat
+the same flag bounds time to first token, queueing included; raise it for
+long-context or deeply queued fleets. Once a streaming response's 2xx status
+has been sent, it is never retried, and neither is any other 2xx or 4xx. In PD mode the failed
+side is excluded, or both sides when the caller set `rid`, which an engine still
+running it would refuse; a new pair gets a new bootstrap room. Retries share the
+request's `--stale-request-timeout-secs` deadline, and none starts after it. When
+every eligible worker has failed, the client gets the last failure.
+`sgl_router_retries_total` counts the retried attempts.
+
+Each retry first waits out a jittered exponential backoff: a random delay in
+`[d/2, d]`, where `d` starts at `--retry-initial-backoff-ms` (default 50),
+doubles per retry, and is capped at `--retry-max-backoff-ms` (default 2000).
+Set the initial backoff to 0 to retry immediately. A backoff never waits past
+the request's stale deadline.
+
 ### Engines with `--api-key`
 
 The router reads each worker's `/server_info` and `/model_info` to learn its
@@ -489,8 +512,9 @@ embeddings, a PD fleet answers 400 and `--dp-aware` pins no rank.
 
 ## DeepSeek V4
 
-Native V4 rendering follows SGLang's serving path (`serving_chat.py`), not
-Dynamo's OpenAI defaults: all declared tools are rendered with SGLang's schema
+Native V4 rendering comes from `rust/sglang-processor`, shared with SGLang's Rust
+server, and follows SGLang's serving path (`serving_chat.py`), not Dynamo's
+OpenAI defaults: all declared tools are rendered with SGLang's schema
 defaults, reasoning effort comes from `reasoning` / `reasoning_effort`, and the
 official/preview effort profile is detected from the checkpoint's
 `encoding/encoding_dsv4.py` or overridden by `dsv4_reasoning_effort_profile` in

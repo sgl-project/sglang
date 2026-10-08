@@ -73,12 +73,6 @@ class DiffusersGenericPipelineConfig(PipelineConfig):
         """
         return width, height
 
-    def adjust_num_frames(self, num_frames, *, log_adjustment: bool = True):
-        """
-        Pass through - diffusers handles frame count.
-        """
-        return num_frames
-
 
 # Static subclasses for each non-default task type.
 # These exist so that _get_diffusers_model_info() can swap the task_type without

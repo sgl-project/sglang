@@ -15,7 +15,7 @@ eager LingBot chain ``(norm(x) * (1 + scale) + shift).to(dtype)``.
 
 Unlike the bit-exact ``rmsnorm_scale_shift_bitexact`` (ERNIE), this kernel does
 *not* reproduce PyTorch's parallel variance reduction order bit-for-bit, so it
-is intended for the request-gated (``quality="extra-high"``/``"high"``) fusion
+is intended for the request-gated (``quality="lossless"``/``"high"``) fusion
 path, matching the existing quality-gated LingBot RMSNorm fusion.
 """
 
