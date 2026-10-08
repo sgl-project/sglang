@@ -302,9 +302,6 @@ class UpscalerModel:
     def dtype(self) -> torch.dtype:
         return next(self.net.parameters()).dtype
 
-    def _copy_input_to_device(self, frames: np.ndarray) -> torch.Tensor:
-        return torch.from_numpy(frames).to(self.device)
-
     def _preprocess_input_tensor(self, imgs_t: torch.Tensor) -> torch.Tensor:
         imgs_t = imgs_t.permute(0, 3, 1, 2).to(dtype=self.dtype).mul_(1.0 / 255.0)
         if self.device.type == "cuda":
@@ -315,10 +312,6 @@ class UpscalerModel:
     def _postprocess_output_tensor(out: torch.Tensor) -> torch.Tensor:
         out = out.permute(0, 2, 3, 1).clamp(0.0, 1.0).mul_(255.0)
         return out.to(torch.uint8).contiguous()
-
-    @staticmethod
-    def _copy_output_to_host(out: torch.Tensor) -> np.ndarray:
-        return out.cpu().numpy()
 
     def _start_cuda_timer(self):
         if self.device.type != "cuda":
@@ -463,7 +456,7 @@ class UpscalerModel:
 
         start_time = time.perf_counter()
         h2d_timer = self._start_cuda_timer()
-        imgs_t = self._copy_input_to_device(imgs)
+        imgs_t = torch.from_numpy(imgs).to(self.device)
         self._stop_cuda_timer(h2d_timer)
         h2d_wall_duration_s = time.perf_counter() - start_time
 
@@ -501,7 +494,7 @@ class UpscalerModel:
 
         start_time = time.perf_counter()
         output_d2h_timer = self._start_cuda_timer()
-        out_np = self._copy_output_to_host(out)
+        out_np = out.cpu().numpy()
         self._stop_cuda_timer(output_d2h_timer)
         output_d2h_wall_duration_s = time.perf_counter() - start_time
 
