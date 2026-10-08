@@ -156,7 +156,7 @@ def _score_shard_packed(
         # At <=top-k blocks the native selector emits every block without
         # reading scores. In particular, graph padding need not read K.
         score = tl.full((TILE,), 0.0, tl.float32)
-        # scalar branch on the group's longest row; num_blocks restores each row's rule
+        # one branch per group: its longest row decides whether K is read
         group_blocks = tl.cdiv(group_len, 128)
         if (block < group_blocks) & (group_blocks > 16):
             pos = block * 128 + positions
@@ -172,16 +172,15 @@ def _score_shard_packed(
                 mask=token_valid[None, :],
                 other=0.0,
             ).to(q.dtype)
-            # Preserve the baseline's dot orientation and scale order.
+            # same dot orientation and scale order as _score_shard, so scores match exactly
             dot = tl.dot(q, k) * (sm_scale * 1.4426950409 * k_scale)
             dot = tl.where(pos[None, :] < lengths[:, None], dot, float("-inf"))
-            scored = tl.max(dot, 1)
-            scored = tl.where(
+            score = tl.max(dot, 1)
+            score = tl.where(
                 block >= local_start,
                 1e29,
-                tl.where(block < INIT_BLOCKS, 1e30, scored),
+                tl.where(block < INIT_BLOCKS, 1e30, score),
             )
-            score = tl.where(num_blocks > 16, scored, 0.0)
         score = tl.where(valid, score, float("-inf"))
         # Every slot is written on every replay, including empty shards.
         tl.store(
@@ -293,8 +292,8 @@ def score_local_blocks(
 ):
     """Score [world,batch,128] queries through SGLang's token-slot mapping.
 
-    ``packed_queries > 1``: rows come in groups of that many consecutive verify rows of one
-    request (same slot), scored per K block together.
+    With packed_queries > 1, each group of that many consecutive rows belongs to one request
+    and reads each K block once for the whole group.
     """
     world, batch, _ = gathered_q.shape
     blocks = triton.cdiv(max_seqlen, 128)
