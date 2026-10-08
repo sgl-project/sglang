@@ -59,12 +59,13 @@ class SchedulingTraceWriter:
     def record_schedule(self, scheduler: Scheduler, plan: NextBatchPlan) -> None:
         self._step += 1
         batch = plan.batch_to_run
+        batch_reqs = batch.reqs if batch is not None else []
         chunked = scheduler.chunked_req
         record: Dict[str, Any] = {
             "kind": "schedule",
             "step": self._step,
             "mode": _mode_name(batch),
-            "rids": self._labels(batch.reqs if batch is not None else ()),
+            "rids": self._labels(batch_reqs),
         }
         if batch is not None and batch.forward_mode.is_extend():
             record["extend_lens"] = list(batch.extend_lens)
@@ -74,7 +75,16 @@ class SchedulingTraceWriter:
             running=self._labels(plan.running_batch.reqs),
             waiting=self._labels(scheduler.waiting_queue),
             batch_is_full=plan.running_batch.batch_is_full,
-            retracted=self._labels(self._newly_retracted(scheduler.waiting_queue)),
+            retracted=self._labels(
+                self._newly_retracted(
+                    [
+                        *batch_reqs,
+                        *plan.running_batch.reqs,
+                        *scheduler.waiting_queue,
+                        *([chunked] if chunked is not None else []),
+                    ]
+                )
+            ),
             kv_available=scheduler.token_to_kv_pool_allocator.available_size(),
             kv_evictable=scheduler.tree_cache.evictable_size(),
         )
@@ -95,9 +105,12 @@ class SchedulingTraceWriter:
             }
         )
 
-    def _newly_retracted(self, waiting_queue: Iterable) -> List:
+    def _newly_retracted(self, reqs: Iterable) -> List:
+        # A retracted req can be re-admitted in the same plan that first sees
+        # it (e.g. on resume after pause_generation), so look at every req the
+        # record sees, not only the waiting queue.
         retracted = []
-        for req in waiting_queue:
+        for req in reqs:
             if req.retraction_count > self._retraction_counts.get(req.rid, 0):
                 self._retraction_counts[req.rid] = req.retraction_count
                 retracted.append(req)

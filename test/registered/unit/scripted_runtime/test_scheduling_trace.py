@@ -5,11 +5,15 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scripted_runtime.scheduling_trace import (
+    SchedulingTraceWriter,
     diff_trace_dirs,
     first_divergence,
+    load_trace,
     main,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -19,6 +23,40 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 def _schedule(step, **fields):
     return {"kind": "schedule", "step": step, "rids": ["r0"], **fields}
+
+
+class TestSchedulingTraceWriter(CustomTestCase):
+    def test_retraction_seen_after_readmission(self):
+        # pause_generation(retract) skips planning while paused, so the first
+        # plan after resume already re-admits the retracted req into the batch.
+        req = SimpleNamespace(rid="a", retraction_count=0)
+        scheduler = SimpleNamespace(
+            chunked_req=None,
+            waiting_queue=[],
+            token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 8),
+            tree_cache=SimpleNamespace(evictable_size=lambda: 0),
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            forward_mode=ForwardMode.EXTEND,
+            extend_lens=[4],
+            prefix_lens=[9],
+        )
+        plan = SimpleNamespace(
+            batch_to_run=batch,
+            running_batch=SimpleNamespace(reqs=[req], batch_is_full=False),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "t.jsonl")
+            writer = SchedulingTraceWriter(path)
+            writer.record_schedule(scheduler, plan)
+            req.retraction_count = 1
+            writer.record_schedule(scheduler, plan)
+            writer.record_schedule(scheduler, plan)
+            writer.close()
+            records = load_trace(path)
+
+        self.assertEqual([r["retracted"] for r in records], [[], ["r0"], []])
 
 
 class TestFirstDivergence(CustomTestCase):
