@@ -1,0 +1,157 @@
+---
+title: Clef
+description: "Deploy Cloudflare's Clef 27B and Clef Flash 9B decision models with SGLang. Select either variant for BF16 text and image decisions on one NVIDIA B200 or H200."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+Clef support is introduced in [#42721](https://github.com/sgl-project/sglang/pull/42721). Use a build containing that change; v0.5.21 does not include it. Once the PR is merged, use a [nightly build](/docs/get-started/install#nightly-builds) built after the merge until a release includes it. For all installation methods, see the [SGLang installation guide](/docs/get-started/install).
+
+The Python and Docker installation paths below require that build. Before the merge, use the PR checkout.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-index-url https://docs.sglang.ai/whl/cu130/ sglang
+```
+
+Run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+```bash Command
+docker pull lmsysorg/sglang:dev
+```
+
+Use an image built after #42721 merges, then run the **Docker** output of the command panel below. Both checkpoints are public and do not require a Hugging Face token.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Select **Clef** or **Clef Flash** under **Variant**, then select your GPU. Both recipes run on one NVIDIA GPU in BF16 with TP=1. Changing the variant updates the checkpoint in the launch command and the sample request.
+
+import { Deployment } from "/src/snippets/_deployment.jsx"
+import { config } from "/src/snippets/configs/Cloudflare/clef.jsx"
+
+<Deployment config={config} />
+
+<Note>
+  Both variants were tested on one B200 and one H200 using the Python server from [#42721 at 4704c2424a81](https://github.com/sgl-project/sglang/commit/4704c2424a81e1c3e87e50a1de4b949180a47c9d), PyTorch 2.14.1, and Transformers 5.17.0. Each configuration passed short text, short text with an image, long text, and long text with an image. Both long requests used the full 16,384-token prompt budget. These are serving checks, not throughput or accuracy benchmarks; the Docker wrapper was not separately tested.
+</Note>
+
+## 1. Model introduction
+
+**Clef** and **Clef Flash** are decision models from Cloudflare, post-trained from Qwen3.8-27B and Qwen3.5-9B under the Apache-2.0 license. Each keeps its backbone and vision encoder and adds a small joint schema head that reads the backbone's final hidden states. One prompt holds the state and every question with its allowed options. The head routes evidence from the state to each option, lets the questions attend to each other, and returns one logit per allowed option of every question, without generating text.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "40%"}} />
+    <col style={{width: "35%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Variant</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Checkpoint</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Backbone</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style={{backgroundColor: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}>Clef (27B)</td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/Cloudflare/clef">Cloudflare/clef</a></td>
+      <td style={{padding: "9px 12px"}}>Qwen3.8-27B</td>
+    </tr>
+    <tr style={{backgroundColor: "rgba(255,255,255,0.05)"}}>
+      <td style={{padding: "9px 12px"}}>Clef Flash (9B)</td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/Cloudflare/clef-flash">Cloudflare/clef-flash</a></td>
+      <td style={{padding: "9px 12px"}}>Qwen3.5-9B</td>
+    </tr>
+  </tbody>
+</table>
+
+Both variants accept a text or JSON state with optional images. Their `/v1/systemone` responses contain one answer per question: a `choice` over allowed options, a `noul` probability of true, or a `score` over named levels.
+
+## 2. Configuration tips
+
+- **Route.** Send requests to `/v1/systemone`. Clients of the System One API, including the TypeSafe SDKs, work by pointing their base URL at the server. See [System One compatible API](/docs/supported-models/decision_models#system-one-compatible-api) for the request and response reference. `/v1/decisions`, chat, and generation requests are refused, because the checkpoint answers through its head rather than its language model head.
+- **One GPU, one prefill per request.** Keep TP=1 and PP=1. All questions share one prompt, so the state is read once however many questions you ask. SGLang detects `joint_head_config.json`, loads `joint_head.safetensors`, and enables embedding mode without radix cache, chunked prefill, or CUDA graphs automatically. No reasoning parser, tool-call parser, or chat-template override is needed.
+- **Answers.** `probabilities` are the softmax of the head's logits for each question, and `confidence` uses the same formulas as other models on this route, so it can differ from the `confidence` of the checkpoint's reference `systemone()`, which is the probability of the top option. Answers omit `x_label_mass`, because the head scores only the allowed options.
+- **Long states.** The prompt, images included, holds at most 16,384 tokens, the default `max_length` of the checkpoint's reference `encode_record`, or fewer when the server's context length, KV cache, or `--max-prefill-tokens` is smaller. A longer state is truncated so that every question still fits, as in the reference code. The 32,768-token server context and token pool leave room for scheduler reservations; they do not increase the 16,384-token prompt cap.
+- **Concurrency.** The verified recipes set `--max-running-requests 1` and `--max-total-tokens 32768` as a starting point. Requests are processed one at a time. Higher concurrency needs separate memory and load testing.
+- **Images.** Pass each image in `images` as a data URL, such as `data:image/jpeg;base64,...`, or as an HTTP(S) URL. A bare base64 JPEG starts with `/`, which the shared image loader reads as a file path, so the request fails. Images precede the state, as in the reference code.
+
+## 3. Advanced usage
+
+### 3.1 Text decisions
+
+The same request shape works with either variant. Set `MODEL` to the checkpoint selected in the wizard.
+
+<Accordion title="Text decision example (Python)">
+
+```python Example
+import requests
+
+MODEL = "Cloudflare/clef-flash"  # Or "Cloudflare/clef".
+
+response = requests.post(
+    "http://localhost:30000/v1/systemone",
+    json={
+        "model": MODEL,
+        "state": "My Stripe integration keeps failing. I am losing sales. Please help ASAP.",
+        "questions": {
+            "routing": {
+                "type": "choice",
+                "instructions": "Which team should handle this request?",
+                "criteria": {
+                    "billing": "Charges and refunds",
+                    "technical_support": "Integration errors",
+                    "sales": "Questions about buying a product",
+                },
+            },
+            "urgency": {"type": "noul", "instructions": "Does this message express urgency?"},
+            "frustration": {
+                "type": "score",
+                "instructions": "How frustrated is the customer?",
+                "criteria": ["Calm", "Frustrated but civil", "Very angry"],
+            },
+        },
+    },
+    timeout=60,
+)
+response.raise_for_status()
+answers = response.json()["answers"]
+print("Routing:", answers["routing"]["choice"])
+print("Urgency:", answers["urgency"]["noul"])
+print("Frustration:", answers["frustration"]["score"])
+print("Usage:", response.json()["usage"])
+```
+
+</Accordion>
+
+<Accordion title="Example output">
+
+Captured with Clef Flash on one H200. Probabilities can vary with the model variant, hardware, and numerical backend.
+
+```text Output
+Routing: technical_support
+Urgency: 0.9492946352021694
+Frustration: 1.7297646970642042
+Usage: {'input_tokens': 334, 'output_tokens': 0}
+```
+
+</Accordion>
