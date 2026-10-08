@@ -816,6 +816,7 @@ class USPAttention(nn.Module):
         skip_sequence_parallel: bool = False,
         enable_packed_qkv_input_a2a: bool = False,
         is_cross_attention: bool = False,
+        compute_dtype: torch.dtype | None = None,
         **extra_impl_args,
     ) -> None:
         """
@@ -831,6 +832,9 @@ class USPAttention(nn.Module):
             is_cross_attention:
               sparse backend preferences may select a compatible dense backend
               for cross-attention while remaining strict for self-attention.
+            compute_dtype:
+              explicit attention compute precision when it differs from the
+              ambient model-loading mixed precision policy.
         """
         super().__init__()
         if softmax_scale is None:
@@ -841,7 +845,7 @@ class USPAttention(nn.Module):
         if num_kv_heads is None:
             num_kv_heads = num_heads
 
-        dtype = get_compute_dtype()
+        dtype = compute_dtype or get_compute_dtype()
         attn_backend = get_attn_backend(
             head_size,
             dtype,

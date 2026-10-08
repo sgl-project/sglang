@@ -68,6 +68,7 @@ class CausalAttention(nn.Module):
                 },
                 default_attention_backend=AttentionBackendEnum.TORCH_SDPA,
                 skip_sequence_parallel=True,
+                compute_dtype=torch.bfloat16,
             )
             if current_platform.is_cuda()
             else None
