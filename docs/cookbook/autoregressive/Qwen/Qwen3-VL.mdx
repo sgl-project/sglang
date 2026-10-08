@@ -162,6 +162,70 @@ benchmark client, source hashes, and evaluation protocol.
 
 </Accordion>
 
+<Accordion title="Pinned B300 BF16 HND configuration and throughput snapshot">
+
+This separate text-only snapshot uses source commit
+[`3016f3b591`](https://github.com/zcnrex/sglang/commit/3016f3b5917650199c12b47195b9dc1be4c26e4e)
+from PR #42913, with HND KV-cache layout and mixed chunking enabled. It is not
+an off/on comparison and does not measure the causal benefit of mixed chunking
+or HND. The historical NHD comparison above retains its original configuration.
+Use a source build at this commit with Torch `2.14.1+cu130`, FlashInfer
+`0.7.0.post1`, and Transformers `5.17.0`. The model revision is
+`ebb281ec70b05090aa6165b016eac8ec08e71b17`.
+
+```bash Command
+export MODEL_PATH="$(hf download Qwen/Qwen3-VL-4B-Instruct --revision ebb281ec70b05090aa6165b016eac8ec08e71b17)"
+CUDA_VISIBLE_DEVICES=0 SGLANG_USE_HND_KVCACHE=1 sglang serve \
+  --model-path "$MODEL_PATH" \
+  --dtype bfloat16 --kv-cache-dtype bfloat16 --bf16-gemm-backend cutedsl \
+  --attention-backend trtllm_mha --page-size 32 --enable-mixed-chunk \
+  --chunked-prefill-size 16384 --cuda-graph-backend-prefill disabled \
+  --cuda-graph-max-bs-decode 128 \
+  --cuda-graph-bs-decode 1 2 4 8 12 16 24 32 40 48 56 64 72 80 88 96 104 112 120 128 \
+  --max-total-tokens 1600000 --enforce-disable-flashinfer-allreduce-fusion \
+  --random-seed 0 --host 127.0.0.1 --port 30000
+```
+
+All points use TP1, BF16 weights, attention queries and KV cache, the same
+20 decode graph buckets, and a server-verified capacity of 1,600,000 KV tokens.
+The workload uses nominal 8192-token random inputs and 1024-token outputs,
+with random range ratio 1 and client seed 42. Concurrency 1/4/8/16/32/64/128
+uses 30/40/80/80/160/320/640 measured requests and `max(64, concurrency)` warmup
+requests, followed by a cache flush. Every run completed the exact requested
+request, input-token and output-token counts. Commands, the pinned benchmark
+client and raw measurements are retained in the
+[snapshot evidence](https://github.com/zcnrex/sglang/tree/15e34e059db446325c16903e218f0f882567e2f1/benchmark/qwen3_vl/results/current_pr_full_sweep/attempt2).
+
+Throughput is **output tokens/s on one GPU**, not combined input/output
+throughput. TTFT and TPOT below are **medians in milliseconds**.
+
+<table>
+  <thead><tr><th>Concurrency</th><th>Output tokens/s</th><th>Median TTFT ms</th><th>Median TPOT ms</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>393.56</td><td>87.42</td><td>2.46</td></tr>
+    <tr><td>4</td><td>1229.73</td><td>236.64</td><td>3.02</td></tr>
+    <tr><td>8</td><td>1908.32</td><td>355.15</td><td>3.84</td></tr>
+    <tr><td>16</td><td>2583.19</td><td>644.92</td><td>5.58</td></tr>
+    <tr><td>32</td><td>3141.89</td><td>804.63</td><td>9.40</td></tr>
+    <tr><td>64</td><td>3542.95</td><td>818.60</td><td>17.27</td></tr>
+    <tr><td>128</td><td>3833.22</td><td>600.93</td><td>32.64</td></tr>
+    <tr><td>128, second GPU</td><td>3847.33</td><td>592.38</td><td>32.53</td></tr>
+  </tbody>
+</table>
+
+At concurrency 128, mean TTFT was 1421.79/1462.02 ms, p95 was
+6725.15/6769.09 ms, and p99 was 8616.83/8594.28 ms for the two GPUs,
+respectively. The median alone understates first-token latency for some requests.
+The eight servers ran concurrently on separate B300 GPUs on one host. Normal
+public startup autotuning used fresh per-worker caches; the two C128 runs
+selected different M128 down-projection tactics and differed in throughput by
+0.368%. GPU clocks and overlapping host work also varied. These are individual
+configuration measurements, not an isolated same-device comparison or a
+repeatability bound. No new accuracy evaluation accompanied this sweep; the
+historical accuracy results above do not certify this source snapshot.
+
+</Accordion>
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
