@@ -507,6 +507,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
             # ModelOpt also assigns this method to an excluded BF16 LM head.
             prepare_lossless_bf16_head(layer)
+        if envs.SGLANG_SM120_LOSSLESS_BF16_INPROJ.get():
+            from sglang.kernels.ops.gemm.sm120_lossless_bf16_inproj import (
+                prepare_lossless_bf16_inproj,
+            )
+
+            prepare_lossless_bf16_inproj(layer)
 
     def apply(
         self,
@@ -551,6 +557,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 # opaque op resolves it at runtime with concrete shapes,
                 # keeping the per-shape kernel choice.
                 return bf16_gemm_dispatch(x, layer.weight, bias)
+            if envs.SGLANG_SM120_LOSSLESS_BF16_INPROJ.get():
+                from sglang.kernels.ops.gemm.sm120_lossless_bf16_inproj import (
+                    try_lossless_bf16_inproj,
+                )
+
+                output = try_lossless_bf16_inproj(x, layer, bias)
+                if output is not None:
+                    return output
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
         return F.linear(x, layer.weight, bias)
