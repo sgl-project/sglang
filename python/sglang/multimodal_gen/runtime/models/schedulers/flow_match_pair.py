@@ -237,9 +237,9 @@ class FlowMatchPairScheduler(FlowMatchScheduler):
 
             self.set_pair_postprocess(_quadratic_perp_bulge_swap)
             return
-        if name == "v2a_sequential":
+        if name in ("v2a_sequential", "a2v_sequential"):
 
-            def _v2a(pairs: torch.Tensor):
+            def _sequential(pairs: torch.Tensor):
                 if (
                     not isinstance(pairs, torch.Tensor)
                     or pairs.ndim != 2
@@ -250,8 +250,12 @@ class FlowMatchPairScheduler(FlowMatchScheduler):
                 base = pairs[:, 0]
                 seq_half = base[::2]
                 m = int(seq_half.shape[0])
-                col0 = torch.cat([seq_half, seq_half[-1:].repeat(m)], dim=0)[:N]
-                col1 = torch.cat([seq_half[0:1].repeat(m), seq_half], dim=0)[:N]
+                if name == "v2a_sequential":
+                    col0 = torch.cat([seq_half, seq_half[-1:].repeat(m)], dim=0)[:N]
+                    col1 = torch.cat([seq_half[0:1].repeat(m), seq_half], dim=0)[:N]
+                else:
+                    col0 = torch.cat([seq_half[0:1].repeat(m), seq_half], dim=0)[:N]
+                    col1 = torch.cat([seq_half, seq_half[-1:].repeat(m)], dim=0)[:N]
                 return torch.stack(
                     [
                         col0.to(dtype=pairs.dtype, device=pairs.device),
@@ -260,60 +264,25 @@ class FlowMatchPairScheduler(FlowMatchScheduler):
                     dim=1,
                 )
 
-            self.set_pair_postprocess(_v2a)
+            self.set_pair_postprocess(_sequential)
             return
-        if name == "a2v_sequential":
+        if name in ("v2a", "a2v"):
 
-            def _a2v(pairs: torch.Tensor):
+            def _single_modality(pairs: torch.Tensor):
                 if (
                     not isinstance(pairs, torch.Tensor)
                     or pairs.ndim != 2
                     or pairs.shape[1] != 2
                 ):
                     raise ValueError("pairs must be a torch.Tensor of shape [N, 2]")
-                N = pairs.shape[0]
-                base = pairs[:, 0]
-                seq_half = base[::2]
-                m = int(seq_half.shape[0])
-                col0 = torch.cat([seq_half[0:1].repeat(m), seq_half], dim=0)[:N]
-                col1 = torch.cat([seq_half, seq_half[-1:].repeat(m)], dim=0)[:N]
-                return torch.stack(
-                    [
-                        col0.to(dtype=pairs.dtype, device=pairs.device),
-                        col1.to(dtype=pairs.dtype, device=pairs.device),
-                    ],
-                    dim=1,
-                )
+                if name == "v2a":
+                    zeros = torch.zeros_like(pairs[:, 0])
+                    return torch.stack([zeros, pairs[:, 1]], dim=1)
+                else:
+                    zeros = torch.zeros_like(pairs[:, 1])
+                    return torch.stack([pairs[:, 0], zeros], dim=1)
 
-            self.set_pair_postprocess(_a2v)
-            return
-        if name == "v2a":
-
-            def _v2a_classic(pairs: torch.Tensor):
-                if (
-                    not isinstance(pairs, torch.Tensor)
-                    or pairs.ndim != 2
-                    or pairs.shape[1] != 2
-                ):
-                    raise ValueError("pairs must be a torch.Tensor of shape [N, 2]")
-                zeros = torch.zeros_like(pairs[:, 0])
-                return torch.stack([zeros, pairs[:, 1]], dim=1)
-
-            self.set_pair_postprocess(_v2a_classic)
-            return
-        if name == "a2v":
-
-            def _a2v_classic(pairs: torch.Tensor):
-                if (
-                    not isinstance(pairs, torch.Tensor)
-                    or pairs.ndim != 2
-                    or pairs.shape[1] != 2
-                ):
-                    raise ValueError("pairs must be a torch.Tensor of shape [N, 2]")
-                zeros = torch.zeros_like(pairs[:, 1])
-                return torch.stack([pairs[:, 0], zeros], dim=1)
-
-            self.set_pair_postprocess(_a2v_classic)
+            self.set_pair_postprocess(_single_modality)
             return
         if name == "dual_sigma_shift":
             visual_shift = float(kwargs.get("visual_shift", self.shift))
