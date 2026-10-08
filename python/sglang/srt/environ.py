@@ -1582,6 +1582,18 @@ class Envs:
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
 
+    # Replace the sublayer-boundary all-reduce with the sequence-parallel mHC
+    # boundary kernel: each rank owns T/tp rows of the residual, so the boundary
+    # becomes reduce-scatter -> local post/combine/norm -> all-gather, and the mHC
+    # coefficients are computed in the same launch. Prefill only, and only past
+    # the token count where the fused form beats the all-reduce it replaces.
+    SGLANG_OPT_DSV41_MHC_SP_FUSION = EnvBool(False)
+    # Min global tokens in the batch before the sharded boundary is used.
+    SGLANG_OPT_DSV41_MHC_SP_FUSION_MIN_TOKENS = EnvInt(512)
+    # Min tokens before the Engram seam fuses under replicated TP (None: never).
+    # Under mHC SP the seam always fuses with the boundary.
+    SGLANG_OPT_DSV41_ENGRAM_TP_FUSION_MIN_TOKENS = EnvInt(512)
+
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
