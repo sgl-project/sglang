@@ -57,6 +57,33 @@ _REF2VA_VIDEO_CHAINS = {
 _REFINED_PROMPT_EMBEDS_KEY = "_minimax_h3_refined_prompt_embeds"
 
 
+@contextmanager
+def _record_adaln_cache_stats(model: Any, batch: Req):
+    """Measure the whole loop, including plan preparation before step zero."""
+    metrics = batch.metrics
+    cache = getattr(model, "adaln_cache", None)
+    if (
+        batch.is_warmup
+        or metrics is None
+        or metrics.suppress_stage_breakdown
+        or cache is None
+        or cache.path is not None
+        or cache.weight_files is None
+    ):
+        yield
+        return
+    before = cache.stats.snapshot()
+    try:
+        yield
+    finally:
+        after = cache.stats.snapshot()
+        metrics.record_cache_stats(
+            "minimax_h3_adaln",
+            {key: value - before[key] for key, value in after.items()},
+            after,
+        )
+
+
 def minimax_h3_condition_noise_aug(sampling: Any) -> tuple[float, float]:
     """Resolve condition timesteps using the model defaults."""
 
@@ -836,32 +863,33 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     if not batch.is_warmup:
                         self.step_profile()
 
-                video_rows, audio_rows = minimax_h3_denoise_loop(
-                    model=model,
-                    model_forward=partial(
-                        self._forward_dit,
-                        batch=batch,
+                with _record_adaln_cache_stats(model, batch):
+                    video_rows, audio_rows = minimax_h3_denoise_loop(
+                        model=model,
+                        model_forward=partial(
+                            self._forward_dit,
+                            batch=batch,
+                            attn_metadata=attn_metadata,
+                            build_vsa_h3_step_metadata=build_vsa_h3_step_metadata,
+                        ),
+                        positive=positive,
+                        initial_video_rows=initial_video,
+                        initial_audio_rows=initial_audio,
+                        keyframe_cond_rows=ctx.cond_rows,
+                        audio_ref_rows=ctx.audio_ref_rows,
+                        sigmas_video=sigmas_video,
+                        sigmas_audio=[float(v) for v in ctx.sigmas["audio"]],
+                        device=device,
+                        imgvid_cond_noise_aug_for_inference=float(imgvid_noise_aug),
+                        audio_cond_noise_aug_for_inference=float(audio_noise_aug),
                         attn_metadata=attn_metadata,
-                        build_vsa_h3_step_metadata=build_vsa_h3_step_metadata,
-                    ),
-                    positive=positive,
-                    initial_video_rows=initial_video,
-                    initial_audio_rows=initial_audio,
-                    keyframe_cond_rows=ctx.cond_rows,
-                    audio_ref_rows=ctx.audio_ref_rows,
-                    sigmas_video=sigmas_video,
-                    sigmas_audio=[float(v) for v in ctx.sigmas["audio"]],
-                    device=device,
-                    imgvid_cond_noise_aug_for_inference=float(imgvid_noise_aug),
-                    audio_cond_noise_aug_for_inference=float(audio_noise_aug),
-                    attn_metadata=attn_metadata,
-                    on_step=on_step,
-                    step_profiler=partial(
-                        self._profile_denoising_step,
-                        batch=batch,
-                    ),
-                    rollout_ctx=rollout_ctx,
-                )
+                        on_step=on_step,
+                        step_profiler=partial(
+                            self._profile_denoising_step,
+                            batch=batch,
+                        ),
+                        rollout_ctx=rollout_ctx,
+                    )
                 if rollout_ctx is not None:
                     batch.rollout_trajectory_data = (
                         rollout_ctx.collector.build_trajectory_data()
