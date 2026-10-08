@@ -191,7 +191,8 @@ def forward_mla_prepare_npu(
     # The fused MLA preprocess writes cache rows using the global virtual loc.
     # Keep DCP on the explicit path until that operator accepts owner-filtered
     # physical locations.
-    if is_mla_preprocess_enabled() and not parallel.dcp_enabled:
+    mla_preprocess_used = is_mla_preprocess_enabled() and not parallel.dcp_enabled
+    if mla_preprocess_used:
         if not hasattr(m, "mla_preprocess"):
             m.mla_preprocess = NPUFusedMLAPreprocess(
                 m.fused_qkv_a_proj_with_mqa,
@@ -320,6 +321,7 @@ def forward_mla_prepare_npu(
         zero_allocator,
         positions,
         topk_indices,
+        mla_preprocess_used,
     )
 
 
@@ -333,6 +335,7 @@ def forward_mla_core_npu(
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
     topk_indices: torch.Tensor,
+    mla_preprocess_used: bool,
     # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its gate
     # to inner_state, so every *_core dispatched from forward_core takes it as
     # a trailing arg. None everywhere else.
@@ -351,6 +354,7 @@ def forward_mla_core_npu(
             forward_batch,
             q_rope=q_pe,
             k_rope=k_pe,
+            save_kv_cache=not mla_preprocess_used,
             return_softmax_lse=True,
         )
         attn_output = attn_output.view(
@@ -367,6 +371,7 @@ def forward_mla_core_npu(
             forward_batch,
             q_rope=q_pe,
             k_rope=k_pe,
+            save_kv_cache=not mla_preprocess_used,
             **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
         )
 

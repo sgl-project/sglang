@@ -27,10 +27,7 @@ from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
     forward_dcp_sparse_attention,
 )
 from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache_pages
-from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
-    is_fia_nz,
-    is_mla_preprocess_enabled,
-)
+from sglang.srt.hardware_backend.npu.attention.mla_preprocess import is_fia_nz
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -433,6 +430,10 @@ class AscendAttnBackend(AttentionBackend):
                 self.sparse_kv_manager,
             )
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        if self._dense_mla_dcp_enabled() and not self.use_fia:
+            raise NotImplementedError(
+                "Kimi-K3 NPU DCP requires Ascend FIA. Set ASCEND_USE_FIA=1."
+            )
         self.use_fias_v2_bsnd = (
             get_bool_env_var("SGLANG_NPU_USE_FIAS_V2_BSND", "False")
             and model_runner.spec_algorithm.is_dspark()
@@ -506,14 +507,13 @@ class AscendAttnBackend(AttentionBackend):
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
 
-    def _use_dense_mla_dcp(self) -> bool:
-        """Whether target dense MLA uses DCP; excludes DSA and draft workers."""
-        return (
-            self.use_mla
-            and not self.use_dsa
-            and get_parallel().dcp_enabled
-            and not self.is_draft_worker
-        )
+    def _dense_mla_dcp_enabled(self) -> bool:
+        """Dense MLA in a DCP deployment, including replicated draft workers."""
+        return self.use_mla and not self.use_dsa and get_parallel().dcp_enabled
+
+    def _use_dense_mla_dcp_target(self) -> bool:
+        """Only target workers read sharded KV and need local DCP metadata."""
+        return self._dense_mla_dcp_enabled() and not self.is_draft_worker
 
     def _use_dsa_dcp(self) -> bool:
         """DSA target attention uses page-interleaved KV and a replicated indexer."""
@@ -590,7 +590,7 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        dense_mla_dcp_decode = self._use_dense_mla_dcp() and (
+        dense_mla_dcp_decode = self._use_dense_mla_dcp_target() and (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
         )
@@ -798,7 +798,7 @@ class AscendAttnBackend(AttentionBackend):
         graph_context_len = self.max_context_len
         if self.speculative_num_draft_tokens is not None:
             graph_context_len += self.speculative_num_draft_tokens
-        dense_mla_dcp_graph = self._use_dense_mla_dcp()
+        dense_mla_dcp_graph = self._use_dense_mla_dcp_target()
         if dense_mla_dcp_graph:
             self.graph_metadata = init_mla_dcp_graph_state(
                 max_bs,
@@ -913,7 +913,7 @@ class AscendAttnBackend(AttentionBackend):
                 torch.npu.current_stream(self.device), self.device
             )
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
-        dense_mla_dcp_graph = self._use_dense_mla_dcp()
+        dense_mla_dcp_graph = self._use_dense_mla_dcp_target()
         if dense_mla_dcp_graph:
             metadata.seq_lens = self.graph_metadata["dcp_seq_lens"][:bs]
             if forward_mode.is_target_verify():
@@ -1019,7 +1019,7 @@ class AscendAttnBackend(AttentionBackend):
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         metadata = self.graph_metadata[bs]
-        dense_mla_dcp_graph = self._use_dense_mla_dcp()
+        dense_mla_dcp_graph = self._use_dense_mla_dcp_target()
 
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
@@ -1670,11 +1670,6 @@ class AscendAttnBackend(AttentionBackend):
         **kwargs,
     ):
         return_softmax_lse = bool(kwargs.pop("return_softmax_lse", False))
-        if is_mla_preprocess_enabled() and self.use_mla:
-            # DSA callers set save_kv_cache based on whether preprocessing was used.
-            # Only override it for the existing non-sparse MLA path.
-            if topk_indices is None:
-                save_kv_cache = False
         if self.is_dllm_model:
             return self.forward_dllm(
                 q,
@@ -2608,15 +2603,10 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         dense_mla_dcp_target_verify = (
-            self._use_dense_mla_dcp() and forward_batch.forward_mode.is_target_verify()
+            self._use_dense_mla_dcp_target()
+            and forward_batch.forward_mode.is_target_verify()
         )
         if dense_mla_dcp_target_verify:
-            if not self.use_fia:
-                raise NotImplementedError(
-                    "Kimi-K3 NPU DCP + DSPARK requires Ascend FIA. Set "
-                    "ASCEND_USE_FIA=1."
-                )
-
             # Keep the full query shape, including graph padding rows.
             num_tokens = q.shape[0]
             query_len = int(forward_batch.spec_info.draft_token_num)
@@ -3307,18 +3297,6 @@ class AscendAttnBackend(AttentionBackend):
         **kwargs,
     ):
         return_softmax_lse = bool(kwargs.pop("return_softmax_lse", False))
-        dense_mla_dcp_decode = (
-            self.use_mla and not self.use_dsa and get_parallel().dcp_enabled
-        )
-        if dense_mla_dcp_decode and not self.use_fia:
-            raise NotImplementedError(
-                "Kimi-K3 NPU DCP decode requires Ascend FIA. Set ASCEND_USE_FIA=1."
-            )
-        if is_mla_preprocess_enabled() and self.use_mla and not dense_mla_dcp_decode:
-            # DSA callers set save_kv_cache based on whether preprocessing was used.
-            # Only override it for the existing non-sparse MLA path.
-            if topk_indices is None:
-                save_kv_cache = False
         if topk_indices is not None:
             if self.enable_sparsity_driven_kv_offload:
                 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
@@ -3352,7 +3330,7 @@ class AscendAttnBackend(AttentionBackend):
         if (
             self.graph_mode
             and not self.enable_torch_compile
-            and not dense_mla_dcp_decode
+            and not self._dense_mla_dcp_enabled()
         ):
             return self.forward_decode_graph(
                 q,
