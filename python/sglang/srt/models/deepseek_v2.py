@@ -599,7 +599,7 @@ class MoEOutput(NamedTuple):
     routed_scaling_factor: float
     shared_is_replicated: bool
 
-    def get_merged(self) -> torch.Tensor:
+    def get_merged(self, out: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Merge the pieces, leaving the reduction to the caller."""
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             FlashInferTrtllmDeferredFinalizeOutput,
@@ -609,12 +609,13 @@ class MoEOutput(NamedTuple):
         # NOTE: normal TP-sharded shared expert out
         shared = None if self.shared_is_replicated else self.shared
         if isinstance(self.routed, FlashInferTrtllmDeferredFinalizeOutput):
-            return finalize_flashinfer_trtllm_deferred_output(self.routed, shared)
+            return finalize_flashinfer_trtllm_deferred_output(self.routed, shared, out)
         return maybe_fuse_routed_scale_and_shared_add(
             self.experts,
             self.routed,
             shared,
             self.routed_scaling_factor,
+            out=out,
         )
 
 
@@ -1311,6 +1312,9 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states.device, layer_id=self.layer_id
             )
 
+        deferred_finalize = return_moe_output and isinstance(
+            self.experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod
+        )
         if self._fuse_shared_experts_inside_sbo and not skip_shared_experts:
             shared_output = None
 
@@ -1340,7 +1344,11 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        if pre_quant_input is not None:
+        if deferred_finalize:
+            final_hidden_states = self.experts.forward_deferred_finalize(
+                hidden_states, topk_output, pre_quant_input=pre_quant_input
+            )
+        elif pre_quant_input is not None:
             final_hidden_states = self.experts(
                 hidden_states,
                 topk_output,

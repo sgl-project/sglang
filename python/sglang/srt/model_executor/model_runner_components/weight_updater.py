@@ -50,10 +50,10 @@ def _unsupported_derived_weight_cache_error(
     must be startup-determined and rank-uniform so all workers reject together.
     """
     if model is not None and any(
-        getattr(module, "_hc_attn_tf32_parts", None) is not None
-        or getattr(module, "_hc_ffn_tf32_parts", None) is not None
-        or getattr(module, "_hc_attn_bf16_parts", None) is not None
-        or getattr(module, "_hc_ffn_bf16_parts", None) is not None
+        getattr(module, "_hc_attn_tf32_stack", None) is not None
+        or getattr(module, "_hc_ffn_tf32_stack", None) is not None
+        or getattr(module, "_hc_attn_bf16_stack", None) is not None
+        or getattr(module, "_hc_ffn_bf16_stack", None) is not None
         for module in model.modules()
     ):
         return (
