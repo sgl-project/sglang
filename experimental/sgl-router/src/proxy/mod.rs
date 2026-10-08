@@ -110,7 +110,8 @@ pub struct Proxy {
     /// on a cleartext URL.
     h2c_client: Client,
     /// Wall-clock timeout for a non-streaming upstream request, and for a
-    /// streaming one's response headers. A stream's body is not bounded by it
+    /// streaming one's response headers, which SGLang's chat endpoint sends with
+    /// the first token. A stream's body is not bounded by it
     /// (long generations are valid), only by the idle and stale-request limits.
     pub request_timeout: Duration,
     /// Maximum silence between streamed upstream chunks; `None` waits forever.
