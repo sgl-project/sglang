@@ -1606,7 +1606,13 @@ class SchedulerBatchResultProcessor:
                 return True, committed_len
         elif result.num_correct_drafts_per_req_cpu is not None:
             cur = req.seqlen - 1
-            prev = cur - result.num_correct_drafts_per_req_cpu[i] - 1
+            # Step back by the committed run, which a grammar may truncate below the accepted run.
+            retained = result.grammar_retained_tokens
+            if retained is not None and retained[i] is not None:
+                num_committed = len(retained[i])
+            else:
+                num_committed = result.num_correct_drafts_per_req_cpu[i] + 1
+            prev = cur - num_committed
             if cur // interval != prev // interval:
                 return True, cur // interval * interval
 
