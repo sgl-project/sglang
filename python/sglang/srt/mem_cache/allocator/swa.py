@@ -539,17 +539,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         self.swa_attn_allocator.free_page_ids(swa_pages)
-        # `maybe_evict_swa` releases a request's out-of-window SWA pages right
-        # before the SAME step's `alloc_extend` runs. With `need_sort` off,
-        # `free_page_ids` PREPENDS the released pages, so the new tokens are
-        # handed those very pages straight back and the reused prefix's window
-        # ends up aliasing rows the prefix still references. Park the just-freed
-        # pages at the back of the free list instead: the next allocation then
-        # draws from pages this request did not just release.
-        _n = int(swa_pages.numel())
-        _fp = self.swa_attn_allocator.free_pages
-        if not self.swa_attn_allocator.need_sort and _n > 0 and _n <= _fp.numel():
-            self.swa_attn_allocator.free_pages = torch.cat((_fp[_n:], _fp[:_n]))
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def _free_swa_pages_none_cuda(
@@ -653,7 +642,25 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_page_ids_group = self.swa_page_ids_group
             self.swa_page_ids_group = []
             if not self._swa_req_ring:
-                self.swa_attn_allocator.free_page_ids(torch.cat(swa_page_ids_group))
+                released = torch.cat(swa_page_ids_group)
+                self.swa_attn_allocator.free_page_ids(released)
+                # `maybe_evict_swa` releases a request's out-of-window SWA pages
+                # and ends its free group immediately before the SAME step's
+                # `alloc_extend` runs. With `need_sort` off, `free_page_ids`
+                # PREPENDS the released pages (paged.py:_release_page_ids), so the
+                # new tokens are handed those very pages straight back and the
+                # reused prefix's local window can alias rows the prefix still
+                # references. Park the released batch at the back of the free
+                # list instead, so the next allocation draws from pages this
+                # request did not just release.
+                _n = int(released.numel())
+                _fp = self.swa_attn_allocator.free_pages
+                if (
+                    not self.swa_attn_allocator.need_sort
+                    and _n > 0
+                    and _n <= _fp.numel()
+                ):
+                    self.swa_attn_allocator.free_pages = torch.cat((_fp[_n:], _fp[:_n]))
         if self.swa_free_group:
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
