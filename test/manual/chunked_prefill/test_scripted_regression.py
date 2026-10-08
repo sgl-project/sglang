@@ -148,7 +148,7 @@ class TestRegressionBasic(ScriptedTestCase):
         r2 = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         yield from run_until(r2, lambda h: h.status == "waiting")
 
-        r1_prefix = len(r1.req.prefix_indices)
+        r1_prefix = r1.req.prefix_len
         assert r1.is_chunking, "r1 must still be the in-flight chunked req"
         assert r1_prefix > 0, "r1 must hold a committed prefix as the chunked req"
 
@@ -516,9 +516,9 @@ class TestRegressionGptOss(ScriptedTestCase):
         committed = r.req.kv.kv_committed_len
         assert committed > 0
 
-        assert len(r.req.prefix_indices) <= committed, (
+        assert r.req.prefix_len <= committed, (
             f"checkpoint over-read past kv_committed_len: "
-            f"prefix_indices_len={len(r.req.prefix_indices)}, "
+            f"prefix_indices_len={r.req.prefix_len}, "
             f"kv_committed_len={committed}"
         )
         yield from run_until_finished(r)

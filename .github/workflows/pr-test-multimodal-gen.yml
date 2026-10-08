@@ -391,7 +391,7 @@ jobs:
         with:
           artifact-suffix: component-accuracy
 
-  multimodal-gen-test-1-b200:
+  multimodal-gen-test-4-gpu-b200:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
@@ -421,6 +421,11 @@ jobs:
           SGLANG_CI_EARLY_LD_LIBRARY_PATH: "1"
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run VAE parallel-group regression
+        timeout-minutes: 10
+        run: |
+          python3 -m pytest -v python/sglang/multimodal_gen/test/single_test_file/test_wan_vae_parallel_groups_4_gpu.py
 
       - name: Run diffusion server tests
         timeout-minutes: 240

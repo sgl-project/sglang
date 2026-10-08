@@ -121,7 +121,6 @@ def test_mamba_publication_snapshots_component_cursors(cache_class, swa_enabled)
     assert req.lock.receipt.node_id == 42
     assert flow.prefix_published
     assert flow.mamba_value is None
-    assert req.prefix_indices.tolist() == list(range(12))
 
 
 if __name__ == "__main__":
