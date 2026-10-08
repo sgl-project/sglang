@@ -66,6 +66,7 @@ from sglang.srt.utils import (
     is_hip,
     log_info_on_rank0,
     print_warning_once,
+    retry_on_hub_rate_limit,
 )
 from sglang.srt.utils.common import is_cuda_alike
 from sglang.utils import is_in_ci
@@ -322,13 +323,15 @@ def get_quant_config(
     if not is_local:
         # Download the config files.
         with get_lock(model_name_or_path, load_config.download_dir):
-            hf_folder = snapshot_download(
-                model_name_or_path,
-                revision=model_config.revision,
-                allow_patterns="*.json",
-                cache_dir=load_config.download_dir,
-                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-                tqdm_class=DisabledTqdm,
+            hf_folder = retry_on_hub_rate_limit(
+                lambda: snapshot_download(
+                    model_name_or_path,
+                    revision=model_config.revision,
+                    allow_patterns="*.json",
+                    cache_dir=load_config.download_dir,
+                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                    tqdm_class=DisabledTqdm,
+                )
             )
     else:
         hf_folder = model_name_or_path
@@ -651,7 +654,9 @@ def download_weights_from_hf(
         if not huggingface_hub.constants.HF_HUB_OFFLINE:
             # Before we download we look at what is available:
             fs = HfFileSystem()
-            file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+            file_list = retry_on_hub_rate_limit(
+                lambda: fs.ls(model_name_or_path, detail=False, revision=revision)
+            )
 
             # depending on what is available we download different things
             for pattern in allow_patterns:

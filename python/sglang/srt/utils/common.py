@@ -4283,6 +4283,42 @@ def find_local_repo_dir(
     return None
 
 
+def _hub_rate_limit_response(error: Optional[BaseException]):
+    from huggingface_hub.errors import HfHubHTTPError
+
+    # snapshot_download re-raises an uncached 429 as LocalEntryNotFoundError.
+    while error is not None:
+        if (
+            isinstance(error, HfHubHTTPError)
+            and error.response is not None
+            and error.response.status_code == 429
+        ):
+            return error.response
+        error = error.__cause__
+    return None
+
+
+def retry_on_hub_rate_limit(fn: Callable[[], T], max_wait_s: float = 600) -> T:
+    from huggingface_hub.utils import parse_ratelimit_headers
+
+    deadline = time.monotonic() + max_wait_s
+    while True:
+        try:
+            return fn()
+        except Exception as e:
+            response = _hub_rate_limit_response(e)
+            remaining_s = deadline - time.monotonic()
+            if response is None or remaining_s <= 0:
+                raise
+            rate_limit = parse_ratelimit_headers(response.headers)
+            # Arbitrary fallback for a 429 without a RateLimit header.
+            wait_s = rate_limit.reset_in_seconds + 1 if rate_limit else 30
+            logger.warning(
+                "HF Hub rate limit hit, retrying in %ds: %s", wait_s, response.url
+            )
+            time.sleep(min(wait_s, remaining_s))
+
+
 def download_hf_file_if_exists(repo_id: str, filename: str, **kwargs) -> Optional[str]:
     import huggingface_hub
     from huggingface_hub.errors import LocalEntryNotFoundError, RemoteEntryNotFoundError

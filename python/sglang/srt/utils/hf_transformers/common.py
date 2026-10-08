@@ -96,7 +96,12 @@ from sglang.srt.configs import (
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.deepseek_v41 import DEEPSEEK_V41_CONFIG_CLASSES
 from sglang.srt.configs.internvl import InternVLChatConfig
-from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
+from sglang.srt.utils import (
+    get_bool_env_var,
+    logger,
+    lru_cache_frozenset,
+    retry_on_hub_rate_limit,
+)
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 from ..hf_transformers_patches import normalize_rope_scaling_compat
@@ -341,7 +346,9 @@ def download_from_hf(
     if not allow_patterns:
         allow_patterns = ["*.json", "*.bin", "*.model"]
 
-    return snapshot_download(model_path, allow_patterns=allow_patterns)
+    return retry_on_hub_rate_limit(
+        lambda: snapshot_download(model_path, allow_patterns=allow_patterns)
+    )
 
 
 def resolve_runai_obj_uri(model_name_or_path: str) -> str:

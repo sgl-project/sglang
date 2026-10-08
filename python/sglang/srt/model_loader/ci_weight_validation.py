@@ -18,7 +18,7 @@ from typing import List, Optional, Tuple
 
 import safetensors
 
-from sglang.srt.utils import log_info_on_rank0
+from sglang.srt.utils import log_info_on_rank0, retry_on_hub_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -779,19 +779,21 @@ def ci_download_with_validation_and_retry(
         hf_folder = None
         for attempt in range(max_retries):
             try:
-                hf_folder = snapshot_download(
-                    model_name_or_path,
-                    allow_patterns=allow_patterns,
-                    ignore_patterns=ignore_patterns,
-                    cache_dir=cache_dir,
-                    tqdm_class=DisabledTqdm,
-                    revision=revision,
-                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-                    # Force single-threaded downloads to prevent race conditions
-                    # on NFS. HF hub defaults to max_workers=8, which can cause
-                    # .incomplete file conflicts when multiple threads operate
-                    # on the same files
-                    max_workers=1,
+                hf_folder = retry_on_hub_rate_limit(
+                    lambda: snapshot_download(
+                        model_name_or_path,
+                        allow_patterns=allow_patterns,
+                        ignore_patterns=ignore_patterns,
+                        cache_dir=cache_dir,
+                        tqdm_class=DisabledTqdm,
+                        revision=revision,
+                        local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                        # Force single-threaded downloads to prevent race conditions
+                        # on NFS. HF hub defaults to max_workers=8, which can cause
+                        # .incomplete file conflicts when multiple threads operate
+                        # on the same files
+                        max_workers=1,
+                    )
                 )
             except (FileNotFoundError, OSError) as e:
                 # Race condition: .incomplete file was moved/deleted by another

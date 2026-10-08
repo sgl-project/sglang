@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils.common import retry_on_hub_rate_limit
 
 logger = init_logger(__name__)
 
@@ -70,12 +71,14 @@ def _resolve_ideogram4_distilled_components_path() -> str:
     # fal's model cards explicitly reference the NF4 Diffusers repository for
     # these shared components. Download only those components: its conditional
     # and unconditional base transformers are unused by distilled variants.
-    return snapshot_download(
-        repo_id=_IDEOGRAM4_DISTILLED_COMPONENTS_MODEL,
-        revision=_IDEOGRAM4_DISTILLED_COMPONENTS_REVISION,
-        allow_patterns=_IDEOGRAM4_DISTILLED_COMPONENT_PATTERNS,
-        ignore_patterns=["*.onnx", "*.msgpack"],
-        max_workers=8,
+    return retry_on_hub_rate_limit(
+        lambda: snapshot_download(
+            repo_id=_IDEOGRAM4_DISTILLED_COMPONENTS_MODEL,
+            revision=_IDEOGRAM4_DISTILLED_COMPONENTS_REVISION,
+            allow_patterns=_IDEOGRAM4_DISTILLED_COMPONENT_PATTERNS,
+            ignore_patterns=["*.onnx", "*.msgpack"],
+            max_workers=8,
+        )
     )
 
 
@@ -289,11 +292,13 @@ class Ideogram4DistilledPipeline(Ideogram4Pipeline):
             model_path = (
                 self.model_path
                 if os.path.exists(self.model_path)
-                else snapshot_download(
-                    repo_id=self.model_path,
-                    allow_patterns=["transformer/*"],
-                    ignore_patterns=["*.onnx", "*.msgpack"],
-                    max_workers=8,
+                else retry_on_hub_rate_limit(
+                    lambda: snapshot_download(
+                        repo_id=self.model_path,
+                        allow_patterns=["transformer/*"],
+                        ignore_patterns=["*.onnx", "*.msgpack"],
+                        max_workers=8,
+                    )
                 )
             )
             self._distilled_transformer_path = os.path.join(model_path, "transformer")
