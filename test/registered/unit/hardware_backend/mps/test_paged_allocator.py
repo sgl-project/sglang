@@ -13,15 +13,14 @@ register_mps_ci(est_time=10, suite="stage-a-unit-test-mps")
 @unittest.skipUnless(torch.backends.mps.is_available(), "Requires Torch MPS")
 class TestMPSPagedAllocator(CustomTestCase):
     def test_partial_pages_exhaustion_and_reuse(self):
-        from sglang.srt.hardware_backend.mps.allocator import (
-            MPSPagedTokenToKVPoolAllocator,
-        )
+        from sglang.srt.platforms.mps import MpsSRTPlatform
 
+        allocator_cls = MpsSRTPlatform().get_paged_allocator_cls()
         for page_size in (16, 32, 64):
             for need_sort in (False, True):
                 with self.subTest(page_size=page_size, need_sort=need_sort):
                     p = page_size
-                    allocator = MPSPagedTokenToKVPoolAllocator(
+                    allocator = allocator_cls(
                         size=4 * p,
                         page_size=p,
                         dtype=torch.float32,

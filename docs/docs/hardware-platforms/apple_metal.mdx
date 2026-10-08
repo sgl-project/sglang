@@ -106,231 +106,62 @@ The MLX backend supports two quantization paths on Apple Silicon:
 
 ## Experimental direct compiled MLX decode
 
-`mlx-compiled` follows the direct `torch.export` to MLX approach discussed in
-[the MPS graph RFC](https://github.com/sgl-project/sglang/issues/32321):
-lower the exported ATen graph to MLX operations and compile the
-entire decode function with `mx.compile`. This is **not an ExecuTorch delegate** and does not
-require ExecuTorch. It captures the existing causal-LM forward, including its
-logits processor, with RMS normalization fusion and custom Metal radix attention.
-Admission is based on decoder structure and export capabilities, not a model-name
-allowlist.
+Use `--mps-execution-backend mlx-compiled` to run an exported Torch model's decode
+graph through `mx.compile` with AOT Metal radix attention. Torch retains model
+loading, weight/KV ownership and sampling. Prefill stays eager MPS; native MLX
+is unchanged. This path uses `torch.export`, not ExecuTorch.
 
-This runner requires the existing `srt_mps` extra **and the AOT Metal build**,
-which is optional for ordinary eager MPS. Run the build in the same environment
-as MLX and rebuild it after upgrading MLX:
+Install the `srt_mps` extra and build the Metal extension in the same environment.
+The build requires full Xcode and its Metal compiler (see prerequisites above).
+Rebuild after upgrading MLX:
 
 ```bash
 python python/sglang/kernels/aot/setup_metal.py install
-```
 
-The installed `sgl_kernel` package must contain both `_metal` and
-`sgl_metal_kernels.metallib`. Missing artifacts fail explicitly; there is no JIT
-radix fallback.
-
-```bash
 SGLANG_USE_MLX=0 python -m sglang.launch_server \
   --model-path Qwen/Qwen3-0.6B --device mps --dtype bfloat16 --tp-size 1 \
   --mps-execution-backend mlx-compiled \
-  --context-length 1024 --max-total-tokens 16384 \
+  --context-length 16384 --max-total-tokens 16384 \
   --max-running-requests 16 --mem-fraction-static 0.6
 ```
 
-`--mps-execution-backend mlx-compiled` is the only runner option. It keeps the
-Torch-initialized model, standard Torch-owned KV pools and Torch sampling.
-The normal scheduler enables bounded greedy lookahead; standalone one-batch
-execution is synchronous because it does not supply scheduler lifecycle fences.
-Native MLX is unchanged, and the default Torch execution backend remains `eager`.
+The installed `sgl_kernel` package must include `_metal` and
+`sgl_metal_kernels.metallib`; missing artifacts produce an error.
+The model graph compiles lazily for each batch shape, so warm up before measuring
+decode throughput. AOT applies to the radix shaders, not the entire model.
 
-Decode uses a custom AOT Metal radix kernel over the existing request
-table. No dense KV mirror, gather/padding buffer or native MLX-LM replacement
-model is created. It retains our request-table API rather than adopting the CSR
-paged-attention API from
-[PR #28335](https://github.com/sgl-project/sglang/pull/28335).
-Coalesced SIMD loads, online FP32 softmax, paired GQA-head K/V reuse and a
-workgroup-based KV split budget reduce memory traffic and improve occupancy.
-Partitioned grids merge FP32 maxima, sums and numerators; sufficiently large
-grids avoid that extra launch.
-Current-token and private lookahead K/V are read directly, never written into
-the shared pool by MLX.
+### Supported configurations
 
-The default allocation page size remains 1. Add `--page-size 16` to use real
-16-token physical pages; 32 and 64 are also supported by compiled radix.
-The MPS paged allocator reserves contiguous, aligned slots within each page,
-including partial-page extension and decode. The flat Torch-owned pool and
-request-table interface are unchanged. AOT radix reuses each page's base lookup
-instead of loading a separate table entry for every cached token. Prefix sharing
-is page-aligned, and an unfinished page can waste up to `page_size - 1` slots per
-request; a larger page is not automatically faster.
-Decode uses 128 threads at page size 1 and 256 at the larger page sizes.
-In the matched Qwen3-0.6B comparison, page16/256 was 0.3-3.0% slower than
-page1/128; the default is unchanged. Full controls, native-MLX comparisons,
-and the page32/64 kernel sweep are in `benchmark/mps/README.md`.
+- Dense, unquantized models on a single rank, with decode batches of 1-16.
+  Qwen3-0.6B, SmolLM2-135M and GPT-2 have been checked; other models must pass
+  structural and operator-coverage checks.
+- Standard Torch-owned MHA KV pools and local radix caching. Keep page size 1
+  by default. Sizes 16, 32 and 64 are supported, but larger pages reduce prefix
+  sharing granularity and may waste partially filled slots.
+- Prefill, ineligible batches and unsupported model regions use eager MPS with
+  a fallback log. Unexpected execution errors are not silently retried.
+- LoRA, speculative decoding, MoE/recurrent models, distributed execution,
+  memory saver, alternate KV layouts and external/disaggregated caches are
+  unsupported.
 
-The references use different settings:
-[PR #28335](https://github.com/sgl-project/sglang/pull/28335) uses **page size 1
-and 32 threads**, whereas the pinned
-[vLLM-Metal configuration](https://github.com/vllm-project/vllm-metal/blob/6c4e4d0cf3135b0853f6dcea704f46f7c2450e23/vllm_metal/config.py)
-defaults to **16-token blocks**, with **256 threads** in its host dispatcher.
-These launch geometries do not make the underlying attention algorithms identical.
+The scheduler enables one-token read-only lookahead for eligible greedy requests.
+Torch sampling remains authoritative, and only accepted tokens are committed
+to the KV pool. Grammar, bias and penalty processing disable lookahead, not
+ordinary compiled decode. Standalone one-batch execution is synchronous.
 
-The decode and merge shaders are compiled into the bundled metallib at build
-time. C++ MLX primitives enqueue them on the graph's Metal stream without an
-attention-level evaluation fence. First use can still specialize Metal
-pipelines; AOT radix does not mean the entire `mx.compile` graph is AOT.
+Native MLX remains faster for the measured batch-1 workloads. See
+[`benchmark/mps/README.md`](https://github.com/sgl-project/sglang/blob/main/benchmark/mps/README.md)
+for results and reproduction commands; standalone timings do not represent
+HTTP-serving performance.
 
-### What asynchronous decode means
+### Custom kernels
 
-For an eligible greedy batch, the runner submits the current decode with
-`mx.async_eval`, computes a lazy MLX argmax, and submits the next dependent decode
-**before waiting for or exporting the current result**. The GPU still respects
-the autoregressive dependency: token n+1 cannot be computed independently of n.
-The optimization avoids a host token read between those two submissions.
-
-Lookahead is bounded to one token. Its attention reads the previous step's private
-K/V outputs as a virtual tail, without prematurely allocating a KV slot or
-writing a future token into the shared cache. Only accepted scheduled steps
-commit K/V through the standard pool setter. The normal Torch sampler remains
-authoritative; a prefetched result is used only if the actual next input tokens,
-request rows/generations, lengths, positions, prior KV locations and model state
-match.
-
-The scheduler drains outstanding reads before ingress, control RPCs and slot
-reuse. New requests/control operations, incompatible batches and idle/shutdown
-discard unused results. Greedy requests with grammar, bias or penalty processing
-do not prefetch; ordinary compiled execution still supports their Torch sampling.
-EOS, completion or a changed batch may waste one read-only computation, never
-commit an extra generated token. This is not the CUDA overlap scheduler.
-
-Weights are borrowed through live Torch MPS storage, and K/V deltas are exported
-through DLPack. Sampling receives its own FP32 logits copy so in-place Torch
-logit transforms cannot race the queued MLX forward. Direct users of the internal
-graph API must fence Torch producers and drain MLX before mutating borrowed
-weights or pools.
-
-The ordinary Torch MPS greedy sampler uses a hierarchical argmax to avoid a slow
-vocabulary-wide reduction. It preserves first-index ties, NaNs and all-`-inf`
-rows; non-greedy sampling and native MLX are unchanged. Live graph binding reuses
-its existing metadata checks rather than repeating them, and synchronous
-standalone runs omit lookahead-only model-version snapshots. Scheduler
-lookahead still validates model versions and retains every lifecycle fence.
-In a fresh Qwen3-0.6B BF16 standalone comparison on M4 Pro against updated
-upstream `6cd9c49506`, batch-1 decode improved from 95.67 to 110.50 tokens/s at
-input512 and from 69.98 to 78.65 at input8192. Native MLX measured 140.90 and
-93.40 respectively: the gap is smaller,
-not eliminated. See `benchmark/mps/README.md` for the full protocol, ranges and
-larger-batch results.
-The earlier separate normal-scheduler B1 streaming check (input512/output129) measured
-104.53 versus native MLX's 165.58 tokens/s, excluding TTFT. Standalone gains
-therefore do not imply native-speed interactive serving.
-
-### Scope and extending kernels
-
-This remains an experimental **dense, unquantized, single-rank decode**
-backend, not a general exporter for all Torch MPS models. Real-checkpoint serving
-parity has been checked for Qwen3-0.6B, SmolLM2-135M (`LlamaForCausalLM`) and GPT-2.
-Other models are candidates only if they pass the same capability checks; these
-three checks do not certify every checkpoint in those families. Prefill, including
-production of the first token, remains eager Torch MPS. Batches above the graph
-limit of 16, embedding-input requests and hidden-state capture also use eager MPS.
-Each admitted batch shape compiles lazily; warm ordinary and private-tail
-graphs before timing. Sequence lengths remain device inputs, not graph keys.
-
-The admission contract requires one unambiguous `ModuleList`/`ModuleDict` decoder
-stack, one ordinary `RadixAttention` invocation per block, unique layer IDs,
-homogeneous KV geometry and supported forward arguments. Export must contain only
-supported ATen operations or explicitly registered custom lowerings, and must not
-mutate borrowed inputs or buffers. Unsupported admission or operator coverage
-produces a logged eager-MPS fallback before launching MLX; unexpected export or
-execution errors are not caught and retried.
-
-The tensor wrapper calls the original outer model forward by argument name instead
-of assuming `.model`, positional argument order, or a bias-free linear head.
-FP32 LM-head computation and logit scaling follow the actual logits processor.
-Auxiliary model outputs that cannot be preserved are rejected. Reads of static
-`ForwardBatch` metadata are recorded during capture and checked at replay; a
-different value uses eager MPS instead of reusing a specialized constant. Attention
-invocation order is also checked, so shared/repeated decoder execution cannot
-silently write K/V to the wrong layer. Apart from region-local residual
-bookkeeping, writes to batch metadata are rejected during capture.
-
-Compatible weight/buffer replacement refreshes live views. Replacing modules
-invalidates graphs and reruns structural admission. Model configuration and
-forward code are otherwise initialization-static: restart the runner after
-changing them. Changes to borrowed tensor data require the usual Torch/MLX fences.
-
-LoRA, speculative decoding, MoE/recurrent-state regions, distributed execution,
-memory saver and alternate multidimensional KV layouts are not supported.
-Physical pages in the standard flat MHA pool are supported. The runner requires
-the normal scheduler and local radix cache, not disaggregated serving,
-HiCache, LMCache, PDMux or session radix caching. BF16 rounding can change tied greedy
-choices relative to eager execution. LayerNorm, GELU, ReLU and tanh are supported;
-SiLU retains FP32 intermediates before its output cast to match Torch's
-low-precision activation semantics.
-
-Single-axis LayerNorm uses `mx.fast.layer_norm`; exported mean/rstd outputs
-remain available, and multi-axis LayerNorm retains its arithmetic lowering.
-FP32 RMS normalization followed directly by a compatible weight multiplication
-uses weighted `mx.fast.rms_norm`. An intervening low-precision cast prevents that
-fusion. Cached-cosine/sine RoPE stays arithmetic: `mx.fast.rope` recomputes
-frequencies/trigonometry and does not preserve arbitrary or pre-rounded caches.
-The retained fast operations and benchmark methodology are recorded in
-`benchmark/mps/README.md`.
-
-`python/sglang/kernels/ops/attention/mlx/radix_attention.py` is a concrete custom
-Metal extension: a lazy AOT MLX primitive usable inside `mx.compile`, registered
-as `attention.mlx_radix_decode` with `KernelBackend.AOT`. Its C++ and
-Metal sources live under `python/sglang/kernels/aot/csrc/metal/`. The Torch
-reference and fake export contract live alongside it in
-`mlx/radix_attention_export.py`. Keep MLX attention Python modules together in
-this subpackage; unrelated operator groups and runtime ownership stay separate.
-
-To add another custom kernel:
-
-1. Put the public entry point under `sglang.kernels.ops.<group>`. An AOT operator
-   uses a lazy MLX primitive and sources included by `kernels/aot/setup_metal.py`;
-   a JIT operator can use `mx.fast.metal_kernel`. Register lazy `KernelSpec`
-   metadata in the group's `__init__.py` with `DeviceType.MPS` and respectively
-   `KernelBackend.AOT` or `KernelBackend.MLX`. Registration inventories the
-   callable; it does not automatically lower a Torch graph.
-2. Define a `torch.library.custom_op(..., mutates_args=())` with a Torch reference
-   and `register_fake` implementation that validates shapes/dtypes. The model's
-   exported forward must actually call this op.
-3. Pass the op-overload-to-MLX-callable mapping when constructing the graph in
-   `CompiledMlxRunner._compile`:
-
-   ```python
-   graph = CompiledMlxGraph(
-       model=wrapper,
-       example_inputs=_batch_inputs(batch),
-       attention=mlx_radix_decode,
-       custom_lowerings={
-           torch.ops.sglang.my_custom_op.default: my_mlx_kernel,
-       },
-   )
-   ```
-
-4. Test reference parity, supported and rejected shapes/dtypes, no input
-   mutation, and dependent `mx.async_eval` launches through the exported
-   `mx.compile` graph. Add numerical kernel coverage under
-   `test/registered/kernels/ops/<group>` and export/lifetime coverage under the
-   MPS runtime tests.
-
-Lowerings receive MLX arrays (plus scalar op arguments) and must return lazy MLX
-arrays without host reads or synchronization. Write only newly allocated outputs;
-do not mutate borrowed Torch weights, the table or KV pools. Mutable exports and
-unregistered operations fail closed. The radix attention lowering additionally
-accepts the pending-token K/V tail; stateful kernels must preserve that dependency
-rather than reading an uncommitted slot. Model and pool ownership stay in the
-runner, not in kernels.
-
-`test_compiled_graph.py::test_custom_metal_lowering_survives_export_and_dependent_compile`
-verifies this extension contract with a separate custom Metal op: graph
-construction without its lowering is rejected, and two dependent compiled launches
-match the Torch reference.
-
-See `benchmark/mps/README.md` for the matched native-MLX/compiled-radix comparison.
-Standalone `bench_one` measurements do not enable lookahead and do not measure
-asynchronous serving.
+Register read-only operators under `sglang.kernels.ops.<group>` and expose them
+through a Torch custom op with a fake implementation. The exported model must
+call that op. Supply its MLX callable in `CompiledMlxGraph(custom_lowerings=...)`.
+Lowerings must return lazy MLX arrays without host synchronization or mutation
+of borrowed Torch weights, request tables or KV pools. Attention extensions must
+preserve the private lookahead K/V dependency.
 
 ## Benchmarking with Requests
 

@@ -2142,14 +2142,11 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
                     else:
-                        allocator_cls = PagedTokenToKVPoolAllocator
-                        if self.device == "mps":
-                            from sglang.srt.hardware_backend.mps.allocator import (
-                                MPSPagedTokenToKVPoolAllocator,
-                            )
-
-                            allocator_cls = MPSPagedTokenToKVPoolAllocator
-                        token_to_kv_pool_allocator = allocator_cls(
+                        paged_allocator_cls = (
+                            current_platform.get_paged_allocator_cls()
+                            or PagedTokenToKVPoolAllocator
+                        )
+                        token_to_kv_pool_allocator = paged_allocator_cls(
                             sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
                             page_size=get_schedule().page_size
                             * get_parallel().attn_dcp_size,

@@ -82,9 +82,15 @@ class SRTPlatform(DeviceMixin):
         """Return the DSA KV pool class for this platform (DeepSeek V3.2)."""
         raise NotImplementedError
 
-    def get_paged_allocator_cls(self) -> type:
-        """Return the paged allocator class for this platform."""
-        raise NotImplementedError
+    def get_paged_allocator_cls(self) -> Optional[type]:
+        """Return the paged allocator class, or None for the in-tree default.
+
+        Honored at every paged-allocator construction site, including
+        inside ``SWATokenToKVPoolAllocator``. The in-tree allocator already
+        falls back to torch-native kernels when ``capabilities.supports_triton``
+        is False, so most platforms need no override.
+        """
+        return None
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the compilation backend identifier.
