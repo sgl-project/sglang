@@ -17,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "python"))
 
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 
+from fixture_json import dump
+
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/reasoning_parity"
 
 
@@ -34,13 +36,13 @@ for path in sorted(FIXTURES.glob("*.json")):
     fixture = json.loads(path.read_text())
     fixture["cases"] = [
         {
-            "chunks": case["chunks"],
+            "input": index,
             "force": force,
             "stream": stream,
             **split(fixture["parser"], force, stream, case["chunks"]),
         }
-        for case in fixture["inputs"]
+        for index, case in enumerate(fixture["inputs"])
         for force in (True, False)
         for stream in (True, False)
     ]
-    path.write_text(json.dumps(fixture, indent=1, ensure_ascii=False) + "\n")
+    path.write_text(dump(fixture))
