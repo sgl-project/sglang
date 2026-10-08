@@ -11,7 +11,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-
 from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -31,7 +30,8 @@ def _low_confidence():
         SimpleNamespace(
             block_size=4,
             mask_id=0,
-            first_done_first_out_mode=True, requires_separate_context_encoding=False,
+            first_done_first_out_mode=True,
+            requires_separate_context_encoding=False,
             algorithm_config={"threshold": 0.5},
         )
     )
@@ -65,7 +65,8 @@ def _req(fdfo=True):
             block_size=4,
             mask_id=0,
             max_running_requests=2,
-            first_done_first_out_mode=fdfo, requires_separate_context_encoding=False,
+            first_done_first_out_mode=fdfo,
+            requires_separate_context_encoding=False,
         ),
     )
 
@@ -88,7 +89,9 @@ def _get_empty_dllm_batch(manager):
 
 class TestDllmResultSnapshot(unittest.TestCase):
     def test_queue_snapshot_preserves_dllm_dispatch(self):
-        config = SimpleNamespace(first_done_first_out_mode=True, requires_separate_context_encoding=False)
+        config = SimpleNamespace(
+            first_done_first_out_mode=True, requires_separate_context_encoding=False
+        )
         batch = ScheduleBatch(reqs=[object()], dllm_config=config)
         snapshot = batch.copy()
         self.assertTrue(snapshot.is_dllm())
@@ -99,7 +102,9 @@ class TestDllmResultSnapshot(unittest.TestCase):
 
 class TestFdfoLowConfidenceOverlap(unittest.TestCase):
     def setUp(self):
-        override = get_context().override_server_args(attention_backend="torch_native", dcp_size=1)
+        override = get_context().override_server_args(
+            attention_backend="torch_native", dcp_size=1
+        )
         override.install()
         self.addCleanup(override.restore)
 
@@ -137,7 +142,6 @@ class TestFdfoLowConfidenceOverlap(unittest.TestCase):
         batch.input_ids.fill_(5)
         self.assertEqual(result.block_tokens.tolist(), [[2, 1, 1, 1]])
         self.assertEqual(result.block_done.tolist(), [False])
-
 
     def test_fdfo_commits_only_after_forward_on_final_tokens(self):
         algo = _low_confidence()
@@ -180,7 +184,9 @@ class TestFdfoLowConfidenceOverlap(unittest.TestCase):
         )
         batch = SimpleNamespace(
             is_dllm=lambda: True,
-            dllm_config=SimpleNamespace(first_done_first_out_mode=True, requires_separate_context_encoding=False),
+            dllm_config=SimpleNamespace(
+                first_done_first_out_mode=True, requires_separate_context_encoding=False
+            ),
             req_pool_indices=torch.tensor([1, 2]),
             input_ids=torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.int64),
         )
@@ -208,18 +214,19 @@ class TestFdfoLowConfidenceOverlap(unittest.TestCase):
         req.prefix_len = 0
         req.extend_end = 4
         self.assertEqual(req.dllm_block_id, 0)
-        batch = ScheduleBatch(
-            reqs=[req], device="cpu", dllm_config=req.dllm_config
-        )
+        batch = ScheduleBatch(reqs=[req], device="cpu", dllm_config=req.dllm_config)
 
         class AllocationReached(Exception):
             pass
 
         def prepare():
-            with patch(
-                "sglang.srt.managers.schedule_batch.alloc_for_extend",
-                side_effect=AllocationReached,
-            ), self.assertRaises(AllocationReached):
+            with (
+                patch(
+                    "sglang.srt.managers.schedule_batch.alloc_for_extend",
+                    side_effect=AllocationReached,
+                ),
+                self.assertRaises(AllocationReached),
+            ):
                 batch.prepare_for_extend()
 
         prepare()
@@ -332,18 +339,23 @@ class TestDllmResultProcessing(unittest.TestCase):
                 kv=SimpleNamespace(req_pool_idx=1),
                 time_stats=SimpleNamespace(set_completion_time=lambda: None),
             )
+            req.init_next_round_input = lambda: None
             req.accepted = []
             req.update_finish_state = lambda new_accepted_len: req.accepted.append(
                 new_accepted_len
             )
         streamed = []
         scheduler = SimpleNamespace(
-            future_map=future_map,
+            future_map=future_map or SimpleNamespace(dllm_block_tokens_buf=None),
             forward_stream_ctx=nullcontext(),
             enable_overlap=True,
             model_config=SimpleNamespace(context_len=8192),
             tree_cache=None,
-            dllm_config=SimpleNamespace(block_size=4, first_done_first_out_mode=fdfo, requires_separate_context_encoding=False),
+            dllm_config=SimpleNamespace(
+                block_size=4,
+                first_done_first_out_mode=fdfo,
+                requires_separate_context_encoding=False,
+            ),
             token_to_kv_pool_allocator=SimpleNamespace(
                 free_group_begin=lambda: None, free_group_end=lambda: None
             ),
@@ -354,7 +366,15 @@ class TestDllmResultProcessing(unittest.TestCase):
                 stream_output=lambda *args: streamed.append(True)
             ),
         )
-        scheduler._finish_dllm_request_if_needed = lambda req: SchedulerDllmMixin._finish_dllm_request_if_needed(scheduler, req)
+        # These tests isolate output commits; KV/input handoff uses real Req in
+        # test_dllm_fdfo_kv_reuse.py.
+        scheduler.finish_dllm_forward = lambda req: None
+        scheduler._complete_dllm_block = lambda req: (
+            SchedulerDllmMixin._complete_dllm_block(scheduler, req)
+        )
+        scheduler._finish_dllm_request_if_needed = lambda req: (
+            SchedulerDllmMixin._finish_dllm_request_if_needed(scheduler, req)
+        )
         scheduler._clear_dllm_future = lambda req: Scheduler._clear_dllm_future(
             scheduler, req
         )
@@ -385,9 +405,7 @@ class TestDllmResultProcessing(unittest.TestCase):
             done=True,
         )
         self.assertEqual(req.output_ids, [4, 5])
-        self.assertEqual(
-            list(req.full_untruncated_fill_ids), [2, 3, 4, 5, 0, 0]
-        )
+        self.assertEqual(list(req.full_untruncated_fill_ids), [2, 3, 4, 5, 0, 0])
         self.assertEqual(req.accepted, [2])
         self.assertEqual(count, 2)
         self.assertEqual(streamed, [True])
@@ -417,11 +435,13 @@ class TestDllmResultProcessing(unittest.TestCase):
                 tokens=[2, 3, 4, 5],
                 done=True,
                 finished=True,
-                future_map=future_map,
+                future_map=future_map or SimpleNamespace(dllm_block_tokens_buf=None),
             )
         batch = SimpleNamespace(
             is_dllm=lambda: True,
-            dllm_config=SimpleNamespace(first_done_first_out_mode=True, requires_separate_context_encoding=False),
+            dllm_config=SimpleNamespace(
+                first_done_first_out_mode=True, requires_separate_context_encoding=False
+            ),
             req_pool_indices=torch.tensor([1]),
             input_ids=torch.tensor([6, 0, 0, 0]),
         )

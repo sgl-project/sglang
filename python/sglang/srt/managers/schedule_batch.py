@@ -2705,6 +2705,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # For DLLM, we use a separate forward mode
             self.forward_mode = ForwardMode.DLLM_EXTEND
             for req in self.reqs:
+                if (
+                    req.dllm_block_done
+                    and not self.dllm_config.requires_separate_context_encoding
+                ):
+                    req.init_next_round_input()
                 if req.dllm_block_id == 0 or req.dllm_block_done:
                     req.dllm_block_id += 1
                     req.dllm_block_done = False
@@ -2982,6 +2987,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
+
+        if self.is_dllm() and not self.dllm_config.requires_separate_context_encoding:
+            for req in reqs:
+                if req.extend_end <= len(req.origin_input_ids):
+                    # Prompt-only blocks need one forward, with no sampled output.
+                    req.dllm_block_done = True
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,

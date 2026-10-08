@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.dllm.mixin.scheduler import DllmManager
 from sglang.srt.managers.io_struct import AbortReq
@@ -13,6 +12,7 @@ from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -31,7 +31,8 @@ class TestFdfoAbort(unittest.TestCase):
             block_size=4,
             mask_id=0,
             max_running_requests=2,
-            first_done_first_out_mode=True, requires_separate_context_encoding=False,
+            first_done_first_out_mode=True,
+            requires_separate_context_encoding=False,
         )
         req = Req(
             rid="cancel-me",
@@ -155,6 +156,56 @@ class TestFdfoAbort(unittest.TestCase):
                 self.assertEqual(list(req.dllm_incomplete_ids), [2, 3, 4, 0])
                 self.assertIsNone(req.dllm_algo_state)
                 self.assertEqual(scheduler.metrics_reporter.num_generated_tokens, 0)
+
+    def test_abort_after_block_completion_while_waiting_for_admission(self):
+        scheduler, req = self.make_scheduler()
+        req.sampling_params.normalize(None)
+        scheduler.model_config = SimpleNamespace(context_len=64)
+        scheduler.tree_cache = ChunkCache(
+            SimpleNamespace(
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=None,
+                page_size=4,
+            )
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            return_logprob=False,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        result = GenerationBatchResult(
+            dllm_block_ids=(1,),
+            next_token_ids=torch.tensor([[2, 3, 4, 5]]),
+            dllm_block_done=torch.tensor([True]),
+        )
+        scheduler.process_batch_result_dllm(batch, result)
+        self.assertTrue(req.dllm_block_done)
+        self.assertEqual(req.dllm_block_id, 1)
+        self.assertEqual(req.prefix_len, 0)
+        self.assertEqual(req.kv.req_pool_idx, 1)
+
+        def release(req, tree_cache, checkpoint):
+            self.assertFalse(checkpoint)
+            self.assertTrue(req.kv.holds_kv)
+            self.assertEqual(req.kv.kv_allocated_len, 4)
+            self.assertEqual(
+                scheduler.future_map.dllm_block_tokens_buf[1].tolist(), [-1] * 4
+            )
+            req.kv.req_pool_idx = None
+            req.kv.mark_kv_released()
+
+        with patch(
+            "sglang.srt.managers.scheduler.release_kv_cache", side_effect=release
+        ) as release_cache:
+            scheduler.abort_request(AbortReq(rid=req.rid))
+            scheduler.abort_request(AbortReq(rid=req.rid))
+        self.assertEqual(release_cache.call_count, 1)
+        scheduler.process_batch_result_dllm(batch, result)
+        self.assertTrue(req.finished())
+        self.assertFalse(req.kv.holds_kv)
+        self.assertEqual(req.output_ids.tolist(), [4, 5])
+        self.assertEqual(req.dllm_block_offset, 0)
 
     def test_abort_before_first_forward_does_not_clear_another_slot(self):
         scheduler, req = self.make_scheduler(holds_kv=False)

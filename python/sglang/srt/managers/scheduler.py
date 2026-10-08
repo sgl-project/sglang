@@ -3669,6 +3669,12 @@ class Scheduler(
             self._fpm_batch_t0 = time.monotonic()
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
+            if not self.dllm_config.requires_separate_context_encoding:
+                for req in self.dllm_manager.waiting_queue:
+                    if req.dllm_block_done and req.extend_end > req.prefix_len:
+                        if self.dllm_config.first_done_first_out_mode:
+                            self._clear_dllm_future(req)
+                        self.finish_dllm_forward(req)
 
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()

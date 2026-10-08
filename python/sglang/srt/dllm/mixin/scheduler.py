@@ -83,6 +83,9 @@ class SchedulerDllmMixin:
             self.dllm_config.requires_separate_context_encoding
             and not batch.forward_mode.is_dllm_extend()
         ):
+            for req in batch.reqs:
+                if not req.finished() and not req.dllm_block_done:
+                    self._complete_dllm_block(req)
             self.metrics_reporter.report_prefill_stats(
                 batch=batch,
                 prefill_stats=batch.prefill_stats,
@@ -107,10 +110,9 @@ class SchedulerDllmMixin:
         self.token_to_kv_pool_allocator.free_group_begin()
         for idx, req in enumerate(batch.reqs):
             if (
-                req.finished() # Ignore retired requests
-                # Overlap may leave one extra result
-                or result.dllm_block_ids[idx] != req.dllm_block_id # block_id doesn't match means a new block is opened
-                or req.dllm_block_done # dllm_block_done indicates the req is already done
+                req.finished()
+                or result.dllm_block_ids[idx] != req.dllm_block_id
+                or req.dllm_block_done
             ):
                 continue
 
@@ -125,7 +127,6 @@ class SchedulerDllmMixin:
                 )
                 continue
 
-            req.dllm_block_done = True
             req.dllm_incomplete_ids = array("q")
             req.dllm_algo_state = None
 
@@ -136,17 +137,17 @@ class SchedulerDllmMixin:
             )
 
             len_input = len(req.origin_input_ids)
-            if len_fill <= len_input:
-                continue
-            if len_fill - block_size < len_input:
-                next_token_ids = next_token_ids[len_input - len_fill :]
+            if len_fill > len_input:
+                if len_fill - block_size < len_input:
+                    next_token_ids = next_token_ids[len_input - len_fill :]
 
-            has_new_tokens = True
-            self.metrics_reporter.num_generated_tokens += len(next_token_ids)
-            req.output_ids.extend(next_token_ids)
-            req.update_finish_state(new_accepted_len=len(next_token_ids))
+                has_new_tokens = True
+                self.metrics_reporter.num_generated_tokens += len(next_token_ids)
+                req.output_ids.extend(next_token_ids)
+                req.update_finish_state(new_accepted_len=len(next_token_ids))
+                self._finish_dllm_request_if_needed(req)
 
-            self._finish_dllm_request_if_needed(req)
+            self._complete_dllm_block(req)
 
         if fdfo_mode or has_new_tokens:
             self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -158,6 +159,18 @@ class SchedulerDllmMixin:
             can_run_cuda_graph=result.can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _complete_dllm_block(self: Scheduler, req: Req) -> None:
+        """Finish a block once; keep its ID/done until the next block is scheduled."""
+        if req.dllm_block_done:
+            return
+        req.dllm_block_done = True
+        if req.finished() or not self.dllm_config.requires_separate_context_encoding:
+            return
+        if self.dllm_config.first_done_first_out_mode:
+            self._clear_dllm_future(req)
+        self.finish_dllm_forward(req)
+        req.init_next_round_input()
 
     def _finish_dllm_request_if_needed(self: Scheduler, req: Req) -> None:
         if (
@@ -399,16 +412,6 @@ class SchedulerDllmMixin:
     ) -> AddReqResult:
         """Process staging DLLM requests with resource allocation."""
         for req in reqs:
-            if req.kv.holds_kv:
-                # Prompt chunks can advance without waiting for overlap results.
-                if req.extend_end <= len(req.origin_input_ids):
-                    req.dllm_block_done = True
-                if req.dllm_block_done:
-                    if self.dllm_config.first_done_first_out_mode:
-                        self._clear_dllm_future(req)
-                    self.finish_dllm_forward(req)
-                    self.req_to_token_pool.free(req)
-                    req.init_next_round_input()
             res = adder.add_dllm_staging_req(req)
             if res == AddReqResult.NO_TOKEN:
                 return res

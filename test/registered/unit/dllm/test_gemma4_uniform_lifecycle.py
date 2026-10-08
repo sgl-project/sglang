@@ -6,12 +6,13 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
-
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.allocation import _alloc_extend_loc_with_kv_reuse
+from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -107,9 +108,15 @@ class _Scheduler(SchedulerDllmMixin):
 def _result(next_token_ids, *, accept_lengths=None, algo_states=None):
     return SimpleNamespace(
         copy_done=None,
-        next_token_ids=torch.stack(next_token_ids) if next_token_ids is not None else None,
-        dllm_block_ids=tuple(1 for _ in next_token_ids) if next_token_ids is not None else None,
-        dllm_block_done=torch.tensor([n > 0 for n in accept_lengths]) if accept_lengths is not None else None,
+        next_token_ids=torch.stack(next_token_ids)
+        if next_token_ids is not None
+        else None,
+        dllm_block_ids=tuple(1 for _ in next_token_ids)
+        if next_token_ids is not None
+        else None,
+        dllm_block_done=torch.tensor([n > 0 for n in accept_lengths])
+        if accept_lengths is not None
+        else None,
         accept_length_per_req_cpu=accept_lengths,
         dllm_algo_state=algo_states,
         can_run_cuda_graph=False,
@@ -146,16 +153,47 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         )
         self.assertEqual(mode, ForwardMode.DLLM_EXTEND)
 
-    def test_context_result_skips_fdfo_token_processing(self):
+    def test_context_result_prepares_decode_without_token_processing(self):
         scheduler = _Scheduler(fdfo=True)
-        req = _Req(prefill=True)
+        req = Req(
+            "context",
+            "",
+            array("q", range(8)),
+            SamplingParams(max_new_tokens=32),
+            dllm_config=scheduler.dllm_config,
+        )
+        req.init_next_round_input()
+        req.dllm_block_id = 1
+        req.extend_end = 8
+        req.kv = ReqKvInfo(req_pool_idx=1, kv_allocated_len=8, kv_committed_len=8)
+        scheduler.tree_cache = ChunkCache(
+            SimpleNamespace(
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=None,
+                page_size=4,
+            )
+        )
+        scheduler.stash_chunked_request = lambda req: checkpoint_kv_cache(
+            req, scheduler.tree_cache
+        )
         result = _result(None)
+        batch = _Batch([req])
 
-        SchedulerDllmMixin.process_batch_result_dllm(scheduler, _Batch([req]), result)
-
+        scheduler.process_batch_result_dllm(batch, result)
+        self.assertEqual(req.prefix_len, 8)
+        self.assertEqual(req.dllm_block_offset, 8)
+        self.assertEqual(
+            req.full_untruncated_fill_ids.tolist(), list(range(8)) + [0] * 4
+        )
+        self.assertEqual(req.output_ids.tolist(), [])
+        self.assertTrue(req.dllm_block_done)
+        self.assertEqual(req.dllm_block_id, 1)
+        self.assertFalse(req.is_dllm_prefill())
         scheduler.token_to_kv_pool_allocator.free_group_begin.assert_not_called()
         scheduler.output_streamer.stream_output.assert_not_called()
         scheduler.metrics_reporter.report_prefill_stats.assert_called_once()
+        scheduler.process_batch_result_dllm(batch, result)
+        self.assertEqual(len(req.full_untruncated_fill_ids), 12)
 
     def test_context_admission_obeys_live_swa_budget(self):
         allocator = SimpleNamespace(
