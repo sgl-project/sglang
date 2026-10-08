@@ -4247,21 +4247,22 @@ def get_eager_max_batch_size(max_batch_size: int) -> int:
     return ceil_align(max_batch_size, get_cp_padding_align_size())
 
 
-def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
+def find_local_repo_dir(
+    repo_id: str, revision: Optional[str] = None, cache_dir: Optional[str] = None
+) -> Optional[str]:
     import huggingface_hub as hf
 
     # Build cache path
     cache_path = os.path.join(
-        hf.constants.HF_HUB_CACHE,
+        cache_dir or hf.constants.HF_HUB_CACHE,
         hf.constants.REPO_ID_SEPARATOR.join(["models", *repo_id.split("/")]),
     )
 
-    # Get revision from main ref if not specified
-    if not revision:
-        ref_path = os.path.join(cache_path, "refs", "main")
-        if os.path.isfile(ref_path):
-            with open(ref_path) as f:
-                revision = f.read().strip()
+    # Snapshots are named by commit; a branch or tag maps to one through refs/.
+    ref_path = os.path.join(cache_path, "refs", revision or "main")
+    if os.path.isfile(ref_path):
+        with open(ref_path) as f:
+            revision = f.read().strip()
 
     # List files from revision directory
     if revision:

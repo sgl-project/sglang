@@ -514,22 +514,9 @@ def _find_local_hf_snapshot_dir_unlocked(
     # Check custom cache_dir (if provided)
     if cache_dir:
         try:
-            repo_folder = os.path.join(
-                cache_dir,
-                huggingface_hub.constants.REPO_ID_SEPARATOR.join(
-                    ["models", *model_name_or_path.split("/")]
-                ),
+            found_local_snapshot_dir = find_local_repo_dir(
+                model_name_or_path, revision=revision, cache_dir=cache_dir
             )
-            rev_to_use = revision
-            if not rev_to_use:
-                ref_main = os.path.join(repo_folder, "refs", "main")
-                if os.path.isfile(ref_main):
-                    with open(ref_main) as f:
-                        rev_to_use = f.read().strip()
-            if rev_to_use:
-                rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
-                if os.path.isdir(rev_dir):
-                    found_local_snapshot_dir = rev_dir
         except Exception as e:
             logger.warning(
                 "Failed to find local snapshot in custom cache_dir %s: %s",
