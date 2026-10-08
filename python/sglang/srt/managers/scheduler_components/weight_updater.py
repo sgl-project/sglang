@@ -44,7 +44,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.weight_checker import overall_checksum
 
 logger = logging.getLogger(__name__)
@@ -88,7 +88,6 @@ class _WeightUpdateSession(msgspec.Struct, frozen=True):
 class SchedulerWeightUpdaterManager:
     tp_worker: Any
     draft_worker: Any
-    tp_cpu_group: Any
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
@@ -98,6 +97,10 @@ class SchedulerWeightUpdaterManager:
     stashed_model_static_state: Any = None
     # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
     _session: Optional[_WeightUpdateSession] = None
+    tp_cpu_group: Any = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.tp_cpu_group = get_parallel().tp_group.cpu_group
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:

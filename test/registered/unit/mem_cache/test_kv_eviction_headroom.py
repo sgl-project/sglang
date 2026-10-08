@@ -37,7 +37,7 @@ class TestKVEvictionHeadroom(CustomTestCase):
         allocator.available_size = MagicMock(return_value=100)
         allocator.page_size = 1
         tree_cache = MagicMock()
-        tree_cache.is_chunk_cache.return_value = False
+        tree_cache.supports_prefix_sharing.return_value = True
         tree_cache.evictable_size.return_value = 150
         tree_cache.token_to_kv_pool_allocator = allocator
 
@@ -51,7 +51,7 @@ class TestKVEvictionHeadroom(CustomTestCase):
         allocator.available_size = MagicMock(return_value=256)
         allocator.page_size = 1
         tree_cache = MagicMock()
-        tree_cache.is_chunk_cache.return_value = False
+        tree_cache.supports_prefix_sharing.return_value = True
         tree_cache.token_to_kv_pool_allocator = allocator
 
         with envs.SGLANG_OPT_KV_CACHE_EVICTION_HEADROOM_TOKENS.override(128):
@@ -65,7 +65,7 @@ class TestKVEvictionHeadroom(CustomTestCase):
             swa_available_size=MagicMock(return_value=500),
         )
         tree_cache = MagicMock()
-        tree_cache.is_chunk_cache.return_value = False
+        tree_cache.supports_prefix_sharing.return_value = True
         tree_cache.full_evictable_size.return_value = 1000
 
         with envs.SGLANG_OPT_KV_CACHE_EVICTION_HEADROOM_TOKENS.override(128):
@@ -84,7 +84,7 @@ class TestKVEvictionHeadroom(CustomTestCase):
             ensure_capacity=MagicMock(return_value=True),
         )
         tree_cache = MagicMock()
-        tree_cache.is_chunk_cache.return_value = False
+        tree_cache.supports_prefix_sharing.return_value = True
         tree_cache.full_evictable_size.return_value = 1000
         tree_cache.swa_evictable_size.return_value = 1000
 
@@ -94,7 +94,7 @@ class TestKVEvictionHeadroom(CustomTestCase):
             )
 
         self.assertTrue(ready)
-        tree_cache.evict_for_alloc.assert_called_once_with(
+        tree_cache.evict.assert_called_once_with(
             EvictParams(num_tokens=228, swa_num_tokens=0)
         )
         allocator.ensure_capacity.assert_called_once_with(200, 200)
