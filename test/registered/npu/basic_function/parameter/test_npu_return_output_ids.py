@@ -109,9 +109,7 @@ class TestNpuReturnOutputIds(CustomTestCase):
                 if content:
                     generated_text += content
 
-        self.assertIsNotNone(
-            output_ids, "streaming response missing sglext.output_ids"
-        )
+        self.assertIsNotNone(output_ids, "streaming response missing sglext.output_ids")
         self.assertIsInstance(output_ids, list)
         self.assertEqual(len(output_ids), 1)  # n == 1
         self.assertIsInstance(output_ids[0], list)
@@ -150,4 +148,3 @@ class TestNpuReturnOutputIds(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-    
