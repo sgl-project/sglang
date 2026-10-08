@@ -580,7 +580,8 @@ class _KvTaggingTransformer:
 
 
 class _TwoStepScheduler:
-    timesteps = (torch.tensor(1000.0), torch.tensor(500.0))
+    timesteps = torch.tensor([1000.0, 500.0])
+    order = 1
 
     def set_timesteps(self, *, sigmas, device):
         pass
@@ -604,24 +605,34 @@ def _clip_conditioning(reference_video_latents):
     )
 
 
-def _batch_without_perf_recording() -> SimpleNamespace:
+def _batch_without_perf_recording(*, is_warmup=False) -> SimpleNamespace:
     """The clip loop reads only the perf-recording fields off the batch (and hands it to
     set_forward_context); no metrics object means no step records."""
-    return SimpleNamespace(metrics=None, perf_dump_path=None)
+    return SimpleNamespace(
+        metrics=None,
+        perf_dump_path=None,
+        is_warmup=is_warmup,
+        rollout=False,
+        return_trajectory_latents=False,
+    )
 
 
-def _fake_denoising_stage(transformer, *, events: list[str]) -> SimpleNamespace:
+def _fake_denoising_stage(
+    transformer, *, events: list[str]
+) -> WanAnimate2DenoisingStage:
     """Stand-in for WanAnimate2DenoisingStage in _denoise_single_clip; the residency hooks
     record into ``events`` so a test can read the use interval back."""
-    return SimpleNamespace(
-        transformer=transformer,
-        scheduler=_TwoStepScheduler(),
-        step_profile=lambda: None,
-        begin_declared_component_use=lambda *, component_name, module: events.append(
-            f"begin:{component_name}"
-        ),
-        _finish_active_component_use=lambda: events.append("finish"),
+    stage = WanAnimate2DenoisingStage.__new__(WanAnimate2DenoisingStage)
+    stage.transformer = transformer
+    stage.scheduler = _TwoStepScheduler()
+    stage.step_profile = lambda: None
+    stage._apply_nvtx_gate = lambda is_warmup: False
+    stage.log_info = lambda *args: None
+    stage.begin_declared_component_use = lambda *, component_name, module: (
+        events.append(f"begin:{component_name}")
     )
+    stage._finish_active_component_use = lambda: events.append("finish")
+    return stage
 
 
 def _single_clip_request_state(guidance_scale: float) -> SimpleNamespace:
@@ -633,17 +644,24 @@ def _single_clip_request_state(guidance_scale: float) -> SimpleNamespace:
     )
 
 
-def test_each_clip_is_denoised_with_kv_from_its_own_reference_video():
+@pytest.mark.parametrize("is_warmup", [False, True])
+@pytest.mark.parametrize("guidance_scale", [1.0, 3.0])
+def test_each_clip_is_denoised_with_kv_from_its_own_reference_video(
+    is_warmup, guidance_scale
+):
     """Consecutive clips that share seed and clip index but not the reference video (two
     requests on one DiT) must each be denoised with K/V built from their own reference video,
     never with K/V left over from the previous one."""
     transformer = _KvTaggingTransformer()
-    stage = _fake_denoising_stage(transformer, events=[])
+    events = []
+    stage = _fake_denoising_stage(transformer, events=events)
+    stage.step_profile = lambda: events.append("profile")
     server_args = SimpleNamespace(
-        pipeline_config=SimpleNamespace(flow_shift=5.0), enable_cfg_parallel=False
+        pipeline_config=SimpleNamespace(flow_shift=5.0),
+        enable_cfg_parallel=False,
+        disable_autocast=False,
     )
-    # guidance_scale 1.0: CFG off, one forward per step.
-    request_state = _single_clip_request_state(guidance_scale=1.0)
+    request_state = _single_clip_request_state(guidance_scale=guidance_scale)
     first = _clip_conditioning(torch.full((16, 1, 2, 2), 1.0))
     second = _clip_conditioning(torch.full((16, 1, 2, 2), 2.0))
 
@@ -653,19 +671,23 @@ def test_each_clip_is_denoised_with_kv_from_its_own_reference_video():
         for clip_cond in (first, second):
             WanAnimate2DenoisingStage._denoise_single_clip(
                 stage,
-                batch=_batch_without_perf_recording(),
+                batch=_batch_without_perf_recording(is_warmup=is_warmup),
                 server_args=server_args,
                 request_state=request_state,
                 clip_condition=clip_cond,
-                clip_index=0,
             )
 
     # 2 clips x 2 steps; every forward of a clip gets the K/V built from that clip's latents.
-    assert len(transformer.forward_calls) == 4
-    assert transformer.context_calls == 2
+    branches = 2 if guidance_scale > 1 else 1
+    assert len(transformer.forward_calls) == 4 * branches
+    assert transformer.context_calls == 2 * branches
+    assert events.count("profile") == (0 if is_warmup else 4)
     for clip_cond, reference_kv in transformer.forward_calls:
         assert reference_kv.k[0] is clip_cond.reference_video_latents
-    assert transformer.forward_calls[0][1] is not transformer.forward_calls[2][1]
+    assert (
+        transformer.forward_calls[0][1]
+        is not transformer.forward_calls[2 * branches][1]
+    )
 
 
 def test_dit_work_of_a_clip_runs_inside_one_declared_transformer_use():
@@ -690,7 +712,9 @@ def test_dit_work_of_a_clip_runs_inside_one_declared_transformer_use():
 
     stage = _fake_denoising_stage(_EventTransformer(), events=events)
     server_args = SimpleNamespace(
-        pipeline_config=SimpleNamespace(flow_shift=5.0), enable_cfg_parallel=False
+        pipeline_config=SimpleNamespace(flow_shift=5.0),
+        enable_cfg_parallel=False,
+        disable_autocast=False,
     )
     with patch(
         f"{_DENOISING}.get_local_torch_device", return_value=torch.device("cpu")
@@ -702,7 +726,6 @@ def test_dit_work_of_a_clip_runs_inside_one_declared_transformer_use():
             # guidance_scale 3.0: two forwards (cond, uncond) per step.
             request_state=_single_clip_request_state(guidance_scale=3.0),
             clip_condition=_clip_conditioning(torch.zeros(16, 1, 2, 2)),
-            clip_index=0,
         )
 
     assert events == [

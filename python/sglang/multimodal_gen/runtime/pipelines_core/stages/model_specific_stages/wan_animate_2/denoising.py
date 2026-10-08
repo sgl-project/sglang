@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Wan-Animate-2 denoising and output stages.
 
-WanAnimate2DenoisingStage overrides DenoisingStage.forward entirely: the in-context DiT
+WanAnimate2DenoisingStage orchestrates clips around the shared denoising loop: the in-context DiT
 takes per-clip conditioning via its ``clip_cond`` kwarg and the clip's reference K/V via
 ``reference_kv`` (built once per clip with ``build_reference_kv`` and dropped with the clip),
 runs cond/uncond CFG as two forwards (the unconditional branch skips block 9 via
@@ -12,7 +12,7 @@ WanAnimate2OutputStage then emits the assembled frames.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -41,13 +41,18 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 )
 from sglang.multimodal_gen.runtime.models.dits.wan_animate_2_clip_conditioning import (
     WanAnimate2ClipConditioning,
+    WanAnimate2ReferenceKV,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_dpm_solver_multistep import (
     DPMSolverMultistepScheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingContext,
+    DenoisingStage,
+    DenoisingStepState,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.before_denoising import (
     WAN_ANIMATE_2_REQUEST_STATE_EXTRA_KEY,
     WanAnimate2RequestState,
@@ -69,7 +74,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
 logger = init_logger(__name__)
 
@@ -86,6 +90,16 @@ def _is_request_state(value: object) -> bool:
 def _is_decoded_frames(value: object) -> bool:
     """``[T, H, W, C]`` uint8 frames assembled by the denoising stage."""
     return isinstance(value, np.ndarray) and value.ndim == 4 and value.dtype == np.uint8
+
+
+@dataclass(kw_only=True)
+class WanAnimate2DenoisingContext(DenoisingContext):
+    clip_condition: WanAnimate2ClipConditioning
+    reference_image_embeddings: torch.Tensor
+    cfg_parallel: bool
+    guidance_scale: float
+    reference_kv: WanAnimate2ReferenceKV | None = None
+    context_by_branch: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 class WanAnimate2DenoisingStage(DenoisingStage):
@@ -190,8 +204,6 @@ class WanAnimate2DenoisingStage(DenoisingStage):
         server_args: ServerArgs,
         request_state: WanAnimate2RequestState,
         clip_condition: WanAnimate2ClipConditioning,
-        *,
-        clip_index: int,
     ) -> torch.Tensor:
         """Denoise one clip; return the latents with the reference-image slot dropped.
         ``batch`` is handed to set_forward_context, which the attention backends read, and
@@ -253,84 +265,116 @@ class WanAnimate2DenoisingStage(DenoisingStage):
             )
         cfg_policy = CFGPolicy(branches=branches)
 
-        latents = clip_condition.init_noise  # [16, latent_t, latent_h, latent_w] fp32
+        ctx = WanAnimate2DenoisingContext(
+            scheduler=self.scheduler,
+            extra_step_kwargs={},
+            target_dtype=torch.bfloat16,
+            autocast_enabled=True,
+            timesteps=self.scheduler.timesteps,
+            num_inference_steps=num_inference_steps,
+            num_warmup_steps=0,
+            image_kwargs={},
+            pos_cond_kwargs={},
+            neg_cond_kwargs={},
+            latents=clip_condition.init_noise,
+            boundary_timestep=None,
+            z=None,
+            reserved_frames_mask=None,
+            seq_len=None,
+            guidance=None,
+            is_warmup=batch.is_warmup,
+            cfg_policy=cfg_policy,
+            # DPM-Solver advances once per timestep, irrespective of solver order
+            extra={"progress_step_interval": 1},
+            clip_condition=clip_condition,
+            reference_image_embeddings=reference_image_embeddings,
+            cfg_parallel=cfg_parallel,
+            guidance_scale=guidance_scale,
+        )
+        # clip trajectories are not part of the assembled-video output contract
+        self._run_denoising_loop(ctx, batch, server_args, collect_trajectory=False)
+        return ctx.latents[:, 1:]
 
-        # Three uses are declared, so begin_stage does not activate the DiT; begin it here so
-        # an offloaded DiT is brought back for the clip (reference pass, every step, both
-        # CFG branches), and finish it after the loop as the shared denoise loop does.
+    def _before_denoising_loop(
+        self, ctx: WanAnimate2DenoisingContext, batch: Req, server_args: ServerArgs
+    ) -> None:
+        # activate the DiT before the reference pass, not just the first denoise step
         self.begin_declared_component_use(
             component_name="transformer", module=self.transformer
         )
-
-        # One forward_ref per clip; the K/V (16 GB at TP=1, 640x800, clip_len 37) is text- and
-        # step-independent, so every step and both CFG branches reuse it and it dies with the clip.
         with set_forward_context(
             current_timestep=0, attn_metadata=None, forward_batch=batch
         ):
-            reference_kv = self.transformer.build_reference_kv(clip_cond=clip_condition)
-        context_by_branch: dict[str, torch.Tensor] = {}
+            ctx.reference_kv = self.transformer.build_reference_kv(
+                clip_cond=ctx.clip_condition
+            )
 
-        # One record per step across every clip, like the shared loop: the perf dump and the
-        # CI harness read avg/median denoise-step time from them.
-        for step_index, t in enumerate(self.scheduler.timesteps):
-            timestep = t.unsqueeze(0)  # [1], a view of the scheduler timestep
-            with StageProfiler(
-                f"denoising_step_{clip_index}_{step_index}",
-                logger=logger,
-                metrics=batch.metrics,
-                perf_dump_path_provided=batch.perf_dump_path is not None,
-                record_as_step=True,
+    def _prepare_step_state(
+        self,
+        ctx: WanAnimate2DenoisingContext,
+        batch: Req,
+        server_args: ServerArgs,
+        step_index: int,
+        t_host: torch.Tensor,
+        timesteps_cpu: torch.Tensor,
+    ) -> DenoisingStepState:
+        return DenoisingStepState(
+            step_index=step_index,
+            t_host=t_host,
+            t_device=ctx.timesteps[step_index],
+            t_int=int(t_host.item()),
+            current_model=self.transformer,
+            current_guidance_scale=ctx.guidance_scale,
+            attn_metadata=None,
+        )
+
+    def _run_denoising_step(
+        self,
+        ctx: WanAnimate2DenoisingContext,
+        step: DenoisingStepState,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        def predict(branch: CFGBranch) -> torch.Tensor:
+            with set_forward_context(
+                current_timestep=step.step_index,
+                attn_metadata=None,
+                forward_batch=batch,
             ):
-
-                def predict(branch: CFGBranch) -> torch.Tensor:
-                    with set_forward_context(
-                        current_timestep=step_index,
-                        attn_metadata=None,
-                        forward_batch=batch,
-                    ):
-                        if branch.name not in context_by_branch:
-                            context_by_branch[branch.name] = (
-                                self.transformer.prepare_context(
-                                    branch.kwargs["encoder_hidden_states"],
-                                    reference_image_embeddings,
-                                )
-                            )
-                        prediction = self.transformer(
-                            hidden_states=latents,
-                            timestep=timestep,
-                            encoder_hidden_states_image=reference_image_embeddings,
-                            clip_cond=clip_condition,
-                            reference_kv=reference_kv,
-                            projected_context=context_by_branch[branch.name],
-                            **branch.kwargs,
+                if branch.name not in ctx.context_by_branch:
+                    ctx.context_by_branch[branch.name] = (
+                        self.transformer.prepare_context(
+                            branch.kwargs["encoder_hidden_states"],
+                            ctx.reference_image_embeddings,
                         )
-                    return prediction.contiguous() if cfg_parallel else prediction
-
-                predictions = (
-                    run_cfg_parallel(cfg_policy, predict)
-                    if cfg_parallel
-                    else [predict(branch) for branch in cfg_policy.branches]
-                )
-                noise_pred = predictions[0]
-                if perform_cfg:
-                    # Preserve the sampler's serial arithmetic, without optional CFG postprocess.
-                    noise_pred = predictions[1] + guidance_scale * (
-                        noise_pred - predictions[1]
                     )
+                prediction = self.transformer(
+                    hidden_states=ctx.latents,
+                    timestep=step.t_device.unsqueeze(0),
+                    encoder_hidden_states_image=ctx.reference_image_embeddings,
+                    clip_cond=ctx.clip_condition,
+                    reference_kv=ctx.reference_kv,
+                    projected_context=ctx.context_by_branch[branch.name],
+                    **branch.kwargs,
+                )
+            return prediction.contiguous() if ctx.cfg_parallel else prediction
 
-                denoising_step_output = self.scheduler.step(
-                    noise_pred,
-                    t,
-                    latents.unsqueeze(0),
-                    return_dict=False,
-                )[0]
-                latents = denoising_step_output.squeeze(0)
-            self.step_profile()
-
-        self._finish_active_component_use()
-
-        # Drop the reference-image latent at index-0.
-        return latents[:, 1:]
+        predictions = (
+            run_cfg_parallel(ctx.cfg_policy, predict)
+            if ctx.cfg_parallel
+            else [predict(branch) for branch in ctx.cfg_policy.branches]
+        )
+        noise_pred = predictions[0]
+        if len(predictions) == 2:
+            noise_pred = predictions[1] + step.current_guidance_scale * (
+                noise_pred - predictions[1]
+            )
+        ctx.latents = ctx.scheduler.step(
+            noise_pred,
+            step.t_device,
+            ctx.latents.unsqueeze(0),
+            return_dict=False,
+        )[0].squeeze(0)
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -367,7 +411,6 @@ class WanAnimate2DenoisingStage(DenoisingStage):
                     server_args,
                     request_state,
                     clip_condition=clip_condition,
-                    clip_index=clip_denoising_metadata.clip_index,
                 )
 
                 denoised_latents = latents.to(dtype=torch.float32)
