@@ -83,6 +83,7 @@ from sglang.srt.connector.utils import parse_model_name
 from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.moe.utils import (
     install_shared_experts_fusion_decision,
@@ -314,6 +315,10 @@ def post_load_weights(model: nn.Module) -> None:
     # `is_nextn=True`, so the loader doesn't need to know.
     if hasattr(model, "post_load_weights"):
         model.post_load_weights()
+    # its weight loader derives the buffer, and these loaders bypass it
+    for module in model.modules():
+        if isinstance(module, GemmaRMSNorm):
+            module.refresh_gemma_weight()
 
 
 def _modules_with_quant_method(model: nn.Module):
