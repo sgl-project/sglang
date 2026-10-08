@@ -466,6 +466,49 @@ class TestHostPoolGroup(CustomTestCase):
         self.assertEqual(group.available_size(PoolName.SWA), 1)
         self.assertEqual(group.available_size(PoolName.MAMBA), 2)
 
+    def test_sidecar_resolves_all_source_segments(self):
+        group = self._group(kv=4, swa=4)
+        sources = [
+            PoolTransfer(name=PoolName.SWA, device_indices=torch.tensor([7, 3])),
+            PoolTransfer(name=PoolName.SWA, device_indices=torch.tensor([9, 5])),
+        ]
+        sidecar = PoolTransfer(name=PoolName.INDEXER, indices_from_pool=PoolName.SWA)
+        transfers = [sources[0], sidecar, sources[1]]
+
+        self.assertIs(group.resolve_host_transfers(transfers), transfers)
+        self.assertEqual(sidecar.device_indices.tolist(), [7, 3, 9, 5])
+        expected_host = torch.cat([source.host_indices for source in sources])
+        self.assertTrue(torch.equal(sidecar.host_indices, expected_host))
+        self.assertEqual(group.available_size(PoolName.SWA), 0)
+
+        group.release_transfers(transfers)
+        self.assertEqual(group.available_size(PoolName.SWA), 4)
+
+    def test_split_source_preserves_explicit_sidecar_device_indices(self):
+        group = self._group(kv=4, swa=4)
+        explicit = torch.tensor([13, 11, 17, 19])
+        sidecar = PoolTransfer(
+            name=PoolName.INDEXER,
+            indices_from_pool=PoolName.SWA,
+            device_indices=explicit,
+        )
+        sources = [
+            PoolTransfer(name=PoolName.SWA, device_indices=torch.tensor([7, 3])),
+            PoolTransfer(name=PoolName.SWA, device_indices=torch.tensor([9, 5])),
+        ]
+        transfers = [*sources, sidecar]
+
+        self.assertIs(group.resolve_host_transfers(transfers), transfers)
+        self.assertIs(sidecar.device_indices, explicit)
+        self.assertTrue(
+            torch.equal(
+                sidecar.host_indices,
+                torch.cat([source.host_indices for source in sources]),
+            )
+        )
+        group.release_transfers(transfers)
+        self.assertEqual(group.available_size(PoolName.SWA), 4)
+
 
 class TestDSAIndexerPoolDecl(CustomTestCase):
     """The declaration is the single source of indexer host bytes. The mirror

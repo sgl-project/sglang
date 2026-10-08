@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -63,6 +64,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.pool_host import PoolEntry
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -85,6 +87,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     _TREE_CORE_REGISTRY,
@@ -279,6 +282,31 @@ class _ExtraPoolFullComponent(FullComponent):
                 if part
             ]
         return super().build_hicache_transfers(node, phase, **kwargs)
+
+
+class _SplitBackupSWAComponent(SWAComponent):
+    def build_hicache_transfers(self, node, phase, **kwargs):
+        transfers = super().build_hicache_transfers(node, phase, **kwargs)
+        if phase != CacheTransferPhase.BACKUP_HOST or not transfers:
+            return transfers
+        source = transfers[0]
+        keys = list(node.hash_value)
+        split = len(keys) // 2
+        if split == 0:
+            return transfers
+        boundary = split * self.tree_core.page_size
+        return [
+            replace(
+                source,
+                device_indices=source.device_indices[:boundary],
+                keys=keys[:split],
+            ),
+            replace(
+                source,
+                device_indices=source.device_indices[boundary:],
+                keys=keys[split:],
+            ),
+        ]
 
 
 def _drop_hicache_atexit_pin(cache):
@@ -4412,6 +4440,89 @@ class UnifiedRadixCacheSuite:
         cache.request_buffer_backup(leaf)
         self.assertNotIn(leaf, pipeline.inflight_backup_node_ids)
         cache.sanity_check()
+
+    def test_buffer_only_split_source_sidecar_storage_roundtrip(self):
+        self._skip_unsupported_hicache_test()
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires FULL/SWA buffer storage")
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        cfg = replace(
+            self.cfg,
+            sliding_window_size=max(
+                self.cfg.sliding_window_size, 2 * self.cfg.page_size
+            ),
+        )
+        cache, allocator, req_pool = build_fixture(
+            cfg,
+            component_registry_override={ComponentType.SWA: _SplitBackupSWAComponent},
+            tree_core_backend="python",
+        )
+        self._init_buffer_hicache(cache, storage_dir)
+        controller = cache.cache_controller
+        source = controller.mem_pool_host.entry_map[PoolName.SWA]
+        sidecar_host = MHATokenToKVPoolHost(
+            source.device_pool,
+            host_to_device_ratio=source.host_pool.size / source.device_pool.size,
+            host_size=0,
+            page_size=self.cfg.page_size,
+            layout=source.host_pool.layout,
+        )
+        controller.register_host_pool_entry(
+            PoolEntry(
+                name=PoolName.DRAFT_SWA,
+                host_pool=sidecar_host,
+                device_pool=source.device_pool,
+                layer_mapper=source.layer_mapper,
+            )
+        )
+        cache.sidecar_pool_specs.append(
+            SidecarPoolSpec(PoolName.DRAFT_SWA, PoolName.SWA)
+        )
+        sidecar_host.kv_buffer.fill_(-1000)
+        tokens = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_pool, tokens)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        transfers = cache.tree_core.build_hicache_transfers(
+            ComponentType.SWA, leaf, CacheTransferPhase.BACKUP_HOST
+        )
+        self.assertEqual(len(transfers), 2)
+        for segment, transfer in enumerate(transfers):
+            for layer in range(source.device_pool.layer_num):
+                source.device_pool.k_buffer[layer][transfer.device_indices] = (
+                    segment + 7
+                )
+                source.device_pool.v_buffer[layer][transfer.device_indices] = (
+                    segment + 17
+                )
+        torch.cuda.synchronize()
+        self._buffer_backup_and_wait(cache, leaf)
+
+        keys = list(cache.tree_core.get_hash_values(leaf))
+        indices = source.host_pool.alloc(len(keys) * self.cfg.page_size)
+        self.assertIsNotNone(indices)
+        try:
+            source.host_pool.kv_buffer.zero_()
+            sidecar_host.kv_buffer.zero_()
+            reads = [
+                PoolTransfer(name=name, keys=keys, host_indices=indices)
+                for name in (PoolName.SWA, PoolName.DRAFT_SWA)
+            ]
+            results = controller.storage_backend.batch_get_v2(reads)
+            self.assertTrue(all(results[PoolName.SWA]))
+            self.assertTrue(all(results[PoolName.DRAFT_SWA]))
+            for index in indices[:: self.cfg.page_size].tolist():
+                self.assertTrue(
+                    torch.equal(
+                        source.host_pool.get_data_page(index),
+                        sidecar_host.get_data_page(index),
+                    ),
+                    "Every persisted sidecar page must contain its source's GPU data",
+                )
+        finally:
+            source.host_pool.free(indices)
 
     def test_buffer_only_read_path_roundtrip(self):
         """Read path end to end: prefetch -> staged (host bounce only,
