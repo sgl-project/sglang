@@ -58,6 +58,7 @@ from sglang.srt.layers.dcp.dsa import (
     dcp_gather_index_k_prefill,
     dcp_local_index_block_table,
     dcp_local_index_k_prefill,
+    dcp_local_lens,
     dcp_localize_write_loc,
     dcp_split_rows,
 )
@@ -1369,9 +1370,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # DCP: score this rank's index-K shard, then exchange top-k candidates.
             # Verify / draft-extend rows are already one query per draft token.
             assert self.num_init_tokens == 0 and self.num_local_tokens == 0
-            local_lens = get_dcp_lens(
-                seqlens_32, get_parallel().attn_dcp_size, get_parallel().attn_dcp_rank
-            ).to(torch.int32)
+            local_lens = dcp_local_lens(seqlens_32)
             local_tables, local_max_len = dcp_local_index_block_table(
                 metadata.get_page_table_1(), page_size
             )

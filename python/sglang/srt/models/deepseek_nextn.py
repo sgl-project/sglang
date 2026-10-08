@@ -28,6 +28,7 @@ from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
+from sglang.srt.layers.dcp.dsa import dcp_forward_scope
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -155,6 +156,7 @@ class DeepseekModelNextN(nn.Module):
             exit_stack.enter_context(
                 envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
             )
+        exit_stack.enter_context(dcp_forward_scope(forward_batch))
 
         try:
             zero_allocator = BumpAllocator(

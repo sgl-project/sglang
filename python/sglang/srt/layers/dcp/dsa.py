@@ -17,7 +17,8 @@
 Owner rule matches the widened allocator: slot % W == rank, local row = slot // W.
 """
 
-from typing import Callable, List, NamedTuple, Tuple
+import contextlib
+from typing import Callable, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -27,16 +28,98 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     dcp_topk_pack,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.runtime_context import get_parallel
+
+
+def _localize(loc: torch.Tensor) -> torch.Tensor:
+    parallel = get_parallel()
+    w, r = parallel.attn_dcp_size, parallel.attn_dcp_rank
+    return torch.where(loc % w == r, loc // w, torch.zeros_like(loc))
+
+
+def _root(t: torch.Tensor) -> torch.Tensor:
+    return t if t._base is None else t._base
+
+
+class DcpStep:
+    """Per-forward DCP state: the localized write loc and the per-step indexer
+    metadata, derived once and read by every layer.
+
+    Lives only for one model forward (``dcp_forward_scope``), so it can never
+    serve a later step whose buffers were refilled in place. Under CUDA graph
+    capture the derivation is recorded in the graph and replays once per step.
+    """
+
+    def __init__(self, out_cache_loc: Optional[torch.Tensor]):
+        self.src_loc = out_cache_loc
+        self.local_loc = None if out_cache_loc is None else _localize(out_cache_loc)
+        self._memo = {}
+
+    def local_loc_for(self, loc: torch.Tensor) -> Optional[torch.Tensor]:
+        src = self.src_loc
+        if (
+            src is None
+            or _root(loc) is not _root(src)
+            or loc.data_ptr() != src.data_ptr()
+            or loc.numel() > src.numel()
+            or loc.dim() != 1
+            or loc.stride(0) != 1
+        ):
+            return None
+        return self.local_loc[: loc.numel()]
+
+    def memo(self, name: str, src: torch.Tensor, fn: Callable):
+        hit = self._memo.get(name)
+        if hit is not None and hit[0] is src:
+            return hit[1]
+        out = fn()
+        self._memo[name] = (src, out)
+        return out
+
+
+_STEP: Optional[DcpStep] = None
+
+
+@contextlib.contextmanager
+def dcp_forward_scope(forward_batch):
+    """Open the per-forward ``DcpStep`` around one model forward."""
+    global _STEP
+    if not get_parallel().dcp_enabled or forward_batch.forward_mode.is_idle():
+        yield
+        return
+    prev, _STEP = _STEP, DcpStep(getattr(forward_batch, "out_cache_loc", None))
+    try:
+        yield
+    finally:
+        _STEP = prev
+
+
+def dcp_step() -> Optional[DcpStep]:
+    return _STEP
 
 
 def dcp_localize_write_loc(loc: torch.Tensor) -> torch.Tensor:
     """Widened write loc -> this rank's row; non-owned ids go to reserved row 0."""
-    parallel = get_parallel()
-    if not parallel.dcp_enabled:
+    if not get_parallel().dcp_enabled:
         return loc
-    w, r = parallel.attn_dcp_size, parallel.attn_dcp_rank
-    return torch.where(loc % w == r, loc // w, torch.zeros_like(loc))
+    if _STEP is not None:
+        local = _STEP.local_loc_for(loc)
+        if local is not None:
+            return local
+    return _localize(loc)
+
+
+def dcp_local_lens(seq_lens: torch.Tensor) -> torch.Tensor:
+    """This rank's int32 token counts, memoized per forward on the source tensor."""
+    parallel = get_parallel()
+
+    def fn():
+        return get_dcp_lens(
+            seq_lens, parallel.attn_dcp_size, parallel.attn_dcp_rank
+        ).to(torch.int32)
+
+    return _STEP.memo("lens", seq_lens, fn) if _STEP is not None else fn()
 
 
 def dcp_compact_read_table(
@@ -56,7 +139,15 @@ def dcp_local_index_block_table(page_table_1: torch.Tensor, page_size: int):
     One widened page (page_size * W slots) holds page_size local tokens per rank.
     """
     span = page_size * get_parallel().attn_dcp_size
-    block_tables = (page_table_1[:, ::span] // span).to(torch.int32).contiguous()
+
+    def fn():
+        return (page_table_1[:, ::span] // span).to(torch.int32).contiguous()
+
+    block_tables = (
+        _STEP.memo(f"block_table_{page_size}", page_table_1, fn)
+        if _STEP is not None
+        else fn()
+    )
     return block_tables, block_tables.shape[1] * page_size
 
 
