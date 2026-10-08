@@ -83,8 +83,9 @@ python -m sglang.launch_server \
 #### B300 BF16 mixed chunking for the 4B model
 
 For text-only traffic on one NVIDIA B300 (TP1), you can enable mixed chunking
-with TRTLLM attention to reduce median time to first token (TTFT). Model weights,
-KV cache, and attention queries all remain BF16. The recipe uses page size 32,
+with TRTLLM attention to tune time to first token (TTFT). The benefit depends on
+concurrency and the runtime configuration; benchmark both settings for your
+traffic. Model weights, KV cache, and attention queries all remain BF16. The recipe uses page size 32,
 16384-token prefill chunks, and the default NHD KV-cache layout.
 
 Use a source build containing the BF16 mixed-batch attention and fused QK
@@ -119,9 +120,10 @@ the comparison with mixed chunking disabled, remove only `--enable-mixed-chunk`.
 
 <Accordion title="Measured throughput, latency, and accuracy">
 
-The workload used text-only random prompts of exactly 8192 input tokens and
-1024 output tokens, with concurrency 1/4/8/16/32/64/128 and respectively
-30/40/80/80/160/320/640 measured requests. Each point used
+The workload used text-only random prompts with a nominal length of 8192 input
+tokens before chat templating and retokenization, plus 1024 output tokens. Actual
+model input lengths vary. Concurrency points 1/4/8/16/32/64/128 used
+30/40/80/80/160/320/640 measured requests, respectively. Each point used
 `max(64, concurrency)` warmup requests followed by a cache flush. Both sweeps
 used the same source build and configuration, changing only mixed chunking.
 Each completed all 1350 measured requests and the expected token counts.
@@ -146,7 +148,9 @@ At concurrency 128, enabling mixed chunking reduced median TTFT from 4120 ms
 to 578 ms (86.0%) while output throughput changed from 3764 to 3802 tokens/s
 (+1.0%). Median TPOT increased from 29.97 to 32.95 ms (+10.0%). Use this recipe
 when faster first-token delivery matters, and evaluate the inter-token latency
-tradeoff for your traffic.
+tradeoff for your traffic. These measurements describe the pinned build above;
+later kernel, cache-layout, or graph settings can change the tradeoff. Compare
+mean and tail latency as well as medians before choosing a setting.
 
 Text GSM8K scored 1216/1314 (92.54%) for the combined BF16 configuration and
 1215/1314 (92.47%) for the BF16 reference. The evaluation used the first five
