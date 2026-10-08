@@ -156,9 +156,10 @@ def _score_shard_packed(
         # At <=top-k blocks the native selector emits every block without
         # reading scores. In particular, graph padding need not read K.
         score = tl.full((TILE,), 0.0, tl.float32)
-        # one branch per group: its longest row decides whether K is read
+        # one branch per group: its longest row decides whether K is read;
+        # a padding slot past the table must not index ReqToToken
         group_blocks = tl.cdiv(group_len, 128)
-        if (block < group_blocks) & (group_blocks > 16):
+        if (request < TABLE_ROWS) & (block < group_blocks) & (group_blocks > 16):
             pos = block * 128 + positions
             token_valid = pos < group_len
             slots = tl.load(
