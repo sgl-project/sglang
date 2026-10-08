@@ -14,6 +14,7 @@ import sys
 import msgspec
 import pytest
 
+from sglang.kernels.jit.utils import arch
 from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
@@ -128,6 +129,13 @@ def test_musa_home_uses_mcc_path_when_unconfigured(monkeypatch):
     monkeypatch.setattr(toolchain.shutil, "which", lambda _: "/opt/musa/bin/mcc")
 
     assert toolchain.musa_home.__wrapped__() == "/opt/musa"
+
+
+def test_musa_activation_flags_skip_cuda_fast_math(monkeypatch):
+    monkeypatch.setattr(arch, "is_hip_runtime", lambda: False)
+    monkeypatch.setattr(arch, "is_musa_runtime", lambda: True)
+
+    assert arch.get_activation_cuda_cflags() == []
 
 
 def _publish_leaf(scope: pathlib.Path, paths, *, module_name="m") -> pathlib.Path:
