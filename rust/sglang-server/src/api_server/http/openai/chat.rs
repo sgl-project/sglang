@@ -24,6 +24,7 @@ use dynamo_protocols::types::{
     TopLogprobs,
 };
 use futures::StreamExt;
+use itertools::izip;
 use serde::Deserialize;
 
 use super::completions::completion_usage;
@@ -182,6 +183,13 @@ async fn chat_completions(
         Ok(routing) => routing,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
+    let (bootstrap_host, bootstrap_port, bootstrap_room) = izip!(
+        routing.bootstrap.bootstrap_hosts,
+        routing.bootstrap.bootstrap_ports,
+        routing.bootstrap.bootstrap_rooms,
+    )
+    .next()
+    .expect("routing normalized for one chat prompt");
     let want_logprobs = request.logprobs.unwrap_or(false);
     let parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
     let stream_tool_choice = request.tool_choice.clone();
@@ -224,9 +232,9 @@ async fn chat_completions(
             logprob_start_len: -1,
             top_logprobs_num: request.top_logprobs.unwrap_or(0) as i64,
             return_text_in_logprobs: want_logprobs.then_some(true),
-            bootstrap_host: routing.bootstrap.bootstrap_hosts[0].clone(),
-            bootstrap_port: routing.bootstrap.bootstrap_ports[0],
-            bootstrap_room: routing.bootstrap.bootstrap_rooms[0],
+            bootstrap_host: bootstrap_host.clone(),
+            bootstrap_port,
+            bootstrap_room,
             routed_dp_rank: routing.routed_dp_rank,
             disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
             ..Default::default()

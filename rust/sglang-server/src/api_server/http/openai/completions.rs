@@ -19,6 +19,7 @@ use dynamo_protocols::types::{
     CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
 use futures::StreamExt;
+use itertools::izip;
 use serde::Deserialize;
 
 use super::routing::PDRoutingFields;
@@ -156,7 +157,14 @@ async fn completions(
     let created = unix_seconds_u32();
     let mut submitted = Vec::with_capacity(choice_count);
 
-    for (prompt_index, prompt) in prompts.into_iter().enumerate() {
+    for (prompt_index, (prompt, bootstrap_host, bootstrap_port, bootstrap_room)) in izip!(
+        prompts,
+        routing.bootstrap.bootstrap_hosts,
+        routing.bootstrap.bootstrap_ports,
+        routing.bootstrap.bootstrap_rooms,
+    )
+    .enumerate()
+    {
         let (text, input_ids, mut prompt_echo) = match prompt {
             PromptSpec::Text(text) => {
                 let prompt_echo = if echo { text.clone() } else { String::new() };
@@ -190,9 +198,9 @@ async fn completions(
                 },
                 top_logprobs_num: request.logprobs.unwrap_or(0) as i64,
                 return_text_in_logprobs: request.logprobs.map(|_| true),
-                bootstrap_host: routing.bootstrap.bootstrap_hosts[prompt_index].clone(),
-                bootstrap_port: routing.bootstrap.bootstrap_ports[prompt_index],
-                bootstrap_room: routing.bootstrap.bootstrap_rooms[prompt_index],
+                bootstrap_host: bootstrap_host.clone(),
+                bootstrap_port,
+                bootstrap_room,
                 routed_dp_rank: routing.routed_dp_rank,
                 disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
                 ..Default::default()
