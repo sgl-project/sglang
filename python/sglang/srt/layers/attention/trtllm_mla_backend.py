@@ -57,6 +57,8 @@ from sglang.srt.layers.attention.kv_shard_hooks import (
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+from sglang.srt.mem_cache.layout.paged_view import paged_row_view
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -400,7 +402,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             v2p,
             self.req_to_token.stride(0),
             block_kv_indices.stride(0),
-            self.kv_index_translator.full_page_multiplier,
             PHYSICAL_PAGE_SIZE=self.page_size,
             DCP_SIZE=parallel.dcp_size,
             DCP_RANK=parallel.dcp_rank,
@@ -479,7 +480,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.decode_cuda_graph_kv_indices = torch.full(
             (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
         )
-        # Unified pool: capture-stable buffer for the kernel-facing KV write loc, filled
+        # Unified pool: capture-stable buffer for the physical KV write loc, filled
         # out-of-graph in init_forward_metadata_out_graph so the in-graph
         # set_mla_kv_buffer captures no translate.
         if self.kv_index_translator.is_translating:
@@ -782,15 +783,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         else:
             self._decode_kernel_loc = None
 
-    def _kv_write_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
+    def _kv_write_loc(self, forward_batch: ForwardBatch) -> KVWriteLoc:
         """The loc an unfused KV scatter must write at: the capture-stable
         buffer under a captured unified-pool decode, since the translate
         rebinds `out_cache_loc` to a fresh tensor the graph never recorded;
         the batch's own loc everywhere else.
         """
         if self._decode_kernel_loc is not None:
-            return self._decode_kernel_loc
-        return forward_batch.out_cache_loc
+            # Filled by `fill_capture_write_loc`, which translates it.
+            return KVWriteLoc(self._decode_kernel_loc, physical=True)
+        return KVWriteLoc.for_batch(forward_batch)
 
     def _resolve_fused_write_loc(
         self, forward_batch: ForwardBatch
@@ -1149,7 +1151,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         q: torch.Tensor,
         q_rope: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        """Decode: scatter the KV row at ``loc`` (already kernel-facing) and
+        """Decode: scatter the KV row at ``loc`` (already physical) and
         build the [q_nope | q_rope] fmha query in one kernel launch (saves one
         launch per MLA layer and keeps the PDL chain intact).
 
@@ -1240,12 +1242,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def _dummy_dcp_decode_for_autotune(
         self, q: torch.Tensor, layer: RadixAttention
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Skip decode during FlashInfer MoE autotune dummy forwards.
+        """Skip DCP decode / target-verify during FlashInfer autotune dummy forwards.
 
         That pass discards attention/logits. Under DCP the synthetic
         full-head metadata can overflow the trtllm-gen workspace (and on
-        multi-node GB300 has also produced NVLink errors). Real requests
-        and CUDA-graph capture must not take this path.
+        multi-node GB300 has also produced NVLink errors), and the FlashInfer
+        kernels (trtllm-gen, cute-dsl) start their own tuning, whose synthetic
+        inputs can OOM on some ranks only and hang the cross-rank reduction.
+        Real requests and CUDA-graph capture must not take this path.
         """
         output = torch.zeros(
             (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
@@ -1333,10 +1337,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     )
                 if query is None:
                     self.token_to_kv_pool.set_mla_kv_buffer(
-                        layer, self._decode_kernel_loc, k, k_rope
+                        layer, self._kv_write_loc(forward_batch), k, k_rope
                     )
             else:
-                # eager (or static pool): out_cache_loc is kernel-facing.
+                # eager (or static pool): out_cache_loc is physical.
                 if (
                     merge_query
                     and self._fused_set_kv_concat_q
@@ -1353,7 +1357,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     )
                 if query is None:
                     self.token_to_kv_pool.set_mla_kv_buffer(
-                        layer, forward_batch.out_cache_loc, k, k_rope
+                        layer, KVWriteLoc.for_batch(forward_batch), k, k_rope
                     )
 
         # Prepare query tensor inline (already built when the fused save-KV
@@ -1381,7 +1385,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Prepare KV cache inline
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+        kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
 
         # Get metadata
         metadata = (
@@ -1476,6 +1480,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # A speculative runner's autotune dummy forward is TARGET_VERIFY-shaped,
+        # so it never reaches forward_decode's guard.
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and get_parallel().dcp_enabled
+            and get_in_autotune_dummy_run()
+        ):
+            return self._dummy_dcp_decode_for_autotune(q, layer)
 
         # The fallback belongs to genuine extend forwards only. Target-verify /
         # draft-extend must never honor it: `forward_prefill_metadata` is a
@@ -1538,14 +1550,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert k is not None and k_rope is not None, (
                 "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             )
-            if self._decode_kernel_loc is not None:
-                self.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, self._decode_kernel_loc, k, k_rope
-                )
-            else:
-                self.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, k_rope
-                )
+            self.token_to_kv_pool.set_mla_kv_buffer(
+                layer, self._kv_write_loc(forward_batch), k, k_rope
+            )
 
         # TODO refactor to avoid code duplication
         # Prepare query tensor inline (already built when the fused fp8 path
@@ -1589,7 +1596,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             bs = forward_batch.batch_size
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+            kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
 
             q = q.to(self.data_type)
 

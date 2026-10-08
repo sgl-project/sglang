@@ -13,7 +13,7 @@ _parallel_override = get_parallel().override(
     tp_rank=0,
     attn_tp_size=1,
     attn_tp_rank=0,
-    tp_group=SimpleNamespace(world_size=1),
+    tp_group=SimpleNamespace(rank_in_group=0, world_size=1),
 )
 _parallel_override.__enter__()
 
@@ -454,7 +454,6 @@ class MockMamba2ModelRunner(ModelRunner):
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
         self.init_kv_index_translator()
-        self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False
