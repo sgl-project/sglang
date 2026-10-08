@@ -27,14 +27,12 @@ class _Req:
         self.full_untruncated_fill_ids = self.origin_input_ids + array(
             "q", [0] * block_size
         )
-        self.prefix_indices = torch.arange(context_len, dtype=torch.int64)
+        self.prefix_len = context_len
         self.dllm_block_offset = context_len
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
         self.dllm_phase_prefill = prefill
-        self.extend_range = SimpleNamespace(
-            start=context_len, end=context_len + block_size, length=block_size
-        )
+        self.extend_end = context_len + block_size
         self.kv = ReqKvInfo(
             req_pool_idx=1,
             kv_allocated_len=context_len + block_size,
@@ -50,11 +48,10 @@ class _Req:
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
 
+    extend_len = Req.extend_len
+
     def is_dllm_prefill(self):
         return self.dllm_phase_prefill
-
-    def set_extend_range(self, start, end):
-        self.extend_range = SimpleNamespace(start=start, end=end, length=end - start)
 
     def update_finish_state(self, new_accepted_len=1):
         if self.finish_on_update:
@@ -201,7 +198,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder._check_prefill_tile_budget = Mock(return_value=None)
         req = _Req(context_len=300, block_size=256, prefill=True)
         req.host_hit_length = req.storage_hit_length = 0
-        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        req.prefix_len = 0
         admission = adder._select_prefill_admission(
             req,
             total_tokens=1024,
@@ -210,12 +207,13 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
             truncation_align_size=None,
         )
         self.assertEqual((admission.prefix_len, admission.extend_len), (0, 300))
-        PrefillAdder._add_dllm_req(adder, req, 0)
-        self.assertEqual((req.extend_range.start, req.extend_range.end), (0, 300))
+        PrefillAdder._add_dllm_req(adder, req)
+        self.assertEqual((req.prefix_len, req.extend_end), (0, 300))
 
         req.dllm_phase_prefill = False
-        PrefillAdder._add_dllm_req(adder, req, 300)
-        self.assertEqual((req.extend_range.start, req.extend_range.end), (300, 556))
+        req.prefix_len = 300
+        PrefillAdder._add_dllm_req(adder, req)
+        self.assertEqual((req.prefix_len, req.extend_end), (300, 556))
 
     def test_chunked_context_prefill_stops_at_context_boundary(self):
         adder = object.__new__(PrefillAdder)
@@ -226,12 +224,12 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder._update_prefill_budget = Mock()
 
         req = _Req(context_len=10, block_size=4, prefill=True)
-        req.prefix_indices = torch.arange(7)
+        req.prefix_len = 7
 
         result = PrefillAdder.add_dllm_staging_req(adder, req)
 
         self.assertEqual(result, AddReqResult.CONTINUE)
-        self.assertEqual((req.extend_range.start, req.extend_range.end), (7, 10))
+        self.assertEqual((req.prefix_len, req.extend_end), (7, 10))
         self.assertEqual(adder.can_run_list, [req])
 
     def test_completed_canvas_frees_only_decoder_pages_and_keeps_slot(self):
@@ -241,7 +239,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         )
         req.full_untruncated_fill_ids.extend([0] * block_size)
         req.dllm_block_offset = context_len
-        req.set_extend_range(context_len, context_len + block_size)
+        req.extend_end = context_len + block_size
         req.kv.req_pool_idx = 3
         req.kv.kv_allocated_len = context_len + block_size
         req.kv.kv_committed_len = context_len + block_size
@@ -262,10 +260,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         self.assertEqual(req.kv.req_pool_idx, 3)
         self.assertEqual(req.kv.kv_committed_len, context_len)
         self.assertEqual(req.kv.kv_allocated_len, context_len)
-        self.assertEqual(
-            (req.extend_range.start, req.extend_range.end),
-            (context_len, context_len),
-        )
+        self.assertEqual(req.extend_end, context_len)
         scheduler.stash_chunked_request.assert_called_once_with(req)
 
     def test_unresolved_fdfo_preserves_state_and_reuses_exact_slots(self):
@@ -301,6 +296,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         reused = _alloc_extend_loc_with_kv_reuse(
             alloc_batch,
             [True],
+            [req_to_token[slot, :context_len]],
             torch.tensor([slot]),
             torch.tensor([context_len]),
             torch.tensor([block_size]),
@@ -322,7 +318,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
                 scheduler, _Batch([req]), _result([canvas])
             )
 
-        release.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+        release.assert_called_once_with(req, scheduler.tree_cache, checkpoint=False)
 
     def test_context_boundary_stops_sync_and_fdfo(self):
         block_size = 4
@@ -346,7 +342,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
 
                 self.assertTrue(req.finished())
                 release.assert_called_once_with(
-                    req, scheduler.tree_cache, is_insert=False
+                    req, scheduler.tree_cache, checkpoint=False
                 )
 
 

@@ -177,7 +177,9 @@ def _joy_joint_qkv(*inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
         or not inputs[0].is_cuda
         or torch.version.hip
         or torch.compiler.is_compiling()
-        or not diffusion_kernels.can_use_joint_qkv_cat(*inputs)
+        or inputs[0].dtype not in (torch.float16, torch.bfloat16)
+        or inputs[0].shape[-2] * inputs[0].shape[-1] > 8192
+        or any(x.requires_grad for x in inputs)
     ):
         return reference()
     sig = (inputs[0].device, inputs[0].dtype) + tuple(
