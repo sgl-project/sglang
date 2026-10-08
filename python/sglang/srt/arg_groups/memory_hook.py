@@ -188,12 +188,6 @@ def handle_gpu_memory_settings(server_args: Any):
         and decode_cuda_graph_config.max_bs is not None
         and decode_cuda_graph_config.max_bs > cfg.max_running_requests
     ):
-        logger.info(
-            "Clamping default decode CUDA graph max_bs from %d to "
-            "max_running_requests=%d.",
-            decode_cuda_graph_config.max_bs,
-            cfg.max_running_requests,
-        )
         decode_cuda_graph_config.max_bs = cfg.max_running_requests
 
     from sglang.srt.arg_groups.model_overrides.qwen3_vl import (
