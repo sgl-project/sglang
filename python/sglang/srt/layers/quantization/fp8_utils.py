@@ -232,6 +232,10 @@ if _use_aiter:
     )
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
+    from sglang.kernels.ops.gemm.smallm_fp8_gfx950 import (
+        smallm_fp8_gemm,
+        smallm_fp8_gemm_supported,
+    )
 
 
 if _is_cuda:
@@ -2246,7 +2250,9 @@ def apply_fp8_linear(
     )
 
     if input_prequantized:
-        assert input_scale is not None and input_scale.numel() == 1
+        assert input_scale is not None and (
+            input_scale.numel() == 1 or (_use_aiter and use_per_token_if_dynamic)
+        )
         qinput = input_2d
         if channelwise_cutlass and not native_scalar_a_scale:
             # Unsupported CUTLASS epilogues require one A scale per row.
@@ -2390,7 +2396,12 @@ def apply_fp8_linear(
             # x_scale -> input scale tensor, shape = (m, 1)
             # w_scale -> weight scale tensor, shape = (n ,1)
             # dtype -> output dtype
-            output = gemm_a8w8_bpreshuffle(
+            gemm = (
+                smallm_fp8_gemm
+                if smallm_fp8_gemm_supported(qinput, weight.T, x_scale, output_dtype)
+                else gemm_a8w8_bpreshuffle
+            )
+            output = gemm(
                 XQ=qinput,
                 WQ=weight.T,
                 x_scale=x_scale,
