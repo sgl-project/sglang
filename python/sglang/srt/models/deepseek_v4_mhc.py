@@ -581,6 +581,8 @@ def can_use_mega_mhc_prefill(
     return (
         envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
         and can_fuse_post(cfg)
+        # DeepGEMM Mega mHC supports SM10x only.
+        and get_platform().is_sm100
         and residual.is_cuda
         and not _is_hip
         and forward_batch.forward_mode.is_extend_without_speculative()
