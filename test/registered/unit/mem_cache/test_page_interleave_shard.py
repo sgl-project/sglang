@@ -75,7 +75,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import _evict_until_allocatable
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+    ReqToTokenPool,
+)
 from sglang.srt.mem_cache.page_interleave import (
     PageInterleavePlacement,
     PageShardSpec,
@@ -419,7 +423,9 @@ class TestMTPKVShardConfig(CustomTestCase):
                     KVCacheConfigurator, "_build_mla_kv_pool"
                 ) as build:
                     self.assertIs(_build_mtp_pool(kvc), build.return_value)
-                build.assert_called_once_with(max_total_num_tokens=128)
+                build.assert_called_once_with(
+                    max_total_num_tokens=128, mla_pool_class=MLATokenToKVPool
+                )
 
     def test_rejects_invalid_shared_allocator(self):
         kvc, _ = _make_mtp_configurator()
