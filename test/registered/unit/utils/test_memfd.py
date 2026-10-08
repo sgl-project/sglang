@@ -1,6 +1,7 @@
 import errno
 import mmap
 import os
+import sys
 
 import pytest
 
@@ -39,3 +40,7 @@ def test_fallback_raises_oserror_on_failure(without_os_memfd):
     with pytest.raises(OSError) as exc_info:
         memfd.memfd_create("sglang-test", 0xFFFF)
     assert exc_info.value.errno == errno.EINVAL
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
