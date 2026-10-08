@@ -13,7 +13,7 @@ from typing import (
 )
 
 import torch
-from transformers import BaseImageProcessor
+from transformers import BaseImageProcessor, BatchFeature
 
 from sglang.srt import platforms
 from sglang.srt.managers.schedule_batch import (
@@ -31,6 +31,7 @@ from sglang.srt.multimodal.media_processor import (
     BaseMultiModalProcessorOutput,
     MultimodalProcessorMixin,
     MultimodalSpecialTokens,
+    get_media_source_configs,
 )
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
@@ -57,6 +58,8 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     models = []
     video_preprocessing_device = None
     prefer_tokenized_input = False
+    # Opt in by naming the model's token-space strategy; it gates supported configs.
+    token_space_process_strategy_class = None
     precompute_hash_before_cpu_transfer = False
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.
@@ -72,11 +75,21 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     # when artifact retention is disabled.
     uses_media_artifacts_without_cache = False
 
+    @classmethod
+    def supports_token_space_processing(cls, hf_config):
+        return (
+            cls.token_space_process_strategy_class is not None
+            and cls.token_space_process_strategy_class.supports_token_space_processing(
+                hf_config
+            )
+        )
+
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
     ):
         self.server_args = server_args
         self.transport_mode = transport_mode
+        self.token_space_process_strategy = None
         configured_mm_feature_transport = get_mm().mm_feature_transport
         self.mm_feature_transport = (
             configured_mm_feature_transport
@@ -647,6 +660,150 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                     result[feature_name], torch.Tensor
                 ):
                     result[feature_name] = result[feature_name].to("cpu")
+
+    def _token_space_media_devices(self, processor, images, videos, kwargs):
+        """Pick serving devices for token-space media; pops explicit overrides from kwargs."""
+        processor_device = None
+        if (
+            hasattr(processor, "image_processor")
+            and isinstance(processor.image_processor, BaseImageProcessor)
+            and not self.disable_fast_image_processor
+        ):
+            processor_device = self._fast_image_processor_device(processor)
+        image_device = kwargs.pop("image_device", None)
+        video_device = kwargs.pop("video_device", None)
+        if image_device is None:
+            image_device = processor_device
+        if videos and self.video_preprocessing_device is not None:
+            image_device = video_device = self.video_preprocessing_device
+        return processor_device, image_device, video_device
+
+    def _process_media_item(
+        self, *, modality, item, source_config, options, processor=None
+    ):
+        # The CUDA memory pool is thread-local, so each worker wraps its own item.
+        with self._temporary_fast_processor_cuda_pool(options.get("device")):
+            features = super()._process_media_item(
+                modality=modality,
+                item=item,
+                source_config=source_config,
+                options=options,
+                processor=processor,
+            )
+            self._move_processor_output_to_cpu(features)
+        return features
+
+    def _expand_token_space_media(
+        self,
+        *,
+        input_text,
+        input_ids,
+        media_features,
+        mm_token_expansion_start_len,
+        add_special_tokens=True,
+        processor=None,
+    ) -> MultimodalProcessorOutput:
+        processor, _ = self._resolve_processor(processor)
+        expanded_input_ids = self.token_space_process_strategy.expand_media_tokens(
+            media_features,
+            input_ids=input_ids,
+            input_text=input_text,
+            mm_token_expansion_start_len=mm_token_expansion_start_len,
+            add_special_tokens=add_special_tokens,
+            processor=processor,
+        )
+        return self.sglang_post_process(expanded_input_ids, media_features)
+
+    def sglang_post_process(
+        self, input_ids: list[int], media_features: BatchFeature
+    ) -> MultimodalProcessorOutput:
+        """Bind serving items to final IDs, then let the model build its output."""
+        input_ids_tensor = torch.tensor(input_ids, dtype=torch.long)
+        mm_items = self.collect_mm_items_from_processor_output(media_features)
+        mm_items = self._bind_and_finalize_mm_items(
+            mm_items,
+            input_ids=input_ids_tensor,
+            mm_tokens=self.mm_tokens,
+            images=None,
+        )
+        return self._build_mm_output(input_ids, media_features, mm_items)
+
+    def _build_mm_output(
+        self,
+        input_ids: list[int],
+        media_features: BatchFeature,
+        mm_items: list[MultimodalDataItem],
+    ) -> MultimodalProcessorOutput:
+        """Assemble the model-specific serving output, like each legacy entry does.
+
+        Models that set `token_space_process_strategy_class` must override this.
+        """
+        raise NotImplementedError
+
+    def _get_mm_token_expansion_start_len(self, request_obj, start_len):
+        from sglang.srt.managers.io_struct import GenerateReqInput
+
+        if start_len is None:
+            start_len = (
+                request_obj.mm_token_expansion_start_len or 0
+                if isinstance(request_obj, GenerateReqInput)
+                else 0
+            )
+        return start_len
+
+    async def process_token_space_mm_data_async(
+        self,
+        image_data=None,
+        audio_data=None,
+        input_text="",
+        request_obj=None,
+        *,
+        video_data=None,
+        input_ids=None,
+        mm_token_expansion_start_len=None,
+        max_req_input_len=None,
+        **kwargs,
+    ) -> MultimodalProcessorOutput:
+        assert self.token_space_process_strategy is not None, (
+            f"{type(self).__name__} has no token-space process strategy attached"
+        )
+        mm_token_expansion_start_len = self._get_mm_token_expansion_start_len(
+            request_obj, mm_token_expansion_start_len
+        )
+        if video_data is None and request_obj is not None:
+            video_data = request_obj.video_data
+        if audio_data is None and request_obj is not None:
+            audio_data = request_obj.audio_data
+        self.validate_mm_data(image_data, video_data, audio_data)
+        images, videos, audios = await self._load_media_lists(
+            image_data,
+            video_data,
+            audio_data,
+            audio_sample_rate=None,
+            discard_alpha_channel=True,
+        )
+        _, image_device, video_device = self._token_space_media_devices(
+            self._processor, images, videos, kwargs
+        )
+        media_features = await self.process_media_async(
+            images=images,
+            videos=videos,
+            audios=audios,
+            image_source_configs=get_media_source_configs(image_data),
+            video_source_configs=get_media_source_configs(video_data),
+            audio_source_configs=get_media_source_configs(audio_data),
+            image_device=image_device,
+            video_device=video_device,
+            **kwargs,
+        )
+        return await self._run_mm_processor(
+            self._expand_token_space_media,
+            input_text=input_text,
+            input_ids=input_ids,
+            media_features=media_features,
+            mm_token_expansion_start_len=mm_token_expansion_start_len,
+            add_special_tokens=kwargs.get("add_special_tokens", True),
+        )
 
     @abstractmethod
     async def process_mm_data_async(
