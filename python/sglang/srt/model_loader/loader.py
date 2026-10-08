@@ -83,6 +83,7 @@ from sglang.srt.connector.utils import parse_model_name
 from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.moe.utils import (
     install_shared_experts_fusion_decision,
@@ -314,6 +315,10 @@ def post_load_weights(model: nn.Module) -> None:
     # `is_nextn=True`, so the loader doesn't need to know.
     if hasattr(model, "post_load_weights"):
         model.post_load_weights()
+    # its weight loader derives the buffer, and these loaders bypass it
+    for module in model.modules():
+        if isinstance(module, GemmaRMSNorm):
+            module.refresh_gemma_weight()
 
 
 def _modules_with_quant_method(model: nn.Module):
@@ -827,6 +832,33 @@ class DefaultModelLoader(BaseModelLoader):
                 )
         return model
 
+    def initialize_model_without_storage(
+        self,
+        *,
+        model_config: ModelConfig,
+        device: torch.device,
+    ) -> Tuple[nn.Module, Dict[str, torch.Size]]:
+        """Build the model of `initialize_model_for_startup` without allocating parameter storage.
+
+        Returns the model, with every parameter 0-size on `device`, and the shape each parameter was built with,
+        by name. Parameters keep their subclass, attributes and ties; other tensors stay on meta, so the model
+        cannot run forward. For a trainer that binds its own buffers before loading weights in this rank's layout
+        (p2p weight updates).
+        """
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device("meta"):
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                    quant_config,
+                )
+        built_shapes_by_name = {
+            name: param.shape for name, param in model.named_parameters()
+        }
+        _replace_parameters_with_empty(model, device)
+        return model, built_shapes_by_name
+
     def prepare_model_for_capture(
         self,
         *,
@@ -1088,6 +1120,24 @@ class DefaultModelLoader(BaseModelLoader):
             if isinstance(quant_method, QuantizeMethodBase):
                 with device_loading_context(module, target_device):
                     quant_method.restore_weights_before_loading(module)
+
+
+def _replace_parameters_with_empty(model: nn.Module, device: torch.device) -> None:
+    # by the original's id, so a parameter shared by several modules stays shared
+    replacements: Dict[int, nn.Parameter] = {}
+    for module in model.modules():
+        for name, param in list(module._parameters.items()):
+            if param is None:
+                continue
+            if id(param) not in replacements:
+                replacement = torch.Tensor._make_subclass(
+                    type(param),
+                    torch.empty(0, dtype=param.dtype, device=device),
+                    param.requires_grad,
+                )
+                replacement.__dict__.update(param.__dict__)
+                replacements[id(param)] = replacement
+            module._parameters[name] = replacements[id(param)]
 
 
 class LayeredModelLoader(DefaultModelLoader):

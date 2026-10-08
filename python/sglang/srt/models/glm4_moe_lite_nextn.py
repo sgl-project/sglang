@@ -179,5 +179,9 @@ class Glm4MoeLiteForCausalLMNextN(Glm4MoeLiteForCausalLM):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)
 
+    def post_load_weights(self, is_nextn=True, weight_names=None):
+        # loaders and weight-update sessions that bypass load_weights call it with no arguments
+        super().post_load_weights(is_nextn=True, weight_names=weight_names)
+
 
 EntryClass = [Glm4MoeLiteForCausalLMNextN]

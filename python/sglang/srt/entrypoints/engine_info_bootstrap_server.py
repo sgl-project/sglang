@@ -32,17 +32,19 @@ class EngineInfoBootstrapServer:
     query via HTTP GET.
 
     Currently supports transfer engine memory registration info and
-    per-rank parallelism configuration.
+    per-rank parallelism configuration. Each model runner of a rank registers
+    under its weight-update role (``target``, or a draft role such as ``draft``),
+    so a speculative draft never replaces its target's entry.
     """
 
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
 
-        # Storage: {tp_rank: (session_id, weights_info_dict)}
-        self.transfer_engine_info: Dict[int, Tuple] = {}
-        # Storage: {tp_rank: parallelism_config_dict}
-        self.parallelism_config: Dict[int, dict] = {}
+        # Storage: {(role, tp_rank): (session_id, weights_info_dict)}
+        self.transfer_engine_info: Dict[Tuple[str, int], Tuple] = {}
+        # Storage: {(role, tp_rank): parallelism_config_dict}
+        self.parallelism_config: Dict[Tuple[str, int], dict] = {}
         self.lock = threading.Lock()
 
         app = FastAPI()
@@ -54,19 +56,20 @@ class EngineInfoBootstrapServer:
         @app.put("/register_transfer_engine_info")
         def register_transfer_engine_info(data: dict):
             try:
+                role = data["role"]
                 tp_rank = data["tp_rank"]
                 info = data["transfer_engine_info"]
                 session_id = info["session_id"]
                 weights_info_dict = info["weights_info_dict"]
 
                 with self.lock:
-                    self.transfer_engine_info[tp_rank] = (
+                    self.transfer_engine_info[(role, tp_rank)] = (
                         session_id,
                         weights_info_dict,
                     )
 
                 logger.info(
-                    f"Registered transfer engine info for tp_rank={tp_rank}, "
+                    f"Registered transfer engine info for role={role} tp_rank={tp_rank}, "
                     f"session_id={session_id}"
                 )
                 return PlainTextResponse("OK")
@@ -75,17 +78,17 @@ class EngineInfoBootstrapServer:
                 raise HTTPException(status_code=400, detail=str(e))
 
         @app.get("/get_transfer_engine_info")
-        def get_transfer_engine_info(rank: int):
+        def get_transfer_engine_info(rank: int, role: str = "target"):
             if rank < 0:
                 raise HTTPException(status_code=400, detail="Invalid rank parameter")
 
             with self.lock:
-                info = self.transfer_engine_info.get(rank)
+                info = self.transfer_engine_info.get((role, rank))
 
             if info is None:
                 raise HTTPException(
                     status_code=404,
-                    detail=f"No transfer engine info for rank {rank}",
+                    detail=f"No transfer engine info for role {role} rank {rank}",
                 )
 
             return {"rank": rank, "remote_instance_transfer_engine_info": list(info)}
@@ -96,30 +99,33 @@ class EngineInfoBootstrapServer:
         @app.put("/register_parallelism_config")
         def register_parallelism_config(data: dict):
             try:
+                role = data["role"]
                 tp_rank = data["tp_rank"]
                 config = data["parallelism_config"]
 
                 with self.lock:
-                    self.parallelism_config[tp_rank] = config
+                    self.parallelism_config[(role, tp_rank)] = config
 
-                logger.info(f"Registered parallelism config for tp_rank={tp_rank}")
+                logger.info(
+                    f"Registered parallelism config for role={role} tp_rank={tp_rank}"
+                )
                 return PlainTextResponse("OK")
             except Exception as e:
                 logger.error(f"Failed to register parallelism config: {e}")
                 raise HTTPException(status_code=400, detail=str(e))
 
         @app.get("/get_parallelism_config")
-        def get_parallelism_config(rank: int):
+        def get_parallelism_config(rank: int, role: str = "target"):
             if rank < 0:
                 raise HTTPException(status_code=400, detail="Invalid rank parameter")
 
             with self.lock:
-                config = self.parallelism_config.get(rank)
+                config = self.parallelism_config.get((role, rank))
 
             if config is None:
                 raise HTTPException(
                     status_code=404,
-                    detail=f"No parallelism config for rank {rank}",
+                    detail=f"No parallelism config for role {role} rank {rank}",
                 )
 
             return config
@@ -135,10 +141,14 @@ class EngineInfoBootstrapServer:
         self._server.should_exit = True
         self._thread.join(timeout=5)
 
-    def get_transfer_engine_info(self, rank: int) -> Optional[Tuple]:
+    def get_transfer_engine_info(
+        self, rank: int, role: str = "target"
+    ) -> Optional[Tuple]:
         """Direct in-process access for co-located HTTP server (no HTTP round-trip)."""
-        return self.transfer_engine_info.get(rank)
+        return self.transfer_engine_info.get((role, rank))
 
-    def get_parallelism_config_info(self, rank: int) -> Optional[dict]:
+    def get_parallelism_config_info(
+        self, rank: int, role: str = "target"
+    ) -> Optional[dict]:
         """Direct in-process access for parallelism config (no HTTP round-trip)."""
-        return self.parallelism_config.get(rank)
+        return self.parallelism_config.get((role, rank))
