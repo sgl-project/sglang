@@ -10,8 +10,10 @@ class FoldedExtend(msgspec.Struct, frozen=True):
 
     batch: Any  # ScheduleBatch copy fed to ForwardBatch.init_new
     keep_rows: torch.Tensor  # [original rows] int64, folded-row index of each
+    scheduled_row: torch.Tensor  # [folded rows] int64, original row, -1 if replayed
     row_floor: torch.Tensor  # [folded rows] int64
     compress_skip: torch.Tensor  # [bs] int32, leading replay rows per request
+    replay_lens: list[int]  # [bs] leading replay rows per request
     num_rows: int
 
 
@@ -36,9 +38,32 @@ def apply_folded_extend(folded: FoldedExtend, forward_batch) -> None:
 def drop_folded_rows(*, logits_output, folded: FoldedExtend) -> None:
     """Hand downstream consumers (the DSpark draft) only the original extend rows."""
     hidden = logits_output.hidden_states
-    if hidden is not None and hidden.shape[0] == folded.num_rows:
+    token_indices = logits_output.hidden_states_token_indices
+    if token_indices is not None:
+        # Decoder-SWA tail rows index the folded extend; keep those on original rows.
+        keep = _tail_rows_on_original(
+            folded=folded, num_tail_rows=token_indices.shape[0]
+        ).to(token_indices.device, non_blocking=True)
+        logits_output.hidden_states_token_indices = folded.scheduled_row[
+            token_indices[keep]
+        ]
+        if hidden is not None:
+            logits_output.hidden_states = hidden[keep]
+    elif hidden is not None and hidden.shape[0] == folded.num_rows:
         logits_output.hidden_states = hidden[folded.keep_rows]
-    assert logits_output.hidden_states_token_indices is None
+
+
+def _tail_rows_on_original(*, folded: FoldedExtend, num_tail_rows: int):
+    # Each request's tail is its last SWA_WINDOW folded rows; replay rows lead it.
+    from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
+
+    keep, off = [], 0
+    for n, r in zip(folded.batch.extend_lens, folded.replay_lens):
+        tail = min(SWA_WINDOW, n)
+        keep.append(torch.arange(off + max(0, tail - (n - r)), off + tail))
+        off += tail
+    assert off == num_tail_rows, (off, num_tail_rows)
+    return torch.cat(keep)
 
 
 def run_encoder_swa_replay(worker, batch):
@@ -195,12 +220,17 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
     row_floor = torch.repeat_interleave(
         floor, torch.tensor(new_ext), output_size=fold_off
     )
+    keep_rows = torch.cat(keep)
+    scheduled_row = torch.full((fold_off,), -1, dtype=torch.int64)
+    scheduled_row[keep_rows] = torch.arange(keep_rows.shape[0])
     return FoldedExtend(
         batch=folded,
-        keep_rows=torch.cat(keep).to(device, non_blocking=True),
+        keep_rows=keep_rows.to(device, non_blocking=True),
+        scheduled_row=scheduled_row.to(device, non_blocking=True),
         row_floor=row_floor.to(device, non_blocking=True),
         compress_skip=torch.tensor(replay, dtype=torch.int32).to(
             device, non_blocking=True
         ),
+        replay_lens=replay,
         num_rows=fold_off,
     )
