@@ -2262,8 +2262,8 @@ class FlashInferIndicesUpdaterPrefill:
         if (
             spec_info is not None
             and use_custom_mask is None
-            and getattr(wrapper_paged, "is_cuda_graph_enabled", False)
-            and getattr(wrapper_paged, "_custom_mask_buf", None) is not None
+            and wrapper_paged.is_cuda_graph_enabled
+            and wrapper_paged._custom_mask_buf is not None
         ):
             raise RuntimeError(
                 f"{spec_info.spec_input_type} verify planned without a custom mask on "
