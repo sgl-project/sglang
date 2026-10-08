@@ -60,7 +60,7 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sglang.kernels.ops.attention.fused_qk_norm_mrope import fused_qk_norm_mrope
+    from sglang.kernels.ops.attention.fused_qknorm_rope import fused_qk_norm_mrope
 
 _has_fused_qk_norm_mrope = False
 if _use_aiter:

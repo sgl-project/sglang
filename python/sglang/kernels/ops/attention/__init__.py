@@ -412,7 +412,7 @@ register_kernel(
     KernelSpec(
         op="attention.fused_qk_norm_mrope",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.attention.fused_qk_norm_mrope:fused_qk_norm_mrope",
+        target="sglang.kernels.ops.attention.fused_qknorm_rope:fused_qk_norm_mrope",
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 0))}),
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),

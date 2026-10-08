@@ -33,14 +33,33 @@ struct QKNormParams {
 constexpr uint32_t kWarpsPerBlock = 4;
 constexpr uint32_t kThreadsPerBlock = kWarpsPerBlock * device::kWarpThreads;
 
+struct QKNormIdentityEpilogue {
+  using Params = QKNormParams;
+  static __device__ const QKNormParams& norm_params(const Params& p) {
+    return p;
+  }
+  template <typename Storage>
+  static __device__ Storage apply(Storage output, const Params&, int64_t, int64_t) {
+    return output;
+  }
+  template <typename Storage>
+  static __device__ void after_store(Storage, const Params&, int64_t, int64_t) {}
+};
+
 // Warp-level kernel for head_dim <= 256
-template <int64_t kHeadDim, bool kUsePDL, typename Float>
-__global__ void fused_qknorm_warp(const QKNormParams __grid_constant__ params) {
+template <
+    int64_t kHeadDim,
+    bool kUsePDL,
+    typename Float,
+    typename Epilogue = QKNormIdentityEpilogue,
+    bool kPersistent = true>
+__global__ void fused_qknorm_warp(const typename Epilogue::Params __grid_constant__ params) {
   using namespace device;
   using Storage = norm::StorageType<Float, kHeadDim>;
 
   static_assert(sizeof(Float) == 2, "Only support FP16/BF16");
-  const auto& [q, k, q_stride, k_stride, num_qo_heads, num_kv_heads, eps, q_weight, k_weight, num_tokens] = params;
+  const auto& [q, k, q_stride, k_stride, num_qo_heads, num_kv_heads, eps, q_weight, k_weight, num_tokens] =
+      Epilogue::norm_params(params);
 
   const auto num_blks = gridDim.x;
   const auto num_workers = num_blks * kWarpsPerBlock;
@@ -61,7 +80,10 @@ __global__ void fused_qknorm_warp(const QKNormParams __grid_constant__ params) {
     const auto input_vec = gmem.load(input);
     const auto weight_vec = gmem.load(weight);
     const auto output_vec = norm::apply_norm_warp<kHeadDim>(input_vec, weight_vec, eps);
-    gmem.store(input, output_vec);
+    const auto final_vec = Epilogue::apply(output_vec, params, token_id, head_id);
+    gmem.store(input, final_vec);
+    Epilogue::after_store(final_vec, params, token_id, head_id);
+    if constexpr (!kPersistent) break;
   }
 
   PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
