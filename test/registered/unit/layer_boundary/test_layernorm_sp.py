@@ -8,6 +8,7 @@ fused matmul fast-paths need a real TP group and are covered by the e2e test.
 import unittest
 from functools import partial
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -100,12 +101,15 @@ class TestLayerNormSPGating(CustomTestCase):
 class TestLayerNormSPValidation(CustomTestCase):
     """``validate_layernorm_sp`` is pure; pass config in directly."""
 
-    VALID = dict(
-        architecture="Qwen3ForCausalLM",
-        tp_size=2,
-        attn_dp_enabled=False,
-        speculative_algorithm=None,
-    )
+    VALID: ClassVar[dict[str, object]] = {
+        "architecture": "Qwen3ForCausalLM",
+        "tp_size": 2,
+        "ep_size": 2,
+        "pp_size": 1,
+        "attn_cp_size": 1,
+        "attn_dp_enabled": False,
+        "speculative_algorithm": None,
+    }
 
     def test_valid_config_passes(self):
         validate_layernorm_sp(**self.VALID)  # must not raise
@@ -126,6 +130,51 @@ class TestLayerNormSPValidation(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "speculative"):
             validate_layernorm_sp(**{**self.VALID, "speculative_algorithm": "EAGLE3"})
 
+    def test_qwen4_exp_uses_the_standard_flag_with_general_tp_ep_constraint(self):
+        for tp_size in (2, 4, 8):
+            validate_layernorm_sp(
+                **{
+                    **self.VALID,
+                    "architecture": "Qwen4ExpForCausalLM",
+                    "tp_size": tp_size,
+                    "ep_size": tp_size,
+                }
+            )
+
+    def test_qwen4_exp_requires_ep_equal_tp(self):
+        with self.assertRaisesRegex(ValueError, "ep_size == tp_size"):
+            validate_layernorm_sp(
+                **{
+                    **self.VALID,
+                    "architecture": "Qwen4ExpForCausalLM",
+                    "tp_size": 4,
+                    "ep_size": 2,
+                }
+            )
+
+    def test_qwen4_exp_requires_pp_one(self):
+        with self.assertRaisesRegex(ValueError, "pp_size == 1"):
+            validate_layernorm_sp(
+                **{
+                    **self.VALID,
+                    "architecture": "Qwen4ExpForConditionalGeneration",
+                    "pp_size": 2,
+                }
+            )
+
+    def test_qwen4_exp_rejects_attention_context_parallelism(self):
+        with self.assertRaisesRegex(ValueError, "attn_cp_size == 1"):
+            validate_layernorm_sp(
+                **{
+                    **self.VALID,
+                    "architecture": "Qwen4ExpForConditionalGeneration",
+                    "attn_cp_size": 2,
+                }
+            )
+
+    def test_qwen3_behavior_is_unchanged_with_attention_context_parallelism(self):
+        validate_layernorm_sp(**{**self.VALID, "attn_cp_size": 2})
+
 
 class _Norm:
     def __call__(self, x, residual=None, post_residual_addition=None):
@@ -133,6 +182,49 @@ class _Norm:
             return x * 2
         s = x + residual
         return s * 2, s
+
+
+class TestReplicatedTokenRows(CustomTestCase):
+    def test_partial_output_is_summed_while_scattering(self):
+        def reduce_scatter(output, full_partial):
+            output.copy_(full_partial.tensor_split(2, dim=0)[1] * 2)
+
+        group = SimpleNamespace(
+            world_size=2,
+            rank_in_group=1,
+            all_gather_into_tensor=lambda output, local: output.copy_(
+                torch.cat([local, local])
+            ),
+            reduce_scatter_tensor=MagicMock(side_effect=reduce_scatter),
+        )
+        output = layernorm_sp.run_replicated_token_rows(
+            torch.tensor([[1.0], [2.0]]),
+            lambda full_rows: full_rows + 10,
+            output_is_tp_partial=True,
+            group=group,
+        )
+        torch.testing.assert_close(output, torch.tensor([[22.0], [24.0]]))
+        group.reduce_scatter_tensor.assert_called_once()
+
+    def test_complete_output_is_sharded_without_sum(self):
+        group = SimpleNamespace(
+            world_size=2,
+            rank_in_group=1,
+            all_gather_into_tensor=lambda output, local: output.copy_(
+                torch.cat([local, local])
+            ),
+            reduce_scatter_tensor=MagicMock(
+                side_effect=AssertionError("complete output must not be summed")
+            ),
+        )
+        output = layernorm_sp.run_replicated_token_rows(
+            torch.tensor([[1.0], [2.0]]),
+            lambda full_rows: full_rows + 10,
+            output_is_tp_partial=False,
+            group=group,
+        )
+        torch.testing.assert_close(output, torch.tensor([[11.0], [12.0]]))
+        group.reduce_scatter_tensor.assert_not_called()
 
 
 class TestSpRegionSteps(CustomTestCase):
@@ -221,7 +313,7 @@ class TestSpRegionSteps(CustomTestCase):
         communicator = self.communicator(first_layer=True)
         move = MagicMock(side_effect=lambda **k: k["hidden_states"])
         communicator.paths[BatchVariant.ORDINARY] = self.ordinary_steps(move)
-        (h, _), active, scatter = self.run_prepare_attn(
+        (_h, _), active, scatter = self.run_prepare_attn(
             communicator, ForwardMode.DECODE, torch.ones(2, 4), None
         )
         self.assertFalse(active)
