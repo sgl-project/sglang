@@ -432,7 +432,17 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 state = pool.kv_score_buffer.kv_score
                 data_ptrs.append(state.data_ptr())
                 data_lens.append(state.nbytes)
-                item_lens.append(state[0].nbytes * pool.ring_size)
+                # One SWA page's c4 state spans `span` rows, where span =
+                # 2*ring_size on A5 ratio-4 (mirrors
+                # NPUCompressStatePool.translate_from_swa_loc_to_state_loc); size
+                # the transfer item to the same span so PD/HiCache ships the whole
+                # page's state rows, not ring_size of them.
+                span = (
+                    2 * pool.ring_size
+                    if pool.ratio == 4 and is_npu_arch35()
+                    else pool.ring_size
+                )
+                item_lens.append(state[0].nbytes * span)
 
         return data_ptrs, data_lens, item_lens
 
