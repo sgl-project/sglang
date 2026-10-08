@@ -1,15 +1,19 @@
 """Layer-communication helpers for the Nemotron-H model."""
 
-from torch import nn
-
-from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerScatterModes,
-    ScatterMode,
+from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MOE
+from sglang.srt.layers.layer_boundary import (
+    ExitRows,
+    ProducerReduction,
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    NormQuantReadout,
+    NormReadout,
 )
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.runtime_context import get_parallel
 
 ATTN_LAYERS = (MAMBA, ATTENTION)
 
@@ -18,41 +22,30 @@ def is_attn_layer(layer_type: str) -> bool:
     return layer_type in ATTN_LAYERS
 
 
-def feeds_mlp_layer(pattern: str, layer_idx: int) -> bool:
-    next_idx = layer_idx + 1
-    return next_idx < len(pattern) and not is_attn_layer(pattern[next_idx])
-
-
-def _build_layer_scatter_modes(is_sparse: bool = False) -> LayerScatterModes:
-    scatter_mlp = is_sparse and not get_moe_a2a_backend().is_none()
-    mlp_mode = ScatterMode.SCATTERED if scatter_mlp else ScatterMode.FULL
-    middle_residual_mode = (
-        ScatterMode.SCATTERED if scatter_mlp else ScatterMode.TP_ATTN_FULL
-    )
-    return LayerScatterModes(
-        layer_input_mode=ScatterMode.TP_ATTN_FULL,
-        attn_mode=ScatterMode.TP_ATTN_FULL,
-        mlp_mode=mlp_mode,
-        middle_residual_mode=middle_residual_mode,
-        layer_output_mode=ScatterMode.TP_ATTN_FULL,
+def _declaration(pattern: str, layer_idx: int):
+    if is_attn_layer(pattern[layer_idx]):
+        return declare_attn(
+            read=NormQuantReadout(reads_before_dp_gather=True),
+            reduction=ProducerReduction.EXIT_SCOPED,
+            gathers_attn_tp_input=False,
+        )
+    return declare_ffn(
+        sparse=pattern[layer_idx] == MOE,
+        read=NormReadout(reads_before_dp_gather=True),
+        dense_tp_size=get_parallel().tp_size if pattern[layer_idx] != MOE else None,
+        exit_rows=ExitRows.ATTENTION,
     )
 
 
-def make_layer_communicator(
-    layer_norm: RMSNorm,
-    *,
-    for_attn: bool,
-    allow_reduce_scatter: bool = False,
-    is_sparse: bool = False,
-    is_last_layer: bool = False,
-) -> LayerCommunicator:
-    return LayerCommunicator(
-        layer_scatter_modes=_build_layer_scatter_modes(is_sparse),
-        input_layernorm=layer_norm if for_attn else nn.Identity(),
-        post_attention_layernorm=nn.Identity() if for_attn else layer_norm,
-        # With attention TP > 1, the default gather adds the residual to one
-        # rank's partial in bf16 before the cross-rank sum.
-        force_layernorm_before_dp_gather=True,
-        allow_reduce_scatter=allow_reduce_scatter,
-        is_last_layer=is_last_layer,
+def make_stage_boundary(layer_norm: RMSNorm, *, pattern: str, layer_idx: int):
+    from sglang.srt.layers import layernorm_sp
+
+    if get_parallel().attn_cp_size > 1 or layernorm_sp.layernorm_sp_enabled():
+        raise NotImplementedError("a Nemotron stage with attention CP or LayerNorm SP")
+    (boundary,) = append_stages(
+        (
+            _declaration(pattern, layer_idx),
+            layer_norm,
+        ),
     )
+    return boundary

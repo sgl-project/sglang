@@ -35,7 +35,7 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
 from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (  # noqa: E402
     commit_kda_replayssm_spec,
 )
-from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (  # noqa: E402
+from sglang.kernels.ops.attention.kda_decode_mtp import (  # noqa: E402
     fused_kda_decode_mtp_dspark,
 )
 
