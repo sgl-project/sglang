@@ -174,29 +174,25 @@ class FlexKVRadixCache(RadixCache):
         if len(key) == 0:
             return base_res
 
-        device_value: torch.Tensor = base_res.device_indices
         last_node: TreeNode = base_res.last_device_node
 
         if self._mode is FlexKVMode.MP:
             if params.req is None:
                 return base_res
-            return self._mp_match_prefix(
-                key, base_res, device_value, last_node, params.req
-            )
-        return self._ip_match_prefix(key, base_res, device_value, last_node)
+            return self._mp_match_prefix(key, base_res, last_node, params.req)
+        return self._ip_match_prefix(key, base_res, last_node)
 
     def _mp_match_prefix(
         self,
         key: RadixKey,
         base_res: MatchResult,
-        device_value: torch.Tensor,
         last_node: TreeNode,
         req: Req,
     ) -> MatchResult:
         """LOOKUP-only path. Sets ``host_hit_length`` on the result so
         the scheduler later invokes :meth:`init_load_back`."""
         token_ids = key.raw_token_ids()
-        device_len = int(device_value.numel())
+        device_len = base_res.device_prefix_len
         if device_len >= len(token_ids):
             return base_res
 
@@ -226,7 +222,7 @@ class FlexKVRadixCache(RadixCache):
             value_numel=device_len,
         )
         return MatchResult(
-            device_indices=device_value,
+            device_prefix_len=device_len,
             last_device_node=last_node,
             last_host_node=last_node,
             best_match_node=last_node,
@@ -237,13 +233,12 @@ class FlexKVRadixCache(RadixCache):
         self,
         key: RadixKey,
         base_res: MatchResult,
-        device_value: torch.Tensor,
         last_node: TreeNode,
     ) -> MatchResult:
         """Layerwise path: allocate slots and fire ``start_load_kv_layerwise``
         immediately. Per-layer hook waits during forward."""
         token_ids = key.raw_token_ids()
-        device_len = int(device_value.numel())
+        device_len = base_res.device_prefix_len
         if device_len >= len(token_ids):
             return base_res
 
@@ -271,7 +266,7 @@ class FlexKVRadixCache(RadixCache):
             return base_res
         new_slots, new_node = result
         return MatchResult(
-            device_indices=torch.cat([device_value, new_slots]),
+            device_prefix_len=device_len + len(new_slots),
             last_device_node=new_node,
             last_host_node=new_node,
             best_match_node=new_node,
