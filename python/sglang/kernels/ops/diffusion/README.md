@@ -60,11 +60,12 @@ themselves against the live eager chain on first sight via
 `sites/bitexact_gate.py` and fall back permanently on mismatch — the
 dispatch they replicate can change under them.
 
-**Not bit-exact → quality-gated.** Mounted onto marked `nn.Module` sites only
-for `quality="extra-high"` and `quality="high"` requests, at batch boundaries,
-all-or-nothing per transformer (`sites/quality_gate.py`). `extra-high` adds
-only these request-gated DiT/VAE fusions; `high` is cumulative and may also
-enable model-owned approximate paths such as Cache-DiT or a lower-precision
+**Not bit-exact → quality-gated.** Mounted onto marked `nn.Module` sites at
+batch boundaries, all-or-nothing per transformer (`sites/quality_gate.py`),
+from the lowest tier that may run each one: `lossless` for a fusion that keeps
+the reference math and every operand's precision and only moves the rounding,
+`high` for one that quantizes or lowers a precision. `high` is cumulative and
+may also enable model-owned approximate paths such as Cache-DiT or a lower-precision
 decode. A plain fp32 single-pass norm fusion looks harmless and is not: on
 ERNIE-Image it moved the 50-step trajectory to PSNR 18.83 dB, which is what
 motivated the bit-exact rewrite.
@@ -250,7 +251,11 @@ inspecting model modules is its whole job.
    wrapper when the fallback policy is shared.
 4. State the numerical contract in the module docstring, including which
    shapes it was verified on.
-5. If it is not bit-exact, gate it through `sites/`. It must mount for both
-   `extra-high` and `high`, never for the default `lossless` path.
+5. If it is not bit-exact, gate it through `sites/` and declare its tier in
+   `_QUALITY_FUSION_HANDLERS`: `lossless` when it keeps the reference math and
+   every operand's precision, `high` when it does not. Never `exact`, which
+   is reserved for paths that reproduce the reference's rounding. A
+   `lossless` claim has to pass
+   `multimodal_gen/test/quality_tier_admission.py`.
 6. Test it in the domain suite (`test/registered/kernels/ops/diffusion/`), and
    the model wiring in `test_model_fast_paths.py`.

@@ -3,6 +3,9 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
 from sglang.kernels.ops.common.numerics import mul_rn_f32
+from sglang.kernels.ops.diffusion.common.fallback_torch import (
+    fuse_scale_shift_kernel_native,
+)
 from sglang.kernels.ops.diffusion.common.platform import (
     is_cuda,
     is_hip,
@@ -10,6 +13,7 @@ from sglang.kernels.ops.diffusion.common.platform import (
     lazy_fallback,
     select_impl,
 )
+from sglang.srt.utils import is_gfx1250_supported
 
 
 @triton.jit
@@ -445,6 +449,11 @@ def fuse_scale_shift_kernel(
 ):
     assert (x.is_cuda and scale.is_cuda) or (x.is_xpu and scale.is_xpu)
     assert x.is_contiguous()
+
+    if is_gfx1250_supported() and x.dtype is torch.bfloat16:
+        return fuse_scale_shift_kernel_native(
+            x, scale, shift, scale_constant, block_l, block_c
+        )
 
     B, L, C = x.shape
     output = torch.empty_like(x)
