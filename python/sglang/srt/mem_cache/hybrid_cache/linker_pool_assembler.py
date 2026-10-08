@@ -406,10 +406,10 @@ def _build_dsa_device_pool_group(
             f"{kvcache.page_size} != {page_size}."
         )
     from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo
-    from sglang.srt.mem_cache.hybrid_cache.device_pool_binding import (
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+    from sglang.srt.mem_cache.pool_buffer_binding import (
         bind_packed_pool_buffers,
     )
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
     from sglang.srt.utils import is_cuda
 
     if (

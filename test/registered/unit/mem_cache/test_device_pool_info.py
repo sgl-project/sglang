@@ -12,13 +12,13 @@ from sglang.srt.mem_cache.device_pool_info import (
     MLABufferInfo,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.hybrid_cache.device_pool_binding import (
-    bind_packed_pool_buffers,
-)
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     _build_dsa_device_pool_group,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.pool_buffer_binding import (
+    bind_packed_pool_buffers,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

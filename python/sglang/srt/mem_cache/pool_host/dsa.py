@@ -92,7 +92,7 @@ class DSAIndexerHostPoolBuilder:
                 for pool in (target, *packed_draft_device_pools)
             )
         ):
-            from sglang.srt.mem_cache.hybrid_cache.device_pool_binding import (
+            from sglang.srt.mem_cache.pool_buffer_binding import (
                 bind_packed_pool_buffers,
             )
 

@@ -10,9 +10,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     SidecarPoolSpec,
 )
-from sglang.srt.mem_cache.hybrid_cache.device_pool_binding import (
-    bind_packed_pool_buffers,
-)
 from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
     HostPoolGroupConfig,
     check_packed_kv_rows,
@@ -28,6 +25,9 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
     LogicalHostPool,
+)
+from sglang.srt.mem_cache.pool_buffer_binding import (
+    bind_packed_pool_buffers,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type

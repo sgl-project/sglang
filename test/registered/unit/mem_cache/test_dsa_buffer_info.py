@@ -3,15 +3,15 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.hybrid_cache.device_pool_binding import (
-    bind_packed_pool_buffers,
-)
 from sglang.srt.mem_cache.hybrid_cache.host_pool_config import prepare_host_pool_config
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_host_pool_group,
     build_kv_host_pool,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+from sglang.srt.mem_cache.pool_buffer_binding import (
+    bind_packed_pool_buffers,
+)
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.runtime_context import publish, reset_context
