@@ -1,5 +1,4 @@
 import torch
-from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import is_ltx23_native_variant
 from sglang.multimodal_gen.runtime.distributed import (
@@ -167,30 +166,6 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                 return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
             return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
-
-    @staticmethod
-    def _randn_like_with_batch_generators(
-        reference_tensor: torch.Tensor, batch: Req
-    ) -> torch.Tensor:
-        generator = getattr(batch, "generator", None)
-        if isinstance(generator, list):
-            bsz = int(reference_tensor.shape[0])
-            valid_generators = [g for g in generator if isinstance(g, torch.Generator)]
-            if len(valid_generators) == 1:
-                generator = valid_generators[0]
-            elif len(valid_generators) >= bsz:
-                generator = valid_generators[:bsz]
-            else:
-                generator = None
-        elif not isinstance(generator, torch.Generator):
-            generator = None
-
-        return randn_tensor(
-            reference_tensor.shape,
-            generator=generator,
-            device=reference_tensor.device,
-            dtype=reference_tensor.dtype,
-        )
 
     @staticmethod
     def _reset_stage2_generators(batch: Req) -> None:
