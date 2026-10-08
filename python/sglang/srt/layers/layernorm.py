@@ -618,25 +618,7 @@ class RMSNorm(BaseFusedOp):
                 # we probably need to add another parameter to fused_add_rmsnorm
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
-                if (
-                    x.shape[0] <= 16
-                    and x.dtype in (torch.float16, torch.bfloat16)
-                    and self.weight.data.dtype == x.dtype
-                    and is_supported_jit_fused_add_rmsnorm_hidden_size(x.shape[-1])
-                ):
-                    # Decode hot path: the JIT kernel is ~2x faster than the
-                    # generic one at tiny M (3.4us vs 6.2us at [1, 4096]).
-                    _jit_fused_add_rmsnorm(
-                        x,
-                        residual,
-                        self.weight.data,
-                        self.variance_epsilon,
-                        cast_x_before_out_mul=False,
-                    )
-                else:
-                    fused_add_rmsnorm(
-                        x, residual, self.weight.data, self.variance_epsilon
-                    )
+                fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
                 result = x, residual
         else:
             result = rmsnorm(x, self.weight.data, self.variance_epsilon)
