@@ -37,12 +37,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
-#elif defined(USE_MUSA)
-#include <musa_bf16.h>
-#include <musa_fp16.h>
-#include <musa_fp8.h>
-#include <musa_runtime.h>
-#else
+#elif defined(USE_ROCM)
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -70,6 +65,11 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #endif
 #define cudaFuncSetAttribute hipFuncSetAttribute
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#else
+#include <musa_bf16.h>
+#include <musa_fp16.h>
+#include <musa_fp8.h>
+#include <musa_runtime.h>
 #endif
 
 #if defined(USE_MUSA)
@@ -123,7 +123,21 @@ using fp8x4_e4m3_t = __nv_fp8x4_e4m3;
 using fp8x4_e5m2_t = __nv_fp8x4_e5m2;
 
 using fp32x4_t = float4;
-#elif defined(USE_MUSA)
+#elif defined(USE_ROCM)
+using fp32_t = float;
+using fp16_t = __half;
+using bf16_t = __hip_bfloat16;
+using fp8_e4m3_t = uint8_t;
+using fp8_e5m2_t = uint8_t;
+using fp32x2_t = float2;
+using fp16x2_t = half2;
+using bf16x2_t = __hip_bfloat162;
+using fp8x2_e4m3_t = uint16_t;
+using fp8x2_e5m2_t = uint16_t;
+using fp8x4_e4m3_t = uint32_t;
+using fp8x4_e5m2_t = uint32_t;
+using fp32x4_t = float4;
+#else
 using fp32_t = float;
 using fp16_t = __half;
 using bf16_t = __mt_bfloat16;
@@ -138,20 +152,6 @@ using fp8x2_e5m2_t = __mt_fp8x2_e5m2;
 using fp8x4_e4m3_t = __mt_fp8x4_e4m3;
 using fp8x4_e5m2_t = __mt_fp8x4_e5m2;
 
-using fp32x4_t = float4;
-#else
-using fp32_t = float;
-using fp16_t = __half;
-using bf16_t = __hip_bfloat16;
-using fp8_e4m3_t = uint8_t;
-using fp8_e5m2_t = uint8_t;
-using fp32x2_t = float2;
-using fp16x2_t = half2;
-using bf16x2_t = __hip_bfloat162;
-using fp8x2_e4m3_t = uint16_t;
-using fp8x2_e5m2_t = uint16_t;
-using fp8x4_e4m3_t = uint32_t;
-using fp8x4_e5m2_t = uint32_t;
 using fp32x4_t = float4;
 #endif
 
@@ -192,10 +192,10 @@ static_assert(
 #endif
 #define SGL_ARCH_HOPPER_OR_GREATER (SGL_CUDA_ARCH >= 900)
 #define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_CUDA_ARCH >= 1000) && (CUDA_VERSION >= 12090))
-#elif defined(USE_MUSA)
+#elif defined(USE_ROCM)
 #define SGL_ARCH_HOPPER_OR_GREATER 0
 #define SGL_ARCH_BLACKWELL_OR_GREATER 0
-#else  // USE_ROCM
+#else  // USE_MUSA
 #define SGL_ARCH_HOPPER_OR_GREATER 0
 #define SGL_ARCH_BLACKWELL_OR_GREATER 0
 #endif
@@ -397,18 +397,18 @@ namespace host {
 /**
  * \brief Check the CUDA error code and panic with location info on failure.
  */
-#if defined(USE_MUSA)
-inline void RuntimeDeviceCheck(::musaError_t error, DebugInfo location = {}) {
-  if (error != ::musaSuccess) {
-    [[unlikely]];
-    host::panic(location, "MUSA error: ", ::musaGetErrorString(error));
-  }
-}
-#else
+#if !defined(USE_MUSA)
 inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
   if (error != ::cudaSuccess) {
     [[unlikely]];
     host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
+  }
+}
+#else
+inline void RuntimeDeviceCheck(::musaError_t error, DebugInfo location = {}) {
+  if (error != ::musaSuccess) {
+    [[unlikely]];
+    host::panic(location, "MUSA error: ", ::musaGetErrorString(error));
   }
 }
 #endif
@@ -523,20 +523,20 @@ struct LaunchKernel {
   }
 
   auto enable_pdl(bool enabled = true) -> LaunchKernel& {
-#ifdef USE_ROCM
-    (void)enabled;
-    m_config.numAttrs = 0;
-#elif defined(USE_MUSA)
-    if (enabled) {
-      auto& attr = m_attrs[m_config.numAttrs++];
-      attr.id = musaLaunchAttributeIgnore;
-      attr.val.programmaticStreamSerializationAllowed = true;
-      m_config.attrs = m_attrs;
-    }
-#else
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
     if (enabled) {
       auto& attr = m_attrs[m_config.numAttrs++];
       attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attr.val.programmaticStreamSerializationAllowed = true;
+      m_config.attrs = m_attrs;
+    }
+#elif defined(USE_ROCM)
+    (void)enabled;
+    m_config.numAttrs = 0;
+#else
+    if (enabled) {
+      auto& attr = m_attrs[m_config.numAttrs++];
+      attr.id = musaLaunchAttributeIgnore;
       attr.val.programmaticStreamSerializationAllowed = true;
       m_config.attrs = m_attrs;
     }
@@ -545,13 +545,13 @@ struct LaunchKernel {
   }
 
   auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
-#if defined(USE_ROCM) || defined(USE_MUSA)
-    (void)cluster_dim;
-#else
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
     auto& attr = m_attrs[m_config.numAttrs++];
     attr.id = cudaLaunchAttributeClusterDimension;
     attr.val.clusterDim = {cluster_dim.x, cluster_dim.y, cluster_dim.z};
     m_config.attrs = m_attrs;
+#else
+    (void)cluster_dim;
 #endif
     return *this;
   }
@@ -579,7 +579,9 @@ struct LaunchKernel {
   template <typename T, typename... Args>
   auto operator()(T&& kernel, Args&&... args) const -> void {
     if (m_prefer_l1) apply_prefer_l1(kernel);
-#ifdef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
+    RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
+#elif defined(USE_ROCM)
     hipLaunchKernelGGL(
         std::forward<T>(kernel),
         m_config.gridDim,
@@ -588,10 +590,8 @@ struct LaunchKernel {
         m_config.stream,
         std::forward<Args>(args)...);
     RuntimeDeviceCheck(m_location);
-#elif defined(USE_MUSA)
-    RuntimeDeviceCheck(::musaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #else
-    RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
+    RuntimeDeviceCheck(::musaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #endif
   }
 
@@ -618,14 +618,14 @@ struct LaunchKernel {
   // Memo hit after load-time configure(); stream-constructed launches use the current device.
   template <typename T>
   void apply_prefer_l1(T&& kernel) const {
-#if defined(USE_MUSA)
-    (void)kernel;
-    return;
-#else
+#if !defined(USE_MUSA)
     int device_id = m_device_id;
     if (device_id < 0) RuntimeDeviceCheck(::cudaGetDevice(&device_id));
     const dim3 block = m_config.blockDim;
     ensure_prefer_l1(+kernel, device_id, block.x * block.y * block.z, m_config.dynamicSmemBytes);
+#else
+    (void)kernel;
+    return;
 #endif
   }
 
@@ -638,16 +638,16 @@ struct LaunchKernel {
 
 // The empty-true-branch if/else form keeps a trailing `else` in user code
 // bound to the user's `if`, not to the macro's.
-#if defined(USE_MUSA)
-#define CHECK_CUDA(COND)                                              \
-  if (const auto error = (COND); error == ::musaSuccess) [[likely]] { \
-  } else                                                              \
-    host::Error() << "MUSA error: " << ::musaGetErrorString(error) << ". "
-#else
+#if !defined(USE_MUSA)
 #define CHECK_CUDA(COND)                                              \
   if (const auto error = (COND); error == ::cudaSuccess) [[likely]] { \
   } else                                                              \
     host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
+#else
+#define CHECK_CUDA(COND)                                              \
+  if (const auto error = (COND); error == ::musaSuccess) [[likely]] { \
+  } else                                                              \
+    host::Error() << "MUSA error: " << ::musaGetErrorString(error) << ". "
 #endif
 
 }  // namespace host

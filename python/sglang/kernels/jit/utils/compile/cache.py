@@ -214,11 +214,13 @@ def _target_tag() -> str:
     ``(major, minor)`` capability: the latter maps gfx940/gfx941/gfx942 onto a
     single ``9.4``, which are three different compile targets.
     """
+    if not is_hip_runtime() and not is_musa_runtime():
+        arch = get_jit_cuda_arch()
+        return f"sm{arch.major}{arch.minor}{arch.suffix}"
     if is_hip_runtime():
         return toolchain.gpu_arch_name().split(":")[0] or "unknown"
     arch = get_jit_cuda_arch()
-    prefix = "mp" if is_musa_runtime() else "sm"
-    return f"{prefix}{arch.major}{arch.minor}{arch.suffix}"
+    return f"mp{arch.major}{arch.minor}{arch.suffix}"
 
 
 @cache_once
@@ -232,11 +234,13 @@ def _environment_fingerprint() -> str:
     different host compiler means different system headers and different host
     codegen for otherwise identical inputs.
     """
-    if is_hip_runtime():
+    if not is_hip_runtime() and not is_musa_runtime():
+        arch = get_jit_cuda_arch()
+        target = f"cuda:{arch.target_name}"
+    elif is_hip_runtime():
         target = f"hip:{toolchain.gpu_arch_name()}"
     else:
-        arch = get_jit_cuda_arch()
-        target = f"{'musa' if is_musa_runtime() else 'cuda'}:{arch.target_name}"
+        target = f"musa:{toolchain.gpu_arch_name()}"
 
     compilers = []
     for path in (toolchain.device_compiler_path(), toolchain.host_compiler_path()):

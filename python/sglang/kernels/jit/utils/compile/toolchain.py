@@ -88,11 +88,11 @@ def device_compiler_path() -> str:
     Resolved the same way tvm-ffi resolves it, so the binary the cache
     fingerprints is the binary that does the compiling.
     """
-    if is_musa_runtime():
-        return os.path.join(musa_home(), "bin", "mcc")
+    if not is_hip_runtime() and not is_musa_runtime():
+        return os.path.join(cuda_home(), "bin", "nvcc")
     if is_hip_runtime():
         return os.path.join(rocm_home(), "bin", "hipcc")
-    return os.path.join(cuda_home(), "bin", "nvcc")
+    return os.path.join(musa_home(), "bin", "mcc")
 
 
 @cache_once
@@ -113,26 +113,28 @@ def gpu_arch_name() -> str:
     CUDA-shaped ``(major, minor)`` capability: the latter maps gfx940/gfx941/
     gfx942 onto a single ``9.4``, which are three different compile targets.
     """
-    if is_musa_runtime():
-        configured = os.environ.get("MTGPU_TARGET")
-        if configured:
-            return configured
+    if not is_hip_runtime() and not is_musa_runtime():
+        return get_jit_cuda_arch().target_name
+    if is_hip_runtime():
         try:
-            device = torch.musa.current_device()
-            properties = torch.musa.get_device_properties(device)
-            return f"mp_{int(properties.major)}{int(properties.minor)}"
+            device = torch.cuda.current_device()
+            return str(torch.cuda.get_device_properties(device).gcnArchName)
         except Exception:
             logger.warning(
-                "Cannot detect MUSA architecture; the JIT cache target degrades."
+                "Cannot detect ROCm gcnArchName; the JIT cache target degrades."
             )
             return "unknown"
-    if not is_hip_runtime():
-        return get_jit_cuda_arch().target_name
+    configured = os.environ.get("MTGPU_TARGET")
+    if configured:
+        return configured
     try:
-        device = torch.cuda.current_device()
-        return str(torch.cuda.get_device_properties(device).gcnArchName)
+        device = torch.musa.current_device()
+        properties = torch.musa.get_device_properties(device)
+        return f"mp_{int(properties.major)}{int(properties.minor)}"
     except Exception:
-        logger.warning("Cannot detect ROCm gcnArchName; the JIT cache target degrades.")
+        logger.warning(
+            "Cannot detect MUSA architecture; the JIT cache target degrades."
+        )
         return "unknown"
 
 
@@ -163,13 +165,13 @@ def target_flags() -> List[str]:
     the compiler driver to probe: the value is part of the cache key, so it has
     to be decided here and not rediscovered at build time.
     """
-    if is_musa_runtime():
-        return [f"--offload-arch={gpu_arch_name()}"]
+    if not is_hip_runtime() and not is_musa_runtime():
+        arch = get_jit_cuda_arch()
+        target = f"{arch.major}{arch.minor}{arch.suffix}"
+        return [f"-gencode=arch=compute_{target},code=sm_{target}"]
     if is_hip_runtime():
         return [f"--offload-arch={gpu_arch_name()}"]
-    arch = get_jit_cuda_arch()
-    target = f"{arch.major}{arch.minor}{arch.suffix}"
-    return [f"-gencode=arch=compute_{target},code=sm_{target}"]
+    return [f"--offload-arch={gpu_arch_name()}"]
 
 
 def base_cxx_flags() -> List[str]:
@@ -183,20 +185,20 @@ def base_cxx_flags() -> List[str]:
 
 
 def base_cuda_flags() -> List[str]:
-    if is_musa_runtime():
-        return ["-fPIC", "-x", "musa"]
+    if not is_hip_runtime() and not is_musa_runtime():
+        return ["-Xcompiler", "-fPIC"]
     if is_hip_runtime():
         return ["-fPIC", "-D__HIP_PLATFORM_AMD__=1", "-fno-gpu-rdc"]
-    return ["-Xcompiler", "-fPIC"]
+    return ["-fPIC", "-x", "musa"]
 
 
 def base_include_paths() -> List[str]:
     includes, _, _ = tvm_ffi_paths()
-    if is_musa_runtime():
-        return [*includes, f"{musa_home()}/include"]
+    if not is_hip_runtime() and not is_musa_runtime():
+        return list(includes)
     if is_hip_runtime():
         return [*includes, f"{rocm_home()}/include"]
-    return list(includes)
+    return [*includes, f"{musa_home()}/include"]
 
 
 def base_link_flags(*, with_device: bool) -> List[str]:
@@ -210,11 +212,11 @@ def base_link_flags(*, with_device: bool) -> List[str]:
     flags = ["-shared", f"-L{lib_dir}", f"-l{lib_name}"]
     if not with_device:
         return flags
-    if is_musa_runtime():
-        return flags + [f"-L{musa_home()}/lib", "-lmusa", "-lmusart"]
+    if not is_hip_runtime() and not is_musa_runtime():
+        return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
     if is_hip_runtime():
         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
-    return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
+    return flags + [f"-L{musa_home()}/lib", "-lmusa", "-lmusart"]
 
 
 def compilers() -> Tuple[str, str]:
