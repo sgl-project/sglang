@@ -79,7 +79,9 @@ def _zero_c4_boundary(
     """
     import os
 
-    if not os.environ.get("SGLANG_DSV4_ZERO_C4_BOUNDARY"):
+    do_zero = bool(os.environ.get("SGLANG_DSV4_ZERO_C4_BOUNDARY"))
+    do_dump = bool(os.environ.get("SGLANG_DSV4_DUMP_C4_BOUNDARY"))
+    if not (do_zero or do_dump):
         return
     tree_cache = getattr(batch, "tree_cache", None)
     alloc = getattr(tree_cache, "token_to_kv_pool_allocator", None)
@@ -122,7 +124,19 @@ def _zero_c4_boundary(
                 state = pool.kv_score_buffer.kv_score
                 sloc = pool.translate_from_swa_loc_to_state_loc(swa).to(torch.int64)
                 valid = (sloc >= 0) & (sloc < state.shape[0])
-                if bool(valid.any()):
+                if not bool(valid.any()):
+                    continue
+                if do_dump:
+                    import hashlib
+
+                    rows = state[sloc[valid]].detach().to(torch.float32).cpu().numpy()
+                    print(
+                        f"[C4BNDV] pid={os.getpid()} prefix_len={prefix_len} "
+                        f"req={i} ratio={pool.ratio} n={int(valid.sum().item())} "
+                        f"md5={hashlib.md5(rows.tobytes()).hexdigest()[:16]}",
+                        flush=True,
+                    )
+                if do_zero:
                     state[sloc[valid]] = 0
                     total += int(valid.sum().item())
     print(
