@@ -31,6 +31,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
+    EncodeWhileDecoding,
+    streamed_video_output_path,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
@@ -96,6 +100,10 @@ def _ensure_tensor_decode_output(decode_output):
     if hasattr(decode_output, "sample"):
         return decode_output.sample
     return decode_output
+
+
+def _to_unit_range(image: torch.Tensor) -> torch.Tensor:
+    return (image / 2 + 0.5).clamp(0, 1)
 
 
 class DecodingStage(PipelineStage):
@@ -208,6 +216,7 @@ class DecodingStage(PipelineStage):
         server_args: ServerArgs,
         *,
         vae_dtype: torch.dtype,
+        on_frames=None,
     ) -> torch.Tensor:
         """
         Decode latent representations into pixel space using VAE.
@@ -220,6 +229,8 @@ class DecodingStage(PipelineStage):
                   VAE precision ("fp32", "fp16", "bf16")
                 - pipeline_config.vae_precision: fallback VAE precision
                 - pipeline_config.vae_tiling: Whether to enable VAE tiling for memory efficiency
+            on_frames: For a VAE with ``supports_decode_on_frames``, receives the
+                returned frames once, in order, in the pieces the VAE finishes them.
 
         Returns:
             Decoded video tensor with shape (batch, channels, frames, height, width),
@@ -257,11 +268,18 @@ class DecodingStage(PipelineStage):
             should_cast_vae = not vae_autocast_enabled
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
+            decode_kwargs = {}
+            if on_frames is not None:
+                decode_kwargs["on_frames"] = lambda frames: on_frames(
+                    _to_unit_range(frames)
+                )
             with temporary_module_dtype(
                 self.vae, vae_dtype, enabled=should_cast_vae
             ) as vae:
                 try:
-                    decode_output = self._get_vae_decode_fn(vae, server_args)(latents)
+                    decode_output = self._get_vae_decode_fn(vae, server_args)(
+                        latents, **decode_kwargs
+                    )
                 except Exception as error:
                     if "out of memory" in str(error).lower():
                         # decode runs after denoising, so the DiT and encoders
@@ -287,7 +305,7 @@ class DecodingStage(PipelineStage):
                 image = _ensure_tensor_decode_output(decode_output)
 
         # De-normalize image to [0, 1] range
-        image = (image / 2 + 0.5).clamp(0, 1)
+        image = _to_unit_range(image)
         return image
 
     def load_model(self):
@@ -304,6 +322,26 @@ class DecodingStage(PipelineStage):
             if pipeline:
                 pipeline.add_module(self.component_name, self.vae)
             self.server_args.model_loaded[self.component_name] = True
+
+    def _encode_while_decoding(
+        self, batch: Req, server_args: ServerArgs
+    ) -> EncodeWhileDecoding | None:
+        """An encoder to feed during the decode, if the frames go to the file as decoded."""
+        if (
+            type(self).forward is not DecodingStage.forward
+            or type(self).decode is not DecodingStage.decode
+            or not isinstance(self.vae, ParallelTiledVAE)
+            or not self.vae.supports_decode_on_frames
+            or batch.return_trajectory_decoded
+            or not isinstance(batch.latents, torch.Tensor)
+        ):
+            return None
+        save_file_path = streamed_video_output_path(
+            batch, server_args, int(batch.latents.shape[0])
+        )
+        if save_file_path is None:
+            return None
+        return EncodeWhileDecoding(save_file_path, batch)
 
     @torch.no_grad()
     def forward(
@@ -327,6 +365,8 @@ class DecodingStage(PipelineStage):
             self.component_name,
             quality=batch.sampling_params.quality,
         )
+        stream = self._encode_while_decoding(batch, server_args)
+        output_file_paths = None
         with self.use_declared_component(
             component_name=self.component_name,
             module=self.vae,
@@ -340,7 +380,24 @@ class DecodingStage(PipelineStage):
                 vae,
                 quality_allows(batch.sampling_params.quality, "lossless"),
             ):
-                frames = self.decode(batch.latents, server_args, vae_dtype=vae_dtype)
+                try:
+                    if stream is None:
+                        # Model-specific decode overrides need not support streaming.
+                        frames = self.decode(
+                            batch.latents, server_args, vae_dtype=vae_dtype
+                        )
+                    else:
+                        frames = self.decode(
+                            batch.latents,
+                            server_args,
+                            vae_dtype=vae_dtype,
+                            on_frames=stream,
+                        )
+                        output_file_paths = stream.finish()
+                except BaseException:
+                    if stream is not None:
+                        stream.abort()
+                    raise
 
                 # decode trajectory latents if needed
                 if batch.return_trajectory_decoded:
@@ -369,11 +426,15 @@ class DecodingStage(PipelineStage):
                 else:
                     trajectory_decoded = None
 
-        frames = server_args.pipeline_config.post_decoding(frames, server_args)
+        if output_file_paths is None:
+            frames = server_args.pipeline_config.post_decoding(frames, server_args)
+        else:
+            frames = None
 
         # Update batch with decoded image
         output_batch = OutputBatch(
             output=frames,
+            output_file_paths=output_file_paths,
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
             rollout_trajectory_data=batch.rollout_trajectory_data,

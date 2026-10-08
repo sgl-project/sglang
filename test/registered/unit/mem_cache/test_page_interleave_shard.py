@@ -652,7 +652,7 @@ def _insert(tree, tokens, rotation_base=None, value=None):
 
 def _match_len(tree, tokens):
     res = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
-    return len(res.device_indices)
+    return res.device_prefix_len
 
 
 class _TreeCoreBackendCase(CustomTestCase):
@@ -784,7 +784,7 @@ class _GraftReq:
         self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         self.extra_key = None
         self.cache_salt = None
-        self.prefix_indices = torch.empty(0, dtype=torch.int64)
+        self.prefix_len = 0
         self.last_node = None
         self.priority = 0
         self.kv_rotation_base = None
@@ -918,7 +918,8 @@ class TestRotationGraftDecline(_TreeCoreBackendCase):
         tree.checkpoint(req, up_to=len(req.fill_ids))
         # No dedup free, no rebind: the request keeps its own locs whole.
         self.assertEqual([t.tolist() for t in freed], [])
-        self.assertTrue(torch.equal(req.prefix_indices, own_locs))
+        row = tree.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :12]
+        self.assertTrue(torch.equal(row.to(dtype=torch.int64), own_locs))
         self.assertEqual(req.kv.cache_protected_len, 0)
         self.assertTrue(
             torch.equal(tree.req_to_token_pool.req_to_token[0, :12], own_locs)

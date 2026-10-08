@@ -124,6 +124,7 @@ from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
+from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_capture_stream,
 )
@@ -762,6 +763,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         raw_num_tokens: Optional[int] = None,
     ):
         with (
+            set_forward_batch(forward_batch),
             forward_context(
                 ForwardContext(attn_backend=self.model_runner.attn_backend)
             ),
@@ -894,6 +896,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         set_is_extend_in_batch(False)
 
         with (
+            set_forward_batch(fb),
             forward_context(
                 ForwardContext(attn_backend=self.model_runner.attn_backend)
             ),
@@ -1503,7 +1506,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
-                out_cache_loc_is_physical=True,
                 batch_size=bs,
                 input_ids=_slot("input_ids"),
                 input_embeds=(
@@ -1569,6 +1571,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
                 max_seq_len_override=self.max_context_size,
             )
+            self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
             ngram_manager = self.model_runner.ngram_embedding_manager
             if ngram_manager.enabled:
                 forward_batch.ngram_embedding_info = NgramEmbeddingInfo.create(
@@ -1868,7 +1871,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         static_forward_batch = ForwardBatch(
             forward_mode=pcg_forward_mode,
-            out_cache_loc_is_physical=True,
             batch_size=bs,
             input_ids=input_ids,
             input_embeds=input_embeds,
@@ -1932,6 +1934,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 or forward_batch.return_pooled_hidden_states
             ),
             max_seq_len_override=self.max_context_size,
+        )
+        forward_batch.kv_loc_plan.bind_replay(
+            static_forward_batch,
+            self.model_runner.kv_index_translator,
+            slots=out_cache_loc,
         )
         # The n-gram hasher runs outside the graph and reads this at replay.
         static_forward_batch.ngram_embedding_info = forward_batch.ngram_embedding_info
