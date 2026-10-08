@@ -183,6 +183,8 @@ async fn chat_completions(
         Ok(routing) => routing,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
+    // Chat has one prompt. Normalization rejects longer routing lists, so
+    // consume the single row and reuse its metadata for each choice.
     let (bootstrap_host, bootstrap_port, bootstrap_room) = izip!(
         routing.bootstrap.bootstrap_hosts,
         routing.bootstrap.bootstrap_ports,

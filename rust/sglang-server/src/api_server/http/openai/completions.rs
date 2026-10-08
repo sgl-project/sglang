@@ -157,6 +157,8 @@ async fn completions(
     let created = unix_seconds_u32();
     let mut submitted = Vec::with_capacity(choice_count);
 
+    // Normalization makes each routing column match the prompt count. Pair
+    // each prompt with its metadata before expanding it into n choices.
     for (prompt_index, (prompt, bootstrap_host, bootstrap_port, bootstrap_room)) in izip!(
         prompts,
         routing.bootstrap.bootstrap_hosts,
