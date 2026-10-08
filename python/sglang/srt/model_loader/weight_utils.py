@@ -13,6 +13,7 @@ import itertools
 import json
 import logging
 import os
+import posixpath
 import re
 import struct
 import tempfile
@@ -756,6 +757,37 @@ def filter_safetensors_files_by_weight_name(
                 kept.append(path)
     # Preserve the model's existing missing-weight validation on empty selection.
     return kept or hf_weights_files
+
+
+def filter_safetensors_files_by_weight_map(
+    files: List[str],
+    model_root: str,
+    weight_map: Dict[str, str],
+    is_unused_weight: Callable[[str], bool],
+) -> List[str]:
+    """Select remote shards without opening their tensor data."""
+    if not isinstance(weight_map, dict) or not weight_map:
+        return files
+    if any(
+        not isinstance(name, str)
+        or not isinstance(shard, str)
+        or not shard
+        or posixpath.isabs(shard)
+        or posixpath.normpath(shard) != shard
+        or shard in (".", "..")
+        or shard.startswith("../")
+        for name, shard in weight_map.items()
+    ):
+        return files
+    root = model_root.rstrip("/") + "/"
+    indexed = {root + shard for shard in weight_map.values()}
+    needed = {
+        root + shard for name, shard in weight_map.items() if not is_unused_weight(name)
+    }
+    # Extra files, such as separately packaged draft weights, are not described
+    # by this index. Their absence from the map is not evidence they are unused.
+    kept = [path for path in files if path not in indexed or path in needed]
+    return kept or files
 
 
 # For models like Mistral-7B-v0.3, there are both sharded

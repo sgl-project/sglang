@@ -115,6 +115,7 @@ from sglang.srt.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
+    filter_safetensors_files_by_weight_map,
     filter_safetensors_files_by_weight_name,
     get_gguf_extra_tensor_names,
     get_quant_config,
@@ -3956,6 +3957,12 @@ class RunaiModelStreamerLoader(BaseModelLoader):
 
     Note: Metadata files must be pre-downloaded via
     ObjectStorageModel.download_and_get_path() before instantiation.
+
+    Models can expose is_unused_checkpoint_weight to skip complete unused shards.
+    Local selection reads headers; remote selection uses the cached checkpoint
+    index. Mixed shards are still read in full, and models without a rule keep
+    the existing file list. Tensor mapping and loading remain model-owned.
+    Distributed ranks share the union of required files before streaming.
     """
 
     @dataclasses.dataclass
@@ -3977,6 +3984,9 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        is_unused_weight: Optional[Callable[[str], bool]] = None
+        """Model-owned rule over original checkpoint names, before remapping."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
             model_weights = model_config.model_path
@@ -3988,6 +3998,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 prefix="",
                 fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
                 model_config=model_config,
+                is_unused_weight=getattr(model, "is_unused_checkpoint_weight", None),
             )
 
     def __init__(self, load_config: LoadConfig):
@@ -4081,6 +4092,32 @@ class RunaiModelStreamerLoader(BaseModelLoader):
 
         return hf_folder, hf_weights_files
 
+    def _select_safetensors_files(
+        self, source: Source, root: str, files: List[str]
+    ) -> List[str]:
+        from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
+
+        if (
+            source.is_unused_weight is None
+            or source.prefix
+            or self.load_config.draft_model_idx is not None
+        ):
+            return files
+        if not is_runai_obj_uri(root):
+            return filter_safetensors_files_by_weight_name(
+                files, source.is_unused_weight
+            )
+        try:
+            with open(
+                os.path.join(ObjectStorageModel.get_path(root), SAFE_WEIGHTS_INDEX_NAME)
+            ) as index:
+                weight_map = json.load(index)["weight_map"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return files
+        return filter_safetensors_files_by_weight_map(
+            files, root, weight_map, source.is_unused_weight
+        )
+
     def _get_weights_iterator(
         self, source: Source
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
@@ -4101,8 +4138,24 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 source.model_config.hf_config,
             )
 
+        selected_files = self._select_safetensors_files(
+            source, hf_folder, hf_weights_files
+        )
+        if self._is_distributed and torch.distributed.is_initialized():
+            # RunAI distributes across node-local or WORLD groups, not only TP.
+            # Missing optional metadata on one rank must not change file IDs.
+            selections = get_parallel().world_group.all_gather_object(
+                (hf_weights_files, selected_files)
+            )
+            if all(files == hf_weights_files for files, _ in selections):
+                needed = {path for _, selected in selections for path in selected}
+                selected_files = [path for path in hf_weights_files if path in needed]
+            else:
+                # Preserve pre-existing node-local paths instead of substituting
+                # files from a different source or host.
+                selected_files = hf_weights_files
         weights_iterator = runai_safetensors_weights_iterator(
-            hf_weights_files, self._is_distributed, self.target_device_str
+            selected_files, self._is_distributed, self.target_device_str
         )
 
         if self.load_config.draft_model_idx is not None:

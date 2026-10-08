@@ -37,6 +37,31 @@ def _touch(folder, name):
 
 
 class TestFilterSafetensorsFilesByWeightName(CustomTestCase):
+    def test_remote_ambiguous_or_empty_map_keeps_files(self):
+        files = [
+            "s3://bucket/model/main.safetensors",
+            "s3://bucket/model/draft.safetensors",
+        ]
+        for weight_map in (
+            None,
+            {},
+            [],
+            {"draft.weight": None},
+            {"main.weight": "main.safetensors", "draft.weight": "../draft.safetensors"},
+            {"main.weight": "main.safetensors", "draft.weight": "/draft.safetensors"},
+            {"main.weight": "main.safetensors", "draft.weight": "./draft.safetensors"},
+        ):
+            with self.subTest(weight_map=weight_map):
+                self.assertEqual(
+                    weight_utils.filter_safetensors_files_by_weight_map(
+                        files,
+                        "s3://bucket/model",
+                        weight_map,
+                        lambda name: not name.startswith("draft."),
+                    ),
+                    files,
+                )
+
     def test_keeps_mixed_shards_and_preserves_order_and_values(self):
         with tempfile.TemporaryDirectory() as folder:
             files = []
