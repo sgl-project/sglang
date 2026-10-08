@@ -109,8 +109,8 @@ class Qwen2MLP(nn.Module):
         if get_exec().deterministic.rl_on_policy_target is not None:
             x = x.bfloat16()
 
-        if self.dual_gemm.can_run(x):
-            x = self.dual_gemm(x)
+        if self.dual_gemm.can_run(x, self.gate_up_proj):
+            x = self.dual_gemm(x, self.gate_up_proj)
         else:
             gate_up, _ = self.gate_up_proj(x)
             x = self.act_fn(gate_up)

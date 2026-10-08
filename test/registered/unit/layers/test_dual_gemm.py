@@ -97,19 +97,61 @@ class TestDualGemm(CustomTestCase):
         mlp, _ = _make_llama_mlp()
         self.assertFalse(
             mlp.dual_gemm.can_run(
-                torch.empty((0, _HIDDEN_SIZE), device="cuda", dtype=torch.bfloat16)
+                torch.empty((0, _HIDDEN_SIZE), device="cuda", dtype=torch.bfloat16),
+                mlp.gate_up_proj,
             )
         )
         self.assertTrue(
             mlp.dual_gemm.can_run(
-                torch.empty((16, _HIDDEN_SIZE), device="cuda", dtype=torch.bfloat16)
+                torch.empty((16, _HIDDEN_SIZE), device="cuda", dtype=torch.bfloat16),
+                mlp.gate_up_proj,
             )
         )
         self.assertFalse(
             mlp.dual_gemm.can_run(
-                torch.empty((17, _HIDDEN_SIZE), device="cuda", dtype=torch.bfloat16)
+                torch.empty((17, _HIDDEN_SIZE), device="cuda", dtype=torch.bfloat16),
+                mlp.gate_up_proj,
             )
         )
+
+    def test_gate_up_lora_wrapper_falls_back(self):
+        """Replacing gate/up with a LoRA wrapper must bypass the fused kernel."""
+
+        class GateUpWrapper(torch.nn.Module):
+            def __init__(self, base_layer):
+                super().__init__()
+                self.base_layer = base_layer
+                self.called = False
+
+            def forward(self, x):
+                self.called = True
+                return self.base_layer(x)
+
+        mlp, generator = _make_llama_mlp()
+        x = torch.randn(
+            (16, _HIDDEN_SIZE),
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        with (
+            torch.inference_mode(),
+            get_parallel().override(tp_group=object()),
+            patch(
+                "sglang.kernels.ops.gemm.dual_gemm_swiglu",
+                side_effect=AssertionError("LoRA wrapper used the fused gate/up path"),
+            ),
+        ):
+            gate_up, _ = mlp.gate_up_proj(x)
+            expected, _ = mlp.down_proj(mlp.act_fn(gate_up))
+
+            wrapper = GateUpWrapper(mlp.gate_up_proj)
+            mlp.gate_up_proj = wrapper
+            self.assertFalse(mlp.dual_gemm.can_run(x, mlp.gate_up_proj))
+            actual = mlp(x)
+
+        self.assertTrue(wrapper.called)
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2.5e-1)
 
     def test_float16_integration(self):
         for dtype in (torch.bfloat16, torch.float16):
