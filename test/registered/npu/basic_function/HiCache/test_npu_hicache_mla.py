@@ -13,7 +13,11 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_npu_ci(est_time=400, suite="base-b-test-4-npu-a3")
+register_npu_ci(
+    est_time=400,
+    suite="base-b-test-4-npu-a3",
+    disabled="model is no longer tracked",
+)
 register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
 TEST_MODEL_MATRIX = {

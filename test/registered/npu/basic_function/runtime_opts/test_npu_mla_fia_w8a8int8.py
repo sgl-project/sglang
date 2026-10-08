@@ -14,7 +14,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="base-b-test-2-npu-a3")
+register_npu_ci(
+    est_time=400,
+    suite="base-b-test-2-npu-a3",
+    disabled="model is no longer tracked",
+)
 register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
 
 TEST_MODEL_MATRIX = {
