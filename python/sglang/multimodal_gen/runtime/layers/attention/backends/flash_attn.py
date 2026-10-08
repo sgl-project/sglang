@@ -322,12 +322,6 @@ class FlashAttentionMetadata:
 
 
 class FlashAttentionMetadataBuilder(AttentionMetadataBuilder):
-    def __init__(self) -> None:
-        pass
-
-    def prepare(self) -> None:
-        pass
-
     def build(  # type: ignore
         self,
         raw_latent_shape=list,

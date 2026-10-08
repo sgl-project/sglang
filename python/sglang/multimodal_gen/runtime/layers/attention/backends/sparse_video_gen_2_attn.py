@@ -107,12 +107,6 @@ class SparseVideoGen2AttentionMetadata(AttentionMetadata):
 
 
 class SparseVideoGen2AttentionMetadataBuilder(AttentionMetadataBuilder):
-    def __init__(self) -> None:
-        pass
-
-    def prepare(self) -> None:
-        pass
-
     def build(  # type: ignore[override]
         self,
         current_timestep: int,
