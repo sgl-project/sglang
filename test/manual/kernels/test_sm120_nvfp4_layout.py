@@ -28,6 +28,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner_components.nvfp4_layout import (
     prepare_nvfp4_layout,
 )
+from sglang.srt.model_executor.model_runner_components.weight_exporter import (
+    WeightExporter,
+)
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     _unsupported_derived_weight_cache_error,
 )
@@ -229,6 +232,32 @@ class TestNvfp4LayoutCycle(CustomTestCase):
                 "SGLANG_SM120_NVFP4_PHASE_LAYOUT",
                 _unsupported_derived_weight_cache_error(),
             )
+
+
+class TestNvfp4LayoutExports(CustomTestCase):
+    def test_reject_before_any_weight_access_or_external_write(self):
+        with envs.SGLANG_SM120_NVFP4_PHASE_LAYOUT.override(True):
+            exporter = WeightExporter(
+                tp_rank=0,
+                tp_size=1,
+                gpu_id=0,
+                get_model_path=lambda: self.fail("guard must run before model access"),
+                get_model=lambda: self.fail("guard must run before model access"),
+            )
+            operations = [
+                lambda: exporter.init_weights_send_group_for_remote_instance(
+                    None, None, None, None, None
+                ),
+                lambda: exporter.send_weights_to_remote_instance(None, None, None),
+                lambda: exporter.save_remote_model(None),
+                lambda: exporter.save_sharded_model(None),
+                lambda: exporter.get_weights_by_name("w2_weight"),
+            ]
+            for operation in operations:
+                with self.assertRaisesRegex(
+                    RuntimeError, "Weight export is not supported"
+                ):
+                    operation()
 
 
 if __name__ == "__main__":
