@@ -147,7 +147,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 )
             return param_value
         elif param_type in ["boolean", "bool", "binary"]:
-            param_value = param_value.lower()
+            param_value = param_value.strip().lower()
             if param_value not in ["true", "false"]:
                 logger.warning(
                     f"Parsed value '{param_value}' of parameter '{param_name}' is not a boolean (`true` of `false`) in tool '{func_name}', degenerating to false."
