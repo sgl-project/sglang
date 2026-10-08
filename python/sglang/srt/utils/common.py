@@ -4256,12 +4256,12 @@ def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optiona
         hf.constants.REPO_ID_SEPARATOR.join(["models", *repo_id.split("/")]),
     )
 
-    # Get revision from main ref if not specified
-    if not revision:
-        ref_path = os.path.join(cache_path, "refs", "main")
-        if os.path.isfile(ref_path):
-            with open(ref_path) as f:
-                revision = f.read().strip()
+    # A branch or tag name (default "main") maps to a commit through refs/;
+    # snapshots/ is keyed by commit only.
+    ref_path = os.path.join(cache_path, "refs", revision or "main")
+    if os.path.isfile(ref_path):
+        with open(ref_path) as f:
+            revision = f.read().strip()
 
     # List files from revision directory
     if revision:
