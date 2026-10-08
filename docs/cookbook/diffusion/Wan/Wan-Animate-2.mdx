@@ -98,6 +98,11 @@ denoised. The padding and conditioning of every retained clip are unchanged.
 Text encoding uses the native `TextEncodingStage` and its conditioning cache and
 residency management. CFG-parallel dispatch shares the native CFG utilities while
 retaining the single-GPU arithmetic order.
+Text and image conditioning projections are reused within each clip and CFG
+branch, rather than recomputed at every timestep. These projected tensors are
+released after the clip and never reused across requests. Decoded output is
+copied to CPU and clip-local intermediates are released; only the decoded
+overlap frames needed by the next clip remain on the GPU.
 
 Measured on one H200, with a 576×1024 budget, 8 steps, CFG 3, seed 42,
 `clip_len=37`, text-encoder CPU offload, and MP4 plus raw-frame output, the initial
