@@ -15,10 +15,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 from functools import partial
 from typing import Callable, Optional, Tuple
 
-import msgspec
 import torch
 
 from sglang.srt.distributed import GroupCoordinator
@@ -388,7 +388,11 @@ def _batch_allows_deferred_sum(forward_batch: ForwardBatch, boundary=None) -> bo
     return residual is not None and aiter_ar_fusion_applies(residual, forward_batch)
 
 
-class ExitDecision(msgspec.Struct, frozen=True):
+# ExitDecision is created inside the traced forward region, so it is a plain
+# dataclass: torch.compile cannot construct msgspec structs (dynamo's example
+# value goes through object.__new__, which msgspec's C-level tp_new rejects).
+@dataclasses.dataclass(frozen=True)
+class ExitDecision:
     """One decision for an FFN output, made before compute runs.
 
     Fields:
