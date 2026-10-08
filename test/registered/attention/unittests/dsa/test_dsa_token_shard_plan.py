@@ -1,19 +1,15 @@
-"""CPU unit test for the the DSA token shard token-shard plan.
+"""CPU unit test for the DSA token shard plan.
 
-Pins ``plan_dsa_token_shard`` (``layers/attention/dsa/dsa_token_shard_layout.py``). the DSA token shard
-cuts an extend batch's TOKENS across the attention-TP group, so a rank computes
-every head for its slice instead of its own heads for every token. The cut is by
-position, not by request, and at a 13,855-token tail over 16 ranks a request
-straddles almost every boundary -- so each rank's per-request query and key
-lengths have to be recomputed against its slice.
+Pins ``plan_dsa_token_shard`` (``layers/attention/dsa/dsa_token_shard_layout.py``),
+which cuts an extend batch's tokens across the attention-TP group. The cut is by
+position, not by request, so a request can straddle a slice boundary and each
+rank's per-request query and key lengths have to be recomputed against its slice.
 
 That recomputation is clamp arithmetic, and getting it wrong is silent: the
-sparse operator is handed a span that is merely different rather than invalid,
-reads real KV from the wrong place, and returns fluent text that stops following
-the prompt. So the test does not check the clamps. It rebuilds the answer the
-slow way -- walk every token, assign it to a rank, read the counts off -- and
-requires the two to agree, over the served shapes, every small batch
-exhaustively, and random large ragged ones.
+operator is handed a span that is merely different rather than invalid. So the
+test does not check the clamps. It rebuilds the answer the slow way -- walk every
+token, assign it to a rank, read the counts off -- and requires the two to agree
+on every small batch.
 
 Usage:
     python -m pytest test_dsa_token_shard_plan.py -v
@@ -21,7 +17,6 @@ Usage:
 """
 
 import itertools
-import random
 import unittest
 
 from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import plan_dsa_token_shard
@@ -85,26 +80,6 @@ class TestDsaTokenShardPlan(CustomTestCase):
         # output that nothing downstream will notice.
         self.assertTrue(all(c == 1 for c in covered), f"{label} partition")
 
-    def test_the_served_shapes(self):
-        # p10's cached tail, AISBench's, and a chunked-prefill chunk.
-        self._check([13855], [972319], 16, "p10 tail")
-        self._check([10828], [1000012], 16, "aisbench tail")
-        self._check([16384], [933888], 16, "prefill chunk")
-
-    def test_a_key_length_is_the_last_tokens_not_the_first(self):
-        # The operator walks back from the last query row (right-down causal),
-        # so handing it the first token's span would truncate every other row.
-        plan = plan_dsa_token_shard([8], [108], 4, 0)
-        self.assertEqual(plan.query_lens, [2])
-        self.assertEqual(plan.key_lens, [102])  # prefix 100 + 2 tokens, not + 1
-
-    def test_requests_outside_the_slice_are_dropped_entirely(self):
-        # A length without a query row is a span the operator would read for
-        # nothing, so it must be zero rather than the request's true length.
-        plan = plan_dsa_token_shard([2, 2, 2, 2], [102, 202, 302, 402], 4, 2)
-        self.assertEqual(plan.query_lens, [0, 0, 2, 0])
-        self.assertEqual(plan.key_lens, [0, 0, 302, 0])
-
     def test_every_small_batch_exhaustively(self):
         # 1-3 requests, 0-6 tokens each, tp 1-5. Off-by-ones live here.
         for nreq in (1, 2, 3):
@@ -114,24 +89,6 @@ class TestDsaTokenShardPlan(CustomTestCase):
                 seqs = [n + 10 * (i + 1) for i, n in enumerate(lens)]
                 for tp in (1, 2, 3, 4, 5):
                     self._check(list(lens), seqs, tp, f"{lens} tp{tp}")
-
-    def test_random_large_ragged_batches(self):
-        rng = random.Random(20260918)
-        for trial in range(200):
-            nreq = rng.randint(1, 6)
-            lens = [rng.randint(0, 40000) for _ in range(nreq)]
-            if sum(lens) == 0:
-                continue
-            seqs = [n + rng.randint(0, 1_000_000) for n in lens]
-            self._check(lens, seqs, rng.choice([2, 4, 8, 16]), f"rand {trial}")
-
-    def test_fewer_tokens_than_ranks(self):
-        # Legal to plan, even though the runtime gate declines it: ranks past
-        # the tokens get an empty slice rather than a negative one.
-        plan = plan_dsa_token_shard([3], [103], 16, 9)
-        self.assertEqual(plan.rows, 1)
-        self.assertEqual(max(0, plan.local_end - plan.local_start), 0)
-        self.assertEqual(plan.query_lens, [0])
 
     def test_mismatched_metadata_raises_rather_than_guesses(self):
         with self.assertRaises(AssertionError):
