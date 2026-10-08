@@ -157,6 +157,7 @@ def _generate_minimax_h3(
             audio=result.audio,
             audio_sample_rate=result.audio_sample_rate,
             output_compression=request.output_compression,
+            x264_preset=request.x264_preset,
         )
         sampling_params.validate_video_final_outputs(output_paths, request)
         return output_paths[0]

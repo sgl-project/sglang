@@ -43,42 +43,45 @@ class UnreducedOutput(msgspec.Struct, frozen=True):
     Fields:
         partial: Tensor containing this rank's contribution to the sum.
         group: All-reduce group when no redistribution callable is supplied.
-        reduce_and_redistribute: Callable(partial) completing the sum and moving
+        reduce_to_dp_local: Callable(partial) completing the sum and moving
             it to destination rows; takes precedence over group.
 
-    Exits hand this form to ResidualStream.leave(), which exposes an opaque
-    OwedOutput to models. Low-level adapters use reduce_output() before reading
-    it. A group is required when reduce_and_redistribute is absent.
+    Exits hand this form to ResidualStream.record(), which keeps it as the
+    contribution's owed work and exposes an opaque OwedOutput to models.
+    Low-level adapters use complete_owed() before reading it. A group is
+    required when reduce_to_dp_local is absent.
     """
 
     partial: torch.Tensor
     group: Optional[GroupCoordinator] = None
     # Under attention DP: the reduction that also brings ``partial`` back to this
     # rank's tokens (a reduce-scatter, or an all-reduce then a scatter).
-    reduce_and_redistribute: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    reduce_to_dp_local: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+
+    def complete(self) -> torch.Tensor:
+        """Complete the sum, on the destination rows when it moves them."""
+        if self.reduce_to_dp_local is not None:
+            return self.reduce_to_dp_local(self.partial)
+        return self.group.all_reduce(self.partial)
 
 
-class HandoffOutput(msgspec.Struct, frozen=True):
+class DeferredFinalize(msgspec.Struct, frozen=True):
     """A layer output that still owes work only its producer knows how to do (a
     MoE's finalize and sum), left for the next layer's input or for a terminal
-    norm that accepts it (residual_batch.norm(handoff_norm=...)). A fused kernel
+    norm that accepts it (residual_batch.final_norm(finalize_norm=...)). A fused kernel
     there may do that work together with its own; anything else passes it
-    through reduce_output(), which calls ``complete()``."""
+    through complete_owed(), which calls ``complete()``."""
 
     def complete(self) -> torch.Tensor:
         """Do the owed work, unfused, and return the complete output."""
         raise NotImplementedError
 
 
-def reduce_output(
-    hidden_states: Union[torch.Tensor, UnreducedOutput, HandoffOutput, None],
+def complete_owed(
+    hidden_states: Union[torch.Tensor, UnreducedOutput, DeferredFinalize, None],
 ) -> Optional[torch.Tensor]:
-    """Run the work an UnreducedOutput or a HandoffOutput still owes; pass
+    """Run the work an UnreducedOutput or a DeferredFinalize still owes; pass
     anything else through."""
-    if isinstance(hidden_states, UnreducedOutput):
-        if hidden_states.reduce_and_redistribute is not None:
-            return hidden_states.reduce_and_redistribute(hidden_states.partial)
-        return hidden_states.group.all_reduce(hidden_states.partial)
-    if isinstance(hidden_states, HandoffOutput):
+    if isinstance(hidden_states, (UnreducedOutput, DeferredFinalize)):
         return hidden_states.complete()
     return hidden_states

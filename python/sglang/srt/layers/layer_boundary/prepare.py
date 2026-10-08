@@ -24,6 +24,9 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.layers.cp.interleave import (
+    attn_cp_interleave_gather,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     dp_scatter,
@@ -32,25 +35,22 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layer_boundary.adapters.attention import (
     AttentionInputs,
-    _redistribute_from_attn_tp_shards,
-    _redistribute_to_attn_tp_shards,
+    attn_tp_gather,
+    attn_tp_slice,
     get_attn_tp_context,
-)
-from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
-    dsa_cp_gather_hidden_states,
+    tp_gather,
 )
 from sglang.srt.layers.layer_boundary.layout import (
     SumGroup,
     _cp_shard_token_rows,
-    moe_cp_gathered_rows,
 )
 from sglang.srt.layers.layer_boundary.output import (
-    HandoffOutput,
+    DeferredFinalize,
     UnreducedOutput,
-    reduce_output,
+    complete_owed,
 )
-from sglang.srt.layers.layer_boundary.residual import StageRead, StageUpdate
-from sglang.srt.layers.layer_boundary.residual.add_norm import ADD, NORM_READ
+from sglang.srt.layers.layer_boundary.residual import ResidualReadout, ResidualUpdate
+from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_READOUT, PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel
@@ -65,68 +65,77 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 
 from sglang.srt.layers.layer_boundary.ops import (
-    _mlp_input_reduce_output,
-    _redistribute_input_to_dp,
-    _redistribute_input_to_moe_cp,
-    _reduce_and_redistribute_output_to_attn_tp_shards,
-    _reduce_and_redistribute_output_to_dp,
-    _tp_all_gather_scattered_rows,
+    attn_tp_all_reduce,
+    attn_tp_reduce_scatter,
+    dp_gather,
+    dp_gather_sum,
+    moe_cp_gather,
 )
 
 
-def _mlp_input_without_dp(
+def _reduce_update_read(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
-    layernorm: torch.nn.Module,
+    norm: torch.nn.Module,
     *,
     cache=None,
     gathers_residual: bool,
     fusions: Tuple[Callable, ...],
     group: SumGroup = SumGroup.ATTN_TP,
-    read: StageRead = NORM_READ,
-    update: StageUpdate = ADD,
+    read: ResidualReadout = NORM_READOUT,
+    update: ResidualUpdate = PLAIN_ADD,
+    quant_format: str = "",
+    post_residual_addition: Optional[torch.Tensor] = None,
 ):
     """Complete the sum the input owes over ``group`` on the rows it is on,
     unless one of ``fusions`` does it with the residual add and the norm, then
-    write it into the residual and read the input."""
+    write it into the residual and read the input (an attention's read takes
+    ``quant_format`` and ``post_residual_addition``)."""
     if gathers_residual:
-        residual = update.residual_from_attn_tp_shards(residual)
+        residual = update.gather_residual_attn_tp(residual)
     for fused in fusions:
         result = fused(hidden_states, residual, forward_batch)
         if result is not None:
             return result
     if group is SumGroup.ATTN_TP:
         # MHC sums its streams in full precision.
-        hidden_states = _mlp_input_reduce_output(
-            hidden_states, forward_batch, may_quantize=update.adds_plainly
+        hidden_states = attn_tp_all_reduce(
+            hidden_states, forward_batch, may_quantize=update.is_plain_add
         )
     elif group is SumGroup.TP:
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
     if _is_npu and cache is not None:
         _ = prepare_weight_cache(hidden_states, cache)
-    return read.update_and_read(update, hidden_states, residual, layernorm)
+    return read.update_and_read(
+        update,
+        hidden_states,
+        residual,
+        norm,
+        quant_format=quant_format,
+        post_residual_addition=post_residual_addition,
+    )
 
 
-def _mlp_input_dp_replicate(
+def _reduce_update_read_dp_gather(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
-    layernorm: torch.nn.Module,
+    norm: torch.nn.Module,
     *,
     cache=None,
     gathers_residual: bool,
     reduces_attention_tp: bool,
     places_cp_shards: bool = False,
-    read: StageRead = NORM_READ,
-    update: StageUpdate = ADD,
+    read: ResidualReadout = NORM_READOUT,
+    update: ResidualUpdate = PLAIN_ADD,
 ):
     """Attention DP: complete the attention-TP sum if it is owed, write the
     output into the residual and read the FFN input locally, then gather. With
     ``places_cp_shards`` each CP rank puts its shard of the DP group's tokens
     beside the others' in the group's slot."""
     if gathers_residual:
-        residual = update.residual_from_attn_tp_shards(residual)
+        residual = update.gather_residual_attn_tp(residual)
     if hidden_states.shape[0] != 0:
         if reduces_attention_tp:
             hidden_states = attention_tensor_model_parallel_all_reduce(hidden_states)
@@ -135,48 +144,46 @@ def _mlp_input_dp_replicate(
             disabled=not is_allocation_symmetric(),
         ):
             hidden_states, residual = read.update_and_read(
-                update, hidden_states, residual, layernorm
+                update, hidden_states, residual, norm
             )
     else:
         hidden_states, residual = read.update_and_read(
-            update, hidden_states, residual, layernorm
+            update, hidden_states, residual, norm
         )
     cp_shard_counts = _cp_shard_token_rows(forward_batch) if places_cp_shards else None
     return (
-        _redistribute_input_to_dp(hidden_states, forward_batch, cp_shard_counts),
+        dp_gather(hidden_states, forward_batch, cp_shard_counts),
         residual,
     )
 
 
-def _mlp_input_dp_partial(
+def _dp_gather_sum_read(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
-    layernorm: torch.nn.Module,
+    norm: torch.nn.Module,
     *,
     cache=None,
     gathers_residual: bool,
     places_cp_shards: bool = False,
-    read: StageRead = NORM_READ,
-    update: StageUpdate = ADD,
+    read: ResidualReadout = NORM_READOUT,
+    update: ResidualUpdate = PLAIN_ADD,
 ):
     """Attention DP: one rank adds the residual, the gather sums it, then read
     the input from the sum. With ``places_cp_shards`` each CP rank puts its
     shard of the DP group's tokens beside the others' in the group's slot."""
     if gathers_residual:
-        residual = _redistribute_from_attn_tp_shards(residual)
+        residual = attn_tp_gather(residual)
     if get_parallel().attn_tp_rank == 0:
         hidden_states += residual
     cp_shard_counts = _cp_shard_token_rows(forward_batch) if places_cp_shards else None
-    hidden_states = _reduce_and_redistribute_output_to_dp(
-        hidden_states, forward_batch, cp_shard_counts
-    )
+    hidden_states = dp_gather_sum(hidden_states, forward_batch, cp_shard_counts)
     dp_scatter(residual, hidden_states, forward_batch, cp_shard_counts)
-    hidden_states, _ = read.read(hidden_states, layernorm)
+    hidden_states, _ = read.read(hidden_states, norm)
     return hidden_states, residual
 
 
-def _hand_qkv_hook_its_input(
+def _attn_input_default(
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
     qkv_latent_func: Optional[Callable],
@@ -189,7 +196,7 @@ def _hand_qkv_hook_its_input(
     return hidden_states
 
 
-def _hand_scattered_input_to_attention(
+def _attn_input_scattered(
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
     qkv_latent_func: Optional[Callable],
@@ -200,7 +207,7 @@ def _hand_scattered_input_to_attention(
     told they are."""
     ctx = get_attn_tp_context()
     if ctx.is_dsa or qkv_latent_func is None:
-        hidden_states = _tp_all_gather_scattered_rows(hidden_states, forward_batch)
+        hidden_states = tp_gather(hidden_states, forward_batch)
     if qkv_latent_func is not None:
         ctx.set_attn_inputs(
             AttentionInputs(
@@ -213,36 +220,36 @@ def _hand_scattered_input_to_attention(
     return hidden_states
 
 
-def _dispatch_consumer(
-    hidden_states, residual, forward_batch, norm, *, paths, update=ADD, **call
+def _dispatch_by_update(
+    hidden_states, residual, forward_batch, norm, *, paths, update=PLAIN_ADD, **call
 ):
     if residual is None:
         # A missing residual cannot join a partial sum. The non-plain path
-        # performs enter/read without that optimization.
+        # performs init_residual/read without that optimization.
         prepare = paths[False]
     else:
         try:
-            prepare = paths[update.adds_plainly]
+            prepare = paths[update.is_plain_add]
         except KeyError:
             raise RuntimeError("producer update has no bound input path") from None
     return prepare(hidden_states, residual, forward_batch, norm, update=update, **call)
 
 
-def _consumer_step(
-    hidden_states: Union[torch.Tensor, UnreducedOutput, HandoffOutput],
+def _run_entry(
+    hidden_states: Union[torch.Tensor, UnreducedOutput, DeferredFinalize],
     residual: Optional[torch.Tensor],
     forward_batch: ForwardBatch,
     norm: torch.nn.Module,
     *,
     step: Callable,
-    adds_plainly: bool,
+    is_plain_add: bool,
     carried_fusions: Tuple[Callable, ...],
     expected_sum: Optional[SumGroup] = None,
     completed_step: Optional[Callable] = None,
     pending=None,
     written_step: Optional[Callable] = None,
     written: bool = False,
-    update: StageUpdate = ADD,
+    update: ResidualUpdate = PLAIN_ADD,
     **call,
 ):
     """A boundary's half into a stage: complete what the value carries, a sum
@@ -253,7 +260,7 @@ def _consumer_step(
     whose declared sum is already completed uses ``completed_step`` instead;
     a pending declared sum must match ``expected_sum``. ``call`` is what the stage's read takes (the attention's
     ``quant_format`` and ``post_residual_addition``)."""
-    if residual is not None and update.adds_plainly != adds_plainly:
+    if residual is not None and update.is_plain_add != is_plain_add:
         raise RuntimeError("producer update does not match the boundary's capability")
     if pending is not None:
         if isinstance(pending.owed, DeclaredSum):
@@ -274,11 +281,8 @@ def _consumer_step(
                 f"an input that owes its sum by construction arrived as "
                 f"{type(owed).__name__}"
             )
-        if (
-            isinstance(owed, UnreducedOutput)
-            and owed.reduce_and_redistribute is not None
-        ):
-            hidden_states = reduce_output(owed)
+        if isinstance(owed, UnreducedOutput) and owed.reduce_to_dp_local is not None:
+            hidden_states = complete_owed(owed)
         else:
             for fused in carried_fusions:
                 result = fused(
@@ -286,36 +290,36 @@ def _consumer_step(
                 )
                 if result is not None:
                     return result
-            if isinstance(owed, HandoffOutput) or owed.partial.shape[0] != 0:
-                hidden_states = reduce_output(owed)
+            if isinstance(owed, DeferredFinalize) or owed.partial.shape[0] != 0:
+                hidden_states = complete_owed(owed)
             else:
                 hidden_states = owed.partial
     return step(hidden_states, residual, forward_batch, norm, update=update, **call)
 
 
-def _read_input(
+def _update_read(
     hidden_states: torch.Tensor,
     residual: Optional[torch.Tensor],
     forward_batch: ForwardBatch,
     norm: torch.nn.Module,
     *,
     cache=None,
-    layer_input: Optional[Callable],
+    pre_move: Optional[Callable],
     enters_stack: bool,
-    read: StageRead,
-    update: StageUpdate = ADD,
+    read: ResidualReadout,
+    update: ResidualUpdate = PLAIN_ADD,
     quant_format: str = "",
     post_residual_addition: Optional[torch.Tensor] = None,
 ):
-    """Complete what the input owes by construction (``layer_input``), then
+    """Complete what the input owes by construction (``pre_move``), then
     write the previous stage's output into the residual and read the stage's
     input with ``norm``. The layer stack's first stage (``enters_stack``)
     starts its residual from its input."""
     enters = residual is None and enters_stack
-    if layer_input is not None:
-        hidden_states, residual = layer_input(hidden_states, residual)
+    if pre_move is not None:
+        hidden_states, residual = pre_move(hidden_states, residual)
     if enters:
-        hidden_states, residual = read.enter(hidden_states), None
+        hidden_states, residual = read.init_residual(hidden_states), None
     if residual is None:
         # The previous layer already wrote its output into the residual.
         return read.read(hidden_states, norm, quant_format)
@@ -329,50 +333,50 @@ def _read_input(
     )
 
 
-def _mlp_input_scatter(
+def _attn_tp_reduce_scatter_update_read(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
-    layernorm: torch.nn.Module,
+    norm: torch.nn.Module,
     *,
     cache=None,
     scatters_residual: bool,
-    read: StageRead = NORM_READ,
-    update: StageUpdate = ADD,
+    read: ResidualReadout = NORM_READOUT,
+    update: ResidualUpdate = PLAIN_ADD,
 ):
-    hidden_states = _reduce_and_redistribute_output_to_attn_tp_shards(hidden_states)
+    hidden_states = attn_tp_reduce_scatter(hidden_states)
     if scatters_residual:
-        residual = update.residual_to_attn_tp_shard(residual)
-    return read.update_and_read(update, hidden_states, residual, layernorm)
+        residual = update.slice_residual_attn_tp(residual)
+    return read.update_and_read(update, hidden_states, residual, norm)
 
 
-def _mlp_input_slice(
+def _attn_tp_slice_update_read(
     hidden_states: torch.Tensor,
     residual: Optional[torch.Tensor],
     forward_batch: ForwardBatch,
-    layernorm: torch.nn.Module,
+    norm: torch.nn.Module,
     *,
     cache=None,
     scatters_residual: bool,
-    read: StageRead = NORM_READ,
-    update: StageUpdate = ADD,
+    read: ResidualReadout = NORM_READOUT,
+    update: ResidualUpdate = PLAIN_ADD,
 ):
-    hidden_states = _redistribute_to_attn_tp_shards(hidden_states).clone()
+    hidden_states = attn_tp_slice(hidden_states).clone()
     if scatters_residual and residual is not None:
-        residual = update.residual_to_attn_tp_shard(residual)
-    return read.update_and_read(update, hidden_states, residual, layernorm)
+        residual = update.slice_residual_attn_tp(residual)
+    return read.update_and_read(update, hidden_states, residual, norm)
 
 
-def _mlp_input_on_residual_shard(
+def _tp_reduce_scatter_update_read_gather(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
-    layernorm: torch.nn.Module,
+    norm: torch.nn.Module,
     *,
     cache=None,
     reduces: bool = True,
-    read: StageRead,
-    update: StageUpdate,
+    read: ResidualReadout,
+    update: ResidualUpdate,
 ):
     """The residual stays on each rank's slice while the FFN takes the full
     rows: reduce-scatter the attention output onto the slice, which completes
@@ -386,84 +390,75 @@ def _mlp_input_on_residual_shard(
         parallel.tp_group.reduce_scatter_tensor(shard, hidden_states)
     else:
         shard = shard.clone()
-    shard, residual = read.update_and_read(update, shard, residual, layernorm)
+    shard, residual = read.update_and_read(update, shard, residual, norm)
     attn_tp_all_gather_into_tensor(hidden_states, shard)
     return hidden_states, residual
 
 
-def _mlp_input_residual_into_sum(
+def _tp_sum_with_residual_read(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
-    layernorm: torch.nn.Module,
+    norm: torch.nn.Module,
     *,
     cache=None,
-    read: StageRead = NORM_READ,
-    update: StageUpdate = ADD,
+    read: ResidualReadout = NORM_READOUT,
+    update: ResidualUpdate = PLAIN_ADD,
 ):
-    return _tp_all_reduce_with_scattered_residual(
-        hidden_states, residual, layernorm, read
-    )
+    return _tp_all_reduce_with_scattered_residual(hidden_states, residual, norm, read)
 
 
-def _mlp_input_gather_attention_cp(
+def _then_attn_cp_gather(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
-    layernorm: torch.nn.Module,
+    norm: torch.nn.Module,
     *,
     cache=None,
     gather: Callable,
-    update: StageUpdate = ADD,
+    update: ResidualUpdate = PLAIN_ADD,
 ):
     """DSA and MLA CP: complete this rank's shard, then gather the shards, of
     equal length, over the attention-CP group. The residual stays on the
     shard."""
     hidden_states, residual = gather(
-        hidden_states, residual, forward_batch, layernorm, update=update, cache=cache
+        hidden_states, residual, forward_batch, norm, update=update, cache=cache
     )
-    return dsa_cp_gather_hidden_states(hidden_states), residual
+    return attn_cp_interleave_gather(hidden_states), residual
 
 
-def _mlp_input_gather_moe_cp(
+def _then_moe_cp_gather(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
-    layernorm: torch.nn.Module,
+    norm: torch.nn.Module,
     *,
     cache=None,
     gather: Callable,
-    update: StageUpdate = ADD,
+    update: ResidualUpdate = PLAIN_ADD,
 ):
-    """Gather for the FFN, then over the MoE-CP group so each rank holds all
-    tokens of its MoE group (moe_dp_size < attn_cp_size). The residual stays on
-    this rank's attention rows."""
-    # Early return on empty tensor is safe for MOE_CP because:
-    # - During CP extend: zigzag split guarantees all CP ranks have non-zero tokens,
-    #   so no rank hits this path while others proceed to the allgather.
-    # - During decode: moe_cp allgather is skipped (guarded by is_context_parallel_extend).
-    # - CUDA graph warmup: not applicable when --cuda-graph-backend-prefill=disabled is used.
-    if hidden_states.shape[0] == 0:
-        return hidden_states, residual
+    """Read each shard, then gather the MoE group's tokens on its CP path.
 
+    StagePlan selects this path only for a CP extend with MoE-CP rows; zigzag
+    eligibility guarantees nonempty shards. Decode and non-CP batches use the
+    ordinary path. The residual stays on this rank's attention rows.
+    """
     hidden_states, residual = gather(
-        hidden_states, residual, forward_batch, layernorm, update=update, cache=cache
+        hidden_states, residual, forward_batch, norm, update=update, cache=cache
     )
-
-    rows = moe_cp_gathered_rows(forward_batch)
-    if rows is not None and hidden_states.shape[0] > 0:
-        hidden_states = _redistribute_input_to_moe_cp(
-            hidden_states, rows, get_moe_cp_size()
-        )
-
+    hidden_states = moe_cp_gather(
+        hidden_states,
+        forward_batch.attn_cp_metadata.per_rank_actual_token,
+        get_moe_cp_size(),
+    )
     return hidden_states, residual
 
 
 def _tp_all_reduce_with_scattered_residual(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
-    layernorm: torch.nn.Module,
-    read: StageRead = NORM_READ,
+    norm: torch.nn.Module,
+    read: ResidualReadout = NORM_READOUT,
 ):
     parallel = get_parallel()
     if hidden_states.shape[0] == 0:
@@ -472,4 +467,4 @@ def _tp_all_reduce_with_scattered_residual(
     scattered_states = hidden_states.tensor_split(parallel.tp_size)[parallel.tp_rank]
     scattered_states += residual
     residual = tensor_model_parallel_all_reduce(hidden_states)
-    return read.read(residual, layernorm)
+    return read.read(residual, norm)
