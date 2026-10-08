@@ -410,6 +410,30 @@ def moe_fused_gate(
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
 
+    from sglang.srt.environ import envs
+
+    if (
+        envs.SGLANG_SM120_MTP_ROUTER_TOP22.get()
+        and scoring_func.lower() == "sigmoid"
+        and num_fused_shared_experts == 0
+        and num_expert_group <= 1
+        and moe_softcapping == 0.0
+    ):
+        from sglang.kernels.ops.moe.sm120_topk_gate_small_m import (
+            covered,
+            topk_gate_small_m,
+        )
+
+        if covered(scores, bias, topk):
+            return topk_gate_small_m(
+                scores,
+                bias,
+                topk=topk,
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            )
+
     # K3 radix-select fast path: native-CUDA radix-select replaces the 16
     # dependent argmax rounds (single CTA per token; ids bit-identical to this
     # triton kernel incl. ties).

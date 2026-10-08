@@ -21,8 +21,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from torch import nn
-
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
@@ -69,6 +67,7 @@ from sglang.srt.utils.common import (
     is_pin_memory_available,
     use_intel_amx_backend,
 )
+from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -1032,8 +1031,12 @@ class LogitsProcessor(nn.Module):
                             hopper_bf16_gemv,
                             use_hopper_bf16_gemv,
                         )
+                        from sglang.kernels.ops.gemm.sm120_lossless_bf16_head import (
+                            try_lossless_bf16_head,
+                        )
 
-                        if use_hopper_bf16_gemv(
+                        logits = try_lossless_bf16_head(hidden_states, lm_head)
+                        if logits is None and use_hopper_bf16_gemv(
                             1, lm_head.weight.shape[0], lm_head.weight.shape[1]
                         ):
                             logits = hopper_bf16_gemv(hidden_states, lm_head.weight)

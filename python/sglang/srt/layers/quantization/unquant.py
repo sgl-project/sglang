@@ -452,6 +452,14 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if envs.SGLANG_SM120_LOSSLESS_BF16_HEAD.get():
+            from sglang.kernels.ops.gemm.sm120_lossless_bf16_head import (
+                prepare_lossless_bf16_head,
+            )
+
+            prepare_lossless_bf16_head(layer)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -492,6 +500,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+        if envs.SGLANG_SM120_LOSSLESS_BF16_HEAD.get():
+            from sglang.kernels.ops.gemm.sm120_lossless_bf16_head import (
+                prepare_lossless_bf16_head,
+            )
+
+            # ModelOpt also assigns this method to an excluded BF16 LM head.
+            prepare_lossless_bf16_head(layer)
 
     def apply(
         self,
