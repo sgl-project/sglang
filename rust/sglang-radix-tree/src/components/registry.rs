@@ -31,27 +31,27 @@ where
     }
 }
 
-/// One registered factory supports both concrete tree key representations.
-pub trait RegisteredTreeComponentFactory:
+/// A family of factories supporting both concrete tree key representations.
+pub trait TreeComponentFactoryFamily:
     TreeComponentFactory<Vec<i64>> + TreeComponentFactory<Vec<(i64, i64)>>
 {
 }
 
-impl<F> RegisteredTreeComponentFactory for F where
+impl<F> TreeComponentFactoryFamily for F where
     F: TreeComponentFactory<Vec<i64>> + TreeComponentFactory<Vec<(i64, i64)>>
 {
 }
 
 pub trait TreeComponentKey: ChildKeyType {
     fn create(
-        factory: &dyn RegisteredTreeComponentFactory,
+        factory: &dyn TreeComponentFactoryFamily,
         argument: &TreeComponentArgument<'_>,
     ) -> TreeComponentInstance<Self>;
 }
 
 impl TreeComponentKey for Vec<i64> {
     fn create(
-        factory: &dyn RegisteredTreeComponentFactory,
+        factory: &dyn TreeComponentFactoryFamily,
         argument: &TreeComponentArgument<'_>,
     ) -> TreeComponentInstance<Self> {
         TreeComponentFactory::<Self>::create(factory, argument)
@@ -60,7 +60,7 @@ impl TreeComponentKey for Vec<i64> {
 
 impl TreeComponentKey for Vec<(i64, i64)> {
     fn create(
-        factory: &dyn RegisteredTreeComponentFactory,
+        factory: &dyn TreeComponentFactoryFamily,
         argument: &TreeComponentArgument<'_>,
     ) -> TreeComponentInstance<Self> {
         TreeComponentFactory::<Self>::create(factory, argument)
@@ -87,14 +87,14 @@ pub enum TreeComponentRegistryError {
     },
 }
 
-type FactoryEntry = (ComponentType, Arc<dyn RegisteredTreeComponentFactory>);
+type FactoryEntry = (ComponentType, Arc<dyn TreeComponentFactoryFamily>);
 
 pub struct TreeComponentRegistry {
     factories: RwLock<HashMap<String, FactoryEntry>>,
 }
 
 pub struct TreeComponentFactorySnapshot {
-    factories: HashMap<ComponentType, Arc<dyn RegisteredTreeComponentFactory>>,
+    factories: HashMap<ComponentType, Arc<dyn TreeComponentFactoryFamily>>,
 }
 
 impl TreeComponentFactorySnapshot {
@@ -163,13 +163,13 @@ impl TreeComponentRegistry {
         &self,
         name: &str,
         component_type: ComponentType,
-        factory: impl RegisteredTreeComponentFactory + 'static,
+        factory: impl TreeComponentFactoryFamily + 'static,
         replace: bool,
     ) -> Result<(), TreeComponentRegistryError> {
         if name.trim().is_empty() {
             return Err(TreeComponentRegistryError::EmptyKey);
         }
-        let factory: Arc<dyn RegisteredTreeComponentFactory> = Arc::new(factory);
+        let factory: Arc<dyn TreeComponentFactoryFamily> = Arc::new(factory);
         let previous = {
             let mut factories = self.factories.write().unwrap();
             if let Some((registered_type, _)) = factories.get(name) {
@@ -246,7 +246,7 @@ fn tree_component_registry() -> &'static TreeComponentRegistry {
 pub fn register_tree_component(
     name: &str,
     component_type: ComponentType,
-    factory: impl RegisteredTreeComponentFactory + 'static,
+    factory: impl TreeComponentFactoryFamily + 'static,
     replace: bool,
 ) -> Result<(), TreeComponentRegistryError> {
     tree_component_registry().register_tree_component(name, component_type, factory, replace)
