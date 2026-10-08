@@ -3039,6 +3039,7 @@ fn insert_coalesces_parent_linked_block_stores() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
     // Events hash lazily even though the storage tier is off.
@@ -3076,6 +3077,7 @@ fn insert_attributes_stored_blocks_to_session_without_changing_hashes() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: Some(Arc::from("session-a")),
+            extra_key: None,
         }]
     );
 }
@@ -3151,6 +3153,7 @@ fn extra_key_nodes_publish_token_only_event_hashes() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 
@@ -3244,6 +3247,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: None,
         session_id: None,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 1);
     // A different block size must not join the parent-linked store tail.
@@ -3255,6 +3259,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: None,
         session_id: None,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 2);
     // Matching size and parent are still separated across media.
@@ -3266,6 +3271,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Cpu,
         cache_salt: None,
         session_id: None,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 3);
     // Matching size and medium are still separated without the parent link.
@@ -3277,6 +3283,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Cpu,
         cache_salt: None,
         session_id: None,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 4);
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
@@ -3320,6 +3327,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: Some(Arc::from("tenant-a")),
         session_id: None,
+        extra_key: None,
     });
     tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
         block_hashes: vec![2],
@@ -3329,6 +3337,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: Some(Arc::from("tenant-b")),
         session_id: None,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 2);
 }
@@ -3362,6 +3371,121 @@ fn eviction_emits_block_removed_with_all_page_hashes() {
             medium: StorageMedium::Gpu,
         }]
     );
+}
+
+fn dynamo_events_core(page_size: usize) -> UnifiedTreeCore<Vec<i64>> {
+    UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size,
+            enable_kv_cache_events: true,
+            dynamo_kv_event_format: true,
+            ..CacheInitParams::default()
+        },
+        vec![FULL],
+    )
+}
+
+fn evict_all_device(tc: &mut UnifiedTreeCore<Vec<i64>>) {
+    let mut tracker = HashMap::from([(FULL, 0)]);
+    let (mut device_frees, mut host_frees) = (HashMap::new(), HashMap::new());
+    tc.evict_device_start(FULL, 100);
+    loop {
+        let (node, step) = tc.evict_device_next_node(FULL, &tracker);
+        accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+        let Some(node) = node else { break };
+        let (_, step) = tc
+            .evict_device_leaf(node, /* is_write_back = */ false)
+            .expect("live test node");
+        accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+    }
+    tc.evict_device_end(FULL);
+}
+
+fn stored_block_hashes(events: &[KvCacheEvent<i64>]) -> Vec<Vec<i64>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            KvCacheEvent::BlockStored { block_hashes, .. } => Some(block_hashes.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn dynamo_format_separates_namespaces_that_share_block_hashes() {
+    // A router that keys blocks by hash uses these hashes to keep adapter
+    // blocks and base blocks apart. This is also necessary for removals.
+    let mut tc = dynamo_events_core(2);
+    let key = vec![1, 2, 7, 8];
+    tc.insert(&insert_params(&key, &[10, 11, 12, 13]));
+    tc.insert(&insert_params_in_namespace(
+        &key,
+        &[20, 21, 22, 23],
+        Some("lora-a"),
+        None,
+    ));
+    let stored = stored_block_hashes(&tc.take_events());
+    let [base, lora] = stored.as_slice() else {
+        panic!("expected one store per namespace, got {stored:?}");
+    };
+    assert_ne!(lora, base);
+
+    evict_all_device(&mut tc);
+    let mut removed: Vec<i64> = tc
+        .take_events()
+        .into_iter()
+        .flat_map(|event| match event {
+            KvCacheEvent::BlockRemoved { block_hashes, .. } => block_hashes,
+            other => panic!("unexpected event {other:?}"),
+        })
+        .collect();
+    let mut expected: Vec<i64> = base.iter().chain(lora).copied().collect();
+    removed.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(removed, expected);
+}
+
+#[test]
+fn namespaced_block_hash_is_pinned() {
+    // Python has its own copy of this function, and its test uses the same values.
+    // Thus the two copies must give the same hashes, and the hashes must not change.
+    let seed = kv_event_namespace_seed(&KeyNamespace::new(Some("lora-a"), None));
+    assert_eq!(
+        namespaced_block_hash(seed.as_ref(), 123),
+        9220659119954863560
+    );
+    assert_eq!(
+        namespaced_block_hash(seed.as_ref(), -5),
+        -1810974732006142875
+    );
+}
+
+#[test]
+fn dynamo_format_parent_link_survives_node_split() {
+    let mut tc = dynamo_events_core(2);
+    tc.insert(&insert_params_in_namespace(
+        &vec![1, 2, 7, 8],
+        &[10, 11, 12, 13],
+        Some("lora-a"),
+        None,
+    ));
+    let first = stored_block_hashes(&tc.take_events());
+    tc.insert(&insert_params_in_namespace(
+        &vec![1, 2, 9, 10],
+        &[10, 11, 14, 15],
+        Some("lora-a"),
+        None,
+    ));
+    let events = tc.take_events();
+    let [
+        KvCacheEvent::BlockStored {
+            parent_block_hash, ..
+        },
+    ] = events.as_slice()
+    else {
+        panic!("expected one store for the new branch, got {events:?}");
+    };
+    assert_eq!(*parent_block_hash, Some(first[0][0]));
 }
 
 #[test]
@@ -3402,6 +3526,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 }
@@ -3426,6 +3551,7 @@ fn finish_write_through_emits_cpu_stored_events() {
             medium: StorageMedium::Cpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 }
@@ -3482,6 +3608,7 @@ fn load_back_commit_emits_gpu_stored_events() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 }
@@ -3502,6 +3629,7 @@ fn unevict_on_insert_emits_a_gpu_stored_event() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 }
@@ -3591,6 +3719,7 @@ fn split_insert_stores_only_the_new_block_chained_to_the_split_parent() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
     // The split divided the page hashes between the two fragments.
@@ -3673,6 +3802,7 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
             medium: StorageMedium::Cpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
     // The matching ack cleared the pending mark on both fragments.
@@ -4004,6 +4134,7 @@ fn insert_host_publishes_a_host_store_event() {
             medium: StorageMedium::Cpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 }
