@@ -1274,22 +1274,6 @@ def get_parallel() -> ParallelContext:
     return _PARALLEL
 
 
-def get_linear_attn_tp_size() -> int:
-    """Linear attention keeps full TP when CP shares that communication group."""
-    parallel = get_parallel()
-    return parallel.tp_size if parallel.cp_tp_group_sharing else parallel.attn_tp_size
-
-
-def get_linear_attn_tp_rank() -> int:
-    parallel = get_parallel()
-    return parallel.tp_rank if parallel.cp_tp_group_sharing else parallel.attn_tp_rank
-
-
-def get_linear_attn_tp_group():
-    parallel = get_parallel()
-    return parallel.tp_group if parallel.cp_tp_group_sharing else parallel.attn_tp_group
-
-
 def get_server_args() -> ServerArgs:
     return _CONTEXT.server_args
 

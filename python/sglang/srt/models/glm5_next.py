@@ -397,10 +397,13 @@ class Glm5NextLinearAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        from sglang.srt.runtime_context import get_linear_attn_tp_size
+        from sglang.srt.runtime_context import (
+            linear_attn_parallel_group,
+            linear_attn_tp_size,
+        )
 
-        head_shard_size = get_linear_attn_tp_size()
-        head_parallel_group = "tp" if get_parallel().cp_tp_group_sharing else "attn_tp"
+        head_shard_size = linear_attn_tp_size()
+        head_parallel_group = linear_attn_parallel_group()
 
         self.hidden_size = hidden_size
         self.config = config
@@ -812,7 +815,7 @@ class Glm5NextDecoderLayer(nn.Module):
                     read=residual.attn_readout,
                     update=residual.attn_update,
                     tp_group=SumGroup.TP
-                    if self.is_linear_attn and get_parallel().cp_tp_group_sharing
+                    if self.is_linear_attn and get_parallel().enable_cp_tp_group_sharing
                     else SumGroup.ATTN_TP,
                 ),
                 self.input_layernorm,

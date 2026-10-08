@@ -370,7 +370,12 @@ class EagerRunner(BaseRunner):
                         forward_batch,
                         **kwargs,
                     )
-            elif cp_active:
+            elif cp_active and (
+                not get_parallel().enable_cp_tp_group_sharing
+                or getattr(model_runner.model, "prepare_cp_inputs", None) is not None
+            ):
+                # GLM delegates its CP boundary to this runner via prepare_cp_inputs.
+                # Other group-sharing models keep owning the layout in forward().
                 ret = self._execute_extend_cp(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(
