@@ -216,7 +216,7 @@ class TestGLM53FlashHiCacheKL(CustomTestCase):
         self.assertNotIn(common[0], [ids[0] for ids in pressure])
         return common, prompt, branch, bridge, continuation, pressure
 
-    def _score(self, prompt, bridge, continuation, *, cached=False, host=False):
+    def _score(self, prompt, bridge, continuation, *, cached=False, min_host_tokens=0):
         steps = []
         cache = []
         for i in range(OUTPUT_TOKENS):
@@ -234,11 +234,8 @@ class TestGLM53FlashHiCacheKL(CustomTestCase):
                 )
             else:
                 self.assertEqual(meta["cached_tokens"], 0)
-            if host and i == 0:
-                # Pressure must evict substantially all of A, not just one page.
-                self.assertGreaterEqual(
-                    details.get("host", 0), len(prompt) - GROUP_SIZE + 1
-                )
+            if min_host_tokens and i == 0:
+                self.assertGreaterEqual(details.get("host", 0), min_host_tokens)
             else:
                 self.assertEqual(details.get("host", 0), 0)
             cache.append({"cached_tokens": meta["cached_tokens"], "details": details})
@@ -325,7 +322,20 @@ class TestGLM53FlashHiCacheKL(CustomTestCase):
                                 self._generate(ids)
                         time.sleep(2)
                         name = "concurrent_host" if concurrent else "fork_host"
-                        record(name, cold, score(cached=True, host=True))
+                        # Concurrent B may leave the shared prefix on device.
+                        # Its sibling A must still restore its unique suffix;
+                        # the serial arm must restore almost the entire prompt.
+                        restore_length = (
+                            len(prompt) - len(common) if concurrent else len(prompt)
+                        )
+                        record(
+                            name,
+                            cold,
+                            score(
+                                cached=True,
+                                min_host_tokens=restore_length - GROUP_SIZE + 1,
+                            ),
+                        )
 
         self.assertEqual(
             set(kl_values),
