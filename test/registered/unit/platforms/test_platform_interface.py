@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang import _platform_stubs
-from sglang.srt.platforms import _load_platform_class, _resolve_platform
+from sglang.srt.platforms import _load_platform_class, _resolve_platform, interface
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.device_mixin import (
@@ -187,6 +187,17 @@ class TestSRTPlatform(CustomTestCase):
             )
         )
 
+    def test_mamba_cache_extra_buffer_capability(self):
+        self.assertFalse(SRTPlatform().support_mamba_cache_extra_buffer())
+
+        class OutOfTreePlatform(SRTPlatform):
+            _enum = PlatformEnum.OOT
+
+            def support_mamba_cache_extra_buffer(self) -> bool:
+                return True
+
+        self.assertTrue(OutOfTreePlatform().support_mamba_cache_extra_buffer())
+
 
 class TestCudaDeviceMixin(CustomTestCase):
     """Tests for CUDA device operation defaults."""
@@ -221,6 +232,12 @@ class TestCudaDeviceMixin(CustomTestCase):
         mock_torch_seed.assert_called_once_with(123)
         mock_cuda_seed.assert_called_once_with(123)
 
+    def test_cuda_srt_platform_capabilities(self):
+        base = CudaSRTPlatform()
+        self.assertTrue(base.capabilities.graph_capture)
+        self.assertTrue(base.capabilities.piecewise_graph)
+        self.assertTrue(base.capabilities.supports_triton)
+
 
 class TestXpuDeviceMixin(CustomTestCase):
     """Tests for XPU device operation defaults."""
@@ -248,6 +265,11 @@ class TestXpuDeviceMixin(CustomTestCase):
         mock_np_seed.assert_called_once_with(123)
         mock_torch_seed.assert_called_once_with(123)
         mock_xpu_seed.assert_called_once_with(123)
+
+    def test_xpu_srt_platform_capabilities(self):
+        base = XpuSRTPlatform()
+        self.assertTrue(base.capabilities.graph_capture)
+        self.assertTrue(base.capabilities.piecewise_graph)
 
 
 class TestNpuDeviceMixin(CustomTestCase):
@@ -317,6 +339,12 @@ class TestNpuDeviceMixin(CustomTestCase):
         mock_torch_seed.assert_not_called()
         mock_npu.manual_seed_all.assert_not_called()
 
+    def test_npu_srt_platform_capabilities(self):
+        base = NPUSRTPlatform()
+        self.assertTrue(base.capabilities.graph_capture)
+        self.assertFalse(base.capabilities.piecewise_graph)
+        self.assertTrue(base.capabilities.supports_triton)
+
 
 class TestCpuDeviceMixin(CustomTestCase):
     """Tests for CPU device operation defaults (covers both x86 and ARM)."""
@@ -372,6 +400,56 @@ class TestCpuDeviceMixin(CustomTestCase):
         base = CpuSRTPlatform()
         name = base.get_device_name()
         self.assertIn("x86_64", name)
+
+    def test_cpu_srt_platform_capabilities(self):
+        base = CpuSRTPlatform()
+        self.assertTrue(base.capabilities.graph_capture)
+        self.assertFalse(base.capabilities.piecewise_graph)
+        self.assertFalse(base.capabilities.supports_triton)
+        # CPU has no GPU to pin host memory to.
+        self.assertFalse(base.is_pin_memory_available())
+        self.assertFalse(base.is_pin_memory_available(device="cpu"))
+
+
+class TestLegacyKvPoolHookDeprecation(CustomTestCase):
+    """get_kv_pool_cls() still serves platforms on the removed class hooks.
+
+    get_{mha,mla,dsa}_kv_pool_cls were the out-of-tree contract before
+    get_kv_pool_cls replaced them. An OOT platform pinned to an older sglang
+    overrides them and nothing else, so dropping the hooks outright would
+    silently build the CUDA-assuming in-tree pool on its device.
+    """
+
+    def test_legacy_hook_is_used_and_warns_once_per_kind(self):
+        sentinel = type("VendorMHAPool", (), {})
+
+        class LegacyPlatform(SRTPlatform):
+            def get_mha_kv_pool_cls(self):
+                return sentinel
+
+        platform = LegacyPlatform()
+        with self.assertLogs("sglang.srt.platforms.interface", "WARNING") as logs:
+            self.assertIs(platform.get_kv_pool_cls(kind="mha"), sentinel)
+        self.assertIn("get_mha_kv_pool_cls", logs.output[0])
+
+        # The warning is per (class, hook); a hot path must not re-log it.
+        with patch.object(interface.logger, "warning") as mock_warning:
+            self.assertIs(platform.get_kv_pool_cls(kind="mha"), sentinel)
+        mock_warning.assert_not_called()
+
+    def test_kinds_without_a_legacy_hook_stay_none(self):
+        class LegacyPlatform(SRTPlatform):
+            def get_mha_kv_pool_cls(self):
+                return type("VendorMHAPool", (), {})
+
+        platform = LegacyPlatform()
+        self.assertIsNone(platform.get_kv_pool_cls(kind="mla"))
+        self.assertIsNone(platform.get_kv_pool_cls(kind="dsa"))
+
+    def test_platform_on_neither_api_gets_the_in_tree_pool(self):
+        base = SRTPlatform()
+        for kind in ("mha", "mla", "dsa"):
+            self.assertIsNone(base.get_kv_pool_cls(kind=kind))
 
 
 class TestMpsDeviceMixin(CustomTestCase):
