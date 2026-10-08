@@ -915,6 +915,29 @@ class TestAnthropicServing(unittest.TestCase):
                 chat_request = serving._convert_to_chat_completion_request(request)
                 self.assertEqual(chat_request.reasoning_effort, openai_effort)
 
+    def test_json_output_reaches_sampling_constraints(self):
+        schema = {
+            "type": "object",
+            "properties": {"answer": {"type": "integer", "enum": [42]}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        }
+        request = self._anthropic_request(
+            output_config={"format": {"type": "json_schema", "schema": schema}},
+        )
+        converted = self._serving()._convert_to_chat_completion_request(request)
+        self.assertEqual(
+            json.loads(converted.to_sampling_params([], {})["json_schema"]), schema
+        )
+
+    def test_invalid_json_output_format_is_rejected(self):
+        for output_format in ({"type": "text"}, {"type": "json_schema"}):
+            with (
+                self.subTest(output_format=output_format),
+                self.assertRaises(ValueError),
+            ):
+                self._anthropic_request(output_config={"format": output_format})
+
     def test_request_output_config_task_budget_is_logged_not_enforced(self):
         """``task_budget`` is a soft hint; ``max_tokens`` is the hard cap."""
         import logging

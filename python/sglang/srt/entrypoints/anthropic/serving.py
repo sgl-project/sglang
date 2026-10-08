@@ -47,6 +47,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionStreamResponse,
+    ResponseFormat,
     StreamOptions,
     Tool,
     ToolChoice,
@@ -629,6 +630,15 @@ class AnthropicServing:
         # is still the hard cap).
         if anthropic_request.output_config is not None:
             oc = anthropic_request.output_config
+            if oc.format is not None:
+                chat_request.response_format = ResponseFormat(
+                    type="json_schema",
+                    json_schema={
+                        "name": "response",
+                        "schema": oc.format.schema_,
+                        "strict": True,
+                    },
+                )
             if oc.effort is not None:
                 chat_request.reasoning_effort = (
                     "max" if oc.effort == "xhigh" else oc.effort

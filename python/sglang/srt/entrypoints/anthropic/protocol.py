@@ -329,6 +329,11 @@ class AnthropicTaskBudget(BaseModel):
     remaining: Optional[int] = Field(default=None, ge=0)
 
 
+class AnthropicJSONOutputFormat(BaseModel):
+    type: Literal["json_schema"]
+    schema_: dict[str, Any] = Field(alias="schema")
+
+
 class AnthropicOutputConfig(BaseModel):
     """Claude 4.7 ``output_config`` block.
 
@@ -339,6 +344,7 @@ class AnthropicOutputConfig(BaseModel):
 
     effort: Optional[Literal["minimal", "low", "medium", "high", "xhigh", "max"]] = None
     task_budget: Optional[AnthropicTaskBudget] = None
+    format: Optional[AnthropicJSONOutputFormat] = None
 
 
 class AnthropicCountTokensRequest(BaseModel):
