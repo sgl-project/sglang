@@ -28,6 +28,7 @@ def _make_backend():
         current_device=mock.Mock(return_value=3),
         synchronize=mock.Mock(),
         set_device=mock.Mock(),
+        Event=mock.Mock(),
     )
     runner = SimpleNamespace(
         device_module=device_module,
