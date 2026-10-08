@@ -78,7 +78,7 @@ SGL_DEVICE void wg_wait0() {
   asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
 }
 // d (+)= A B, m64n64k32 s8 -> s32, A from registers; scale_d = acc ? accumulate : overwrite
-SGL_DEVICE void wgmma_rs(int (&d)[32], const uint4& a, unsigned desc_lo, unsigned desc_hi, int acc) {
+SGL_DEVICE void wgmma_rs(int32_t (&d)[32], const uint4& a, uint32_t desc_lo, uint32_t desc_hi, int32_t acc) {
   asm volatile(
       "{\n.reg .pred p;\n.reg .b64 bd;\nsetp.ne.b32 p, %37, 0;\nmov.b64 bd, {%36, %38};\n"
       "wgmma.mma_async.sync.aligned.m64n64k32.s32.s8.s8 " DSPARK_MW_WG_D32 ", {%32, %33, %34, %35}, bd, p;\n}"
@@ -86,7 +86,7 @@ SGL_DEVICE void wgmma_rs(int (&d)[32], const uint4& a, unsigned desc_lo, unsigne
       : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(desc_lo), "r"(acc), "r"(desc_hi));
 }
 // no instruction: every later read of d stays below the wgmma wait (the compiler does not know d is written async)
-SGL_DEVICE void wg_fence_operand(int (&d)[32]) {
+SGL_DEVICE void wg_fence_operand(int32_t (&d)[32]) {
   asm volatile("" : DSPARK_MW_WG_D32_OUT(d)::"memory");
 }
 SGL_DEVICE uint4 ldg_nc(const void* p) {  // read-only path (u rows: shared by many CTAs, L1 merges)
@@ -94,14 +94,14 @@ SGL_DEVICE uint4 ldg_nc(const void* p) {  // read-only path (u rows: shared by m
   asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
   return v;
 }
-SGL_DEVICE uint4 ldg_ef(const void* p, unsigned long long pol) {  // streamed once (base): L2 evict_first
+SGL_DEVICE uint4 ldg_ef(const void* p, uint64_t pol) {  // streamed once (base): L2 evict_first
   uint4 v;
   asm volatile("ld.global.L2::cache_hint.v4.u32 {%0, %1, %2, %3}, [%4], %5;"
                : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
                : "l"(p), "l"(pol));
   return v;
 }
-SGL_DEVICE void stg_ef(void* p, uint4 v, unsigned long long pol) {
+SGL_DEVICE void stg_ef(void* p, uint4 v, uint64_t pol) {
   asm volatile("st.global.L2::cache_hint.v4.u32 [%0], {%1, %2, %3, %4}, %5;" ::"l"(p),
                "r"(v.x),
                "r"(v.y),
@@ -110,23 +110,23 @@ SGL_DEVICE void stg_ef(void* p, uint4 v, unsigned long long pol) {
                "l"(pol)
                : "memory");
 }
-SGL_DEVICE unsigned long long evict_last_policy() {
-  unsigned long long pol;
+SGL_DEVICE uint64_t evict_last_policy() {
+  uint64_t pol;
   asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
   return pol;
 }
 // ring hand-off (see the protocol above); the writer sides are RMWs, which racecheck does not report against the polls
-SGL_DEVICE int ld_acquire_s32(const int* p) {
-  int v;
+SGL_DEVICE int32_t ld_acquire_s32(const int32_t* p) {
+  int32_t v;
   asm volatile("ld.acquire.cta.shared::cta.s32 %0, [%1];" : "=r"(v) : "r"(to_shared(p)) : "memory");
   return v;
 }
-SGL_DEVICE void exch_release_s32(int* p, int v) {
+SGL_DEVICE void exch_release_s32(int32_t* p, int32_t v) {
   asm volatile("{ .reg .b32 o; atom.release.cta.shared::cta.exch.b32 o, [%0], %1; }" ::"r"(to_shared(p)), "r"(v)
                : "memory");
 }
-SGL_DEVICE int add_acq_rel_s32(int* p, int v) {
-  int old;
+SGL_DEVICE int32_t add_acq_rel_s32(int32_t* p, int32_t v) {
+  int32_t old;
   asm volatile("atom.acq_rel.cta.shared::cta.add.u32 %0, [%1], %2;" : "=r"(old) : "r"(to_shared(p)), "r"(v) : "memory");
   return old;
 }
@@ -135,93 +135,94 @@ SGL_DEVICE int add_acq_rel_s32(int* p, int v) {
 
 namespace sglang::dspark_markov_walk::wgmma {
 
-constexpr int kMaxB = 64;
-constexpr int kThr = 512, kNumWG = 4;
-constexpr int kTileRows = 64;
-constexpr int kTileBytes = 16384, kChunkBytes = 2048;
-constexpr int kBlockReq = 32;
-constexpr int kW1fBytes = 528;              // 512 B fragment-ordered q_hi | q_lo + s_hi, s_lo, pad
-constexpr int kPairU64 = 16;                // one {key, count} pair per 128-B line
-constexpr int kStepU64 = kMaxB * kPairU64;  // one step's pairs in a set
+constexpr int32_t kMaxB = 64;
+constexpr int32_t kThr = 512, kNumWG = 4;
+constexpr int32_t kTileRows = 64;
+constexpr int32_t kTileBytes = 16384, kChunkBytes = 2048;
+constexpr int32_t kBlockReq = 32;
+constexpr int32_t kW1fBytes = 528;              // 512 B fragment-ordered q_hi | q_lo + s_hi, s_lo, pad
+constexpr int32_t kPairU64 = 16;                // one {key, count} pair per 128-B line
+constexpr int32_t kStepU64 = kMaxB * kPairU64;  // one step's pairs in a set
 
 // K-major, no swizzle, LBO 128, SBO 256: the high word is the constant SBO field, the low word start address | LBO.
 // Offsets inside the 228 KiB window never carry out of the 14-bit address field, so they are 32-bit adds.
-constexpr unsigned kDescHi = 256 >> 4;
-SGL_DEVICE unsigned wg_desc_lo(unsigned addr) {
+constexpr uint32_t kDescHi = 256 >> 4;
+SGL_DEVICE uint32_t wg_desc_lo(uint32_t addr) {
   return ((addr & 0x3FFFF) >> 4) | ((128 >> 4) << 16);
 }
 
 // W2 placement: kRes of the kTiles tiles SMEM-resident, the others (kStreamMask) streamed through a kRing-slot TMA ring
-template <int kTiles, int kRes, int kRing, uint32_t kStreamMask>
+template <int32_t kTiles, int32_t kRes, int32_t kRing, uint32_t kStreamMask>
 __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
-    const unsigned char* __restrict__ w2_res,
-    const unsigned char* __restrict__ w2_str,
+    const uint8_t* __restrict__ w2_res,
+    const uint8_t* __restrict__ w2_str,
     const float* __restrict__ row_scale,
-    const unsigned char* __restrict__ w1f,
+    const uint8_t* __restrict__ w1f,
     const __nv_bfloat16* __restrict__ base,
     const int64_t* __restrict__ anchor,
     int64_t* __restrict__ tokens,
     __nv_bfloat16* __restrict__ corrected,
-    u64* __restrict__ state,
+    uint64_t* __restrict__ state,
     const float* __restrict__ temps,
-    int nb,
-    int num_steps,
-    int state_steps,
-    int kb,
-    int ld,
-    int valid_rows,
-    u64 seed) {
-  constexpr int kRowsCta = kTiles * kTileRows;
-  constexpr int kStr = kTiles - kRes;
+    int32_t nb,
+    int32_t num_steps,
+    int32_t state_steps,
+    int32_t kb,
+    int32_t ld,
+    int32_t valid_rows,
+    uint64_t seed) {
+  constexpr int32_t kRowsCta = kTiles * kTileRows;
+  constexpr int32_t kStr = kTiles - kRes;
   static_assert(kRing >= 1 && kRing <= kStr, "ring depth");
-  extern __shared__ __align__(128) unsigned char smem_raw[];
-  unsigned char* res_s = smem_raw;                                         // [kRes][16 KiB]
-  unsigned char* ring_s = res_s + kRes * kTileBytes;                       // [kRing][16 KiB]
+  extern __shared__ __align__(128) uint8_t smem_raw[];
+  uint8_t* res_s = smem_raw;                                               // [kRes][16 KiB]
+  uint8_t* ring_s = res_s + kRes * kTileBytes;                             // [kRing][16 KiB]
   float* scale_s = reinterpret_cast<float*>(ring_s + kRing * kTileBytes);  // [kRowsCta] natural row order
-  __shared__ __align__(8) u64 mbar_res[kRes + 1];  // one per resident tile (first use waits for its own tile) + scales
-  __shared__ __align__(8) u64 mbar_full[kRing];
-  __shared__ int slot_q[kRing];    // the FIFO index the slot holds / is being filled with
-  __shared__ int slot_cnt[kRing];  // monotone: 4 warps x consumers per fill
-  __shared__ u64 wbest_s[kMaxB][kNumWG];
-  __shared__ unsigned tok_s[kMaxB];
+  __shared__ __align__(8)
+      uint64_t mbar_res[kRes + 1];  // one per resident tile (first use waits for its own tile) + scales
+  __shared__ __align__(8) uint64_t mbar_full[kRing];
+  __shared__ int32_t slot_q[kRing];    // the FIFO index the slot holds / is being filled with
+  __shared__ int32_t slot_cnt[kRing];  // monotone: 4 warps x consumers per fill
+  __shared__ uint64_t wbest_s[kMaxB][kNumWG];
+  __shared__ uint32_t tok_s[kMaxB];
   __shared__ float inv_t_s[kMaxB];
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int wg = warp >> 2, wq = warp & 3, g = lane >> 2, tig = lane & 3;
-  const int row_base = blockIdx.x * kRowsCta;
+  const int32_t lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int32_t wg = warp >> 2, wq = warp & 3, g = lane >> 2, tig = lane & 3;
+  const int32_t row_base = blockIdx.x * kRowsCta;
 
-  const u64 round = ptx::ld_relaxed(state);
-  const int set = static_cast<int>(round & 1);
-  const int set_u64 = state_steps * kStepU64;
-  u64* pairs = state + 16 + set * set_u64;
-  auto pair = [&](int k, int b) { return pairs + kPairU64 * (k * kMaxB + b); };
+  const uint64_t round = ptx::ld_relaxed(state);
+  const int32_t set = static_cast<int32_t>(round & 1);
+  const int32_t set_u64 = state_steps * kStepU64;
+  uint64_t* pairs = state + 16 + set * set_u64;
+  auto pair = [&](int32_t k, int32_t b) { return pairs + kPairU64 * (k * kMaxB + b); };
   if (blockIdx.x == 0)
-    for (int i = threadIdx.x; i < state_steps * kMaxB * 2; i += kThr)
+    for (int32_t i = threadIdx.x; i < state_steps * kMaxB * 2; i += kThr)
       ptx::st_relaxed(state + 16 + (set ^ 1) * set_u64 + (i >> 1) * kPairU64 + (i & 1), 0);
-  const uint2 seed2 = make_uint2(static_cast<unsigned>(seed), static_cast<unsigned>(seed >> 32));
+  const uint2 seed2 = make_uint2(static_cast<uint32_t>(seed), static_cast<uint32_t>(seed >> 32));
 
   // ---- work split
-  const int nblk = (nb + kBlockReq - 1) / kBlockReq, wpb = kNumWG / nblk;
-  const int blk = wg / wpb, phase = wg % wpb;
-  const int b = blk * kBlockReq + 8 * wq + g;  // this thread's request
+  const int32_t nblk = (nb + kBlockReq - 1) / kBlockReq, wpb = kNumWG / nblk;
+  const int32_t blk = wg / wpb, phase = wg % wpb;
+  const int32_t b = blk * kBlockReq + 8 * wq + g;  // this thread's request
   const bool live = b < nb;
   // tile limits: run 0 (tile rows 8 tig .. +8) / run 1 (32 + 8 tig .. +8) of tile t is a valid vocabulary row run iff
   // t < lim0 / lim1 (valid_rows % 8 == 0: a run is all valid or all padding).  Only the last CTA's last tiles fall
   // outside.  A dead request gets 0: the same predicate that keeps the base loads inside the valid rows also skips
   // them for dead requests.
-  const int vloc = valid_rows - row_base;
-  const int lim0 = live ? min(kTiles, max(0, vloc - 8 * tig + kTileRows - 1) / kTileRows) : 0;
-  const int lim1 = live ? min(kTiles, max(0, vloc - 32 - 8 * tig + kTileRows - 1) / kTileRows) : 0;
-  const int consumers = 4 * nblk;   // ring arrivals per fill (4 warps per warpgroup)
-  const int nq = kStr * num_steps;  // streamed fills per round
-  auto str_idx = [&](int t) { return __popc(kStreamMask & ((1u << t) - 1u)); };  // t < kTiles <= 32: shift < 32
+  const int32_t vloc = valid_rows - row_base;
+  const int32_t lim0 = live ? min(kTiles, max(0, vloc - 8 * tig + kTileRows - 1) / kTileRows) : 0;
+  const int32_t lim1 = live ? min(kTiles, max(0, vloc - 32 - 8 * tig + kTileRows - 1) / kTileRows) : 0;
+  const int32_t consumers = 4 * nblk;   // ring arrivals per fill (4 warps per warpgroup)
+  const int32_t nq = kStr * num_steps;  // streamed fills per round
+  auto str_idx = [&](int32_t t) { return __popc(kStreamMask & ((1u << t) - 1u)); };  // t < kTiles <= 32: shift < 32
 
   // ---- once per round: resident tiles + row scales by TMA, ring prefill
-  const u64 pol_last = ptx::evict_last_policy(), pol_first = ptx::evict_first_policy();
-  auto res_mbar = [&](int i) { return ptx::to_shared(&mbar_res[i]); };
-  auto issue_fill = [&](int q) {  // thread-local: tag, arm, copy (q < nq)
-    const int slot = q % kRing;
+  const uint64_t pol_last = ptx::evict_last_policy(), pol_first = ptx::evict_first_policy();
+  auto res_mbar = [&](int32_t i) { return ptx::to_shared(&mbar_res[i]); };
+  auto issue_fill = [&](int32_t q) {  // thread-local: tag, arm, copy (q < nq)
+    const int32_t slot = q % kRing;
     ptx::exch_release_s32(&slot_q[slot], q);
-    const unsigned mb = ptx::to_shared(&mbar_full[slot]);
+    const uint32_t mb = ptx::to_shared(&mbar_full[slot]);
     ptx::mbar_expect_tx(mb, kTileBytes);
     ptx::bulk_g2s_hint(
         ptx::to_shared(ring_s + slot * kTileBytes),
@@ -231,9 +232,9 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
         q >= nq - kStr ? pol_first : pol_last);  // last step: demote the lines for whatever runs next
   };
   if (threadIdx.x == 0) {
-    for (int i = 0; i <= kRes; ++i)
+    for (int32_t i = 0; i <= kRes; ++i)
       ptx::mbar_init(res_mbar(i), 1);
-    for (int s = 0; s < kRing; ++s) {
+    for (int32_t s = 0; s < kRing; ++s) {
       ptx::mbar_init(ptx::to_shared(&mbar_full[s]), 1);
       slot_cnt[s] = 0;
     }
@@ -241,9 +242,9 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
     // scales first (every epilogue needs them), then the ring prefill, then the resident tiles in first-use order
     ptx::mbar_expect_tx(res_mbar(kRes), kRowsCta * 4);
     ptx::bulk_g2s_hint(ptx::to_shared(scale_s), row_scale + row_base, kRowsCta * 4, res_mbar(kRes), pol_first);
-    for (int q = 0; q < kRing && q < nq; ++q)
+    for (int32_t q = 0; q < kRing && q < nq; ++q)
       issue_fill(q);
-    for (int i = 0; i < kRes; ++i) {
+    for (int32_t i = 0; i < kRes; ++i) {
       ptx::mbar_expect_tx(res_mbar(i), kTileBytes);
       ptx::bulk_g2s_hint(
           ptx::to_shared(res_s + i * kTileBytes),
@@ -253,7 +254,7 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
           pol_first);
     }
   }
-  for (int i = threadIdx.x; i < nb; i += kThr) {
+  for (int32_t i = threadIdx.x; i < nb; i += kThr) {
     tok_s[i] = clamp_row(anchor[i], valid_rows);
     inv_t_s[i] = inv_temperature(temps[i]);
   }
@@ -262,67 +263,67 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
 
   const float inv_t = live ? inv_t_s[b] : 0.f;
   const float t2 = inv_t * 1.4426950408889634f;
-  const unsigned res_desc0 = wg_desc_lo(ptx::to_shared(res_s)), ring_desc0 = wg_desc_lo(ptx::to_shared(ring_s));
+  const uint32_t res_desc0 = wg_desc_lo(ptx::to_shared(res_s)), ring_desc0 = wg_desc_lo(ptx::to_shared(ring_s));
   uint4 nb0 = make_uint4(0, 0, 0, 0), nb1 = make_uint4(0, 0, 0, 0);  // base of this thread's next tile (bf16 x 8 x 2)
 
-  for (int k = 0; k < num_steps; ++k) {
+  for (int32_t k = 0; k < num_steps; ++k) {
     // u fragments of this thread's request (dead requests: zeros, so the warpgroup's MMA stays well defined)
     uint4 a[8];
     float s_lo = 0.f;
     if (live) {
-      const unsigned char* src = w1f + static_cast<size_t>(tok_s[b]) * kW1fBytes;
+      const uint8_t* src = w1f + static_cast<size_t>(tok_s[b]) * kW1fBytes;
 #pragma unroll
-      for (int j = 0; j < 8; ++j)
+      for (int32_t j = 0; j < 8; ++j)
         a[j] = ptx::ldg_nc(src + j * 64 + tig * 16);
       s_lo = __ldg(reinterpret_cast<const float*>(src + 516));
     } else {
 #pragma unroll
-      for (int j = 0; j < 8; ++j)
+      for (int32_t j = 0; j < 8; ++j)
         a[j] = make_uint4(0, 0, 0, 0);
     }
-    const int ob = (b * kb + k) * ld + row_base + 8 * tig;  // element offset of (b, k, run 0 of tile 0)
+    const int32_t ob = (b * kb + k) * ld + row_base + 8 * tig;  // element offset of (b, k, run 0 of tile 0)
     if (k == 0) {  // the first tile's base (later steps load it before the previous step's exchange)
       if (phase < lim0) nb0 = ptx::ldg_ef(base + ob + phase * kTileRows, pol_first);
       if (phase < lim1) nb1 = ptx::ldg_ef(base + ob + phase * kTileRows + 32, pol_first);
     }
     float cur_v = -INFINITY;
-    int cur_r = -1;
+    int32_t cur_r = -1;
 
 #pragma unroll 2
-    for (int t = phase; t < kTiles; t += wpb) {
+    for (int32_t t = phase; t < kTiles; t += wpb) {
       // mask & bit, not (kStreamMask >> t) & 1: the shift form compiles to a longer bit test (2 more SASS per tile)
       const bool streamed = (kStreamMask & (1u << t)) != 0u;
-      unsigned bd;
-      int q = 0;
+      uint32_t bd;
+      int32_t q = 0;
       if (streamed) {
         q = k * kStr + str_idx(t);
-        const int slot = q % kRing;
+        const int32_t slot = q % kRing;
         while (ptx::ld_acquire_s32(&slot_q[slot]) != q) {
         }
-        ptx::mbar_wait_cta(ptx::to_shared(&mbar_full[slot]), static_cast<unsigned>((q / kRing) & 1));
+        ptx::mbar_wait_cta(ptx::to_shared(&mbar_full[slot]), static_cast<uint32_t>((q / kRing) & 1));
         bd = ring_desc0 + slot * (kTileBytes >> 4);
       } else {
-        const int ri = t - str_idx(t);
+        const int32_t ri = t - str_idx(t);
         if (k == 0) ptx::mbar_wait_cta(res_mbar(ri), 0);  // first use of a resident tile: its own TMA (overlaps step 0)
         bd = res_desc0 + ri * (kTileBytes >> 4);
       }
-      int d[32];
+      int32_t d[32];
       ptx::wg_fence();
 #pragma unroll
-      for (int j = 0; j < 8; ++j)
+      for (int32_t j = 0; j < 8; ++j)
         ptx::wgmma_rs(d, a[j], bd + j * (kChunkBytes >> 4), kDescHi, j);
       ptx::wg_commit();
       // this tile's base was loaded one tile ago; the next tile's goes out under this MMA.  Runs past valid_rows (and
       // dead requests) load nothing: their registers keep a stale tile, masked below.
-      const int o = ob + t * kTileRows;
+      const int32_t o = ob + t * kTileRows;
       const uint4 bb0 = nb0, bb1 = nb1;
       if (t + wpb < lim0) nb0 = ptx::ldg_ef(base + o + wpb * kTileRows, pol_first);
       if (t + wpb < lim1) nb1 = ptx::ldg_ef(base + o + wpb * kTileRows + 32, pol_first);
       ptx::wg_wait0();
       ptx::wg_fence_operand(d);     // keep every read of d below the wait (d is written async)
       if (streamed && lane == 0) {  // this warp is done reading the slot
-        const int slot = q % kRing;
-        const int done = ptx::add_acq_rel_s32(&slot_cnt[slot], 1) + 1;
+        const int32_t slot = q % kRing;
+        const int32_t done = ptx::add_acq_rel_s32(&slot_cnt[slot], 1) + 1;
         if (done == (q / kRing + 1) * consumers && q + kRing < nq) issue_fill(q + kRing);
       }
       if (!live) continue;
@@ -333,33 +334,33 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
       const float4 sd = *reinterpret_cast<const float4*>(scale_s + t * kTileRows + 32 + 8 * tig + 4);
       const float sr[16] = {
           sa.x, sa.y, sa.z, sa.w, sb.x, sb.y, sb.z, sb.w, sc.x, sc.y, sc.z, sc.w, sd.x, sd.y, sd.z, sd.w};
-      const unsigned bw[8] = {bb0.x, bb0.y, bb0.z, bb0.w, bb1.x, bb1.y, bb1.z, bb1.w};
+      const uint32_t bw[8] = {bb0.x, bb0.y, bb0.z, bb0.w, bb1.x, bb1.y, bb1.z, bb1.w};
       float lg[16];  // [run][q]: run 0 = i < 4, element q = 2 (i % 4) + e
 #pragma unroll
-      for (int i = 0; i < 8; ++i)
+      for (int32_t i = 0; i < 8; ++i)
 #pragma unroll
-        for (int e = 0; e < 2; ++e) {
-          const int idx = 8 * (i >> 2) + 2 * (i & 3) + e;
+        for (int32_t e = 0; e < 2; ++e) {
+          const int32_t idx = 8 * (i >> 2) + 2 * (i & 3) + e;
           const float bias = s_lo * static_cast<float>(d[4 * i + e] * 256 + d[4 * i + 2 + e]);
-          const unsigned w = bw[idx >> 1];
+          const uint32_t w = bw[idx >> 1];
           lg[idx] = fmaf(sr[idx], bias, __uint_as_float(e ? (w & 0xFFFF0000u) : (w << 16)));
         }
       // the walk's logits are the bf16 roundings (RNE) of these -- the values sglang's verifier reads back from
       // corrected: pk[4 run + qq] = {lg[8 run + 2 qq] (low half), lg[8 run + 2 qq + 1] (high half)}, i.e. corrected's
       // 16 B of run `run` in memory order.  Greedy works on pk directly; the sampler unpacks (bf16 -> fp32 is a shift).
-      unsigned pk[8];
+      uint32_t pk[8];
 #pragma unroll
-      for (int p2 = 0; p2 < 8; ++p2) {
+      for (int32_t p2 = 0; p2 < 8; ++p2) {
         const __nv_bfloat162 h = __floats2bfloat162_rn(lg[2 * p2], lg[2 * p2 + 1]);
-        pk[p2] = *reinterpret_cast<const unsigned*>(&h);
+        pk[p2] = *reinterpret_cast<const uint32_t*>(&h);
       }
-      const int r = row_base + t * kTileRows + 8 * tig;   // run 0 rows r .. r + 8, run 1 rows r + 32 .. r + 40
+      const int32_t r = row_base + t * kTileRows + 8 * tig;  // run 0 rows r .. r + 8, run 1 rows r + 32 .. r + 40
       if (row_base + (t + 1) * kTileRows > valid_rows) {  // the last CTA's padding runs (uniform per tile): bf16 -inf
 #pragma unroll
-        for (int run = 0; run < 2; ++run)
+        for (int32_t run = 0; run < 2; ++run)
           if (r + 32 * run >= valid_rows) {  // valid_rows % 8 == 0: whole runs
 #pragma unroll
-            for (int qq = 0; qq < 4; ++qq)
+            for (int32_t qq = 0; qq < 4; ++qq)
               pk[4 * run + qq] = 0xFF80FF80u;
           }
       }
@@ -370,7 +371,7 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
           if (t < lim1) ptx::stg_ef(corrected + o + 32, make_uint4(pk[4], pk[5], pk[6], pk[7]), pol_first);
         }
 #pragma unroll
-        for (int p2 = 0; p2 < 8; ++p2) {
+        for (int32_t p2 = 0; p2 < 8; ++p2) {
           lg[2 * p2] = __uint_as_float(pk[p2] << 16);
           lg[2 * p2 + 1] = __uint_as_float(pk[p2] & 0xFFFF0000u);
         }
@@ -379,29 +380,29 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
         // round): x, y for run 0, z, w for run 1 (run-1 items 8 T + 4 + tig never coincide with a run-0 counter)
         const uint4 xr = philox(
             make_uint4(
-                static_cast<unsigned>(r >> 3),
-                static_cast<unsigned>(k) | (static_cast<unsigned>(b) << 8),
-                static_cast<unsigned>(round),
-                static_cast<unsigned>(round >> 32)),
+                static_cast<uint32_t>(r >> 3),
+                static_cast<uint32_t>(k) | (static_cast<uint32_t>(b) << 8),
+                static_cast<uint32_t>(round),
+                static_cast<uint32_t>(round >> 32)),
             seed2);
 #pragma unroll
-        for (int run = 0; run < 2; ++run) {
+        for (int32_t run = 0; run < 2; ++run) {
           const float* l8 = lg + 8 * run;
           const float m =
               __uint_as_float(ptx::bf16x8_max(pk[4 * run], pk[4 * run + 1], pk[4 * run + 2], pk[4 * run + 3]) << 16);
           const float mz = m * t2;
           float cs[8], c = 0.f;
 #pragma unroll
-          for (int qq = 0; qq < 8; ++qq) {
+          for (int32_t qq = 0; qq < 8; ++qq) {
             c += ptx::ex2_ftz(fmaf(l8[qq], t2, -mz));
             cs[qq] = c;
           }
-          const unsigned xu = run == 0 ? xr.x : xr.z, xg = run == 0 ? xr.y : xr.w;
+          const uint32_t xu = run == 0 ? xr.x : xr.z, xg = run == 0 ? xr.y : xr.w;
           const float u = uniform23(xu);
           const float tt = u * c;  // < c (uniform23)
-          int qi = 7;
+          int32_t qi = 7;
 #pragma unroll
-          for (int qq = 6; qq >= 0; --qq)
+          for (int32_t qq = 6; qq >= 0; --qq)
             qi = tt < cs[qq] ? qq : qi;
           const float g2 = gumbel2_fast(xg);
           const float key_v = mz + ptx::lg2_ftz(c) + g2;
@@ -412,10 +413,10 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
         }
       } else {  // greedy on the packed bf16 values
 #pragma unroll
-        for (int run = 0; run < 2; ++run) {
-          const unsigned* p8 = pk + 4 * run;
-          const unsigned m2 = ptx::bf16x8_max(p8[0], p8[1], p8[2], p8[3]);
-          const int qi = ptx::bf16x8_first_eq(p8[0], p8[1], p8[2], p8[3], m2);  // ties -> smallest row
+        for (int32_t run = 0; run < 2; ++run) {
+          const uint32_t* p8 = pk + 4 * run;
+          const uint32_t m2 = ptx::bf16x8_max(p8[0], p8[1], p8[2], p8[3]);
+          const int32_t qi = ptx::bf16x8_first_eq(p8[0], p8[1], p8[2], p8[3], m2);  // ties -> smallest row
           const float m = __uint_as_float(m2 << 16);
           if (m > cur_v) {
             cur_v = m;
@@ -426,7 +427,7 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
     }
     // the 4 tig lanes of a request -> this warpgroup's best for it
     {
-      u64 key = cur_r >= 0 ? pack_key(cur_v, static_cast<unsigned>(cur_r)) : 0ull;
+      uint64_t key = cur_r >= 0 ? pack_key(cur_v, static_cast<uint32_t>(cur_r)) : 0;
       key = max(key, __shfl_xor_sync(0xffffffffu, key, 1));
       key = max(key, __shfl_xor_sync(0xffffffffu, key, 2));
       if (tig == 0 && live) wbest_s[b][phase] = key;
@@ -434,48 +435,48 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
     // next step's base does not depend on the tokens: its first tile into registers, the next ones into L2, all
     // under the exchange
     if (k + 1 < num_steps) {
-      const int o1 = ob + ld + phase * kTileRows;
+      const int32_t o1 = ob + ld + phase * kTileRows;
       if (phase < lim0) nb0 = ptx::ldg_ef(base + o1, pol_first);
       if (phase < lim1) nb1 = ptx::ldg_ef(base + o1 + 32, pol_first);
     }
     __syncthreads();
     if (warp == 0) {
-      u64 key[2] = {0ull, 0ull};
+      uint64_t key[2] = {0, 0};
 #pragma unroll
-      for (int qd = 0; qd < 2; ++qd) {
-        const int bq = lane + 32 * qd;
+      for (int32_t qd = 0; qd < 2; ++qd) {
+        const int32_t bq = lane + 32 * qd;
         if (bq < nb) {
-          u64 bst = 0ull;
-          for (int p = 0; p < wpb; ++p)
+          uint64_t bst = 0;
+          for (int32_t p = 0; p < wpb; ++p)
             bst = max(bst, wbest_s[bq][p]);
-          atomicMax(pair(k, bq), bst);
+          ptx::red_relaxed_max_u64(pair(k, bq), bst);
           ptx::red_add_release(pair(k, bq) + 1, 1);
         }
       }
       // both of a lane's requests polled in the same round trip; a request the lane does not hold starts "arrived"
-      const u64 n = gridDim.x;
-      ulonglong2 v0 = make_ulonglong2(0, lane < nb ? 0 : n), v1 = make_ulonglong2(0, lane + 32 < nb ? 0 : n);
+      const uint64_t n = gridDim.x;
+      uint64_t v0[2] = {0, lane < nb ? 0 : n}, v1[2] = {0, lane + 32 < nb ? 0 : n};
       do {
-        if (v0.y < n) v0 = ptx::ld_relaxed_v2(pair(k, lane));
-        if (v1.y < n) v1 = ptx::ld_relaxed_v2(pair(k, lane + 32));
-      } while (v0.y < n || v1.y < n);
-      key[0] = v0.x;
-      key[1] = v1.x;
+        if (v0[1] < n) ptx::ld_relaxed_v2(pair(k, lane), v0);
+        if (v1[1] < n) ptx::ld_relaxed_v2(pair(k, lane + 32), v1);
+      } while (v0[1] < n || v1[1] < n);
+      key[0] = v0[0];
+      key[1] = v1[0];
 #pragma unroll
-      for (int qd = 0; qd < 2; ++qd) {
-        const int bq = lane + 32 * qd;
+      for (int32_t qd = 0; qd < 2; ++qd) {
+        const int32_t bq = lane + 32 * qd;
         if (bq < nb) {
           // key 0 = no row was a candidate anywhere: every logit of the request NaN / -inf (greedy: NaN never wins
           // `>`, -inf never beats the -inf start; sampling: an item with a NaN or all -inf has a NaN key) -- e.g. a
           // padded CUDA-graph row.  key_row(0) = 0xFFFFFFFF would make the next step's W1 gather an illegal address:
           // emit row 0, torch.argmax's answer for such a row.
-          const unsigned tok = key[qd] != 0ull ? key_row(key[qd]) : 0u;
+          const uint32_t tok = key[qd] != 0 ? key_row(key[qd]) : 0u;
           tok_s[bq] = tok;
           if (blockIdx.x == 0) tokens[static_cast<size_t>(bq) * num_steps + k] = tok;
           if (k + 1 < num_steps) {  // the next gather's u row into L2 before the barrier releases it: a 528-B
-            const unsigned char* src = w1f + static_cast<size_t>(tok) * kW1fBytes;  // row spans 5 128-B lines
+            const uint8_t* src = w1f + static_cast<size_t>(tok) * kW1fBytes;  // row spans 5 128-B lines
 #pragma unroll
-            for (int l = 0; l < 5; ++l)
+            for (int32_t l = 0; l < 5; ++l)
               ptx::prefetch_l2_evict_last(src + 128 * l);
           }
         }
@@ -512,7 +513,7 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
  * \param valid_rows The vocabulary size: % 8 == 0, <= min(ld, rows_pad, V).
  * \param seed       Philox key; the round counter in state advances every launch.
  */
-template <int kTiles, int kRes, int kRing, uint32_t kStreamMask>
+template <int32_t kTiles, int32_t kRes, int32_t kRing, uint32_t kStreamMask>
 inline void walk(
     tvm::ffi::TensorView w2_res,
     tvm::ffi::TensorView w2_str,
@@ -532,7 +533,7 @@ inline void walk(
   static_assert(kRes >= 1 && kRing >= 1 && kTiles - kRes >= kRing, "ring depth");
   static_assert(std::popcount(kStreamMask) == kTiles - kRes, "kStreamMask must name kTiles - kRes tiles");
   static_assert(kTiles == 32 || (kStreamMask >> (kTiles % 32)) == 0, "kStreamMask bits must be below bit kTiles");
-  constexpr int kRowsCta = kTiles * kTileRows;
+  constexpr int32_t kRowsCta = kTiles * kTileRows;
   auto grid = SymbolicSize{"grid"};
   auto w1_rows = SymbolicSize{"w1_rows"};
   auto nb = SymbolicSize{"batch_size"};
@@ -586,23 +587,23 @@ inline void walk(
       kThr,
       kSmem,
       kSmem,
-      static_cast<const unsigned char*>(w2_res.data_ptr()),
-      static_cast<const unsigned char*>(w2_str.data_ptr()),
+      static_cast<const uint8_t*>(w2_res.data_ptr()),
+      static_cast<const uint8_t*>(w2_str.data_ptr()),
       static_cast<const float*>(row_scale.data_ptr()),
-      static_cast<const unsigned char*>(w1f.data_ptr()),
+      static_cast<const uint8_t*>(w1f.data_ptr()),
       static_cast<const __nv_bfloat16*>(base.data_ptr()),
       static_cast<const int64_t*>(anchor.data_ptr()),
       static_cast<int64_t*>(tokens.data_ptr()),
       corrected.has_value() ? static_cast<__nv_bfloat16*>(corrected.value().data_ptr()) : nullptr,
-      static_cast<u64*>(state.data_ptr()),
+      static_cast<uint64_t*>(state.data_ptr()),
       static_cast<const float*>(temps.data_ptr()),
-      static_cast<int>(nb_v),
-      static_cast<int>(num_steps),
-      static_cast<int>(state_steps),
-      static_cast<int>(kb_v),
-      static_cast<int>(ld_v),
-      static_cast<int>(valid_rows),
-      static_cast<u64>(seed));
+      static_cast<int32_t>(nb_v),
+      static_cast<int32_t>(num_steps),
+      static_cast<int32_t>(state_steps),
+      static_cast<int32_t>(kb_v),
+      static_cast<int32_t>(ld_v),
+      static_cast<int32_t>(valid_rows),
+      static_cast<uint64_t>(seed));
 }
 
 #undef DSPARK_MW_WG_D32_OUT

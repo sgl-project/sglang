@@ -37,20 +37,20 @@
 
 namespace sglang::dspark_markov_walk::small_batch {
 
-constexpr int kMaxB = 64;                   // state / SMEM array sizing
-constexpr int kPairMaxB = 8;                // launcher limit (two mma passes)
-constexpr int kGrp = 4;                     // requests per mma pass (column pairs)
-constexpr int kPairU64 = 16;                // one {key, count} pair per 128-B line
-constexpr int kStepU64 = kMaxB * kPairU64;  // one step's pairs in a set
+constexpr int32_t kMaxB = 64;                   // state / SMEM array sizing
+constexpr int32_t kPairMaxB = 8;                // launcher limit (two mma passes)
+constexpr int32_t kGrp = 4;                     // requests per mma pass (column pairs)
+constexpr int32_t kPairU64 = 16;                // one {key, count} pair per 128-B line
+constexpr int32_t kStepU64 = kMaxB * kPairU64;  // one step's pairs in a set
 // W2 slice per CTA: TS SMEM tiles + NG register tiles per warp, 72 16-row tiles = 1152 rows
-constexpr int NG = 6, TS = 3;
-constexpr int kTilesSmem = TS * kWarps, kTilesPerCta = kTilesSmem + NG * kWarps, kRowsCta = kTilesPerCta * 16;
+constexpr int32_t NG = 6, TS = 3;
+constexpr int32_t kTilesSmem = TS * kWarps, kTilesPerCta = kTilesSmem + NG * kWarps, kRowsCta = kTilesPerCta * 16;
 
 // The fp32 bias of rows l0 + g and + 8 with its rounding sequence pinned: bias = sr (u_hi c_hi + u_lo c_lo) as
 // t = u_lo c_lo (RN), fma(u_hi, c_hi, t), times sr (RN) -- a last-bit difference in fp32 can cross a bf16 rounding
 // boundary, so the exact reference must replay this order.
-SGL_DEVICE void
-store_bias_rn(const int (&c)[4], float sr_lo, float sr_hi, float u_hi, float u_lo, float* bias_s, int l0, int g) {
+SGL_DEVICE void store_bias_rn(
+    const int32_t (&c)[4], float sr_lo, float sr_hi, float u_hi, float u_lo, float* bias_s, int32_t l0, int32_t g) {
   bias_s[l0 + g] =
       __fmul_rn(sr_lo, __fmaf_rn(u_hi, static_cast<float>(c[0]), __fmul_rn(u_lo, static_cast<float>(c[1]))));
   bias_s[l0 + g + 8] =
@@ -65,21 +65,21 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
     const int64_t* __restrict__ anchor,
     int64_t* __restrict__ tokens,
     __nv_bfloat16* __restrict__ corrected,
-    u64* __restrict__ state,
+    uint64_t* __restrict__ state,
     const float* __restrict__ temps,
-    int nb,
-    int num_steps,
-    int state_steps,
-    int kb,
-    int ld,
-    int valid_rows,
-    u64 seed) {
-  constexpr int tiles_smem = kTilesSmem;
-  constexpr int tiles_per_cta = kTilesPerCta;
-  constexpr int rows_cta = kRowsCta;
-  constexpr int kChunks = rows_cta / 8;  // epilogue items per request (8 rows each)
-  extern __shared__ __align__(16) unsigned char smem_raw[];
-  unsigned char* p = smem_raw;
+    int32_t nb,
+    int32_t num_steps,
+    int32_t state_steps,
+    int32_t kb,
+    int32_t ld,
+    int32_t valid_rows,
+    uint64_t seed) {
+  constexpr int32_t tiles_smem = kTilesSmem;
+  constexpr int32_t tiles_per_cta = kTilesPerCta;
+  constexpr int32_t rows_cta = kRowsCta;
+  constexpr int32_t kChunks = rows_cta / 8;  // epilogue items per request (8 rows each)
+  extern __shared__ __align__(16) uint8_t smem_raw[];
+  uint8_t* p = smem_raw;
   __nv_bfloat16* base_s = reinterpret_cast<__nv_bfloat16*>(p);
   p += 2 * kGrp * rows_cta * 2;  // [2][grp][rows]
   float* bias_s = reinterpret_cast<float*>(p);
@@ -89,39 +89,39 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
   uint4* w_s = reinterpret_cast<uint4*>(p);
   p += tiles_smem * kTileVecs * 16;
   uint32_t* u_s = reinterpret_cast<uint32_t*>(p);  // (nb + 1) W1q rows, row nb = zeros
-  __shared__ u64 wbest_s[kMaxB][kWarps];           // per request: its epilogue warps' best keys
-  __shared__ unsigned tok_s[kMaxB];
+  __shared__ uint64_t wbest_s[kMaxB][kWarps];      // per request: its epilogue warps' best keys
+  __shared__ uint32_t tok_s[kMaxB];
   __shared__ float inv_t_s[kMaxB];
-  __shared__ __align__(8) u64 mbar_load;
-  __shared__ __align__(8) u64 mbar_u[kMaxB / kGrp];  // u rows of pass p landed (phase = step parity)
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int g = lane >> 2, tig = lane & 3;
-  const int tile0 = blockIdx.x * tiles_per_cta;
-  const int row_base = tile0 * 16;
+  __shared__ __align__(8) uint64_t mbar_load;
+  __shared__ __align__(8) uint64_t mbar_u[kMaxB / kGrp];  // u rows of pass p landed (phase = step parity)
+  const int32_t lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int32_t g = lane >> 2, tig = lane & 3;
+  const int32_t tile0 = blockIdx.x * tiles_per_cta;
+  const int32_t row_base = tile0 * 16;
   const uint4* g_frag = frag + static_cast<size_t>(tile0) * kTileVecs;
 
-  const u64 round = ptx::ld_relaxed(state);
-  const int set = static_cast<int>(round & 1);
-  const int set_u64 = state_steps * kStepU64;
-  u64* pairs = state + 16 + set * set_u64;  // pair (k, b) at pairs + kPairU64 * (k * kMaxB + b)
-  auto pair = [&](int k, int b) { return pairs + kPairU64 * (k * kMaxB + b); };
+  const uint64_t round = ptx::ld_relaxed(state);
+  const int32_t set = static_cast<int32_t>(round & 1);
+  const int32_t set_u64 = state_steps * kStepU64;
+  uint64_t* pairs = state + 16 + set * set_u64;  // pair (k, b) at pairs + kPairU64 * (k * kMaxB + b)
+  auto pair = [&](int32_t k, int32_t b) { return pairs + kPairU64 * (k * kMaxB + b); };
   if (blockIdx.x == 0)  // clear the set round r+1 uses (it may differ in B, and in K <= state_steps)
-    for (int i = threadIdx.x; i < state_steps * kMaxB * 2; i += kThreads)
+    for (int32_t i = threadIdx.x; i < state_steps * kMaxB * 2; i += kThreads)
       ptx::st_relaxed(state + 16 + (set ^ 1) * set_u64 + (i >> 1) * kPairU64 + (i & 1), 0);
-  const uint2 seed2 = make_uint2(static_cast<unsigned>(seed), static_cast<unsigned>(seed >> 32));
-  const int npass = (nb + kGrp - 1) / kGrp;
-  const int n_items = num_steps * npass;  // (step, pass) in walk order
+  const uint2 seed2 = make_uint2(static_cast<uint32_t>(seed), static_cast<uint32_t>(seed >> 32));
+  const int32_t npass = (nb + kGrp - 1) / kGrp;
+  const int32_t n_items = num_steps * npass;  // (step, pass) in walk order
 
   // base rows of item it = (k, pass) -> base_s[it & 1]: the pass's requests, this CTA's rows.  Chunks at or past
   // valid_rows (the last CTA's tail; valid_rows % 8 == 0) copy the last valid chunk instead -- in bounds whatever the
   // row stride; the epilogue skips them (r < valid_rows)
-  const int last8 = valid_rows - 8;
-  auto prefetch_base = [&](int it) {
-    const int k = it / npass, r0 = (it % npass) * kGrp, nr = min(kGrp, nb - r0);
+  const int32_t last8 = valid_rows - 8;
+  auto prefetch_base = [&](int32_t it) {
+    const int32_t k = it / npass, r0 = (it % npass) * kGrp, nr = min(kGrp, nb - r0);
     __nv_bfloat16* dst = base_s + (it & 1) * kGrp * rows_cta;
-    for (int i = threadIdx.x; i < nr * kChunks; i += kThreads) {
-      const int rr = i / kChunks, c = i % kChunks;
-      ptx::cp_async16(
+    for (int32_t i = threadIdx.x; i < nr * kChunks; i += kThreads) {
+      const int32_t rr = i / kChunks, c = i % kChunks;
+      ptx::cp_async_cg_16B(
           dst + rr * rows_cta + c * 8,
           base + (static_cast<size_t>(r0 + rr) * kb + k) * ld + min(row_base + c * 8, last8));
     }
@@ -130,36 +130,36 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
 
   // ---- once per round: base of item 0, W2 slice (+ row scales) on-chip
   prefetch_base(0);
-  const u64 pol = ptx::evict_first_policy();
-  const unsigned a_mbar = ptx::to_shared(&mbar_load);
+  const uint64_t pol = ptx::evict_first_policy();
+  const uint32_t a_mbar = ptx::to_shared(&mbar_load);
   if (threadIdx.x == 0) {
     ptx::mbar_init(a_mbar, 1);
-    for (int ps = 0; ps < npass; ++ps)
+    for (int32_t ps = 0; ps < npass; ++ps)
       ptx::mbar_init(ptx::to_shared(&mbar_u[ps]), kThreads);  // every thread arrives
     ptx::fence_mbarrier_init();
-    constexpr unsigned kW2Bytes = tiles_smem * kTileVecs * 16, kScaleBytes = tiles_per_cta * 64, kChunk = 16384;
+    constexpr uint32_t kW2Bytes = tiles_smem * kTileVecs * 16, kScaleBytes = tiles_per_cta * 64, kChunk = 16384;
     ptx::mbar_expect_tx(a_mbar, kW2Bytes + kScaleBytes);
-    for (unsigned off = 0; off < kW2Bytes; off += kChunk)
+    for (uint32_t off = 0; off < kW2Bytes; off += kChunk)
       ptx::bulk_g2s_hint(
-          ptx::to_shared(reinterpret_cast<unsigned char*>(w_s) + off),
-          reinterpret_cast<const unsigned char*>(g_frag) + off,
+          ptx::to_shared(reinterpret_cast<uint8_t*>(w_s) + off),
+          reinterpret_cast<const uint8_t*>(g_frag) + off,
           off + kChunk <= kW2Bytes ? kChunk : kW2Bytes - off,
           a_mbar,
           pol);
     ptx::bulk_g2s_hint(ptx::to_shared(scale_s), row_scale + row_base, kScaleBytes, a_mbar, pol);
   }
-  for (int b = threadIdx.x; b < nb; b += kThreads) {
+  for (int32_t b = threadIdx.x; b < nb; b += kThreads) {
     tok_s[b] = clamp_row(anchor[b], valid_rows);
     inv_t_s[b] = inv_temperature(temps[b]);
   }
-  for (int i = threadIdx.x; i < kURowWords; i += kThreads)
+  for (int32_t i = threadIdx.x; i < kURowWords; i += kThreads)
     u_s[nb * kURowWords + i] = 0;  // padding request
   uint4 a_reg[NG][8];
 #pragma unroll
-  for (int gi = 0; gi < NG; ++gi) {
-    const int t = tiles_smem + warp * NG + gi;
+  for (int32_t gi = 0; gi < NG; ++gi) {
+    const int32_t t = tiles_smem + warp * NG + gi;
 #pragma unroll
-    for (int j = 0; j < 8; ++j)
+    for (int32_t j = 0; j < 8; ++j)
       a_reg[gi][j] = ptx::ldcg_hint(g_frag + (t * 8 + j) * 32 + lane, pol);
   }
   // only thread 0 (which initialized it) waits on the load barrier: another thread could reach a try_wait before the
@@ -169,62 +169,62 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
 
   // GEMV over this warp's NG + TS tiles; ub = this lane's B column source (a W1q row: q_hi | q_lo words),
   // column n takes q_hi for even n, q_lo for odd n
-  auto gemv = [&](int (&acc)[NG + TS][4], const uint32_t* ub) {
+  auto gemv = [&](int32_t (&acc)[NG + TS][4], const uint32_t* ub) {
 #pragma unroll
-    for (int i = 0; i < NG + TS; ++i)
+    for (int32_t i = 0; i < NG + TS; ++i)
       acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
+    for (int32_t j = 0; j < 8; ++j) {
       uint4 as[TS];
 #pragma unroll
-      for (int ts = 0; ts < TS; ++ts)
+      for (int32_t ts = 0; ts < TS; ++ts)
         as[ts] = w_s[((warp + kWarps * ts) * 8 + j) * 32 + lane];
       const uint32_t b0 = ub[(g & 1) * 64 + j * 8 + tig];
       const uint32_t b1 = ub[(g & 1) * 64 + j * 8 + 4 + tig];
 #pragma unroll
-      for (int gi = 0; gi < NG; ++gi)
+      for (int32_t gi = 0; gi < NG; ++gi)
         ptx::mma_s8(acc[gi], a_reg[gi][j], b0, b1);
 #pragma unroll
-      for (int ts = 0; ts < TS; ++ts)
+      for (int32_t ts = 0; ts < TS; ++ts)
         ptx::mma_s8(acc[NG + ts], as[ts], b0, b1);
     }
   };
 
   // u rows of pass ps (requests 4 ps ..): cp.async spread over the threads, completion tracked on the pass's mbarrier
   // (cp.async.mbarrier.arrive: every thread arrives once per pass and step), fetched one pass ahead
-  auto fetch_u = [&](int ps) {
-    constexpr int kRowVecs = kURowBytes / 16;
-    const int r0 = ps * kGrp, nr = min(kGrp, nb - r0);
+  auto fetch_u = [&](int32_t ps) {
+    constexpr int32_t kRowVecs = kURowBytes / 16;
+    const int32_t r0 = ps * kGrp, nr = min(kGrp, nb - r0);
     // %tid.x re-read here: no threadIdx-derived index kept live across the step (255 registers, 0 spill)
-    const unsigned tq = ptx::tid_x();
+    const uint32_t tq = ptx::tid_x();
     if (tq < nr * kRowVecs) {
-      const int b = r0 + tq / kRowVecs, v = tq % kRowVecs;
-      ptx::cp_async16(
+      const int32_t b = r0 + tq / kRowVecs, v = tq % kRowVecs;
+      ptx::cp_async_cg_16B(
           reinterpret_cast<uint4*>(u_s) + b * kRowVecs + v,
           reinterpret_cast<const uint4*>(w1q) + static_cast<size_t>(tok_s[b]) * kRowVecs + v);
     }
     ptx::cp_async_mbar_arrive_noinc(ptx::to_shared(&mbar_u[ps]));
   };
-  constexpr int kXchgWarp = kWarps - 1;
-  const u64 n = gridDim.x;
-  for (int k = 0; k < num_steps; ++k) {
+  constexpr int32_t kXchgWarp = kWarps - 1;
+  const uint64_t n = gridDim.x;
+  for (int32_t k = 0; k < num_steps; ++k) {
     // u rows of all requests (prefetched into L2 by the CTAs that held a local winner)
     fetch_u(0);  // pass 0's u rows; pass p fetches pass p+1's
-    for (int ps = 0; ps < npass; ++ps) {
-      const int it = k * npass + ps, r0 = ps * kGrp, nr = min(kGrp, nb - r0);
+    for (int32_t ps = 0; ps < npass; ++ps) {
+      const int32_t it = k * npass + ps, r0 = ps * kGrp, nr = min(kGrp, nb - r0);
       if (ps + 1 < npass) fetch_u(ps + 1);
       ptx::mbar_wait_cta(ptx::to_shared(&mbar_u[ps]), k & 1);
       {
-        const int rq = r0 + (g >> 1);
-        int acc[NG + TS][4];
+        const int32_t rq = r0 + (g >> 1);
+        int32_t acc[NG + TS][4];
         gemv(acc, u_s + (rq < nb ? rq : nb) * kURowWords);
         if (tig < nr) {  // lane tig: request r0 + tig, rows g / g+8 of every tile of this warp
           const uint32_t* ur = u_s + (r0 + tig) * kURowWords;
           const float u_hi = __uint_as_float(ur[128]), u_lo = __uint_as_float(ur[129]);
           float* dst = bias_s + ((it & 1) * kGrp + tig) * rows_cta;
 #pragma unroll
-          for (int i = 0; i < NG + TS; ++i) {
-            const int t = i < NG ? tiles_smem + warp * NG + i : warp + kWarps * (i - NG);
+          for (int32_t i = 0; i < NG + TS; ++i) {
+            const int32_t t = i < NG ? tiles_smem + warp * NG + i : warp + kWarps * (i - NG);
             store_bias_rn(acc[i], scale_s[t * 16 + g], scale_s[t * 16 + g + 8], u_hi, u_lo, dst, t * 16, g);
           }
         }
@@ -235,17 +235,17 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
       // epilogue: wpr = kWarps / (nr rounded up to a power of 2) whole warps per request (8 for a lone request:
       // sampling's noise is the bulk of the work), lane's 8-row chunks (warp % wpr) * 32 + lane + 32 wpr j --
       // a plain warp max per request, no shared atomics
-      const int wpr = nr == 1 ? kWarps : nr == 2 ? kWarps / 2 : kWarps / 4;
-      const int rr = warp / wpr;
+      const int32_t wpr = nr == 1 ? kWarps : nr == 2 ? kWarps / 2 : kWarps / 4;
+      const int32_t rr = warp / wpr;
       if (rr < nr) {
-        const int b = r0 + rr;
+        const int32_t b = r0 + rr;
         const __nv_bfloat16* bsrc = base_s + ((it & 1) * kGrp + rr) * rows_cta;
         const float* bias = bias_s + ((it & 1) * kGrp + rr) * rows_cta;
         const float inv_t = inv_t_s[b];
-        u64 best = 0;
+        uint64_t best = 0;
 #pragma unroll 1
-        for (int c = (warp % wpr) * 32 + lane; c < kChunks; c += wpr * 32) {
-          const int l = c * 8;
+        for (int32_t c = (warp % wpr) * 32 + lane; c < kChunks; c += wpr * 32) {
+          const int32_t l = c * 8;
           const uint4 bb = *reinterpret_cast<const uint4*>(bsrc + l);
           const float4 b0 = *reinterpret_cast<const float4*>(bias + l);
           const float4 b1 = *reinterpret_cast<const float4*>(bias + l + 4);
@@ -268,17 +268,17 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
           // (bf16 -> fp32 is a shift).  valid_rows % 8 == 0: a chunk is all valid or all padding (skipped below).
           uint4 o;
           {
-            unsigned* op = reinterpret_cast<unsigned*>(&o);
+            uint32_t* op = reinterpret_cast<uint32_t*>(&o);
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
+            for (int32_t i = 0; i < 4; ++i) {
               const __nv_bfloat162 hv = __floats2bfloat162_rn(lg[2 * i], lg[2 * i + 1]);
-              op[i] = *reinterpret_cast<const unsigned*>(&hv);
+              op[i] = *reinterpret_cast<const uint32_t*>(&hv);
             }
           }
           const size_t out = (static_cast<size_t>(b) * kb + k) * ld + row_base + l;
-          const int r = row_base + l;
+          const int32_t r = row_base + l;
           float m;
-          int idx;
+          int32_t idx;
           if (inv_t > 0.f) {  // Gumbel-max; Philox counter (row / 4, step | request << 8, round), small_batch's own key
             // corrected: sampling requests only (the verifier's q), valid rows only
             if (corrected && r < valid_rows) *reinterpret_cast<uint4*>(corrected + out) = o;
@@ -291,72 +291,72 @@ __global__ void __launch_bounds__(kThreads, 1) markov_walk_small_batch_kernel(
             lg[6] = __uint_as_float(o.w << 16);
             lg[7] = __uint_as_float(o.w & 0xFFFF0000u);
 #pragma unroll
-            for (int h = 0; h < 2; ++h) {
+            for (int32_t h = 0; h < 2; ++h) {
               const uint4 x = philox(
                   make_uint4(
-                      static_cast<unsigned>((r + 4 * h) >> 2),
-                      static_cast<unsigned>(k) | (static_cast<unsigned>(b) << 8),
-                      static_cast<unsigned>(round),
-                      static_cast<unsigned>(round >> 32)),
+                      static_cast<uint32_t>((r + 4 * h) >> 2),
+                      static_cast<uint32_t>(k) | (static_cast<uint32_t>(b) << 8),
+                      static_cast<uint32_t>(round),
+                      static_cast<uint32_t>(round >> 32)),
                   seed2);
               const float gv[4] = {gumbel_fast(x.x), gumbel_fast(x.y), gumbel_fast(x.z), gumbel_fast(x.w)};
 #pragma unroll
-              for (int i = 0; i < 4; ++i)
+              for (int32_t i = 0; i < 4; ++i)
                 lg[4 * h + i] = __fmaf_rn(lg[4 * h + i], inv_t, gv[i]);
             }
             m = fmaxf(fmaxf(fmaxf(lg[0], lg[1]), fmaxf(lg[2], lg[3])), fmaxf(fmaxf(lg[4], lg[5]), fmaxf(lg[6], lg[7])));
             idx = 7;
 #pragma unroll
-            for (int i = 6; i >= 0; --i)
+            for (int32_t i = 6; i >= 0; --i)
               idx = lg[i] == m ? i : idx;  // ties -> smallest row, as torch.argmax
           } else {
-            const unsigned m2 = ptx::bf16x8_max(o.x, o.y, o.z, o.w);
+            const uint32_t m2 = ptx::bf16x8_max(o.x, o.y, o.z, o.w);
             idx = ptx::bf16x8_first_eq(o.x, o.y, o.z, o.w, m2);
             m = __uint_as_float(m2 << 16);
           }
           if (r < valid_rows) best = max(best, pack_key(m, r + idx));
         }
-        const unsigned hi = static_cast<unsigned>(best >> 32);
-        const unsigned mx = __reduce_max_sync(0xffffffffu, hi);
-        const unsigned lo = __reduce_max_sync(0xffffffffu, hi == mx ? static_cast<unsigned>(best) : 0u);
-        if (lane == 0) wbest_s[b][warp % wpr] = (static_cast<u64>(mx) << 32) | lo;
+        const uint32_t hi = static_cast<uint32_t>(best >> 32);
+        const uint32_t mx = __reduce_max_sync(0xffffffffu, hi);
+        const uint32_t lo = __reduce_max_sync(0xffffffffu, hi == mx ? static_cast<uint32_t>(best) : 0u);
+        if (lane == 0) wbest_s[b][warp % wpr] = (static_cast<uint64_t>(mx) << 32) | lo;
       }
     }
     __syncthreads();  // every request's warp bests are in wbest_s
     if (warp == kXchgWarp) {
       // post: W1q[local winner] -> L2 (the global winner's row is then an L2 hit for every CTA), atomicMax of the
       // key, then the arrival count with release semantics (orders this lane's max before its arrival)
-      for (int b = lane; b < nb; b += 32) {
-        const int r0 = b / kGrp * kGrp, nr = min(kGrp, nb - r0);  // b's pass: how many warps wrote a best
-        const int wpr = nr == 1 ? kWarps : nr == 2 ? kWarps / 2 : kWarps / 4;
-        u64 best = wbest_s[b][0];
-        for (int w = 1; w < wpr; ++w)
+      for (int32_t b = lane; b < nb; b += 32) {
+        const int32_t r0 = b / kGrp * kGrp, nr = min(kGrp, nb - r0);  // b's pass: how many warps wrote a best
+        const int32_t wpr = nr == 1 ? kWarps : nr == 2 ? kWarps / 2 : kWarps / 4;
+        uint64_t best = wbest_s[b][0];
+        for (int32_t w = 1; w < wpr; ++w)
           best = max(best, wbest_s[b][w]);
         const char* row = reinterpret_cast<const char*>(w1q + static_cast<size_t>(key_row(best)) * kURowWords);
 #pragma unroll
-        for (int line = 0; line < 5; ++line)
+        for (int32_t line = 0; line < 5; ++line)
           ptx::prefetch_l2(row + line * 128);
-        atomicMax(pair(k, b), best);
+        ptx::red_relaxed_max_u64(pair(k, b), best);
       }
-      u64 key[kMaxB / 32] = {};  // the winner key of requests lane + 32 q (zero-initialized: kept in registers)
-      for (int b = lane; b < nb; b += 32)
+      uint64_t key[kMaxB / 32] = {};  // the winner key of requests lane + 32 q (zero-initialized: kept in registers)
+      for (int32_t b = lane; b < nb; b += 32)
         ptx::red_add_release(pair(k, b) + 1, 1);
 #pragma unroll
-      for (int q = 0; q < kMaxB / 32; ++q) {
-        const int b = lane + 32 * q;
+      for (int32_t q = 0; q < kMaxB / 32; ++q) {
+        const int32_t b = lane + 32 * q;
         if (b < nb) {
-          ulonglong2 v;
+          uint64_t v[2];
           do {
-            v = ptx::ld_relaxed_v2(pair(k, b));
-          } while (v.y < n);
-          key[q] = v.x;
+            ptx::ld_relaxed_v2(pair(k, b), v);
+          } while (v[1] < n);
+          key[q] = v[0];
         }
       }
 #pragma unroll
-      for (int q = 0; q < kMaxB / 32; ++q) {
-        const int b = lane + 32 * q;
+      for (int32_t q = 0; q < kMaxB / 32; ++q) {
+        const int32_t b = lane + 32 * q;
         if (b < nb) {
-          const unsigned tok = key_row(key[q]);
+          const uint32_t tok = key_row(key[q]);
           tok_s[b] = tok;
           if (blockIdx.x == 0) tokens[static_cast<size_t>(b) * num_steps + k] = tok;
         }
@@ -453,15 +453,15 @@ inline void walk(
       static_cast<const int64_t*>(anchor.data_ptr()),
       static_cast<int64_t*>(tokens.data_ptr()),
       corrected.has_value() ? static_cast<__nv_bfloat16*>(corrected.value().data_ptr()) : nullptr,
-      static_cast<u64*>(state.data_ptr()),
+      static_cast<uint64_t*>(state.data_ptr()),
       static_cast<const float*>(temps.data_ptr()),
-      static_cast<int>(nb_v),
-      static_cast<int>(num_steps),
-      static_cast<int>(state_steps),
-      static_cast<int>(kb_v),
-      static_cast<int>(ld_v),
-      static_cast<int>(valid_rows),
-      static_cast<u64>(seed));
+      static_cast<int32_t>(nb_v),
+      static_cast<int32_t>(num_steps),
+      static_cast<int32_t>(state_steps),
+      static_cast<int32_t>(kb_v),
+      static_cast<int32_t>(ld_v),
+      static_cast<int32_t>(valid_rows),
+      static_cast<uint64_t>(seed));
 }
 
 }  // namespace sglang::dspark_markov_walk::small_batch
