@@ -232,6 +232,888 @@ This section provides deployment configurations optimized for different hardware
 
 - **Xeon CPU service configuration**: Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
+### 3.3 GB200 NVFP4-V2 with Dynamo prefill/decode disaggregation
+
+Use these recipes to serve text requests with
+[`nvidia/Qwen3.5-397B-A17B-NVFP4-V2`](https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4-V2)
+on GB200 NVL72. Separate prefill and decode workers exchange KV and Mamba state through
+Mooncake; a Dynamo frontend exposes the OpenAI API. The decode workers use the
+checkpoint's embedded MTP head. These commands use `python3 -m dynamo.sglang`, the
+Dynamo backend entrypoint, rather than the aggregated `sglang serve` entrypoint above.
+
+The settings below come from nine executed fixed-sequence deployment variants in
+[InferenceX PR #2594](https://github.com/SemiAnalysisAI/InferenceX/pull/2594), at commit
+`c6331223dc1495f185373aef7ce2e1c759441367`.
+[Run 34389014274, attempt 1](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34389014274)
+executed nine benchmarks and six GSM8K evaluations. The harness executed these serving
+settings; the standalone Docker and service commands below have not been independently
+executed on GB200. This section does not add measurements to the interactive generator.
+
+<Warning>
+These are short-context settings: `--context-length 9236`, FP8 E4M3 KV cache, and disabled
+radix cache. They are suitable starting points for the measured 8192-input/1024-output
+text workload, not the model's full context window. FP8 KV can affect accuracy; validate
+your workload before adopting it. The long heartbeat and watchdog settings retain the
+tested configuration and delay detection of an unhealthy worker. The higher decode
+memory fraction in the final variant leaves less headroom for other workloads.
+</Warning>
+
+#### Prerequisites and versions
+
+- Linux ARM64 GB200 hosts with four GPUs per host, a working NVL72 multi-node fabric,
+  NVIDIA Container Toolkit, RDMA devices, and host networking. The executed fingerprint
+  reported driver `580.126.20`, CUDA `13.0`, and Python `3.12.3`.
+- Container: `lmsysorg/sglang:nightly-dev-cu13-20260709-074bb928`. Preserve this tag when
+  using the legacy `--mamba-scheduler-strategy` spelling below; do not substitute `latest`.
+  Image build metadata reports SGLang commit
+  `074bb928f09c6e044b98b93c7b8aef48032d013d`; the executed package fingerprint reports
+  `0.0.0.dev1+g2b3d9ad37` and editable source revision
+  `2b3d9ad3752eb7a20370c91a02beda7bcc073165`. These are separate provenance fields,
+  not evidence that a fresh pull was independently reproduced.
+- The first eight variants retain the image's Dynamo packages. The executed fingerprint
+  reports both `ai-dynamo` and `ai-dynamo-runtime` as `1.3.0.dev20260708`, with TCP as the
+  request plane. Check the installed versions before serving. The final variant installs
+  both packages at `1.2.1` and uses NATS. Use the same pair and request plane on every
+  worker and frontend in a deployment.
+- Stage the complete checkpoint and tokenizer on every worker host. The executed model
+  revision was `8f590eae8f10bf55d9a46f79ea0280bde435c9f8`. Use the checkpoint's embedded MTP
+  head and the framework's default loading of it; do not replace or quantize that head.
+- Provide reachable etcd and NATS services. The examples use etcd client port `2379` and
+  NATS port `4222` with JetStream. Install ARM64 binaries compatible with the selected
+  Dynamo version; the worker fingerprints do not establish exact service-binary versions.
+
+On each worker host, choose writable host directories and download the checkpoint before
+entering the serving container. `hf` is the Hugging Face CLI; authenticate with it if your
+environment requires credentials.
+
+```bash Stage the checkpoint on each worker host
+export MODEL_DIR=/srv/models/Qwen3.5-397B-A17B-NVFP4-V2
+export CACHE_DIR=/var/tmp/qwen35-dynamo-cache
+mkdir -p "$MODEL_DIR" "$CACHE_DIR/deepgemm-cache" "$CACHE_DIR/flashinfer-cache"
+hf download nvidia/Qwen3.5-397B-A17B-NVFP4-V2 \
+  --revision 8f590eae8f10bf55d9a46f79ea0280bde435c9f8 \
+  --local-dir "$MODEL_DIR"
+docker run --rm -it --gpus all --network host --ipc host \
+  --ulimit memlock=-1:-1 --device /dev/infiniband \
+  --mount "type=bind,src=$MODEL_DIR,dst=/model,readonly" \
+  --mount "type=bind,src=$CACHE_DIR,dst=/configs" \
+  lmsysorg/sglang:nightly-dev-cu13-20260709-074bb928 bash
+```
+
+Use a separate container/shell on each worker host. For the TP2 variants expose two GPUs
+per worker, for example `export CUDA_VISIBLE_DEVICES=0,1` inside its container. All other
+variants use four local GPUs. Each TP2 worker occupied its own physical host in the
+executed recipes; packing several workers onto one host is a different layout.
+
+<Accordion title="Dynamo package setup and version check">
+
+Only for `7p4d-dep4-dep4-c12288`, run this in each worker and frontend container:
+
+```bash Install the final variant's Dynamo pair
+python3 -m pip install --break-system-packages --no-deps \
+  --extra-index-url https://pypi.nvidia.com \
+  ai-dynamo==1.2.1 ai-dynamo-runtime==1.2.1
+```
+
+For every variant, inspect the package identity rather than inferring it from the image tag:
+
+```bash Inspect serving package versions
+python3 - <<'PY'
+from importlib.metadata import version
+for name in ("sglang", "ai-dynamo", "ai-dynamo-runtime"):
+    print(name, version(name))
+PY
+```
+
+Install before launching processes. `--no-deps` matches the original staged-wheel install
+and preserves the image's engine and shared dependency versions. The wheel pair is an official Dynamo dependency,
+not a serving-engine patch. A different package combination needs fresh validation.
+
+</Accordion>
+
+#### Start discovery and transport services
+
+Run these commands on one infrastructure host, in separate terminals. Replace the example
+IP with that host's reachable address. Use dedicated empty data directories; do not
+delete data belonging to an existing service. This single-instance setup matches the
+deployment layout and is not a highly available service configuration.
+
+```bash Start etcd on the infrastructure host
+export INFRA_IP=192.0.2.10
+export ETCD_DATA_DIR=/var/tmp/qwen35-etcd
+etcd --data-dir "$ETCD_DATA_DIR" \
+  --listen-client-urls http://0.0.0.0:2379 \
+  --advertise-client-urls "http://$INFRA_IP:2379"
+```
+
+```bash Start NATS with JetStream on the infrastructure host
+export NATS_DATA_DIR=/var/tmp/qwen35-nats
+nats-server -js -sd "$NATS_DATA_DIR"
+```
+
+On all workers and frontend shells, set the same reachable endpoints. TCP request-plane
+variants still use NATS for events and etcd for discovery.
+
+```bash Set discovery endpoints in each serving shell
+export ETCD_ENDPOINTS=http://192.0.2.10:2379
+export NATS_SERVER=nats://192.0.2.10:4222
+export DYN_SKIP_SGLANG_LOG_FORMATTING=1
+export DYN_LOG=info,dynamo_runtime::pipeline::network::ingress::push_handler=warn
+```
+
+Permit the discovery ports, the frontend API port, each worker's HTTP/system/NCCL and
+prefill bootstrap ports, and fabric traffic between participating hosts. The service
+and fabric addresses must resolve inside the containers.
+
+#### Worker environment and shared engine flags
+
+Run the following blocks in each worker container's Bash shell. Cache paths refer to the
+writable `/configs` mount above. The original offline flags (`HF_HUB_OFFLINE=1` and
+`TRANSFORMERS_OFFLINE=1`) can be enabled after the complete checkpoint/tokenizer is
+staged; they control file access rather than the engine's numerical behavior.
+
+```bash Set the shared worker environment
+export NO_COLOR=1
+export PYTHONUNBUFFERED=1
+export TORCH_DISTRIBUTED_DEFAULT_TIMEOUT=3600
+export TORCH_NCCL_WATCHDOG_TIMEOUT_SEC=3600
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600
+export NCCL_MNNVL_ENABLE=1
+export NCCL_NVLS_ENABLE=0
+export NCCL_CUMEM_ENABLE=1
+export MC_FORCE_MNNVL=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_DG_CACHE_DIR=/configs/deepgemm-cache
+export FLASHINFER_WORKSPACE_BASE=/configs/flashinfer-cache
+export SGLANG_ENABLE_JIT_DEEPGEMM=true
+export SGLANG_ENABLE_FLASHINFER_GEMM=true
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+export SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE=100000
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=100000
+export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=100000
+export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True
+export SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=0
+export SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK=1
+export SGLANG_HEALTH_CHECK_TIMEOUT=3600
+export SGLANG_HEALTH_STARTING_OK=1
+export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0
+```
+
+Use the network device names configured for your NVL72 hosts. The executed launch also
+set `NCCL_NET_GDR_C2C=1`, `NCCL_IB_SL=1`, `NCCL_IB_TIMEOUT=20`, and
+`NVSHMEM_REMOTE_TRANSPORT=none`; copy these only on a matching fabric. Interface and HCA
+names are site-specific. The following names are placeholders, not universal GB200 defaults:
+
+```bash Set the worker's fabric interfaces
+export NCCL_NET_GDR_C2C=1
+export NCCL_IB_SL=1
+export NCCL_IB_TIMEOUT=20
+export NCCL_SOCKET_IFNAME=YOUR_IP_INTERFACE
+export NCCL_IB_HCA=YOUR_COMMA_SEPARATED_HCA_NAMES
+export UCX_NET_DEVICES=YOUR_COMMA_SEPARATED_HCA_PORTS_AND_IP_INTERFACE
+export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=YOUR_IP_INTERFACE
+export NVSHMEM_ENABLE_NIC_PE_MAPPING=1
+export NVSHMEM_HCA_PE_MAPPING=YOUR_HCA_PE_MAPPING
+export NVSHMEM_REMOTE_TRANSPORT=none
+```
+
+The shared arguments retain mixed target quantization, FlashInfer CUTLASS FP4 GEMM,
+TensorRT-LLM attention/MoE, FlashInfer linear-attention decode, FP8 KV cache, BF16 Mamba
+state, disabled radix cache, and 64-token pages. Prefill and decode have separate cache,
+batching, and MTP settings in the next block.
+
+```bash Define shared worker arguments
+COMMON_ARGS=(
+  --model-path /model
+  --served-model-name nvidia/Qwen3.5-397B-A17B-NVFP4-V2
+  --trust-remote-code
+  --reasoning-parser qwen3
+  --tool-call-parser qwen3_coder
+  --quantization modelopt_mixed
+  --fp4-gemm-backend flashinfer_cutlass
+  --kv-cache-dtype fp8_e4m3
+  --mamba-scheduler-strategy no_buffer
+  --mamba-ssm-dtype bfloat16
+  --attention-backend trtllm_mha
+  --mm-attention-backend triton_attn
+  --linear-attn-decode-backend flashinfer
+  --disaggregation-transfer-backend mooncake
+  --disable-radix-cache
+  --context-length 9236
+  --page-size 64
+)
+```
+
+#### Choose a serving variant
+
+`P` and `D` count logical prefill/decode workers. A TP16/EP16 decode worker spans four
+physical four-GPU hosts; four DEP4 decode workers occupy four hosts independently.
+The `c` suffix identifies the originating workload point, not a frontend admission limit.
+The per-worker `--max-running-requests` values remain explicit below.
+
+<table>
+  <thead><tr><th>Variant</th><th>Workers and parallelism (TP/EP/DP)</th><th>Physical hosts</th><th>Decode MTP steps</th></tr></thead>
+  <tbody>
+    <tr><td><code>1p1d-tp4-tp4-c1</code></td><td>1P 4/1/1; 1D 4/1/1</td><td>2</td><td>3</td></tr>
+    <tr><td><code>1p1d-tp4-tp4-c4</code></td><td>1P 4/1/1; 1D 4/1/1</td><td>2</td><td>3</td></tr>
+    <tr><td><code>1p1d-tp4-tp4-c8</code></td><td>1P 4/1/1; 1D 4/1/1</td><td>2</td><td>3</td></tr>
+    <tr><td><code>3p5d-tp4-tp4-c128</code></td><td>3P 4/1/1; 5D 4/1/1</td><td>8</td><td>3</td></tr>
+    <tr><td><code>2p2d-tp2-tp2-c512</code></td><td>2P 2/1/1; 2D 2/1/1</td><td>4</td><td>3</td></tr>
+    <tr><td><code>2p3d-tp2-tp2-c768</code></td><td>2P 2/1/1; 3D 2/1/1</td><td>5</td><td>3</td></tr>
+    <tr><td><code>7p1d-dep4-dep16-c5120</code></td><td>7P 4/4/4; 1D 16/16/16</td><td>11</td><td>2</td></tr>
+    <tr><td><code>7p1d-dep4-dep16-c8192</code></td><td>7P 4/4/4; 1D 16/16/16</td><td>11</td><td>2</td></tr>
+    <tr><td><code>7p4d-dep4-dep4-c12288</code></td><td>7P 4/4/4; 4D 4/4/4</td><td>11</td><td>1</td></tr>
+  </tbody>
+</table>
+
+Select one variant explicitly. This block defines the complete role-specific arguments
+and environment additions for that variant; run it in every worker and frontend shell.
+Frontend shells only need `DYN_REQUEST_PLANE` from this block.
+
+<Accordion title="Serving arguments for all nine variants">
+
+```bash Select the serving variant
+PROFILE=1p1d-tp4-tp4-c1
+case "$PROFILE" in
+  1p1d-tp4-tp4-c1)
+    export DYN_REQUEST_PLANE=tcp
+    PREFILL_ARGS=(
+      --tensor-parallel-size 4
+      --data-parallel-size 1
+      --expert-parallel-size 1
+      --mamba-track-interval 2048
+      --moe-runner-backend flashinfer_trtllm
+      --mem-fraction-static 0.8
+      --max-total-tokens 128000
+      --max-running-requests 128
+      --cuda-graph-max-bs 4
+      --chunked-prefill-size 32768
+      --max-prefill-tokens 32768
+      --scheduler-recv-interval 10
+      --stream-interval 30
+      --load-balance-method round_robin
+      --watchdog-timeout 1000000
+      --log-level info
+    )
+    PREFILL_ENV=(
+
+    )
+    DECODE_ARGS=(
+      --tensor-parallel-size 4
+      --data-parallel-size 1
+      --expert-parallel-size 1
+      --mamba-track-interval 128
+      --moe-runner-backend flashinfer_trtllm
+      --speculative-algorithm NEXTN
+      --speculative-num-steps 3
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens 4
+      --mem-fraction-static 0.8
+      --max-total-tokens 1500000
+      --max-mamba-cache-size 256
+      --max-running-requests 128
+      --cuda-graph-max-bs 256
+      --chunked-prefill-size 32768
+      --max-prefill-tokens 32768
+      --scheduler-recv-interval 10
+      --stream-interval 30
+      --watchdog-timeout 1000000
+      --decode-log-interval 1
+    )
+    DECODE_ENV=(
+      MC_TE_METRIC=true
+      SGLANG_DECODE_BOOTSTRAP_TIMEOUT=1000
+    )
+    ;;
+  1p1d-tp4-tp4-c4)
+    export DYN_REQUEST_PLANE=tcp
+    PREFILL_ARGS=(
+      --tensor-parallel-size 4
+      --data-parallel-size 1
+      --expert-parallel-size 1
+      --mamba-track-interval 2048
+      --moe-runner-backend flashinfer_trtllm
+      --mem-fraction-static 0.8
+      --max-total-tokens 128000
+      --max-running-requests 128
+      --cuda-graph-max-bs 4
+      --chunked-prefill-size 32768
+      --max-prefill-tokens 32768
+      --scheduler-recv-interval 1
+      --stream-interval 30
+      --load-balance-method round_robin
+      --watchdog-timeout 1000000
+      --log-level info
+    )
+    PREFILL_ENV=(
+
+    )
+    DECODE_ARGS=(
+      --tensor-parallel-size 4
+      --data-parallel-size 1
+      --expert-parallel-size 1
+      --mamba-track-interval 128
+      --moe-runner-backend flashinfer_trtllm
+      --speculative-algorithm NEXTN
+      --speculative-num-steps 3
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens 4
+      --mem-fraction-static 0.8
+      --max-total-tokens 1500000
+      --max-mamba-cache-size 256
+      --max-running-requests 128
+      --cuda-graph-max-bs 256
+      --chunked-prefill-size 32768
+      --max-prefill-tokens 32768
+      --scheduler-recv-interval 10
+      --stream-interval 30
+      --watchdog-timeout 1000000
+      --decode-log-interval 1
+    )
+    DECODE_ENV=(
+      MC_TE_METRIC=true
+      SGLANG_DECODE_BOOTSTRAP_TIMEOUT=1000
+    )
+    ;;
+  1p1d-tp4-tp4-c8)
+    export DYN_REQUEST_PLANE=tcp
+    PREFILL_ARGS=(
+      --tensor-parallel-size 4
+      --data-parallel-size 1
+      --expert-parallel-size 1
+      --mamba-track-interval 2048
+      --moe-runner-backend flashinfer_trtllm
+      --mem-fraction-static 0.8
+      --max-total-tokens 128000
+      --max-running-requests 128
+      --cuda-graph-max-bs 4
+      --chunked-prefill-size 32768
+      --max-prefill-tokens 32768
+      --scheduler-recv-interval 10
+      --stream-interval 30
+      --load-balance-method round_robin
+      --watchdog-timeout 1000000
+      --log-level info
+    )
+    PREFILL_ENV=(
+
+    )
+    DECODE_ARGS=(
+      --tensor-parallel-size 4
+      --data-parallel-size 1
+      --expert-parallel-size 1
+      --mamba-track-interval 128
+      --moe-runner-backend flashinfer_trtllm
+      --speculative-algorithm NEXTN
+      --speculative-num-steps 3
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens 4
+      --mem-fraction-static 0.8
+      --max-total-tokens 1500000
+      --max-mamba-cache-size 256
+      --max-running-requests 128
+      --cuda-graph-max-bs 256
+      --chunked-prefill-size 32768
+      --max-prefill-tokens 32768
+      --scheduler-recv-interval 10
+      --stream-interval 50
+      --watchdog-timeout 1000000
+      --decode-log-interval 1
+    )
+    DECODE_ENV=(
+      MC_TE_METRIC=true
+      SGLANG_DECODE_BOOTSTRAP_TIMEOUT=1000
+    )
+    ;;
+  3p5d-tp4-tp4-c128)
+    export DYN_REQUEST_PLANE=tcp
+    PREFILL_ARGS=(
+      --tensor-parallel-size 4
+      --data-parallel-size 1
+      --expert-parallel-size 1
+      --mamba-track-interval 2048
+      --moe-runner-backend flashinfer_trtllm
+      --mem-fraction-static 0.8
+      --max-total-tokens 128000
+      --max-running-requests 128
+      --cuda-graph-max-bs 4
+      --chunked-prefill-size 32768
+      --max-prefill-tokens 32768
+      --scheduler-recv-interval 10
+      --stream-interval 30
+      --load-balance-method round_robin
+      --watchdog-timeout 1000000
+      --log-level info
+    )
+    PREFILL_ENV=(
+
+    )
+    DECODE_ARGS=(
+      --tensor-parallel-size 4
+      --data-parallel-size 1
+      --expert-parallel-size 1
+      --mamba-track-interval 128
+      --moe-runner-backend flashinfer_trtllm
+      --speculative-algorithm NEXTN
+      --speculative-num-steps 3
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens 4
+      --mem-fraction-static 0.8
+      --max-total-tokens 1500000
+      --max-mamba-cache-size 256
+      --max-running-requests 128
+      --cuda-graph-max-bs 256
+      --chunked-prefill-size 32768
+      --max-prefill-tokens 32768
+      --scheduler-recv-interval 10
+      --stream-interval 30
+      --watchdog-timeout 1000000
+      --decode-log-interval 1
+    )
+    DECODE_ENV=(
+      MC_TE_METRIC=true
+      SGLANG_DECODE_BOOTSTRAP_TIMEOUT=1000
+    )
+    ;;
+  2p2d-tp2-tp2-c512)
+    export DYN_REQUEST_PLANE=tcp
+    PREFILL_ARGS=(
+      --tensor-parallel-size 2
+      --data-parallel-size 1
+      --expert-parallel-size 1
+      --mamba-track-interval 2048
+      --moe-runner-backend flashinfer_trtllm
+      --mem-fraction-static 0.8
+      --max-total-tokens 64000
+      --max-running-requests 64
+      --cuda-graph-max-bs 4
+      --chunked-prefill-size 16384
+      --max-prefill-tokens 16384
+      --scheduler-recv-interval 10
+      --stream-interval 30
+      --load-balance-method round_robin
+      --watchdog-timeout 1000000
+      --log-level info
+    )
+    PREFILL_ENV=(
+      ETCD_LEASE_TTL=120
+    )
+    DECODE_ARGS=(
+      --tensor-parallel-size 2
+      --data-parallel-size 1
+      --expert-parallel-size 1
+      --mamba-track-interval 128
+      --moe-runner-backend flashinfer_trtllm
+      --speculative-algorithm NEXTN
+      --speculative-num-steps 3
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens 4
+      --mem-fraction-static 0.8
+      --max-total-tokens 750000
+      --max-mamba-cache-size 128
+      --max-running-requests 84
+      --cuda-graph-max-bs 88
+      --chunked-prefill-size 32768
+      --max-prefill-tokens 32768
+      --scheduler-recv-interval 10
+      --stream-interval 30
+      --watchdog-timeout 1000000
+      --decode-log-interval 1
+    )
+    DECODE_ENV=(
+      ETCD_LEASE_TTL=120
+      MC_TE_METRIC=true
+      SGLANG_DECODE_BOOTSTRAP_TIMEOUT=1000
+    )
+    ;;
+  2p3d-tp2-tp2-c768)
+    export DYN_REQUEST_PLANE=tcp
+    PREFILL_ARGS=(
+      --tensor-parallel-size 2
+      --data-parallel-size 1
+      --expert-parallel-size 1
+      --mamba-track-interval 2048
+      --moe-runner-backend flashinfer_trtllm
+      --mem-fraction-static 0.8
+      --max-total-tokens 64000
+      --max-running-requests 64
+      --cuda-graph-max-bs 4
+      --chunked-prefill-size 16384
+      --max-prefill-tokens 16384
+      --scheduler-recv-interval 10
+      --stream-interval 30
+      --load-balance-method round_robin
+      --watchdog-timeout 1000000
+      --log-level info
+    )
+    PREFILL_ENV=(
+
+    )
+    DECODE_ARGS=(
+      --tensor-parallel-size 2
+      --data-parallel-size 1
+      --expert-parallel-size 1
+      --mamba-track-interval 128
+      --moe-runner-backend flashinfer_trtllm
+      --speculative-algorithm NEXTN
+      --speculative-num-steps 3
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens 4
+      --mem-fraction-static 0.8
+      --max-total-tokens 750000
+      --max-mamba-cache-size 128
+      --max-running-requests 86
+      --cuda-graph-max-bs 88
+      --chunked-prefill-size 32768
+      --max-prefill-tokens 32768
+      --scheduler-recv-interval 10
+      --stream-interval 30
+      --watchdog-timeout 1000000
+      --decode-log-interval 1
+    )
+    DECODE_ENV=(
+      MC_TE_METRIC=true
+      SGLANG_DECODE_BOOTSTRAP_TIMEOUT=1000
+    )
+    ;;
+  7p1d-dep4-dep16-c5120)
+    export DYN_REQUEST_PLANE=tcp
+    PREFILL_ARGS=(
+      --tensor-parallel-size 4
+      --data-parallel-size 4
+      --expert-parallel-size 4
+      --enable-dp-attention
+      --enable-dp-lm-head
+      --mamba-track-interval 2048
+      --moe-runner-backend flashinfer_trtllm
+      --mem-fraction-static 0.8
+      --max-total-tokens 128000
+      --max-running-requests 128
+      --cuda-graph-max-bs 4
+      --chunked-prefill-size 65536
+      --max-prefill-tokens 65536
+      --scheduler-recv-interval 1
+      --stream-interval 50
+      --load-balance-method round_robin
+      --watchdog-timeout 1000000
+      --log-level info
+    )
+    PREFILL_ENV=(
+
+    )
+    DECODE_ARGS=(
+      --tensor-parallel-size 16
+      --data-parallel-size 16
+      --expert-parallel-size 16
+      --enable-dp-attention
+      --enable-dp-lm-head
+      --mamba-track-interval 128
+      --moe-a2a-backend flashinfer
+      --moe-runner-backend flashinfer_cutedsl
+      --speculative-moe-a2a-backend none
+      --speculative-moe-runner-backend flashinfer_trtllm
+      --disable-shared-experts-fusion
+      --speculative-algorithm NEXTN
+      --speculative-num-steps 2
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens 3
+      --cuda-graph-max-bs 256
+      --mem-fraction-static 0.8
+      --max-total-tokens 2200000
+      --max-mamba-cache-size 2048
+      --max-running-requests 2048
+      --chunked-prefill-size 4096
+      --max-prefill-tokens 32768
+      --scheduler-recv-interval 1
+      --stream-interval 50
+      --watchdog-timeout 1000000
+      --decode-log-interval 50
+    )
+    DECODE_ENV=(
+      MC_TE_METRIC=true
+      SGLANG_MOE_NVFP4_DISPATCH=1
+      SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024
+      SGLANG_DECODE_BOOTSTRAP_TIMEOUT=1000
+    )
+    ;;
+  7p1d-dep4-dep16-c8192)
+    export DYN_REQUEST_PLANE=tcp
+    PREFILL_ARGS=(
+      --tensor-parallel-size 4
+      --data-parallel-size 4
+      --expert-parallel-size 4
+      --enable-dp-attention
+      --enable-dp-lm-head
+      --mamba-track-interval 2048
+      --moe-runner-backend flashinfer_trtllm
+      --mem-fraction-static 0.8
+      --max-total-tokens 128000
+      --max-running-requests 128
+      --cuda-graph-max-bs 4
+      --chunked-prefill-size 65536
+      --max-prefill-tokens 65536
+      --scheduler-recv-interval 1
+      --stream-interval 50
+      --load-balance-method round_robin
+      --watchdog-timeout 1000000
+      --log-level info
+    )
+    PREFILL_ENV=(
+
+    )
+    DECODE_ARGS=(
+      --tensor-parallel-size 16
+      --data-parallel-size 16
+      --expert-parallel-size 16
+      --enable-dp-attention
+      --enable-dp-lm-head
+      --mamba-track-interval 128
+      --moe-a2a-backend flashinfer
+      --moe-runner-backend flashinfer_cutedsl
+      --speculative-moe-a2a-backend none
+      --speculative-moe-runner-backend flashinfer_trtllm
+      --disable-shared-experts-fusion
+      --speculative-algorithm NEXTN
+      --speculative-num-steps 2
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens 3
+      --cuda-graph-max-bs 256
+      --mem-fraction-static 0.8
+      --max-total-tokens 2200000
+      --max-mamba-cache-size 3413
+      --max-running-requests 3413
+      --chunked-prefill-size 4096
+      --max-prefill-tokens 32768
+      --scheduler-recv-interval 1
+      --stream-interval 50
+      --watchdog-timeout 1000000
+      --decode-log-interval 50
+    )
+    DECODE_ENV=(
+      MC_TE_METRIC=true
+      SGLANG_MOE_NVFP4_DISPATCH=1
+      SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024
+      SGLANG_DECODE_BOOTSTRAP_TIMEOUT=1000
+    )
+    ;;
+  7p4d-dep4-dep4-c12288)
+    export DYN_REQUEST_PLANE=nats
+    PREFILL_ARGS=(
+      --tensor-parallel-size 4
+      --data-parallel-size 4
+      --expert-parallel-size 4
+      --enable-dp-attention
+      --enable-dp-attention-local-control-broadcast
+      --enable-dp-lm-head
+      --mamba-track-interval 2048
+      --moe-runner-backend flashinfer_trtllm
+      --mem-fraction-static 0.8
+      --max-total-tokens 256000
+      --max-running-requests 128
+      --cuda-graph-max-bs 4
+      --chunked-prefill-size 262144
+      --max-prefill-tokens 131072
+      --scheduler-recv-interval 1
+      --stream-interval 50
+      --load-balance-method round_robin
+      --watchdog-timeout 1000000
+      --log-level info
+    )
+    PREFILL_ENV=(
+
+    )
+    DECODE_ARGS=(
+      --tensor-parallel-size 4
+      --data-parallel-size 4
+      --expert-parallel-size 4
+      --enable-dp-attention
+      --enable-dp-lm-head
+      --mamba-track-interval 128
+      --moe-a2a-backend none
+      --moe-runner-backend flashinfer_trtllm
+      --speculative-moe-a2a-backend none
+      --speculative-moe-runner-backend flashinfer_trtllm
+      --disable-shared-experts-fusion
+      --speculative-algorithm NEXTN
+      --speculative-num-steps 1
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens 2
+      --disable-flashinfer-autotune
+      --cuda-graph-max-bs 512
+      --mem-fraction-static 0.94
+      --max-total-tokens 2052736
+      --max-mamba-cache-size 1056
+      --max-running-requests 1056
+      --chunked-prefill-size 4096
+      --max-prefill-tokens 32768
+      --scheduler-recv-interval 1
+      --disaggregation-decode-polling-interval 8
+      --stream-interval 50
+      --soft-watchdog-timeout 240
+      --watchdog-timeout 300
+      --decode-log-interval 50
+    )
+    DECODE_ENV=(
+      MC_TE_METRIC=true
+      SGLANG_MOE_NVFP4_DISPATCH=1
+      SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024
+      SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH=1
+      SGLANG_DECODE_BOOTSTRAP_TIMEOUT=1000
+    )
+    ;;
+  *) printf 'Unknown serving variant: %s\n' "$PROFILE" >&2; exit 1 ;;
+esac
+```
+
+</Accordion>
+
+The DEP4 and DEP16 variants enable DP attention and DP LM-head alongside EP. The wide
+DEP16 decode uses `flashinfer` all-to-all and `flashinfer_cutedsl` for target MoE, while
+the speculative MoE path remains `flashinfer_trtllm` with no all-to-all. The final DEP4
+variant uses TensorRT-LLM MoE with no all-to-all, one MTP step, disabled FlashInfer
+autotuning, and `SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH=1`.
+
+The final variant also enabled `NCCL_DEBUG=INFO`, `NCCL_DEBUG_SUBSYS=COLL`, and CUDA
+coredumps in the harness. These are optional failure diagnostics, not numerical serving
+settings. If enabled, point `CUDA_COREDUMP_FILE` at a writable diagnostic directory and
+budget disk space. The commands above retain all engine and transport settings without
+requiring a harness-owned `/logs` path.
+
+#### Launch prefill and decode workers
+
+For a one-host worker, set its system and NCCL ports explicitly. The HTTP port may be the
+same on different physical hosts. When placing several processes on one host, allocate
+different HTTP, system, NCCL, and prefill-bootstrap ports. The original TP4 recipes supplied
+bootstrap port `31000`; for the other recipes the launcher allocated it. The example uses
+`31000` on each distinct prefill host and passes it once, avoiding duplicate flags.
+
+```bash Launch each one-host prefill worker
+export DYN_SYSTEM_PORT=7500
+env "${PREFILL_ENV[@]}" python3 -m dynamo.sglang \
+  "${COMMON_ARGS[@]}" "${PREFILL_ARGS[@]}" \
+  --host 0.0.0.0 --port 6100 --nccl-port 17500 \
+  --request-plane "$DYN_REQUEST_PLANE" \
+  --disaggregation-mode prefill --disaggregation-bootstrap-port 31000
+```
+
+```bash Launch each one-host decode worker
+export DYN_SYSTEM_PORT=7501
+env "${DECODE_ENV[@]}" python3 -m dynamo.sglang \
+  "${COMMON_ARGS[@]}" "${DECODE_ARGS[@]}" \
+  --host 0.0.0.0 --port 6100 --nccl-port 17501 \
+  --request-plane "$DYN_REQUEST_PLANE" --disaggregation-mode decode
+```
+
+For either `7p1d-dep4-dep16` variant, use the prefill command on seven separate hosts.
+Replace the one-host decode command with the following on each of its four decode hosts.
+All four ranks use the same leader address, distributed-init port, and selected profile;
+set a different rank on each host. Each rank exposes four local GPUs.
+
+```bash Launch one rank of the four-host TP16 decode worker
+DECODE_LEADER_IP=192.0.2.20
+NODE_RANK=0 # Set to 0, 1, 2, or 3 on the corresponding decode host.
+export DYN_SYSTEM_PORT=7501
+env "${DECODE_ENV[@]}" python3 -m dynamo.sglang \
+  "${COMMON_ARGS[@]}" "${DECODE_ARGS[@]}" \
+  --host 0.0.0.0 --port 6100 --nccl-port 17501 \
+  --request-plane "$DYN_REQUEST_PLANE" --disaggregation-mode decode \
+  --nnodes 4 --node-rank "$NODE_RANK" \
+  --dist-init-addr "$DECODE_LEADER_IP:29500"
+```
+
+#### Launch the frontend and send requests
+
+Run a frontend in the same image and Dynamo package environment as its workers. It needs
+the discovery endpoints and the selected request plane, but no model weights or GPU.
+Wait for the expected worker registrations before sending requests.
+
+```bash Launch a single Dynamo frontend
+python3 -m dynamo.frontend --http-port=30000 --enforce-disagg
+```
+
+The source recipes pass `--enforce-disagg`. The executed nightly frontend logs that this
+flag is deprecated and ignored: it determines routing and readiness from registered
+prefill/decode worker types. Do not rely on the flag alone to establish readiness.
+
+The wide DEP16 variants used three frontend replicas behind nginx. Start one on each of
+three distinct hosts using the frontend command above, with the same etcd/NATS endpoints
+and request plane. Configure nginx on another API host, replacing the example replica IPs.
+The upstream list uses nginx's round-robin selection, as in the harness. nginx is an
+external deployment dependency; pin its image/version for your environment.
+
+<Accordion title="nginx configuration for the three-frontend variants">
+
+```nginx nginx.conf
+worker_processes auto;
+events { worker_connections 65535; }
+http {
+    client_max_body_size 45m;
+    upstream dynamo_frontends {
+        server 192.0.2.31:30000;
+        server 192.0.2.32:30000;
+        server 192.0.2.33:30000;
+        keepalive 512;
+    }
+    server {
+        listen 30000;
+        location / {
+            proxy_pass http://dynamo_frontends;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_buffering off;
+            proxy_read_timeout 24h;
+            proxy_send_timeout 24h;
+        }
+    }
+}
+```
+
+```bash Start nginx on the API host
+nginx -c /absolute/path/to/nginx.conf -g 'daemon off;'
+```
+
+</Accordion>
+
+Set `API_HOST` to the single frontend or nginx host. Inspect `/health` for the expected
+prefill and decode worker counts. Then submit text through the chat endpoint so the
+server applies the checkpoint's chat template.
+
+```bash Inspect readiness and submit a chat request
+export API_HOST=192.0.2.30
+curl --fail "http://$API_HOST:30000/health"
+curl --fail "http://$API_HOST:30000/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "nvidia/Qwen3.5-397B-A17B-NVFP4-V2",
+    "messages": [{"role": "user", "content": "Explain prefill and decode in two sentences."}],
+    "max_tokens": 1024
+  }'
+```
+
+No standalone response output is claimed here. To compare this serving translation with
+the tested deployment, preserve the package/model identities, worker counts, role flags,
+environment, and request plane, and run an applicable accuracy and workload check on
+your target hosts.
+
+<Accordion title="Benchmark controls excluded from serving commands">
+
+The InferenceX workload used `sa-bench`, input length `8192`, output length `1024`,
+concurrencies `1/4/8/128/512/768/5120/8192/12288`, infinite offered request rate,
+`random_range_ratio=0.8`, prompt/warmup multipliers `10/2`, and chat-template formatting.
+The final point additionally enabled benchmark HTTP connection reuse. These configure
+the load generator, not production serving. Slurm allocation labels, result filenames,
+health-check retry loops, power collectors, and local model/cache aliases are also
+harness controls. The serving cache sizes, scheduler intervals, kernels, MTP settings,
+and worker/frontends above are retained because they affect the deployment itself.
+
+Source for the nine settings:
+[checked-in recipes at the tested commit](https://github.com/SemiAnalysisAI/InferenceX/tree/c6331223dc1495f185373aef7ce2e1c759441367/benchmarks/multi_node/srt-slurm-recipes/sglang/qwen3.5/gb200-fp4-v2/8k1k/mtp).
+The executed worker commands and framework fingerprints are in that run's
+`multinode_server_logs_*` artifacts. This qualification proves execution through the
+original harness; it does not prove an independently executed standalone launch.
+
+</Accordion>
+
 ## 4. Model Invocation
 
 **NVIDIA:**
