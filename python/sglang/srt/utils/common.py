@@ -1157,11 +1157,15 @@ def is_gfx1250_supported():
     """
     Returns whether the current platform is AMD RDNA4 (gfx1250).
     """
-    if torch.version.hip and torch.cuda.is_available():
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx1250"])
-    else:
+    if not torch.version.hip:
         return False
+    try:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+    except RuntimeError:
+        # No visible device (e.g. a num_gpus=0 Ray actor): HIP init fails with
+        # hipErrorNoDevice even though torch.cuda.is_available() can be True.
+        return False
+    return "gfx1250" in gcn_arch
 
 
 def get_hip_version():
