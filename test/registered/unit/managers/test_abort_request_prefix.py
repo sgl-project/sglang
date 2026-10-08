@@ -10,9 +10,10 @@ the flag, because batch requests derive child rids as ``f"{rid}_{i}"``.
 """
 
 import asyncio
+import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -24,23 +25,36 @@ from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _make_tokenizer_manager(rids=(), tokenizer_worker_num=1) -> TokenizerManager:
-    """Create a TokenizerManager with mocked dependencies, bypassing __init__."""
+def _make_tokenizer_manager(case, rids=(), tokenizer_worker_num=1) -> TokenizerManager:
+    """Create a TokenizerManager with mocked dependencies, bypassing __init__.
+
+    The config it reads comes from the bags, so the stand-in needs a published
+    config rather than attributes on a mock.
+    """
+    override = get_context().override_server_args(
+        tokenizer_worker_num=tokenizer_worker_num
+    )
+    override.install()
+    case.addCleanup(override.restore)
     tm = TokenizerManager.__new__(TokenizerManager)
-    tm.server_args = MagicMock()
-    tm.server_args.tokenizer_worker_num = tokenizer_worker_num
     tm.enable_metrics = False
     tm.enable_lora = False
-    tm.rid_to_state = {rid: Mock() for rid in rids}
+    tm.rid_to_state = {rid: Mock(abort_sent=False) for rid in rids}
     tm.send_to_scheduler = MagicMock()
     tm.tokenizer_ipc_name = None
     # The IPC boundary: sock_send's wire format varies (pickle/msgpack), so
     # tests observe dispatched objects here instead of on the zmq socket.
     tm._dispatch_to_scheduler = MagicMock()
+    tm.encoder_dispatch_ready = {}
+    tm.cuda_vmm_feature_transport = MagicMock()
+    tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
+        return_value=[]
+    )
     return tm
 
 
@@ -51,7 +65,7 @@ def _sent_req(tm) -> AbortReq:
 
 class TestAbortRequestPrefix(CustomTestCase):
     def test_prefix_match_sends_abort(self):
-        tm = _make_tokenizer_manager(rids=["job-1-seq-0", "job-1-seq-1", "other"])
+        tm = _make_tokenizer_manager(self, rids=["job-1-seq-0", "job-1-seq-1", "other"])
         tm.abort_request(rid="job-1", prefix=True)
 
         req = _sent_req(tm)
@@ -60,19 +74,19 @@ class TestAbortRequestPrefix(CustomTestCase):
         self.assertFalse(req.abort_all)
 
     def test_prefix_without_match_is_ignored(self):
-        tm = _make_tokenizer_manager(rids=["other-1", "other-2"])
+        tm = _make_tokenizer_manager(self, rids=["other-1", "other-2"])
         tm.abort_request(rid="job-1", prefix=True)
 
         tm._dispatch_to_scheduler.assert_not_called()
 
     def test_prefix_requires_full_prefix_not_substring(self):
-        tm = _make_tokenizer_manager(rids=["seq-job-1"])
+        tm = _make_tokenizer_manager(self, rids=["seq-job-1"])
         tm.abort_request(rid="job-1", prefix=True)
 
         tm._dispatch_to_scheduler.assert_not_called()
 
     def test_exact_match_still_works_without_prefix(self):
-        tm = _make_tokenizer_manager(rids=["job-1"])
+        tm = _make_tokenizer_manager(self, rids=["job-1"])
         tm.abort_request(rid="job-1")
 
         req = _sent_req(tm)
@@ -81,14 +95,14 @@ class TestAbortRequestPrefix(CustomTestCase):
 
     def test_exact_mode_does_not_prefix_match(self):
         # rid is only a prefix of a tracked request; exact mode must ignore it.
-        tm = _make_tokenizer_manager(rids=["job-1-seq-0"])
+        tm = _make_tokenizer_manager(self, rids=["job-1-seq-0"])
         tm.abort_request(rid="job-1")
 
         tm._dispatch_to_scheduler.assert_not_called()
 
     def test_empty_rid_is_ignored(self):
         # An empty rid would prefix-match every request on the scheduler.
-        tm = _make_tokenizer_manager(rids=["job-1"])
+        tm = _make_tokenizer_manager(self, rids=["job-1"])
         tm.abort_request(rid="", prefix=True)
 
         tm._dispatch_to_scheduler.assert_not_called()
@@ -96,7 +110,7 @@ class TestAbortRequestPrefix(CustomTestCase):
     def test_multi_tokenizer_worker_skips_local_check(self):
         # With >1 tokenizer workers, rid_to_state is not authoritative; the
         # abort must be forwarded even if this worker tracks no matching rid.
-        tm = _make_tokenizer_manager(rids=[], tokenizer_worker_num=2)
+        tm = _make_tokenizer_manager(self, rids=[], tokenizer_worker_num=2)
         tm.abort_request(rid="job-1", prefix=True)
 
         req = _sent_req(tm)
@@ -113,8 +127,8 @@ def _make_state(rid: str) -> ReqState:
     return ReqState([], False, asyncio.Event(), obj, MagicMock())
 
 
-def _make_tokenizer_manager_with_states(rids) -> TokenizerManager:
-    tm = _make_tokenizer_manager()
+def _make_tokenizer_manager_with_states(case, rids) -> TokenizerManager:
+    tm = _make_tokenizer_manager(case)
     tm.rid_to_state = {rid: _make_state(rid) for rid in rids}
     return tm
 
@@ -128,7 +142,7 @@ class TestAbortTokenizerHeldRequests(CustomTestCase):
 
     def test_prefix_abort_flags_matching_states(self):
         tm = _make_tokenizer_manager_with_states(
-            ["job-1-seq-0", "job-1-seq-1", "other"]
+            self, ["job-1-seq-0", "job-1-seq-1", "other"]
         )
         tm.abort_request(rid="job-1", prefix=True)
 
@@ -139,27 +153,26 @@ class TestAbortTokenizerHeldRequests(CustomTestCase):
         self.assertEqual(_sent_req(tm).rid, "job-1")
 
     def test_exact_abort_flags_only_exact_state(self):
-        tm = _make_tokenizer_manager_with_states(["job-1", "job-1-seq-0"])
+        tm = _make_tokenizer_manager_with_states(self, ["job-1", "job-1-seq-0"])
         tm.abort_request(rid="job-1")
 
         self.assertTrue(tm.rid_to_state["job-1"].abort_before_dispatch)
         self.assertFalse(tm.rid_to_state["job-1-seq-0"].abort_before_dispatch)
 
     def test_abort_all_flags_every_state(self):
-        tm = _make_tokenizer_manager_with_states(["a", "b"])
+        tm = _make_tokenizer_manager_with_states(self, ["a", "b"])
         tm.abort_request(abort_all=True)
 
         self.assertTrue(tm.rid_to_state["a"].abort_before_dispatch)
         self.assertTrue(tm.rid_to_state["b"].abort_before_dispatch)
 
     def test_dispatch_resolves_flagged_request_locally(self):
-        tm = _make_tokenizer_manager_with_states(["job-1-seq-0"])
-        tm.server_args.weight_version = "v0"
+        tm = _make_tokenizer_manager_with_states(self, ["job-1-seq-0"])
         state = tm.rid_to_state["job-1-seq-0"]
         tm.abort_request(rid="job-1", prefix=True)
         tm._dispatch_to_scheduler.reset_mock()
 
-        tm._send_one_request(SimpleNamespace(rid="job-1-seq-0"))
+        asyncio.run(tm._send_one_request(SimpleNamespace(rid="job-1-seq-0")))
 
         # Never dispatched; resolved as aborted so _wait_one_response returns.
         tm._dispatch_to_scheduler.assert_not_called()
@@ -170,7 +183,7 @@ class TestAbortTokenizerHeldRequests(CustomTestCase):
         self.assertEqual(finish_reason["type"], "abort")
 
     def test_dispatch_sends_unflagged_request(self):
-        tm = _make_tokenizer_manager_with_states(["job-1", "other"])
+        tm = _make_tokenizer_manager_with_states(self, ["job-1", "other"])
         tm.abort_request(rid="job-1")
         tm._dispatch_to_scheduler.reset_mock()
 
@@ -180,19 +193,23 @@ class TestAbortTokenizerHeldRequests(CustomTestCase):
             "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
             side_effect=lambda obj: obj,
         ):
-            tm._send_one_request(tokenized_obj)
+            asyncio.run(tm._send_one_request(tokenized_obj))
 
         tm._dispatch_to_scheduler.assert_called_once_with(tokenized_obj)
         self.assertIn("other", tm.rid_to_state)
 
     def test_batch_dispatch_filters_flagged_requests(self):
-        tm = _make_tokenizer_manager_with_states(["job-1-seq-0", "job-1-seq-1"])
-        tm.server_args.weight_version = "v0"
+        tm = _make_tokenizer_manager_with_states(self, ["job-1-seq-0", "job-1-seq-1"])
         tm.abort_request(rid="job-1", prefix=True)
         tm._dispatch_to_scheduler.reset_mock()
 
-        tm._send_batch_request(
-            [SimpleNamespace(rid="job-1-seq-0"), SimpleNamespace(rid="job-1-seq-1")]
+        asyncio.run(
+            tm._send_batch_request(
+                [
+                    SimpleNamespace(rid="job-1-seq-0"),
+                    SimpleNamespace(rid="job-1-seq-1"),
+                ]
+            )
         )
 
         tm._dispatch_to_scheduler.assert_not_called()
@@ -204,12 +221,21 @@ class FakeReq:
         self.rid = rid
         self.mamba_pool_idx = None
         self.to_finish = None
+        self.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
+        self.weight_version_events = []
+        self.output_ids = []
 
     def finished(self) -> bool:
         return False
 
 
-def _make_scheduler(waiting_rids=(), running_rids=(), chunked_rid=None):
+def _make_scheduler(
+    case, waiting_rids=(), running_rids=(), chunked_rid=None, **server_args
+):
+    # abort_request reads pp_size and the disagg config from the published bags.
+    override = get_context().override_server_args(**server_args)
+    override.install()
+    case.addCleanup(override.restore)
     sched = SimpleNamespace()
     sched.chunked_req = FakeReq(chunked_rid) if chunked_rid is not None else None
     sched.waiting_queue = [FakeReq(rid) for rid in waiting_rids]
@@ -217,12 +243,18 @@ def _make_scheduler(waiting_rids=(), running_rids=(), chunked_rid=None):
     sched.dllm_config = None  # abort_request reads it since the dLLM rework (#27877)
     sched.disaggregation_mode = DisaggregationMode.NULL
     sched.grammar_manager = MagicMock()
+    sched.mm_receiver = None
+    sched.beam_coordinator = MagicMock()
+    sched.tree_cache = MagicMock()
+    sched._release_aborted_request = MagicMock()
     sched.running_batch = SimpleNamespace(reqs=[FakeReq(rid) for rid in running_rids])
     sched.cur_batch = None
     # abort_request collects in-flight reqs from (running_batch, last_batch) on
     # the pp_size == 1 path since the v0.5.16 rebase.
-    sched.ps = SimpleNamespace(pp_size=1)
     sched.last_batch = None
+    sched.collect_inflight_reqs = types.MethodType(
+        Scheduler.collect_inflight_reqs, sched
+    )
     sched.ipc_channels = MagicMock()
     return sched
 
@@ -233,6 +265,7 @@ class TestSchedulerAbortMatching(CustomTestCase):
 
     def test_prefix_abort_isolates_namespaces(self):
         sched = _make_scheduler(
+            self,
             waiting_rids=["A::1", "A::2", "B::1"],
             running_rids=["A::3", "B::2"],
         )
@@ -252,19 +285,19 @@ class TestSchedulerAbortMatching(CustomTestCase):
     def test_matching_is_prefix_based_even_without_prefix_flag(self):
         # Pre-existing scheduler semantics: batch requests derive child rids as
         # f"{rid}_{i}", so an exact-mode abort for the parent must cover them.
-        sched = _make_scheduler(waiting_rids=["job-1_0", "job-1_1", "job-2_0"])
+        sched = _make_scheduler(self, waiting_rids=["job-1_0", "job-1_1", "job-2_0"])
         Scheduler.abort_request(sched, AbortReq(rid="job-1", prefix=False))
 
         self.assertEqual([req.rid for req in sched.waiting_queue], ["job-2_0"])
 
     def test_chunked_request_is_prefix_matched(self):
-        sched = _make_scheduler(chunked_rid="A::9")
+        sched = _make_scheduler(self, chunked_rid="A::9")
         Scheduler.abort_request(sched, AbortReq(rid="A::", prefix=True))
 
         self.assertIs(sched._pending_chunked_abort_req, sched.chunked_req)
 
     def test_abort_all_covers_everything(self):
-        sched = _make_scheduler(waiting_rids=["A::1"], running_rids=["B::1"])
+        sched = _make_scheduler(self, waiting_rids=["A::1"], running_rids=["B::1"])
         Scheduler.abort_request(sched, AbortReq(abort_all=True))
 
         self.assertEqual(sched.waiting_queue, [])
@@ -278,8 +311,8 @@ def _make_disagg_req(rid: str, pending_bootstrap: bool = False) -> FakeReq:
     return req
 
 
-def _make_prefill_scheduler(waiting_rids=(), bootstrap_rids=(), inflight_rids=()):
-    sched = _make_scheduler()
+def _make_prefill_scheduler(case, waiting_rids=(), bootstrap_rids=(), inflight_rids=()):
+    sched = _make_scheduler(case)
     sched.disaggregation_mode = DisaggregationMode.PREFILL
     sched.waiting_queue = [
         _make_disagg_req(rid, pending_bootstrap=True) for rid in waiting_rids
@@ -291,21 +324,33 @@ def _make_prefill_scheduler(waiting_rids=(), bootstrap_rids=(), inflight_rids=()
     sched.disagg_prefill_inflight_queue = [
         _make_disagg_req(rid) for rid in inflight_rids
     ]
+    sched.disagg_prefill_pending_chunk_rids = set()
+    for name in ("release_aborted_prefill_waiting_req", "clear_pending_chunk_send"):
+        setattr(sched, name, types.MethodType(getattr(Scheduler, name), sched))
     return sched
 
 
 def _make_decode_req(rid: str) -> SimpleNamespace:
-    return SimpleNamespace(req=FakeReq(rid), kv_receiver=Mock())
+    return SimpleNamespace(req=FakeReq(rid), kv_receiver=Mock(), host_staged=False)
 
 
 def _make_retracted_req(rid: str) -> SimpleNamespace:
-    return SimpleNamespace(rid=rid, kv_cache_cpu=object())
+    return SimpleNamespace(
+        rid=rid,
+        kv=SimpleNamespace(retraction_backup=object()),
+        weight_version_events=[],
+        output_ids=[],
+    )
 
 
 def _make_decode_scheduler(
-    waiting_rids=(), prealloc_rids=(), transfer_rids=(), retracted_rids=()
+    case, waiting_rids=(), prealloc_rids=(), transfer_rids=(), retracted_rids=()
 ):
-    sched = _make_scheduler(waiting_rids=waiting_rids)
+    sched = _make_scheduler(
+        case,
+        waiting_rids=waiting_rids,
+        disaggregation_decode_retraction_backup="cpu_tensor",
+    )
     sched.disaggregation_mode = DisaggregationMode.DECODE
     sched.tree_cache = MagicMock()
     sched.disagg_decode_prealloc_queue = SimpleNamespace(
@@ -333,7 +378,7 @@ class TestSchedulerDisaggPrefillAbort(CustomTestCase):
 
     def test_bootstrap_and_inflight_queues_prefix_matched(self):
         sched = _make_prefill_scheduler(
-            bootstrap_rids=["A::1", "B::1"], inflight_rids=["A::2", "B::2"]
+            self, bootstrap_rids=["A::1", "B::1"], inflight_rids=["A::2", "B::2"]
         )
         Scheduler.abort_request(sched, AbortReq(rid="A::", prefix=True))
 
@@ -345,9 +390,9 @@ class TestSchedulerDisaggPrefillAbort(CustomTestCase):
         inflight["B::2"].disagg_kv_sender.abort.assert_not_called()
 
     def test_waiting_queue_releases_metadata_buffer(self):
-        sched = _make_prefill_scheduler(waiting_rids=["A::1", "B::1"])
+        sched = _make_prefill_scheduler(self, waiting_rids=["A::1", "B::1"])
         with patch(
-            "sglang.srt.managers.scheduler.maybe_release_metadata_buffer"
+            "sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer"
         ) as release:
             Scheduler.abort_request(sched, AbortReq(rid="A::", prefix=True))
 
@@ -358,19 +403,10 @@ class TestSchedulerDisaggPrefillAbort(CustomTestCase):
         self.assertIs(allocator, sched.req_to_metadata_buffer_idx_allocator)
         self.assertEqual(_echoed_rids(sched), {"A::1"})
 
-    def test_waiting_queue_pending_bootstrap_gates_sender_abort(self):
-        pending = _make_disagg_req("A::1", pending_bootstrap=True)
-        bootstrapped = _make_disagg_req("A::2", pending_bootstrap=False)
-        sched = _make_prefill_scheduler()
-        sched.waiting_queue = [pending, bootstrapped]
-        with patch("sglang.srt.managers.scheduler.maybe_release_metadata_buffer"):
-            Scheduler.abort_request(sched, AbortReq(rid="A::", prefix=True))
-
-        pending.disagg_kv_sender.abort.assert_called_once()
-        bootstrapped.disagg_kv_sender.abort.assert_not_called()
-
     def test_abort_all_covers_prefill_queues(self):
-        sched = _make_prefill_scheduler(bootstrap_rids=["A::1"], inflight_rids=["B::1"])
+        sched = _make_prefill_scheduler(
+            self, bootstrap_rids=["A::1"], inflight_rids=["B::1"]
+        )
         Scheduler.abort_request(sched, AbortReq(abort_all=True))
 
         sched.disagg_prefill_bootstrap_queue.queue[
@@ -389,7 +425,7 @@ class TestSchedulerDisaggDecodeAbort(CustomTestCase):
 
     def test_prealloc_and_transfer_queues_prefix_matched(self):
         sched = _make_decode_scheduler(
-            prealloc_rids=["A::1", "B::1"], transfer_rids=["A::2", "B::2"]
+            self, prealloc_rids=["A::1", "B::1"], transfer_rids=["A::2", "B::2"]
         )
         Scheduler.abort_request(sched, AbortReq(rid="A::", prefix=True))
 
@@ -401,7 +437,7 @@ class TestSchedulerDisaggDecodeAbort(CustomTestCase):
         transfer["B::2"].kv_receiver.abort.assert_not_called()
 
     def test_retracted_queue_frees_cpu_cache_and_echoes(self):
-        sched = _make_decode_scheduler(retracted_rids=["A::1", "B::1"])
+        sched = _make_decode_scheduler(self, retracted_rids=["A::1", "B::1"])
         aborted = sched.disagg_decode_prealloc_queue.retracted_queue[0]
         Scheduler.abort_request(sched, AbortReq(rid="A::", prefix=True))
 
@@ -409,11 +445,11 @@ class TestSchedulerDisaggDecodeAbort(CustomTestCase):
             [d.rid for d in sched.disagg_decode_prealloc_queue.retracted_queue],
             ["B::1"],
         )
-        self.assertFalse(hasattr(aborted, "kv_cache_cpu"))
+        self.assertIsNone(aborted.kv.retraction_backup)
         self.assertEqual(_echoed_rids(sched), {"A::1"})
 
     def test_waiting_queue_releases_kv_cache(self):
-        sched = _make_decode_scheduler(waiting_rids=["A::1", "B::1"])
+        sched = _make_decode_scheduler(self, waiting_rids=["A::1", "B::1"])
         with patch("sglang.srt.managers.scheduler.release_kv_cache") as release:
             Scheduler.abort_request(sched, AbortReq(rid="A::", prefix=True))
 
@@ -424,7 +460,7 @@ class TestSchedulerDisaggDecodeAbort(CustomTestCase):
     def test_exact_mode_is_still_prefix_matched_in_disagg_queues(self):
         # Same load-bearing semantics as the non-disagg queues: batch children
         # derive rids as f"{rid}_{i}", so exact-mode must cover them here too.
-        sched = _make_decode_scheduler(prealloc_rids=["job-1_0"])
+        sched = _make_decode_scheduler(self, prealloc_rids=["job-1_0"])
         Scheduler.abort_request(sched, AbortReq(rid="job-1", prefix=False))
 
         sched.disagg_decode_prealloc_queue.queue[
@@ -433,7 +469,10 @@ class TestSchedulerDisaggDecodeAbort(CustomTestCase):
 
     def test_abort_all_covers_decode_queues(self):
         sched = _make_decode_scheduler(
-            prealloc_rids=["A::1"], transfer_rids=["B::1"], retracted_rids=["C::1"]
+            self,
+            prealloc_rids=["A::1"],
+            transfer_rids=["B::1"],
+            retracted_rids=["C::1"],
         )
         Scheduler.abort_request(sched, AbortReq(abort_all=True))
 

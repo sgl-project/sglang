@@ -52,6 +52,7 @@ def _make_manager() -> LoRAManager:
     manager.loras = {}
     manager.lora_refs = {}
     manager.num_pinned_loras = 0
+    manager.enable_dp_attention = False
     manager.max_loras_per_batch = 4
     manager.base_hf_config = MagicMock(vocab_size=32000)
     manager.lora_modules = []

@@ -108,7 +108,7 @@ class TestMergeLoRAUpdateResults(CustomTestCase):
             )
             if from_stream:
                 request = RegisterLoRAAdapterReqInput(lora_name="a", config_dict={})
-                result = await manager.load_lora_adapter_from_stream(request)
+                result = await manager.register_lora_adapter(request)
             else:
                 request = LoadLoRAAdapterReqInput(lora_name="a", lora_path="path")
                 result = await manager.load_lora_adapter(request)
