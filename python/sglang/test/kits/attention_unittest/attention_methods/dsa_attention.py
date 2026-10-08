@@ -5,7 +5,6 @@ from typing import Any
 import torch
 from torch import nn
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, ReqToTokenPool
@@ -318,11 +317,7 @@ class DSAMockModelRunner(ModelRunner):
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
-        self.tp_size = 1
         self._kernel_warmed_up = True
-        self.dp_size = 1
-        self.pp_size = 1
-        self.ps = ParallelState.trivial()
         self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
@@ -346,7 +341,6 @@ class DSAMockModelRunner(ModelRunner):
             dsa_prefill_backend=dsa_prefill_backend,
             device=device,
             enable_deterministic_inference=False,
-            enable_dp_attention=False,
             enable_prefill_cp=False,
             enable_mis=False,
             is_embedding=False,
@@ -405,7 +399,6 @@ class DSAMockModelRunner(ModelRunner):
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
         self.init_kv_index_translator()
-        self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False

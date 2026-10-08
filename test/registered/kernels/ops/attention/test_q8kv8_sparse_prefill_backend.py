@@ -95,6 +95,9 @@ class _TokenToKVPool:
     def get_swa_key_layout(self) -> KVLayout:
         return KVLayout.V4
 
+    def get_swa_key_page_size(self) -> int:
+        return self.swa_kv_pool.page_size
+
     def get_extra_key_layout(self, layer_id: int) -> KVLayout:
         _ = layer_id
         return KVLayout.V4

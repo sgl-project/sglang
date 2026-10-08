@@ -37,10 +37,7 @@ def _mock_global_server_args(backend="pytorch"):
     class _DummyTPGroup:
         device_group = None
 
-    # `Sampler.__init__` asks the context for the group; state one for the rest
-    # of the process, since this process has no distributed init. Not the scoped
-    # `override()`: its context manager would be collected here and take the
-    # value back down with it.
+    # Provide a TP group for sampler initialization without distributed setup.
     get_parallel().override_permanently(tp_group=_DummyTPGroup())
     from sglang.srt.runtime_context import get_flags
 

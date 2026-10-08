@@ -67,14 +67,14 @@ def _run_activation_inplace(
 
 @register_custom_op(mutates_args=["out"])
 def _run_activation_with_rounding_inplace(
-    op_name: str, input: torch.Tensor, out: torch.Tensor
+    op_name: str, input: torch.Tensor, out: torch.Tensor, clamp_limit: float = 0.0
 ) -> None:
     hidden_size = input.shape[-1] // 2
     # Fast-math changes FP16 SiLU at eager rounding boundaries on SM90.
     module = activation_module(input.dtype, fast_math=False)
     input_2d = input.view(-1, hidden_size * 2)
     out_2d = out.view(-1, hidden_size)
-    module.run_activation_with_rounding(input_2d, out_2d, op_name)
+    module.run_activation_with_rounding(input_2d, out_2d, op_name, clamp_limit)
 
 
 @register_custom_op(mutates_args=["input"])
@@ -134,10 +134,10 @@ def run_activation(
 
 @register_custom_op(mutates_args=["out"])
 def _run_unary_activation_inplace(
-    op_name: str, input: torch.Tensor, out: torch.Tensor
+    op_name: str, input: torch.Tensor, out: torch.Tensor, fast_math: bool = True
 ) -> None:
     last = input.shape[-1]
-    module = activation_module(input.dtype)
+    module = activation_module(input.dtype, fast_math=fast_math)
     module.run_unary_activation(input.view(-1, last), out.view(-1, last), op_name)
 
 
@@ -145,6 +145,8 @@ def run_unary_activation(
     op_name: str,
     input: torch.Tensor,
     out: Optional[torch.Tensor] = None,
+    *,
+    fast_math: bool = True,
 ) -> torch.Tensor:
     """Apply a standalone (non-gated) element-wise activation: ``out = act(input)``.
 
@@ -156,16 +158,18 @@ def run_unary_activation(
     )
     if out is None:
         out = torch.empty_like(input)
-    _run_unary_activation_inplace(op_name, input, out)
+    _run_unary_activation_inplace(op_name, input, out, fast_math)
     return out
 
 
 def relu2(
     input: torch.Tensor,
     out: Optional[torch.Tensor] = None,
+    *,
+    fast_math: bool = True,
 ) -> torch.Tensor:
-    """Squared ReLU: ``out = max(0, input) ** 2`` (element-wise)."""
-    return run_unary_activation("relu2", input, out)
+    """Squared ReLU; disable fast math to preserve BF16 subnormal results."""
+    return run_unary_activation("relu2", input, out, fast_math=fast_math)
 
 
 def silu_and_mul(
@@ -180,11 +184,13 @@ def silu_and_mul(
 def silu_and_mul_with_activation_rounding(
     input: torch.Tensor,
     out: Optional[torch.Tensor] = None,
+    *,
+    clamp_limit: float = 0.0,
 ) -> torch.Tensor:
     hidden_size = input.shape[-1] // 2
     if out is None:
         out = input.new_empty(*input.shape[:-1], hidden_size)
-    _run_activation_with_rounding_inplace("silu", input, out)
+    _run_activation_with_rounding_inplace("silu", input, out, clamp_limit)
     return out
 
 

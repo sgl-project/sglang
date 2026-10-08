@@ -104,6 +104,11 @@ class FakeKVSender(BaseKVSender):
     def get_transfer_metric(self) -> KVTransferMetric:
         return KVTransferMetric()
 
+    def mark_prefill_complete(self) -> None:
+        # Warmup and health checks use a fake sender even with a real PD manager.
+        # They have no decode peer to admit or notify.
+        pass
+
     def init(
         self,
         num_kv_indices: int,
@@ -187,3 +192,8 @@ class FakeKVReceiver(BaseKVReceiver):
 
     def abort(self):
         self.conclude_state = KVPoll.Failed
+
+    def ensure_abort_notified(self, *, force_arm: bool = False) -> None:
+        """No prefill rank holds a fake receiver's destinations, so there is
+        nothing to notify: ``abort_notified`` stays False and decode releases
+        the pages at once."""

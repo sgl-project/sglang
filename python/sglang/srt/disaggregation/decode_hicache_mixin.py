@@ -253,7 +253,7 @@ class DecodeHiCacheTransferMixin:
 
         dr.hicache_restored_kv_indices = torch.cat(
             [rematch.device_indices[pm.l1_prefix_len :], new_indices]
-        )
+        )[: pm.restore_token_count]
         dr.hicache_restored_node = restored_node
         dr.hicache_restore_lock_receipt = self.tree_cache.inc_lock_ref(
             restored_node
@@ -266,9 +266,6 @@ class DecodeHiCacheTransferMixin:
         return True
 
     def _process_hicache_local_restores(self, decode_reqs: List[DecodeRequest]) -> None:
-        if not hasattr(self.tree_cache, "is_load_back_event_done"):
-            return
-
         # Filter once: keep only PENDING reqs that still need restore work;
         # trivially-done reqs (no prefix_match / nothing to restore) flip to READY.
         active: List[DecodeRequest] = []
@@ -291,13 +288,8 @@ class DecodeHiCacheTransferMixin:
             ):
                 dr.hicache_restore_status = HiCacheRestoreResult.READY
 
-        # Phase B: queue new load_back ops if the next slot is free.
-        # The (producer_index + 1) check ensures we never overwrite a still-in-flight slot:
-        # if a previous req holds that slot and isn't done, its event won't be signaled.
-        counter = self.tree_cache.cache_controller.layer_done_counter
-        if not self.tree_cache.is_load_back_event_done(
-            (counter.producer_index + 1) % counter.num_counters
-        ):
+        # Phase B: queue new load_back ops if the next slot is free on every rank.
+        if not self.tree_cache.has_free_load_back_slot():
             return
         queued = [
             dr
