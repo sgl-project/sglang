@@ -275,9 +275,15 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
             allocator=self.allocator,
             registration_granularity_bytes=(
-                self.page_size * self.layout_dim
-                if self.layout in ("page_first", "page_first_direct")
-                else None
+                # Direct copies coalesce consecutive pages within a layer.
+                # Keep each entire layer in one registered range.
+                self.size * self.token_stride_size
+                if self.layout == "layer_first"
+                else (
+                    self.page_size * self.layout_dim
+                    if self.layout in ("page_first", "page_first_direct")
+                    else None
+                )
             ),
         )
         return buffer
@@ -935,9 +941,15 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
             allocator=self.allocator,
             registration_granularity_bytes=(
-                self.page_size * self.layout_dim
-                if self.layout in ("page_first", "page_first_direct")
-                else None
+                # Direct copies coalesce consecutive pages within a layer.
+                # Keep each entire layer in one registered range.
+                self.size * self.token_stride_size
+                if self.layout == "layer_first"
+                else (
+                    self.page_size * self.layout_dim
+                    if self.layout in ("page_first", "page_first_direct")
+                    else None
+                )
             ),
         )
 
