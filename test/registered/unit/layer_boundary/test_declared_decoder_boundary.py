@@ -83,6 +83,7 @@ def parallel_of(*, attn_dp, attn_tp, attn_cp=1, **overrides):
         moe_tp_size=attn_dp * attn_cp * attn_tp,
         moe_dp_size=1,
         dwdp_size=1,
+        pp_size=1,
         attn_dp_enabled=attn_dp > 1,
         enable_attn_tp_input_scattered=False,
         tp_group=SimpleNamespace(
@@ -313,6 +314,10 @@ def build_mhc(
         return stages
 
 
+def deferral(deferred):
+    return dict(hc_attn_post_pre=lambda **kwargs: None) if deferred else {}
+
+
 class TestMhcOnTheDeclarations(CustomTestCase):
     """An MHC layer takes the same declarations and runs the same steps as any
     other layer; only the residual operations the steps run are MHC's."""
@@ -538,14 +543,20 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         )
 
     def test_the_postprocess_writes_the_output_into_the_streams(self):
-        # The last layer also contracts the streams into the hidden states.
+        # The last layer also contracts the streams into the hidden states, and
+        # still writes back itself when the layers before it defer.
         parallel = parallel_of(attn_dp=1, attn_tp=1)
-        for layer_id, contracted in ((1, False), (2, True)):
-            with self.subTest(layer_id=layer_id):
+        for layer_id, contracted, deferred in (
+            (1, False, False),
+            (2, True, False),
+            (2, True, True),
+        ):
+            with self.subTest(layer_id=layer_id, deferred=deferred):
                 communicator = build_mhc(
                     layer_case(layer_id, 3),
                     parallel,
                     hc_post=lambda h, r, h_res, h_post: h + r,
+                    **deferral(deferred),
                 )
                 communicator.mhc.h_res = communicator.mhc.h_post = torch.zeros(2)
                 with (
@@ -581,8 +592,12 @@ class TestMhcOnTheDeclarations(CustomTestCase):
             attn_dp=1, attn_tp=1, attn_cp=2, enable_prefill_cp=True, moe_dense_tp_size=1
         )
         facts = layer_case(1, 3, sparse=True, previous_sparse=False)
-        with self.assertRaises(NotImplementedError):
-            build_mhc(facts, parallel, dsa_cp=True)
+        for deferred in (False, True):
+            with (
+                self.subTest(deferred=deferred),
+                self.assertRaises(NotImplementedError),
+            ):
+                build_mhc(facts, parallel, dsa_cp=True, **deferral(deferred))
         # A dense layer on every rank computes on its own shard: nothing moves.
         facts = layer_case(1, 3, sparse=False, previous_sparse=False)
         build_mhc(facts, parallel, dsa_cp=True)
@@ -590,11 +605,16 @@ class TestMhcOnTheDeclarations(CustomTestCase):
     def test_input_scattered_attention_under_attention_cp_is_rejected(self):
         scattered = dict(enable_attn_tp_input_scattered=True)
         parallel = parallel_of(attn_dp=1, attn_tp=2, attn_cp=2, **scattered)
-        with self.assertRaisesRegex(NotImplementedError, "input-scattered"):
-            build_mhc(
-                layer_case(1, 3, sparse=False, previous_sparse=False),
-                parallel,
-            )
+        for deferred in (False, True):
+            with (
+                self.subTest(deferred=deferred),
+                self.assertRaisesRegex(NotImplementedError, "input-scattered"),
+            ):
+                build_mhc(
+                    layer_case(1, 3, sparse=False, previous_sparse=False),
+                    parallel,
+                    **deferral(deferred),
+                )
         parallel = parallel_of(attn_dp=1, attn_tp=2, **scattered)
         build_mhc(
             layer_case(1, 3, sparse=False, previous_sparse=False),
@@ -604,13 +624,14 @@ class TestMhcOnTheDeclarations(CustomTestCase):
     def test_a_moe_gathered_over_moe_cp_is_rejected(self):
         # A MoE-CP gather (MoE DP narrower than CP), which MHC has not been run with.
         for prefill_cp in (True, False):
-            with self.subTest(prefill_cp=prefill_cp):
-                parallel = parallel_of(
-                    attn_dp=1, attn_tp=2, attn_cp=2, enable_prefill_cp=prefill_cp
-                )
-                facts = layer_case(1, 3, sparse=True, previous_sparse=True)
-                with self.assertRaisesRegex(NotImplementedError, "MoE-CP group"):
-                    build_mhc(facts, parallel)
+            for deferred in (False, True):
+                with self.subTest(prefill_cp=prefill_cp, deferred=deferred):
+                    parallel = parallel_of(
+                        attn_dp=1, attn_tp=2, attn_cp=2, enable_prefill_cp=prefill_cp
+                    )
+                    facts = layer_case(1, 3, sparse=True, previous_sparse=True)
+                    with self.assertRaisesRegex(NotImplementedError, "MoE-CP group"):
+                        build_mhc(facts, parallel, **deferral(deferred))
         # A dense layer builds, and so does a MoE on its own CP shard (MoE DP = CP).
         parallel = parallel_of(attn_dp=1, attn_tp=2, attn_cp=2)
         build_mhc(
