@@ -74,5 +74,51 @@ class TestFileStoragePathRouting(CustomTestCase):
         self.assertEqual(HiCacheFile(_make_config(extra)).file_path, "/env/hicache")
 
 
+class TestFileBackendMHADraftBackup(CustomTestCase):
+    def test_file_backend_mha_draft_is_backed_up_per_rank(self):
+        # Regression for an MLA target with an MHA draft (e.g. Kimi-K2-Instruct
+        # + Kimi-K2-Instruct-eagle3) on the file backend. A nonzero TP rank has
+        # backup_skip=True, and should_backup() used to allow MHA draft/draft-SWA
+        # only for mooncake, so the file backend never wrote rank>0's draft
+        # shard. Because HiCacheFile keys that shard per rank, the missing file
+        # zeroed rank>0's storage hit and the cross-rank MIN collapsed the whole
+        # prefix hit to zero.
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+        # should_backup now lets every rank back up an MHA draft on the file
+        # backend (matching mooncake), while keeping the TP0-only rules for
+        # non-MHA draft hosts and for backends that do not namespace draft
+        # keys per rank.
+        def controller_for(backend_type, host_pool):
+            controller = HybridCacheController.__new__(HybridCacheController)
+            # Nonzero MLA TP rank: backup_skip is derived from storage_config.
+            controller.storage_config = SimpleNamespace(is_storage_writer=False)
+            controller.storage_backend_type = backend_type
+            controller.mem_pool_host = SimpleNamespace(
+                entry_map={PoolName.DRAFT: SimpleNamespace(host_pool=host_pool)}
+            )
+            return controller
+
+        mha_draft = MagicMock(spec=MHATokenToKVPoolHost)
+        draft_transfer = SimpleNamespace(name=PoolName.DRAFT)
+        self.assertTrue(controller_for("file", mha_draft).should_backup(draft_transfer))
+        self.assertTrue(
+            controller_for("mooncake", mha_draft).should_backup(draft_transfer)
+        )
+        self.assertFalse(
+            controller_for("file", SimpleNamespace()).should_backup(draft_transfer)
+        )
+        self.assertFalse(
+            controller_for("hf3fs", mha_draft).should_backup(draft_transfer)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
