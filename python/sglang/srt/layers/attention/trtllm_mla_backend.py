@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import triton
 
+from sglang.kernels.cake_kernels._routes import cake_route_enabled
 from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.pad import (
@@ -178,6 +180,32 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 # the query-prep kernels (which already trigger their PDL secondary).
 _ENABLE_PDL = is_arch_support_pdl()
 
+# Opt-in Cake Kimi-K3 FP8 MLA decode (``SGLANG_CAKE_ROUTES=kimi_k3_mla``): the
+# decode call switches the FlashInfer public entry to ``backend="cake"`` when the
+# ``sglang.kernels.cake_kernels.attention_mla`` admission check accepts the call
+# (FP8 e4m3 query + latent cache, kv_lora_rank 512 + rope 64, page size 64, no
+# LSE / DCP / sinks). Everything else keeps the trtllm-gen kernel.
+CAKE_MLA_ROUTE = "kimi_k3_mla"
+_cake_mla_logged: set = set()
+
+
+def _cake_mla_log_once(key, msg: str) -> None:
+    if key in _cake_mla_logged:
+        return
+    _cake_mla_logged.add(key)
+    logger.info(msg)
+
+
+# Diagnostic (engine side only): SGLANG_CAKE_K3_MLA_CHECK=1 compares every eager
+# Cake MLA decode launch with the stock trtllm-gen kernel on the same inputs.
+_CAKE_MLA_CHECK = os.environ.get("SGLANG_CAKE_K3_MLA_CHECK", "0") == "1"
+# SGLANG_CAKE_K3_MLA_DUMP_DIR=<dir>: with the check on, save a compact reproducer
+# (query, referenced KV pages, block tables, lengths, both outputs) for the first
+# calls where the Cake output is non-finite while query, KV and stock output are finite.
+_CAKE_MLA_DUMP_DIR = os.environ.get("SGLANG_CAKE_K3_MLA_DUMP_DIR", "")
+_CAKE_MLA_DUMPS_PER_LAYER = 2
+_cake_mla_check_stats: dict = {}
+
 
 @dataclass
 class TRTLLMMLADecodeMetadata:
@@ -242,6 +270,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Runtime parameters
         self.backend = backend
+        self._cake_mla_verdicts: dict = {}
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
@@ -974,6 +1003,264 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             return self.dense_q_indptr_verify[: bs + 1]
         return self.q_indptr_decode[: bs + 1] * draft_token_num
 
+    def _cake_mla_check(
+        self,
+        cake_out,
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens_i32,
+        max_seq_len,
+        bmm1_scale,
+        layer,
+    ):
+        """Diagnostic: stock trtllm-gen decode on the same inputs; log non-finite values and large deviations."""
+        key = getattr(layer, "layer_id", None)
+        st = _cake_mla_check_stats.setdefault(
+            key,
+            {
+                "calls": 0,
+                "anom": 0,
+                "q_nf_calls": 0,
+                "cake_nf": 0,
+                "ref_nf": 0,
+                "max_rel": 0.0,
+                "kv_nf_scans": 0,
+                "kv_nf_total": 0,
+            },
+        )
+        st["calls"] += 1
+        with torch.no_grad():
+            ref = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=query,
+                kv_cache=kv_cache,
+                enable_pdl=False,
+                workspace_buffer=self.workspace_buffer,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=seq_lens_i32,
+                max_seq_len=max_seq_len,
+                bmm1_scale=bmm1_scale,
+                return_lse=False,
+                multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+            )
+            q_nf = int((~torch.isfinite(query.float())).sum().item())
+            cake_nf = int((~torch.isfinite(cake_out.float())).sum().item())
+            ref_nf = int((~torch.isfinite(ref.float())).sum().item())
+            ref_max = (
+                float(ref.float().abs().max().item()) if ref_nf == 0 else float("nan")
+            )
+            rel = (
+                (
+                    float((cake_out.float() - ref.float()).abs().max().item())
+                    / (ref_max + 1e-6)
+                )
+                if (cake_nf == 0 and ref_nf == 0)
+                else float("nan")
+            )
+        if q_nf:
+            st["q_nf_calls"] += 1
+        st["cake_nf"] += cake_nf
+        st["ref_nf"] += ref_nf
+        if rel == rel:
+            st["max_rel"] = max(st["max_rel"], rel)
+        anomalous = (
+            cake_nf > 0 or ref_nf > 0 or q_nf > 0 or not (rel == rel) or rel > 0.1
+        )
+        if anomalous:
+            st["anom"] += 1
+            if (
+                _CAKE_MLA_DUMP_DIR
+                and cake_nf > 0
+                and ref_nf == 0
+                and q_nf == 0
+                and st.setdefault("dumps", 0) < _CAKE_MLA_DUMPS_PER_LAYER
+            ):
+                st["dumps"] += 1
+                try:
+                    self._cake_mla_dump(
+                        key,
+                        st["dumps"],
+                        cake_out,
+                        ref,
+                        query,
+                        kv_cache,
+                        block_tables,
+                        seq_lens_i32,
+                        max_seq_len,
+                        bmm1_scale,
+                    )
+                except Exception as exc:  # diagnostics must never take the server down
+                    logger.warning(
+                        "[cake-route] kimi_k3_mla CHECK dump failed: %r", exc
+                    )
+            if st["anom"] <= 10:
+                bad_rows = (
+                    torch.nonzero(
+                        ~torch.isfinite(cake_out.float())
+                        .reshape(cake_out.shape[0], -1)
+                        .all(dim=1)
+                    )
+                    .flatten()
+                    .tolist()[:8]
+                )
+                kv_nf = -1
+                if st["kv_nf_scans"] < 3:
+                    st["kv_nf_scans"] += 1
+                    kv_nf = (
+                        int((~torch.isfinite(kv_cache.float())).sum().item())
+                        if kv_cache.numel() < 2**33
+                        else -2
+                    )
+                    st["kv_nf_total"] += max(kv_nf, 0)
+                logger.warning(
+                    "[cake-route] kimi_k3_mla CHECK layer=%s anomaly bs=%d q_nonfinite=%d cake_out_nonfinite=%d stock_out_nonfinite=%d max_rel=%s |stock|max=%.4g bad_rows=%s seq_lens[bad]=%s kv_cache_nonfinite=%d bmm1_scale=%s",
+                    key,
+                    int(query.shape[0]),
+                    q_nf,
+                    cake_nf,
+                    ref_nf,
+                    f"{rel:.4f}",
+                    ref_max,
+                    bad_rows,
+                    [int(seq_lens_i32[r].item()) for r in bad_rows],
+                    kv_nf,
+                    float(bmm1_scale),
+                )
+        if st["calls"] % 500 == 0 or st["calls"] == 1:
+            logger.info(
+                "[cake-route] kimi_k3_mla CHECK layer=%s summary calls=%d anomalies=%d q_nonfinite_calls=%d cake_nonfinite_total=%d stock_nonfinite_total=%d max_rel=%.4f kv_nonfinite_seen=%d",
+                key,
+                st["calls"],
+                st["anom"],
+                st["q_nf_calls"],
+                st["cake_nf"],
+                st["ref_nf"],
+                st["max_rel"],
+                st["kv_nf_total"],
+            )
+
+    def _cake_mla_dump(
+        self,
+        key,
+        n,
+        cake_out,
+        ref,
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens_i32,
+        max_seq_len,
+        bmm1_scale,
+    ):
+        """Save a compact, self-contained reproducer of one Cake MLA decode call."""
+        bs = int(query.shape[0])
+        page = int(kv_cache.shape[-2])
+        bt = block_tables[:bs].to(torch.int64).cpu()
+        seq = seq_lens_i32[:bs].to(torch.int64).cpu()
+        pages_needed = (seq + page - 1) // page
+        used = []
+        for r in range(bs):
+            used.extend(bt[r, : int(pages_needed[r])].tolist())
+        uniq = sorted(set(used))
+        remap = {p: i for i, p in enumerate(uniq)}
+        idx = torch.tensor(uniq, device=kv_cache.device, dtype=torch.long)
+        compact_kv = kv_cache.index_select(0, idx).contiguous()
+        new_bt = torch.zeros_like(bt, dtype=torch.int32)
+        for r in range(bs):
+            for j in range(int(pages_needed[r])):
+                new_bt[r, j] = remap[int(bt[r, j])]
+        bad_rows = (
+            torch.nonzero(~torch.isfinite(cake_out.float()).reshape(bs, -1).all(dim=1))
+            .flatten()
+            .tolist()
+        )
+        os.makedirs(_CAKE_MLA_DUMP_DIR, exist_ok=True)
+        dev = query.device.index if query.device.index is not None else 0
+        path = os.path.join(_CAKE_MLA_DUMP_DIR, f"mla_repro_layer{key}_dev{dev}_{n}.pt")
+        torch.save(
+            {
+                "layer": key,
+                "query": query.detach().cpu(),
+                "kv_cache": compact_kv.cpu(),
+                "kv_page_ids": uniq,
+                "block_tables": new_bt,
+                "seq_lens": seq.to(torch.int32),
+                "max_seq_len": int(max_seq_len),
+                "bmm1_scale": float(bmm1_scale),
+                "bad_rows": bad_rows,
+                "cake_out": cake_out.detach().cpu(),
+                "stock_out": ref.detach().cpu(),
+                "workspace_bytes": int(
+                    self.workspace_buffer.numel() * self.workspace_buffer.element_size()
+                ),
+                "qk_nope_head_dim": int(self.qk_nope_head_dim),
+                "kv_lora_rank": int(self.kv_lora_rank),
+                "qk_rope_head_dim": int(self.qk_rope_head_dim),
+                "page_size": page,
+            },
+            path,
+        )
+        logger.warning(
+            "[cake-route] kimi_k3_mla CHECK dump layer=%s bad_rows=%s pages=%d -> %s",
+            key,
+            bad_rows,
+            len(uniq),
+            path,
+        )
+
+    def _cake_mla_decode_admitted(
+        self, query: torch.Tensor, kv_cache: torch.Tensor, return_lse: bool
+    ) -> bool:
+        """Whether this decode call takes the opt-in Cake Kimi-K3 FP8 MLA route.
+
+        Admission is the adapter's ``supports_trtllm_batch_decode_with_kv_cache_mla``
+        (shape / dtype / page-size / module checks, never raises) evaluated once per
+        query shape and cached; the verdict is logged once per shape. An explicit
+        non-trtllm-gen kernel backend (cute-dsl, ...) and LSE-returning calls keep
+        their own kernel.
+        """
+        if not cake_route_enabled(CAKE_MLA_ROUTE):
+            return False
+        if self.backend != "trtllm-gen":
+            _cake_mla_log_once(
+                ("backend", self.backend),
+                f"[cake-route] {CAKE_MLA_ROUTE}: skipped (explicit kernel backend "
+                f"{self.backend!r} keeps priority)",
+            )
+            return False
+        if return_lse:
+            _cake_mla_log_once(
+                "lse", f"[cake-route] {CAKE_MLA_ROUTE}: skipped (return_lse requested)"
+            )
+            return False
+        key = (tuple(query.shape), query.dtype, kv_cache.dtype, self.page_size)
+        verdict = self._cake_mla_verdicts.get(key)
+        if verdict is None:
+            from sglang.kernels.cake_kernels import attention_mla as cake_mla
+
+            verdict = bool(
+                cake_mla.supports_trtllm_batch_decode_with_kv_cache_mla(
+                    query,
+                    kv_cache,
+                    qk_nope_head_dim=self.qk_nope_head_dim,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    return_lse=return_lse,
+                )
+            )
+            self._cake_mla_verdicts[key] = verdict
+            _cake_mla_log_once(
+                ("verdict", key),
+                f"[cake-route] {CAKE_MLA_ROUTE}: "
+                f"{'taken' if verdict else 'skipped (not admitted)'} "
+                f"query={tuple(query.shape)} {query.dtype} kv={tuple(kv_cache.shape)} "
+                f"{kv_cache.dtype} page={self.page_size}",
+            )
+        return verdict
+
     def _run_decode_kernel(
         self,
         query: torch.Tensor,
@@ -1028,6 +1315,35 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
+        if self._cake_mla_decode_admitted(query, kv_cache, return_lse):
+            # Cake contract (FlashInfer ``backend="cake"``): host float scales,
+            # no PDL, no skip-softmax, no LSE, no multi-CTA counter buffer.
+            cake_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=query,
+                kv_cache=kv_cache,
+                enable_pdl=False,
+                workspace_buffer=self.workspace_buffer,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=seq_lens_i32,
+                max_seq_len=max_seq_len,
+                bmm1_scale=float(bmm1_scale),
+                backend="cake",
+            )
+            if _CAKE_MLA_CHECK and not torch.cuda.is_current_stream_capturing():
+                self._cake_mla_check(
+                    cake_out,
+                    query,
+                    kv_cache,
+                    block_tables,
+                    seq_lens_i32,
+                    max_seq_len,
+                    bmm1_scale,
+                    layer,
+                )
+            return cake_out
         extra_kwargs = {"backend": self.backend} if self.backend != "trtllm-gen" else {}
         if self.backend == "trtllm-gen":
             extra_kwargs["multi_ctas_kv_counter_buffer"] = (

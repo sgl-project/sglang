@@ -1,0 +1,479 @@
+"""Cake ``FP8_PB_WO`` projection GEMMs for the Kimi-K3 MLA linears.
+
+Opt-in through ``SGLANG_CAKE_ROUTES=kimi_k3_fp8_projection``. Follows the
+``_k3_bf16_gemm`` / ``cutedsl_bf16_gemm`` precedent in ``kimi_k3.py``: a
+shape-gated GEMM swap that leaves the linear's weights, loading, TP reduction
+and output-gate wrappers untouched. The swap is installed at the quant-method
+level of each admitted linear (``q_a`` / ``kv_a`` (fused or split), ``q_b``,
+``kv_b``, ``o_proj``), so every ``forward`` variant of the linear classes keeps
+its collective logic and only the ``apply`` / ``apply_into`` GEMM changes.
+
+Lifecycle (FlashInfer ``gemm.kimi_k3_fp8_projection`` at ``e4f94f948``):
+
+* weights: ``prepare_kimi_k3_fp8_projection_weights`` once per linear, after
+  ``process_weights_after_loading`` (the wrapper hooks that call; loaders that
+  processed the weights before ``post_load_weights`` are covered by a lazy
+  first-call prepare). FlashInfer requantizes to UE8M0 and stores a 256-row
+  padded, 128x128-tiled E4M3 copy: roughly one extra copy of the FP8 weight
+  per admitted linear stays resident next to the original (the fallback path
+  and the other quant-method consumers keep using the original).
+* workspace: ``allocate_kimi_k3_fp8_projection_workspace(prepared, M)`` per
+  call (``[M, K]`` E4M3 + a small byte buffer). It is not cached: ``M`` is
+  arbitrary during prefill and a cache keyed by ``M`` would either grow
+  unboundedly or free memory that a captured graph still addresses. Inside
+  CUDA-graph capture the allocation comes from the graph pool and stays alive
+  with the graph, exactly like the activations around it.
+* runner: ``prepare_kimi_k3_fp8_projection(x, prepared, out, workspace)`` binds
+  the tensor addresses and depends on ``M`` (route table), so it is rebuilt per
+  call; ``launch()`` is allocation-free and capturable. The JIT modules of a
+  route are loaded on the first eager call for that ``M``; during capture a
+  not-yet-warmed ``M`` falls back to the regular FP8 linear (logged once).
+  SGLang's graph runner warms every captured batch size eagerly first.
+
+Admission (``supports_kimi_k3_fp8_projection_weights`` / ``_projection``):
+SM100a / SM103a, E4M3 ``[N, K]`` weight with ``K % 128 == 0`` and the ModelOpt
+fp32 block scale ``[ceil(N/128), K/128]``, even ``N``; ``N`` not a multiple of
+128 is padded once with zero rows into a transient copy before preparation
+(``n_valid = N``). Activations BF16 ``[M, K]`` contiguous, no bias, output BF16
+``[M, N]`` (``apply_into`` targets need unit column stride, an even row stride
+``>= N`` and 4-byte alignment). Anything else runs the wrapped quant method.
+
+Co-enabling with the ``kimi_k3_mla`` decode route needs FlashInfer main at or
+above ``50a180ed0`` (flashinfer-ai/flashinfer#6126): earlier builds of the Cake
+FP8 MLA decode kernel emitted non-finite rows on requests with an attention-sink
+key once decode-M Cake projection outputs fed them, which is why this route used
+to serve prefill only (``M >= 256``) in that configuration. The default is now
+every ``M``; ``SGLANG_CAKE_K3_PROJ_MIN_M`` remains as an explicit restriction.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any, Callable, Optional
+
+import torch
+
+from sglang.kernels.cake_kernels._routes import cake_route_enabled
+
+logger = logging.getLogger(__name__)
+
+# Diagnostic knobs (engine side only; no numerics are changed):
+#   SGLANG_CAKE_K3_PROJ_MIN_M=<int>   keep the FP8 linear for row counts below <int>
+#                                     (default 0: every M takes the Cake route)
+#   SGLANG_CAKE_K3_PROJ_ONLY=a,b,...  wrap only the listed projection names
+#   SGLANG_CAKE_K3_PROJ_CHECK=1       compare every eager Cake launch with the
+#                                     wrapped FP8 linear and log anomalies
+_PROJ_MIN_M = int(os.environ.get("SGLANG_CAKE_K3_PROJ_MIN_M", "0") or 0)
+_PROJ_ONLY = frozenset(
+    s.strip()
+    for s in os.environ.get("SGLANG_CAKE_K3_PROJ_ONLY", "").split(",")
+    if s.strip()
+)
+_PROJ_CHECK = os.environ.get("SGLANG_CAKE_K3_PROJ_CHECK", "0") == "1"
+
+ROUTE = "kimi_k3_fp8_projection"
+BLOCK = 128
+PROJECTIONS = (
+    "fused_qkv_a_proj_with_mqa",
+    "q_a_proj",
+    "kv_a_proj_with_mqa",
+    "q_b_proj",
+    "kv_b_proj",
+    "o_proj",
+)
+_CAKE_ERRORS = (RuntimeError, ValueError, NotImplementedError)
+
+
+# Thin indirections to the Cake adapter / facade so the heavy modules load
+# lazily and unit tests can substitute them.
+def _supports_weights(weight, weight_scale, n_valid) -> bool:
+    from sglang.kernels.cake_kernels import gemm_kimi_k3_fp8_projection as cake
+
+    return cake.supports_kimi_k3_fp8_projection_weights(weight, weight_scale, n_valid)
+
+
+def _supports_projection(x, prepared, out=None, workspace=None) -> bool:
+    from sglang.kernels.cake_kernels import gemm_kimi_k3_fp8_projection as cake
+
+    return cake.supports_kimi_k3_fp8_projection(x, prepared, out, workspace)
+
+
+def _prepare_weights(weight, weight_scale, n_valid):
+    from sglang.kernels.ops.gemm.cake import (
+        cake_prepare_kimi_k3_fp8_projection_weights,
+    )
+
+    return cake_prepare_kimi_k3_fp8_projection_weights(weight, weight_scale, n_valid)
+
+
+def _allocate_workspace(prepared, m: int):
+    from sglang.kernels.ops.gemm.cake import (
+        cake_allocate_kimi_k3_fp8_projection_workspace,
+    )
+
+    return cake_allocate_kimi_k3_fp8_projection_workspace(prepared, m)
+
+
+def _prepare_projection(x, prepared, out, workspace):
+    from sglang.kernels.ops.gemm.cake import cake_prepare_kimi_k3_fp8_projection
+
+    return cake_prepare_kimi_k3_fp8_projection(x, prepared, out, workspace)
+
+
+def _is_capturing() -> bool:
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+def prepare_linear_weight(linear: torch.nn.Module, name: str) -> Optional[Any]:
+    """Prepare one linear's serialized FP8_PB_WO weight for Cake; ``None`` when
+    the weight is not in the contract (logged once per linear)."""
+    weight = getattr(linear, "weight", None)
+    scale = getattr(linear, "weight_scale_inv", None)
+    if weight is None or scale is None:
+        logger.info("Cake %s: no FP8 block weight / weight_scale_inv; skipped", name)
+        return None
+    weight = weight.data
+    scale = scale.data
+    if (
+        weight.dtype != torch.float8_e4m3fn
+        or weight.ndim != 2
+        or not weight.is_contiguous()
+        or scale.dtype != torch.float32
+    ):
+        logger.info(
+            "Cake %s: weight %s/%s scale %s is not a serialized FP8_PB_WO block "
+            "weight; skipped",
+            name,
+            tuple(weight.shape),
+            weight.dtype,
+            scale.dtype,
+        )
+        return None
+    n, k = (int(v) for v in weight.shape)
+    n_pad = -(-n // BLOCK) * BLOCK
+    scale_2d = scale.reshape(-1, scale.shape[-1]) if scale.ndim == 4 else scale
+    if (
+        k % BLOCK
+        or n % 2
+        or scale_2d.ndim != 2
+        or tuple(scale_2d.shape) != (n_pad // BLOCK, k // BLOCK)
+    ):
+        logger.info(
+            "Cake %s: shape N=%d K=%d scale %s outside the contract; skipped",
+            name,
+            n,
+            k,
+            tuple(scale.shape),
+        )
+        return None
+    scale_2d = scale_2d.contiguous()
+    if n == n_pad:
+        padded = weight
+    else:
+        # Serialized checkpoints carry the 128-row block scale but not the
+        # padded rows; pad once into a transient copy (freed after prepare).
+        padded = torch.zeros((n_pad, k), dtype=weight.dtype, device=weight.device)
+        padded[:n].copy_(weight)
+    if not _supports_weights(padded, scale_2d, n):
+        logger.info(
+            "Cake %s: adapter admission rejected N=%d (pad %d) K=%d on %s; skipped",
+            name,
+            n,
+            n_pad,
+            k,
+            weight.device,
+        )
+        return None
+    prepared = _prepare_weights(padded, scale_2d, n)
+    logger.info(
+        "Cake %s: prepared FP8 projection N=%d (pad %d) K=%d", name, n, n_pad, k
+    )
+    return prepared
+
+
+class CakeFp8ProjectionLinearMethod:
+    """Instance-level quant-method wrapper: Cake projection when admitted,
+    otherwise the wrapped FP8 method. Every other attribute (``quant_config``,
+    ``process_weights_after_loading``, ``weight_block_size``, ...) is delegated.
+    """
+
+    def __init__(self, inner: Any, name: str):
+        self._inner = inner
+        self.name = name
+        self.prepared: Optional[Any] = None
+        self.n_valid = 0
+        self.k = 0
+        self._prepare_attempted = False
+        self._admitted: dict = {}  # M -> adapter admission for that row count
+        self._warm: set = set()  # M values launched eagerly (JIT modules loaded)
+        self._logged: set = set()
+        if getattr(inner, "apply_into", None) is not None:
+            # Only advertise apply_into when the wrapped method has it
+            # (RowParallelLinear probes it with getattr).
+            self.apply_into = self._apply_into
+
+    def __getattr__(self, attr: str):
+        if attr == "_inner":
+            raise AttributeError(attr)
+        return getattr(self._inner, attr)
+
+    # ---- lifecycle ----
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self._inner.process_weights_after_loading(layer)
+        self._prepare(layer)
+
+    def _prepare(self, layer: torch.nn.Module) -> None:
+        self._prepare_attempted = True
+        self.prepared = None
+        self._admitted.clear()
+        self._warm.clear()
+        prepared = prepare_linear_weight(layer, self.name)
+        if prepared is None:
+            return
+        self.prepared = prepared
+        self.n_valid = int(prepared.n_valid)
+        self.k = int(prepared.K)
+
+    # ---- GEMM ----
+
+    def apply(self, layer: torch.nn.Module, x, bias: Optional[torch.Tensor] = None):
+        out = self._cake(layer, x, None, bias)
+        if out is not None:
+            return out
+        return self._inner.apply(layer, x, bias)
+
+    def _apply_into(
+        self,
+        layer: torch.nn.Module,
+        x,
+        out: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ):
+        res = self._cake(layer, x, out, bias)
+        if res is not None:
+            return res
+        return self._inner.apply_into(layer, x, out, bias=bias)
+
+    def _log_once(self, key: str, msg: str) -> None:
+        if key in self._logged:
+            return
+        self._logged.add(key)
+        logger.info("Cake %s: %s", self.name, msg)
+
+    def _out_ok(self, out: torch.Tensor, m: int, device: torch.device) -> bool:
+        return (
+            isinstance(out, torch.Tensor)
+            and out.ndim == 2
+            and out.dtype == torch.bfloat16
+            and out.device == device
+            and tuple(out.shape) == (m, self.n_valid)
+            and out.stride(1) == 1
+            and out.stride(0) % 2 == 0
+            and out.stride(0) >= self.n_valid
+            and (out.storage_offset() * out.element_size()) % 4 == 0
+        )
+
+    def _cake(
+        self,
+        layer: torch.nn.Module,
+        x,
+        out: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if bias is not None or not isinstance(x, torch.Tensor):
+            return None
+        capturing = _is_capturing()
+        if self.prepared is None:
+            if self._prepare_attempted or capturing:
+                if capturing and not self._prepare_attempted:
+                    self._log_once(
+                        "capture-unprepared",
+                        "first call happened inside CUDA-graph capture; "
+                        "weights were not prepared, using the FP8 linear",
+                    )
+                return None
+            # Loader ran process_weights_after_loading before post_load_weights
+            # installed this wrapper: prepare lazily on the first eager call.
+            self._prepare(layer)
+            if self.prepared is None:
+                return None
+        if (
+            x.ndim != 2
+            or x.dtype != torch.bfloat16
+            or int(x.shape[1]) != self.k
+            or not x.is_contiguous()
+        ):
+            return None
+        m = int(x.shape[0])
+        if _PROJ_MIN_M and m < _PROJ_MIN_M:
+            self._log_once(
+                f"minm-{m}",
+                f"M={m} below SGLANG_CAKE_K3_PROJ_MIN_M={_PROJ_MIN_M}; using the FP8 linear",
+            )
+            return None
+        if out is not None and not self._out_ok(out, m, x.device):
+            return None
+        if capturing and m not in self._warm:
+            self._log_once(
+                f"capture-{m}",
+                f"M={m} reached CUDA-graph capture before an eager warm-up "
+                "launch; using the FP8 linear for this graph",
+            )
+            return None
+        admitted = self._admitted.get(m)
+        if admitted is None:
+            admitted = bool(_supports_projection(x, self.prepared))
+            self._admitted[m] = admitted
+            if not admitted:
+                self._log_once(
+                    f"reject-{m}",
+                    f"adapter admission rejected M={m} N={self.n_valid} K={self.k}",
+                )
+        if not admitted:
+            return None
+        if out is None:
+            out = torch.empty((m, self.n_valid), dtype=torch.bfloat16, device=x.device)
+        try:
+            workspace = _allocate_workspace(self.prepared, m)
+            runner = _prepare_projection(x, self.prepared, out, workspace)
+            runner.launch()
+        except _CAKE_ERRORS as exc:
+            # FlashInfer validates on the host before launching; keep this M
+            # on the FP8 linear from now on.
+            self._admitted[m] = False
+            logger.warning(
+                "Cake %s: FlashInfer rejected M=%d N=%d K=%d, using the FP8 "
+                "linear for this shape: %s",
+                self.name,
+                m,
+                self.n_valid,
+                self.k,
+                exc,
+            )
+            return None
+        if not capturing:
+            self._warm.add(m)
+            if _PROJ_CHECK:
+                self._check(layer, x, out, m)
+        return out
+
+    def _check(
+        self, layer: torch.nn.Module, x: torch.Tensor, out: torch.Tensor, m: int
+    ) -> None:
+        """Diagnostic: compare the Cake output with the wrapped FP8 linear (eager calls only)."""
+        st = self.__dict__.setdefault(
+            "_check_stats",
+            {
+                "calls": 0,
+                "anom": 0,
+                "max_rel": 0.0,
+                "nonfinite": 0,
+                "x_nonfinite_calls": 0,
+                "nf_logged": 0,
+            },
+        )
+        st["calls"] += 1
+        with torch.no_grad():
+            ref = self._inner.apply(layer, x, None)
+            nonfinite = int((~torch.isfinite(out)).sum().item())
+            x_nf = int((~torch.isfinite(x)).sum().item())
+            ref_max = float(ref.abs().max().item())
+            rel = float((out.float() - ref.float()).abs().max().item()) / (
+                ref_max + 1e-6
+            )
+        st["max_rel"] = max(st["max_rel"], rel)
+        if x_nf:
+            st["x_nonfinite_calls"] += 1
+        anomalous = nonfinite > 0 or rel > 0.1
+        if anomalous:
+            st["anom"] += 1
+            st["nonfinite"] += nonfinite
+            if nonfinite > 0 and st["nf_logged"] < 5:
+                st["nf_logged"] += 1
+                bad_rows = (
+                    torch.nonzero(~torch.isfinite(out).all(dim=1))
+                    .flatten()
+                    .tolist()[:8]
+                )
+                logger.warning(
+                    "Cake %s: PROJ_CHECK NON-FINITE M=%d x_nonfinite=%d out_nonfinite=%d ref_nonfinite=%d rows=%s",
+                    self.name,
+                    m,
+                    x_nf,
+                    nonfinite,
+                    int((~torch.isfinite(ref)).sum().item()),
+                    bad_rows,
+                )
+            if st["anom"] <= 10:
+                logger.warning(
+                    "Cake %s: PROJ_CHECK anomaly M=%d N=%d K=%d non_finite=%d max_rel=%.4f |ref|max=%.4g |out|max=%.4g x_finite=%s |x|max=%.4g",
+                    self.name,
+                    m,
+                    self.n_valid,
+                    self.k,
+                    nonfinite,
+                    rel,
+                    ref_max,
+                    float(out.float().abs().max().item()),
+                    bool(torch.isfinite(x).all().item()),
+                    float(x.float().abs().max().item()),
+                )
+        if st["calls"] % 500 == 0 or st["calls"] == 1:
+            logger.info(
+                "Cake %s: PROJ_CHECK summary calls=%d anomalies=%d non_finite_total=%d x_nonfinite_calls=%d max_rel=%.4f (M=%d)",
+                self.name,
+                st["calls"],
+                st["anom"],
+                st["nonfinite"],
+                st["x_nonfinite_calls"],
+                st["max_rel"],
+                m,
+            )
+
+
+def install_cake_kimi_k3_fp8_projections(
+    attn: torch.nn.Module,
+    is_fp8_pb_wo: Callable[[str], bool],
+    prefix: str = "",
+) -> list:
+    """Wrap the admitted MLA projection linears of ``attn`` for the Cake route.
+
+    ``is_fp8_pb_wo(prefix)`` is the model's ``_uses_modelopt_fp8_pb_wo``
+    predicate bound to its quant config; only linears it admits are wrapped.
+    Returns the names of the wrapped linears (empty when the route is off).
+    The wrapper prepares the Cake weight copy when the loader calls
+    ``process_weights_after_loading`` on it, or lazily on the first eager call.
+    """
+    if not cake_route_enabled(ROUTE):
+        return []
+    installed = []
+    for name in PROJECTIONS:
+        linear = getattr(attn, name, None)
+        if linear is None or not isinstance(linear, torch.nn.Module):
+            continue
+        if _PROJ_ONLY and name not in _PROJ_ONLY:
+            logger.info("Cake %s.%s: skipped by SGLANG_CAKE_K3_PROJ_ONLY", prefix, name)
+            continue
+        quant_method = getattr(linear, "quant_method", None)
+        if quant_method is None or isinstance(
+            quant_method, CakeFp8ProjectionLinearMethod
+        ):
+            continue
+        full_name = f"{prefix}.{name}" if prefix else name
+        if not is_fp8_pb_wo(full_name):
+            logger.info("Cake %s: quant algo is not FP8_PB_WO; skipped", full_name)
+            continue
+        linear.quant_method = CakeFp8ProjectionLinearMethod(quant_method, full_name)
+        installed.append(name)
+    return installed
+
+
+__all__ = (
+    "ROUTE",
+    "PROJECTIONS",
+    "CakeFp8ProjectionLinearMethod",
+    "install_cake_kimi_k3_fp8_projections",
+    "prepare_linear_weight",
+)
