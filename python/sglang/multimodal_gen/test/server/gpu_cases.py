@@ -775,14 +775,12 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
     DiffusionTestCase(
         "fasth3_t2va_vsa_4gpu_h100",
         DiffusionServerArgs(
-            model_path="FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+            model_path="FastVideo/FastVideo-FastH3-8-Step-V2",
             modality="video",
             num_gpus=4,
             extras=[
-                "--attention-backend",
-                "video_sparse_attn_h3",
-                "--attention-backend-config",
-                '{"VSA_sparsity": 0.9}',
+                "--component-attention-backends",
+                "transformer=video_sparse_attn_h3",
                 "--enable-torch-compile",
                 "false",
             ],
@@ -805,7 +803,7 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
                     "aspect_ratio": "16:9",
                     "duration_seconds": 5.0,
                 },
-                "num_inference_steps": 5,
+                "num_inference_steps": 9,
                 "seed": 42,
             },
         ),
@@ -1203,6 +1201,8 @@ TWO_GPU_CASES = [
             ulysses_degree=1,
             ring_degree=2,
         ),
+        # Keeps the pre-rename spelling of "lossless" so the compatibility
+        # alias is covered end to end; the case id is also a perf-baseline key.
         replace(T2I_sampling_params, extras={"quality": "extra-high"}),
         run_component_accuracy_check=False,
         run_models_api_check=False,

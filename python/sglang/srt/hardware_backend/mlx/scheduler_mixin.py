@@ -171,10 +171,9 @@ class SchedulerMlxOverlapMixin:
             extend_logprob_start_len_per_req = None
             if batch.return_logprob:
                 # Mirror Scheduler.run_batch's launch-time copy.
-                extend_input_len_per_req = [
-                    req.extend_range.length if req.extend_range is not None else 0
-                    for req in batch.reqs
-                ]
+                extend_input_len_per_req = (
+                    list(batch.extend_lens) if batch.forward_mode.is_extend() else None
+                )
                 extend_logprob_start_len_per_req = batch.extend_logprob_start_lens
             return MlxPendingJob(
                 launch=launch,

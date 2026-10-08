@@ -159,6 +159,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
     check_quantized_moe_compatibility,
     init_lplb_solvers,
+    prebuild_deepep_v2_buffer,
     prepare_moe_topk,
 )
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
@@ -417,10 +418,21 @@ class ModelRunner:
         if get_exec().features.enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
-        # Set device early so that TransferEngine init (e.g. Ascend NPU)
-        # can access the device context.
+        # Set the device before TransferEngine init. MPS has one implicit device.
+        is_mps_device = str(self.device).split(":", 1)[0] == "mps"
+        if is_mps_device:
+            from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
+            if not use_mlx():
+                # Direct ModelRunner construction bypasses the ServerArgs gate.
+                from sglang.srt.hardware_backend.mps.runtime import (
+                    validate_mps_runtime,
+                )
+
+                validate_mps_runtime()
         try:
-            torch.get_device_module(self.device).set_device(get_device().gpu_id)
+            if not is_mps_device:
+                torch.get_device_module(self.device).set_device(get_device().gpu_id)
         except Exception:
             import os
 
@@ -619,7 +631,10 @@ class ModelRunner:
             spec_algorithm=self.spec_algorithm,
             is_draft_worker=self.is_draft_worker,
             post_capture_kv_active=is_post_capture_kv_active(
-                server_args=self.server_args, is_draft_worker=self.is_draft_worker
+                server_args=self.server_args,
+                is_draft_worker=self.is_draft_worker,
+                spec_algorithm=self.spec_algorithm,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             ),
             spec_aux_config=self.spec_aux_config,
             is_hybrid_swa=self.is_hybrid_swa,
@@ -885,6 +900,7 @@ class ModelRunner:
             token_to_kv_pool=self.token_to_kv_pool,
             page_size=self.page_size or 1,
             device=self.device,
+            is_draft_worker=self.is_draft_worker,
         )
 
     def max_shared_logits_buffer_rows(self) -> int:
@@ -1137,6 +1153,8 @@ class ModelRunner:
             target_size = get_parallel().ep_join_rank_offset + get_parallel().tp_size
             self._finalize_elastic_ep_joiner(target_size)
 
+        prebuild_deepep_v2_buffer(model=self.model)
+
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
             # Capture is target-only. The draft worker runs in the same process
@@ -1236,6 +1254,7 @@ class ModelRunner:
             )
         self.loader = loaded.loader
         self.model = loaded.model
+        current_platform.post_load_model(self.model)
         self.startup_weight_load = loaded.startup_weight_load
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (

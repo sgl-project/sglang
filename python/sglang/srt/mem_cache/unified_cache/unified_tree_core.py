@@ -525,12 +525,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Rolling digest of reclaim victim ids, cross-checked across TP ranks.
         self.write_back_duplicate_reclaim_digest: int = 0
 
+        self._empty_device_indices = torch.empty(
+            (0,), dtype=torch.int64, device=self.device
+        )
         self._empty_match_result = MatchResult(
-            device_indices=torch.empty(
-                (0,),
-                dtype=torch.int64,
-                device=self.device,
-            ),
+            device_prefix_len=0,
             last_device_node=self.root_node.id,
             last_host_node=self.root_node.id,
             best_match_node=self.root_node.id,
@@ -1006,12 +1005,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node if self.enable_hicache else best_match_device_node
         )
 
-        if best_match_device_value_len > 0:
-            device_indices = torch.cat(value[:best_match_device_value_len])
-        else:
-            device_indices = self._empty_match_result.device_indices
         result = MatchResult(
-            device_indices=device_indices,
+            device_prefix_len=sum(len(v) for v in value[:best_match_device_value_len]),
             last_device_node=best_match_device_node,
             last_host_node=last_host_node,
             best_match_node=best_match_node,
@@ -1036,7 +1031,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     @property
     def empty_match_result(self) -> MatchResult:
-        """A shared empty MatchResult (empty device indices + boundary NodeIds)."""
+        """A shared empty MatchResult (zero device prefix + boundary NodeIds)."""
         return self._empty_match_result
 
     def is_full_device_evicted(self, node_id: NodeId) -> bool:
@@ -1057,7 +1052,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             prefix_chunks.append(value)
             node = node.parent
         if not prefix_chunks:
-            return self._empty_match_result.device_indices
+            return self._empty_device_indices
         prefix_chunks.reverse()
         return torch.cat(prefix_chunks)
 
@@ -2380,6 +2375,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def build_backup_spec(self, node_id: NodeId):
         """Read a node's device->host backup spec (device value + component transfers) now."""
         return self._build_backup_spec(self.node_by_id(node_id))
+
+    def buffer_backup_pool_keys(
+        self, node_id: NodeId, hash_values: list[str]
+    ) -> dict[ComponentType, dict[PoolName, list[str]]]:
+        node = self.node_by_id(node_id)
+        named: dict[ComponentType, dict[PoolName, list[str]]] = {}
+        for comp in self.components:
+            pool_keys = comp.buffer_backup_keys(node, hash_values)
+            if pool_keys:
+                named[comp.component_type] = pool_keys
+        return named
+
+    def build_backup_kv_action(self, node_id: NodeId) -> BackupKV:
+        return self._build_backup_kv_action(self.node_by_id(node_id))
 
     def _build_backup_spec(self, node: UnifiedTreeNode):
         """Gather missing Full and component transfers for Host backup."""

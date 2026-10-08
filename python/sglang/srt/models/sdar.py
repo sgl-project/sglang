@@ -15,9 +15,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -99,7 +99,6 @@ class SDARAttention(nn.Module):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
@@ -129,8 +128,7 @@ class SDARAttention(nn.Module):
             self.total_num_kv_heads,
             bias=getattr(config, "attention_bias", False),
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -139,8 +137,7 @@ class SDARAttention(nn.Module):
             bias=getattr(config, "attention_bias", False),
             quant_config=quant_config,
             reduce_results=reduce_results,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -294,7 +291,7 @@ class SDARBlock(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -303,8 +300,6 @@ class SDARBlock(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn() if layer_id != 0 else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
