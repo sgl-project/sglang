@@ -1857,9 +1857,20 @@ class Envs:
     # cannot service it, so enabling one on unsupported hardware is a no-op.
     SGLANG_ROCM_K3_AITER_MLA_GATE = EnvBool(False)
     SGLANG_ROCM_K3_AITER_KDA_GROUP64 = EnvBool(False)
+    SGLANG_ROCM_K3_AITER_MOE_PREROUTE_FP8 = EnvBool(False)
+    SGLANG_ROCM_K3_AITER_LATENT_TAIL_FP8 = EnvBool(False)
     # Extend the KDA and MoE pre-route fusions from the single-token bucket to
     # two tokens.
     SGLANG_ROCM_K3_AITER_B2_FUSIONS = EnvBool(False)
+    # Route two- and four-token MoE decode through the cooperative FlyDSL
+    # tri-projection, which returns the shared expert already SiTU-activated.
+    SGLANG_ROCM_K3_PREROUTE_PREACTIVATED_SHARED = EnvBool(False)
+    # Launch geometry for that cooperative kernel: compute units, waves per
+    # block, waves per execution unit, and the weight-load cache modifier.
+    SGLANG_ROCM_K3_PREROUTE_COOP_CU = EnvInt(256)
+    SGLANG_ROCM_K3_PREROUTE_COOP_WPB = EnvInt(8)
+    SGLANG_ROCM_K3_PREROUTE_COOP_WPE = EnvInt(3)
+    SGLANG_ROCM_K3_PREROUTE_COOP_WCM = EnvInt(3)
     # Where the K3 FlyDSL kernels come from: "auto" prefers the SGLang copy and
     # falls back to AITER, "sglang" and "aiter" pin one source.
     SGLANG_ROCM_K3_FLYDSL_SOURCE = EnvStrWithAlias(
