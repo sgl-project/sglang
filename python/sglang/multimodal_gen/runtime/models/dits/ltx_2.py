@@ -520,11 +520,6 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         audio_coords = audio_coords.unsqueeze(1)
         return audio_coords
 
-    def prepare_coords(self, *args, **kwargs):
-        if self.modality == "video":
-            return self.prepare_video_coords(*args, **kwargs)
-        return self.prepare_audio_coords(*args, **kwargs)
-
     def forward(
         self,
         coords: torch.Tensor,
