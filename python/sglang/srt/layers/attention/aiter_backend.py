@@ -344,6 +344,7 @@ class AiterAttnBackend(AttentionBackend):
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.kv_index_translator = model_runner.kv_index_translator
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
@@ -1720,7 +1721,10 @@ class AiterAttnBackend(AttentionBackend):
             swa_out_cache_loc = self.swa_kv_pool.translate_loc_from_full_to_swa(
                 forward_batch.out_cache_loc
             )
-        max_kv_len = forward_batch.seq_lens_cpu.max().item()
+        # Absent under the sync-free path (needs_cpu_seq_lens=False); unified
+        # verify sizes from its page table instead.
+        if forward_batch.seq_lens_cpu is not None:
+            max_kv_len = forward_batch.seq_lens_cpu.max().item()
 
         # dcp metadata
         local_kv_lens = None
@@ -1943,10 +1947,10 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 kv_indices, kv_indptr, qo_indptr, _ = (
                     forward_batch.spec_info.generate_attn_arg_prefill(
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens,
-                        forward_batch.seq_lens_sum,
-                        self.req_to_token,
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        paged_kernel_lens=forward_batch.seq_lens,
+                        paged_kernel_lens_sum=forward_batch.seq_lens_sum,
+                        translator=self.kv_index_translator,
                     )
                 )
                 self.forward_metadata = ForwardMetadata(
@@ -2530,9 +2534,13 @@ class AiterAttnBackend(AttentionBackend):
         verify_token_table = None
 
         swa_page_table = None
+        # Unified verify never reads this host max (replay sizes from
+        # max_context_len); torch.max(seq_lens).item() would sync every replay.
         max_kv_len = (
             seq_lens_cpu.max().item()
             if seq_lens_cpu is not None
+            else None
+            if forward_mode.is_target_verify() and self._use_unified_verify
             else torch.max(seq_lens).item()
         )
 
@@ -4431,6 +4439,7 @@ class AiterIndicesUpdaterPrefill:
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.kv_index_translator = model_runner.kv_index_translator
         self.update = self.update_single_wrapper
 
         self.kv_indices = None
@@ -4502,10 +4511,10 @@ class AiterIndicesUpdaterPrefill:
         else:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    paged_kernel_lens_sum,
-                    self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    paged_kernel_lens=paged_kernel_lens,
+                    paged_kernel_lens_sum=paged_kernel_lens_sum,
+                    translator=self.kv_index_translator,
                 )
             )
 
@@ -4519,6 +4528,7 @@ class AiterMlaIndicesUpdaterPrefill:
 
         # Buffers and wrappers
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.kv_index_translator = model_runner.kv_index_translator
         self.update = self.update_single_wrapper
 
         self.kv_indptr = None
@@ -4580,10 +4590,10 @@ class AiterMlaIndicesUpdaterPrefill:
         else:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    kv_lens,
-                    kv_lens_sum,
-                    self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    paged_kernel_lens=kv_lens,
+                    paged_kernel_lens_sum=kv_lens_sum,
+                    translator=self.kv_index_translator,
                 )
             )
 
@@ -4637,6 +4647,7 @@ class AiterMultiStepDraftBackend:
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.page_size = get_schedule().page_size
+        self.kv_index_translator = model_runner.kv_index_translator
 
     def common_template(
         self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int
@@ -4652,6 +4663,7 @@ class AiterMultiStepDraftBackend:
             if self.max_context_len >= _KV_INDEX_BLOCKS_MIN_CONTEXT
             else 1
         )
+        v2p = self.kv_index_translator.full_flat_v2p()
         self.generate_draft_decode_kv_indices[
             (self.speculative_num_steps * num_token_blocks, num_seqs, self.topk)
         ](
@@ -4661,6 +4673,7 @@ class AiterMultiStepDraftBackend:
             kv_indices_buffer,
             self.kv_indptr,
             forward_batch.positions,
+            v2p,
             self.pool_len,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
@@ -4671,6 +4684,7 @@ class AiterMultiStepDraftBackend:
             # A single token block is the historical launch; NUM_STEPS=0 keeps
             # its 128-wide program instead of the token-block specialization.
             NUM_STEPS=self.speculative_num_steps if num_token_blocks > 1 else 0,
+            TRANSLATE=v2p is not None,
         )
 
         for i in range(self.speculative_num_steps - 1):

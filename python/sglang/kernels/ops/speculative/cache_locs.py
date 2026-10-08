@@ -79,6 +79,17 @@ def assign_draft_cache_locs_contiguous(
 
 
 @triton.jit
+def _translate_token_ids(ids, v2p, mask, page_size: tl.constexpr):
+    """Virtual token ids -> physical ones through the page-level v2p table,
+    as `translate_kv_loc` does. A negative id maps to the page-0 sink instead
+    of loading before `v2p`."""
+    i64 = ids.to(tl.int64)
+    vpage = tl.where(i64 < 0, 0, i64 // page_size)
+    phys = tl.load(v2p + vpage, mask=mask, other=0)
+    return tl.where(i64 < 0, 0, tl.maximum(phys * page_size + i64 % page_size, 0))
+
+
+@triton.jit
 def generate_draft_decode_kv_indices(
     req_pool_indices,
     req_to_token,
@@ -86,6 +97,7 @@ def generate_draft_decode_kv_indices(
     kv_indices,
     kv_indptr,
     positions,
+    v2p,
     pool_len: tl.constexpr,
     kv_indices_stride: tl.constexpr,
     kv_indptr_stride: tl.constexpr,
@@ -96,6 +108,7 @@ def generate_draft_decode_kv_indices(
     window_size: tl.constexpr = 0,
     sink_size: tl.constexpr = 0,
     NUM_STEPS: tl.constexpr = 0,
+    TRANSLATE: tl.constexpr = False,
 ):
     # window_size > 0 restricts the draft (not the target) to sink_size prefix
     # tokens + the most-recent window_size; window_size == 0 is the identity.
@@ -153,6 +166,8 @@ def generate_draft_decode_kv_indices(
                 recent_start + copy_offset - s_eff,
             )
             data = tl.load(token_pool_ptr + src, mask=mask)
+            if TRANSLATE:
+                data = _translate_token_ids(data, v2p, mask, page_size)
             tl.store(kv_ptr + copy_offset, data, mask=mask)
             copy_offset += BLOCK_SIZE
     else:
@@ -165,6 +180,8 @@ def generate_draft_decode_kv_indices(
                 recent_start + copy_offset - s_eff,
             )
             data = tl.load(token_pool_ptr + src, mask=mask)
+            if TRANSLATE:
+                data = _translate_token_ids(data, v2p, mask, page_size)
             tl.store(kv_ptr + copy_offset, data, mask=mask)
 
     # Extension entries and kv_indptr belong to token block 0 alone; other
@@ -194,6 +211,11 @@ def generate_draft_decode_kv_indices(
             extend_data = tl.load(
                 token_pool_ptr + start + extend_offset,
                 mask=extend_offset < iters,
+            )
+
+        if TRANSLATE:
+            extend_data = _translate_token_ids(
+                extend_data, v2p, extend_offset < iters, page_size
             )
 
         tl.store(

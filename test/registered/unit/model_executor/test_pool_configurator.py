@@ -179,6 +179,9 @@ def _make_model_runner(
         eagle_draft_swa_num_layers=None,
         dflash_draft_num_layers=None,
     )
+    # Fused draft KV is off unless a test opts in (a bare MagicMock return
+    # would read as a truthy entry size and take the fused pricing branch).
+    mr.fused_entry_bytes.return_value = None
 
     return mr
 
@@ -1428,6 +1431,107 @@ class TestSWAPoolFloor(CustomTestCase):
                         check_dsv4_unified_fp8_pd_supported(
                             **{**base, "disaggregation_mode": mode, key: value}
                         )
+
+
+class TestFusedDraftPricing(unittest.TestCase):
+    """Fused draft KV: the boot solve must price the EXACT fused entry.
+
+    The fused full-side entry (host + draft + alignment pad) replaces BOTH the
+    per-token full term and the per-draft-layer approximation; charging both
+    would over-reserve, charging only the approximation would under-reserve
+    and OOM at pool construction (the factory allocates tokens x fused entry).
+    """
+
+    def _make(self, fused_entry, draft_layers, **runner_kwargs):
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(4)),
+            swa_attention_layer_ids=list(range(4, 12)),
+            swa_num_kv_heads=4,
+            page_size=1,
+            swa_full_tokens_ratio=0.5,
+            **runner_kwargs,
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_standalone.return_value = False
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = draft_layers
+        mr.fused_entry_bytes.side_effect = lambda name: (
+            fused_entry if name == "full" else None
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            return mr, create_memory_pool_configurator(mr)
+
+    def _expected_cell(self, cfg, full_term):
+        return (
+            full_term
+            + cfg._swa_per_token * cfg._draft_swa_full_layers_num
+            + cfg._swa_full_tokens_ratio * cfg._swa_per_token * cfg._swa_layers_num
+            + cfg._draft_cell_size
+        )
+
+    def test_unfused_keeps_the_draft_layer_approximation(self):
+        _, cfg = self._make(fused_entry=None, draft_layers=2)
+        self.assertEqual(cfg._draft_full_layers_num, 2)
+        self.assertEqual(
+            cfg._cell_size,
+            self._expected_cell(cfg, cfg._full_per_token * (4 + 2)),
+        )
+
+    def test_fused_entry_replaces_full_and_draft_terms(self):
+        fused_entry = 54_321
+        _, cfg = self._make(fused_entry=fused_entry, draft_layers=2)
+        self.assertEqual(cfg._draft_full_layers_num, 0)
+        self.assertEqual(cfg._cell_size, self._expected_cell(cfg, fused_entry))
+
+    def _assert_unified_bytes_price_the_fused_entry(self, cfg, config, available):
+        """The bytes handed to the unified pool must buy every full token at
+        the fused entry -- the factory divides them by it -- and must not leave
+        a full token's worth of the budget unspent."""
+        fused_entry = cfg._fused_full_entry
+        swa_bytes = (
+            config.swa_max_total_num_tokens * cfg._swa_per_token * cfg._swa_layers_num
+        )
+        self.assertEqual(
+            config.unified_memory_pool_bytes,
+            config.full_max_total_num_tokens * fused_entry + swa_bytes,
+        )
+        self.assertLessEqual(config.unified_memory_pool_bytes, available)
+        self.assertGreater(
+            config.unified_memory_pool_bytes + 2 * fused_entry, available
+        )
+
+    def test_unified_solve_prices_the_fused_entry(self):
+        available = 50_000_000
+        _, cfg = self._make(
+            fused_entry=54_321, draft_layers=2, enable_unified_memory=True
+        )
+        config = cfg.calculate_pool_sizes(available, 1)
+        self._assert_unified_bytes_price_the_fused_entry(cfg, config, available)
+
+    def test_chunk_cap_solve_prices_the_fused_entry(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            SWAChunkCapPoolConfigurator,
+        )
+
+        available = 50_000_000
+        _, cfg = self._make(
+            fused_entry=54_321,
+            draft_layers=2,
+            enable_unified_memory=True,
+            disable_radix_cache=True,
+            chunked_prefill_size=4,
+            sliding_window_size=8,
+            max_running_requests=2,
+        )
+        self.assertIsInstance(cfg, SWAChunkCapPoolConfigurator)
+        config = cfg.calculate_pool_sizes(available, 1)
+        self._assert_unified_bytes_price_the_fused_entry(cfg, config, available)
 
 
 if __name__ == "__main__":

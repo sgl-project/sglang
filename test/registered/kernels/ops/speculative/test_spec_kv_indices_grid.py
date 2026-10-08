@@ -60,6 +60,7 @@ def _run_draft(kern_inputs, topk, steps, page_size, nb, kw):
         kv_i,
         kv_p,
         positions,
+        None,  # v2p: no unified-pool translation
         POOL_LEN,
         kv_i.shape[1],
         kv_p.shape[1],

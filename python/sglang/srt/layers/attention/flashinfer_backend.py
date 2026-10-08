@@ -1840,10 +1840,6 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
-        # Kept ONLY for the spec-info branches (generate_attn_arg_prefill),
-        # which are static-pool-only: unified memory asserts spec off. The
-        # normal builders source from the per-batch KVIndexTable.
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._swa_kv_pool = attn_backend._swa_kv_pool
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
@@ -2202,20 +2198,22 @@ class FlashInferIndicesUpdaterPrefill:
             if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
-                        req_pool_indices,
-                        paged_kernel_lens,
-                        paged_kernel_lens_sum,
-                        self.req_to_token,
+                        req_pool_indices=req_pool_indices,
+                        paged_kernel_lens=paged_kernel_lens,
+                        paged_kernel_lens_sum=paged_kernel_lens_sum,
+                        translator=translator,
+                        sliding_window=use_swa_source,
                         kv_start_idx=kv_start_idx,
                     )
                 )
             else:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
-                        req_pool_indices,
-                        paged_kernel_lens,
-                        paged_kernel_lens_sum,
-                        self.req_to_token,
+                        req_pool_indices=req_pool_indices,
+                        paged_kernel_lens=paged_kernel_lens,
+                        paged_kernel_lens_sum=paged_kernel_lens_sum,
+                        translator=translator,
+                        sliding_window=use_swa_source,
                     )
                 )
 
@@ -2371,6 +2369,7 @@ class FlashInferMultiStepDraftBackend:
         self.draft_window_size, self.draft_sink_size = resolve_draft_decode_window(
             model_runner
         )
+        self.kv_index_translator = model_runner.kv_index_translator
 
     def common_template(
         self,
@@ -2393,6 +2392,7 @@ class FlashInferMultiStepDraftBackend:
             seq_lens_sum=seq_lens_sum,
         )
 
+        v2p = self.kv_index_translator.full_flat_v2p()
         self.generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
         ](
@@ -2402,6 +2402,7 @@ class FlashInferMultiStepDraftBackend:
             kv_indices_buffer,
             self.kv_indptr,
             forward_batch.positions,
+            v2p,
             self.pool_len,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
@@ -2411,6 +2412,7 @@ class FlashInferMultiStepDraftBackend:
             self.page_size,
             self.draft_window_size,
             self.draft_sink_size,
+            TRANSLATE=v2p is not None,
         )
 
         assert forward_batch.spec_info is not None

@@ -38,11 +38,16 @@ from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DenseDraftRegion,
+    FusedDraftPlacement,
+)
 from sglang.srt.mem_cache.layout.token_major import (
     ROW_ALIGN_BYTES,
     DenseEntryLayout,
     DensePart,
     align_entry_bytes,
+    align_part_offset,
     build_dense_views,
     build_mamba_entry_views,
 )
@@ -113,6 +118,8 @@ class SubPoolSpec(ABC):
     name: str
     layer_num: int
     grow_direction: str  # "up" | "down" | "float"
+    # Fused draft region riding in this sub-pool's entries; None = unfused.
+    draft_region: Optional[DenseDraftRegion] = None
 
     def __post_init__(self):
         assert self.grow_direction in self._allowed_grow_directions, (
@@ -134,7 +141,17 @@ class SubPoolSpec(ABC):
 
 @dataclass(frozen=True, kw_only=True)
 class MHASubPoolSpec(SubPoolSpec):
-    """Per-slot layout of one MHA-shaped sub-pool. `v_head_dim` defaults to `head_dim`."""
+    """Per-slot layout of one MHA-shaped sub-pool. `v_head_dim` defaults to `head_dim`.
+
+    With `draft_region` set, the draft model's K and V rows are two more
+    parts of every slot's entry, after the host parts:
+
+        [ K_0 | V_0 | ... | K_{Lh-1} | V_{Lh-1} | dK_0 | dV_0 | ... | pad ]
+
+    The slot stride stays the one entry, so host and draft views are indexed
+    by the same physical token id; only their offsets differ. `draft_region
+    is None` keeps the layout byte-identical to the unfused one.
+    """
 
     head_num: int
     head_dim: int
@@ -159,6 +176,8 @@ class MHASubPoolSpec(SubPoolSpec):
         assert self.v_head_dim > 0, (
             f"v_head_dim must be positive; got {self.v_head_dim}"
         )
+        if self.draft_region is not None:
+            self.draft_region.validate()
 
     def k_row_bytes(self) -> int:
         return self.head_num * self.head_dim * self.store_dtype.itemsize
@@ -166,9 +185,20 @@ class MHASubPoolSpec(SubPoolSpec):
     def v_row_bytes(self) -> int:
         return self.head_num * self.v_head_dim * self.store_dtype.itemsize
 
+    def host_entry_bytes(self) -> int:
+        """Host (target-only) bytes for one slot, before any draft parts."""
+        return self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
+
+    def draft_offset_in_entry(self) -> int:
+        """Byte offset of the fused draft parts inside one slot's entry."""
+        assert self.draft_region is not None
+        return align_part_offset(self.host_entry_bytes())
+
     def entry_bytes(self) -> int:
+        if self.draft_region is None:
+            return align_entry_bytes(self.host_entry_bytes())
         return align_entry_bytes(
-            self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
+            self.draft_offset_in_entry() + self.draft_region.entry_bytes()
         )
 
     def page_bytes(self, page_size: int) -> int:
@@ -179,27 +209,27 @@ class MHASubPoolSpec(SubPoolSpec):
         is ``page_size`` such entries back to back."""
         _check_row_alignment(self.name, K=self.k_row_bytes(), V=self.v_row_bytes())
         layer_stride = self.k_row_bytes() + self.v_row_bytes()
-        return DenseEntryLayout(
-            entry_bytes=self.entry_bytes(),
-            parts=(
-                DensePart(
-                    name="k",
-                    offset_bytes=0,
-                    layer_stride_bytes=layer_stride,
-                    layer_num=self.layer_num,
-                    row_shape=(self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                ),
-                DensePart(
-                    name="v",
-                    offset_bytes=self.k_row_bytes(),
-                    layer_stride_bytes=layer_stride,
-                    layer_num=self.layer_num,
-                    row_shape=(self.head_num, self.v_head_dim),
-                    dtype=self.store_dtype,
-                ),
+        parts = (
+            DensePart(
+                name="k",
+                offset_bytes=0,
+                layer_stride_bytes=layer_stride,
+                layer_num=self.layer_num,
+                row_shape=(self.head_num, self.head_dim),
+                dtype=self.store_dtype,
+            ),
+            DensePart(
+                name="v",
+                offset_bytes=self.k_row_bytes(),
+                layer_stride_bytes=layer_stride,
+                layer_num=self.layer_num,
+                row_shape=(self.head_num, self.v_head_dim),
+                dtype=self.store_dtype,
             ),
         )
+        if self.draft_region is not None:
+            parts += self.draft_region.parts(self.draft_offset_in_entry())
+        return DenseEntryLayout(entry_bytes=self.entry_bytes(), parts=parts)
 
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
@@ -226,6 +256,9 @@ class MLASubPoolSpec(SubPoolSpec):
         )
         assert self.qk_rope_head_dim > 0, (
             f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
+        )
+        assert self.draft_region is None, (
+            "MLA sub-pools do not carry a fused draft region yet"
         )
 
     @property
@@ -271,6 +304,9 @@ class MambaSubPoolSpec(SubPoolSpec):
     def __post_init__(self):
         super().__post_init__()
         assert len(self.conv_state_shapes) > 0, "conv_state_shapes must be non-empty"
+        assert self.draft_region is None, (
+            "mamba state pages carry no fused draft region yet"
+        )
 
     def conv_row_bytes(self, idx: int) -> int:
         return _prod(self.conv_state_shapes[idx]) * self.conv_dtype.itemsize
@@ -350,6 +386,7 @@ class UnifiedKVPool:
         page_size: int = 1,
         post_capture_active: bool = False,
         bs1_floor_terms: Optional[List[Tuple[str, int]]] = None,
+        fused_draft: Optional[FusedDraftPlacement] = None,
     ):
         assert page_size >= 1, f"page_size must be >= 1; got {page_size}"
         assert len(sub_pool_specs) >= 2, (
@@ -386,6 +423,17 @@ class UnifiedKVPool:
         self.post_capture_active = post_capture_active
         self._post_capture_owner: Optional[KvVmmBufferOwner] = None
         self._bs1_floor_terms = bs1_floor_terms or []
+        self.fused_draft = fused_draft
+        for spec in sub_pool_specs:
+            expected = (
+                fused_draft.region
+                if fused_draft is not None and spec.name == "full"
+                else None
+            )
+            assert spec.draft_region is expected, (
+                f"sub-pool {spec.name!r}: draft_region {spec.draft_region} does "
+                f"not match the fused draft placement's {expected}"
+            )
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -588,6 +636,17 @@ class UnifiedKVPool:
         )
         return s
 
+    def require_draft_host_spec(self, name: str) -> SubPoolSpec:
+        """The sub-pool spec whose entries carry a fused draft region.
+
+        Kind-agnostic: any spec that resolves a `draft_region` also lays the
+        draft parts out in its `layout()`."""
+        s = self._specs_by_name[name]
+        assert s.draft_region is not None, (
+            f"sub-pool {name!r} carries no fused draft region"
+        )
+        return s
+
     def max_slots(self, name: str) -> int:
         return self._max_slots[name]
 
@@ -627,6 +686,27 @@ class UnifiedKVPool:
                 anchor_bytes=anchor_bytes,
             )
             for name in ("k", "v")
+        )
+        return k_views, v_views
+
+    def build_dense_draft_views(
+        self, sub_pool_name: str
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Per-layer K/V views of the DRAFT parts fused into ``sub_pool_name``'s
+        entries: same pages, same slot ids, same v2p table as the host."""
+        spec = self.require_draft_host_spec(sub_pool_name)
+        layout = spec.layout()
+        page_size = self._page_size
+        num_slots = self.max_slots(sub_pool_name) // page_size * page_size
+        k_views, v_views = (
+            build_dense_views(
+                self._raw,
+                layout=layout,
+                part_name=name,
+                num_slots=num_slots,
+                anchor_bytes=self._anchor_bytes[sub_pool_name],
+            )
+            for name in ("draft_k", "draft_v")
         )
         return k_views, v_views
 
@@ -710,6 +790,9 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             enable_kv_cache_copy=False,
             kv_cache_layout="page_major",
         )
+
+    def _kv_tokens_per_row(self) -> int:
+        return 1
 
     def _create_buffers(self):
         self.k_buffer = self._k_views
@@ -1896,8 +1979,15 @@ def init_unified_swa_pools(
     lazy_compaction: bool = False,
     model_context_len: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
+    fused_draft: Optional[FusedDraftPlacement] = None,
 ) -> UnifiedSWAPoolBundle:
-    """Build the SWA-hybrid unified-memory-pool stack."""
+    """Build the SWA-hybrid unified-memory-pool stack.
+
+    With ``fused_draft``, every entry of the "full" sub-pool carries the
+    draft model's K/V parts after the host parts, and each draft runner
+    binds a `UnifiedDraftKVPool` over its own lanes instead of allocating a
+    pool of its own.
+    """
     from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedSWATokenToKVPoolAllocator,
     )
@@ -1923,6 +2013,7 @@ def init_unified_swa_pools(
         store_dtype=store_dtype,
         kv_cache_dtype=kv_cache_dtype,
         grow_direction="down",
+        draft_region=None if fused_draft is None else fused_draft.region,
     )
     swa_spec = MHASubPoolSpec(
         name="swa",
@@ -1978,6 +2069,7 @@ def init_unified_swa_pools(
         page_size=page_size,
         post_capture_active=post_capture_active,
         bs1_floor_terms=bs1_floor_terms,
+        fused_draft=fused_draft,
     )
     token_to_kv_pool = UnifiedSWAKVPool(
         unified_buffer=shared_pool,
