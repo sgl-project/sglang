@@ -40,6 +40,7 @@ is every run of the CPU suite this file is registered to.
 """
 
 import os
+import shutil
 import unittest
 import unittest.mock
 from array import array
@@ -48,11 +49,14 @@ from types import SimpleNamespace
 
 import torch
 import torch.multiprocessing as mp
+from parameterized import parameterized_class
 
 from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import page_interleave
 from sglang.srt.mem_cache.allocator.page_interleave import (
     PageInterleavePoolAllocator,
@@ -60,7 +64,6 @@ from sglang.srt.mem_cache.allocator.page_interleave import (
 )
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
     EvictResult,
     InsertParams,
     MatchPrefixParams,
@@ -82,12 +85,12 @@ from sglang.srt.mem_cache.page_interleave_pool import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_parallel, publish
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_div
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
@@ -647,16 +650,25 @@ def _insert(tree, tokens, rotation_base=None, value=None):
     )
 
 
-def _node(tree, node_id):
-    return tree.tree_core.node_by_id(node_id)
-
-
 def _match_len(tree, tokens):
     res = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
-    return len(res.device_indices)
+    return res.device_prefix_len
 
 
-class TestUnifiedRotationBase(CustomTestCase):
+class _TreeCoreBackendCase(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        if self.tree_core_backend == "rust" and shutil.which("cargo") is None:
+            self.skipTest("the Rust backend builds with cargo")
+        override = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(
+            self.tree_core_backend
+        )
+        override.__enter__()
+        self.addCleanup(override.__exit__, None, None, None)
+
+
+@parameterized_class(("tree_core_backend",), [("python",), ("rust",)])
+class TestUnifiedRotationBase(_TreeCoreBackendCase):
     """The host rotation base on UnifiedTreeNode: the one new piece of
     metadata. The Full component's value is a device tensor, so the base must
     survive inserts and splits purely host-side or the alloc path gains a D2H
@@ -671,12 +683,12 @@ class TestUnifiedRotationBase(CustomTestCase):
         probe = list(range(8)) + [99, 98, 97, 96]
         _insert(tree, probe, rotation_base=2)
         res = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", probe))))
-        tail = _node(tree, res.last_device_node)
-        self.assertEqual(tail.rotation_base, 2)
-        parent = tail.parent
-        self.assertEqual(parent.rotation_base, 2)
-        for child in parent.children.values():
-            self.assertEqual(child.rotation_base, 2)
+        self.assertEqual(tree.rotation_base_of(res.last_device_node), 2)
+        for tokens in (list(range(8)), list(range(12))):
+            matched = tree.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            )
+            self.assertEqual(tree.rotation_base_of(matched.last_device_node), 2)
 
     def test_new_chain_gets_its_own_base(self):
         tree = _unified_tree()
@@ -686,8 +698,8 @@ class TestUnifiedRotationBase(CustomTestCase):
         r2 = tree.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", range(100, 108))))
         )
-        self.assertEqual(_node(tree, r1.last_device_node).rotation_base, 1)
-        self.assertEqual(_node(tree, r2.last_device_node).rotation_base, 3)
+        self.assertEqual(tree.rotation_base_of(r1.last_device_node), 1)
+        self.assertEqual(tree.rotation_base_of(r2.last_device_node), 3)
 
     def test_extension_tail_node_stamped_from_request(self):
         tree = _unified_tree()
@@ -696,13 +708,13 @@ class TestUnifiedRotationBase(CustomTestCase):
         # tail node with the (same, chain-constant) base.
         _insert(tree, list(range(16)), rotation_base=1)
         res = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", range(16)))))
-        self.assertEqual(_node(tree, res.last_device_node).rotation_base, 1)
+        self.assertEqual(tree.rotation_base_of(res.last_device_node), 1)
 
     def test_unsharded_inserts_keep_none(self):
         tree = _unified_tree()
         _insert(tree, list(range(8)))
         res = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", range(8)))))
-        self.assertIsNone(_node(tree, res.last_device_node).rotation_base)
+        self.assertIsNone(tree.rotation_base_of(res.last_device_node))
 
     def test_rotation_base_of_reads_through_the_cache_boundary(self):
         """The alloc path holds a NodeId, not a node: the base must be
@@ -717,12 +729,13 @@ class TestUnifiedRotationBase(CustomTestCase):
         self.assertIsNone(tree.rotation_base_of(tree.tree_core.root_node_handle()))
 
 
-class TestShardedCoreGate(CustomTestCase):
+@parameterized_class(("tree_core_backend",), [("python",), ("rust",)])
+class TestShardedCoreGate(_TreeCoreBackendCase):
     """A tree core that does not model rotation_base would never decline a
     cross-base graft. Pairing one with a sharded allocator must fail at
     construction, not produce wrong-owner gathers at serve time."""
 
-    def test_python_core_supports_rotation_base(self):
+    def test_core_supports_rotation_base(self):
         tree = _unified_tree()
         self.assertTrue(tree.tree_core.supports_rotation_base)
 
@@ -737,48 +750,45 @@ class TestShardedCoreGate(CustomTestCase):
             tree_components=(ComponentType.FULL,),
         )
         with unittest.mock.patch.object(
-            UnifiedTreeCore, "supports_rotation_base", False
+            type(tree.tree_core), "supports_rotation_base", False
         ):
             with self.assertRaisesRegex(ValueError, "rotation bases"):
                 UnifiedRadixCache(params)
 
     def test_unsharded_allocator_accepts_any_core(self):
+        tree = _unified_tree()
         params = CacheInitParams(
             disable=False,
             req_to_token_pool=ReqToTokenPool(
                 size=8, max_context_len=128, device="cpu", enable_memory_saver=False
             ),
-            token_to_kv_pool_allocator=_unified_tree().token_to_kv_pool_allocator,
+            token_to_kv_pool_allocator=tree.token_to_kv_pool_allocator,
             page_size=4,
             eviction_policy="lru",
             tree_components=(ComponentType.FULL,),
         )
         with unittest.mock.patch.object(
-            UnifiedTreeCore, "supports_rotation_base", False
+            type(tree.tree_core), "supports_rotation_base", False
         ):
             UnifiedRadixCache(params)  # no raise: sharding is off
 
 
 class _GraftReq:
-    """Minimal Req stand-in for cache_unfinished/finished_req."""
+    """Minimal Req stand-in for checkpoint."""
 
     def __init__(self, fill_ids, req_pool_idx=0):
         self.fill_ids = list(fill_ids)
         self.origin_input_ids = array("q", fill_ids)
+        self.full_untruncated_fill_ids = self.origin_input_ids
         self.output_ids = array("q", [])
-        self.kv = SimpleNamespace(
-            req_pool_idx=req_pool_idx,
-            cache_protected_len=0,
-            swa_evicted_seqlen=0,
-        )
+        self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         self.extra_key = None
         self.cache_salt = None
-        self.prefix_indices = torch.empty(0, dtype=torch.int64)
+        self.prefix_len = 0
         self.last_node = None
         self.priority = 0
         self.kv_rotation_base = None
-        self.lock_receipt = DecLockRefParams()
-        self.swa_prefix_lock_released = False
+        self.lock = None
         self.finished_reason = None
         self.session = None
         self.session_id = None
@@ -786,8 +796,15 @@ class _GraftReq:
     def get_fill_ids(self):
         return array("q", self.fill_ids)
 
+    def refresh_fill_ids(self):
+        pass  # fill ids are fixed for the stand-in
 
-class TestRotationGraftDecline(CustomTestCase):
+    def finished(self):
+        return self.finished_reason is not None
+
+
+@parameterized_class(("tree_core_backend",), [("python",), ("rust",)])
+class TestRotationGraftDecline(_TreeCoreBackendCase):
     """The overlap disagg-prefill loop plans batch t+1 before batch t's radix
     insert lands, so two requests sharing a prefix can allocate under
     different rotation bases. Grafting the second one's tail under the first
@@ -819,7 +836,7 @@ class TestRotationGraftDecline(CustomTestCase):
             freed.extend(torch.as_tensor(seg).clone() for seg, _start in segments)
             return real_free_segments(segments)
 
-        def spy_segment(free_index, *, start_pos):
+        def spy_segment(free_index, start_pos):
             freed.append(torch.as_tensor(free_index).clone())
             return real_free_segment(free_index, start_pos=start_pos)
 
@@ -892,28 +909,29 @@ class TestRotationGraftDecline(CustomTestCase):
         res = _insert(tree, list(range(12)), rotation_base=3)
         self.assertTrue(res.rotation_tail_declined)
 
-    def test_cache_unfinished_decline_keeps_request_on_own_pages(self):
+    def test_insert_decline_keeps_request_on_own_pages(self):
         tree, freed = self._tree_with_spy()
         self._seed_chain(tree, list(range(8)), base=1)
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 3
         own_locs = self._own_row(tree, req, 12)
-        tree.cache_unfinished_req(req)
+        tree.checkpoint(req, up_to=len(req.fill_ids))
         # No dedup free, no rebind: the request keeps its own locs whole.
         self.assertEqual([t.tolist() for t in freed], [])
-        self.assertTrue(torch.equal(req.prefix_indices, own_locs))
+        row = tree.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :12]
+        self.assertTrue(torch.equal(row.to(dtype=torch.int64), own_locs))
         self.assertEqual(req.kv.cache_protected_len, 0)
         self.assertTrue(
             torch.equal(tree.req_to_token_pool.req_to_token[0, :12], own_locs)
         )
 
-    def test_cache_finished_decline_frees_duplicates_and_suffix(self):
+    def test_checkpoint_decline_frees_duplicates_and_suffix(self):
         tree, freed = self._tree_with_spy()
         self._seed_chain(tree, list(range(8)), base=1)
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 3
         own_locs = self._own_row(tree, req, 12)
-        tree.cache_finished_req(req, owned_kv_len=12)
+        finish_req(tree, req, 12)
         released = torch.cat(freed)
         # Everything past the protected prefix is released: the duplicates of
         # the matched region AND the declined tail (nothing leaks, nothing is
@@ -921,7 +939,7 @@ class TestRotationGraftDecline(CustomTestCase):
         self.assertEqual(set(released.tolist()), set(own_locs.tolist()))
         self.assertEqual(_match_len(tree, req.fill_ids), 8)
 
-    def test_cache_finished_same_base_keeps_the_tail_cached(self):
+    def test_checkpoint_same_base_keeps_the_tail_cached(self):
         """Control for the decline test: with an agreeing base the tail is
         grafted and only the matched duplicates are freed."""
         tree, freed = self._tree_with_spy()
@@ -929,7 +947,8 @@ class TestRotationGraftDecline(CustomTestCase):
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 1
         own_locs = self._own_row(tree, req, 12)
-        tree.cache_finished_req(req, owned_kv_len=12)
+        req.last_node = tree.root_node_handle()
+        finish_req(tree, req, 12)
         self.assertEqual(_match_len(tree, req.fill_ids), 12)
         released = torch.cat(freed) if freed else torch.empty(0, dtype=torch.int64)
         # Only the 8 duplicate rows go back; the tail stays live in the tree.

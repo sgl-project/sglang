@@ -404,6 +404,7 @@ bool is_valid_config(
 #define MXFP4_GET_IF(W_TYPE)            \
   MXFP4_GET_IF_M1(W_TYPE, 8, 8, 256)    \
   MXFP4_GET_IF_M1(W_TYPE, 8, 4, 128)    \
+  MXFP4_GET_IF_M1(W_TYPE, 4, 8, 128)    \
   MXFP4_GET_IF_M234(W_TYPE, 16, 4, 256) \
   MXFP4_GET_IF_M234(W_TYPE, 8, 4, 128)
 
@@ -492,6 +493,16 @@ exec_config_t determine_exec_config(
     bool is_zp_float,
     int max_shared_mem,
     int sms) {
+#if SGL_CUDA_ARCH == 900
+  if constexpr (std::is_same_v<scalar_t, __nv_bfloat16> && !kIsEP && !kHasBias) {
+    // H200 TP8 DeepSeek-V4.1 gate/up: six sparse expert rows need a narrower
+    // N tile and fewer persistent blocks than the occupancy-only heuristic.
+    if (q_type == host::kFE2M1f && group_size == 32 && prob_m == 1 && prob_n == 640 && prob_k == 5120 && top_k == 6 &&
+        thread_m_blocks == 1 && m_block_size_8 && !has_act_order && !has_zp) {
+      return exec_config_t{2, thread_config_t{128, 64, 128}};
+    }
+  }
+#endif
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
   thread_config_t* thread_configs = thread_m_blocks > 1 ? large_batch_thread_configs : small_batch_thread_configs;
   int thread_configs_size = thread_m_blocks > 1 ? sizeof(large_batch_thread_configs) / sizeof(thread_config_t)
