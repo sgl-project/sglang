@@ -267,7 +267,7 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
         bootstrap_hosts,
         bootstrap_ports,
         bootstrap_rooms,
-    } = normalize_bootstrap_columns(bootstrap_host, bootstrap_port, bootstrap_room, n, 1)?;
+    } = normalize_bootstrap_columns(bootstrap_host, bootstrap_port, bootstrap_room, n)?;
     let bootstrap_pair_keys = flatten_column(fan_out(bootstrap_pair_key, n, "bootstrap_pair_key")?);
     let decode_tp_sizes = flatten_column(fan_out(decode_tp_size, n, "decode_tp_size")?);
     // `mm_hashes` has no batch form: honoring it only here would give the two
@@ -612,7 +612,7 @@ fn flatten_column<T>(column: Vec<Option<Option<T>>>) -> Vec<Option<T>> {
 }
 
 /// Reject a broadcast whose clones would exceed [`MAX_BROADCAST_CLONE_BYTES`].
-pub(super) fn check_broadcast_budget(per_clone: usize, n: usize, name: &str) -> Result<(), Error> {
+pub(crate) fn check_broadcast_budget(per_clone: usize, n: usize, name: &str) -> Result<(), Error> {
     // `n == 1` is not a broadcast — there is one value and one prompt, so nothing
     // is duplicated. Charging it here rejected ordinary single requests with a
     // message about a batch they never sent.
@@ -653,7 +653,7 @@ fn fan_out<T: OneOrManyItem + Clone + HeapBytes>(
     }
 }
 
-/// Validated bootstrap columns, one value per prompt.
+/// Bootstrap metadata columns with matching lengths.
 pub(crate) struct BootstrapColumns {
     pub(crate) bootstrap_hosts: Vec<Option<String>>,
     pub(crate) bootstrap_ports: Vec<Option<i64>>,
@@ -662,29 +662,18 @@ pub(crate) struct BootstrapColumns {
 
 /// Normalize native and OpenAI bootstrap fields after wire decoding.
 /// Missing values and null elements stay unset; lists must match the prompt count.
-/// Scalar rooms advance per prompt; each prompt's choices share that room.
-/// `choices_per_prompt` accounts for the adapter's later host clones without
-/// expanding the columns beyond `prompt_count`.
+/// Scalars broadcast, except rooms advance once per prompt.
 pub(crate) fn normalize_bootstrap_columns(
     hosts: Option<OneOrMany<Option<String>>>,
     ports: Option<OneOrMany<Option<i64>>>,
     rooms: Option<OneOrMany<Option<i64>>>,
     prompt_count: usize,
-    choices_per_prompt: usize,
 ) -> Result<BootstrapColumns, Error> {
     let bootstrap_hosts = flatten_column(fan_out(hosts, prompt_count, "bootstrap_host")?);
-    // Prompt expansion is already bounded; charge the choices before admission.
-    if choices_per_prompt > 1 {
-        check_broadcast_budget(
-            bootstrap_hosts.iter().map(HeapBytes::heap_bytes).sum(),
-            choices_per_prompt,
-            "bootstrap_host",
-        )?;
-    }
     let bootstrap_ports = flatten_column(fan_out(ports, prompt_count, "bootstrap_port")?);
     let bootstrap_rooms = match rooms {
         // Wrapping preserves distinct pairing keys at the i64 boundary;
-        // saturating would make multiple prompts share a room.
+        // saturating would make multiple requests share a room.
         Some(OneOrMany::One(Some(room))) => (0..prompt_count)
             .map(|i| Some(room.wrapping_add(i as i64)))
             .collect(),

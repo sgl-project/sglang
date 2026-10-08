@@ -3,7 +3,9 @@
 use serde::Deserialize;
 use sglang_api_types::api::v1::{Int64OrList, OptionalInt64OrList, StringOrList};
 
-use crate::message::request::{BootstrapColumns, normalize_bootstrap_columns};
+use crate::message::request::{
+    BootstrapColumns, check_broadcast_budget, normalize_bootstrap_columns,
+};
 use crate::message::types::OneOrMany;
 use crate::message::wire;
 use crate::utils::error::Error;
@@ -20,7 +22,6 @@ pub(super) struct PDRoutingFields {
 }
 
 /// Validated per-prompt columns, ready for admission.
-/// Each prompt's choices share the same routing metadata.
 pub(super) struct PDRouting {
     pub(super) bootstrap: BootstrapColumns,
     pub(super) routed_dp_rank: Option<i64>,
@@ -28,8 +29,8 @@ pub(super) struct PDRouting {
 }
 
 impl PDRoutingFields {
-    /// Convert the wire carriers and normalize their bootstrap columns once,
-    /// retaining the scalar DP hints for each submitted choice.
+    /// Normalize bootstrap fields per prompt and bound the handlers' host clones
+    /// across choices. DP hints remain scalar.
     pub(super) fn into_routing(self, prompt_count: usize, n: usize) -> Result<PDRouting, Error> {
         let hosts = self
             .bootstrap_host
@@ -45,14 +46,26 @@ impl PDRoutingFields {
                 OneOrMany::One(room) => OneOrMany::One(Some(room)),
                 OneOrMany::Many(rooms) => OneOrMany::Many(rooms.into_iter().map(Some).collect()),
             });
-        Ok(PDRouting {
-            bootstrap: normalize_bootstrap_columns(
-                hosts,
-                self.bootstrap_port.and_then(wire::optional_int64_or_list),
-                rooms,
-                prompt_count,
+        let bootstrap = normalize_bootstrap_columns(
+            hosts,
+            self.bootstrap_port.and_then(wire::optional_int64_or_list),
+            rooms,
+            prompt_count,
+        )?;
+        if n > 1 {
+            check_broadcast_budget(
+                bootstrap
+                    .bootstrap_hosts
+                    .iter()
+                    .filter_map(Option::as_ref)
+                    .map(String::len)
+                    .sum(),
                 n,
-            )?,
+                "bootstrap_host",
+            )?;
+        }
+        Ok(PDRouting {
+            bootstrap,
             routed_dp_rank: self.routed_dp_rank,
             disagg_prefill_dp_rank: self.disagg_prefill_dp_rank,
         })
