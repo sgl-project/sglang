@@ -27,12 +27,7 @@ from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
 from sglang.kernels.ops.attention.prefill_attention import context_attention_fwd
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
-from sglang.srt.utils import (
-    is_cuda,
-    is_gfx95_supported,
-    is_gfx1250_supported,
-    is_hip,
-)
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_gfx1250_supported, is_hip
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -1257,8 +1252,14 @@ def _fwd_kernel_unified(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    # Unified loop: process all KV tokens (prefix + extend)
-    for start_n in range(0, cur_seq_kv_len, BLOCK_N):
+    start_k, end_k = 0, cur_seq_kv_len
+    if IS_CAUSAL and SLIDING_WINDOW_SIZE > 0 and not USE_CUSTOM_MASK:
+        first_query = cur_block_m * BLOCK_M
+        last_query = tl.minimum(first_query + BLOCK_M, cur_seq_q_len)
+        start_k = tl.maximum(0, cur_seq_prefix_len + first_query - SLIDING_WINDOW_SIZE)
+        start_k = start_k // BLOCK_N * BLOCK_N
+        end_k = tl.minimum(cur_seq_kv_len, cur_seq_prefix_len + last_query)
+    for start_n in range(start_k, end_k, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_kv_len
 

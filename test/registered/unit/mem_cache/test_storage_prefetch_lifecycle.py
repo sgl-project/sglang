@@ -47,6 +47,7 @@ def _staged_fixture(full_match=2):
         prefetch_anchor_info=lambda node: (None, None),
         match_full_device_prefix=Mock(return_value=(full_match, 1, full_match)),
         collect_full_device_indices=Mock(return_value=torch.arange(8)),
+        root_node_handle=lambda extra_key=None: 0,
         inc_full_pin=Mock(),
         dec_full_pin=Mock(),
         empty_match_result=SimpleNamespace(
@@ -83,8 +84,12 @@ def _staged_fixture(full_match=2):
     cc.storage_backend.batch_exists.return_value = 0
     cc.mem_pool_host = SimpleNamespace(
         free=Mock(),
+        anchor_entry=SimpleNamespace(host_pool=SimpleNamespace()),
         entry_map={
-            PoolName.SWA: SimpleNamespace(host_pool=SimpleNamespace(free=Mock()))
+            PoolName.SWA: SimpleNamespace(
+                host_pool=SimpleNamespace(free=Mock()),
+                device_indices_from_anchor_fn=None,
+            )
         },
     )
     cache.cache_controller = cc
@@ -108,7 +113,7 @@ def _staged_fixture(full_match=2):
     req = SimpleNamespace(
         rid="r",
         cache_request_handle=_REQ,
-        prefix_indices=torch.arange(2),
+        prefix_len=2,
         last_node=1,
         kv=SimpleNamespace(cache_protected_len=2),
         extra_key=None,
@@ -197,7 +202,7 @@ def _two_rank_retry_trace(rank, rendezvous):
                     1,
                     full_match,
                 )
-                req.prefix_indices = torch.arange(full_match)
+                req.prefix_len = full_match
                 if cache.buffer_pipeline.prepare_staged_prefetch(req):
                     assert (
                         cache.init_load_back(
@@ -281,6 +286,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
                     swa = PoolTransfer(name=PoolName.SWA, host_indices=torch.arange(4))
                     operation.pool_transfers = [swa]
                     operation.host_indices = torch.arange(hit_tokens)
+                    operation.buffer_host_occupied_units = hit_tokens
                     cache.ongoing_prefetch[req.cache_request_handle] = info._replace(
                         host_indices=operation.host_indices, comp_xfers={"swa": [swa]}
                     )
@@ -297,7 +303,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
                         len(RadixKey(held.key_tokens, is_bigram=bigram)), 10
                     )
                     # A joint match counts bigrams, not their extra raw boundary token.
-                    req.prefix_indices = torch.arange(10)
+                    req.prefix_len = 10
                     req.kv.cache_protected_len = 10
                     self.assertTrue(pipeline.prepare_staged_prefetch(req))
                     self.assertFalse(pipeline.has_staged(req.cache_request_handle))
@@ -339,7 +345,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
 
         # A twin made [0, 6) jointly reusable while the fetch was held.
         cache.tree_core.match_full_device_prefix.return_value = (8, 1, 8)
-        req.prefix_indices = torch.arange(6)
+        req.prefix_len = 6
         self.assertTrue(pipeline.prepare_staged_prefetch(req))
         self.assertEqual(
             split_cached_prefix_by_tier(
@@ -376,12 +382,12 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         cache.tree_core.match_full_device_prefix.assert_called_once()
         # A twin finished first: the next pass's joint match runs past the
         # staged span and is kept as is (a shrink would strand its recompute).
-        req.prefix_indices = torch.arange(12)
+        req.prefix_len = 12
         req.last_node = 9
         req.kv.cache_protected_len = 12
         self.assertTrue(cache.buffer_pipeline.prepare_staged_prefetch(req))
         self.assertIsNone(req.staged_prefetch_plan)
-        self.assertEqual(len(req.prefix_indices), 12)
+        self.assertEqual(req.prefix_len, 12)
         self.assertEqual((req.last_node, req.kv.cache_protected_len), (9, 12))
         self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (0, 0))
         self.assertFalse(pipeline.has_staged(req.cache_request_handle))
@@ -410,7 +416,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
                 anchor = pipeline.anchor_locks[req.cache_request_handle]
                 cache.tree_core.match_full_device_prefix.reset_mock()
                 for attempt in range(1, 4):
-                    req.prefix_indices = torch.arange(2)
+                    req.prefix_len = 2
                     self.assertTrue(cache.buffer_pipeline.prepare_staged_prefetch(req))
                     self.assertIsNone(
                         cache.init_load_back(
@@ -451,14 +457,14 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
 
         # Tree changes occur while queued, before the next preparation pass.
         cache.tree_core.match_full_device_prefix.return_value = (6, 1, 6)
-        req.prefix_indices = torch.arange(2)
+        req.prefix_len = 2
         self.assertTrue(cache.buffer_pipeline.prepare_staged_prefetch(req))
         self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (2, 4))
         self.assertTrue(pipeline.has_staged(req.cache_request_handle))
         self.assertEqual(cache.storage_prefetch_retries.pop_ready([req], 0, 8), [])
 
         cache.tree_core.match_full_device_prefix.return_value = (0, 0, 0)
-        req.prefix_indices = torch.arange(0)
+        req.prefix_len = 0
         self.assertFalse(cache.buffer_pipeline.prepare_staged_prefetch(req))
         self.assertFalse(pipeline.has_staged(req.cache_request_handle))
         self.assertEqual(
@@ -510,7 +516,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         pipeline.max_staged_admission_defers = 3
         params = lambda: InitLoadBackParams(None, req.host_hit_length, req=req)
         for attempt in range(1, 4):
-            req.prefix_indices = torch.arange(2)
+            req.prefix_len = 2
             self.assertTrue(pipeline.prepare_staged_prefetch(req))
             self.assertIsNone(cache.init_load_back(params()))
             self.assertEqual(pipeline.has_staged(req.cache_request_handle), attempt < 3)
