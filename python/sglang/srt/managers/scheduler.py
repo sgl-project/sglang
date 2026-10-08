@@ -2830,6 +2830,7 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
                 token_indices_to_pool=recv_req.token_indices_to_pool,
             )
+            req.prefill_uncached_fraction = recv_req.prefill_uncached_fraction
             req.tokenizer = self.tokenizer
 
             if radix_native_session:
