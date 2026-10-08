@@ -18,9 +18,14 @@ import torch
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import MLPSyncBatchInfo
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -52,6 +57,50 @@ def _logits_output(num_rows: int) -> SimpleNamespace:
 
 
 class TestMlpSyncPadUnpad(CustomTestCase):
+    def test_idle_mrope_batch_keeps_position_layout_when_padded(self):
+        empty = torch.empty(0, dtype=torch.int64)
+        schedule_batch = ScheduleBatch(
+            reqs=[],
+            device="cpu",
+            forward_mode=ForwardMode.IDLE,
+            input_ids=empty,
+            req_pool_indices=empty,
+            req_pool_indices_cpu=empty,
+            seq_lens=empty,
+            seq_lens_cpu=empty,
+            orig_seq_lens=torch.empty(0, dtype=torch.int32),
+            out_cache_loc=empty,
+            seq_lens_sum=0,
+        )
+        runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            is_draft_worker=False,
+            model_config=SimpleNamespace(model_is_mrope=True),
+            kv_index_translator=MagicMock(),
+            lora_manager=None,
+        )
+
+        with patch(
+            "sglang.srt.model_executor.forward_batch_info._maybe_build_forward_token_modalities",
+            return_value=None,
+        ):
+            batch = ForwardBatch.init_new(
+                schedule_batch,
+                runner,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                return_hidden_states_before_norm=False,
+            )
+
+        self.assertEqual(tuple(batch.mrope_positions.shape), (3, 0))
+
+        batch._pad_inputs_to_size(_mock_model_runner(), num_tokens=4, bs=1)
+
+        self.assertEqual(tuple(batch.positions.shape), (4,))
+        self.assertEqual(tuple(batch.mrope_positions.shape), (3, 4))
+        torch.testing.assert_close(
+            batch.mrope_positions, torch.zeros((3, 4), dtype=torch.int64)
+        )
+
     def test_idle_rank_does_not_index_dummy_last_token(self):
         # MLP-sync turns an idle rank into a dummy zero-token EXTEND batch.
         empty = torch.empty(0, dtype=torch.int64)
