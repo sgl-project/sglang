@@ -29,12 +29,6 @@ def _w(w):
     return wq
 
 
-def _quant(x):
-    from sglang.srt.layers.quantization.fp8_utils import aiter_per1x128_quant as q
-
-    return q(x, quant_dtype=torch.float8_e4m3fn, transpose_scale=False)
-
-
 @unittest.skipUnless(
     torch.version.hip
     and fp8_utils._use_aiter_bpreshuffle_gfx95
@@ -49,59 +43,56 @@ class TestSmallMFp8BlockscaleGfx950(CustomTestCase):
     def test_matches_aiter(self):
         from aiter import gemm_a8w8_blockscale_bpreshuffle as gemm
 
-        from sglang.srt.layers.quantization.fp8_utils import (
-            materialize_bpreshuffle_fp8_scale as materialize,
-        )
+        materialize = fp8_utils.materialize_bpreshuffle_fp8_scale
+        q = fp8_utils.aiter_per1x128_quant
 
         for n, k in SHAPES:
             wq = _w(torch.randn(n, k, device="cuda") * 0.5)
             ws = torch.rand(n // 128, k // 128, device="cuda") * 1e-2 + 1e-3
             for m in MS:
                 x = _x(m, k)
-                self.assertTrue(B.smallm_fp8_bs_supported(x, wq, ws), f"{n=} {m=}")
-                xq, xs = _quant(x)
+                xq, xs = q(x, quant_dtype=torch.float8_e4m3fn, transpose_scale=False)
                 ref = gemm(xq, wq, materialize(xs), ws, dtype=torch.bfloat16)
-                out = B.smallm_fp8_bs_linear(x, wq, ws)
+                out = B.try_smallm_fp8_bs_linear(x, wq, ws)
                 torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
     def test_quant_bit_exact(self):
         # one-hot weights, unit scales: out[m, n] = bf16(q[m, k] * xs[m, k // 128])
+        q = fp8_utils.aiter_per1x128_quant
         for n, k in SHAPES:
             col = torch.arange(n, device="cuda") % k
             wq = _w(torch.nn.functional.one_hot(col, k).float())
             ws = torch.ones(n // 128, k // 128, device="cuda")
             for m in MS:
                 x = _x(m, k)
-                xq, xs = _quant(x)
+                xq, xs = q(x, quant_dtype=torch.float8_e4m3fn, transpose_scale=False)
                 ref = (xq.float() * xs.repeat_interleave(128, 1))[:, col].bfloat16()
-                out = B.smallm_fp8_bs_linear(x, wq, ws)
+                out = B.try_smallm_fp8_bs_linear(x, wq, ws)
                 self.assertTrue(torch.equal(out, ref), f"{n=} {m=}")
 
     def test_fallback(self):
         wq = _w(torch.zeros(4096, 2048, device="cuda"))
         ws = torch.ones(32, 16, device="cuda")
         x = _x(4, 2048)
-        self.assertTrue(B.smallm_fp8_bs_supported(x, wq, ws))
         unaligned = torch.randn(4, 2052, device="cuda").bfloat16()[:, :2048]
-        unshuffled = wq.view(torch.uint8).view(wq.dtype)
         for bad_x, bad_w in (
             (_x(33, 2048), wq),
             (x.half(), wq),
             (unaligned, wq),
-            (x, unshuffled),
+            (x, wq.view(torch.uint8).view(wq.dtype)),
         ):
-            self.assertFalse(B.smallm_fp8_bs_supported(bad_x, bad_w, ws))
+            self.assertIsNone(B.try_smallm_fp8_bs_linear(bad_x, bad_w, ws))
         with mock.patch.dict(os.environ, {"SGLANG_ROCM_SMALLM_FP8_BS": "0"}):
-            self.assertFalse(B.smallm_fp8_bs_supported(x, wq, ws))
+            self.assertIsNone(B.try_smallm_fp8_bs_linear(x, wq, ws))
 
     def test_graph_replay(self):
         wq = _w(torch.randn(5120, 4096, device="cuda") * 0.5)
         ws = torch.rand(40, 32, device="cuda") * 1e-2
         x = _x(4, 4096)
-        eager = B.smallm_fp8_bs_linear(x, wq, ws)
+        eager = B.try_smallm_fp8_bs_linear(x, wq, ws)
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            out = B.smallm_fp8_bs_linear(x, wq, ws)
+            out = B.try_smallm_fp8_bs_linear(x, wq, ws)
         g.replay()
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(out, eager))

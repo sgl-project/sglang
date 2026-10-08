@@ -26,7 +26,7 @@ _ALLOWED_INSTALL_SCRIPT = re.compile(r"^scripts/ci/cuda/[\w.-]+\.sh$")
 
 # Temporarily disabled while their runners are unavailable. rerun-test.yml
 # skips these too; rejecting here gives a clear reply instead of a skipped run.
-_DISABLED_RUNNER_CONFIGS = {"4-gpu-gb300", "8-gpu-b300"}
+_DISABLED_RUNNER_CONFIGS = {"4-gpu-gb300"}
 
 # Configuration
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
