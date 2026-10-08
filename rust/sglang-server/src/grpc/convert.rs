@@ -10,6 +10,8 @@ use tonic::Status;
 use crate::frontend::FrontendRequest;
 use crate::message::config::PreferredSamplingParams;
 use crate::message::ids::Rid;
+use crate::message::multimodal::MmItem;
+use crate::message::request::MmData;
 use crate::message::sampling::SamplingParams;
 
 type ConvertResult<T> = Result<T, ConvertError>;
@@ -130,6 +132,7 @@ pub(super) fn generate(
         require_reasoning,
         max_thinking_tokens,
         kv_hints,
+        image_data,
     } = request;
 
     reject_unsupported([
@@ -169,7 +172,12 @@ pub(super) fn generate(
         decode_tp_size: None,
         routed_dp_rank: routed_dp_rank.map(i64::from),
         disagg_prefill_dp_rank: None,
-        mm: None,
+        mm: (!image_data.is_empty()).then(|| {
+            Box::new(MmData {
+                image_data: image_data.into_iter().map(MmItem::Source).collect(),
+                ..Default::default()
+            })
+        }),
         mm_buffers: Vec::new(),
     })
 }
@@ -459,6 +467,30 @@ mod tests {
         );
         assert_eq!(unsupported.code(), Code::Unimplemented);
         assert!(unsupported.message().contains("routing_key, priority"));
+    }
+
+    #[test]
+    fn token_request_preserves_ordered_image_sources() {
+        let request = generate(
+            proto::GenerateRequest {
+                input_ids: vec![1, 2, 3],
+                image_data: vec![
+                    "https://example.com/image.png".into(),
+                    "data:image/png;base64,aW1hZ2U=".into(),
+                ],
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            request.mm.unwrap().image_data,
+            vec![
+                MmItem::Source("https://example.com/image.png".into()),
+                MmItem::Source("data:image/png;base64,aW1hZ2U=".into()),
+            ]
+        );
     }
 
     #[test]
