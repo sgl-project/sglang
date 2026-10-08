@@ -1,1022 +1,464 @@
 {
- "parser": "deepseekv4",
- "tools": [
-  {
-   "type": "function",
-   "function": {
-    "name": "get_weather",
-    "parameters": {
-     "type": "object",
-     "properties": {}
+  "parser": "deepseekv4",
+  "tools": [
+    {
+      "type": "function",
+      "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {}}}
+    },
+    {
+      "type": "function",
+      "function": {"name": "get_time", "parameters": {"type": "object", "properties": {}}}
+    },
+    {
+      "type": "function",
+      "function": {"name": "f", "parameters": {"type": "object", "properties": {}}}
     }
-   }
-  },
-  {
-   "type": "function",
-   "function": {
-    "name": "get_time",
-    "parameters": {
-     "type": "object",
-     "properties": {}
+  ],
+  "inputs": [
+    [
+      "Let me ",
+      "check.\n",
+      "\n<｜DSML",
+      "｜tool_c",
+      "alls>\n<",
+      "｜DSML｜i",
+      "nvoke n",
+      "ame=\"ge",
+      "t_weath",
+      "er\">\n<｜",
+      "DSML｜pa",
+      "rameter",
+      " name=\"",
+      "city\" s",
+      "tring=\"",
+      "true\">P",
+      "aris</｜",
+      "DSML｜pa",
+      "rameter",
+      ">\n</｜DS",
+      "ML｜invo",
+      "ke>\n</｜",
+      "DSML｜to",
+      "ol_call",
+      "s>"
+    ],
+    [
+      "Let me check.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    ],
+    [
+      "<｜DSM",
+      "L｜too",
+      "l_cal",
+      "ls>\n<",
+      "｜DSML",
+      "｜invo",
+      "ke na",
+      "me=\"g",
+      "et_we",
+      "ather",
+      "\">\n<｜",
+      "DSML｜",
+      "param",
+      "eter ",
+      "name=",
+      "\"city",
+      "\" str",
+      "ing=\"",
+      "true\"",
+      ">Pari",
+      "s</｜D",
+      "SML｜p",
+      "arame",
+      "ter>\n",
+      "</｜DS",
+      "ML｜in",
+      "voke>",
+      "\n<｜DS",
+      "ML｜in",
+      "voke ",
+      "name=",
+      "\"get_",
+      "time\"",
+      ">\n<｜D",
+      "SML｜p",
+      "arame",
+      "ter n",
+      "ame=\"",
+      "tz\" s",
+      "tring",
+      "=\"tru",
+      "e\">UT",
+      "C</｜D",
+      "SML｜p",
+      "arame",
+      "ter>\n",
+      "<｜DSM",
+      "L｜par",
+      "amete",
+      "r nam",
+      "e=\"ho",
+      "urs\" ",
+      "strin",
+      "g=\"fa",
+      "lse\">",
+      "3</｜D",
+      "SML｜p",
+      "arame",
+      "ter>\n",
+      "</｜DS",
+      "ML｜in",
+      "voke>",
+      "\n</｜D",
+      "SML｜t",
+      "ool_c",
+      "alls>"
+    ],
+    [
+      "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n{\"city\": \"東京\", \"days\": 3}\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    ],
+    [
+      "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_time\">\n<｜DSML｜parameter name=\"opts\" string=\"false\">{\"a\": [1, 2.5, true]}</｜DSML｜parameter>\n<｜DSML｜parameter name=\"n\" string=\"false\">1e2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    ],
+    [
+      "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"unknown_tool\">\n<｜DSML｜parameter name=\"x\" string=\"true\">1</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    ],
+    [
+      "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Par"
+    ],
+    ["<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\"/>\n</｜DSML｜tool_calls>"],
+    ["Just text.  ", "\n\n", "more <", "b>"],
+    ["Plain answer without tools."],
+    [
+      "<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Rome</｜DSML｜parameter>\n</｜DSML｜invoke>"
+    ],
+    [
+      "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\">Oslo</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    ],
+    [
+      "Let me check.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+      "\nTrailing words."
+    ],
+    ["Text then cut <｜DS"],
+    [
+      "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_time\">\n{\"x\": 1.5e-05, \"y\": 1e16, \"z\": 77947932308658.125, \"w\": [0.1, 100]}\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    ],
+    [
+      "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_time\">\n<｜DSML｜parameter name=\"x\" string=\"false\">2.50</｜DSML｜parameter>\n<｜DSML｜parameter name=\"y\" string=\"false\">1E2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    ]
+  ],
+  "cases": [
+    {
+      "chunks": [
+        "Let me ",
+        "check.\n",
+        "\n<｜DSML",
+        "｜tool_c",
+        "alls>\n<",
+        "｜DSML｜i",
+        "nvoke n",
+        "ame=\"ge",
+        "t_weath",
+        "er\">\n<｜",
+        "DSML｜pa",
+        "rameter",
+        " name=\"",
+        "city\" s",
+        "tring=\"",
+        "true\">P",
+        "aris</｜",
+        "DSML｜pa",
+        "rameter",
+        ">\n</｜DS",
+        "ML｜invo",
+        "ke>\n</｜",
+        "DSML｜to",
+        "ol_call",
+        "s>"
+      ],
+      "steps": [
+        ["Let me", []],
+        [" check.", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", [[0, "get_weather", "{\"city\": \"Paris\"}"]]],
+        ["", []],
+        ["", []],
+        ["", []]
+      ],
+      "unary": ["Let me check.", [[0, "get_weather", "{\"city\": \"Paris\"}"]]]
+    },
+    {
+      "chunks": [
+        "Let me check.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+      ],
+      "steps": [["Let me check.", [[0, "get_weather", "{\"city\": \"Paris\"}"]]]],
+      "unary": ["Let me check.", [[0, "get_weather", "{\"city\": \"Paris\"}"]]]
+    },
+    {
+      "chunks": [
+        "<｜DSM",
+        "L｜too",
+        "l_cal",
+        "ls>\n<",
+        "｜DSML",
+        "｜invo",
+        "ke na",
+        "me=\"g",
+        "et_we",
+        "ather",
+        "\">\n<｜",
+        "DSML｜",
+        "param",
+        "eter ",
+        "name=",
+        "\"city",
+        "\" str",
+        "ing=\"",
+        "true\"",
+        ">Pari",
+        "s</｜D",
+        "SML｜p",
+        "arame",
+        "ter>\n",
+        "</｜DS",
+        "ML｜in",
+        "voke>",
+        "\n<｜DS",
+        "ML｜in",
+        "voke ",
+        "name=",
+        "\"get_",
+        "time\"",
+        ">\n<｜D",
+        "SML｜p",
+        "arame",
+        "ter n",
+        "ame=\"",
+        "tz\" s",
+        "tring",
+        "=\"tru",
+        "e\">UT",
+        "C</｜D",
+        "SML｜p",
+        "arame",
+        "ter>\n",
+        "<｜DSM",
+        "L｜par",
+        "amete",
+        "r nam",
+        "e=\"ho",
+        "urs\" ",
+        "strin",
+        "g=\"fa",
+        "lse\">",
+        "3</｜D",
+        "SML｜p",
+        "arame",
+        "ter>\n",
+        "</｜DS",
+        "ML｜in",
+        "voke>",
+        "\n</｜D",
+        "SML｜t",
+        "ool_c",
+        "alls>"
+      ],
+      "steps": [
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", [[0, "get_weather", "{\"city\": \"Paris\"}"]]],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", [[1, "get_time", "{\"tz\": \"UTC\", \"hours\": 3}"]]],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", []]
+      ],
+      "unary": [
+        "",
+        [
+          [0, "get_weather", "{\"city\": \"Paris\"}"],
+          [1, "get_time", "{\"tz\": \"UTC\", \"hours\": 3}"]
+        ]
+      ]
+    },
+    {
+      "chunks": [
+        "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n{\"city\": \"東京\", \"days\": 3}\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+      ],
+      "steps": [["", [[0, "get_weather", "{\"city\": \"東京\", \"days\": 3}"]]]],
+      "unary": ["", [[0, "get_weather", "{\"city\": \"東京\", \"days\": 3}"]]]
+    },
+    {
+      "chunks": [
+        "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_time\">\n<｜DSML｜parameter name=\"opts\" string=\"false\">{\"a\": [1, 2.5, true]}</｜DSML｜parameter>\n<｜DSML｜parameter name=\"n\" string=\"false\">1e2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+      ],
+      "steps": [["", [[0, "get_time", "{\"opts\": {\"a\": [1, 2.5, true]}, \"n\": 100.0}"]]]],
+      "unary": ["", [[1, "get_time", "{\"opts\": {\"a\": [1, 2.5, true]}, \"n\": 100.0}"]]]
+    },
+    {
+      "chunks": [
+        "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"unknown_tool\">\n<｜DSML｜parameter name=\"x\" string=\"true\">1</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+      ],
+      "steps": [["", [[0, "unknown_tool", "{\"x\": \"1\"}"]]]],
+      "unary": ["", []]
+    },
+    {
+      "chunks": [
+        "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Par"
+      ],
+      "steps": [["", []]],
+      "unary": ["", []]
+    },
+    {
+      "chunks": ["<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\"/>\n</｜DSML｜tool_calls>"],
+      "steps": [["", [[0, "f", "{}"]]]],
+      "unary": ["", [[2, "f", "{}"]]]
+    },
+    {
+      "chunks": ["Just text.  ", "\n\n", "more <", "b>"],
+      "steps": [["Just text.", []], ["", []], ["", []], ["  \n\nmore <b>", []]],
+      "unary": ["Just text.  \n\nmore <b>", []]
+    },
+    {
+      "chunks": ["Plain answer without tools."],
+      "steps": [["Plain answer without tools.", []]],
+      "unary": ["Plain answer without tools.", []]
+    },
+    {
+      "chunks": [
+        "<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Rome</｜DSML｜parameter>\n</｜DSML｜invoke>"
+      ],
+      "steps": [["", [[0, "get_weather", "{\"city\": \"Rome\"}"]]]],
+      "unary": ["", [[0, "get_weather", "{\"city\": \"Rome\"}"]]]
+    },
+    {
+      "chunks": [
+        "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\">Oslo</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+      ],
+      "steps": [["", []]],
+      "unary": ["", []]
+    },
+    {
+      "chunks": [
+        "Let me check.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+        "\nTrailing words."
+      ],
+      "steps": [["Let me check.", [[0, "get_weather", "{\"city\": \"Paris\"}"]]], ["", []]],
+      "unary": ["Let me check.", [[0, "get_weather", "{\"city\": \"Paris\"}"]]]
+    },
+    {
+      "chunks": ["Text then cut <｜DS"],
+      "steps": [["Text then cut <｜DS", []]],
+      "unary": ["Text then cut <｜DS", []]
+    },
+    {
+      "chunks": [
+        "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_time\">\n{\"x\": 1.5e-05, \"y\": 1e16, \"z\": 77947932308658.125, \"w\": [0.1, 100]}\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+      ],
+      "steps": [
+        [
+          "",
+          [
+            [
+              0,
+              "get_time",
+              "{\"x\": 1.5e-05, \"y\": 1e16, \"z\": 77947932308658.125, \"w\": [0.1, 100]}"
+            ]
+          ]
+        ]
+      ],
+      "unary": [
+        "",
+        [
+          [
+            1,
+            "get_time",
+            "{\"x\": 1.5e-05, \"y\": 1e+16, \"z\": 77947932308658.12, \"w\": [0.1, 100]}"
+          ]
+        ]
+      ]
+    },
+    {
+      "chunks": [
+        "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_time\">\n<｜DSML｜parameter name=\"x\" string=\"false\">2.50</｜DSML｜parameter>\n<｜DSML｜parameter name=\"y\" string=\"false\">1E2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+      ],
+      "steps": [["", [[0, "get_time", "{\"x\": 2.5, \"y\": 100.0}"]]]],
+      "unary": ["", [[1, "get_time", "{\"x\": 2.5, \"y\": 100.0}"]]]
     }
-   }
-  },
-  {
-   "type": "function",
-   "function": {
-    "name": "f",
-    "parameters": {
-     "type": "object",
-     "properties": {}
-    }
-   }
-  }
- ],
- "inputs": [
-  [
-   "Let me ",
-   "check.\n",
-   "\n<｜DSML",
-   "｜tool_c",
-   "alls>\n<",
-   "｜DSML｜i",
-   "nvoke n",
-   "ame=\"ge",
-   "t_weath",
-   "er\">\n<｜",
-   "DSML｜pa",
-   "rameter",
-   " name=\"",
-   "city\" s",
-   "tring=\"",
-   "true\">P",
-   "aris</｜",
-   "DSML｜pa",
-   "rameter",
-   ">\n</｜DS",
-   "ML｜invo",
-   "ke>\n</｜",
-   "DSML｜to",
-   "ol_call",
-   "s>"
-  ],
-  [
-   "Let me check.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
-  ],
-  [
-   "<｜DSM",
-   "L｜too",
-   "l_cal",
-   "ls>\n<",
-   "｜DSML",
-   "｜invo",
-   "ke na",
-   "me=\"g",
-   "et_we",
-   "ather",
-   "\">\n<｜",
-   "DSML｜",
-   "param",
-   "eter ",
-   "name=",
-   "\"city",
-   "\" str",
-   "ing=\"",
-   "true\"",
-   ">Pari",
-   "s</｜D",
-   "SML｜p",
-   "arame",
-   "ter>\n",
-   "</｜DS",
-   "ML｜in",
-   "voke>",
-   "\n<｜DS",
-   "ML｜in",
-   "voke ",
-   "name=",
-   "\"get_",
-   "time\"",
-   ">\n<｜D",
-   "SML｜p",
-   "arame",
-   "ter n",
-   "ame=\"",
-   "tz\" s",
-   "tring",
-   "=\"tru",
-   "e\">UT",
-   "C</｜D",
-   "SML｜p",
-   "arame",
-   "ter>\n",
-   "<｜DSM",
-   "L｜par",
-   "amete",
-   "r nam",
-   "e=\"ho",
-   "urs\" ",
-   "strin",
-   "g=\"fa",
-   "lse\">",
-   "3</｜D",
-   "SML｜p",
-   "arame",
-   "ter>\n",
-   "</｜DS",
-   "ML｜in",
-   "voke>",
-   "\n</｜D",
-   "SML｜t",
-   "ool_c",
-   "alls>"
-  ],
-  [
-   "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n{\"city\": \"東京\", \"days\": 3}\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
-  ],
-  [
-   "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_time\">\n<｜DSML｜parameter name=\"opts\" string=\"false\">{\"a\": [1, 2.5, true]}</｜DSML｜parameter>\n<｜DSML｜parameter name=\"n\" string=\"false\">1e2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
-  ],
-  [
-   "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"unknown_tool\">\n<｜DSML｜parameter name=\"x\" string=\"true\">1</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
-  ],
-  [
-   "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Par"
-  ],
-  [
-   "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\"/>\n</｜DSML｜tool_calls>"
-  ],
-  [
-   "Just text.  ",
-   "\n\n",
-   "more <",
-   "b>"
-  ],
-  [
-   "Plain answer without tools."
-  ],
-  [
-   "<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Rome</｜DSML｜parameter>\n</｜DSML｜invoke>"
-  ],
-  [
-   "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\">Oslo</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
-  ],
-  [
-   "Let me check.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
-   "\nTrailing words."
-  ],
-  [
-   "Text then cut <｜DS"
-  ],
-  [
-   "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_time\">\n{\"x\": 1.5e-05, \"y\": 1e16, \"z\": 77947932308658.125, \"w\": [0.1, 100]}\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
-  ],
-  [
-   "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_time\">\n<｜DSML｜parameter name=\"x\" string=\"false\">2.50</｜DSML｜parameter>\n<｜DSML｜parameter name=\"y\" string=\"false\">1E2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
   ]
- ],
- "cases": [
-  {
-   "chunks": [
-    "Let me ",
-    "check.\n",
-    "\n<｜DSML",
-    "｜tool_c",
-    "alls>\n<",
-    "｜DSML｜i",
-    "nvoke n",
-    "ame=\"ge",
-    "t_weath",
-    "er\">\n<｜",
-    "DSML｜pa",
-    "rameter",
-    " name=\"",
-    "city\" s",
-    "tring=\"",
-    "true\">P",
-    "aris</｜",
-    "DSML｜pa",
-    "rameter",
-    ">\n</｜DS",
-    "ML｜invo",
-    "ke>\n</｜",
-    "DSML｜to",
-    "ol_call",
-    "s>"
-   ],
-   "steps": [
-    [
-     "Let me",
-     []
-    ],
-    [
-     " check.",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     [
-      [
-       0,
-       "get_weather",
-       "{\"city\": \"Paris\"}"
-      ]
-     ]
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ]
-   ],
-   "unary": [
-    "Let me check.",
-    [
-     [
-      0,
-      "get_weather",
-      "{\"city\": \"Paris\"}"
-     ]
-    ]
-   ]
-  },
-  {
-   "chunks": [
-    "Let me check.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
-   ],
-   "steps": [
-    [
-     "Let me check.",
-     [
-      [
-       0,
-       "get_weather",
-       "{\"city\": \"Paris\"}"
-      ]
-     ]
-    ]
-   ],
-   "unary": [
-    "Let me check.",
-    [
-     [
-      0,
-      "get_weather",
-      "{\"city\": \"Paris\"}"
-     ]
-    ]
-   ]
-  },
-  {
-   "chunks": [
-    "<｜DSM",
-    "L｜too",
-    "l_cal",
-    "ls>\n<",
-    "｜DSML",
-    "｜invo",
-    "ke na",
-    "me=\"g",
-    "et_we",
-    "ather",
-    "\">\n<｜",
-    "DSML｜",
-    "param",
-    "eter ",
-    "name=",
-    "\"city",
-    "\" str",
-    "ing=\"",
-    "true\"",
-    ">Pari",
-    "s</｜D",
-    "SML｜p",
-    "arame",
-    "ter>\n",
-    "</｜DS",
-    "ML｜in",
-    "voke>",
-    "\n<｜DS",
-    "ML｜in",
-    "voke ",
-    "name=",
-    "\"get_",
-    "time\"",
-    ">\n<｜D",
-    "SML｜p",
-    "arame",
-    "ter n",
-    "ame=\"",
-    "tz\" s",
-    "tring",
-    "=\"tru",
-    "e\">UT",
-    "C</｜D",
-    "SML｜p",
-    "arame",
-    "ter>\n",
-    "<｜DSM",
-    "L｜par",
-    "amete",
-    "r nam",
-    "e=\"ho",
-    "urs\" ",
-    "strin",
-    "g=\"fa",
-    "lse\">",
-    "3</｜D",
-    "SML｜p",
-    "arame",
-    "ter>\n",
-    "</｜DS",
-    "ML｜in",
-    "voke>",
-    "\n</｜D",
-    "SML｜t",
-    "ool_c",
-    "alls>"
-   ],
-   "steps": [
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     [
-      [
-       0,
-       "get_weather",
-       "{\"city\": \"Paris\"}"
-      ]
-     ]
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     [
-      [
-       1,
-       "get_time",
-       "{\"tz\": \"UTC\", \"hours\": 3}"
-      ]
-     ]
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ]
-   ],
-   "unary": [
-    "",
-    [
-     [
-      0,
-      "get_weather",
-      "{\"city\": \"Paris\"}"
-     ],
-     [
-      1,
-      "get_time",
-      "{\"tz\": \"UTC\", \"hours\": 3}"
-     ]
-    ]
-   ]
-  },
-  {
-   "chunks": [
-    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n{\"city\": \"東京\", \"days\": 3}\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
-   ],
-   "steps": [
-    [
-     "",
-     [
-      [
-       0,
-       "get_weather",
-       "{\"city\": \"東京\", \"days\": 3}"
-      ]
-     ]
-    ]
-   ],
-   "unary": [
-    "",
-    [
-     [
-      0,
-      "get_weather",
-      "{\"city\": \"東京\", \"days\": 3}"
-     ]
-    ]
-   ]
-  },
-  {
-   "chunks": [
-    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_time\">\n<｜DSML｜parameter name=\"opts\" string=\"false\">{\"a\": [1, 2.5, true]}</｜DSML｜parameter>\n<｜DSML｜parameter name=\"n\" string=\"false\">1e2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
-   ],
-   "steps": [
-    [
-     "",
-     [
-      [
-       0,
-       "get_time",
-       "{\"opts\": {\"a\": [1, 2.5, true]}, \"n\": 100.0}"
-      ]
-     ]
-    ]
-   ],
-   "unary": [
-    "",
-    [
-     [
-      1,
-      "get_time",
-      "{\"opts\": {\"a\": [1, 2.5, true]}, \"n\": 100.0}"
-     ]
-    ]
-   ]
-  },
-  {
-   "chunks": [
-    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"unknown_tool\">\n<｜DSML｜parameter name=\"x\" string=\"true\">1</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
-   ],
-   "steps": [
-    [
-     "",
-     [
-      [
-       0,
-       "unknown_tool",
-       "{\"x\": \"1\"}"
-      ]
-     ]
-    ]
-   ],
-   "unary": [
-    "",
-    []
-   ]
-  },
-  {
-   "chunks": [
-    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Par"
-   ],
-   "steps": [
-    [
-     "",
-     []
-    ]
-   ],
-   "unary": [
-    "",
-    []
-   ]
-  },
-  {
-   "chunks": [
-    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\"/>\n</｜DSML｜tool_calls>"
-   ],
-   "steps": [
-    [
-     "",
-     [
-      [
-       0,
-       "f",
-       "{}"
-      ]
-     ]
-    ]
-   ],
-   "unary": [
-    "",
-    [
-     [
-      2,
-      "f",
-      "{}"
-     ]
-    ]
-   ]
-  },
-  {
-   "chunks": [
-    "Just text.  ",
-    "\n\n",
-    "more <",
-    "b>"
-   ],
-   "steps": [
-    [
-     "Just text.",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "",
-     []
-    ],
-    [
-     "  \n\nmore <b>",
-     []
-    ]
-   ],
-   "unary": [
-    "Just text.  \n\nmore <b>",
-    []
-   ]
-  },
-  {
-   "chunks": [
-    "Plain answer without tools."
-   ],
-   "steps": [
-    [
-     "Plain answer without tools.",
-     []
-    ]
-   ],
-   "unary": [
-    "Plain answer without tools.",
-    []
-   ]
-  },
-  {
-   "chunks": [
-    "<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Rome</｜DSML｜parameter>\n</｜DSML｜invoke>"
-   ],
-   "steps": [
-    [
-     "",
-     [
-      [
-       0,
-       "get_weather",
-       "{\"city\": \"Rome\"}"
-      ]
-     ]
-    ]
-   ],
-   "unary": [
-    "",
-    [
-     [
-      0,
-      "get_weather",
-      "{\"city\": \"Rome\"}"
-     ]
-    ]
-   ]
-  },
-  {
-   "chunks": [
-    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\">Oslo</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
-   ],
-   "steps": [
-    [
-     "",
-     []
-    ]
-   ],
-   "unary": [
-    "",
-    []
-   ]
-  },
-  {
-   "chunks": [
-    "Let me check.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
-    "\nTrailing words."
-   ],
-   "steps": [
-    [
-     "Let me check.",
-     [
-      [
-       0,
-       "get_weather",
-       "{\"city\": \"Paris\"}"
-      ]
-     ]
-    ],
-    [
-     "",
-     []
-    ]
-   ],
-   "unary": [
-    "Let me check.",
-    [
-     [
-      0,
-      "get_weather",
-      "{\"city\": \"Paris\"}"
-     ]
-    ]
-   ]
-  },
-  {
-   "chunks": [
-    "Text then cut <｜DS"
-   ],
-   "steps": [
-    [
-     "Text then cut <｜DS",
-     []
-    ]
-   ],
-   "unary": [
-    "Text then cut <｜DS",
-    []
-   ]
-  },
-  {
-   "chunks": [
-    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_time\">\n{\"x\": 1.5e-05, \"y\": 1e16, \"z\": 77947932308658.125, \"w\": [0.1, 100]}\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
-   ],
-   "steps": [
-    [
-     "",
-     [
-      [
-       0,
-       "get_time",
-       "{\"x\": 1.5e-05, \"y\": 1e16, \"z\": 77947932308658.125, \"w\": [0.1, 100]}"
-      ]
-     ]
-    ]
-   ],
-   "unary": [
-    "",
-    [
-     [
-      1,
-      "get_time",
-      "{\"x\": 1.5e-05, \"y\": 1e+16, \"z\": 77947932308658.12, \"w\": [0.1, 100]}"
-     ]
-    ]
-   ]
-  },
-  {
-   "chunks": [
-    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_time\">\n<｜DSML｜parameter name=\"x\" string=\"false\">2.50</｜DSML｜parameter>\n<｜DSML｜parameter name=\"y\" string=\"false\">1E2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
-   ],
-   "steps": [
-    [
-     "",
-     [
-      [
-       0,
-       "get_time",
-       "{\"x\": 2.5, \"y\": 100.0}"
-      ]
-     ]
-    ]
-   ],
-   "unary": [
-    "",
-    [
-     [
-      1,
-      "get_time",
-      "{\"x\": 2.5, \"y\": 100.0}"
-     ]
-    ]
-   ]
-  }
- ]
 }
