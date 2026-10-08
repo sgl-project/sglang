@@ -18,6 +18,10 @@
       "destination": "/cookbook/intro"
     },
     {
+      "source": "/cookbook/autoregressive/Perplexity/pplx-decider-v1-27b",
+      "destination": "/cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B"
+    },
+    {
       "source": "/whl",
       "destination": "https://sgl-project.github.io/whl/",
       "permanent": false
@@ -1481,7 +1485,8 @@
                   {
                     "group": "Perplexity",
                     "pages": [
-                      "cookbook/autoregressive/Perplexity/pplx-decider-v1-27b"
+                      "cookbook/autoregressive/Perplexity/PPLX-Decider-v1.1-27B",
+                      "cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B"
                     ]
                   }
                 ]
@@ -1605,6 +1610,14 @@
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/MiniMax/MiniMax-H3"
+                    ]
+                  },
+                  {
+                    "group": "Kandinsky",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/Kandinsky/Kandinsky6",
+                      "cookbook/diffusion/Kandinsky/Kandinsky6-SR"
                     ]
                   },
                   {
