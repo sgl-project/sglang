@@ -3,6 +3,8 @@
 import unittest
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.model_loader.loader import post_load_weights
 from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteForCausalLM
 from sglang.srt.models.glm4_moe_lite_nextn import Glm4MoeLiteForCausalLMNextN
@@ -18,6 +20,8 @@ class TestGlm4MoeLiteNextNPostLoad(CustomTestCase):
         post_load_weights; on the draft the main model's branch walks a layer range it does not have."""
         nextn_flags = []
         draft = Glm4MoeLiteForCausalLMNextN.__new__(Glm4MoeLiteForCausalLMNextN)
+        # an empty module, without the layers its __init__ would build
+        torch.nn.Module.__init__(draft)
 
         with patch.object(
             Glm4MoeLiteForCausalLM,
