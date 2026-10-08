@@ -936,6 +936,13 @@ def _tail_rows(
     return t[token_indices]
 
 
+def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
+    assert t.shape[0] <= num_rows, (t.shape[0], num_rows)
+    if t.shape[0] == num_rows:
+        return t
+    return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))
+
+
 # Rows per logits chunk for the ratio-1/2 indexer inside the prefill CUDA graph;
 # its width is the graph's max_seq_len, and longer contexts replay eagerly.
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
@@ -4006,9 +4013,11 @@ class DeepseekV4AttnBackend(
                 group_first = torch.cummax(torch.where(starts, offset, 0), dim=0).values
                 swa_replay_start = raw_positions - (offset - group_first)
             elif swa_replay_start is None and self.encoder_row_floor is not None:
-                # Folded replay: hits floor every row at their replay start.
-                assert self.encoder_row_floor.shape[0] == raw_positions.shape[0]
-                swa_replay_start = self.encoder_row_floor
+                # Folded replay: hits floor every row at their replay start;
+                # MLP-sync padding rows follow the real ones with floor 0.
+                swa_replay_start = _pad_rows(
+                    self.encoder_row_floor, num_rows=raw_positions.shape[0]
+                )
             request_layout = window_layout(
                 req_pool_indices_repeated,
                 raw_positions,
