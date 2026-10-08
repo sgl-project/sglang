@@ -35,7 +35,7 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_compiler_backend,
@@ -584,10 +584,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         self.quant_config = quant_config
 
         # We only support pack LMHead if it's not quantized.
+        # skip amx packing when using fp32 LM head
         if _is_cpu and _is_cpu_amx_available:
-            is_skip_pack = get_exec().features.enable_fp32_lm_head or use_fp32_lm_head
             if (
-                not is_skip_pack
+                not use_fp32_lm_head
                 and hasattr(self, "weight")
                 and self.weight.dtype
                 in [
