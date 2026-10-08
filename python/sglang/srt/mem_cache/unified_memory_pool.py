@@ -711,6 +711,9 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             kv_cache_layout="page_major",
         )
 
+    def _kv_tokens_per_row(self) -> int:
+        return 1
+
     def _create_buffers(self):
         self.k_buffer = self._k_views
         self.v_buffer = self._v_views
