@@ -40,13 +40,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_parallel,
-    get_schedule,
-    get_spec,
-    process_model_config,
-)
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -166,6 +160,7 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         *,
         dllm_fa4: bool = False,
+        target_hf_config=None,
     ):
         # Lazy import to avoid the initialization of cuda context
         from sglang.kernels.ops.attention.decode_attention import (
@@ -244,12 +239,10 @@ class TritonAttnBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         # The grouped-head verify kernel is tuned for Kimi-K3 MLA and GQA with
         # exactly one TP-local KV head (Qwen3.5, MiniMax-M3 and its EAGLE3 draft).
-        # a draft runner's own config does not name the target it drafts for
-        target_hf_config = (
-            process_model_config().hf_config
-            if model_runner.is_draft_worker
-            else model_runner.model_config.hf_config
-        )
+        # a draft runner's own config does not name the target it drafts for, so the
+        # speculative worker passes the target's; a target runner is its own target
+        if target_hf_config is None:
+            target_hf_config = model_runner.model_config.hf_config
         self.use_verify_shared_kv = _should_use_verify_shared_kv(
             model_runner.model_config,
             self.topk,
@@ -2484,6 +2477,7 @@ class TritonMultiStepDraftBackend:
         model_runner: ModelRunner,
         topk: int,
         speculative_num_steps: int,
+        target_hf_config=None,
     ):
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
@@ -2503,6 +2497,7 @@ class TritonMultiStepDraftBackend:
                     model_runner,
                     skip_prefill=True,
                     kv_indptr_buf=self.kv_indptr[i],
+                    target_hf_config=target_hf_config,
                 )
             )
         self.max_context_len = self.attn_backends[0].max_context_len

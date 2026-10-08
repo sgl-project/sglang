@@ -35,12 +35,14 @@ class DraftBackendFactory:
         speculative_num_steps: int,
         seed_dsa_topk_from_draft_extend: bool = False,
         qsa_profile: Optional[QSAProfile] = None,
+        target_hf_config=None,
     ):
         self.draft_model_runner = draft_model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.seed_dsa_topk_from_draft_extend = seed_dsa_topk_from_draft_extend
         self.qsa_profile = qsa_profile
+        self.target_hf_config = target_hf_config
         # The draft runner's own backend, not the process-wide config.
         self.draft_attn_backend = draft_model_runner.draft_attention_backend
 
@@ -257,7 +259,10 @@ class DraftBackendFactory:
         return (
             "triton",
             TritonMultiStepDraftBackend(
-                self.draft_model_runner, self.topk, self.speculative_num_steps
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+                target_hf_config=self.target_hf_config,
             ),
         )
 
@@ -477,7 +482,11 @@ class DraftBackendFactory:
 
         return (
             "triton",
-            TritonAttnBackend(self.draft_model_runner, skip_prefill=False),
+            TritonAttnBackend(
+                self.draft_model_runner,
+                skip_prefill=False,
+                target_hf_config=self.target_hf_config,
+            ),
         )
 
     def _create_intel_amx_prefill_backend(self):
