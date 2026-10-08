@@ -4,7 +4,8 @@ import importlib.util
 import os
 import sys
 import unittest
-from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -80,8 +81,8 @@ class TestSparseKVCacheManager(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def make_manager(self, topk=1536, enable_lru=False, factor=2):
-        pool = ReqToTokenPool(2, 4096, "cpu", False)
+    def make_manager(self, topk=1536, enable_lru=False, factor=2, pool_device="cpu"):
+        pool = ReqToTokenPool(2, 4096, pool_device, False)
         kv = MLATokenToKVPool.__new__(MLATokenToKVPool)
         kv.start_layer = 0
         kv.layer_num = 2
@@ -227,6 +228,97 @@ class TestSparseKVCacheManager(unittest.TestCase):
         self.assertTrue((manager.device_slot_map[0][2] == -1).all())
         self.assertTrue((manager.host_kv_buffer[0][2, :3, :, :2] == 7).all())
         self.assertTrue((manager.host_kv_buffer[0][2, :3, :, 2:] == 8).all())
+
+    def test_pd_worker_uses_allocated_device_after_default_device_changes(self):
+        self.kernels.fused_timestamp_lru_metadata_update_with_probation = Mock()
+        self.kernels.parallel_lru_metadata_write = Mock()
+        for enable_lru in (False, True):
+            with self.subTest(enable_lru=enable_lru):
+                # None resolves to CPU at allocation, then meta in the worker.
+                # This reproduces late device resolution without NPU hardware:
+                # bare "npu" can resolve to a different card in the PD thread.
+                manager, _ = self.make_manager(
+                    2048, enable_lru=enable_lru, pool_device=None
+                )
+                manager.ensure_pd_decode_staging_buffers()
+                for layer in range(manager.layer_num):
+                    manager.device_slot_map[layer][2].fill_(7)
+                    manager.pd_decode_k_staging[layer][0, :3].fill_(7)
+                    manager.pd_decode_v_staging[layer][0, :3].fill_(8)
+                    if enable_lru:
+                        manager.device_slot_tokens[layer][2].fill_(7)
+                        manager.device_lru_slots[layer][2].fill_(0)
+                        manager.device_lru_slot_stamps[layer][2].fill_(9)
+
+                def offload_in_worker():
+                    with torch.device("meta"):
+                        manager.offload_pd_decode_staging_to_host(0, 2, 3)
+
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    executor.submit(offload_in_worker).result()
+
+                for layer in range(manager.layer_num):
+                    self.assertTrue((manager.device_slot_map[layer][2] == -1).all())
+                    self.assertTrue(
+                        (manager.host_kv_buffer[layer][2, :3, :, :2] == 7).all()
+                    )
+                    self.assertTrue(
+                        (manager.host_kv_buffer[layer][2, :3, :, 2:] == 8).all()
+                    )
+                    if enable_lru:
+                        self.assertTrue(
+                            (manager.device_slot_tokens[layer][2] == -1).all()
+                        )
+                        torch.testing.assert_close(
+                            manager.device_lru_slots[layer][2],
+                            manager._initial_lru_slot_order[0],
+                        )
+                        self.assertEqual(
+                            manager.device_lru_slot_stamps[layer][2].sum().item(), 0
+                        )
+
+    def test_pd_reset_and_copy_complete_on_same_stream(self):
+        for token_count in (0, 3):
+            for use_custom_stream in (False, True):
+                with self.subTest(
+                    token_count=token_count, use_custom_stream=use_custom_stream
+                ):
+                    manager, _ = self.make_manager()
+                    manager.ensure_pd_decode_staging_buffers()
+                    stream = (
+                        Mock() if use_custom_stream else manager._pd_decode_copy_stream
+                    )
+                    active_stream = None
+                    reset_requests = manager.reset_requests
+
+                    @contextmanager
+                    def stream_context(selected_stream):
+                        nonlocal active_stream
+                        active_stream = selected_stream
+                        try:
+                            yield
+                        finally:
+                            active_stream = None
+
+                    def reset_on_copy_stream(req_ids):
+                        self.assertIs(active_stream, stream)
+                        stream.synchronize.assert_not_called()
+                        reset_requests(req_ids)
+
+                    with (
+                        patch.object(self.npu, "stream", stream_context),
+                        patch.object(
+                            manager, "reset_requests", side_effect=reset_on_copy_stream
+                        ) as reset,
+                    ):
+                        manager.offload_pd_decode_staging_to_host(
+                            0,
+                            2,
+                            token_count,
+                            stream=stream if use_custom_stream else None,
+                        )
+                    reset.assert_called_once_with([2])
+                    stream.synchronize.assert_called_once_with()
 
 
 if __name__ == "__main__":

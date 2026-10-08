@@ -116,7 +116,9 @@ class SparseKVCacheManager:
                 fused_timestamp_lru_metadata_update_with_probation
             )
             self._lru_metadata_write = parallel_lru_metadata_write
-        self.device = req_to_token_pool.device
+        # Bind allocations to this rank's device. The pool's device string may
+        # be bare "npu", which can resolve to NPU 0 in the PD receive thread.
+        self.device = req_to_token_pool.req_to_token.device
         paged_kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if not isinstance(paged_kv_cache, MLATokenToKVPool):
             raise TypeError(
@@ -555,12 +557,11 @@ class SparseKVCacheManager:
             )
 
         self.host_kv_ctx_len[req_pool_idx] = token_count
-        self.reset_requests([req_pool_idx])
-        if token_count == 0:
-            return
-
         actual_stream = stream if stream is not None else self._pd_decode_copy_stream
         with torch.npu.stream(actual_stream):
+            # The receive thread must finish both metadata reset and KV copies
+            # before publishing transfer success, including empty transfers.
+            self.reset_requests([req_pool_idx])
             for layer_idx in range(self.layer_num):
                 dst = self.host_kv_buffer[layer_idx][req_pool_idx, :token_count]
                 dst[..., : self.kv_lora_rank].copy_(
