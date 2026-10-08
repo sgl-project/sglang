@@ -244,6 +244,47 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     return backend
 
 
+def validate_decode_radix_cache(
+    *,
+    model_config: ModelConfig,
+    token_to_kv_pool: object,
+    is_hybrid_swa: bool,
+    enable_hierarchical_cache: bool,
+) -> None:
+    """Reject decode-side radix cache on KV layouts its prefix reuse cannot serve.
+
+    SWA models go through the unified tree, whose component pools preserve the
+    full-attention prefix while the SWA window is transferred fresh. Hybrid
+    SSM/KDA uses UnifiedRadixCache's Mamba component (match + lock + CoW), the
+    same path as colocated serving.
+    """
+    if not is_hybrid_swa:
+        return
+    if enable_hierarchical_cache:
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache with sliding "
+            "window attention (SWA) models currently supports only "
+            "device-resident cache and is incompatible with "
+            "--enable-hierarchical-cache."
+        )
+    # DeepSeek-V4 qualifies only on the unified KV layout (bf16 or fp8 rows): its
+    # SWA ring and c128 state are request-scoped and always transferred whole, so
+    # the tree shares only the compressed full-attention pages.
+    if getattr(model_config, "is_deepseek_v4_arch", False) and not getattr(
+        token_to_kv_pool, "_unified_kv", False
+    ):
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache with DeepSeek-V4 "
+            "requires the unified KV layout "
+            "(SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton)."
+        )
+    if getattr(model_config, "is_hybrid_swa_compress", False):
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache does not support "
+            "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
+        )
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -294,32 +335,16 @@ def build_kv_cache(
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
-    # Decode-side radix cache supports SWA only through the unified tree, whose
-    # component pools preserve the full-attention prefix while transferring the
-    # SWA window fresh. Hybrid SSM/KDA uses UnifiedRadixCache's Mamba
-    # component (match + lock + CoW), the same path as colocated serving.
     if (
         get_disagg().disaggregation_decode_enable_radix_cache
         and get_disagg().disaggregation_mode == "decode"
     ):
-        if is_hybrid_swa:
-            if enable_hierarchical_cache:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache with sliding "
-                    "window attention (SWA) models currently supports only "
-                    "device-resident cache and is incompatible with "
-                    "--enable-hierarchical-cache."
-                )
-            if getattr(model_config, "is_deepseek_v4_arch", False):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache does not support "
-                    "DeepSeek-V4 (DSA) compressed KV (c4/c128/indexer) yet."
-                )
-            if getattr(model_config, "is_hybrid_swa_compress", False):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache does not support "
-                    "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
-                )
+        validate_decode_radix_cache(
+            model_config=model_config,
+            token_to_kv_pool=token_to_kv_pool,
+            is_hybrid_swa=is_hybrid_swa,
+            enable_hierarchical_cache=enable_hierarchical_cache,
+        )
 
     effective_chunked_prefill_size = get_schedule().chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
