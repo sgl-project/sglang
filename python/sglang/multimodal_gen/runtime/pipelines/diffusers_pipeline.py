@@ -745,11 +745,6 @@ class DiffusersPipeline(ComposedPipelineBase):
         self._stage_name_mapping[stage_name] = stage
         return self
 
-    @property
-    def stages(self) -> list[PipelineStage]:
-        """List of stages in the pipeline."""
-        return self._stages
-
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Execute the pipeline on the given batch."""
