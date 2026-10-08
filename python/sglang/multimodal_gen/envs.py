@@ -57,6 +57,12 @@ if TYPE_CHECKING:
     # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
     # the resolver below -- that is the value the runtime reads.
     SGLANG_DIFFUSION_IPC_A2A: bool = True
+    # copy-engine all-to-all for Ulysses groups of any size on one host; off by
+    # default while it is validated. Falls back to NCCL when unavailable.
+    SGLANG_DIFFUSION_IPC_A2A_MULTI: bool = False
+    # head groups for pipelining the Ulysses exchange against dense attention
+    # over the copy-engine transport; 0 or 1 keeps the sequential exchange
+    SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS: int = 0
     # a deadlock backstop, not a per-step budget: a rank can legitimately stall
     # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
     # retires the transport on every rank and fails the request
@@ -401,6 +407,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable cache-dit acceleration for DiT inference
     # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
     "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
+    "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_bool(
+        "SGLANG_DIFFUSION_IPC_A2A_MULTI", "false"
+    ),
+    "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS": _lazy_int(
+        "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS", 0
+    ),
     "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS": _lazy_float(
         "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS", 10000.0
     ),

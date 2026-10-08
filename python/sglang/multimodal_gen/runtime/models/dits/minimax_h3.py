@@ -653,6 +653,46 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         return out
 
 
+def _minimax_h3_pipelined_dense_attention(
+    attention: MiniMaxH3Attention,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_host: tuple[int, ...] | None,
+    max_seqlen: int,
+) -> torch.Tensor | None:
+    """Dense FA with the Ulysses exchange pipelined over head groups.
+
+    Returns None (caller keeps the sequential exchange) unless head-group
+    pipelining is enabled and the dense FlashAttention path would run.
+    """
+    groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
+    if groups <= 1 or torch.compiler.is_compiling():
+        return None
+    if attention._attention_backend_enum is not AttentionBackendEnum.FA:
+        return None
+    impl = attention._attention_impl
+    if impl._request_skip_softmax_threshold()[0]:
+        return None
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
+        ulysses_pipelined_attention,
+    )
+
+    def attend(q_group, k_group, v_group):
+        return impl.forward_varlen(
+            q_group,
+            k_group,
+            v_group,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            cu_seqlens_host=cu_seqlens_host,
+        )
+
+    return ulysses_pipelined_attention(q, k, v, attend, groups)
+
+
 def _minimax_h3_attention_core_impl(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -674,15 +714,6 @@ def _minimax_h3_attention_core_impl(
     kernel and sequence-parallel collectives execute eagerly.
     """
 
-    if ulysses_active:
-        from sglang.multimodal_gen.runtime.layers.usp import (
-            _usp_all_gather,
-            _usp_input_all_to_all_packed_qkv,
-            _usp_output_all_to_all,
-        )
-
-        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
-
     if attention._attention_impl is None:
         attention._set_attention_backend(
             get_attn_backend(
@@ -692,6 +723,28 @@ def _minimax_h3_attention_core_impl(
                 attention_requirements=AttentionRequirements(packed_varlen=True),
             )
         )
+
+    if ulysses_active and not ring_active and gate_compress is None:
+        out = _minimax_h3_pipelined_dense_attention(
+            attention,
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_host=cu_seqlens_host,
+            max_seqlen=max_seqlen,
+        )
+        if out is not None:
+            return out
+
+    if ulysses_active:
+        from sglang.multimodal_gen.runtime.layers.usp import (
+            _usp_all_gather,
+            _usp_input_all_to_all_packed_qkv,
+            _usp_output_all_to_all,
+        )
+
+        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
         attn_metadata = (
