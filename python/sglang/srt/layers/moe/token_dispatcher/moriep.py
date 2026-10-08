@@ -1542,6 +1542,12 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
                 ]
         self._routing = routing
         self._recv_topk_ids = recv_indices
+        # Count after dispatch and before combine (combine resets total_recv), on
+        # the compute stream that already waited for the dispatch.
+        if _should_record_expert_distribution():
+            get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+                self.mori_op.local_expert_count()
+            )
         expert_output = None
         if self._direct_output:
             combine_in_view = getattr(self.mori_op, "combine_in_view", None)
