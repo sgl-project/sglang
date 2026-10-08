@@ -89,11 +89,11 @@ def _build_cpu_pool(kvc, size):
         kwargs["device"] = "cpu"
         return DSATokenToKVPool(*args, **kwargs)
 
-    with patch(
-        "sglang.srt.mem_cache.kv_cache_configurator.DSATokenToKVPool",
-        side_effect=allocate_cpu,
-    ):
-        return kvc._build_dsa_kv_pool(max_total_num_tokens=size, max_running_requests=8)
+    return kvc._build_dsa_kv_pool(
+        max_total_num_tokens=size,
+        max_running_requests=8,
+        dsa_pool_class=allocate_cpu,
+    )
 
 
 def _allocate_all(pool, dcp_size):

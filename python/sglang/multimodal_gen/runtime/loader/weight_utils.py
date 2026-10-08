@@ -395,6 +395,34 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
         raise
 
 
+def load_stacked_weight(
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: dict[str, torch.nn.Parameter],
+    stacked_params_mapping: Iterable[tuple[str, str, str | int]],
+) -> str | None:
+    """Load a known parameter or its fused shard; return None for unknown names."""
+    for param_name, weight_name, shard_id in stacked_params_mapping:
+        if weight_name not in name:
+            continue
+        name = name.replace(weight_name, param_name)
+        if name not in params_dict:
+            continue
+        param = params_dict[name]
+        param.weight_loader(param, loaded_weight, shard_id)
+        return name
+
+    if name not in params_dict:
+        return None
+    param = params_dict[name]
+    try:
+        weight_loader = param.weight_loader
+    except AttributeError:
+        weight_loader = default_weight_loader
+    weight_loader(param, loaded_weight)
+    return name
+
+
 def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> str | None:
     """Remap the name of FP8 k/v_scale parameters.
 
