@@ -50,6 +50,7 @@ from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -140,21 +141,15 @@ class Qwen2_5_VLMLP(nn.Module):
         prefix: str = "",
         use_data_parallel: bool = False,
         fuse_gate_up: bool = True,
-        tp_size: Optional[int] = None,
-        tp_rank: Optional[int] = None,
+        parallel_group: Optional[LinearParallelGroup] = None,
     ):
         super().__init__()
+        if use_data_parallel and parallel_group is not None:
+            raise ValueError("Explicit MLP TP cannot be combined with data parallel")
         if use_data_parallel:
-            if tp_size is not None or tp_rank is not None:
-                raise ValueError(
-                    "Explicit MLP TP cannot be combined with data parallel"
-                )
-            self.tp_size, self.tp_rank = 1, 0
-        else:
-            if (tp_size is None) != (tp_rank is None):
-                raise ValueError("MLP tp_size and tp_rank must be set together")
-            self.tp_size = get_parallel().tp_size if tp_size is None else tp_size
-            self.tp_rank = get_parallel().tp_rank if tp_rank is None else tp_rank
+            parallel_group = "replicated"
+        elif parallel_group is None:
+            parallel_group = "tp"
         self.fuse_gate_up = fuse_gate_up
         if fuse_gate_up:
             self.gate_up_proj = MergedColumnParallelLinear(
@@ -163,8 +158,7 @@ class Qwen2_5_VLMLP(nn.Module):
                 bias=bias,
                 quant_config=quant_config,
                 prefix=add_prefix("gate_up_proj", prefix),
-                tp_size=self.tp_size,
-                tp_rank=self.tp_rank,
+                parallel_group=parallel_group,
             )
         else:
             projection_kwargs = dict(
@@ -172,8 +166,7 @@ class Qwen2_5_VLMLP(nn.Module):
                 output_size=hidden_features,
                 bias=bias,
                 quant_config=quant_config,
-                tp_size=self.tp_size,
-                tp_rank=self.tp_rank,
+                parallel_group=parallel_group,
             )
             self.gate_proj = ColumnParallelLinear(
                 **projection_kwargs,
@@ -183,7 +176,11 @@ class Qwen2_5_VLMLP(nn.Module):
                 **projection_kwargs,
                 prefix=add_prefix("up_proj", prefix),
             )
-        if not self.fuse_gate_up and self.tp_size == 1:
+        self.tp_group = (
+            self.gate_up_proj if self.fuse_gate_up else self.gate_proj
+        ).tp_group
+        tp_size = self.tp_group.world_size if self.tp_group is not None else 1
+        if not self.fuse_gate_up and tp_size == 1:
             self.down_proj = ReplicatedLinear(
                 hidden_features,
                 in_features,
@@ -198,8 +195,7 @@ class Qwen2_5_VLMLP(nn.Module):
                 bias=bias,
                 quant_config=quant_config,
                 prefix=add_prefix("down_proj", prefix),
-                tp_size=self.tp_size,
-                tp_rank=self.tp_rank,
+                parallel_group=parallel_group,
             )
         self.hidden_act = hidden_act
         if self.fuse_gate_up and self.hidden_act == "silu":
@@ -326,8 +322,6 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
             cast_x_before_out_mul=cast_x_before_out_mul,
             force_native=force_native_norm,
         )
-        tp_size = 1 if use_data_parallel else get_parallel().tp_size
-        tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
         self.mlp = nn.ModuleList(
             [
                 ColumnParallelLinear(
@@ -336,8 +330,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
                     bias=True,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp.0", prefix),
-                    tp_size=tp_size,
-                    tp_rank=tp_rank,
+                    parallel_group="replicated" if use_data_parallel else "tp",
                 ),
                 nn.GELU(),
                 RowParallelLinear(
@@ -346,8 +339,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
                     bias=True,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp.2", prefix),
-                    tp_size=tp_size,
-                    tp_rank=tp_rank,
+                    parallel_group="replicated" if use_data_parallel else "tp",
                 ),
             ]
         )

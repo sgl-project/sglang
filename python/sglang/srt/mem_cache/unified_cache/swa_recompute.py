@@ -88,7 +88,7 @@ def init_swa_recompute(
     """Bind fresh SWA rows behind the FULL prefix and publish its last window.
     The window holds no data until the returned replay runs, so the request must
     enter the batch being built."""
-    matched_len = len(req.prefix_indices)
+    matched_len = req.prefix_len
     full_len, node_id = _recomputable_full_len(cache, key, matched_len)
     if node_id is None:
         return None
