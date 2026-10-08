@@ -296,10 +296,7 @@ class MiniMaxM3MLP(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
         hidden_act = config.hidden_act
-        self.fuse_swiglu_oai_mxfp8 = (
-            hidden_act == "swigluoai"
-            and envs.SGLANG_OPT_MINIMAX_M3_FUSED_SWIGLU_MXFP8.get()
-        )
+        self.fuse_swiglu_oai_mxfp8 = hidden_act == "swigluoai"
         if self.fuse_swiglu_oai_mxfp8:
             self.swiglu_alpha = float(config.swiglu_alpha)
             self.swiglu_limit = float(config.swiglu_limit)

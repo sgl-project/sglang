@@ -1772,9 +1772,6 @@ class Envs:
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
     # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
-    # Dense/shared MLP SwiGLU-OAI fused with the MXFP8 down_proj input quant
-    # (FlashInfer CUTLASS / CuTe-DSL or DeepGEMM).
-    SGLANG_OPT_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(True)
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
