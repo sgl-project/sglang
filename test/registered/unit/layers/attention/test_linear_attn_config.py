@@ -220,7 +220,13 @@ class TestFlashInferKDAPrefillPolicy(CustomTestCase):
                     model=config.model_type, capability=capability, fields=fields
                 ),
                 get_context().override_server_args(
-                    **{"linear_attn_backend": "triton", **fields}
+                    **{
+                        "linear_attn_backend": "triton",
+                        "cuda_graph_config": CudaGraphConfig(
+                            prefill=PhaseConfig(backend="disabled")
+                        ),
+                        **fields,
+                    }
                 ),
                 patch(
                     "sglang.srt.layers.attention.linear.kda_backend.is_cuda",
