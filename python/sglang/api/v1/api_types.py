@@ -203,6 +203,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, frozen=True):
     sampling_seed: Optional[int] = None
     custom_params: Optional[Any] = None
     beam_width: Optional[int] = None
+    watermark: Optional[WatermarkRequestConfig] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "SamplingParams":
@@ -212,6 +213,23 @@ class SamplingParams(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_SamplingParams(self)
+
+
+class WatermarkRequestConfig(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.WatermarkRequestConfig: JSON object (unknown keys rejected)."""
+
+    enabled: Optional[bool] = None
+    key: Optional[str] = None
+    context_window: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "WatermarkRequestConfig":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_WatermarkRequestConfig(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_WatermarkRequestConfig(self)
 
 
 class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
@@ -873,7 +891,7 @@ def encode_FinishReason(v: FinishReason) -> Any:
     raise TypeError(f"FinishReason: unsupported value {type(v).__name__}")
 
 
-_FIELDS_SamplingParams = ("max_new_tokens", "stop", "stop_token_ids", "stop_regex", "temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_new_tokens", "n", "json_schema", "regex", "ebnf", "structural_tag", "ignore_eos", "skip_special_tokens", "spaces_between_special_tokens", "no_stop_trim", "stream_interval", "logit_bias", "sampling_seed", "custom_params", "beam_width",)
+_FIELDS_SamplingParams = ("max_new_tokens", "stop", "stop_token_ids", "stop_regex", "temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_new_tokens", "n", "json_schema", "regex", "ebnf", "structural_tag", "ignore_eos", "skip_special_tokens", "spaces_between_special_tokens", "no_stop_trim", "stream_interval", "logit_bias", "sampling_seed", "custom_params", "beam_width", "watermark",)
 
 
 def decode_SamplingParams(value: Any) -> SamplingParams:
@@ -932,6 +950,8 @@ def decode_SamplingParams(value: Any) -> SamplingParams:
             kw["custom_params"] = x
         elif key == "beam_width":
             kw["beam_width"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "watermark":
+            kw["watermark"] = None if x is None else decode_WatermarkRequestConfig(x)
         else:
             raise _unknown_field(key, fields=_FIELDS_SamplingParams)
     return SamplingParams(**kw)
@@ -990,6 +1010,37 @@ def encode_SamplingParams(v: SamplingParams) -> Dict[str, Any]:
         d["custom_params"] = v.custom_params
     if v.beam_width is not None:
         d["beam_width"] = v.beam_width
+    if v.watermark is not None:
+        d["watermark"] = encode_WatermarkRequestConfig(v.watermark)
+    return d
+
+
+_FIELDS_WatermarkRequestConfig = ("enabled", "key", "context_window",)
+
+
+def decode_WatermarkRequestConfig(value: Any) -> WatermarkRequestConfig:
+    m = _expect_map(value, expected="struct WatermarkRequestConfig")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "enabled":
+            kw["enabled"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "key":
+            kw["key"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "context_window":
+            kw["context_window"] = None if x is None else _expect_int(x, expected="i64")
+        else:
+            raise _unknown_field(key, fields=_FIELDS_WatermarkRequestConfig)
+    return WatermarkRequestConfig(**kw)
+
+
+def encode_WatermarkRequestConfig(v: WatermarkRequestConfig) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.enabled is not None:
+        d["enabled"] = v.enabled
+    if v.key is not None:
+        d["key"] = v.key
+    if v.context_window is not None:
+        d["context_window"] = v.context_window
     return d
 
 

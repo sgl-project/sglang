@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use sglang_api_types::api::v1 as api;
 
 use super::multimodal::{MmDataInput, MmItem};
-use super::sampling::{CustomParamValue, SamplingParams};
+use super::sampling::{CustomParamValue, SamplingParams, WatermarkRequestConfig};
 use super::types::{OneOrMany, TokenIds};
 use crate::utils::error::Error;
 
@@ -162,6 +162,11 @@ impl TryFrom<api::SamplingParams> for SamplingParams {
             logit_bias: (!p.logit_bias.is_empty()).then(|| p.logit_bias.into_iter().collect()),
             sampling_seed: p.sampling_seed,
             custom_params,
+            watermark: p.watermark.map(|watermark| WatermarkRequestConfig {
+                enabled: watermark.enabled,
+                key: watermark.key,
+                context_window: watermark.context_window,
+            }),
             ..defaults
         })
     }
@@ -378,6 +383,21 @@ mod tests {
             Some(1.5)
         );
         assert_eq!(p.temperature, 1.0, "schema default applied by the decoder");
+    }
+
+    #[test]
+    fn watermark_crosses_generated_schema() {
+        let key = "0123456789abcdef";
+        let p: api::SamplingParams = serde_json::from_value(serde_json::json!({
+            "watermark": {"enabled": true, "key": key, "context_window": 4}
+        }))
+        .unwrap();
+        let p = SamplingParams::try_from(p).unwrap();
+        let watermark = p.watermark.as_ref().unwrap();
+        assert_eq!(watermark.enabled, Some(true));
+        assert_eq!(watermark.key.as_deref(), Some(key));
+        assert_eq!(watermark.context_window, Some(4));
+        assert!(!format!("{p:?}").contains(key));
     }
 
     /// The protobuf entry fills the same keys the JSON entry does: a set field

@@ -1107,6 +1107,9 @@ impl ::serde::Serialize for SamplingParams {
         if let Some(v) = &self.beam_width {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "beam_width", v)?;
         }
+        if let Some(v) = &self.watermark {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "watermark", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1140,6 +1143,7 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
             "sampling_seed",
             "custom_params",
             "beam_width",
+            "watermark",
         ];
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {
@@ -1177,6 +1181,7 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                 let mut f_sampling_seed = None;
                 let mut f_custom_params = None;
                 let mut f_beam_width = None;
+                let mut f_watermark = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "max_new_tokens" => {
@@ -1383,6 +1388,12 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                             }
                             f_beam_width = Some(map.next_value::<Option<i64>>()?);
                         }
+                        "watermark" => {
+                            if f_watermark.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("watermark"));
+                            }
+                            f_watermark = Some(map.next_value::<Option<WatermarkRequestConfig>>()?);
+                        }
                         other => {
                             return Err(::serde::de::Error::unknown_field(other, FIELDS));
                         }
@@ -1416,6 +1427,76 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                     sampling_seed: f_sampling_seed.flatten(),
                     custom_params: f_custom_params.flatten(),
                     beam_width: f_beam_width.flatten(),
+                    watermark: f_watermark.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for WatermarkRequestConfig {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.enabled {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "enabled", v)?;
+        }
+        if let Some(v) = &self.key {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "key", v)?;
+        }
+        if let Some(v) = &self.context_window {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "context_window", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for WatermarkRequestConfig {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const FIELDS: &[&str] = &["enabled", "key", "context_window"];
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = WatermarkRequestConfig;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct WatermarkRequestConfig")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_enabled = None;
+                let mut f_key = None;
+                let mut f_context_window = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "enabled" => {
+                            if f_enabled.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("enabled"));
+                            }
+                            f_enabled = Some(map.next_value::<Option<bool>>()?);
+                        }
+                        "key" => {
+                            if f_key.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("key"));
+                            }
+                            f_key =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "context_window" => {
+                            if f_context_window.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("context_window"));
+                            }
+                            f_context_window = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        other => {
+                            return Err(::serde::de::Error::unknown_field(other, FIELDS));
+                        }
+                    }
+                }
+                Ok(WatermarkRequestConfig {
+                    enabled: f_enabled.flatten(),
+                    key: f_key.flatten(),
+                    context_window: f_context_window.flatten(),
                 })
             }
         }
