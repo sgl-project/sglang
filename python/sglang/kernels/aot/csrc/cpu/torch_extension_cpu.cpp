@@ -127,9 +127,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qk_gemma_rmsnorm_with_gate_
     double eps,
     int64_t head_dim,
     int64_t num_head);
-// pack qkv
-void pack_qkv_destination_major_cpu(
-    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, int64_t world_size, at::Tensor& output);
 // speculative decoding
 void verify_tree_greedy_cpu(
     at::Tensor predicts,
@@ -1046,9 +1043,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // raw base pointers), which schema-level alias annotations cannot express.
   m.def("copy_all_layer_kv_cache_cpu(Tensor data_ptrs, Tensor strides, Tensor tgt_loc, Tensor src_loc) -> ()");
   m.impl("copy_all_layer_kv_cache_cpu", torch::kCPU, &copy_all_layer_kv_cache_cpu);
-  // pack qkv
-  m.def("pack_qkv_destination_major_cpu(Tensor q, Tensor k, Tensor v, int world_size, Tensor(a!) output) -> ()");
-  m.impl("pack_qkv_destination_major_cpu", torch::kCPU, &pack_qkv_destination_major_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
