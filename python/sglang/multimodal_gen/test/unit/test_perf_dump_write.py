@@ -14,6 +14,7 @@ def _metrics(request_id: str) -> SimpleNamespace:
         stages={"DenoisingStage": 1.0},
         steps=[1.0],
         memory_snapshots={},
+        cache_stats={},
         total_duration_ms=1.0,
     )
 

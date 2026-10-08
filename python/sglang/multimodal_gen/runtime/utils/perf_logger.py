@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from copy import deepcopy
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -67,6 +68,7 @@ class RequestMetrics:
         self.suppress_stage_breakdown: bool = False
         # memory tracking: {checkpoint_name: MemorySnapshot}
         self.memory_snapshots: Dict[str, MemorySnapshot] = {}
+        self.cache_stats: dict[str, dict[str, dict[str, int]]] = {}
 
     @property
     def total_duration_s(self) -> float:
@@ -108,10 +110,26 @@ class RequestMetrics:
             return
         self.memory_snapshots[checkpoint_name] = snapshot
 
+    def record_cache_stats(
+        self, name: str, request: dict[str, int], cumulative: dict[str, int]
+    ) -> None:
+        """Accumulate request-local work and retain the latest cache snapshot."""
+        if self.suppress_stage_breakdown:
+            return
+        previous = self.cache_stats.get(name, {}).get("request", {})
+        combined = dict(previous)
+        for key, value in request.items():
+            combined[key] = combined.get(key, 0) + value
+        self.cache_stats[name] = {
+            "request": combined,
+            "cumulative": dict(cumulative),
+        }
+
     def to_dict(self) -> Dict[str, Any]:
         """Serializes the metrics data to a dictionary."""
         return {
             "request_id": self.request_id,
+            "cache_stats": deepcopy(self.cache_stats),
             "stages": self.stages,
             "denoising_stages": sorted(self.denoising_stages),
             "steps": self.steps,
@@ -255,6 +273,9 @@ class RequestPerfRecord:
     steps: list[float]
     total_duration_ms: float
     memory_snapshots: dict[str, dict] = dataclasses.field(default_factory=dict)
+    cache_stats: dict[str, dict[str, dict[str, int]]] = dataclasses.field(
+        default_factory=dict
+    )
 
     def __init__(
         self,
@@ -266,6 +287,7 @@ class RequestPerfRecord:
         total_duration_ms,
         memory_snapshots=None,
         timestamp=None,
+        cache_stats=None,
     ):
         self.request_id = request_id
         if timestamp is not None:
@@ -279,6 +301,7 @@ class RequestPerfRecord:
         self.steps = steps
         self.total_duration_ms = total_duration_ms
         self.memory_snapshots = memory_snapshots or {}
+        self.cache_stats = deepcopy(cache_stats) if cache_stats is not None else {}
 
 
 class StageProfiler:
@@ -439,6 +462,7 @@ class PerformanceLogger:
             "steps": formatted_steps,
             "denoise_steps_ms": denoise_steps_ms,
             "memory_checkpoints": memory_checkpoints,
+            "cache_stats": deepcopy(metrics.cache_stats),
             "meta": meta or {},
         }
 
@@ -487,6 +511,7 @@ class PerformanceLogger:
             steps=metrics.steps,
             total_duration_ms=metrics.total_duration_ms,
             memory_snapshots=memory_checkpoints,
+            cache_stats=metrics.cache_stats,
         )
 
         try:
