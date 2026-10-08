@@ -1176,7 +1176,7 @@ def init_lora_cuda_graph_moe_buffers(
     if max_running_requests is not None:
         max_bs = min(
             max_bs,
-            max_running_requests // get_parallel().attn_dp_size,
+            max(1, max_running_requests // get_parallel().attn_dp_size),
         )
     # With spec on, the decode graph captures TARGET_VERIFY batches of
     # num_draft_tokens per request, and the buffers below are per-token, so
