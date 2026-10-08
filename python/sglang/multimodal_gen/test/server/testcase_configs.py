@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.sample.sampling_params import normalize_quality
 from sglang.multimodal_gen.registry import (
     get_model_info,
     get_pipeline_config_classes,
@@ -360,6 +361,42 @@ class DiffusionTestCase:
             and self.sampling_params.realtime_num_chunks is not None
         ):
             raise ValueError(f"{self.id}: request warmup requires non-realtime metrics")
+
+        # A consistency golden records one path, and these were recorded on the
+        # reference one, so the case asks for it by name instead of inheriting
+        # whichever level is the server default. Without this the check would
+        # answer two questions at once -- "did the code regress" and "how far
+        # is the default level from the goldens" -- and spend its whole budget
+        # on the second: the default's own drift already sits at SSIM 0.91
+        # against goldens whose threshold is 0.92. A case that names a level
+        # keeps it; refreshing the goldens onto the default level is what
+        # removes the pin.
+        # Replaces rather than mutates: several cases share one module-level
+        # sampling-params instance.
+        if self.run_consistency_check and "quality" not in self.sampling_params.extras:
+            object.__setattr__(
+                self,
+                "sampling_params",
+                replace(
+                    self.sampling_params,
+                    extras={**self.sampling_params.extras, "quality": "exact"},
+                ),
+            )
+        # Warmup must run the request's level: a request below the server default
+        # unmounts the fusions warmup mounted, so its timed run is the first pass
+        # over an unwarmed path.
+        request_quality = self.sampling_params.extras.get("quality")
+        if request_quality is not None:
+            object.__setattr__(
+                self,
+                "server_args",
+                replace(
+                    self.server_args,
+                    extras=_with_warmup_quality(
+                        self.server_args.extras, normalize_quality(request_quality)
+                    ),
+                ),
+            )
 
         has_startup_lora = self.server_args.lora_path is not None
         has_dynamic_lora = self.server_args.dynamic_lora_path is not None
@@ -852,6 +889,37 @@ HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
     prompt="",
     image_path="https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png",
 )
+
+
+def _with_warmup_quality(extras: Sequence[str], quality: str) -> list[str]:
+    """Return ``extras`` with ``quality`` in ``--warmup-sampling-params``.
+
+    Merges into an existing JSON object and keeps a quality the case set itself.
+    """
+    option = "--warmup-sampling-params"
+
+    def with_quality(raw: str) -> str:
+        params = json.loads(raw)
+        params.setdefault("quality", quality)
+        return json.dumps(params)
+
+    merged: list[str] = []
+    found = False
+    for item in extras:
+        tokens = shlex.split(item)
+        changed = False
+        for index, token in enumerate(tokens):
+            if token.startswith(f"{option}="):
+                tokens[index] = f"{option}={with_quality(token[len(option) + 1 :])}"
+                changed = True
+            elif token == option and index + 1 < len(tokens):
+                tokens[index + 1] = with_quality(tokens[index + 1])
+                changed = True
+        merged.append(shlex.join(tokens) if changed else item)
+        found = found or changed
+    if not found:
+        merged.append(f"{option} {shlex.quote(json.dumps({'quality': quality}))}")
+    return merged
 
 
 def _get_extra_arg_value(extras: Sequence[str], option_name: str) -> str | None:

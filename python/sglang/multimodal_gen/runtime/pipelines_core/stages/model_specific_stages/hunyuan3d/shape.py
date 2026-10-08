@@ -24,6 +24,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.component_loading import (
     load_transformer_if_needed,
     register_loaded_transformer,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    retrieve_timesteps,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
@@ -41,51 +44,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.mesh3d_utils import export_to_trimesh
 
 logger = init_logger(__name__)
-
-
-def retrieve_timesteps(
-    scheduler,
-    num_inference_steps=None,
-    device=None,
-    timesteps=None,
-    sigmas=None,
-    **kwargs,
-):
-    """Retrieve timesteps from scheduler."""
-    import inspect
-
-    if timesteps is not None and sigmas is not None:
-        raise ValueError("Only one of timesteps or sigmas can be passed.")
-
-    if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(
-            inspect.signature(scheduler.set_timesteps).parameters.keys()
-        )
-        if not accepts_timesteps:
-            raise ValueError(
-                f"Scheduler {scheduler.__class__} doesn't support custom timesteps."
-            )
-        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
-
-    elif sigmas is not None:
-        accepts_sigmas = "sigmas" in set(
-            inspect.signature(scheduler.set_timesteps).parameters.keys()
-        )
-        if not accepts_sigmas:
-            raise ValueError(
-                f"Scheduler {scheduler.__class__} doesn't support custom sigmas."
-            )
-        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
-
-    else:
-        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-
-    return timesteps, num_inference_steps
 
 
 def _prepare_shape_image(image_processor, image, mask=None) -> dict:

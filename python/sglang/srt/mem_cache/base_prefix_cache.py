@@ -241,6 +241,16 @@ class DecLockRefParams:
 
 
 @dataclasses.dataclass
+class TreeLock:
+    """``receipt`` replays the acquire on release; ``swa_released`` marks the
+    SWA part released early, so neither release takes it twice."""
+
+    node: Any
+    receipt: DecLockRefParams
+    swa_released: bool = False
+
+
+@dataclasses.dataclass
 class DecLockRefResult:
     """Result of an dec_lock_ref operation."""
 
@@ -510,20 +520,31 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     ) -> DecLockRefResult:
         pass
 
-    def unpin(self, req: Req) -> None:
-        """Drop the tree lock the request holds on ``req.last_node``; a cache
-        whose acquire returned a receipt releases with it here."""
-        if req.last_node is not None:
-            self.dec_lock_ref(req.last_node)
+    def lock(self, node: Any) -> Optional[TreeLock]:
+        """Take a tree lock on ``node`` for one holder; ``unlock`` releases it."""
+        return TreeLock(node, self.inc_lock_ref(node).to_dec_params())
+
+    def unlock(self, lock: Optional[TreeLock]) -> None:
+        if lock is not None:
+            self.dec_lock_ref(lock.node, lock.receipt)
+
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        """KV indices of req's matched prefix, read off the path to its locked
+        match node; valid from match until allocation writes them into the row."""
+        raise NotImplementedError
+
+    def maybe_hand_to_session(self, req: Req) -> None:
+        """A cache that keeps records across requests (a streaming session) takes
+        the just-allocated row and the request's tree lock; the request borrows it."""
 
     def claim_kv_row(self, req: Req) -> bool:
         """A streaming session keeps the request's kv row for the next turn.
         Return True after taking the row; the caller then releases nothing."""
         return False
 
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        """The row is freed and the lock dropped; ``inserted`` says whether the
-        KV went into the tree first. Drop per-request state kept outside the tree."""
+    def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        """The row is freed and the lock dropped; ``checkpointed`` says whether
+        the KV went into the tree first. Drop per-request state kept outside the tree."""
 
     def evictable_size(self):
         return 0
