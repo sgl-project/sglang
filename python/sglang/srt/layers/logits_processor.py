@@ -107,8 +107,6 @@ class SamplingMaskOutput:
     selected_logprobs: torch.Tensor
     support_logprobs: Optional[torch.Tensor]
     statuses: torch.Tensor
-    # Request-major verify positions, padded past each request's accept length.
-    tokens_per_request: int = 1
 
     def map_device_tensors(self, fn) -> None:
         self.token_ids = fn(self.token_ids)

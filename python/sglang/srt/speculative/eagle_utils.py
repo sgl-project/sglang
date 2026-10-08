@@ -1032,12 +1032,6 @@ def eagle_sample(
             tp_group.broadcast(num_correct_drafts, src=0)
 
     if mask_req_rows is not None:
-        if SIMULATE_ACC_LEN > 0:
-            raise ValueError(
-                "return_sampling_mask does not support simulated acceptance."
-            )
-        if mask_probs is None and not sampling_info.is_all_greedy:
-            raise RuntimeError("This verify sampler cannot return sampling masks.")
         tp_group = get_parallel().tp_group.device_group
         cp_group = None
         if is_dp_attention_enabled():

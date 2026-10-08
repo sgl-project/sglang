@@ -1,12 +1,7 @@
-"""return_sampling_mask for chain EAGLE verify (speculative_eagle_topk == 1).
+"""Target-model sampling supports for chain EAGLE/NEXTN verification.
 
-Target-only verify accepts draft ``d`` at verify row ``r`` with probability
-``p_r(d)`` and otherwise samples ``p_r`` without ``d``, writing the emitted
-token to ``predict[r]``; ``accept_index`` lists those rows in emission order.
-Each emitted token's support is therefore the positive support of its row of
-``target_probs``. Opted-in rows use the joint top-k/top-p filter of the
-non-speculative sampler instead of verify's top-p over the top-k-renormalized
-distribution, so both paths sample from the same support.
+Each accepted position uses its verify row's target distribution, filtered with
+joint top-k/top-p to match the non-speculative sampler.
 """
 
 from typing import Optional, Tuple
@@ -160,5 +155,4 @@ def verify_sampling_mask_output(
         selected_logprobs=selected_logprobs,
         statuses=statuses,
         support_logprobs=support_logprobs,
-        tokens_per_request=accept_index.shape[1],
     )

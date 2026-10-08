@@ -60,7 +60,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
     def test_selected_and_support_modes_share_one_batch(self):
         output = LogitsProcessorOutput(
             next_token_logits=None,
-            sampling_mask_output=SamplingMaskOutput(
+            sampling_mask_output=SimpleNamespace(
                 token_ids=torch.tensor([[7, 8], [9, 10]], dtype=torch.int32),
                 lengths=torch.tensor([2, 2]),
                 selected_logprobs=torch.tensor([-0.5, -0.25]),
@@ -93,7 +93,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
     def test_selected_mode_does_not_require_support_tensor(self):
         output = LogitsProcessorOutput(
             next_token_logits=None,
-            sampling_mask_output=SamplingMaskOutput(
+            sampling_mask_output=SimpleNamespace(
                 token_ids=torch.tensor([[7, 8]], dtype=torch.int32),
                 lengths=torch.tensor([2]),
                 selected_logprobs=torch.tensor([-0.5]),
@@ -119,7 +119,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         packed_ids.cpu.return_value = torch.tensor([[7, 8, 0], [9, 0, 0]])
         output = LogitsProcessorOutput(
             next_token_logits=None,
-            sampling_mask_output=SamplingMaskOutput(
+            sampling_mask_output=SimpleNamespace(
                 token_ids=packed_ids,
                 lengths=torch.tensor([2, 1]),
                 selected_logprobs=torch.tensor([-0.5, -0.25]),
@@ -225,7 +225,6 @@ class TestDecodeSamplingMaskRetention(CustomTestCase):
                     selected_logprobs=torch.zeros(4),
                     support_logprobs=None,
                     statuses=torch.zeros(4, dtype=torch.int32),
-                    tokens_per_request=4,
                 ),
             ),
             speculative_num_draft_tokens=4,

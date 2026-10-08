@@ -1185,7 +1185,7 @@ class SchedulerBatchResultProcessor:
         batch_indices = [i for i, req in enumerate(reqs) if req.return_sampling_mask]
         lengths = sampling_output.lengths.tolist()
         statuses = sampling_output.statuses.tolist()
-        stride = sampling_output.tokens_per_request
+        stride = len(lengths) // len(batch_indices) if batch_indices else 1
         assert len(batch_indices) * stride == len(lengths)
 
         batch_size = len(reqs)

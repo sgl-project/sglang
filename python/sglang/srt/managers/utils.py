@@ -309,11 +309,6 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
             if sampling_mask_output is None
             else sampling_mask_output.support_logprobs
         ),
-        "sampling_mask_tokens_per_request": (
-            None
-            if sampling_mask_output is None
-            else sampling_mask_output.tokens_per_request
-        ),
         "sampling_mask_statuses": (
             None if sampling_mask_output is None else sampling_mask_output.statuses
         ),
@@ -337,7 +332,6 @@ def get_logprob_from_pp_outputs(
             selected_logprobs=next_pp_outputs["sampling_mask_selected_logprobs"],
             support_logprobs=next_pp_outputs["sampling_mask_support_logprobs"],
             statuses=next_pp_outputs["sampling_mask_statuses"],
-            tokens_per_request=next_pp_outputs["sampling_mask_tokens_per_request"],
         )
     logits_output = LogitsProcessorOutput(
         # Do not send logits and hidden states because they are large

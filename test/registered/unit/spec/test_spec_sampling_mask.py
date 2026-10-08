@@ -84,7 +84,6 @@ class TestSpecSamplingMask(CustomTestCase):
             support_capture_indices=None,
             sync_groups=(),
         )
-        self.assertEqual(out.tokens_per_request, 2)
         self.assertEqual(out.lengths.tolist(), [3, 1, 2, 0])
         self.assertEqual(sorted(out.token_ids[0, :3].tolist()), [1, 2, 3])
         self.assertAlmostEqual(out.selected_logprobs[0].item(), math.log(0.3), places=5)
@@ -96,7 +95,6 @@ class TestSpecSamplingMask(CustomTestCase):
 
     def test_materialize_one_support_per_position(self):
         mask = SimpleNamespace(
-            tokens_per_request=2,
             support_logprobs=None,
             token_ids=torch.tensor([[5, 6], [7, 0], [8, 0], [0, 0]], dtype=torch.int32),
             lengths=torch.tensor([2, 1, 1, 0]),
