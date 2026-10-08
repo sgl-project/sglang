@@ -18,7 +18,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-from sglang.kernels.ops.diffusion.common.numerics import mul_rn_f32
+from sglang.kernels.ops.common.numerics import mul_rn_f32
 
 _MAX_BLOCK = 4096
 

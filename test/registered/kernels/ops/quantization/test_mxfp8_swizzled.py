@@ -7,15 +7,16 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.diffusion import (
+from sglang.kernels.ops.diffusion import indexed_scale_shift_bf16_
+from sglang.kernels.ops.quantization import mxfp8_swizzled_triton
+from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import (
     can_use_mxfp8_swizzled,
     can_use_silu_mul_mxfp8,
-    indexed_scale_shift_bf16_,
     indexed_scale_shift_mxfp8_,
     mxfp8_quantize_swizzled,
     silu_mul_mxfp8,
+    swiglu_oai_mxfp8,
 )
-from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import swiglu_oai_mxfp8
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     swiglu_no_interleaved_with_alpha_and_limit,
 )
@@ -44,30 +45,39 @@ def test_quantize_swizzled_is_byte_exact() -> None:
     _assert_matches_flashinfer(mxfp8_quantize_swizzled(x), x)
 
 
-def test_silu_mul_mxfp8_is_byte_exact() -> None:
+def test_silu_mul_mxfp8_is_byte_exact(monkeypatch: pytest.MonkeyPatch) -> None:
     g = torch.Generator(device="cuda").manual_seed(2)
     x = (torch.randn((ROWS, 2 * HIDDEN), device="cuda", generator=g) * 2).to(
         torch.bfloat16
     )
     assert can_use_silu_mul_mxfp8(x)
     ref = torch.nn.functional.silu(x[:, :HIDDEN]) * x[:, HIDDEN:]
+    _poison_scale_alloc(monkeypatch)
     _assert_matches_flashinfer(silu_mul_mxfp8(x), ref)
 
 
-def _dirty_allocator() -> None:
-    torch.full((1 << 19,), 0xFF, dtype=torch.uint8, device="cuda")
+def _poison_scale_alloc(monkeypatch: pytest.MonkeyPatch) -> None:
+    alloc = mxfp8_swizzled_triton._alloc
+
+    def poisoned(*args, **kwargs):
+        q, s = alloc(*args, **kwargs)
+        return q, s.fill_(0xFF)
+
+    monkeypatch.setattr(mxfp8_swizzled_triton, "_alloc", poisoned)
 
 
 @pytest.mark.parametrize("rows", [1, 7, 128, 333])
 @pytest.mark.parametrize("n", [768, 1056])
 @pytest.mark.parametrize("scale", [1e-3, 1.0, 30.0])
-def test_swiglu_oai_mxfp8_matches_eager_chain(rows: int, n: int, scale: float) -> None:
+def test_swiglu_oai_mxfp8_matches_eager_chain(
+    rows: int, n: int, scale: float, monkeypatch: pytest.MonkeyPatch
+) -> None:
     g = torch.Generator(device="cuda").manual_seed(rows * 31 + n)
     x = (torch.randn((rows, 2 * n + 64), device="cuda", generator=g) * scale).to(
         torch.bfloat16
     )[:, : 2 * n]
     ref = swiglu_no_interleaved_with_alpha_and_limit(x, 1.702, 7.0)
-    _dirty_allocator()
+    _poison_scale_alloc(monkeypatch)
     _assert_matches_flashinfer(swiglu_oai_mxfp8(x, 1.702, 7.0), ref)
 
 

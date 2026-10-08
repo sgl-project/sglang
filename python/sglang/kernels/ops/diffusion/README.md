@@ -41,7 +41,7 @@ quantization/ FP8 rowwise producers fused into the GEMM input path
 attention/   sparse linear attention, gated delta-net
 routing/     diffusion-model MoE routing and expert selection
 layout/      pure data movement: USP/Ulysses relayout, varlen pack, causal pad
-common/      numerics primitives, platform predicates, non-Triton fallbacks
+common/      platform predicates, non-Triton fallbacks (numerics: kernels/ops/common)
 sites/       request-scoped mount policy — NOT kernels (see below)
 ext/         JIT C++/CUDA extensions (Hunyuan3D raster/inpaint) — NOT kernels
 ../../kda_kernels/  agent-generated implementations and their JIT CUDA sources
