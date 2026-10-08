@@ -32,7 +32,9 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     fill_transparent_bg as _fill_transparent_bg,
 )
-from sglang.srt.multimodal.kimi_k3_image_processing import to_chw_uint8
+from sglang.srt.multimodal.kimi_k3_image_processing import (
+    to_chw_uint8,
+)
 from sglang.srt.multimodal.media_artifacts import (
     MediaArtifactCacheMixin,
     MediaArtifactInput,
@@ -45,7 +47,9 @@ from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 from sglang.srt.multimodal.processors.kimi_common import (
     KimiGridMMDataMixin,
     KimiLoadedImage,
