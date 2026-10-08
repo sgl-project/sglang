@@ -10,7 +10,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
 from array import array
@@ -38,20 +38,27 @@ def _recv(rid, input_ids, max_new_tokens=8):
         return_logprob=False,
         top_logprobs_num=0,
         token_ids_logprob=None,
+        return_sampling_mask=False,
+        sampling_logprobs_mode="selected",
         require_reasoning=False,
         return_hidden_states=False,
         return_routed_experts=False,
         routed_experts_start_len=0,
+        bootstrap_host=None,
+        bootstrap_port=None,
+        bootstrap_room=None,
+        routed_dp_rank=None,
+        disagg_prefill_dp_rank=None,
         priority=None,
         routing_key=None,
         extra_key=None,
+        cache_salt=None,
         http_worker_ipc=None,
         time_stats=None,
     )
 
 
 class TestSessionTokenShare(CustomTestCase):
-
     def setUp(self):
         self.session = Session(capacity_of_str_len=0, session_id="s", streaming=True)
 
@@ -72,7 +79,7 @@ class TestSessionTokenShare(CustomTestCase):
         if baked is None:
             baked = len(output)
         req.output_ids.extend(output[:baked])
-        req._refresh_fill_ids()
+        req.refresh_fill_ids()
         req.output_ids.extend(output[baked:])
         self.session.finish_req(req)
 
@@ -108,7 +115,7 @@ class TestSessionTokenShare(CustomTestCase):
         r2 = self._create("r2", [50, 51])
         self.assertEqual(list(r2.origin_input_ids), in1 + out1 + [50, 51])
         r2.output_ids.extend([6, 7])
-        r2._refresh_fill_ids()
+        r2.refresh_fill_ids()
         self.session.abort_req()
         self.assertEqual(self.session.committed_origin_len, len(in1))
 
@@ -143,7 +150,7 @@ class TestSessionTokenShare(CustomTestCase):
         # array, then output trimmed to finished_len (like _trim_overshoot)
         # before finish.
         r1.output_ids.extend([1, 2, 3, 4, 5, 6])
-        r1._refresh_fill_ids()
+        r1.refresh_fill_ids()
         del r1.output_ids[4:]
         self.session.finish_req(r1)
         self.assertEqual(
@@ -155,7 +162,7 @@ class TestSessionTokenShare(CustomTestCase):
         r2 = self._create("r2", [50])
         self.assertEqual(list(r2.origin_input_ids), in1 + [1, 2, 3, 4] + [50])
         self.assertEqual(len(r2.full_untruncated_fill_ids), 0)  # carry skipped
-        r2._refresh_fill_ids()
+        r2.refresh_fill_ids()
         self.assertEqual(list(r2.full_untruncated_fill_ids), list(r2.origin_input_ids))
 
 

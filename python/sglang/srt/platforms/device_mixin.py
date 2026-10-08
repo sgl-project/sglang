@@ -27,6 +27,9 @@ Method status annotations:
 
 import enum
 import random
+from collections.abc import Iterator
+from contextlib import contextmanager
+from functools import cached_property
 from typing import NamedTuple, Optional
 
 import numpy as np
@@ -159,6 +162,15 @@ class DeviceMixin:
         """[Active] Get current peak memory usage in bytes."""
         raise NotImplementedError
 
+    def is_pin_memory_available(self, device=None) -> bool:
+        """[Active] Whether pinned host memory is available for a target device."""
+        return False
+
+    @contextmanager
+    def reindex_device_id(self, device_id: int) -> Iterator[int]:
+        """[Active] Temporarily remap a physical device to logical device 0."""
+        yield device_id
+
     # ------------------------------------------------------------------
     # Planned methods — reserved interface.  Core still uses hardcoded
     # calls (e.g. torch.cuda.*).  OOT implementations will NOT take
@@ -235,6 +247,10 @@ class DeviceMixin:
         """[Planned] Validate that a quantization method is supported. No-op by default."""
         pass
 
+    @cached_property
+    def cpu_arch(self) -> "CpuArchEnum":
+        return self.get_cpu_architecture()
+
     @classmethod
     def get_cpu_architecture(cls) -> "CpuArchEnum":
         """[Planned] Detect CPU architecture."""
@@ -246,6 +262,14 @@ class DeviceMixin:
         elif machine in ("arm64", "aarch64"):
             return CpuArchEnum.ARM
         return CpuArchEnum.UNSPECIFIED
+
+    def get_torch_profiler_activity_str(self) -> str:
+        """[Planned] Return the torch profiler activity string."""
+        raise NotImplementedError
+
+    def get_torch_profiler_activity(self) -> torch.profiler.ProfilerActivity:
+        """[Planned] Return the torch profiler activity."""
+        raise NotImplementedError
 
     # ------------------------------------------------------------------
     # Dunder helpers

@@ -11,7 +11,6 @@ import sys
 import time
 import traceback
 import urllib.request
-import warnings
 import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -30,17 +29,6 @@ from tqdm import tqdm
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
-
-KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
-    "lerobot/pi05": "Pi05Pipeline",
-    "lerobot--pi05": "Pi05Pipeline",
-    "pi05": "Pi05Pipeline",
-    "pi0.5": "Pi05Pipeline",
-    "hunyuan3d": "Hunyuan3D2Pipeline",
-    "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
-    "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
-    "comfy-org--ideogram-4": "Ideogram4Nvfp4Pipeline",
-}
 
 
 def load_diffusion_overlay_registry_from_env() -> dict[str, dict[str, Any]]:
@@ -78,14 +66,6 @@ def has_diffusion_overlay_registry_match(
         return False
     base_name = os.path.basename(os.path.normpath(model_path))
     return any(base_name == key.rsplit("/", 1)[-1] for key in registry)
-
-
-def is_known_non_diffusers_diffusion_model(model_path: str) -> bool:
-    model_path_lower = model_path.lower()
-    return any(
-        pattern in model_path_lower
-        for pattern in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
-    )
 
 
 def execute_once(func):
@@ -181,14 +161,6 @@ def dump_state_text(filename: str, states: list, mode: str = "w"):
 def normalize_base_url(host: str, port: int) -> str:
     from sglang.srt.utils.network import NetworkAddress
 
-    if host.startswith("http://") or host.startswith("https://"):
-        warnings.warn(
-            f"Including the scheme in --host ('{host}') is deprecated. "
-            f"Pass just the hostname (e.g. '127.0.0.1') instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return f"{host}:{port}"
     return NetworkAddress(host, port).to_url()
 
 

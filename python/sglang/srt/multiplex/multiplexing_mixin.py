@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 from torch.cuda.streams import ExternalStream
 
-from sglang.srt.distributed.parallel_state import set_pdmux_status
+from sglang.srt.distributed.parallel_state import pdmux_prefill_tp_group
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.pdmux_context import (
     get_current_stream_idx,
@@ -21,6 +21,7 @@ from sglang.srt.multiplex.pdmux_context import (
     load_pdmux_config,
     set_current_stream_idx,
 )
+from sglang.srt.runtime_context import get_device, get_disagg, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -30,14 +31,13 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerMultiplexMixin:
-
     def init_pdmux(self: Scheduler):
         # The current split prefill batch
         self.split_prefill_batch: Optional[ScheduleBatch] = None
 
         # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
-        self.pdmux_config = load_pdmux_config(self.server_args.pdmux_config_path)
-        initialize_stream_groups(self.gpu_id, self.pdmux_config)
+        self.pdmux_config = load_pdmux_config(get_disagg().pdmux_config_path)
+        initialize_stream_groups(get_device().gpu_id, self.pdmux_config)
         self.stream_groups = get_stream_groups()
         self.sm_counts = get_sm_counts()
         self.real_sm_group_num = len(self.stream_groups)
@@ -47,10 +47,10 @@ class SchedulerMultiplexMixin:
 
     # TODO(jason-fxz): This is a temporary demo
     def adjust_stream_groups(
-        self: Scheduler,
+        self: Scheduler, running_batch: ScheduleBatch
     ) -> tuple[int, tuple[ExternalStream, ExternalStream]]:
-        if not self.running_batch.is_empty() and self.split_prefill_batch:
-            decode_bs = self.running_batch.batch_size()
+        if not running_batch.is_empty() and self.split_prefill_batch:
+            decode_bs = running_batch.batch_size()
             manual_divisions = self.pdmux_config.manual_divisions
             if manual_divisions:
                 for i in range(len(manual_divisions)):
@@ -68,7 +68,7 @@ class SchedulerMultiplexMixin:
                     ),
                 )
             set_current_stream_idx(stream_idx)
-        elif not self.running_batch.is_empty():
+        elif not running_batch.is_empty():
             set_current_stream_idx(self.real_sm_group_num - 1)
         else:
             set_current_stream_idx(0)
@@ -78,21 +78,23 @@ class SchedulerMultiplexMixin:
         self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
         return stream_idx, self.stream_groups[stream_idx]
 
-    def update_split_prefill_batch(self: Scheduler, sm_count: int) -> bool:
+    def update_split_prefill_batch(
+        self: Scheduler, sm_count: int, running_batch: ScheduleBatch
+    ) -> tuple[bool, ScheduleBatch]:
         if self.split_prefill_batch:
-            return False
+            return False, running_batch
 
         # add new request
-        prefill_plan = self.get_new_batch_prefill(self.running_batch)
+        prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
-        self.running_batch = prefill_plan.running_batch
+        running_batch = prefill_plan.running_batch
         if batch and not batch.is_empty():
             batch.forward_mode = (
                 ForwardMode.SPLIT_PREFILL
             )  # Set forward mode for split prefill
             self.split_prefill_batch = batch
-            return True
-        return False
+            return True, running_batch
+        return False, running_batch
 
     @torch.inference_mode()
     def event_loop_pdmux(self: Scheduler):
@@ -111,31 +113,34 @@ class SchedulerMultiplexMixin:
 
         while True:
             with torch.cuda.stream(decode_stream):
-                set_pdmux_status(False)
-                recv_reqs = self.request_receiver.recv_requests()
-                self.process_input_requests(recv_reqs)
+                self.ingest_requests()
+                running_batch = self.running_batch
 
-            with torch.cuda.stream(prefill_stream):
-                set_pdmux_status(True)
+            with torch.cuda.stream(prefill_stream), pdmux_prefill_tp_group():
                 sm_count = self.sm_counts[stream_idx][0]
                 if not wait_prefill_kernel_done:
-                    adjust_stream_group = (
-                        self.update_split_prefill_batch(sm_count) or adjust_stream_group
+                    created, running_batch = self.update_split_prefill_batch(
+                        sm_count, running_batch=running_batch
                     )
+                    self.running_batch = running_batch
+                    adjust_stream_group = created or adjust_stream_group
 
             with torch.cuda.stream(decode_stream):
-                set_pdmux_status(False)
-                self.running_batch = self.update_running_batch(self.running_batch)
+                running_batch = self.update_running_batch(running_batch)
+                self.running_batch = running_batch
                 adjust_stream_group = adjust_stream_group or (
-                    stream_idx > 0 and self.running_batch.is_empty()
+                    stream_idx > 0 and running_batch.is_empty()
                 )
-                if self.running_batch.is_empty() and self.split_prefill_batch is None:
+                if running_batch.is_empty() and self.split_prefill_batch is None:
+                    self._sched_idled = True
                     self.on_idle()
 
             if adjust_stream_group:
                 prefill_stream.synchronize()
                 decode_stream.synchronize()
-                stream_idx, stream_group = self.adjust_stream_groups()
+                stream_idx, stream_group = self.adjust_stream_groups(
+                    running_batch=running_batch
+                )
                 prefill_stream = stream_group[0]
                 decode_stream = stream_group[1]
                 adjust_stream_group = False
@@ -144,15 +149,13 @@ class SchedulerMultiplexMixin:
                 )
 
             with torch.cuda.stream(decode_stream):
-                set_pdmux_status(False)
                 # process decode batch
-                if self.running_batch and not self.running_batch.is_empty():
-                    decode_result = self.run_batch(self.running_batch)
+                if running_batch and not running_batch.is_empty():
+                    decode_result = self.run_batch(running_batch)
                     decode_done = True
                 else:
                     decode_done = False
-            with torch.cuda.stream(prefill_stream):
-                set_pdmux_status(True)
+            with torch.cuda.stream(prefill_stream), pdmux_prefill_tp_group():
                 if (
                     self.split_prefill_batch
                     and not self.split_prefill_batch.is_empty()
@@ -189,13 +192,11 @@ class SchedulerMultiplexMixin:
                     prefill_done = False
 
             with torch.cuda.stream(decode_stream):
-                set_pdmux_status(False)
                 decode_stream.synchronize()
                 if decode_done:
-                    self.process_batch_result(self.running_batch, decode_result)
+                    self.process_batch_result(running_batch, decode_result)
 
-            with torch.cuda.stream(prefill_stream):
-                set_pdmux_status(True)
+            with torch.cuda.stream(prefill_stream), pdmux_prefill_tp_group():
                 if prefill_done and self.split_prefill_batch.split_prefill_finished:
                     wait_prefill_kernel_done = True
                     prefill_exe_done_flag = prefill_exe_done.query()
@@ -206,14 +207,15 @@ class SchedulerMultiplexMixin:
                     )
 
                     self.tp_cpu_group.allreduce(flags, dist.ReduceOp.SUM).wait()
-                    if flags.item() == self.tp_size:
+                    if flags.item() == get_parallel().tp_size:
                         self.process_batch_result(
                             self.split_prefill_batch, prefill_result
                         )
-                        if self.running_batch and not self.running_batch.is_empty():
-                            self.running_batch.merge_batch(self.split_prefill_batch)
+                        if running_batch and not running_batch.is_empty():
+                            running_batch.merge_batch(self.split_prefill_batch)
                         else:
-                            self.running_batch = self.split_prefill_batch
+                            running_batch = self.split_prefill_batch
+                        self.running_batch = running_batch
 
                         self.split_prefill_batch = None
                         wait_prefill_kernel_done = False

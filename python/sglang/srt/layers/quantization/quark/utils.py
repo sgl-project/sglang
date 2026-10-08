@@ -2,8 +2,18 @@
 
 import re
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Optional
+
+
+@dataclass
+class Nvfp4SourceConfig:
+    """Dispatch marker for online NVFP4 -> MXFP4 re-quantization, carried on
+    `QuarkConfig.dequantization_config` to represent an NVFP4 source
+    Only ModelOpt / AMD Quark NVFP4 (per-tensor `weight_scale_2`
+    that multiplies the per-block scale) is supported."""
+
 
 import torch
 
@@ -45,6 +55,19 @@ def should_ignore_layer(
     # proj_name = qkv_proj
     proj_name = layer_name.split(".")[-1]
 
+    # a fused module can be excluded under its fused name, so match it before expanding
+    if check_equal_or_regex_match(layer_name=layer_name, targets=ignore):
+        return True
+
+    # excludes may name experts individually, so an excluded expert excludes the module
+    if layer_name.endswith(".experts"):
+        expert_prefix = layer_name + "."
+        if any(
+            isinstance(target, str) and target.startswith(expert_prefix)
+            for target in ignore
+        ):
+            return True
+
     # Fused layers like gate_up_proj or qkv_proj will not be fused
     # in the safetensors checkpoint. So, we convert the name
     # from the fused version to unfused + check to make sure that
@@ -77,12 +100,9 @@ def should_ignore_layer(
                     "requires all to use the same scheme."
                 )
 
-    # Unfused layers like down_proj and o_proj will match
-    # the safetensors checkpoint already.
+    # an unfused name was already tried by the direct check above
     else:
-        should_ignore_layer = check_equal_or_regex_match(
-            layer_name=layer_name, targets=ignore
-        )
+        should_ignore_layer = False
 
     assert should_ignore_layer is not None
 
@@ -206,5 +226,9 @@ def quark_post_load_weights(self_attn: nn.Module, w: torch.Tensor, quant_format:
             w_vc, w_s_vc = b_dynamic_mxfp4_quant(w_vc)
             w_s_kc = w_s_kc.transpose(1, 2).contiguous().transpose(1, 2)
             w_s_vc = w_s_vc.contiguous().transpose(1, 2)
+        else:
+            raise ValueError(
+                f"Unexpected w.dtype: {w.dtype} (should be bfloat16 or uint8)"
+            )
 
         return w_kc, w_s_kc, w_vc, w_s_vc

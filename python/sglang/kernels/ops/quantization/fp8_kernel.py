@@ -12,91 +12,67 @@
 # limitations under the License.
 # ==============================================================================
 
-import functools
-import json
 import logging
-import os
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
-try:
-    from triton.tools.tensor_descriptor import TensorDescriptor
-except:
-    pass
-
-from sglang.jit_kernel.utils import is_arch_support_pdl
-from sglang.srt.environ import envs
-from sglang.srt.layers import deep_gemm_wrapper
+from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
 from sglang.srt.utils import (
     ceil_align,
     get_bool_env_var,
-    get_device_core_count,
-    get_device_name,
     is_cpu,
     is_cuda,
+    is_gfx1250_supported,
     is_hip,
     is_musa,
-    is_sm100_supported,
-    is_sm120_supported,
-    log_info_on_rank0,
+    is_xpu,
 )
-from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_musa = is_musa()
-_is_sm100_supported = is_sm100_supported()
-_is_sm120_supported = is_sm120_supported()
+_is_gfx1250 = is_gfx1250_supported()
+_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_cuda or _is_musa:
-    from sglang.jit_kernel.per_tensor_quant_fp8 import (
+if _is_cuda:
+    from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
+    from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
-    from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
+    from sglang.kernels.ops.quantization.per_token_group_quant import (
+        per_token_group_quant,
+    )
+elif _is_xpu:
+    from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
 
-    # Temporary
+if _is_musa:
+    from sgl_kernel import sgl_per_token_quant_fp8
+
+    from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
+        per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
+    )
+
+if _is_musa:
+    # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
+    from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
+
+if _is_hip and _use_aiter:
     try:
-        from sgl_kernel import sgl_per_token_group_quant_8bit
-
-        enable_sgl_per_token_group_quant_8bit = True
+        from aiter import (  # v0.1.3
+            dynamic_per_tensor_quant,
+            dynamic_per_token_scaled_quant,
+            static_per_tensor_quant,
+        )
     except ImportError:
-        from sgl_kernel import sgl_per_token_group_quant_fp8
-
-        enable_sgl_per_token_group_quant_8bit = False
-
-    from sglang.jit_kernel.per_token_group_quant_8bit import (
-        per_token_group_quant_8bit as sgl_per_token_group_quant_8bit_jit,
-    )
-    from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
-        per_token_group_quant_8bit_v2 as sgl_per_token_group_quant_8bit_jit_v2,
-    )
-
-if _is_hip:
-    _has_vllm = False
-    if _use_aiter:
-        try:
-            from aiter import (  # v0.1.3
-                dynamic_per_tensor_quant,
-                dynamic_per_token_scaled_quant,
-                static_per_tensor_quant,
-            )
-        except ImportError:
-            raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
-    else:
-        try:
-            import vllm._C  # noqa: F401
-
-            _has_vllm = True
-        except ImportError:
-            # Fallback: vllm not available, will use native PyTorch implementation
-            _has_vllm = False
+        raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 
 if _is_musa:
 
@@ -134,28 +110,6 @@ else:
     fp8_dtype = torch.float8_e4m3fn
     fp8_max = torch.finfo(fp8_dtype).max
 fp8_min = -fp8_max
-
-
-@register_custom_op(mutates_args=["C"])
-def deep_gemm_fp8_fp8_bf16_nt(
-    A: torch.Tensor,
-    As: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    C: torch.Tensor,
-) -> None:
-    deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
-
-
-@register_custom_op(mutates_args=["C"])
-def deep_gemm_mxfp8_fp8_bf16_nt(
-    A: torch.Tensor,
-    As: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    C: torch.Tensor,
-) -> None:
-    deep_gemm_wrapper.gemm_nt_mxfp8_f8f8bf16((A, As), (B, Bs), C)
 
 
 @triton.jit
@@ -260,6 +214,9 @@ def _per_token_group_quant_8bit_raw(
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
+    *,
+    output_q: Optional[torch.Tensor] = None,
+    output_s: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Function to perform per-token-group quantization on an input tensor `x`.
 
@@ -275,16 +232,19 @@ def _per_token_group_quant_8bit_raw(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
     """
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, (
+        "the last dimension of `x` cannot be divisible by `group_size`"
+    )
     assert x.is_contiguous(), "`x` is not contiguous"
 
     if _is_hip:
         if dtype == torch.int8:
             bit8_max = 127.0
         else:
-            bit8_max = 224.0
+            # fp8 range is device-dependent on ROCm: e4m3fnuz (max 224.0) on
+            # gfx94x vs e4m3fn (max 448.0) on gfx95x. Use the device-resolved
+            # module constant instead of hardcoding the gfx94x value.
+            bit8_max = fp8_max
         bit8_min = -bit8_max  # TODO incorrect for int8
     else:
         if dtype == torch.int8:
@@ -294,14 +254,22 @@ def _per_token_group_quant_8bit_raw(
         bit8_max = info.max
         bit8_min = info.min
 
-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
-        x_shape=x.shape,
-        device=x.device,
-        group_size=group_size,
-        column_major_scales=column_major_scales,
-        scale_tma_aligned=scale_tma_aligned,
-        scale_ue8m0=False,
+    x_q = (
+        output_q
+        if output_q is not None
+        else torch.empty_like(x, device=x.device, dtype=dtype)
+    )
+    x_s = (
+        output_s
+        if output_s is not None
+        else create_per_token_group_quant_fp8_output_scale(
+            x_shape=x.shape,
+            device=x.device,
+            group_size=group_size,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=False,
+        )
     )
 
     M = x.numel() // group_size
@@ -381,7 +349,7 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
 
     from deep_gemm import transform_sf_into_required_layout
 
-    from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
+    from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_post_quant_fwd
 
     assert column_major_scales
     assert scale_tma_aligned
@@ -501,11 +469,13 @@ def create_per_token_group_quant_fp8_output_scale(
             # TODO extract "align" function
             # aligned to 4 * sizeof(float)
             aligned_size = (x_shape[-2] + 3) // 4 * 4
+            # `...` so batched (e.g. masked [E, T, H]) shapes slice the token
+            # axis, not dim 0.
             return torch.empty(
                 x_shape[:-2] + (x_shape[-1] // group_size, aligned_size),
                 device=device,
                 dtype=torch.float32,
-            ).transpose(-1, -2)[: x_shape[-2], :]
+            ).transpose(-1, -2)[..., : x_shape[-2], :]
         else:
             return torch.empty(
                 (x_shape[-1] // group_size,) + x_shape[:-1],
@@ -520,7 +490,10 @@ def create_per_token_group_quant_fp8_output_scale(
         )
 
 
-_V2_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128)
+# AOT v2 (the MUSA path) runtime-switches on these; the JIT
+# per_token_group_quant kernel also templates on 256.
+_MUSA_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128)
+_V3_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256)
 
 
 def _run_per_token_group_quant_8bit_kernel(
@@ -532,50 +505,42 @@ def _run_per_token_group_quant_8bit_kernel(
     fp8_min: float,
     fp8_max: float,
     *,
-    column_major_scales: bool,
     scale_ue8m0: bool,
     fuse_silu_and_mul: bool,
     masked_m: Optional[torch.Tensor],
-    enable_v2: Optional[bool],
 ) -> None:
-    # V1 JIT (.cuh) is byte-identical to V2 but CUDA-only and col-major-UE8M0-only;
-    # gate it to opt-in plain-2D non-MUSA calls, else fall back to V2 / AOT v1.
-    if enable_v2 is None:
-        enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES or _is_musa
+    """Quantize into caller-owned ``x_q`` / ``x_s``.
 
-    use_jit_per_token_group_v1_quant = (
-        envs.SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT.get()
-        and enable_v2
-        and not _is_musa
-        and not fuse_silu_and_mul
-        and masked_m is None
-        and x.dim() == 2
-        and group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES
-        and not (scale_ue8m0 and not column_major_scales)
-    )
+    CUDA routes to the JIT per_token_group_quant kernel; MUSA stays on the AOT
+    v2 op (the JIT kernel is CUDA-only), and the fp32-pow-2 storage flavor of
+    row-major UE8M0 (float32 ``x_s``, deep_gemm ``ceil_to_ue8m0`` convention)
+    stays on the JIT v2 baseline — per_token_group_quant only packs UE8M0 as
+    int32. The kernel bakes the quant constants in at compile time, so
+    drifted constants are rejected loudly here instead of silently quantizing
+    with different ones; unsupported shapes/layouts error inside its host
+    checks. Whole-row (per-token) quantization is a different op:
+    ``sglang_per_token_quant_fp8``.
+    """
+    if scale_ue8m0 and x_s.dtype == torch.float32 and not _is_musa:
+        from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
+            per_token_group_quant_8bit_v2,
+        )
 
-    if use_jit_per_token_group_v1_quant:
-        sgl_per_token_group_quant_8bit_jit(
+        per_token_group_quant_8bit_v2(
             input=x,
             output_q=x_q,
             output_s=x_s,
             group_size=group_size,
             eps=eps,
-            fp8_min=fp8_min,
-            fp8_max=fp8_max,
+            min_8bit=fp8_min,
+            max_8bit=fp8_max,
             scale_ue8m0=scale_ue8m0,
+            fuse_silu_and_mul=fuse_silu_and_mul,
+            masked_m=masked_m,
         )
         return
 
-    if not enable_sgl_per_token_group_quant_8bit:
-        assert not enable_v2
-        sgl_per_token_group_quant_fp8(
-            x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
-        )
-        return
-
-    if enable_v2 and _is_musa:
-        # JIT v2 .cuh is CUDA-only (no MUSA fallback); AOT v2 carries the USE_MUSA path.
+    if _is_musa:
         sgl_per_token_group_quant_8bit(
             x,
             x_q,
@@ -589,34 +554,25 @@ def _run_per_token_group_quant_8bit_kernel(
             masked_m,
             enable_v2=True,
         )
-    elif enable_v2:
-        sgl_per_token_group_quant_8bit_jit_v2(
-            x,
-            x_q,
-            x_s,
-            group_size,
-            eps,
-            fp8_min,
-            fp8_max,
-            scale_ue8m0=scale_ue8m0,
-            fuse_silu_and_mul=fuse_silu_and_mul,
-            masked_m=masked_m,
-        )
-    else:
-        # JIT kernels static_assert on group_size in {16,32,64,128}; keep AOT v1 otherwise.
-        sgl_per_token_group_quant_8bit(
-            x,
-            x_q,
-            x_s,
-            group_size,
-            eps,
-            fp8_min,
-            fp8_max,
-            scale_ue8m0,
-            fuse_silu_and_mul,
-            masked_m,
-            enable_v2=enable_v2,
-        )
+        return
+
+    assert eps == 1e-10, (
+        f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
+    )
+    expected_range = (-448.0, 448.0) if x_q.dtype == fp8_dtype else (-128.0, 127.0)
+    assert (fp8_min, fp8_max) == expected_range, (
+        f"per_token_group_quant bakes the {x_q.dtype} quant range in at {expected_range}, "
+        f"got ({fp8_min}, {fp8_max})"
+    )
+    per_token_group_quant(
+        x,
+        x_q,
+        x_s,
+        group_size,
+        scale_ue8m0=scale_ue8m0,
+        fuse_silu_and_mul=fuse_silu_and_mul,
+        masked_m=masked_m,
+    )
 
 
 def sglang_per_token_group_quant_fp8(
@@ -628,23 +584,52 @@ def sglang_per_token_group_quant_fp8(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
-    enable_v2: Optional[bool] = None,
+    *,
+    output_q: Optional[torch.Tensor] = None,
+    output_s: Optional[torch.Tensor] = None,
 ):
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, (
+        "the last dimension of `x` cannot be divisible by `group_size`"
+    )
     assert x.is_contiguous(), "`x` is not contiguous"
+
+    if (
+        group_size == x.shape[-1]
+        and x.dim() == 2
+        and not (column_major_scales or scale_ue8m0 or fuse_silu_and_mul)
+        and masked_m is None
+    ):
+        # Whole-row group quant is per-token quant; route to the dedicated
+        # kernel (same [T, 1] scale shape) instead of a group kernel that
+        # would need arbitrary group sizes.
+        if output_q is not None and output_q.dtype != fp8_dtype:
+            return _per_token_group_quant_8bit_raw(
+                x,
+                group_size,
+                dtype=output_q.dtype,
+                output_q=output_q,
+                output_s=output_s,
+            )
+        return sglang_per_token_quant_fp8(x, output_q=output_q, output_s=output_s)
 
     out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
 
-    x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
-        x_shape=out_shape,
-        device=x.device,
-        group_size=group_size,
-        column_major_scales=column_major_scales,
-        scale_tma_aligned=scale_tma_aligned,
-        scale_ue8m0=scale_ue8m0,
+    x_q = (
+        output_q
+        if output_q is not None
+        else torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
+    )
+    x_s = (
+        output_s
+        if output_s is not None
+        else create_per_token_group_quant_fp8_output_scale(
+            x_shape=out_shape,
+            device=x.device,
+            group_size=group_size,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=scale_ue8m0,
+        )
     )
 
     if x.shape[0] > 0:
@@ -656,11 +641,9 @@ def sglang_per_token_group_quant_fp8(
             eps,
             fp8_min,
             fp8_max,
-            column_major_scales=column_major_scales,
             scale_ue8m0=scale_ue8m0,
             fuse_silu_and_mul=fuse_silu_and_mul,
             masked_m=masked_m,
-            enable_v2=enable_v2,
         )
 
     return x_q, x_s
@@ -683,14 +666,18 @@ def sglang_per_token_group_quant_fp8_row_padded(
     bit-exact; the caller still slices the GEMM output back to m.
     """
     assert x.dim() == 2, "row-padded quant expects a 2D input"
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` must be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, (
+        "the last dimension of `x` must be divisible by `group_size`"
+    )
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    if not (enable_sgl_per_token_group_quant_8bit and group_size in (16, 32, 64, 128)):
-        # No v2 kernel available: keep the legacy unpadded path and let the
-        # GEMM wrapper do the padding.
+    supported_group_sizes = (
+        _MUSA_KERNEL_SUPPORTED_GROUP_SIZES
+        if _is_musa
+        else _V3_KERNEL_SUPPORTED_GROUP_SIZES
+    )
+    if group_size not in supported_group_sizes:
+        # Keep the legacy unpadded path and let the GEMM wrapper do the padding.
         return sglang_per_token_group_quant_fp8(
             x, group_size, eps, column_major_scales=True
         )
@@ -704,32 +691,18 @@ def sglang_per_token_group_quant_fp8_row_padded(
         (k // group_size, m_pad), device=x.device, dtype=torch.float32
     ).transpose(0, 1)
     if m > 0:
-        # V1 JIT (.cuh) is CUDA-only; MUSA must stay on the AOT v2 op below.
-        if envs.SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT.get() and not _is_musa:
-            sgl_per_token_group_quant_8bit_jit(
-                input=x,
-                output_q=x_q[:m],
-                output_s=x_s[:m],
-                group_size=group_size,
-                eps=eps,
-                fp8_min=fp8_min,
-                fp8_max=fp8_max,
-                scale_ue8m0=False,
-            )
-        else:
-            sgl_per_token_group_quant_8bit(
-                x,
-                x_q[:m],
-                x_s[:m],
-                group_size,
-                eps,
-                fp8_min,
-                fp8_max,
-                False,  # scale_ue8m0
-                False,  # fuse_silu_and_mul
-                None,  # masked_m
-                enable_v2=True,
-            )
+        _run_per_token_group_quant_8bit_kernel(
+            x,
+            x_q[:m],
+            x_s[:m],
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            scale_ue8m0=False,
+            fuse_silu_and_mul=False,
+            masked_m=None,
+        )
     if m_pad != m:
         # Tail rows feed the cutlass GEMM's padded region; zero them so the padded
         # GEMM stays bit-exact with the legacy pad_tensor path (torch.empty is garbage).
@@ -743,14 +716,10 @@ def sglang_per_token_group_quant_fp8_ue8m0(
     group_size: int,
     eps: float = 1e-10,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert (
-        x.shape[-1] % group_size == 0
-    ), f"hidden ({x.shape[-1]}) must be divisible by group_size ({group_size})"
-    assert x.is_contiguous(), "x must be contiguous"
-    assert enable_sgl_per_token_group_quant_8bit, (
-        "sgl_per_token_group_quant_8bit is required (v2 kernel supports "
-        "group_size in {16, 32, 64, 128})"
+    assert x.shape[-1] % group_size == 0, (
+        f"hidden ({x.shape[-1]}) must be divisible by group_size ({group_size})"
     )
+    assert x.is_contiguous(), "x must be contiguous"
 
     *x_batch, x_q_mn, x_q_k = x.shape
     x_q = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
@@ -766,7 +735,7 @@ def sglang_per_token_group_quant_fp8_ue8m0(
     ).transpose(-1, -2)[..., :x_s_mn, :]
 
     if x.shape[0] > 0:
-        sgl_per_token_group_quant_8bit(
+        _run_per_token_group_quant_8bit_kernel(
             x,
             x_q,
             x_s,
@@ -774,10 +743,9 @@ def sglang_per_token_group_quant_fp8_ue8m0(
             eps,
             fp8_min,
             fp8_max,
-            True,  # scale_ue8m0
-            False,  # fuse_silu_and_mul
-            None,  # masked_m
-            enable_v2=True,
+            scale_ue8m0=True,
+            fuse_silu_and_mul=False,
+            masked_m=None,
         )
 
     return x_q, x_s
@@ -794,7 +762,6 @@ def sglang_per_token_group_quant_8bit(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
-    enable_v2: Optional[bool] = None,
 ):
     from sglang.kernels.ops.quantization.int8_kernel import (
         sglang_per_token_group_quant_int8,
@@ -810,7 +777,6 @@ def sglang_per_token_group_quant_8bit(
             group_size=group_size,
             eps=eps,
             dtype=dst_dtype,
-            enable_v2=enable_v2,
         )
 
     return sglang_per_token_group_quant_fp8(
@@ -822,22 +788,32 @@ def sglang_per_token_group_quant_8bit(
         scale_ue8m0=scale_ue8m0,
         fuse_silu_and_mul=fuse_silu_and_mul,
         masked_m=masked_m,
-        enable_v2=enable_v2,
     )
 
 
 def sglang_per_token_quant_fp8(
     x: torch.Tensor,
     dtype: torch.dtype = fp8_dtype,
+    *,
+    output_q: Optional[torch.Tensor] = None,
+    output_s: Optional[torch.Tensor] = None,
 ):
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
-    x_s = torch.empty(
-        x.shape[0],
-        1,
-        device=x.device,
-        dtype=torch.float32,
+    x_q = (
+        output_q
+        if output_q is not None
+        else torch.empty_like(x, device=x.device, dtype=dtype)
+    )
+    x_s = (
+        output_s
+        if output_s is not None
+        else torch.empty(
+            x.shape[0],
+            1,
+            device=x.device,
+            dtype=torch.float32,
+        )
     )
 
     sgl_per_token_quant_fp8(x, x_q, x_s)
@@ -867,6 +843,7 @@ def _static_quant_fp8(
     fp8_max,
     # Meta-parameters
     BLOCK: tl.constexpr,
+    FP8_DTYPE: tl.constexpr,
     REPEAT_SCALE: tl.constexpr,
     USE_PDL: tl.constexpr = False,
 ):
@@ -895,9 +872,9 @@ def _static_quant_fp8(
         tl.extra.cuda.gdc_launch_dependents()
 
     y_s_inv = 1.0 / y_s
-    y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(FP8_DTYPE)
 
-    tl.store(y_q_ptr + cols, y_q, mask=mask)
+    tl.store(y_q_ptr + cols, y_q.to(tl.uint8, bitcast=True), mask=mask)
     if REPEAT_SCALE:
         tl.store(y_s_repeat_ptr, y_s)
 
@@ -943,7 +920,7 @@ def static_quant_fp8(
     pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     _static_quant_fp8[(M,)](
         x,
-        x_q,
+        x_q.view(torch.uint8),
         x_s,
         x_s_repeat,
         N,
@@ -951,6 +928,7 @@ def static_quant_fp8(
         fp8_min=fp8_min,
         fp8_max=fp8_max,
         BLOCK=BLOCK,
+        FP8_DTYPE=fp8_dtype_to_triton(fp8_dtype),
         REPEAT_SCALE=repeat_scale,
         num_warps=num_warps,
         num_stages=num_stages,
@@ -960,749 +938,7 @@ def static_quant_fp8(
     return x_q, x_s
 
 
-@triton.jit
-def _w8a8_block_fp8_matmul(
-    # Pointers to inputs and output
-    A,
-    B,
-    C,
-    As,
-    Bs,
-    # Shape for matmul
-    M,
-    N,
-    K,
-    # Block size for block-wise quantization
-    group_n,
-    group_k,
-    # Stride for inputs and output
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    stride_As_m,
-    stride_As_k,
-    stride_Bs_k,
-    stride_Bs_n,
-    # Meta-parameters
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    needs_masking: tl.constexpr,
-):
-    """Triton-accelerated function used to perform linear operations (dot
-    product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
-    tensor `C`.
-    """
-
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-
-    As_ptrs = As + offs_am * stride_As_m
-    offs_bsn = offs_bn // group_n
-    Bs_ptrs = Bs + offs_bsn * stride_Bs_n
-    n_tiles_k_per_group_k = group_k // BLOCK_SIZE_K
-
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        if needs_masking:
-            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        else:
-            a = tl.load(a_ptrs)
-            b = tl.load(b_ptrs)
-
-        a_s = tl.load(As_ptrs)
-        b_s = tl.load(Bs_ptrs)
-
-        scale_step_k = tl.where((k + 1) % n_tiles_k_per_group_k == 0, 1, 0)
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-        As_ptrs += scale_step_k * stride_As_k
-        Bs_ptrs += scale_step_k * stride_Bs_k
-
-    if C.dtype.element_ty == tl.bfloat16:
-        c = accumulator.to(tl.bfloat16)
-    elif C.dtype.element_ty == tl.float16:
-        c = accumulator.to(tl.float16)
-    else:
-        c = accumulator.to(tl.float32)
-
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
-
-
-@triton.jit
-def _w8a8_block_fp8_matmul_unrolledx4(
-    # Pointers to inputs and output
-    A,
-    B,
-    C,
-    As,
-    Bs,
-    # Shape for matmul
-    M,
-    N,
-    K,
-    # Block size for block-wise quantization
-    group_n,
-    group_k,
-    # Stride for inputs and output
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    stride_As_m,
-    stride_As_k,
-    stride_Bs_k,
-    stride_Bs_n,
-    # Meta-parameters
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    needs_masking: tl.constexpr,
-):
-    """Triton-accelerated function used to perform linear operations (dot
-    product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
-    tensor `C`.
-    """
-
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-
-    As_ptrs = As + offs_am * stride_As_m
-    offs_bsn = offs_bn // group_n
-    Bs_ptrs = Bs + offs_bsn * stride_Bs_n
-    scale_step_k = BLOCK_SIZE_K // group_k
-
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    # manually unroll to 4 iterations
-    UNROLL_FACTOR = 4
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K * UNROLL_FACTOR)):
-        # 1st iteration
-        if needs_masking:
-            a = tl.load(
-                a_ptrs,
-                mask=offs_k[None, :] < K - (k * UNROLL_FACTOR) * BLOCK_SIZE_K,
-                other=0.0,
-            )
-            b = tl.load(
-                b_ptrs,
-                mask=offs_k[:, None] < K - (k * UNROLL_FACTOR) * BLOCK_SIZE_K,
-                other=0.0,
-            )
-        else:
-            a = tl.load(a_ptrs)
-            b = tl.load(b_ptrs)
-
-        a_s = tl.load(As_ptrs)
-        b_s = tl.load(Bs_ptrs)
-
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-        As_ptrs += scale_step_k * stride_As_k
-        Bs_ptrs += scale_step_k * stride_Bs_k
-
-        # 2nd iteration
-        if needs_masking:
-            a = tl.load(
-                a_ptrs,
-                mask=offs_k[None, :] < K - (k * UNROLL_FACTOR + 1) * BLOCK_SIZE_K,
-                other=0.0,
-            )
-            b = tl.load(
-                b_ptrs,
-                mask=offs_k[:, None] < K - (k * UNROLL_FACTOR + 1) * BLOCK_SIZE_K,
-                other=0.0,
-            )
-        else:
-            a = tl.load(a_ptrs)
-            b = tl.load(b_ptrs)
-
-        a_s = tl.load(As_ptrs)
-        b_s = tl.load(Bs_ptrs)
-
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-        As_ptrs += scale_step_k * stride_As_k
-        Bs_ptrs += scale_step_k * stride_Bs_k
-
-        # 3rd iteration
-        if needs_masking:
-            a = tl.load(
-                a_ptrs,
-                mask=offs_k[None, :] < K - (k * UNROLL_FACTOR + 2) * BLOCK_SIZE_K,
-                other=0.0,
-            )
-            b = tl.load(
-                b_ptrs,
-                mask=offs_k[:, None] < K - (k * UNROLL_FACTOR + 2) * BLOCK_SIZE_K,
-                other=0.0,
-            )
-        else:
-            a = tl.load(a_ptrs)
-            b = tl.load(b_ptrs)
-
-        a_s = tl.load(As_ptrs)
-        b_s = tl.load(Bs_ptrs)
-
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-        As_ptrs += scale_step_k * stride_As_k
-        Bs_ptrs += scale_step_k * stride_Bs_k
-
-        # 4th iteration
-        if needs_masking:
-            a = tl.load(
-                a_ptrs,
-                mask=offs_k[None, :] < K - (k * UNROLL_FACTOR + 3) * BLOCK_SIZE_K,
-                other=0.0,
-            )
-            b = tl.load(
-                b_ptrs,
-                mask=offs_k[:, None] < K - (k * UNROLL_FACTOR + 3) * BLOCK_SIZE_K,
-                other=0.0,
-            )
-        else:
-            a = tl.load(a_ptrs)
-            b = tl.load(b_ptrs)
-
-        a_s = tl.load(As_ptrs)
-        b_s = tl.load(Bs_ptrs)
-
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-        As_ptrs += scale_step_k * stride_As_k
-        Bs_ptrs += scale_step_k * stride_Bs_k
-
-    if C.dtype.element_ty == tl.bfloat16:
-        c = accumulator.to(tl.bfloat16)
-    elif C.dtype.element_ty == tl.float16:
-        c = accumulator.to(tl.float16)
-    else:
-        c = accumulator.to(tl.float32)
-
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
-
-
-@functools.lru_cache
-def get_w8a8_block_fp8_configs(
-    N: int, K: int, block_n: int, block_k: int
-) -> Optional[Dict[int, Any]]:
-    """
-    Return optimized configurations for the w8a8 block fp8 kernel.
-
-    The return value will be a dictionary that maps an irregular grid of
-    batch sizes to configurations of the w8a8 block fp8 kernel. To evaluate the
-    kernel on a given batch size bs, the closest batch size in the grid should
-    be picked and the associated configuration chosen to invoke the kernel.
-    """
-
-    # Skip config lookup during torch.compile to avoid non-Tensor ops (e.g., device name).
-    # Returning None forces the caller to use the default config path during compile.
-    if torch._dynamo.is_compiling():
-        return None
-
-    # First look up if an optimized configuration is available in the configs
-    # directory
-    device_name = get_device_name().replace(" ", "_")
-    json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n}, {block_k}].json"
-
-    config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
-    )
-    if os.path.exists(config_file_path):
-        with open(config_file_path) as f:
-            log_info_on_rank0(
-                logger,
-                f"Using configuration from {config_file_path} for W8A8 Block FP8 kernel.",
-            )
-            raw = {int(key): val for key, val in json.load(f).items()}
-
-        sanitized = {}
-        clamped_ms = []
-        for m_key, cfg in raw.items():
-            if cfg["BLOCK_SIZE_K"] < block_k and (
-                not _is_cuda or block_k % cfg["BLOCK_SIZE_K"] != 0
-            ):
-                clamped_ms.append((m_key, cfg["BLOCK_SIZE_K"]))
-                cfg = {**cfg, "BLOCK_SIZE_K": block_k}
-            sanitized[m_key] = cfg
-        if clamped_ms:
-            logger.warning(
-                "Clamped BLOCK_SIZE_K up to %d in tuned config %s for entries %s "
-                "(scale stepping requires BLOCK_SIZE_K >= block_k).",
-                block_k,
-                json_file_name,
-                clamped_ms,
-            )
-
-        return sanitized
-
-    # If no optimized configuration is available, we will use the default
-    # configuration
-    logger.warning(
-        (
-            "Using default W8A8 Block FP8 kernel config. Performance might be sub-optimal! "
-            "Config file not found at %s"
-        ),
-        config_file_path,
-    )
-    return None
-
-
-def select_w8a8_block_fp8_matmul_kernel(M, N, META):
-    return _w8a8_block_fp8_matmul
-
-
-if _is_hip:
-
-    def use_w8a8_block_fp8_matmul_unrolledx4(M, N, META):
-        # Use manually unrolledx4 kernel on AMD GPU when the grid size is small.
-        # Empirical testing shows the sweet spot lies when it's less than the # of
-        # compute units available on the device.
-        num_workgroups = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(
-            N, META["BLOCK_SIZE_N"]
-        )
-        num_workgroups <= get_device_core_count()
-
-    def select_w8a8_block_fp8_matmul_kernel(M, N, META):
-        if use_w8a8_block_fp8_matmul_unrolledx4(M, N, META):
-            return _w8a8_block_fp8_matmul_unrolledx4
-        else:
-            return _w8a8_block_fp8_matmul
-
-
-def prepare_block_fp8_matmul_inputs(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: torch.Tensor,
-    Bs: torch.Tensor,
-    block_size: List[int],
-    output_dtype: torch.dtype = torch.float16,
-) -> Tuple[int, int, int]:
-    assert len(block_size) == 2
-    block_n, block_k = block_size[0], block_size[1]
-
-    assert A.shape[-1] == B.shape[-1]
-    assert A.shape[:-1] == As.shape[:-1]
-    assert A.is_contiguous()
-
-    if As.dtype == torch.float:
-        assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
-    elif As.dtype == torch.int:
-        assert (
-            triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1]
-        ), f"{A.shape=} {As.shape=} {block_size=}"
-    else:
-        raise NotImplementedError
-
-    M = A.numel() // A.shape[-1]
-
-    assert B.ndim == 2
-    assert B.is_contiguous()
-    assert Bs.ndim == 2
-    N, K = B.shape
-
-    if Bs.dtype == torch.float:
-        assert triton.cdiv(N, block_n) == Bs.shape[0]
-        assert triton.cdiv(K, block_k) == Bs.shape[1]
-    elif Bs.dtype == torch.int:
-        assert N == Bs.shape[0], f"{B.shape=} {Bs.shape=} {block_size=}"
-        assert (
-            triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1]
-        ), f"{B.shape=} {Bs.shape=} {block_size=}"
-    else:
-        raise NotImplementedError
-
-    C_shape = A.shape[:-1] + (N,)
-    C = A.new_empty(C_shape, dtype=output_dtype)
-
-    return M, N, K, C
-
-
-def w8a8_block_fp8_matmul_deepgemm(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: torch.Tensor,
-    Bs: torch.Tensor,
-    block_size: List[int],
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-    M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
-
-    # Deepgemm only supports output tensor type as bfloat16
-    assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-
-    deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
-
-    return C
-
-
-def w8a8_mxfp8_matmul_deepgemm(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: torch.Tensor,
-    Bs: torch.Tensor,
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-    assert A.is_contiguous() and B.is_contiguous()
-    assert output_dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-
-    M = A.numel() // A.shape[-1]
-    N, K = B.shape
-    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
-
-    deep_gemm_mxfp8_fp8_bf16_nt(A, As, B, Bs, C)
-
-    return C
-
-
-def w8a8_block_fp8_matmul_triton(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: torch.Tensor,
-    Bs: torch.Tensor,
-    block_size: List[int],
-    output_dtype: torch.dtype = torch.float16,
-) -> torch.Tensor:
-    """This function performs matrix multiplication with block-wise quantization.
-
-    It takes two input tensors `A` and `B` with scales `As` and `Bs`.
-    The output is returned in the specified `output_dtype`.
-
-    Args:
-        A: The input tensor, e.g., activation.
-        B: The input tensor, e.g., weight.
-        As: The per-token-group quantization scale for `A`.
-        Bs: The per-block quantization scale for `B`.
-        block_size: The block size for per-block quantization. It should be 2-dim, e.g., [128, 128].
-        output_dytpe: The dtype of the returned tensor.
-
-    Returns:
-        torch.Tensor: The result of matmul.
-    """
-
-    M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
-
-    block_n, block_k = block_size
-
-    configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
-    if configs:
-        # If an optimal configuration map has been found, look up the
-        # optimal config
-        config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
-    else:
-        # Default config
-        # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
-        config = {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": block_size[0],
-            "BLOCK_SIZE_K": block_size[1],
-            "GROUP_SIZE_M": 32,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
-
-    needs_masking = bool(K % config["BLOCK_SIZE_K"] != 0)
-
-    def grid(META):
-        return (
-            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        )
-
-    kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
-
-    kernel[grid](
-        A,
-        B,
-        C,
-        As,
-        Bs,
-        M,
-        N,
-        K,
-        block_n,
-        block_k,
-        A.stride(-2),
-        A.stride(-1),
-        B.stride(1),
-        B.stride(0),
-        C.stride(-2),
-        C.stride(-1),
-        As.stride(-2),
-        As.stride(-1),
-        Bs.stride(1),
-        Bs.stride(0),
-        **config,
-        needs_masking=needs_masking,
-    )
-
-    return C
-
-
 # universal entry point, for testing purposes
-def w8a8_block_fp8_matmul(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: torch.Tensor,
-    Bs: torch.Tensor,
-    block_size: List[int],
-    output_dtype: torch.dtype = torch.float16,
-) -> torch.Tensor:
-    if output_dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-        return w8a8_block_fp8_matmul_deepgemm(
-            A, B, As, Bs, block_size, output_dtype=output_dtype
-        )
-
-    return w8a8_block_fp8_matmul_triton(
-        A, B, As, Bs, block_size, output_dtype=output_dtype
-    )
-
-
-# Copied and adapted from https://github.com/triton-lang/triton/blob/main/python/tutorials/10-block-scaled-matmul.py
-@triton.jit
-def _mxfp8_block_scaled_matmul_kernel(  #
-    a_desc,  #
-    a_scale_desc,  #
-    b_desc,  #
-    b_scale_desc,  #
-    c_desc,  #
-    M: tl.constexpr,  #
-    N: tl.constexpr,  #
-    K: tl.constexpr,  #
-    output_type: tl.constexpr,  #
-    BLOCK_M: tl.constexpr,  #
-    BLOCK_N: tl.constexpr,  #
-    BLOCK_K: tl.constexpr,  #
-    rep_m: tl.constexpr,  #
-    rep_n: tl.constexpr,  #
-    rep_k: tl.constexpr,  #
-    NUM_STAGES: tl.constexpr,  #
-):  #
-    if output_type == 0:
-        output_dtype = tl.float32
-    elif output_type == 1:
-        output_dtype = tl.float16
-    elif output_type == 2:
-        output_dtype = tl.bfloat16
-
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    pid_m = pid % num_pid_m
-    pid_n = pid // num_pid_m
-    offs_am = pid_m * BLOCK_M
-    offs_bn = pid_n * BLOCK_N
-    offs_k_a = 0
-    offs_k_b = 0
-    offs_scale_m = pid_m * rep_m
-    offs_scale_n = pid_n * rep_n
-    offs_scale_k = 0
-
-    VEC_SIZE: tl.constexpr = 32
-
-    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in tl.range(0, tl.cdiv(K, BLOCK_K), num_stages=NUM_STAGES):
-        a = a_desc.load([offs_am, offs_k_a])
-        b = b_desc.load([offs_bn, offs_k_b])
-        scale_a = a_scale_desc.load([0, offs_scale_m, offs_scale_k, 0, 0])
-        scale_b = b_scale_desc.load([0, offs_scale_n, offs_scale_k, 0, 0])
-
-        scale_a = (
-            scale_a.reshape(rep_m, rep_k, 32, 4, 4)
-            .trans(0, 3, 2, 1, 4)
-            .reshape(BLOCK_M, BLOCK_K // VEC_SIZE)
-        )
-        scale_b = (
-            scale_b.reshape(rep_n, rep_k, 32, 4, 4)
-            .trans(0, 3, 2, 1, 4)
-            .reshape(BLOCK_N, BLOCK_K // VEC_SIZE)
-        )
-
-        accumulator = tl.dot_scaled(
-            a, scale_a, "e4m3", b.T, scale_b, "e4m3", accumulator
-        )
-
-        offs_k_a += BLOCK_K
-        offs_k_b += BLOCK_K
-        offs_scale_k += rep_k
-
-    c_desc.store([offs_am, offs_bn], accumulator.to(output_dtype))
-
-
-# Copied and adapted from https://github.com/triton-lang/triton/blob/main/python/tutorials/10-block-scaled-matmul.py
-def mxfp8_block_scaled_matmul_triton(
-    a: torch.Tensor,
-    a_scale: torch.Tensor,
-    b: torch.Tensor,
-    b_scale: torch.Tensor,
-    output_dtype: torch.dtype,
-    *,
-    block_m: int = 128,
-    block_n: int = 256,
-    block_k: int = 128,
-    num_stages: Optional[int] = None,
-) -> torch.Tensor:
-    """Block-scaled matmul for MXFP8 using Triton dot_scaled.
-
-    Args:
-        num_stages: Number of pipeline stages. If None, auto-selects based on GPU:
-            SM120: 1, SM100: 4.
-    """
-    if num_stages is None:
-        num_stages = 1 if _is_sm120_supported else (4 if _is_sm100_supported else 1)
-    M, K = a.shape
-    N, K_b = b.shape
-    assert K == K_b
-
-    if output_dtype == torch.float32:
-        output_type = 0
-    elif output_dtype == torch.float16:
-        output_type = 1
-    elif output_dtype == torch.bfloat16:
-        output_type = 2
-    else:
-        raise ValueError(f"Unsupported output dtype: {output_dtype}")
-
-    rep_m = block_m // 128
-    rep_n = block_n // 128
-    rep_k = block_k // 32 // 4
-
-    a_desc = TensorDescriptor.from_tensor(a, [block_m, block_k])
-    b_desc = TensorDescriptor.from_tensor(b, [block_n, block_k])
-
-    scale_block_shape = [1, rep_m, rep_k, 2, 256]
-    a_scale_desc = TensorDescriptor.from_tensor(a_scale, block_shape=scale_block_shape)
-    scale_block_shape = [1, rep_n, rep_k, 2, 256]
-    b_scale_desc = TensorDescriptor.from_tensor(b_scale, block_shape=scale_block_shape)
-
-    output = torch.empty((M, N), dtype=output_dtype, device=a.device)
-    c_desc = TensorDescriptor.from_tensor(output, [block_m, block_n])
-
-    grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n), 1)
-    _mxfp8_block_scaled_matmul_kernel[grid](
-        a_desc,
-        a_scale_desc,
-        b_desc,
-        b_scale_desc,
-        c_desc,
-        M,
-        N,
-        K,
-        output_type,
-        block_m,
-        block_n,
-        block_k,
-        rep_m,
-        rep_n,
-        rep_k,
-        num_stages,
-    )
-    return output
-
-
-@triton.jit
-def _pack_mxfp8_scales_kernel(
-    scale_ptr,
-    out_ptr,
-    M: tl.constexpr,
-    K_GROUPS: tl.constexpr,
-    SCALE_K: tl.constexpr,
-    TOTAL: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < TOTAL
-
-    idx256 = offs % 256
-    tmp = offs // 256
-    two = tmp % 2
-    tmp = tmp // 2
-    scale_k = tmp % SCALE_K
-    scale_m = tmp // SCALE_K
-
-    within = two * 256 + idx256
-    row_inner_32 = within // 16
-    rem = within - row_inner_32 * 16
-    row_outer_4 = rem // 4
-    k_inner_4 = rem - row_outer_4 * 4
-
-    row = scale_m * 128 + row_outer_4 * 32 + row_inner_32
-    col = scale_k * 4 + k_inner_4
-    value = tl.load(scale_ptr + row * K_GROUPS + col, mask & (row < M), other=127)
-    tl.store(out_ptr + offs, value, mask)
-
-
-def pack_mxfp8_scales_triton(scale_u8: torch.Tensor) -> torch.Tensor:
-    assert scale_u8.dim() == 2, f"Expected 2D scale tensor, got {scale_u8.dim()}D"
-    scale_u8 = scale_u8.contiguous()
-    m, k_groups = scale_u8.shape
-    assert (
-        k_groups % 4 == 0
-    ), f"{k_groups=} must be divisible by 4 (K must be multiple of 128)"
-
-    scale_m = triton.cdiv(m, 128)
-    scale_k = k_groups // 4
-    out = torch.empty(
-        (1, scale_m, scale_k, 2, 256), dtype=scale_u8.dtype, device=scale_u8.device
-    )
-    total = out.numel()
-    block = 1024
-    grid = (triton.cdiv(total, block),)
-    _pack_mxfp8_scales_kernel[grid](
-        scale_u8,
-        out,
-        m,
-        k_groups,
-        scale_k,
-        total,
-        BLOCK=block,
-    )
-    return out
 
 
 @triton.jit
@@ -1739,6 +975,7 @@ def _per_tensor_quant_mla_fp8_stage2(
     x_stride_s,
     fp8_min,
     fp8_max,
+    FP8_DTYPE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
@@ -1753,8 +990,8 @@ def _per_tensor_quant_mla_fp8_stage2(
     x_q_ptr += head_id * num_seq * head_size + seq_id * head_size
 
     x = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
-    x_q = tl.clamp(x * x_s_inv, fp8_min, fp8_max).to(x_q_ptr.dtype.element_ty)
-    tl.store(x_q_ptr + offset, x_q, mask=mask)
+    x_q = tl.clamp(x * x_s_inv, fp8_min, fp8_max).to(FP8_DTYPE)
+    tl.store(x_q_ptr + offset, x_q.to(tl.uint8, bitcast=True), mask=mask)
 
 
 def per_tensor_quant_mla_fp8(
@@ -1790,13 +1027,14 @@ def per_tensor_quant_mla_fp8(
     _per_tensor_quant_mla_fp8_stage2[grid](
         x,
         x_s_out,
-        x_q,
+        x_q.view(torch.uint8),
         num_seq,
         head_size,
         x.stride(0),
         x.stride(1),
         fp8_min,
         fp8_max,
+        fp8_dtype_to_triton(fp8_dtype),
         BLOCK_SIZE,
     )
 
@@ -1819,6 +1057,7 @@ def _per_token_group_quant_mla_deep_gemm_masked_fp8(
     eps,
     fp8_min,
     fp8_max,
+    FP8_DTYPE: tl.constexpr,
     NUM_GROUP: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -1847,9 +1086,13 @@ def _per_token_group_quant_mla_deep_gemm_masked_fp8(
         )
         _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
         y_s = _absmax / fp8_max
-        y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+        y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(FP8_DTYPE)
 
-        tl.store(y_q_ptr + gid * group_size + cols, y_q, mask=mask)
+        tl.store(
+            y_q_ptr + gid * group_size + cols,
+            y_q.to(tl.uint8, bitcast=True),
+            mask=mask,
+        )
         tl.store(y_s_ptr + gid * y_s_stride_g, y_s)
 
 
@@ -1879,7 +1122,7 @@ def per_token_group_quant_mla_deep_gemm_masked_fp8(
 
     _per_token_group_quant_mla_deep_gemm_masked_fp8[grid](
         x,
-        x_q,
+        x_q.view(torch.uint8),
         x_s,
         masked_m,
         group_size,
@@ -1892,6 +1135,7 @@ def per_token_group_quant_mla_deep_gemm_masked_fp8(
         eps,
         -fp8_max,
         fp8_max,
+        fp8_dtype_to_triton(dtype),
         num_tiles_k,
         BLOCK_SIZE,
     )
@@ -1924,7 +1168,7 @@ Raises:
 if _is_hip:
 
     def _native_dynamic_per_token_quant_fp8(output, input, scale):
-        """Native PyTorch fallback for dynamic per-token FP8 quantization when vLLM is unavailable."""
+        """Native PyTorch fallback for dynamic per-token FP8 quantization when AITER is disabled."""
         M, N = input.shape
         eps = 1e-12
         # Compute per-token scale
@@ -1937,7 +1181,7 @@ if _is_hip:
         output.copy_(output_data)
 
     def _native_dynamic_per_tensor_quant_fp8(output, input, scale):
-        """Native PyTorch fallback for dynamic per-tensor FP8 quantization when vLLM is unavailable."""
+        """Native PyTorch fallback for dynamic per-tensor FP8 quantization when AITER is disabled."""
         eps = 1e-12
         absmax = input.abs().max()
         absmax = torch.clamp(absmax, min=eps)
@@ -1949,7 +1193,7 @@ if _is_hip:
         output.copy_(output_data)
 
     def _native_static_quant_fp8(output, input, scale):
-        """Native PyTorch fallback for static FP8 quantization when vLLM is unavailable."""
+        """Native PyTorch fallback for static FP8 quantization when AITER is disabled."""
         # Use tensor directly instead of .item() to avoid CPU-GPU sync
         output_data = torch.clamp(input / scale, fp8_min, fp8_max).to(fp8_dtype)
         output.copy_(output_data)
@@ -1974,29 +1218,21 @@ if _is_hip:
                 )
                 if _use_aiter:
                     dynamic_per_token_scaled_quant(output, input, scale)
-                elif _has_vllm:
-                    torch.ops._C.dynamic_per_token_scaled_fp8_quant(
-                        output, input.contiguous(), scale, None
-                    )
                 else:
                     _native_dynamic_per_token_quant_fp8(output, input, scale)
             else:
-                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+                scale = torch.empty(1, device=input.device, dtype=torch.float32)
                 if _use_aiter:
                     dynamic_per_tensor_quant(output, input, scale)
-                elif _has_vllm:
-                    torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
                 else:
                     _native_dynamic_per_tensor_quant_fp8(output, input, scale)
         else:
             # Static scaling
-            assert (
-                scale.numel() == 1
-            ), f"Expected scalar scale, got numel={scale.numel()}"
+            assert scale.numel() == 1, (
+                f"Expected scalar scale, got numel={scale.numel()}"
+            )
             if _use_aiter:
                 static_per_tensor_quant(output, input, scale)
-            elif _has_vllm:
-                torch.ops._C.static_scaled_fp8_quant(output, input, scale)
             else:
                 _native_static_quant_fp8(output, input, scale)
 
@@ -2010,7 +1246,6 @@ else:
         num_token_padding: Optional[int] = None,
         use_per_token_if_dynamic: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
         assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
         shape = input.shape
         if num_token_padding:
@@ -2031,9 +1266,9 @@ else:
                 )  # False for dynamic
         else:
             # Static scaling
-            assert (
-                scale.numel() == 1
-            ), f"Expected scalar scale, got numel={scale.numel()}"
+            assert scale.numel() == 1, (
+                f"Expected scalar scale, got numel={scale.numel()}"
+            )
             sgl_per_tensor_quant_fp8(
                 input, output, scale, is_static=True
             )  # True for static
@@ -2061,6 +1296,7 @@ def _per_token_group_quant_fp8_hopper_moe_mn_major(
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     M_ALIGNMENT: tl.constexpr,
+    FP8_DTYPE: tl.constexpr,
     BLOCK_M: tl.constexpr,  # tune
 ):
     k_offset = tl.program_id(0)
@@ -2080,13 +1316,13 @@ def _per_token_group_quant_fp8_hopper_moe_mn_major(
         inp = tl.load(a_ptrs, mask=a_mask).to(tl.float32)  # [BLOCK_M, BLOCK_K]
         inp_amax = tl.max(tl.abs(inp), axis=1)  # [BLOCK_M,]
         inp_amax = tl.clamp(inp_amax, min=1e-4, max=float("inf"))
-        inp_fp8 = (inp * (448.0 / inp_amax[:, None])).to(tl.float8e4nv)
+        inp_fp8 = (inp * (448.0 / inp_amax[:, None])).to(FP8_DTYPE)
 
         # Store fp8
         a_fp8_ptrs = (
             a_fp8 + current_expert_offset * K + coord_m[:, None] * K + coord_k[None, :]
         )
-        tl.store(a_fp8_ptrs, inp_fp8, mask=a_mask)
+        tl.store(a_fp8_ptrs, inp_fp8.to(tl.uint8, bitcast=True), mask=a_mask)
 
         # Store sfa
         k = tl.cdiv(K, BLOCK_K)
@@ -2111,9 +1347,9 @@ def per_token_group_quant_fp8_hopper_moe_mn_major(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert A.dim() == 2
     assert A.is_contiguous(), "`A` is not contiguous"
-    assert (
-        A.shape[-1] % group_size == 0
-    ), "the last dimension of `A` cannot be divisible by `group_size`"
+    assert A.shape[-1] % group_size == 0, (
+        "the last dimension of `A` cannot be divisible by `group_size`"
+    )
 
     a_q = torch.empty_like(A, device=A.device, dtype=fp8_dtype)
     M, K = A.shape[0], A.shape[1]
@@ -2125,11 +1361,12 @@ def per_token_group_quant_fp8_hopper_moe_mn_major(
         A,
         expert_offsets,
         problem_sizes,
-        a_q,
+        a_q.view(torch.uint8),
         sfa,
         K,
         group_size,
         expert_tokens_alignment,
+        fp8_dtype_to_triton(fp8_dtype),
     )
     return a_q, sfa
 
@@ -2193,253 +1430,25 @@ def per_group_transpose(
     return trans_a
 
 
-def is_weak_contiguous(x: torch.Tensor):
-    strides = x.stride()
-    sizes = x.shape
-    is_not_transpose = strides[0] == 1 and (strides[1] >= max(1, sizes[0]))
-    is_transpose = strides[1] == 1 and (strides[0] >= max(1, sizes[1]))
-    return is_transpose or is_not_transpose
-
-
-def _as_column_scale(scale: torch.Tensor, expected_len: int) -> torch.Tensor:
-    if scale.dim() <= 1:
-        return scale.reshape(-1, 1)
-    if scale.dim() == 2:
-        if scale.shape[1] == 1:
-            return scale
-        if scale.shape[0] == 1 and scale.shape[1] == expected_len:
-            return scale.t()
-    return scale
-
-
 @triton.jit
-def scaled_mm_kernel(
-    a_ptr,
-    b_ptr,
-    scale_a_ptr,
-    scale_b_ptr,
-    c_ptr,
-    bias_ptr,
-    M,
-    N,
-    K,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    ACCUMULATOR_DTYPE: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    BLOCK_SIZE_SCALE_A: tl.constexpr,
-    BLOCK_SIZE_SCALE_B: tl.constexpr,
+def _dequant_group_fp8_kernel(
+    X, S, Y, M, K: tl.constexpr, SS: tl.constexpr, BLOCK: tl.constexpr
 ):
-    pid = tl.program_id(axis=0)
-
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-
-    pid_m = pid // num_pid_n
-    pid_n = pid % num_pid_n
-
-    accumulator_dtype = ACCUMULATOR_DTYPE
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=accumulator_dtype)
-
-    # NOTE: Some tensor inputs are so large, they will cause int32 overflow
-    # so it is necessary to use tl.int64 for all the offsets, else SEGV will
-    # eventually occur.
-
-    # Offsets and masks.
-    offsets_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-    masks_am = offsets_am < M
-
-    offsets_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
-    masks_bn = offsets_bn < N
-
-    offsets_k = tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
-    offsets_a = stride_am * offsets_am[:, None] + stride_ak * offsets_k[None, :]
-    offsets_b = stride_bk * offsets_k[:, None] + stride_bn * offsets_bn[None, :]
-
-    # NOTE: BLOCK_SIZE_SCALE_A could be 1 or BLOCK_SIZE_M, so need to create
-    # appropriate offsets and masks for each case. Same goes for
-    # BLOCK_SIZE_SCALE_B.
-    offsets_scale_am = (
-        tl.arange(0, BLOCK_SIZE_SCALE_A)
-        + (BLOCK_SIZE_SCALE_A > 1) * pid_m * BLOCK_SIZE_M
-    )
-    masks_scale_am = offsets_scale_am < M
-
-    offsets_scale_bn = (
-        tl.arange(0, BLOCK_SIZE_SCALE_B)
-        + (BLOCK_SIZE_SCALE_B > 1) * pid_n * BLOCK_SIZE_N
-    )
-    masks_scale_bn = offsets_scale_bn < N
-
-    a_ptrs = a_ptr + offsets_a
-    b_ptrs = b_ptr + offsets_b
-
-    scale_a_ptrs = scale_a_ptr + offsets_scale_am
-    scale_b_ptrs = scale_b_ptr + offsets_scale_bn
-
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        masks_k = offsets_k < K
-        masks_a = masks_am[:, None] & masks_k[None, :]
-        a = tl.load(a_ptrs, mask=masks_a)
-
-        masks_b = masks_k[:, None] & masks_bn[None, :]
-        b = tl.load(b_ptrs, mask=masks_b)
-
-        # Accumulate results.
-        accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
-
-        offsets_k += BLOCK_SIZE_K
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-
-    # Apply scale at end.
-    masks_scale_a = masks_scale_am[:, None] & (tl.arange(0, 1) < 1)[:, None]
-    scale_a = tl.load(scale_a_ptrs[:, None], masks_scale_a)
-    # Need to broadcast to the appropriate size, if scale_a is already
-    # (BLOCK_SIZE_M, 1) then it will broadcast to its own shape. Same goes
-    # for scale_b below.
-    scale_a = scale_a.broadcast_to((BLOCK_SIZE_M, 1))
-    accumulator = scale_a * accumulator.to(tl.float32)
-
-    masks_scale_b = masks_scale_bn[:, None] & (tl.arange(0, 1) < 1)[None, :]
-    scale_b = tl.load(scale_b_ptrs[:, None], masks_scale_b)
-    scale_b = scale_b.broadcast_to((BLOCK_SIZE_N, 1))
-    accumulator = scale_b.T * accumulator.to(tl.float32)
-
-    # Convert to output format.
-    c = accumulator.to(c_ptr.type.element_ty)
-
-    # Add bias, it's already in output format, so add it after conversion.
-    if bias_ptr:
-        offsets_bias = offsets_bn
-        bias_ptrs = bias_ptr + offsets_bias
-        bias_mask = offsets_bias < N
-        bias = tl.load(bias_ptrs, bias_mask)
-        c += bias
-
-    # Save output
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
-    offs_cm = offs_cm.to(tl.int64)
-    offs_cn = offs_cn.to(tl.int64)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-
-    tl.store(c_ptrs, c, mask=c_mask)
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    rows, cols = offsets // K, offsets % K
+    value = tl.load(X + offsets, offsets < M * K, 0.0).to(tl.float32)
+    scale = tl.load(S + rows * SS + cols // 32, rows < M, 0.0)
+    tl.store(Y + offsets, value * scale, offsets < M * K)
 
 
-# input  - [M, K]
-# weight - [K, N]
-# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
-def triton_scaled_mm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    scale_a: torch.Tensor,
-    scale_b: torch.Tensor,
-    out_dtype: type[torch.dtype],
-    bias: Optional[torch.Tensor] = None,
-    block_size_m: int = 32,
-    block_size_n: int = 32,
-    block_size_k: int = 32,
-    use_heuristic=True,
-) -> torch.Tensor:
-    M, K = input.shape
-    N = weight.shape[1]
-
-    assert N > 0 and K > 0 and M > 0
-    assert weight.shape[0] == K
-    assert input.dtype == weight.dtype
-
-    scale_a = _as_column_scale(scale_a, M)
-    scale_b = _as_column_scale(scale_b, N)
-
-    assert scale_a.dim() == 2 and scale_b.dim() == 2
-    assert scale_a.dtype == scale_b.dtype and scale_a.is_floating_point()
-    assert scale_a.shape[1] == 1 and (scale_a.shape[0] == 1 or scale_a.shape[0] == M)
-    assert scale_b.shape[1] == 1 and (scale_b.shape[0] == 1 or scale_b.shape[0] == N)
-    assert out_dtype.is_floating_point
-    assert bias is None or bias.is_floating_point()
-    assert is_weak_contiguous(input)
-    assert is_weak_contiguous(weight)
-
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
-
-    result = torch.empty((M, N), dtype=out_dtype, device=input.device)
-
-    has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
-
-    if use_heuristic:
-        is_small_N = N < 8192
-        next_power_of_2_M = max(32, triton.next_power_of_2(M))
-        if next_power_of_2_M <= 32:
-            tile_shape = (64, 64, 256) if is_small_N else (64, 128, 256)
-        elif next_power_of_2_M <= 64:
-            tile_shape = (64, 64, 256)
-        elif next_power_of_2_M <= 128:
-            tile_shape = (64, 128, 128)
-        else:
-            tile_shape = (128, 128, 128)
-
-    block_size_m, block_size_n, block_size_k = tile_shape
-
-    block_size_sa = 1 if has_scalar(scale_a) else block_size_m
-    block_size_sb = 1 if has_scalar(scale_b) else block_size_n
-
-    accumulator_dtype = tl.float32 if input.is_floating_point() else tl.int32
-
-    # A = input, B = weight, C = result
-    # A = M x K, B = K x N, C = M x N
-    scaled_mm_kernel[grid](
-        input,
-        weight,
-        scale_a,
-        scale_b,
-        result,
-        bias,
-        M,
-        N,
-        K,
-        input.stride(0),
-        input.stride(1),
-        weight.stride(0),
-        weight.stride(1),
-        result.stride(0),
-        result.stride(1),
-        accumulator_dtype,
-        BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=block_size_n,
-        BLOCK_SIZE_K=block_size_k,
-        BLOCK_SIZE_SCALE_A=block_size_sa,
-        BLOCK_SIZE_SCALE_B=block_size_sb,
-    )
-
-    return result.to(out_dtype)
-
-
-if _is_cuda:
-    if enable_sgl_per_token_group_quant_8bit:
-
-        @register_fake_if_exists("sgl_kernel::sgl_per_token_group_quant_8bit")
-        def _(
-            input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
-        ):
-            return
-
-    else:
-
-        @register_fake_if_exists("sgl_kernel::sgl_per_token_group_quant_fp8")
-        def _(
-            input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
-        ):
-            return
-
-    @register_fake_if_exists("sgl_kernel::sgl_per_token_quant_fp8")
-    def _(input, output_q, output_s):
-        return
+def dequant_group_fp8_to_bf16(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Expand row-wise group32 FP8 values; UE8M0 scaling is exact in BF16."""
+    m, k = x.shape
+    assert x.is_contiguous() and k % 32 == 0
+    assert scale.shape == (m, k // 32) and scale.stride(1) == 1
+    out = torch.empty_like(x, dtype=torch.bfloat16)
+    if m:
+        _dequant_group_fp8_kernel[(triton.cdiv(m * k, 1024),)](
+            x, scale, out, m, k, scale.stride(0), 1024
+        )
+    return out

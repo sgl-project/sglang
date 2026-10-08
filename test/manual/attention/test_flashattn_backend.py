@@ -50,19 +50,18 @@ class MockModelRunner:
         self.kv_cache_dtype = (
             self.dtype
         )  # torch dtype, required by FlashAttentionBackend
+        self.kv_cache_dtype_str = "auto"
 
-        # server_args is still needed for string-based config (kv_cache_dtype_str)
         self.server_args = type(
             "ServerArgs",
             (),
             {
-                "kv_cache_dtype": "auto",  # string version for kv_cache_dtype_str
+                "kv_cache_dtype": "auto",
                 "speculative_eagle_topk": None,
                 "speculative_num_draft_tokens": 0,
                 "enable_deterministic_inference": False,
             },
         )
-        self.attn_cp_size = 1
         # Create a large enough req_to_token_pool to fit the test usage.
         self.req_to_token_pool = type(
             "TokenPool",

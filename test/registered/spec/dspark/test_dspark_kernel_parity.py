@@ -12,23 +12,25 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.dsv4 import attn_metadata_kernels
-from sglang.srt.speculative import ragged_verify_kernels
-from sglang.srt.speculative.dspark_components.dspark_planner import (
-    DSparkScheduleConfig,
+from sglang.kernels.ops.attention import (
+    dsv4_attn_metadata_kernels as attn_metadata_kernels,
 )
-from sglang.srt.speculative.dspark_components.kernels import (
+from sglang.kernels.ops.speculative import ragged_verify_kernels
+from sglang.kernels.ops.speculative.dspark import (
     dspark_accept,
     dspark_attn_metadata,
     dspark_draft_model,
     dspark_schedule,
     dspark_verify_window,
 )
+from sglang.srt.speculative.dspark_components.dspark_planner import (
+    DSparkScheduleConfig,
+)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
 DEVICE = torch.device("cuda")
 VOCAB = 129280
@@ -207,12 +209,15 @@ def _case_commit_inject_layout(tc):
     )
     tc._parity(dspark_verify_window.BuildCommitInjectLayout, **kw)
     # commit_len edges: 0 masks the whole row to -1, stride keeps it all.
+    # The uncommitted row holds out-of-range entries that must not be loaded.
+    rp0, p0 = int(kw["req_pool_indices"][0]), int(kw["prefix_lens"][0])
+    kw["req_to_token"][rp0, p0 : p0 + stride] = 1 << 40
     kw.update(
         req_pool_indices=kw["req_pool_indices"][:2],
         prefix_lens=kw["prefix_lens"][:2],
         commit_lens=torch.tensor([0, stride], device=DEVICE, dtype=torch.int32),
     )
-    edge = dspark_verify_window.BuildCommitInjectLayout.triton(**kw)
+    edge, _ = tc._parity(dspark_verify_window.BuildCommitInjectLayout, **kw)
     swa_2d = edge.swa_loc.view(2, stride)
     tc.assertTrue(bool((swa_2d[0] == -1).all()))
     tc.assertTrue(bool((swa_2d[1] >= 0).all()))

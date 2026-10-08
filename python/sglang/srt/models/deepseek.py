@@ -59,7 +59,7 @@ if _is_cpu and _is_cpu_amx_available:
     import sgl_kernel  # noqa: F401
 
 if _is_npu:
-    from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
         fused_moe_npu as fused_moe,
     )
 else:
@@ -67,7 +67,6 @@ else:
 
 
 class DeepseekMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -95,8 +94,7 @@ class DeepseekMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -108,16 +106,15 @@ class DeepseekMLP(nn.Module):
 
 
 class DeepseekMoE(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__()
         self.config = config
-        self.rank = get_parallel().tp_rank
         self.tp_size = get_parallel().tp_size
         self.n_routed_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
@@ -128,6 +125,7 @@ class DeepseekMoE(nn.Module):
             )
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=layer_id,
             renormalize=config.norm_topk_prob,
         )
         self.experts = nn.ModuleList(
@@ -228,7 +226,6 @@ class DeepseekMoE(nn.Module):
 
 
 class DeepseekAttention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -314,7 +311,6 @@ class DeepseekAttention(nn.Module):
 
 
 class DeepseekDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -344,6 +340,7 @@ class DeepseekDecoderLayer(nn.Module):
         ):
             self.mlp = DeepseekMoE(
                 config=config,
+                layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
@@ -386,7 +383,6 @@ class DeepseekDecoderLayer(nn.Module):
 
 
 class DeepseekModel(nn.Module):
-
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -440,7 +436,6 @@ class DeepseekModel(nn.Module):
 
 
 class DeepseekForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

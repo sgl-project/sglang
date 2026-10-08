@@ -27,7 +27,7 @@ from sglang.srt.configs import DbrxConfig
 from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     fused_moe_npu,
 )
 from sglang.srt.layers.linear import (
@@ -70,7 +70,6 @@ class DbrxRouter(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_parallel().tp_size
         self.num_total_experts = config.ffn_config.moe_num_experts
         self.d_model = config.d_model
         self.layer = ReplicatedLinear(
@@ -97,12 +96,14 @@ class DbrxExperts(nn.Module):
     def __init__(
         self,
         config: DbrxConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         params_dtype: Optional[torch.dtype] = None,
         prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
+        self.tp_rank = get_parallel().tp_rank
         self.num_total_experts = config.ffn_config.moe_num_experts
         self.top_k = config.ffn_config.moe_top_k
         self.d_model = config.d_model
@@ -115,6 +116,7 @@ class DbrxExperts(nn.Module):
         self.router = DbrxRouter(config, self.params_dtype)
         self.topk = TopK(
             self.top_k,
+            layer_id=layer_id,
             renormalize=True,
         )
         self.moe_runner_config = MoeRunnerConfig(inplace=True)
@@ -154,10 +156,9 @@ class DbrxExperts(nn.Module):
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, weight_name: str
     ):
-        tp_rank = get_parallel().tp_rank
         param_data = param.data
         shard_size = self.intermediate_size
-        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        shard = slice(self.tp_rank * shard_size, (self.tp_rank + 1) * shard_size)
         # DBRX uses GLU for each experts.
         # GLU has 3 linear layers: w1, v1 and w2.
         if weight_name.endswith("w1"):
@@ -242,7 +243,6 @@ class DbrxAttention(nn.Module):
         )
 
         tp_world_size = get_parallel().tp_size
-        self.tp_size = tp_world_size
         assert self.total_num_heads % tp_world_size == 0
         self.num_heads = self.total_num_heads // tp_world_size
         if self.total_num_kv_heads >= tp_world_size:
@@ -336,7 +336,7 @@ class DbrxBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("norm_attn_norm", prefix),
         )
-        self.ffn = DbrxExperts(config, quant_config=quant_config)
+        self.ffn = DbrxExperts(config, layer_id, quant_config=quant_config)
 
     def forward(
         self,

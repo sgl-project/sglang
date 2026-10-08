@@ -14,6 +14,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
@@ -23,6 +24,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     PlatformEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import is_gfx1250_supported
 
 logger = init_logger(__name__)
 
@@ -47,6 +49,19 @@ class RocmPlatform(Platform):
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return str(torch.cuda.get_device_name(device_id))
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_gcn_arch_name(cls, device_id: int = 0) -> str:
+        """Return the GCN architecture string (e.g. "gfx1151", "gfx950")."""
+        return str(torch.cuda.get_device_properties(device_id).gcnArchName)
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def is_gfx1151(cls) -> bool:
+        return torch.cuda.is_available() and cls.get_gcn_arch_name().startswith(
+            "gfx1151"
+        )
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -155,7 +170,9 @@ class RocmPlatform(Platform):
             try:
                 import flash_attn  # noqa: F401
 
-                from sglang.jit_kernel.flash_attention_v3 import _is_fa3_supported
+                from sglang.kernels.ops.attention.flash_attention_v3 import (
+                    _is_fa3_supported,
+                )
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
                     FlashAttentionBackend,
                 )
@@ -229,6 +246,15 @@ class RocmPlatform(Platform):
                     exc_info=True,
                 )
 
+        if is_gfx1250_supported():
+            count = cls._force_math_sdpa_in_attention(vae)
+            if count > 0:
+                logger.info(
+                    "Pinned %d VAE attention modules to the math SDPA backend "
+                    "(AOTriton fails above head_dim 256 on gfx1250)",
+                    count,
+                )
+
         use_bf16 = envs.SGLANG_USE_ROCM_VAE_CONV2D_BF16
         use_conv2d = envs.SGLANG_USE_ROCM_VAE_CONV2D or use_bf16
         if use_conv2d:
@@ -243,6 +269,35 @@ class RocmPlatform(Platform):
                 )
 
         return vae
+
+    @staticmethod
+    def _force_math_sdpa_in_attention(module: torch.nn.Module) -> int:
+        """Wrap VAE attention forwards so SDPA resolves to the math backend.
+
+        On gfx1250, AOTriton's flash and mem_efficient SDPA backends fail when
+        head_dim > 256. On ROCm 10.0 (AOTriton 0.13.50) the VAE returns wrong
+        values with no error. On ROCm 10.1 (0.14.50) it raises
+        hipErrorProfilerNotInitialized after the full denoise.
+        """
+        count = 0
+        for child in module.modules():
+            if getattr(child, "_sgl_math_sdpa", False):
+                continue
+            has_qkv = hasattr(child, "to_qkv") or all(
+                getattr(child, a, None) is not None for a in ("to_q", "to_k", "to_v")
+            )
+            if not has_qkv:
+                continue
+            original = child.forward
+
+            def wrapped(*args, _orig=original, **kwargs):
+                with sdpa_kernel(SDPBackend.MATH):
+                    return _orig(*args, **kwargs)
+
+            child.forward = wrapped
+            child._sgl_math_sdpa = True
+            count += 1
+        return count
 
     @staticmethod
     def _replace_groupnorm(module: torch.nn.Module, aiter_gn_cls: type) -> int:
@@ -330,8 +385,16 @@ class RocmPlatform(Platform):
         Kw>1) are replaced; pointwise or 1-D-temporal convolutions are left
         untouched.  Modules with non-default ``groups`` or ``dilation`` are
         skipped as the 2-D decomposition assumes groups=1 and dilation=1.
+
+        Spatial-parallel convs shard the height dimension across ranks and get
+        their missing rows from a halo exchange, so their ``_padding`` carries
+        no height padding.  Replacing their ``forward`` would drop the halo
+        exchange and silently shrink the output height, so for those the 2-D
+        decomposition is installed as the inner ``_halo_conv_forward`` kernel
+        instead, leaving the halo exchange and output trim intact.
         """
         patched = 0
+        patched_halo = 0
         skipped = 0
         for _name, child in module.named_modules():
             if not isinstance(child, nn.Conv3d):
@@ -343,6 +406,15 @@ class RocmPlatform(Platform):
                 skipped += 1
                 continue
             if child.groups != 1 or any(d != 1 for d in child.dilation):
+                skipped += 1
+                continue
+
+            is_spatial_parallel = hasattr(child, "height_halo_size")
+            if is_spatial_parallel and (
+                not hasattr(child, "_halo_conv_forward")
+                or child.padding_mode != "zeros"
+            ):
+                # No safe hook to patch without breaking the halo exchange.
                 skipped += 1
                 continue
 
@@ -384,19 +456,50 @@ class RocmPlatform(Platform):
                     compute_bf16=_bf16,
                 )
 
-            child.forward = types.MethodType(_patched_forward, child)
-            patched += 1
+            def _patched_halo_conv_forward(
+                self,
+                x,
+                *,
+                _stride=stride,
+                _kt=kt,
+                _bf16=use_bf16,
+            ):
+                # ``x`` is already halo-exchanged and causally padded; only the
+                # conv's own ``padding`` is still outstanding.
+                pad_t, pad_h, pad_w = self.padding
+                if pad_t or pad_h or pad_w:
+                    x = F.pad(x, (pad_w, pad_w, pad_h, pad_h, pad_t, pad_t))
+                x = x.to(self.weight.dtype)
+                return RocmPlatform._conv3d_as_batched_conv2d(
+                    x,
+                    self._weight_2d,
+                    self.bias,
+                    _stride,
+                    _kt,
+                    compute_bf16=_bf16,
+                )
+
+            if is_spatial_parallel:
+                child._halo_conv_forward = types.MethodType(
+                    _patched_halo_conv_forward, child
+                )
+                patched_halo += 1
+            else:
+                child.forward = types.MethodType(_patched_forward, child)
+                patched += 1
 
         logger.info(
-            "Conv3D→Conv2D: patched %d CausalConv3d (3D kernel, compute=%s), "
-            "skipped %d (1D/pointwise/grouped)",
+            "Conv3D→Conv2D: patched %d CausalConv3d + %d spatial-parallel halo "
+            "kernels (3D kernel, compute=%s), skipped %d (1D/pointwise/grouped/"
+            "unsupported spatial-parallel)",
             patched,
+            patched_halo,
             "BF16" if use_bf16 else "same dtype",
             skipped,
         )
-        return patched
+        return patched + patched_halo
 
     @classmethod
-    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
-        """ROCm performs better without DIT layerwise offload on Wan."""
+    def enable_dit_layerwise_offload_by_default(cls) -> bool:
+        """Whether automatic DiT layerwise offload is enabled on this platform."""
         return False

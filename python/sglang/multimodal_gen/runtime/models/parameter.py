@@ -419,6 +419,6 @@ def permute_param_layout_(
 def _adjust_shard_indexes_for_packing(
     shard_size, shard_offset, packed_factor
 ) -> tuple[Any, Any]:
-    shard_size = shard_size // packed_factor
-    shard_offset = shard_offset // packed_factor
+    shard_size = round(shard_size // packed_factor)
+    shard_offset = round(shard_offset // packed_factor)
     return shard_size, shard_offset

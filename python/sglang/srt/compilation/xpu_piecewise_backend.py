@@ -65,7 +65,7 @@ class XPUPiecewiseBackend(CUDAPiecewiseBackend):
             # at 8192 tokens when the capture grid tops out at 512). The
             # recompiled backend instance has no capture stream; fall back to
             # eager for that sub-graph instead of crashing the scheduler.
-            # Mirrors the HIP fallback in CUDAPiecewiseBackend.__call__.
+            # Mirrors the CUDA fallback in CUDAPiecewiseBackend.__call__.
             stream = get_pcg_capture_stream()
             if stream is None:
                 print_warning_once(

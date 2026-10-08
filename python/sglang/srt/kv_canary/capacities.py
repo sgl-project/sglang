@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
+from sglang.kernels.ops.kv_canary.verify import VerifyPlan
+from sglang.kernels.ops.kv_canary.write import WritePlan
+from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
+from sglang.srt.kv_canary.plan_input import PlanInput
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_schedule,
+    get_spec,
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -43,7 +49,6 @@ class CanaryLaunchCapacities:
     def from_args(
         cls,
         *,
-        server_args: ServerArgs,
         req_to_token_pool_size: int,
         max_seq_len_per_req: int,
         pool_slot_count: int,
@@ -63,7 +68,7 @@ class CanaryLaunchCapacities:
                 f"kv-canary: pool_slot_count must be positive, got {pool_slot_count}"
             )
 
-        cuda_graph_config = server_args.cuda_graph_config
+        cuda_graph_config = get_exec().graph.cuda_graph_config
         cuda_graph_max_bs = (
             cuda_graph_config.decode.max_bs if cuda_graph_config is not None else 0
         ) or 0
@@ -72,7 +77,7 @@ class CanaryLaunchCapacities:
                 f"kv-canary: cuda_graph_max_bs must be non-negative, got {cuda_graph_max_bs}"
             )
 
-        spec_num_draft_tokens = server_args.speculative_num_draft_tokens
+        spec_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if spec_num_draft_tokens is None:
             spec_num_draft_tokens = 0
         if spec_num_draft_tokens < 0:
@@ -81,19 +86,19 @@ class CanaryLaunchCapacities:
                 f"got {spec_num_draft_tokens}"
             )
 
-        max_prefill_tokens = server_args.max_prefill_tokens
+        max_prefill_tokens = get_schedule().max_prefill_tokens
         if max_prefill_tokens <= 0:
             raise ValueError(
                 f"kv-canary: max_prefill_tokens must be positive, got {max_prefill_tokens}"
             )
 
-        num_tokens_per_bs = 1
+        num_tokens_per_req = 1
         if spec_num_draft_tokens:
-            num_tokens_per_bs = max(num_tokens_per_bs, spec_num_draft_tokens)
+            num_tokens_per_req = max(num_tokens_per_req, spec_num_draft_tokens)
 
         max_bs = max(cuda_graph_max_bs, req_to_token_pool_size)
 
-        chunked_prefill_size = server_args.chunked_prefill_size
+        chunked_prefill_size = get_schedule().chunked_prefill_size
         chunked_limit = (
             chunked_prefill_size
             if chunked_prefill_size is not None and chunked_prefill_size >= 0
@@ -102,7 +107,7 @@ class CanaryLaunchCapacities:
         max_extend_tokens_per_forward = min(max_prefill_tokens, chunked_limit)
 
         write_entry_capacity = max(
-            max_bs * num_tokens_per_bs, max_extend_tokens_per_forward
+            max_bs * num_tokens_per_req, max_extend_tokens_per_forward
         )
 
         # Radix prefix sharing lets sum_r prefix_lens[r] exceed pool_slot_count; observed up to ~2x
@@ -114,4 +119,15 @@ class CanaryLaunchCapacities:
             per_forward_verify_capacity=per_forward_verify_capacity,
             per_forward_write_req_capacity=max_bs,
             per_forward_write_entry_capacity=write_entry_capacity,
+        )
+
+    def per_forward_workspace_bytes(self, *, num_buffer_groups: int) -> int:
+        return (
+            num_buffer_groups
+            * (
+                VerifyPlan.allocation_bytes(self.per_forward_verify_capacity)
+                + WritePlan.allocation_bytes(self.per_forward_write_req_capacity)
+            )
+            + ExpectedInputs.allocation_bytes(self.per_forward_write_entry_capacity)
+            + PlanInput.allocation_bytes(self.per_forward_write_req_capacity)
         )

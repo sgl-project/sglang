@@ -1,24 +1,26 @@
-"""Regression: TBO filter_batch resets the attention plan marker on children.
+"""Regression: TBO filter_batch carries non-Optional ForwardBatch fields.
 
 filter_batch's completeness guard raises for any non-None ForwardBatch field
-missing from the child dict; the plan marker defaults to False (non-None) and
-crashed TBO cuda-graph capture until reset. CPU-only.
+missing from the child dict, so every field with a non-None default has to be
+handled explicitly: the plan marker defaults to False and crashed TBO
+cuda-graph capture until reset, and `out_cache_loc_is_physical` defaults to
+False and breaks every split until carried. Carrying the PARENT's value matters
+as much as carrying it at all: a child left at the default would mark an
+already-translated loc unphysical, and a unified pool's write door would refuse
+it. CPU-only.
 """
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
-import sglang.srt.batch_overlap.two_batch_overlap as tbo
 from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_target_verify_batch(bs: int) -> ForwardBatch:
@@ -37,9 +39,13 @@ def _make_target_verify_batch(bs: int) -> ForwardBatch:
 
 
 def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
-    fake_args = SimpleNamespace(moe_dense_tp_size=None, attention_backend="fa3")
-    with get_parallel().override(attn_tp_size=1), patch.object(
-        tbo, "get_server_args", lambda: fake_args
+    # filter_batch reads attention_backend (get_server_args) and
+    # moe_dense_tp_size (get_parallel) from the published config.
+    with (
+        get_context().override_server_args(
+            attention_backend="fa3", moe_dense_tp_size=None
+        ),
+        get_parallel().override(attn_tp_size=1),
     ):
         return TboForwardBatchPreparer.filter_batch(
             batch,
@@ -52,6 +58,20 @@ def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
 
 
 class TestTboFilterBatchMarker(CustomTestCase):
+    def test_filter_batch_clears_mlp_sync_unpad_fields_on_children(self):
+        # MLP-sync padding records _original_batch_size/_original_num_tokens
+        # before TBO splits the batch (prepare_mlp_sync_batch pads first, then
+        # runs TboForwardBatchPreparer); children carry no restore state — the
+        # parent performs the post-forward unpad.
+        parent = _make_target_verify_batch(8)
+        parent._original_batch_size = 8
+        parent._original_num_tokens = 8
+        parent.global_num_tokens_padded_cpu = [8, 0, 0, 0]
+        child = _filter(parent, lo=0, hi=4)
+        self.assertIsNone(child._original_batch_size)
+        self.assertIsNone(child._original_num_tokens)
+        self.assertIsNone(child.global_num_tokens_padded_cpu)
+
     def test_filter_batch_resets_plan_marker_on_children(self):
         child = _filter(_make_target_verify_batch(8), lo=0, hi=4)
         self.assertEqual(child.batch_size, 4)
@@ -60,12 +80,41 @@ class TestTboFilterBatchMarker(CustomTestCase):
         self.assertIsNone(child.forward_metadata_planned_num_tokens)
         self.assertFalse(child.forward_metadata_replan_equivalent)
 
+    def test_a_rebound_parent_hands_its_mark_to_the_child(self):
+        parent = _make_target_verify_batch(8)
+        parent.out_cache_loc_is_physical = True
+        child = _filter(parent, lo=0, hi=4)
+        self.assertTrue(child.out_cache_loc_is_physical)
+
+    def test_an_untranslated_parent_stays_unmarked(self):
+        child = _filter(_make_target_verify_batch(8), lo=0, hi=4)
+        self.assertFalse(child.out_cache_loc_is_physical)
+
     def test_pre_planned_parent_does_not_leak_ready_into_children(self):
         parent = _make_target_verify_batch(8)
         parent.mark_forward_metadata_ready(replan_equivalent=True)
         child = _filter(parent, lo=0, hi=4)
         self.assertFalse(child.forward_metadata_ready)
         self.assertFalse(child.forward_metadata_replan_equivalent)
+
+    def test_filter_batch_children_inherit_deferred_logits(self):
+        """A graph that defers logits to an eager tail defers them for both
+        TBO halves; a child that reset the flag would run the logits processor
+        inside the captured body."""
+        for deferred in (False, True):
+            with self.subTest(deferred=deferred):
+                parent = _make_target_verify_batch(8)
+                parent.defer_logits_to_eager = deferred
+                child = _filter(parent, lo=0, hi=4)
+                self.assertEqual(child.defer_logits_to_eager, deferred)
+
+    def test_filter_batch_drops_aux_hidden_states_buffer(self):
+        """Decode graph capture sets the shared aux output on the parent before
+        the TBO split; children must not inherit it."""
+        parent = _make_target_verify_batch(8)
+        parent.aux_hidden_states_buffer = torch.empty(8, 12)
+        child = _filter(parent, lo=0, hi=4)
+        self.assertIsNone(child.aux_hidden_states_buffer)
 
 
 def _make_valued_batch(bs: int) -> ForwardBatch:

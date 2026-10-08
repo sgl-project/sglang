@@ -22,7 +22,6 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import fast_topk
 
 from ..attention_methods.dense_attention import DEFAULT_DEVICE
 from ..attention_methods.dense_attention import DEFAULT_DEVICE as DENSE_DEFAULT_DEVICE
@@ -90,6 +89,7 @@ from .speculative_cuda_graph_runner import (
 from .speculative_draft_runner import (
     EagleDraftRunnerSettings,
     _configure_runner_for_eagle_draft,
+    _DummyTpGroup,
     _reset_cuda_graph_test_buffers,
     _seeded_rng,
     _single_rank_graph_capture,
@@ -192,7 +192,7 @@ def _run_draft_extend_cuda_graph_case(
     run_graph_eager: bool = True,
     compare_replay_to_graph_eager: bool = True,
     pad_style: str = "small_real",
-    pad_num_tokens_per_bs: int | None = None,
+    pad_num_tokens_per_req: int | None = None,
 ):
     adapter = SpeculativeCudaGraphAdapter(
         build_fixture=build_fixture,
@@ -217,7 +217,7 @@ def _run_draft_extend_cuda_graph_case(
         atol=atol,
         rtol=rtol,
         pad_style=pad_style,
-        pad_num_tokens_per_bs=pad_num_tokens_per_bs,
+        pad_num_tokens_per_req=pad_num_tokens_per_req,
     )
     run_speculative_cuda_graph_case(
         testcase,
@@ -299,7 +299,7 @@ def run_dense_draft_extend_v2_cuda_graph_case(
         run_graph_eager=False,
         compare_replay_to_graph_eager=False,
         pad_style=pad_style,
-        pad_num_tokens_per_bs=num_tokens_per_req,
+        pad_num_tokens_per_req=num_tokens_per_req,
     )
 
 
@@ -367,7 +367,7 @@ def run_mla_draft_extend_v2_cuda_graph_case(
         run_graph_eager=False,
         compare_replay_to_graph_eager=False,
         pad_style=pad_style,
-        pad_num_tokens_per_bs=num_tokens_per_req,
+        pad_num_tokens_per_req=num_tokens_per_req,
     )
 
 
@@ -388,36 +388,10 @@ def run_mla_draft_extend_v2_cuda_graph_case(
 # etc.) is imported from there.
 
 
-def _assert_draft_extend_outputs_close(actual, expected, settings) -> None:
-    torch.testing.assert_close(
-        actual.next_token_logits,
-        expected.next_token_logits,
-        atol=settings.atol,
-        rtol=settings.rtol,
-    )
-    torch.testing.assert_close(
-        actual.hidden_states,
-        expected.hidden_states,
-        atol=settings.atol,
-        rtol=settings.rtol,
-    )
-    torch.testing.assert_close(
-        actual.topk_p,
-        expected.topk_p,
-        atol=settings.atol,
-        rtol=settings.rtol,
-    )
-    torch.testing.assert_close(actual.topk_index, expected.topk_index)
-
-
 def _assert_draft_extend_v2_outputs_close(actual, expected, settings) -> None:
-    # DRAFT_EXTEND_V2 graph runner only anchors the full-row
-    # `next_token_logits` / `hidden_states`; the selected-row `topk_p` /
-    # `topk_index` are owned by EAGLEWorkerV2 and computed *after* replay (see
-    # `eagle_worker_v2._draft_extend_for_decode` and the early-return in
-    # `EAGLEDraftExtendCudaGraphRunner.replay` for DRAFT_EXTEND_V2). The V2
-    # production runner output therefore carries no topk fields, so the
-    # runner-mode reference must only compare what the graph actually anchors.
+    # DRAFT_EXTEND_V2 graph runner anchors selected-row next_token_logits and
+    # hidden_states. Selected-row topk_p / topk_index remain worker-owned and
+    # are computed after replay, so compare only what the graph anchors.
     torch.testing.assert_close(
         actual.next_token_logits,
         expected.next_token_logits,
@@ -445,7 +419,7 @@ class EagleDraftExtendCudaGraphRunnerAdapter:
         lambda _case, _settings: None
     )
     assert_outputs_close: Callable[[Any, Any, EagleDraftRunnerSettings], None] = (
-        _assert_draft_extend_outputs_close
+        _assert_draft_extend_v2_outputs_close
     )
 
 
@@ -522,7 +496,6 @@ def _build_eagle_draft_extend_fixture(
         speculative_attention_mode="prefill",
     )
     draft_extend_attn_backend = DraftBackendFactory(
-        fixture.runner.server_args,
         fixture.runner,
         settings.topk,
         settings.speculative_num_steps,
@@ -559,7 +532,7 @@ def _capture_eagle_draft_extend_graph_runner(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        get_parallel().override(attn_cp_size=1, tp_rank=0),
+        get_parallel().override(attn_cp_size=1, tp_rank=0, tp_group=_DummyTpGroup()),
     ):
         _reset_cuda_graph_test_buffers()
         return EAGLEDraftExtendCudaGraphRunner(
@@ -595,8 +568,9 @@ def _run_eagle_draft_extend_eager(
     model_runner = (
         worker.model_runner if hasattr(worker, "model_runner") else worker.draft_runner
     )
-    with torch.no_grad(), forward_context(
-        ForwardContext(attn_backend=worker.draft_extend_attn_backend)
+    with (
+        torch.no_grad(),
+        forward_context(ForwardContext(attn_backend=worker.draft_extend_attn_backend)),
     ):
         worker.draft_extend_attn_backend.init_forward_metadata(batch)
         ret = model_runner.model.forward(
@@ -604,20 +578,22 @@ def _run_eagle_draft_extend_eager(
             batch.positions,
             batch,
         )
-    # Mirror the production fast path from
-    # EAGLEDraftExtendCudaGraphRunner.replay (#26397): when topk == 1
-    # production skips the full-vocab softmax and returns
-    # `topk_p = ones_like(topk_index)` (the value is unused downstream).
-    # The eager reference must match this for assert_outputs_close.
-    from sglang.srt.utils import is_hip
-
-    if settings.topk == 1 and not is_hip():
-        ret.topk_index = torch.argmax(ret.next_token_logits, dim=-1, keepdim=True)
-        ret.topk_p = torch.ones_like(ret.topk_index, dtype=torch.float32)
-    else:
-        probs = torch.softmax(ret.next_token_logits, dim=-1)
-        ret.topk_p, ret.topk_index = fast_topk(probs, settings.topk, dim=-1)
     return ret
+
+
+def _draft_extend_select_index(
+    batch: ForwardBatch, settings: EagleDraftRunnerSettings
+) -> torch.Tensor:
+    return (
+        torch.arange(
+            batch.batch_size,
+            dtype=torch.int64,
+            device=batch.input_ids.device,
+        )
+        * settings.speculative_num_draft_tokens
+        + batch.spec_info.num_accept_tokens
+        - 1
+    )
 
 
 def run_eagle_draft_extend_cuda_graph_runner_case(
@@ -651,6 +627,11 @@ def run_eagle_draft_extend_cuda_graph_runner_case(
             settings,
         )
         expected = _run_eagle_draft_extend_eager(eager_worker, eager_batch, settings)
+        select_index = _draft_extend_select_index(eager_batch, settings)
+        expected = LogitsProcessorOutput(
+            next_token_logits=expected.next_token_logits[select_index],
+            hidden_states=expected.hidden_states[select_index],
+        )
 
         graph_fixture, graph_worker, graph_backend = _build_eagle_draft_extend_fixture(
             testcase,
@@ -674,7 +655,7 @@ def run_eagle_draft_extend_cuda_graph_runner_case(
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
         testcase.assertTrue(graph_runner.can_run_graph(graph_batch))
-        actual = graph_runner.execute(graph_batch)
+        actual = graph_runner.execute(graph_batch, select_index)
         adapter.assert_outputs_close(actual, expected, settings)
     finally:
         _reset_cuda_graph_test_buffers()
@@ -701,6 +682,8 @@ class _EagleDraftExtendForward(nn.Module):
 
     def _select_logits_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
         if forward_batch.forward_mode.is_draft_extend_v2():
+            if forward_batch.spec_info.select_index is not None:
+                return forward_batch.spec_info.select_index
             return torch.arange(
                 forward_batch.input_ids.shape[0],
                 dtype=torch.int64,
@@ -727,11 +710,12 @@ class _EagleDraftExtendForward(nn.Module):
 
         hidden_states = hidden_states + self.token_embed(input_ids)
         hidden_states = self.module(hidden_states, forward_batch)
-        logits = self.lm_head(hidden_states).float()
         select_index = self._select_logits_positions(forward_batch)
+        hidden_states = hidden_states[select_index]
+        logits = self.lm_head(hidden_states).float()
         return LogitsProcessorOutput(
-            next_token_logits=logits[select_index],
-            hidden_states=hidden_states[select_index],
+            next_token_logits=logits,
+            hidden_states=hidden_states,
         )
 
 

@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.jit_kernel.diffusion.group_norm_silu import apply_group_norm_silu
+from sglang.kernels.ops.diffusion import apply_group_norm_silu
 from sglang.multimodal_gen.configs.models.vaes import HunyuanVAEConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     disable_spatial_parallel_decode,
     gather_and_trim_height,
     gather_variable_height,
+    spatial_parallel_decode_disabled,
     split_height_for_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import (
@@ -100,7 +101,6 @@ def _apply_group_norm_silu(
 
 
 class HunyuanVAEAttention(nn.Module):
-
     def __init__(
         self, in_channels, heads, dim_head, eps, norm_num_groups, bias
     ) -> None:
@@ -126,7 +126,11 @@ class HunyuanVAEAttention(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        *,
+        num_frames: int | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -146,10 +150,30 @@ class HunyuanVAEAttention(nn.Module):
         key = key.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
 
-        # Perform scaled dot-product attention
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        )
+        if num_frames is None:
+            hidden_states = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+        else:
+            # each frame sees all spatial tokens in itself and earlier frames
+            # slicing the key prefix avoids a quadratic whole-video mask
+            tokens_per_frame = sequence_length // num_frames
+            hidden_states = torch.cat(
+                [
+                    F.scaled_dot_product_attention(
+                        query[:, :, start : start + tokens_per_frame],
+                        key[:, :, : start + tokens_per_frame],
+                        value[:, :, : start + tokens_per_frame],
+                    )
+                    for start in range(0, sequence_length, tokens_per_frame)
+                ],
+                dim=2,
+            )
 
         # Reshape back
         hidden_states = hidden_states.transpose(1, 2).reshape(
@@ -167,7 +191,6 @@ class HunyuanVAEAttention(nn.Module):
 
 
 class HunyuanVideoCausalConv3d(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -237,7 +260,6 @@ class HunyuanVideoCausalConv3d(nn.Module):
 
 
 class HunyuanVideoUpsampleCausal3D(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -281,12 +303,13 @@ class HunyuanVideoUpsampleCausal3D(nn.Module):
         else:
             hidden_states = first_frame
 
+        # release interpolation buffers before allocating convolution workspace
+        del first_frame, other_frames
         hidden_states = self.conv(hidden_states)
         return hidden_states
 
 
 class HunyuanVideoDownsampleCausal3D(nn.Module):
-
     def __init__(
         self,
         channels: int,
@@ -309,7 +332,6 @@ class HunyuanVideoDownsampleCausal3D(nn.Module):
 
 
 class HunyuanVideoResnetBlockCausal3D(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -361,7 +383,6 @@ class HunyuanVideoResnetBlockCausal3D(nn.Module):
 
 
 class HunyuanVideoMidBlock3D(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -428,19 +449,25 @@ class HunyuanVideoMidBlock3D(nn.Module):
         self, attn: HunyuanVAEAttention, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         heights = None
-        if self.spatial_parallel:
+        spatial_parallel = (
+            self.spatial_parallel and not spatial_parallel_decode_disabled()
+        )
+        if spatial_parallel:
             hidden_states, heights = gather_variable_height(hidden_states)
 
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         hidden_states = hidden_states.permute(0, 2, 3, 4, 1).flatten(1, 3)
-        attention_mask = prepare_causal_attention_mask(
-            num_frames,
-            height * width,
-            hidden_states.dtype,
-            hidden_states.device,
-            batch_size=batch_size,
-        )
-        hidden_states = attn(hidden_states, attention_mask=attention_mask)
+        if spatial_parallel:
+            hidden_states = attn(hidden_states, num_frames=num_frames)
+        else:
+            attention_mask = prepare_causal_attention_mask(
+                num_frames,
+                height * width,
+                hidden_states.dtype,
+                hidden_states.device,
+                batch_size=batch_size,
+            )
+            hidden_states = attn(hidden_states, attention_mask=attention_mask)
         hidden_states = hidden_states.unflatten(1, (num_frames, height, width)).permute(
             0, 4, 1, 2, 3
         )
@@ -473,7 +500,6 @@ class HunyuanVideoMidBlock3D(nn.Module):
 
 
 class HunyuanVideoDownBlock3D(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -537,7 +563,6 @@ class HunyuanVideoDownBlock3D(nn.Module):
 
 
 class HunyuanVideoUpBlock3D(nn.Module):
-
     def __init__(
         self,
         in_channels: int,

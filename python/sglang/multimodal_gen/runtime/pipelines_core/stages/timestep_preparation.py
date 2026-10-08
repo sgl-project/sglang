@@ -8,6 +8,7 @@ This module contains implementations of timestep preparation stages for diffusio
 """
 
 import inspect
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Tuple
 
@@ -20,7 +21,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils impo
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
-    StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -70,10 +70,6 @@ class TimestepPreparationStage(PipelineStage):
             prepare_extra_set_timesteps_kwargs or []
         )
 
-    @property
-    def parallelism_type(self) -> StageParallelismType:
-        return StageParallelismType.REPLICATED
-
     def forward(
         self,
         batch: Req,
@@ -82,15 +78,20 @@ class TimestepPreparationStage(PipelineStage):
         """
         Prepare timesteps for the diffusion process.
 
-
-
         Returns:
             The batch with prepared timesteps.
         """
         if batch.scheduler is not None and batch.timesteps is not None:
             return batch
 
-        scheduler = get_or_create_request_scheduler(batch, self.scheduler)
+        if batch.rollout:
+            from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
+                get_or_create_rollout_request_scheduler,
+            )
+
+            scheduler = get_or_create_rollout_request_scheduler(batch, self.scheduler)
+        else:
+            scheduler = get_or_create_request_scheduler(batch, self.scheduler)
         device = get_local_torch_device()
         num_inference_steps = batch.num_inference_steps
         timesteps = batch.timesteps
@@ -156,8 +157,14 @@ class TimestepPreparationStage(PipelineStage):
         # Update batch with prepared timesteps
         batch.timesteps = timesteps
         batch.scheduler = scheduler
-        if not batch.is_warmup:
-            self.log_debug("timesteps: %s", timesteps)
+        if not batch.is_warmup and logger.isEnabledFor(logging.DEBUG):
+            # format on cpu to avoid first-use cuda kernels in tensor repr
+            logger.debug(
+                "[%s] timesteps (%s): %s",
+                self.__class__.__name__,
+                timesteps.device,
+                timesteps.detach().cpu(),
+            )
         return batch
 
     def build_dedup_fingerprint(
@@ -210,10 +217,6 @@ class DMDTimestepPreparationStage(PipelineStage):
     def __init__(self, scheduler) -> None:
         super().__init__()
         self.scheduler = scheduler
-
-    @property
-    def parallelism_type(self) -> StageParallelismType:
-        return StageParallelismType.REPLICATED
 
     def forward(
         self,

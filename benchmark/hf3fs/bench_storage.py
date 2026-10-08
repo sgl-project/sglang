@@ -18,11 +18,11 @@ def print_stats(x: List[int]):
     x = sorted(x)
     lenx = len(x)
     print(
-        f"mean = {sum(x)/len(x):.2f}, "
+        f"mean = {sum(x) / len(x):.2f}, "
         f"min = {min(x):.2f}, "
-        f"p25 = {x[int(lenx*0.25)]:.2f}, "
-        f"p50 = {x[int(lenx*0.5)]:.2f}, "
-        f"p75 = {x[int(lenx*0.75)]:.2f}, "
+        f"p25 = {x[int(lenx * 0.25)]:.2f}, "
+        f"p50 = {x[int(lenx * 0.5)]:.2f}, "
+        f"p75 = {x[int(lenx * 0.75)]:.2f}, "
         f"max = {max(x):.2f}"
     )
 
