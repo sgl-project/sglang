@@ -94,11 +94,14 @@ def _zero_c4_boundary(batch: "ScheduleBatch", prefix_lens_cpu: torch.Tensor) -> 
     window = (coff - 1) * ratio  # 4 for c4
     req_to_token = batch.req_to_token_pool.req_to_token
     rp = batch.req_pool_indices.to(torch.int64)
+    total = 0
+    hit_reqs = 0
     for i in range(len(batch.reqs)):
         prefix_len = int(prefix_lens_cpu[i])
         lo = prefix_len - window
         if prefix_len <= 0 or lo < 0:
             continue
+        hit_reqs += 1
         pos = torch.arange(
             lo, prefix_len, device=req_to_token.device, dtype=torch.int64
         )
@@ -117,6 +120,11 @@ def _zero_c4_boundary(batch: "ScheduleBatch", prefix_lens_cpu: torch.Tensor) -> 
                 valid = (sloc >= 0) & (sloc < state.shape[0])
                 if bool(valid.any()):
                     state[sloc[valid]] = 0
+                    total += int(valid.sum().item())
+    print(
+        f"[C4BND] pid={os.getpid()} hit_reqs={hit_reqs} zeroed_rows={total}",
+        flush=True,
+    )
 
 
 def maybe_write_dsv4_extend(
