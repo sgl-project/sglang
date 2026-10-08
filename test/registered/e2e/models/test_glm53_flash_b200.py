@@ -1,12 +1,13 @@
 """B200 per-commit coverage for the GLM-5.3-Flash serving recipes.
 
-Runs the Low Latency, DFlash2, High Throughput, and Prefill CP + MTP recipes on
-four B200 GPUs. All recipes must retain GSM8K accuracy; CP + MTP also checks
-speculative acceptance, and Low Latency checks single-request decode performance.
+Runs the Low Latency, DFlash2, and High Throughput TP4 recipes on four B200
+GPUs. All recipes must retain GSM8K accuracy; the Low Latency recipe also
+checks EAGLE speculative acceptance and single-request decode performance.
 """
 
 import unittest
 
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
@@ -15,11 +16,10 @@ from sglang.test.test_utils import (
     CustomTestCase,
     _wait_for_gpu_idle_in_ci,
     popen_launch_server,
-    terminate_and_kill_process_tree,
     try_cached_model,
 )
 
-register_cuda_ci(est_time=3000, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=2400, stage="base-c", runner_config="4-gpu-b200")
 
 MODEL_PATH = "zai-org/GLM-5.3-Flash"
 DFLASH2_DRAFT_MODEL_PATH = "incoai/GLM-5.3-Flash-DFlash2"
@@ -46,7 +46,7 @@ COMMON_SERVER_ARGS = [
 
 def _stop_server(process):
     if process:
-        terminate_and_kill_process_tree(process)
+        kill_process_tree(process.pid)
         _wait_for_gpu_idle_in_ci(timeout=GPU_IDLE_TIMEOUT)
 
 
