@@ -1,6 +1,44 @@
 from copy import copy
+from typing import Any, Optional
 
+import msgspec
 import torch
+
+
+class FoldedExtend(msgspec.Struct, frozen=True):
+    """An extend batch whose prefix hits start at their replay start."""
+
+    batch: Any  # ScheduleBatch copy fed to ForwardBatch.init_new
+    keep_rows: torch.Tensor  # [original rows] int64, folded-row index of each
+    row_floor: torch.Tensor  # [folded rows] int64
+    compress_skip: torch.Tensor  # [bs] int32, leading replay rows per request
+    num_rows: int
+
+
+def fold_encoder_swa_replay(worker, batch) -> Optional[FoldedExtend]:
+    """Prepend each hit's <=128 replay tokens to its extend instead of replaying."""
+    runner = worker.model_runner
+    window = runner.token_to_kv_pool.request_window
+    if window is None or not batch.forward_mode.is_extend_without_speculative():
+        return None
+    rows = _reset_windows_and_collect_hits(batch=batch, window=window)
+    if not rows:
+        return None
+    return _fold_batch(batch=batch, runner=runner, rows=rows)
+
+
+def apply_folded_extend(folded: FoldedExtend, forward_batch) -> None:
+    forward_batch.encoder_swa_row_floor = folded.row_floor
+    forward_batch.encoder_swa_compress_skip = folded.compress_skip
+    forward_batch.encoder_swa_compress_rows = folded.keep_rows
+
+
+def drop_folded_rows(*, logits_output, folded: FoldedExtend) -> None:
+    """Hand downstream consumers (the DSpark draft) only the original extend rows."""
+    hidden = logits_output.hidden_states
+    if hidden is not None and hidden.shape[0] == folded.num_rows:
+        logits_output.hidden_states = hidden[folded.keep_rows]
+    assert logits_output.hidden_states_token_indices is None
 
 
 def run_encoder_swa_replay(worker, batch):
@@ -99,3 +137,58 @@ def _engram_history(*, reqs, starts, runner):
         ids = list(r.full_untruncated_fill_ids[max(0, s - n) : s])
         hist.append([0] * (n - len(ids)) + ids)
     return torch.tensor(hist, dtype=torch.int32, device=runner.device)
+
+
+def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
+    bs = len(batch.reqs)
+    device = runner.device
+    replay = [0] * bs
+    for i, s, e in rows:
+        replay[i] = e - s
+    ext = list(batch.extend_lens)
+    pre = [p - r for p, r in zip(batch.prefix_lens, replay)]
+    new_ext = [x + r for x, r in zip(ext, replay)]
+    req_to_token = runner.req_to_token_pool.req_to_token
+    ids, locs, keep, cpu_ids = [], [], [], []
+    off = fold_off = 0
+    for i, req in enumerate(batch.reqs):
+        r, n = replay[i], ext[i]
+        if r:
+            head = list(req.full_untruncated_fill_ids[pre[i] : pre[i] + r])
+            ids.append(torch.tensor(head, dtype=batch.input_ids.dtype, device=device))
+            locs.append(req_to_token[batch.req_pool_indices[i], pre[i] : pre[i] + r].long())
+            cpu_ids.append(torch.tensor(head, dtype=torch.int64))
+        ids.append(batch.input_ids[off : off + n])
+        locs.append(batch.out_cache_loc[off : off + n].long())
+        if batch.prefill_input_ids_cpu is not None:
+            cpu_ids.append(batch.prefill_input_ids_cpu[off : off + n].to(torch.int64))
+        keep.append(torch.arange(fold_off + r, fold_off + r + n))
+        off += n
+        fold_off += r + n
+
+    folded = copy(batch)
+    folded.input_ids = torch.cat(ids)
+    folded.out_cache_loc = torch.cat(locs)
+    folded.prefill_input_ids_cpu = (
+        torch.cat(cpu_ids) if batch.prefill_input_ids_cpu is not None else None
+    )
+    folded.prefix_lens = pre
+    folded.extend_lens = new_ext
+    folded.extend_num_tokens = fold_off
+    if batch.extend_logprob_start_lens is not None:
+        folded.extend_logprob_start_lens = [
+            x + r for x, r in zip(batch.extend_logprob_start_lens, replay)
+        ]
+    if batch.engram_history is not None:
+        folded.engram_history = _engram_history(reqs=batch.reqs, starts=pre, runner=runner)
+    floor = torch.tensor([p if r else 0 for p, r in zip(pre, replay)], dtype=torch.int64)
+    row_floor = torch.repeat_interleave(
+        floor, torch.tensor(new_ext), output_size=fold_off
+    )
+    return FoldedExtend(
+        batch=folded,
+        keep_rows=torch.cat(keep).to(device, non_blocking=True),
+        row_floor=row_floor.to(device, non_blocking=True),
+        compress_skip=torch.tensor(replay, dtype=torch.int32).to(device, non_blocking=True),
+        num_rows=fold_off,
+    )
