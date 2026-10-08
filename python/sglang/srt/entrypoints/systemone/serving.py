@@ -29,6 +29,7 @@ from sglang.srt.entrypoints.openai.serving_decisions import (
     render_text,
 )
 from sglang.srt.entrypoints.systemone.joint_schema import (
+    REFERENCE_MAX_LENGTH,
     encode_joint_schema,
     joint_schema_options,
 )
@@ -139,11 +140,14 @@ class SystemOneServing(OpenAIServingDecisions):
         self, adapted_request: EmbeddingReqInput, request: SystemOneRequest
     ) -> None:
         tokenizer_manager = self.tokenizer_manager
-        max_length = max_joint_prompt_tokens(
-            context_len=tokenizer_manager.context_len,
-            num_reserved_tokens=tokenizer_manager.num_reserved_tokens,
-            max_req_input_len=tokenizer_manager.max_req_input_len,
-            max_prefill_tokens=get_schedule().max_prefill_tokens,
+        max_length = min(
+            REFERENCE_MAX_LENGTH,
+            max_joint_prompt_tokens(
+                context_len=tokenizer_manager.context_len,
+                num_reserved_tokens=tokenizer_manager.num_reserved_tokens,
+                max_req_input_len=tokenizer_manager.max_req_input_len,
+                max_prefill_tokens=get_schedule().max_prefill_tokens,
+            ),
         )
         image_token_counts = []
         if adapted_request.image_data:

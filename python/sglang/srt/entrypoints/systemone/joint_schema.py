@@ -38,6 +38,8 @@ _NOUL_CRITERIA = {
     "true": "The proposition is true or the answer is yes.",
     "false": "The proposition is false or the answer is no.",
 }
+# The default max_length of encode_record and systemone in joint_schema_model.py.
+REFERENCE_MAX_LENGTH = 16384
 
 
 def _render(value: Any) -> str:

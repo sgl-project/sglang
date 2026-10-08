@@ -36,7 +36,7 @@ import { config } from "/src/snippets/configs/Cloudflare/clef.jsx"
 - **Route.** Send requests to `/v1/systemone`. Clients of the System One API, including the TypeSafe SDKs, work by pointing their base URL at the server. See [System One compatible API](/docs/supported-models/decision_models#system-one-compatible-api) for the request and response reference. `/v1/decisions`, chat, and generation requests are refused, because the checkpoint answers through its head rather than its language model head.
 - **One prefill per request.** All questions of a request share one prompt, so the state is read once however many questions you ask. SGLang serves these checkpoints in embedding mode without radix cache, chunked prefill, or CUDA graphs, and with `--tp-size 1`.
 - **Answers.** `probabilities` are the softmax of the head's logits for each question, and `confidence` uses the same formulas as other models on this route. Answers omit `x_label_mass`, because the head scores only the allowed options.
-- **Long states.** A state that does not fit the context length is truncated so that every question still fits, as in the checkpoint's reference code.
+- **Long states.** The prompt, images included, holds at most 16,384 tokens, the default `max_length` of the checkpoint's reference `encode_record`, or fewer when the server's context length, KV cache, or `--max-prefill-tokens` is smaller. A longer state is truncated so that every question still fits, as in the reference code.
 - **Images.** Pass each image in `images` as base64 bytes or a URL. They precede the state, as in the reference code.
 
 ## 3. Advanced Usage
