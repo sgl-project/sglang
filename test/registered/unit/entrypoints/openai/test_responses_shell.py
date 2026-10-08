@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 
 import pytest
 from utils import engine_chunk, event_payloads, make_serving
@@ -519,3 +520,7 @@ def test_native_shell_rejects_conflicting_template_tool_definitions(
     assert response.status_code == 400
     assert "managed by Responses built-in tools" in response.body.decode()
     serving.tokenizer_manager.generate_request.assert_not_called()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
