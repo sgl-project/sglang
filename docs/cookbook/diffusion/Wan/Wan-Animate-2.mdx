@@ -323,6 +323,32 @@ synchronizes the device so the per-stage timings are accurate.
   </Tab>
 </Tabs>
 
+### 5.1 Native regression coverage
+
+A separate regression used two B300 GPUs, CFG-parallel with replicated encoders
+and serial VAE decode, a 576x1024 area budget, 40 steps, `clip_len=37`, CFG=3,
+and seed 42. The driving input was looped to 64 frames to exercise two clips;
+this is a bounded regression workload, not a long-video quality benchmark.
+Both revisions (`4ee69b4cf9ea` and `04725c1c2900`) used PyTorch 2.14.1+cu130,
+Transformers 5.19.0, Diffusers 0.37.0, and FlashAttention 4.0.0b34 on the same node.
+
+Cold and warm raw RGB outputs were byte-identical to the pre-optimization native
+implementation, both with resident DiT weights and with layerwise DiT offload.
+The single warm samples measured 112.29 s before and 112.40 s after optimization;
+offload measured 113.46 s. This does not establish a significant latency change.
+Rank 0's request-stage peak allocated memory was 52.24, 52.23, and 23.93 GiB,
+respectively; these are not loading peaks or whole-device physical memory peaks.
+
+An H200 HTTP smoke test also covered image upload, asynchronous job polling and
+download, request warmup, repeated requests, URL video input, and reference-audio
+passthrough. Repeated decoded RGB outputs were identical.
+
+These checks preserve the existing native output, not bitwise parity with the
+newer Diffusers modular pipeline. The native sampler follows the original Wan
+sigma grid starting at exactly 1.0 and retains its BF16 conditioning conversion;
+the modular pipeline's sampling and preprocessing differ. Official-reference
+accuracy must be validated separately with pinned versions and aligned settings.
+
 ## 6. Troubleshooting
 
 - **OOM**: lower `clip_len` (for example `37` instead of `65`/`81`) or add `--dit-layerwise-offload --layerwise-offload-components transformer`.

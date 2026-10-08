@@ -2,8 +2,8 @@
 # Adapted from the Wan-Animate-2 reference implementation (Apache-2.0):
 # https://github.com/Wan-Video/Wan-Animate-2
 #
-# Preprocessing helpers for the Wan-Animate-2 pipeline. diffusers ships no equivalent;
-# their exact numerics feed the conditioning tensors, so do not alter them. The
+# Keep the original Wan preprocessing numerics; the newer Diffusers modular
+# processor is not a numerically interchangeable replacement. The
 # zigzag_padding / resize_by_area names are kept for parity with the official helpers;
 # make_conditioning_mask is the official get_i2v_mask.
 from __future__ import annotations
