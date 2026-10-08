@@ -434,6 +434,42 @@ class TestDPBalanceMetrics(CustomTestCase):
             get("sglang:dp_attention_sync_wait_seconds_sum", labels), 0.006
         )
 
+    def test_ratio_ladder_keeps_widely_supported_boundaries(self):
+        # Downstream metrics gateways with a fixed bucket preset drop the series
+        # when a boundary is not in it; pin the ladder so an edit cannot regress that.
+        reporter, registry, labels = self._reporter_with_collector(attn_dp_rank=0)
+        batch = types.SimpleNamespace(
+            dp_balance_stats=DPBalanceStats.create(4, [8, 4], 0.002)
+        )
+        reporter.log_batch_result_stats(batch, result=object())
+
+        bounds = [
+            float(sample.labels["le"])
+            for metric in registry.collect()
+            if metric.name == "sglang:dp_attention_token_imbalance_ratio"
+            for sample in metric.samples
+            if sample.name.endswith("_bucket") and sample.labels["le"] != "+Inf"
+        ]
+        self.assertEqual(
+            bounds,
+            [
+                1.0,
+                1.5,
+                2.0,
+                2.5,
+                3.0,
+                4.0,
+                5.0,
+                7.5,
+                10.0,
+                15.0,
+                20.0,
+                30.0,
+                45.0,
+                60.0,
+            ],
+        )
+
     def test_engine_ratio_reported_by_dp_rank_zero_only(self):
         reporter, registry, labels = self._reporter_with_collector(attn_dp_rank=1)
         batch = types.SimpleNamespace(
