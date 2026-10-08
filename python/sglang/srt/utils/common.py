@@ -4283,6 +4283,23 @@ def find_local_repo_dir(
     return None
 
 
+def download_hf_file_if_exists(repo_id: str, filename: str, **kwargs) -> Optional[str]:
+    import huggingface_hub
+    from huggingface_hub.errors import LocalEntryNotFoundError, RemoteEntryNotFoundError
+
+    try:
+        return huggingface_hub.hf_hub_download(
+            repo_id=repo_id, filename=filename, **kwargs
+        )
+    except RemoteEntryNotFoundError:
+        return None
+    except LocalEntryNotFoundError:
+        # Offline, a file missing from the cache is absent; online, the Hub failed.
+        if huggingface_hub.constants.HF_HUB_OFFLINE or kwargs.get("local_files_only"):
+            return None
+        raise
+
+
 def read_system_prompt_from_file(model_name: str) -> str:
     """Read system prompt from a file in the HuggingFace cache directory.
 

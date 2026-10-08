@@ -8,7 +8,6 @@ from __future__ import annotations
 import collections
 import concurrent.futures
 import dataclasses
-import fnmatch
 import gc
 import glob
 import hashlib
@@ -67,7 +66,6 @@ except ImportError:
     init_empty_weights = None
     get_max_memory = None
 
-from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
@@ -98,7 +96,7 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
 )
-from sglang.srt.utils.common import is_cuda_alike
+from sglang.srt.utils.common import download_hf_file_if_exists, is_cuda_alike
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
@@ -2603,13 +2601,11 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 if os.path.exists(config_file_path):
                     break
         else:
-            hf_api = HfApi()
-            repo_files = hf_api.list_repo_files(repo_id=qlora_adapter)
             for file in self.possible_config_file_names:
-                if file in repo_files:
-                    config_file_path = hf_hub_download(
-                        repo_id=qlora_adapter, filename=file
-                    )
+                config_file_path = download_hf_file_if_exists(
+                    repo_id=qlora_adapter, filename=file
+                )
+                if config_file_path:
                     break
 
         if not config_file_path:
@@ -2634,19 +2630,18 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 if weight_files:
                     return weight_files, pattern
         else:
-            hf_api = HfApi()
-            repo_files = hf_api.list_repo_files(repo_id=model_name_or_path)
+            # Downloads only the first pattern the repo has, checking the cache first.
+            hf_folder = download_weights_from_hf(
+                model_name_or_path,
+                self.load_config.download_dir,
+                allowed_patterns,
+                revision,
+                ignore_patterns=self.load_config.ignore_patterns,
+            )
             for pattern in allowed_patterns:
-                matching_files = fnmatch.filter(repo_files, pattern)
-                if matching_files:
-                    hf_folder = download_weights_from_hf(
-                        model_name_or_path,
-                        self.load_config.download_dir,
-                        [pattern],
-                        revision,
-                        ignore_patterns=self.load_config.ignore_patterns,
-                    )
-                    return glob.glob(os.path.join(hf_folder, pattern)), pattern
+                weight_files = glob.glob(os.path.join(hf_folder, pattern))
+                if weight_files:
+                    return weight_files, pattern
 
         raise RuntimeError(f"No model weights found in: `{model_name_or_path}`")
 
