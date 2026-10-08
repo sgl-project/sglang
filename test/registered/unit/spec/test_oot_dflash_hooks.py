@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch, sentinel
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
+    _handle_dflash,
     _resolve_dflash_draft_attention_backend,
 )
 from sglang.srt.platforms.interface import SRTPlatform
@@ -62,6 +63,37 @@ class TestOOTDFlashHooks(CustomTestCase):
             _resolve_dflash_draft_attention_backend(args)
         # Resolvers declare into the stash; they never write the field.
         return resolution_result(args, "speculative_draft_attention_backend")
+
+    def test_cuda_dp_requires_a_local_draft_head_and_supported_collectives(self):
+        for fields, error in (
+            ({}, None),
+            ({"enable_dp_lm_head": False}, "enable-dp-lm-head"),
+            ({"attn_cp_size": 2}, "context parallel"),
+            ({"moe_a2a_backend": "deepep"}, "moe_a2a_backend"),
+        ):
+            with self.subTest(fields=fields):
+                options = {
+                    "model_path": "dummy",
+                    "device": "cuda",
+                    "tp_size": 4,
+                    "dp_size": 2,
+                    "enable_dp_attention": True,
+                    "enable_dp_lm_head": True,
+                    "speculative_algorithm": "DFLASH",
+                    "speculative_draft_model_path": "draft",
+                    "speculative_num_draft_tokens": 16,
+                }
+                options.update(fields)
+                args = ServerArgs(**options)
+                with patch(f"{HOOK_MODULE}._resolve_dflash_draft_attention_backend"):
+                    if error is not None:
+                        with self.assertRaisesRegex(ValueError, error):
+                            _handle_dflash(args)
+                    else:
+                        _handle_dflash(args)
+                        self.assertEqual(
+                            resolution_result(args, "speculative_num_steps"), 1
+                        )
 
     def test_explicit_backends_follow_platform_capabilities(self):
         cases = (
