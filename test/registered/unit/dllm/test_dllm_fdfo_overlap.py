@@ -16,6 +16,7 @@ from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -319,7 +320,7 @@ class TestDllmResultProcessing(unittest.TestCase):
                 dllm_block_id=1,
                 dllm_incomplete_ids=array("q"),
                 dllm_algo_state=None,
-                finished=lambda: finished,
+                finished=lambda: finished and bool(req.accepted),
                 kv=SimpleNamespace(req_pool_idx=1),
                 time_stats=SimpleNamespace(set_completion_time=lambda: None),
             )
@@ -331,6 +332,7 @@ class TestDllmResultProcessing(unittest.TestCase):
         scheduler = SimpleNamespace(
             future_map=future_map,
             forward_stream_ctx=nullcontext(),
+            enable_overlap=True,
             tree_cache=None,
             dllm_config=SimpleNamespace(block_size=4, first_done_first_out_mode=fdfo),
             token_to_kv_pool_allocator=SimpleNamespace(
@@ -342,6 +344,9 @@ class TestDllmResultProcessing(unittest.TestCase):
             output_streamer=SimpleNamespace(
                 stream_output=lambda *args: streamed.append(True)
             ),
+        )
+        scheduler._clear_dllm_future = lambda req: Scheduler._clear_dllm_future(
+            scheduler, req
         )
         batch = SimpleNamespace(
             reqs=[req],

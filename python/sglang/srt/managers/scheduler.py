@@ -3602,7 +3602,7 @@ class Scheduler(
         buf = self.future_map.dllm_block_tokens_buf
         slot = req.kv.req_pool_idx
         if buf is not None and slot is not None:
-            with self.forward_stream_ctx:
+            with self.forward_stream_ctx if self.enable_overlap else nullcontext():
                 buf[slot] = -1
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
@@ -5328,11 +5328,16 @@ class Scheduler(
                 recv_req.abort_all, recv_req.rid
             ):
                 self._release_aborted_request(req)
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    _make_abort_req(req), req
-                )
+                req.finished_reason = FINISH_ABORT(recv_req.abort_message)
+                req.to_finish = None
+                req.finished_output = True
                 if req.kv.holds_kv or req.kv.holds_mamba:
+                    if self.dllm_config.first_done_first_out_mode:
+                        self._clear_dllm_future(req)
                     release_kv_cache(req, self.tree_cache, is_insert=False)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    _make_abort_req(req, finished_reason=recv_req.finished_reason), req
+                )
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue

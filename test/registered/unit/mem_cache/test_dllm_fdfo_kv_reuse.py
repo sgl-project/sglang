@@ -201,6 +201,7 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
                     self.assertEqual(manager.staging_queue, [])
                     scheduler = Scheduler.__new__(Scheduler)
                     scheduler.dllm_config = config
+                    scheduler.enable_overlap = True
                     scheduler.req_to_token_pool = self.pool
                     scheduler.tree_cache = ChunkCache(
                         SimpleNamespace(

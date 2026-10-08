@@ -89,9 +89,12 @@ class SchedulerDllmMixin:
 
         self.token_to_kv_pool_allocator.free_group_begin()
         for idx, req in enumerate(batch.reqs):
-            # Overlap may leave one extra result
-            # block_id doesn't match means a new block is opened, dllm_block_done indicates the req is already done
-            if result.dllm_block_ids[idx] != req.dllm_block_id or req.dllm_block_done:
+            if (
+                req.finished() # Ignore retired requests
+                # Overlap may leave one extra result
+                or result.dllm_block_ids[idx] != req.dllm_block_id # block_id doesn't match means a new block is opened
+                or req.dllm_block_done # dllm_block_done indicates the req is already done
+            ):
                 continue
 
             next_token_ids = block_tokens[idx]
@@ -128,10 +131,7 @@ class SchedulerDllmMixin:
 
             if req.finished():
                 if fdfo_mode:
-                    buf = self.future_map.dllm_block_tokens_buf
-                    if buf is not None:
-                        with self.forward_stream_ctx:
-                            buf[req.kv.req_pool_idx] = -1
+                    self._clear_dllm_future(req)
                 release_kv_cache(req, self.tree_cache)
                 req.time_stats.set_completion_time()
 
