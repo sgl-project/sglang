@@ -4,9 +4,10 @@ import unittest
 
 import torch
 
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 BLOCK, TOPK, HEADS, DIM = 128, 16, 4, 128
 INIT_BLOCKS, LOCAL_BLOCKS = 1, 2
@@ -100,7 +101,9 @@ def _cp_topk(q, cache, table, slots, lengths, max_len, k_scale, packed_queries=1
     return [merge_candidates(gathered_keys, head) for head in range(HEADS)]
 
 
-@unittest.skipUnless(torch.version.hip, "MiniMax indexer CP is gfx950-only")
+@unittest.skipUnless(
+    is_hip() and is_gfx95_supported(), "MiniMax indexer CP is gfx950-only"
+)
 class TestMiniMaxIndexerCP(unittest.TestCase):
     def test_sharded_selection_matches_the_native_selector(self):
         device = torch.device("cuda")
