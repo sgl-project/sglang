@@ -116,6 +116,13 @@ use parking_lot::{Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, error};
 
+use super::pending::PendingPrefixes;
+
+mod snapshot;
+
+pub(super) use snapshot::ShapeViolation;
+pub use snapshot::{RestoreError, SnapshotNode};
+
 /// Number of independent tree shards. A power of two so `shard_of` selects
 /// with a shift, not a modulo; large enough that distinct chains rarely
 /// collide, small enough that a per-shard `RwLock` + arena is free.
@@ -312,6 +319,32 @@ impl Tiers {
     /// the individual tiers rather than from raw bit arithmetic.
     pub const fn union(self, other: Tiers) -> Tiers {
         Tiers(self.0 | other.0)
+    }
+
+    /// Raw bits, for the one place a tier set crosses a process boundary:
+    /// [`SnapshotNode::tiers`].
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Read a [`SnapshotNode::tiers`] entry back, keeping only the tiers this
+    /// build ranks.
+    ///
+    /// Follows [`Self::for_store`]'s rule, not [`Self::for_remove`]'s, because
+    /// a restore *is* a store: a bit this build does not know is dropped, and
+    /// an entry naming only unknown bits comes back empty so
+    /// [`HashTree::restore_snapshot`] skips that carrier entirely. The two
+    /// alternatives are both worse than one cold prefill — folding an unknown
+    /// bit onto device turns a future tier's carrier into a preferred device
+    /// owner here, and widening to [`Self::ALL`] invents holdings the
+    /// producer never claimed.
+    ///
+    /// Zero reads as empty for the same reason. It cannot come from a
+    /// same-build producer (every exported carrier holds at least one bit),
+    /// so it is either a malformed producer or a carrier that holds only
+    /// tiers this build has no name for.
+    pub const fn from_bits(bits: u8) -> Tiers {
+        Tiers(bits & Self::ALL.0)
     }
 }
 
@@ -674,6 +707,22 @@ impl TreeState {
         Some(id)
     }
 
+    /// The child of `parent_id` keyed by `block_hash`, created with
+    /// `parent_block_hash` as its breadcrumb when absent. `None` only when
+    /// `parent_id` itself is missing — see [`Self::create_child`].
+    fn child_or_create(
+        &mut self,
+        parent_id: NodeId,
+        block_hash: i64,
+        parent_block_hash: Option<i64>,
+    ) -> Option<NodeId> {
+        let existing = self
+            .nodes
+            .get(&parent_id)
+            .and_then(|n| n.children.get(&block_hash).copied());
+        existing.or_else(|| self.create_child(parent_id, block_hash, parent_block_hash))
+    }
+
     /// Pick the parent node id for an incoming `BlockStored` event, given
     /// that this shard is already known to own (or be the fallback for)
     /// the chain.
@@ -751,20 +800,12 @@ impl TreeState {
         // Occupancy is booked once for the whole chain, not per block.
         let mut delta = TierCounts::default();
         for &h in block_hashes {
-            let child_id = match self
-                .nodes
-                .get(&current)
-                .and_then(|n| n.children.get(&h).copied())
-            {
-                Some(id) => id,
-                // `break`, not `return`: the tier bits are already written
-                // into the nodes visited so far, so bailing without reaching
-                // `account_add` below would leave the occupancy gauge
-                // permanently short by exactly those blocks.
-                None => match self.create_child(current, h, prev_hash) {
-                    Some(id) => id,
-                    None => break,
-                },
+            // `break`, not `return`: the tier bits are already written into
+            // the nodes visited so far, so bailing without reaching
+            // `account_add` below would leave the occupancy gauge permanently
+            // short by exactly those blocks.
+            let Some(child_id) = self.child_or_create(current, h, prev_hash) else {
+                break;
             };
             let Some(child) = self.nodes.get_mut(&child_id) else {
                 error!(
@@ -1146,6 +1187,8 @@ pub struct HashTree {
     /// cross-shard scan that chose its target are atomic against the other
     /// writer. Readers never take it.
     writer: Mutex<()>,
+    /// Route-time predictions, kept apart from the event-driven shards.
+    pending: PendingPrefixes,
 }
 
 impl Default for HashTree {
@@ -1163,7 +1206,12 @@ impl HashTree {
         Self {
             shards,
             writer: Mutex::new(()),
+            pending: PendingPrefixes::default(),
         }
+    }
+
+    pub fn pending(&self) -> &PendingPrefixes {
+        &self.pending
     }
 
     /// Resolve an `insert`'s `parent_hash` over the COMPLETE carrier set and
@@ -1426,12 +1474,14 @@ impl HashTree {
     ///
     /// Fans out: a worker can hold chains in many shards. Also the
     /// scale-down path (`KvEventIndex::remove_worker`), which runs off the
-    /// pump task — hence [`Self::writer`].
+    /// pump task — hence [`Self::writer`]. Pending prefixes are per URL, so
+    /// clearing any rank drops the whole worker's.
     pub fn clear_worker(&self, worker: &KvWorkerId) {
         let _writer = self.writer.lock();
         for shard in &self.shards {
             shard.write().clear_worker(worker);
         }
+        self.pending.forget_worker(&worker.url);
     }
 
     /// Find the longest path from the root that matches a prefix of
@@ -1711,19 +1761,25 @@ impl HashTree {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+mod test_support {
     use super::*;
 
-    fn worker(url: &str, dp_rank: u32) -> KvWorkerId {
+    pub(super) fn worker(url: &str, dp_rank: u32) -> KvWorkerId {
         KvWorkerId {
             url: url.to_string(),
             dp_rank,
         }
     }
 
-    fn workers(ids: &[&KvWorkerId]) -> HashSet<KvWorkerId> {
+    pub(super) fn workers(ids: &[&KvWorkerId]) -> HashSet<KvWorkerId> {
         ids.iter().map(|w| (*w).clone()).collect()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{worker, workers};
+    use super::*;
 
     /// One descent answers for every worker at its *own* depth, where
     /// `match_prefix` names only whoever sits at the deepest matched node.

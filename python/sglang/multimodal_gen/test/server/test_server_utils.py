@@ -783,11 +783,18 @@ class PerformanceValidator:
             and math.isfinite(expected_load_ms)
             and expected_load_ms > 0
         ), "Load baseline missing or invalid"
+        # Startup time swings with the runner's page-cache state far more than
+        # request latency does, so a profile may give it its own tolerance.
+        load_tolerance = (
+            self.tolerances.load
+            if self.tolerances.load is not None
+            else self.tolerances.e2e
+        )
         self._assert_le(
             "Load Latency (excluding warmup)",
             load_ms,
             expected_load_ms,
-            self._timing_tol(self.tolerances.e2e),
+            self._timing_tol(load_tolerance),
         )
 
     def _validate_denoise_agg(self, summary: PerformanceSummary) -> None:
@@ -1720,6 +1727,9 @@ def get_generate_fn(
         action_dim = int(extra.get("action_dim", 32))
         state_dim = int(extra.get("state_dim", action_dim))
         image_size = int(extra.get("image_size", 64))
+        # Policies with a fixed camera resolution (e.g. DROID 360x640) set both.
+        image_height = int(extra.get("image_height", image_size))
+        image_width = int(extra.get("image_width", image_size))
         camera_order = tuple(
             extra.get(
                 "camera_order",
@@ -1735,8 +1745,8 @@ def get_generate_fn(
             }
 
         def image_payload(camera_index: int):
-            y = np.arange(image_size, dtype=np.uint16)[:, None]
-            x = np.arange(image_size, dtype=np.uint16)[None, :]
+            y = np.arange(image_height, dtype=np.uint16)[:, None]
+            x = np.arange(image_width, dtype=np.uint16)[None, :]
             image = np.stack(
                 (
                     (x + camera_index * 17) % 256 + np.zeros_like(y),

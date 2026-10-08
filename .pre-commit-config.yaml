@@ -29,13 +29,13 @@ repos:
     rev: 7.0.0
     hooks:
       - id: isort
-        exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$'
+        exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$|^python/sglang/(api|json)/v1/.*\.py$'
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.1
     hooks:
       - id: ruff
         args:
-          - --select=F401,F821,UP037
+          - --select=F401,F821,F823,UP037
           - --fix
         files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-model-gateway/py_*|test/)
         exclude: |
@@ -47,9 +47,10 @@ repos:
           python/sglang/srt/grpc/.*_pb2_grpc\.py$|
           python/sglang/srt/grpc/.*_pb2\.pyi$|
           python/sglang/srt/grpc/.*_pb2_grpc\.pyi$|
+          python/sglang/(api|json)/v1/.*\.py$|
           )$
       - id: ruff-format
-        exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$'
+        exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$|^python/sglang/(api|json)/v1/.*\.py$'
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
     hooks:
@@ -141,16 +142,16 @@ repos:
         # left (combining --fix with -D warnings can abort the fix phase), then
         # cover sglang-mm's PyO3 bindings + rayon fan-out — both sit behind
         # non-default features, so `--workspace` alone never compiles them. protoc
-        # is not required: sglang-grpc's build.rs falls back to a vendored binary.
+        # is not required: the shared protocol crate falls back to a vendored binary.
         entry: bash -c 'cd rust && cargo clippy --workspace --fix --allow-dirty --allow-staged && cargo clippy --workspace -- -D warnings && cargo clippy -p sglang-mm --features python,parallel --lib -- -D warnings && cargo clippy --manifest-path sglang-radix-tree/Cargo.toml --all-targets --no-default-features --features tch/doc-only -- -D warnings'
         language: system
-        files: ^rust/.*\.rs$
+        files: ^(rust/.*\.(rs|toml)|proto/.*\.(rs|proto|toml))$
         pass_filenames: false
       - id: rustfmt-rust-workspace
         name: rustfmt rust/ workspace
         entry: bash -c 'cd rust && cargo fmt && cargo fmt --manifest-path sglang-radix-tree/Cargo.toml'
         language: system
-        files: ^rust/.*\.rs$
+        files: ^(rust/.*\.(rs|toml)|proto/.*\.(rs|proto|toml))$
         pass_filenames: false
       - id: mint-broken-links
         name: check docs links (Mintlify; opt-in, requires `mint` on PATH)
