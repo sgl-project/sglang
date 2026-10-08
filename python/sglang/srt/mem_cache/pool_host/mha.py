@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -152,6 +153,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             pool_label=pool_label,
         )
         self.element_dim = self.head_num * self.head_dim
+        self._init_device_row_stride(
+            buf
+            for pool in (self.device_pool, *self.mtp_draft_device_pools)
+            if pool is not None
+            for side in ("k_buffer", "v_buffer")
+            for buf in getattr(pool, side, None) or ()
+        )
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged
         # write-back kernel has a ROCm path, so enable them on HIP too. This
@@ -268,7 +276,12 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.staging_k_buffer = None
         self.staging_v_buffer = None
         self.can_use_write_back_jit = False
-        if self.layout != "page_first":
+        # The staged kernel reads whole device pages, so it needs packed rows.
+        if (
+            self.layout != "page_first"
+            or not self.device_rows_packed
+            or not current_platform.capabilities.hicache_device_kernels
+        ):
             return
         page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
         staging = prepare_mha_write_back_staging(
@@ -328,6 +341,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         element_dim=self.element_dim,
                     )
                 else:
+                    self._require_packed_device_rows("transfer_kv_per_layer")
                     transfer_kv_per_layer(
                         src_k=self.k_buffer[host_layer_id],
                         dst_k=device_pool.k_buffer[device_layer_id],
@@ -353,6 +367,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         element_dim=self.element_dim,
                     )
                 else:
+                    self._require_packed_device_rows("transfer_kv_per_layer_pf_lf")
                     transfer_kv_per_layer_pf_lf(
                         src_k=self.k_buffer,
                         dst_k=device_pool.k_buffer[device_layer_id],
@@ -365,6 +380,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         src_layout_dim=self.layout_dim,
                     )
             elif self.layout == "page_head":
+                self._require_packed_device_rows("transfer_kv_per_layer_ph_lf")
                 transfer_kv_per_layer_ph_lf(
                     src_k=self.k_buffer,
                     dst_k=device_pool.k_buffer[device_layer_id],
@@ -489,10 +505,11 @@ class MHATokenToKVPoolHost(HostKVCache):
                         v_ptr_src=device_v_data_ptrs,
                         indices_src=device_indices,
                         kv_cache_dst_stride_bytes=self.token_stride_size,
-                        kv_cache_src_stride_bytes=self.token_stride_size,
+                        kv_cache_src_stride_bytes=self.device_row_stride_bytes,
                         element_size=self.element_dim * self.dtype.itemsize,
                     )
                 else:
+                    self._require_packed_device_rows("transfer_kv_all_layer")
                     transfer_kv_all_layer(
                         src_k_layers=device_k_data_ptrs,
                         dst_k_layers=self.k_data_ptrs,
@@ -516,7 +533,23 @@ class MHATokenToKVPoolHost(HostKVCache):
                         dst_v=self.v_buffer,
                         page_size=self.page_size,
                     )
+                elif self.can_use_jit and not self.device_rows_packed:
+                    # The per-layer host views of page_first rows sit
+                    # `layout_dim` apart, which the all-layer kernel can step.
+                    jit_transfer_hicache_all_layer(
+                        page_size=self.page_size,
+                        k_ptr_dst=self.k_data_ptrs,
+                        v_ptr_dst=self.v_data_ptrs,
+                        indices_dst=host_indices,
+                        k_ptr_src=device_k_data_ptrs,
+                        v_ptr_src=device_v_data_ptrs,
+                        indices_src=device_indices,
+                        kv_cache_dst_stride_bytes=self.layout_dim,
+                        kv_cache_src_stride_bytes=self.device_row_stride_bytes,
+                        element_size=self.element_dim * self.dtype.itemsize,
+                    )
                 else:
+                    self._require_packed_device_rows("transfer_kv_all_layer_lf_pf")
                     transfer_kv_all_layer_lf_pf(
                         src_k_layers=device_k_data_ptrs,
                         dst_k=self.k_buffer,
@@ -529,6 +562,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         num_layers=self.layer_num,
                     )
             elif self.layout == "page_head":
+                self._require_packed_device_rows("transfer_kv_all_layer_lf_ph")
                 transfer_kv_all_layer_lf_ph(
                     src_k_layers=device_k_data_ptrs,
                     dst_k=self.k_buffer,
@@ -794,6 +828,8 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
+        # HostPoolGroup ANDs this over its pools; this pool skips HostKVCache.__init__
+        self.can_use_write_back_jit = False
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
