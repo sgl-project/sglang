@@ -269,10 +269,16 @@ class TritonAttnBackend(AttentionBackend):
             use_mla=self.use_mla,
             use_verify_splitkv=self.use_verify_splitkv,
         )
-        # decode reuses the verify kernel as one extend row per request
+        # M3's EAGLE3 draft also runs draft extend and draft decode through the verify kernel
+        self.use_shared_kv_for_draft_steps = (
+            self.use_verify_shared_kv
+            and model_runner.is_draft_worker
+            and is_minimax_sparse(target_hf_config)
+        )
+        # decode is one extend row per request
         self._decode_shared_kv_qo_indptr = (
             torch.arange(max_bs + 1, dtype=torch.int32, device=model_runner.device)
-            if self.use_verify_shared_kv and not self.use_mla
+            if self.use_shared_kv_for_draft_steps
             else None
         )
         # TODO: this logic should be fixed in non-hip platform
@@ -1808,7 +1814,7 @@ class TritonAttnBackend(AttentionBackend):
         # sliding-window / ragged / topk>1), so we fall through to
         # extend_attention_fwd below. Correctness is never at risk.
         # Route target-verify to the grouped-head kernel when eligible, else the
-        # per-head split-KV kernel. The v2 draft-extend is the same constant-length chain.
+        # per-head split-KV kernel. M3's v2 draft-extend is the same constant-length chain.
         if self.use_verify_shared_kv:
             verify_fwd = self.verify_shared_kv_fwd
         elif self.use_verify_splitkv:
@@ -1820,7 +1826,10 @@ class TritonAttnBackend(AttentionBackend):
             and score_mod is None
             and (
                 forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
+                or (
+                    self.use_shared_kv_for_draft_steps
+                    and forward_batch.forward_mode.is_draft_extend_v2()
+                )
             )
             and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
