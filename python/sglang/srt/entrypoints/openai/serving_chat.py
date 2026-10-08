@@ -106,6 +106,7 @@ from sglang.srt.parser.hunyuan_reasoning import (
 )
 from sglang.srt.parser.jinja_template_utils import (
     MEDIA_URL_PART_TYPES,
+    jinja_template_reads_reasoning_content,
     process_content_for_template_format,
 )
 from sglang.srt.parser.reasoning_parser import (
@@ -388,6 +389,9 @@ class OpenAIServingChat(OpenAIServingBase):
         except Exception:
             self._tokenizer_auto_adds_specials = True
         self._prompt_text_round_trip_is_lossy = self._probe_prompt_text_round_trip()
+        self._template_reads_reasoning_content = (
+            self._chat_template_reads_reasoning_content()
+        )
         self._chat_template_cache: OrderedDict[bytes, tuple[tuple[int, ...], str]] = (
             OrderedDict()
         )
@@ -423,6 +427,15 @@ class OpenAIServingChat(OpenAIServingBase):
             # A template that needs kwargs this probe does not supply tells us
             # nothing; keep the long-standing text path.
             return False
+
+    def _chat_template_reads_reasoning_content(self) -> bool:
+        """Whether the configured Jinja chat template reads ``reasoning_content``;
+        a server-default ``chat_template`` kwarg replaces the tokenizer's template.
+        """
+        template = self.default_chat_template_kwargs.get("chat_template")
+        if template is None and self.tokenizer_manager.tokenizer is not None:
+            template = self.tokenizer_manager.tokenizer.chat_template
+        return jinja_template_reads_reasoning_content(template)
 
     def _handle_last_assistant_message(
         self,
@@ -3168,13 +3181,15 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
 
     def supports_native_reasoning_history(self) -> bool:
-        """Whether the encoder or response template takes ``reasoning_content``
-        rather than inline wire markers; see
+        """Whether the encoder, or a response-template model's Jinja template that
+        reads it, takes ``reasoning_content`` rather than inline wire markers; see
         :func:`chat_encoding.spec_owns_reasoning_history` for why.
         """
-        return chat_encoding.spec_owns_reasoning_history(
-            self.chat_encoding_spec
-        ) or isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector)
+        return chat_encoding.spec_owns_reasoning_history(self.chat_encoding_spec) or (
+            isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector)
+            and self.template_manager.chat_template_name is None
+            and self._template_reads_reasoning_content
+        )
 
     def wrap_reasoning_history(self, reasoning_text: str) -> str:
         """Wrap prior-turn reasoning in the detector's own start/end tokens.

@@ -783,6 +783,14 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
+        # The shared Chat pipeline raises ValueError for requests it rejects,
+        # which Chat itself answers with 400.
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error processing Anthropic request: %s", e)
             return self._error_response(
@@ -828,6 +836,12 @@ class AnthropicServing:
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
             return self._error_response(
@@ -1481,6 +1495,12 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error counting tokens: %s", e)
             return self._error_response(
