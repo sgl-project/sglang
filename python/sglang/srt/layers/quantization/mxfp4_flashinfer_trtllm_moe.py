@@ -483,6 +483,7 @@ def maybe_fuse_routed_scale_and_shared_add(
     routed: torch.Tensor,
     shared: torch.Tensor | None,
     routed_scaling_factor: float,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # When MxFP4 fusion is on, the upstream `routed *= scale` is skipped and
     # the scaling is folded into the shared-add via `shared.add_(routed,
@@ -506,6 +507,18 @@ def maybe_fuse_routed_scale_and_shared_add(
             ExpertPackMoEMethod,
         ),
     )
+    if out is not None:
+        if not fused:
+            alpha = 1.0
+        else:
+            already_scaled = experts.should_fuse_routed_scaling_factor_in_topk
+            alpha = 1.0 if already_scaled else routed_scaling_factor
+        if shared is not None:
+            # alpha scales `routed`, matching the in-place arm's shared.add_.
+            return torch.add(shared, routed, alpha=alpha, out=out)
+        if alpha != 1.0:
+            return torch.mul(routed, alpha, out=out)
+        return out.copy_(routed)
     if fused:
         already_scaled = experts.should_fuse_routed_scaling_factor_in_topk
         if shared is not None:
