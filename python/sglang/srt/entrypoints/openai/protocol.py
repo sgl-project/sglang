@@ -2307,6 +2307,7 @@ class TranscriptionRequest(BaseModel):
 
     model: str = DEFAULT_MODEL_NAME
     language: Optional[str] = None
+    task: Literal["transcribe", "translate"] = "transcribe"
     response_format: str = "json"
     temperature: float = 0.0
     timestamp_granularities: Optional[List[str]] = None
