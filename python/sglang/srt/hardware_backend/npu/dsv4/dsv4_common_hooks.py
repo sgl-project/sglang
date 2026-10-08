@@ -60,7 +60,11 @@ def _resync_swa_window(batch: ScheduleBatch, prefix_lens_cpu: torch.Tensor) -> N
             )
 
 
-def _zero_c4_boundary(batch: "ScheduleBatch", prefix_lens_cpu: torch.Tensor) -> None:
+def _zero_c4_boundary(
+    batch: "ScheduleBatch",
+    req_pool_indices_cpu: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+) -> None:
     """Diagnostic A/B (env ``SGLANG_DSV4_ZERO_C4_BOUNDARY``): on a prefix-cache
     hit, zero the c4 compress-STATE rows covering the reused prefix's boundary
     window ``[prefix - (coff-1)*cmpRatio, prefix)`` = ``[prefix-4, prefix)`` for
@@ -93,7 +97,7 @@ def _zero_c4_boundary(batch: "ScheduleBatch", prefix_lens_cpu: torch.Tensor) -> 
     coff = 2
     window = (coff - 1) * ratio  # 4 for c4
     req_to_token = batch.req_to_token_pool.req_to_token
-    rp = batch.req_pool_indices.to(torch.int64)
+    rp = req_pool_indices_cpu.to(req_to_token.device, dtype=torch.int64)
     total = 0
     hit_reqs = 0
     for i in range(len(batch.reqs)):
@@ -141,7 +145,7 @@ def maybe_write_dsv4_extend(
 
     """
     _resync_swa_window(batch, prefix_lens_cpu)
-    _zero_c4_boundary(batch, prefix_lens_cpu)
+    _zero_c4_boundary(batch, req_pool_indices_cpu, prefix_lens_cpu)
 
     # Bundle stashed on batch.out_cache_loc_dsv4 by mem_cache/common.py;
     # None on CUDA / non-V4 paths → no-op.
