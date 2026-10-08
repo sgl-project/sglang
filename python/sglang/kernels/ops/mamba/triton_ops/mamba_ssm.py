@@ -593,6 +593,8 @@ def selective_state_update(
         retrieve_parent_token_strides[0],
         retrieve_parent_token_strides[1],
     )
+    # Topk-one verification has no explicit parent tree. Keep its original
+    # FP32 sequential state; specializing shapes does not introduce rounding.
     if (
         envs.SGLANG_SM120_MAMBA_STATIC_VERIFY.get()
         and T == 4
@@ -603,7 +605,6 @@ def selective_state_update(
         and intermediate_states_buffer.dtype == torch.bfloat16
         and state_batch_indices is not None
         and intermediate_state_indices is not None
-        and retrieve_parent_token is not None
         and cache_steps == 4
         and tie_hdim
         and not enable_stochastic_rounding

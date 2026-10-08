@@ -18,10 +18,11 @@ class TestStaticVerify(CustomTestCase):
         torch.set_num_threads(2)
         torch.manual_seed(8871)
         for batch in (1, 3):
-            with self.subTest(batch=batch):
-                self._check_batch(batch)
+            for tree in (False, True):
+                with self.subTest(batch=batch, tree=tree):
+                    self._check_batch(batch, tree)
 
-    def _check_batch(self, batch):
+    def _check_batch(self, batch, tree):
         state = torch.randn(5, 128, 64, 128, device="cuda", dtype=torch.bfloat16)
         x = torch.randn(batch, 4, 128, 64, device="cuda", dtype=torch.bfloat16)
         dt = torch.randn(batch, 4, 128, device="cuda", dtype=torch.bfloat16)
@@ -57,7 +58,7 @@ class TestStaticVerify(CustomTestCase):
                 disable_state_update=True,
                 intermediate_states_buffer=caches[which],
                 cache_steps=4,
-                retrieve_parent_token=parents,
+                retrieve_parent_token=parents if tree else None,
                 intermediate_state_indices=cache_indices,
             )
 
@@ -167,12 +168,15 @@ class TestStaticVerify(CustomTestCase):
                 with envs.SGLANG_SM120_MAMBA_STATIC_VERIFY.override(enabled):
                     ssm.selective_state_update(state, x, dt, A, B, B, D, **kwargs)
             with envs.SGLANG_SM120_MAMBA_STATIC_VERIFY.override(True):
+                kwargs["retrieve_parent_token"] = None
+                ssm.selective_state_update(state, x, dt, A, B, B, D, **kwargs)
                 kwargs["disable_state_update"] = False
                 ssm.selective_state_update(state, x, dt, A, B, B, D, **kwargs)
         self.assertIsNone(calls[0])
         self.assertIsNotNone(calls[1])
         self.assertEqual(calls[1][:6], (1, 4, 128, 64, 128, 16))
-        self.assertIsNone(calls[2])
+        self.assertIsNotNone(calls[2])
+        self.assertIsNone(calls[3])
 
 
 if __name__ == "__main__":
