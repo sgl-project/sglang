@@ -1,16 +1,145 @@
+import os
+import tempfile
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import safetensors.torch
 import torch
 
 import sglang.srt.model_loader.loader as loader_mod
+from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+class TestDefaultCheckpointSelection(CustomTestCase):
+    def setUp(self):
+        server_args = patch.object(loader_mod, "get_server_args", return_value=None)
+        server_args.start()
+        self.addCleanup(server_args.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.folder = tmp.name
+        self.files = []
+        for role, value in (("main", 1.0), ("draft", 2.0)):
+            path = os.path.join(self.folder, f"{role}.safetensors")
+            safetensors.torch.save_file({role + ".weight": torch.tensor([value])}, path)
+            self.files.append(path)
+        self.config = SimpleNamespace(
+            model_path=self.folder, revision=None, hf_config=SimpleNamespace()
+        )
+        self.model = SimpleNamespace(
+            is_unused_checkpoint_weight=lambda name: not name.startswith("draft.")
+        )
+        self.loader = DefaultModelLoader(
+            LoadConfig(
+                load_format="safetensors",
+                model_loader_extra_config={"enable_multithread_load": False},
+            )
+        )
+
+    def test_ordinary_load_does_not_read_unused_shards(self):
+        with patch.object(
+            loader_mod,
+            "get_model",
+            return_value=SimpleNamespace(
+                weight_loader_disable_mmap=False,
+                weight_loader_prefetch_checkpoints=False,
+                weight_loader_prefetch_num_threads=1,
+                weight_loader_drop_cache_after_load=False,
+            ),
+        ):
+            loaded = dict(self.loader._get_all_weights(self.config, self.model))
+        self.assertEqual(set(loaded), {"draft.weight"})
+        torch.testing.assert_close(loaded["draft.weight"], torch.tensor([2.0]))
+
+    def test_resolution_filters_before_startup_prefetch(self):
+        resolved = self.loader.resolve_model_weights(self.config, self.model)
+        self.assertEqual(resolved[0].weight_files, (self.files[1],))
+        with patch.object(loader_mod, "_prefetch_all_checkpoints") as prefetch:
+            self.loader.start_checkpoint_prefetch(resolved, num_threads=1)
+        prefetch.assert_called_once_with([self.files[1]], num_threads=1)
+
+    def test_unadapted_model_keeps_all_files(self):
+        resolved = self.loader.resolve_model_weights(self.config, SimpleNamespace())
+        self.assertEqual(set(resolved[0].weight_files), set(self.files))
+
+    def test_unadapted_deepseek_keeps_original_shards(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+        model = DeepseekV2ForCausalLM.__new__(DeepseekV2ForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(num_hidden_layers=1, num_nextn_predict_layers=1)
+        for path, layer, value in zip(self.files, (0, 1), (1.0, 2.0)):
+            safetensors.torch.save_file(
+                {f"model.layers.{layer}.weight": torch.tensor([value])}, path
+            )
+        resolved = self.loader.resolve_model_weights(self.config, model)
+        self.assertEqual(set(resolved[0].weight_files), set(self.files))
+
+    def test_prefixed_secondary_source_is_not_filtered_in_wrong_name_domain(self):
+        source = DefaultModelLoader.Source.init_new(self.config, self.model)
+        source.prefix = "nested."
+        model = SimpleNamespace(secondary_weights=[source])
+        resolved = self.loader.resolve_model_weights(self.config, model)
+        self.assertEqual(set(resolved[1].weight_files), set(self.files))
+
+    def test_layer_remapping_preserves_original_file_list(self):
+        self.loader.load_config.draft_model_idx = 1
+        resolved = self.loader.resolve_model_weights(self.config, self.model)
+        self.assertEqual(set(resolved[0].weight_files), set(self.files))
+
+    def test_qwen_main_and_draft_select_their_own_shards(self):
+        from sglang.srt.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+        from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
+        from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
+        from sglang.srt.models.qwen3_moe_mtp import Qwen3MoeForCausalLMMTP
+        from sglang.srt.models.qwen3_next import Qwen3NextForCausalLM
+        from sglang.srt.models.qwen3_next_mtp import Qwen3NextForCausalLMMTP
+        from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+        from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
+
+        for path, name, value in zip(
+            self.files,
+            ("model.layers.0.weight", "mtp.layers.0.weight"),
+            (1.0, 2.0),
+        ):
+            safetensors.torch.save_file({name: torch.tensor([value])}, path)
+        for main_cls, draft_cls in (
+            (Qwen3MoeForCausalLM, Qwen3MoeForCausalLMMTP),
+            (Qwen3NextForCausalLM, Qwen3NextForCausalLMMTP),
+            (Qwen3_5ForConditionalGeneration, Qwen3_5ForCausalLMMTP),
+            (Qwen4ExpForConditionalGeneration, Qwen4ExpForCausalLMMTP),
+        ):
+            for model_cls, expected in (
+                (main_cls, (self.files[0],)),
+                (draft_cls, (self.files[1],)),
+            ):
+                with self.subTest(model=model_cls.__name__):
+                    model = model_cls.__new__(model_cls)
+                    torch.nn.Module.__init__(model)
+                    resolved = self.loader.resolve_model_weights(self.config, model)
+                    self.assertEqual(resolved[0].weight_files, expected)
+
+    def test_pt_checkpoint_does_not_apply_safetensors_selection(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "pytorch_model.pt")
+            torch.save({"target.weight": torch.ones(1)}, path)
+            model = SimpleNamespace(
+                is_unused_checkpoint_weight=lambda _: True,
+            )
+            loader = DefaultModelLoader(LoadConfig(load_format="pt"))
+            config = SimpleNamespace(
+                model_path=folder, revision=None, hf_config=SimpleNamespace()
+            )
+            resolved = loader.resolve_model_weights(config, model)
+            self.assertFalse(resolved[0].use_safetensors)
+            self.assertEqual(resolved[0].weight_files, (path,))
 
 
 class TestDefaultModelLoader(CustomTestCase):
