@@ -4,7 +4,7 @@ import os
 import time
 from argparse import Namespace
 from dataclasses import dataclass
-from typing import AsyncGenerator, Dict, Iterator, List
+from typing import AsyncGenerator, Dict, Iterator, List, Optional
 
 from transformers import PreTrainedTokenizerBase
 
@@ -52,6 +52,8 @@ async def get_mooncake_request_over_time(
     tokenizer: PreTrainedTokenizerBase,
     slowdown_factor: float,
     num_rounds: int,
+    *,
+    start_time: Optional[float] = None,
 ) -> AsyncGenerator[DatasetRow, None]:
     """
     An async generator that yields requests based on the timestamps in the Mooncake trace file,
@@ -62,7 +64,8 @@ async def get_mooncake_request_over_time(
 
     input_requests.sort(key=lambda r: r["timestamp"])
 
-    start_time = time.perf_counter()
+    if start_time is None:
+        start_time = time.perf_counter()
     trace_start_time_ms = input_requests[0]["timestamp"]
 
     for record in input_requests:
@@ -123,6 +126,7 @@ def get_mooncake_rounds(
             prompt=full_prompt_text,
             prompt_len=prompt_len,
             output_len=output_len_per_round,
+            timestamp=record["timestamp"],
         )
 
         # Add a placeholder assistant response for the next round's context

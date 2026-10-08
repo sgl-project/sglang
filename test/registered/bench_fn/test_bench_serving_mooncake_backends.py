@@ -23,7 +23,27 @@ class TestMooncakeBackends(unittest.TestCase):
             with self.subTest(backend=backend):
                 self._replay(backend)
 
-    def _replay(self, backend):
+    def test_burst_records_client_wait_and_failed_request_terminal_times(self):
+        outputs = self._replay("vllm", concurrency=1, burst=True)
+        timings = [output.client_timing for output in outputs]
+        self.assertEqual([t["scheduled_arrival_s"] for t in timings], [0, 0, 0])
+        self.assertEqual([t["ready_s"] for t in timings], [0, 0, 0])
+        self.assertEqual([t["dispatch_s"] for t in timings], [0, 1, 2])
+        self.assertEqual([t["backend_start_s"] for t in timings], [0, 1, 2])
+        self.assertEqual([t["terminal_s"] for t in timings], [1, 2, 3])
+        self.assertEqual([t["first_token_s"] for t in timings], [0.25, None, 2.25])
+        self.assertEqual([t["success"] for t in timings], [True, False, False])
+        self.assertEqual([o.latency for o in outputs], [1, 0, 0])
+        self.assertEqual(outputs[1].error, "queue full")
+        self.assertEqual(outputs[2].error, "failure after partial output")
+
+    def test_prompt_preparation_does_not_shift_planned_arrival(self):
+        outputs = self._replay("vllm", preparation_delay=0.25)
+        self.assertEqual(
+            [o.client_timing["ready_s"] for o in outputs], [0.25, 2.25, 4.25]
+        )
+
+    def _replay(self, backend, *, concurrency=8, burst=False, preparation_delay=0):
         serving.set_global_args(
             Namespace(
                 dataset_name="mooncake",
@@ -32,7 +52,7 @@ class TestMooncakeBackends(unittest.TestCase):
                 plot_throughput=False,
             )
         )
-        clock = [0.0]
+        clock = [100.0]
         sleeps = []
         calls = []
         original_sleep = asyncio.sleep
@@ -44,10 +64,28 @@ class TestMooncakeBackends(unittest.TestCase):
 
         async def request(request_func_input, pbar=None):
             calls.append(request_func_input)
+            if burst and len(calls) > 1:
+                index = len(calls) - 2
+                started = clock[0]
+                await original_sleep(0)
+                clock[0] += 1
+                return serving.RequestFuncOutput(
+                    success=index == 0,
+                    start_time=started,
+                    ttft=0.25 if index != 1 else 0,
+                    latency=1 if index == 0 else 0,
+                    output_len=4 if index != 1 else 0,
+                    error=["", "queue full", "failure after partial output"][index],
+                )
             return serving.RequestFuncOutput(success=True, output_len=4)
 
         tokenizer = Mock()
-        tokenizer.encode.side_effect = lambda text: list(range(len(text.split())))
+
+        def encode(text):
+            clock[0] += preparation_delay
+            return list(range(len(text.split())))
+
+        tokenizer.encode.side_effect = encode
         tokenizer.apply_chat_template.side_effect = lambda messages, **_: messages[0][
             "content"
         ]
@@ -56,6 +94,9 @@ class TestMooncakeBackends(unittest.TestCase):
             {"timestamp": 1000, "hash_ids": [101], "output_length": 4},
             {"timestamp": 2000, "hash_ids": [202], "output_length": 4},
         ]
+        if burst:
+            for row in trace:
+                row["timestamp"] = 1000
         recorded = {}
 
         def metrics(**kwargs):
@@ -87,7 +128,7 @@ class TestMooncakeBackends(unittest.TestCase):
                         tokenizer=tokenizer,
                         input_requests=trace,
                         request_rate=float("inf"),
-                        max_concurrency=8,
+                        max_concurrency=concurrency,
                         disable_tqdm=True,
                         lora_names=None,
                         lora_request_distribution=None,
@@ -99,18 +140,27 @@ class TestMooncakeBackends(unittest.TestCase):
                         mooncake_num_rounds=1,
                     )
                 )
-        self.assertEqual(sleeps, [1.0, 2.0, 2.0])
+        self.assertEqual(
+            sleeps,
+            [1.0] if burst else [1.0, 2.0 - preparation_delay, 2.0 - preparation_delay],
+        )
         self.assertEqual(len(calls), 4)
         self.assertEqual(calls[0].prompt, calls[1].prompt)
         self.assertEqual(calls[0].prompt_len, calls[1].prompt_len)
-        for call, marker in zip(calls[1:], [101, 202, 303]):
+        markers = [303, 101, 202] if burst else [101, 202, 303]
+        for call, marker in zip(calls[1:], markers):
             self.assertIn(str(marker), call.prompt)
             self.assertEqual(call.output_len, 4)
         self.assertEqual(len(recorded["outputs"]), 3)
         self.assertEqual(
+            [o.client_timing["scheduled_arrival_s"] for o in recorded["outputs"]],
+            [0, 0, 0] if burst else [0, 2, 4],
+        )
+        self.assertEqual(
             [r.prompt for r in recorded["input_requests"]],
             [r.prompt for r in calls[1:]],
         )
+        return recorded["outputs"]
 
 
 if __name__ == "__main__":
