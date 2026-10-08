@@ -41,7 +41,7 @@ from sglang.srt.managers.schedule_batch import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel, get_stream
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -502,6 +502,9 @@ class HYV3ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head or getattr(
+            config, "enable_lm_head_fp32", False
+        )
 
         self.model = HYV3Model(config, quant_config, prefix=f"{prefix}.model")
         self.lm_head = ParallelLMHead(
@@ -509,7 +512,7 @@ class HYV3ForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=f"{prefix}.lm_head",
-            use_fp32_lm_head=getattr(config, "enable_lm_head_fp32", False),
+            use_fp32_lm_head=self.use_fp32_lm_head,
         )
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight
