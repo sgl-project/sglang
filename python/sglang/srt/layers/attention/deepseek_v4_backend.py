@@ -3443,7 +3443,9 @@ class DeepseekV4AttnBackend(
         req_ids = self.forward_metadata.low_ratio_dense_req_indices
         req_lens = self.forward_metadata.low_ratio_dense_seq_lens
         local_req_ids = self.forward_metadata.low_ratio_local_req_indices
-        assert req_ids is not None and req_lens is not None and local_req_ids is not None
+        assert (
+            req_ids is not None and req_lens is not None and local_req_ids is not None
+        )
         ratio = layer.compress_ratio
         ks = self.forward_metadata.low_ratio_dense_k_offsets.get(ratio)
         if ks is None:
