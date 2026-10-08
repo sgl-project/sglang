@@ -819,7 +819,7 @@ pub trait ChildKeyType:
     /// through, so the unigram key never copies.
     fn key_from(token_ids: Cow<'_, Vec<i64>>) -> Cow<'_, Self>;
 
-    /// The atom's token ids as u32 storage-hash words.
+    /// The atom's token ids as non-negative storage-hash words.
     fn hash_words(atom: &Self::Atom) -> impl Iterator<Item = u64>;
 
     /// The raw token ids spanned by `atoms`; the unigram view borrows, bigram
