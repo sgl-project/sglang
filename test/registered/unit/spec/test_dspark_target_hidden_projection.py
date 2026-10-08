@@ -93,9 +93,7 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
             draft_model=draft_model,
             draft_model_runner=SimpleNamespace(
                 token_to_kv_pool=pool,
-                kv_index_translator=SimpleNamespace(
-                    translate_full_attn_ids=lambda ids: ids
-                ),
+                kv_index_translator=SimpleNamespace(),
             ),
             model_runner=SimpleNamespace(device=torch.device("cpu")),
             device=torch.device("cpu"),

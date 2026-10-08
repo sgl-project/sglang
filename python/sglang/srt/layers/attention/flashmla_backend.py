@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             or forward_mode.is_draft_extend_v2()
         ):
             self._apply_decode_target_verify_metadata(
+                plan=forward_batch.kv_loc_plan,
                 bs=forward_batch.batch_size,
                 req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens=forward_batch.seq_lens,
@@ -165,10 +167,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
             if self.kv_index_translator.reads_are_translated:
                 assert self.page_size == PAGE_SIZE
-                self.kv_index_translator.fill_read_table(
-                    out=block_kv_indices,
-                    req_pool_indices=forward_batch.req_pool_indices,
-                    seq_lens=forward_batch.seq_lens,
+                self.kv_index_translator.copy_page_table(
+                    forward_batch.kv_loc_plan, out=block_kv_indices
                 )
             else:
                 create_flashmla_kv_indices_triton[
@@ -200,10 +200,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
             if self.kv_index_translator.reads_are_translated:
                 assert self.page_size == PAGE_SIZE
-                self.kv_index_translator.fill_read_table(
-                    out=block_kv_indices,
-                    req_pool_indices=forward_batch.req_pool_indices,
-                    seq_lens=seq_lens,
+                self.kv_index_translator.copy_page_table(
+                    forward_batch.kv_loc_plan, out=block_kv_indices
                 )
             else:
                 create_flashmla_kv_indices_triton[
@@ -240,10 +238,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
             if self.kv_index_translator.reads_are_translated:
                 assert self.page_size == PAGE_SIZE
-                self.kv_index_translator.fill_read_table(
-                    out=block_kv_indices,
-                    req_pool_indices=forward_batch.req_pool_indices,
-                    seq_lens=seq_lens_k,
+                self.kv_index_translator.copy_page_table(
+                    forward_batch.kv_loc_plan, out=block_kv_indices
                 )
             else:
                 create_flashmla_kv_indices_triton[
@@ -328,6 +324,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
     def _apply_decode_target_verify_metadata(
         self,
+        plan: KVLocPlan,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -355,10 +352,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             if self.kv_index_translator.reads_are_translated:
                 assert self.page_size == PAGE_SIZE
-                self.kv_index_translator.fill_read_table(
-                    out=self.cuda_graph_kv_indices,
-                    req_pool_indices=req_pool_indices[:bs],
-                    seq_lens=seq_lens,
+                # The plan's table reaches a verify's draft tail.
+                self.kv_index_translator.copy_page_table(
+                    plan, out=self.cuda_graph_kv_indices[:bs]
                 )
             else:
                 create_flashmla_kv_indices_triton[

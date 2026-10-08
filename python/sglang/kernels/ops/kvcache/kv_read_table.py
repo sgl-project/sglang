@@ -30,10 +30,11 @@ Two delivery forms over that one formula:
                 which the pool bounds, where a page table's width is bounded
                 only by `max_context_len`.
 
-PREFIX-ONLY per row: nothing past the row's live prefix is written, so a
-caller-owned buffer keeps what it had there -- which is what lets a captured
-cuda-graph buffer be refreshed in place. Readers bound themselves by
-`cache_seqlens` and never look past the prefix.
+PREFIX-ONLY per row by default: nothing past the row's live prefix is written,
+so a caller-owned buffer keeps what it had there -- which is what lets a
+captured cuda-graph buffer be refreshed in place. Readers bound themselves by
+`cache_seqlens` and never look past the prefix. A fresh (`torch.empty`) table
+asks for the sink past the prefix instead (`zero_tail`).
 
 A `-1` in `req_to_token` and a freed (`-1`) v2p row both clamp to entry 0, the
 reserved padding slot, so a kernel dereferences padding, not a wild address.
@@ -60,6 +61,56 @@ _TARGET_BLOCKS = 1024
 
 
 @triton.jit
+def _gather_translate_items(
+    row_in,  # this row of `req_to_token` -- VIRTUAL token ids
+    row_out,  # where this row's items land
+    v2p_ptr,  # [num_pages + 1] int64 -- virtual->physical page table
+    live,  # scalar: the row reads `req_to_token`; else every item is the sink
+    kv_start,  # first token of the row's window
+    n_items,  # live items in the row
+    n_written,  # items stored: `n_items`, or a wider zeroed row
+    item_begin,  # this program's first item
+    item_stride,  # items one program advances per loop trip
+    PAGE_SIZE: tl.constexpr,
+    EMIT_PER_TOKEN: tl.constexpr,
+    OUT_INT64: tl.constexpr,
+    ZERO_TAIL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    for start in range(item_begin, n_written, item_stride):
+        item = start + tl.arange(0, BLOCK)
+        mask = item < n_items
+        load_mask = mask & live
+        pos = kv_start + item
+        if EMIT_PER_TOKEN:
+            page = pos // PAGE_SIZE
+        else:
+            page = pos
+        tok = tl.load(
+            row_in + page.to(tl.int64) * PAGE_SIZE, mask=load_mask, other=0
+        ).to(tl.int64)
+        # Triton's `//` truncates toward zero, so `-1 // ps` is 0 for ps > 1 but
+        # -1 at ps == 1, which would read one element BEFORE `v2p`.
+        vpage = tl.where(tok < 0, 0, tok // PAGE_SIZE)
+        entry = tl.maximum(tl.load(v2p_ptr + vpage, mask=load_mask, other=0), 0)
+        if EMIT_PER_TOKEN:
+            value = entry * PAGE_SIZE + pos % PAGE_SIZE
+        else:
+            value = entry
+        store_mask = mask
+        if ZERO_TAIL:
+            value = tl.where(mask, value, 0)
+            store_mask = item < n_written
+        if OUT_INT64:
+            tl.store(row_out + item, value, mask=store_mask)
+        else:
+            tl.store(row_out + item, value.to(tl.int32), mask=store_mask)
+
+
+# The per-call widths and lengths stay unspecialized: Triton would otherwise
+# compile a new variant (`== 1`, `% 16`) mid-serving each time a batch's shape
+# hits a combination it has not seen.
+@triton.jit(do_not_specialize=["out_stride", "seq_len_delta", "max_row_items"])
 def build_kv_read_indices_kernel(
     req_to_token_ptr,  # in: [max_reqs, max_context] -- VIRTUAL token ids
     req_pool_indices_ptr,  # in: [bs] -- req_to_token row per batch lane
@@ -76,6 +127,7 @@ def build_kv_read_indices_kernel(
     PAGE_SIZE: tl.constexpr,
     EMIT_PER_TOKEN: tl.constexpr,
     OUT_INT64: tl.constexpr,
+    ZERO_TAIL: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     bid = tl.program_id(0)
@@ -98,30 +150,24 @@ def build_kv_read_indices_kernel(
         # A widened window can outrun a fixed-width row (a verify near the
         # context limit); writing past it would land in the next row.
         n_items = tl.minimum(n_items, max_row_items)
-
-    for start in range(tl.program_id(1) * BLOCK, n_items, item_stride):
-        item = start + tl.arange(0, BLOCK)
-        mask = item < n_items
-        pos = kv_start + item
-        if EMIT_PER_TOKEN:
-            page = pos // PAGE_SIZE
-        else:
-            page = pos
-        tok = tl.load(row_in + page.to(tl.int64) * PAGE_SIZE, mask=mask, other=0).to(
-            tl.int64
-        )
-        # Triton's `//` truncates toward zero, so `-1 // ps` is 0 for ps > 1 but
-        # -1 at ps == 1, which would read one element BEFORE `v2p`.
-        vpage = tl.where(tok < 0, 0, tok // PAGE_SIZE)
-        entry = tl.maximum(tl.load(v2p_ptr + vpage, mask=mask, other=0), 0)
-        if EMIT_PER_TOKEN:
-            value = entry * PAGE_SIZE + pos % PAGE_SIZE
-        else:
-            value = entry
-        if OUT_INT64:
-            tl.store(row_out + item, value, mask=mask)
-        else:
-            tl.store(row_out + item, value.to(tl.int32), mask=mask)
+    # A fresh (unzeroed) table also takes the sink past the live prefix.
+    n_written = max_row_items if ZERO_TAIL else n_items
+    _gather_translate_items(
+        row_in,
+        row_out,
+        v2p_ptr,
+        True,
+        kv_start,
+        n_items,
+        n_written,
+        tl.program_id(1) * BLOCK,
+        item_stride,
+        PAGE_SIZE=PAGE_SIZE,
+        EMIT_PER_TOKEN=EMIT_PER_TOKEN,
+        OUT_INT64=OUT_INT64,
+        ZERO_TAIL=ZERO_TAIL,
+        BLOCK=BLOCK,
+    )
 
 
 def _launch(
@@ -138,6 +184,7 @@ def _launch(
     kv_start_idx: Optional[torch.Tensor],
     emit_per_token: bool,
     seq_len_delta: int = 0,
+    zero_tail: bool = False,
 ) -> None:
     bs = int(req_pool_indices.numel())
     item_programs = min(
@@ -159,6 +206,7 @@ def _launch(
         PAGE_SIZE=page_size,
         EMIT_PER_TOKEN=emit_per_token,
         OUT_INT64=out.dtype == torch.int64,
+        ZERO_TAIL=zero_tail,
         BLOCK=_BLOCK_ITEMS,
         num_warps=_NUM_WARPS,
     )
@@ -188,17 +236,18 @@ def build_kv_read_table(
     max_pages: int,
     out: torch.Tensor,
     seq_len_delta: int = 0,
+    zero_tail: bool = False,
 ) -> torch.Tensor:
     """Fill ``out``'s live prefix with PAGE TABLE entries.
 
-    ``out`` is caller-owned (fresh zeros for the eager path, the module's
-    capture-stable buffer for replay) and only its ``[:bs, :max_pages]``
-    region's live prefix is written -- never rebound, never tail-cleared.
+    ``out`` is caller-owned and only its ``[:bs, :max_pages]`` region is
+    written: each row's live prefix, and with ``zero_tail`` the sink (0) past
+    it up to ``max_pages`` -- what a fresh ``torch.empty`` table needs, in the
+    same launch. Never rebound.
 
-    ``seq_len_delta`` widens every row's live prefix -- the whole-sequence
-    verify contract (draft KV read back from the pool). Every row stops at
-    ``max_pages``: a widened window that outruns the row is cut there rather
-    than spilling into the next row, on CUDA as on CPU.
+    ``seq_len_delta`` widens every row's live prefix (a verify reads its draft
+    tokens' KV back from the pool); a widened row is cut at ``max_pages``
+    rather than spilling into the next row.
     """
     bs = int(req_pool_indices.numel())
     assert out.dtype == torch.int32, (
@@ -228,6 +277,8 @@ def build_kv_read_table(
                 v2p=v2p,
                 page_size=page_size,
             ).to(torch.int32)
+            if zero_tail:
+                out[b, live:max_pages] = 0
         return out
 
     _launch(
@@ -243,6 +294,7 @@ def build_kv_read_table(
         kv_start_idx=None,
         emit_per_token=False,
         seq_len_delta=seq_len_delta,
+        zero_tail=zero_tail,
     )
     return out
 

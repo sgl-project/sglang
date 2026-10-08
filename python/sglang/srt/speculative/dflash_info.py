@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import Cols, IdSpaceKind, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -51,6 +52,10 @@ class DFlashVerifyInput(SpecInput):
     live_seq_lens_cpu: Optional[torch.Tensor] = None
     # Conservative request-lifetime bound for candidate graph dispatch.
     candidate_max_seq_len_upper_bound: Optional[int] = None
+    # The iteration's plan when the caller planned the verify window, and the
+    # part of it this verify writes (`KVLocPlan.write_ids`).
+    kv_loc_plan: Optional[KVLocPlan] = None
+    kv_loc_cols: Optional[Cols] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
@@ -101,6 +106,8 @@ class DFlashVerifyInput(SpecInput):
             target_worker.model_runner,
             capture_hidden_mode=self.capture_hidden_mode,
             return_hidden_states_before_norm=False,
+            kv_loc_plan=self.kv_loc_plan,
+            write_cols=self.kv_loc_cols,
         )
 
         can_run_cuda_graph = bool(
@@ -133,13 +140,14 @@ class DFlashVerifyInput(SpecInput):
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         translator: KVIndexTranslator,
+        plan: KVLocPlan,
         kv_start_idx: Optional[torch.Tensor] = None,
         kv_indices_buf: Optional[torch.Tensor] = None,
-        sliding_window: bool = False,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
     ):
-        """CSR verify args, gathered straight into the packed stream. The lens
-        are widened here and handed to the translator, so nothing materializes
-        a ``[bs, max_pages]`` rectangle to repack from."""
+        """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
+        is widened here; the translator packs the read ids straight into
+        ``kv_indices``."""
         device = req_pool_indices.device
         bs = req_pool_indices.numel()
 
@@ -179,14 +187,14 @@ class DFlashVerifyInput(SpecInput):
                 dtype=torch.int32,
                 device=device,
             )
-        translator.fill_packed_read_stream(
+        translator.pack_read_stream(
+            plan,
             req_pool_indices=req_pool_indices,
             seq_lens=paged_kernel_lens,
             indptr=cum_kv_seq_len,
-            total_tokens=paged_kernel_lens_sum + kv_indices_extra,
             out=kv_indices,
             kv_start_idx=kv_start_idx,
-            sliding_window=sliding_window,
+            kind=kind,
         )
         mask = self.custom_mask
         if mask is not None:

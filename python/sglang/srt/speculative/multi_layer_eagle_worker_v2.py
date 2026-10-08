@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -107,6 +107,7 @@ _is_cpu = is_cpu()
 
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
 
 
@@ -460,7 +461,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
+        forward_batch, can_run_decode_cuda_graph, kv_loc_plan = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
             batch,
@@ -468,12 +469,14 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner_list[0],
             self.topk,
             self.speculative_num_steps,
+            target_translator=self.target_worker.model_runner.kv_index_translator,
+            num_draft_tokens=self.speculative_num_draft_tokens,
         )
 
         # Run draft
         parent_list, top_scores_index, draft_tokens = self.draft_forward(forward_batch)
 
-        return build_eagle_verify_input(
+        verify_input = build_eagle_verify_input(
             batch,
             draft_input,
             parent_list,
@@ -487,6 +490,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
         )
+        if kv_loc_plan is not None:
+            # Verify and draft extend write the window the draft planned.
+            verify_input.kv_loc_plan = kv_loc_plan
+            verify_input.prepared_out_cache_loc = kv_loc_plan.write_virtual
+        return verify_input
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -596,6 +604,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         batch: ScheduleBatch,
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
+        kv_loc_plan: Optional[KVLocPlan] = None,
     ):
         """
         Run draft model extend to correctly fill the KV cache.
@@ -604,6 +613,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             batch: The batch to run.
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
+            kv_loc_plan: The target prefill's plan; the draft writes the same
+                slots.
         """
         # The draft embed clamps unconditionally (to tolerate multimodal pad
         # sentinels), so probe next_token_ids here first -- otherwise a corrupted id
@@ -641,6 +652,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner_list[0],
             capture_hidden_mode=draft_capture_hidden_mode,
             return_hidden_states_before_norm=True,
+            kv_loc_plan=kv_loc_plan,
         )
 
         self._apply_deferred_mamba_init_to_draft_pools(forward_batch)
@@ -766,14 +778,20 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 draft_token_num=self.speculative_num_draft_tokens,
                 device=batch.device,
             )
+        seq_lens = batch.seq_lens + self.speculative_num_draft_tokens
         runner.stage_shared_reads(
-            seq_lens=batch.seq_lens + self.speculative_num_draft_tokens,
+            seq_lens=seq_lens,
             req_pool_indices=batch.req_pool_indices,
             out_cache_loc=locs,
             positions=positions,
-            # Both loc sources read req_to_token untranslated, so `locs` is the
-            # PRE-translate write loc the capture rail needs.
+            # Both loc sources read req_to_token untranslated: `locs` is virtual.
             out_cache_loc_virtual=locs,
+            kv_loc_plan=self.draft_runner_list[0].kv_index_translator.plan(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=None,
+                write_virtual=locs,
+            ),
         )
         return True
 
@@ -783,6 +801,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         batch_result: GenerationBatchResult,
         *,
         staged: bool = False,
+        kv_loc_plan: Optional[KVLocPlan] = None,
     ):
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
@@ -826,6 +845,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 return_hidden_states_before_norm=True,
                 widened_out_cache_loc=boundary_kv_locs,
                 widened_positions=boundary_kv_positions,
+                kv_loc_plan=kv_loc_plan,
             )
 
         if self.plan_stream:
@@ -1091,7 +1111,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=target_capture_mode,
+                return_kv_loc_plan=True,
             )
+            kv_loc_plan, batch_output.kv_loc_plan = batch_output.kv_loc_plan, None
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
@@ -1106,6 +1128,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 batch,
                 batch_output.logits_output.hidden_states,
                 batch_output.next_token_ids,
+                kv_loc_plan=kv_loc_plan,
             )
             return batch_output
         else:
@@ -1134,7 +1157,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
             self.draft_worker._draft_extend_for_decode(
-                batch, batch_output, staged=staged
+                batch,
+                batch_output,
+                staged=staged,
+                kv_loc_plan=verify_input.kv_loc_plan,
             )
             return batch_output
 

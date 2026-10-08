@@ -499,10 +499,9 @@ def _assert_spec_verify_backends(
 ) -> None:
     """Refuse target backends whose verify id rails are not translation-audited.
 
-    Only the target's prefill/decode pair is checked here. A draft that fuses
-    into the target's pages must run on the translated rails; the fused-draft
-    decision enforces that by declining fusion otherwise, and a private-pool
-    draft indexes its own pool by virtual id."""
+    Only the target's prefill/decode pair is checked here: fusion declines for
+    a draft off the translated rails, and a private-pool draft indexes its own
+    pool by virtual id."""
     if allowed is None:
         allowed = _SPEC_VERIFY_AUDITED_BACKENDS
     dcp_note = ""
@@ -591,8 +590,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "DFLASH",
     ), (
         "--enable-unified-memory only supports --speculative-algorithm "
-        "DSPARK (chain draft), DFLASH (fused block draft), and "
-        "EAGLE/EAGLE3 (fused draft KV); other speculative algorithms are "
+        "DSPARK, DFLASH, EAGLE and EAGLE3; other speculative algorithms are "
         "not yet audited for the unified pool's virtual-to-physical loc "
         "translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
@@ -627,9 +625,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             f"spec-verify-audited attention backends {sorted(eagle_allowed)} "
             f"(got {sorted(eagle_backends, key=str)})."
         )
-        # An unset draft backend inherits the target's pair. A fused draft is
-        # MHA-shaped on every host, and these rails also serve a draft that
-        # keeps an MLA pool of its own.
+        # An unset draft backend inherits the target's pair.
         draft_backend = cfg.speculative_draft_attention_backend
         draft_backends = {draft_backend} if draft_backend else eagle_backends
         assert draft_backends <= TRANSLATED_MHA_RAILS, (
@@ -649,9 +645,8 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         )
     assert not cfg.enable_two_batch_overlap, (
         "--enable-unified-memory does not support --enable-two-batch-overlap: "
-        "TBO's replay split hands each child a view without the pre-translate "
-        "write loc, so a captured decode replay raises. "
-        "TODO(ch-wan): carry out_cache_loc_virtual into the child view."
+        "the iteration's read tables are indexed by the whole batch's rows, and "
+        "a TBO child's readers do not offset into them."
     )
     assert not cfg.enable_lmcache, (
         "--enable-unified-memory is not yet compatible with --enable-lmcache: "
@@ -679,8 +674,8 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     ), (
         "--enable-unified-memory + EAGLE/EAGLE3 does not support "
         "--disaggregation-decode-retraction-backup=host_pool: the backup builds "
-        "the draft's host pool off a device pool of its own, and an EAGLE draft "
-        "on the unified pool lives fused in the target's pages, without one."
+        "the draft's host pool off the draft's own device pool, which a fused "
+        "EAGLE draft does not have."
     )
     assert not (
         cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
