@@ -193,6 +193,10 @@ class EnvIntWithAlias(_DeprecatedEnvFallback, EnvInt):
     pass
 
 
+class EnvStrWithAlias(_DeprecatedEnvFallback, EnvStr):
+    pass
+
+
 class EnvFloat(EnvField):
     def parse(self, value: str) -> float:
         try:
@@ -936,6 +940,7 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
@@ -963,10 +968,14 @@ class Envs:
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
     SGLANG_AITER_MLA_GLUON = EnvBool(True)
-    # Select the AITER MLA kernel for DCP decode. "gluon" preserves the native
-    # low-head Triton path; "asm" quantizes the DCP-gathered query to FP8 and
-    # runs mla_decode_fwd with persistent metadata and return_lse=True.
-    SGLANG_AITER_MLA_DCP_DECODE_BACKEND = EnvStr("gluon")
+    # Select the AITER MLA kernel for decode, "asm" or "gluon".
+    SGLANG_AITER_MLA_DECODE_BACKEND = EnvStrWithAlias(
+        "asm", deprecated_name="SGLANG_AITER_MLA_DCP_DECODE_BACKEND"
+    )
+    # Select the AITER MLA kernel for target verify, "asm" or "gluon".
+    SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
+    # Let aiter plan the KV splits for the asm persistent MLA decode.
+    SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
