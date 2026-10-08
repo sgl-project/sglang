@@ -30,12 +30,13 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponsesRequest,
     ResponsesResponse,
 )
+from sglang.srt.entrypoints.openai.responses_adapters import encode_reasoning_state
 from sglang.srt.entrypoints.openai.serving_responses import (
     OpenAIServingResponses,
     _build_output_text_logprobs,
     _should_emit_normal_text_as_message,
 )
-from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
@@ -57,6 +58,68 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class InputMessageConstructionTestCase(CustomTestCase):
+    def test_beam_tool_continuation_preserves_reasoning_and_instructions(self):
+        serving = make_serving()
+        serving.tokenizer_manager.model_config.hf_config.model_type = "beam"
+        request = ResponsesRequest(
+            model="x",
+            store=False,
+            instructions="Current system instructions.",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                }
+            ],
+            input=[
+                {"role": "developer", "content": "Use the weather tool."},
+                {"role": "user", "content": "Weather in Paris?"},
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": encode_reasoning_state("Check weather. 😀"),
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_weather",
+                    "name": "get_weather",
+                    "arguments": '{"city":"Paris"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_weather",
+                    "output": "Sunny.",
+                },
+            ],
+        )
+        # This checks the inputs delivered to the checkpoint's chat template;
+        # checkpoint-specific rendering needs its actual tokenizer assets.
+        messages = serving._construct_input_messages(request)
+        self.assertEqual(
+            [m["role"] for m in messages], ["system", "user", "assistant", "tool"]
+        )
+        self.assertEqual(
+            messages[0]["content"],
+            "Current system instructions.\n\nDeveloper instructions:\nUse the weather tool.",
+        )
+        self.assertEqual(messages[2]["reasoning_content"], "Check weather. 😀")
+        self.assertEqual(messages[2]["tool_calls"][0]["id"], "call_weather")
+        self.assertEqual(
+            orjson.loads(messages[2]["tool_calls"][0]["function"]["arguments"]),
+            {"city": "Paris"},
+        )
+        self.assertEqual(
+            messages[3],
+            {"role": "tool", "tool_call_id": "call_weather", "content": "Sunny."},
+        )
+        tool = serving._response_tools_to_chat_tools(request)[0]
+        self.assertEqual(tool.function.name, "get_weather")
+        self.assertEqual(tool.function.parameters, request.tools[0].parameters)
+
     def test_previous_response_replays_assistant_text_not_instructions(self):
         serving = make_serving()
         prev_response = Mock(id="resp_prev")
@@ -1222,7 +1285,9 @@ class OutputItemsTestCase(CustomTestCase):
         ) as parser_cls:
             instance = parser_cls.return_value
             instance.has_tool_call.return_value = True
-            instance.parse_non_stream.return_value = ("trailing text", [fake_call])
+            instance.parse_non_stream_result.return_value = StreamingParseResult(
+                normal_text="trailing text", calls=[fake_call]
+            )
             output_items = serving._make_response_output_items(
                 self._function_tool_request(),
                 "raw model output with <tool_call>",
@@ -1254,9 +1319,8 @@ class OutputItemsTestCase(CustomTestCase):
         ) as parser_cls:
             instance = parser_cls.return_value
             instance.has_tool_call.return_value = True
-            instance.parse_non_stream.return_value = (
-                "I'll check the weather.",
-                [fake_call],
+            instance.parse_non_stream_result.return_value = StreamingParseResult(
+                normal_text="I'll check the weather.", calls=[fake_call]
             )
             output_items = serving._make_response_output_items(
                 self._function_tool_request(),
@@ -1268,6 +1332,40 @@ class OutputItemsTestCase(CustomTestCase):
         types = [type(item).__name__ for item in output_items]
         self.assertEqual(types, ["ResponseOutputMessage", "ResponseFunctionToolCall"])
         self.assertEqual(output_items[0].phase, "commentary")
+
+    def test_beam_preserves_text_tool_text_order(self):
+        serving = self.serving
+        serving.reasoning_parser = "beam"
+        serving.tool_call_parser = "beam"
+        tokenizer = serving.tokenizer_manager.tokenizer
+        tokenizer.response_template = None
+        tokenizer.init_kwargs = {}
+        request = self._function_tool_request()
+        request._response_parser_prefix = "<|start|>assistant"
+        raw = (
+            "<|channel|>analysis<|message|>Check weather.<|end|>"
+            "<|start|>assistant<|channel|>final<|message|>Before.<|end|>"
+            "<|start|>assistant to=get_weather<|channel|>analysis"
+            ' <|constrain|>xml<|message|><rfl:parameter name="city">'
+            "\nParis\n</rfl:parameter><|end|>"
+            "<|start|>assistant<|channel|>final<|message|>After.<|return|>"
+        )
+
+        items = serving._make_response_output_items(
+            request, raw, tokenizer, require_reasoning=True
+        )
+
+        self.assertEqual(
+            [item.type for item in items],
+            ["reasoning", "message", "function_call", "message"],
+        )
+        self.assertEqual(items[0].content[0].text, "Check weather.")
+        self.assertEqual(items[1].content[0].text, "Before.")
+        self.assertEqual(items[1].phase, "commentary")
+        self.assertEqual(items[2].name, "get_weather")
+        self.assertEqual(orjson.loads(items[2].arguments), {"city": "Paris"})
+        self.assertEqual(items[3].content[0].text, "After.")
+        self.assertEqual(items[3].phase, "final_answer")
 
     def test_required_tool_choice_parses_json_array_without_native_parser(self):
         serving = self.serving

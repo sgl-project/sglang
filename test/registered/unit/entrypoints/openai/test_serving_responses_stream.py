@@ -14,10 +14,13 @@ from utils import (
     make_serving,
 )
 
+from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.protocol import (
+    MessageProcessingResult,
     RequestResponseMetadata,
     ResponsesRequest,
 )
+from sglang.srt.parser.beam import BeamReasoningDetector
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -48,6 +51,325 @@ RESPONSE_TEMPLATE = {
 
 
 class NonHarmonyStreamTestCase(CustomTestCase):
+    def test_create_responses_beam_continuation_reaches_engine_and_parsers(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                serving = make_serving()
+                serving.reasoning_parser = "beam"
+                serving.tool_call_parser = "beam"
+                serving._reasoning_detector = BeamReasoningDetector()
+                tokenizer = serving.tokenizer_manager.tokenizer
+                tokenizer.response_template = None
+                tokenizer.init_kwargs = {}
+                tokenizer.decode.return_value = "<|start|>assistant"
+                request = ResponsesRequest(
+                    model="x",
+                    stream=stream,
+                    store=False,
+                    instructions="Be concise.",
+                    tools=[
+                        {
+                            "type": "function",
+                            "name": "get_weather",
+                            "parameters": {"type": "object"},
+                        }
+                    ],
+                    input=[
+                        {"role": "user", "content": "Weather?"},
+                        {
+                            "type": "function_call",
+                            "name": "get_weather",
+                            "call_id": "call_weather",
+                            "arguments": "{}",
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_weather",
+                            "output": "Sunny.",
+                        },
+                    ],
+                )
+                raw = (
+                    "<|channel|>analysis<|message|>Use the result.<|end|>"
+                    "<|start|>assistant<|channel|>final<|message|>Sunny.<|return|>"
+                )
+                captured = {}
+
+                async def generate(adapted, raw_request):
+                    captured["engine"] = adapted
+                    yield engine_chunk(raw, 9, finish=True)
+
+                serving.tokenizer_manager.generate_request = generate
+
+                def render(chat_request, is_multimodal):
+                    captured["chat"] = chat_request
+                    # Only the checkpoint renderer is substituted. The real
+                    # request processing and Beam parsers run on either path.
+                    return MessageProcessingResult(
+                        prompt="<|start|>assistant",
+                        prompt_ids=[1, 2, 3],
+                        image_data=None,
+                        audio_data=None,
+                        video_data=None,
+                        modalities=[],
+                        stop=[],
+                    )
+
+                async def respond():
+                    response = await serving.create_responses(request)
+                    if stream:
+                        events = [event async for event in response]
+                        return find_completed_event(events)["response"]
+                    return response.model_dump()
+
+                with patch.object(
+                    serving, "_apply_conversation_template", side_effect=render
+                ):
+                    response = asyncio.run(respond())
+                self.assertEqual(response["status"], "completed")
+                self.assertEqual(
+                    [i["type"] for i in response["output"]], ["reasoning", "message"]
+                )
+                self.assertEqual(response["output"][1]["content"][0]["text"], "Sunny.")
+                self.assertEqual(captured["engine"].input_ids, [1, 2, 3])
+                self.assertFalse(
+                    captured["engine"].sampling_params["skip_special_tokens"]
+                )
+                self.assertTrue(captured["engine"].require_reasoning)
+                self.assertEqual(request._response_parser_prefix, "<|start|>assistant")
+                messages = captured["chat"].messages
+                self.assertEqual(messages[0].content, "Be concise.")
+                self.assertEqual(messages[-1].tool_call_id, "call_weather")
+                self.assertEqual(messages[-1].content, "Sunny.")
+                self.assertEqual(captured["chat"].tools[0].function.name, "get_weather")
+
+    def test_beam_cut_off_regions_match_full_output(self):
+        serving = make_serving()
+        serving.reasoning_parser = "beam"
+        serving.tool_call_parser = "beam"
+        tokenizer = serving.tokenizer_manager.tokenizer
+        tokenizer.response_template = None
+        tokenizer.init_kwargs = {}
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                }
+            ],
+        )
+        request._response_parser_prefix = "<|start|>assistant"
+        reasoning = "<|channel|>analysis<|message|>Thinking"
+        tool = (
+            "<|channel|>analysis<|message|>Think.<|end|>"
+            "<|start|>assistant to=get_weather<|channel|>analysis"
+            ' <|constrain|>xml<|message|><rfl:parameter name="city">Par'
+        )
+
+        def normalized(value):
+            if isinstance(value, list):
+                return [normalized(v) for v in value]
+            if isinstance(value, dict):
+                return {
+                    k: normalized(v)
+                    for k, v in value.items()
+                    if k not in ("id", "call_id")
+                }
+            return value
+
+        for raw in (reasoning, reasoning + "<|en", tool):
+            full = serving._make_response_output_items(
+                request, raw, tokenizer, require_reasoning=True
+            )
+            for finish, status in (("length", "incomplete"), ("abort", "failed")):
+                # The second layout exposes the tool name before its XML body
+                # is cut off. The first delivers the entire truncated output at once.
+                for split in (0, len(raw) - 3):
+                    with self.subTest(raw=raw, finish=finish, split=split):
+                        chunk = engine_chunk(raw, 9, finish=True)
+                        chunk["meta_info"]["finish_reason"] = {"type": finish}
+                        chunks = (
+                            [engine_chunk(raw[:split]), chunk] if split else [chunk]
+                        )
+                        events = event_payloads(
+                            StreamFixture(serving, request, require_reasoning=True).run(
+                                chunks
+                            )
+                        )
+                        terminal = events[-1]
+                        self.assertEqual(terminal["type"], f"response.{status}")
+                        self.assertEqual(
+                            normalized(terminal["response"]["output"]),
+                            normalized([i.model_dump() for i in full]),
+                        )
+                        if raw == tool:
+                            item = terminal["response"]["output"][-1]
+                            self.assertEqual(item["type"], "function_call")
+                            self.assertEqual(item["status"], "incomplete")
+                            self.assertEqual(item["arguments"], "")
+
+    def test_beam_terminal_status_and_usage_match_full_response(self):
+        serving = make_serving()
+        serving.reasoning_parser = "beam"
+        tokenizer = serving.tokenizer_manager.tokenizer
+        tokenizer.response_template = None
+        tokenizer.init_kwargs = {}
+        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
+        request._response_parser_prefix = "<|start|>assistant"
+        raw = (
+            "<|channel|>analysis<|message|>Think.<|end|>"
+            "<|start|>assistant<|channel|>final<|message|>Answer"
+        )
+        for finish, expected_status in (
+            ("stop", "completed"),
+            ("length", "incomplete"),
+            ("abort", "failed"),
+            ("error", "failed"),
+        ):
+            with self.subTest(finish=finish):
+                chunk = engine_chunk(raw, 9, finish=True)
+                chunk["meta_info"].update(
+                    reasoning_tokens=2, finish_reason={"type": finish}
+                )
+                context = SimpleContext()
+
+                async def generate():
+                    context.append_output(chunk)
+                    yield context
+
+                full = asyncio.run(
+                    serving.responses_full_generator(
+                        request,
+                        {},
+                        generate(),
+                        context,
+                        "x",
+                        tokenizer,
+                        RequestResponseMetadata(request_id=request.request_id),
+                        require_reasoning=True,
+                    )
+                ).model_dump()
+                events = event_payloads(
+                    StreamFixture(serving, request, require_reasoning=True).run([chunk])
+                )
+                terminal = events[-1]
+                self.assertEqual(terminal["type"], f"response.{expected_status}")
+                streamed = terminal["response"]
+                for field in ("status", "usage", "incomplete_details", "error"):
+                    self.assertEqual(streamed[field], full[field], field)
+                self.assertEqual(full["status"], expected_status)
+                self.assertEqual(full["usage"]["input_tokens"], 5)
+                self.assertEqual(full["usage"]["output_tokens"], 9)
+                self.assertEqual(
+                    full["usage"]["output_tokens_details"]["reasoning_tokens"], 2
+                )
+                # Outer response status is separate from each output item's status.
+                self.assertEqual(
+                    [i["status"] for i in streamed["output"]],
+                    [i["status"] for i in full["output"]],
+                )
+
+    def test_beam_text_tool_text_matches_full_response_across_chunks(self):
+        serving = make_serving()
+        serving.reasoning_parser = "beam"
+        serving.tool_call_parser = "beam"
+        tokenizer = serving.tokenizer_manager.tokenizer
+        tokenizer.response_template = None
+        tokenizer.init_kwargs = {}
+        request = ResponsesRequest(
+            model="x",
+            input="weather?",
+            stream=True,
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                }
+            ],
+        )
+        request._response_parser_prefix = "<|start|>assistant"
+        raw = (
+            "<|channel|>analysis<|message|>Check weather.<|end|>"
+            "<|start|>assistant<|channel|>final<|message|>Before.<|end|>"
+            "<|start|>assistant to=get_weather<|channel|>analysis"
+            ' <|constrain|>xml<|message|><rfl:parameter name="city">'
+            "Paris</rfl:parameter><|end|>"
+            "<|start|>assistant<|channel|>final<|message|>After.<|return|>"
+        )
+
+        def semantic(items):
+            return [
+                (
+                    item["type"],
+                    item.get("phase"),
+                    [part["text"] for part in item.get("content") or []],
+                    item.get("name"),
+                    item.get("arguments"),
+                )
+                for item in items
+            ]
+
+        full = serving._make_response_output_items(
+            request, raw, tokenizer, require_reasoning=True
+        )
+        self.assertEqual(
+            [i.type for i in full], ["reasoning", "message", "function_call", "message"]
+        )
+        expected = semantic([i.model_dump() for i in full])
+        # A single engine chunk, character-wise output, and every two-way split
+        # exercise both complete regions and partial control/XML delimiters.
+        boundaries = [[len(raw)], list(range(1, len(raw) + 1))]
+        boundaries.extend([split, len(raw)] for split in range(1, len(raw)))
+        for ends in boundaries:
+            with self.subTest(ends=ends if len(ends) == 2 else len(ends)):
+                events = StreamFixture(serving, request, require_reasoning=True).run(
+                    [
+                        engine_chunk(raw[:end], end, finish=end == len(raw))
+                        for end in ends
+                    ]
+                )
+                payloads = event_payloads(events)
+                output = find_completed_event(events)["response"]["output"]
+                self.assertEqual(semantic(output), expected)
+                done = [
+                    p["item"]
+                    for p in payloads
+                    if p["type"] == "response.output_item.done"
+                ]
+                self.assertEqual(semantic(done), expected)
+                self.assertEqual(
+                    [p["sequence_number"] for p in payloads], list(range(len(payloads)))
+                )
+                for index, item in enumerate(output):
+                    deltas = [p for p in payloads if p.get("output_index") == index]
+                    if item["type"] == "message":
+                        text = "".join(
+                            p["delta"]
+                            for p in deltas
+                            if p["type"] == "response.output_text.delta"
+                        )
+                        self.assertEqual(text, item["content"][0]["text"])
+                    elif item["type"] == "function_call":
+                        args = "".join(
+                            p["delta"]
+                            for p in deltas
+                            if p["type"] == "response.function_call_arguments.delta"
+                        )
+                        self.assertEqual(args, item["arguments"])
+
     def test_reasoning_parser_uses_processed_reasoning_state(self):
         serving = make_serving()
         serving.reasoning_parser = "deepseek-r1"
@@ -406,20 +728,14 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             engine_chunk(" " * 14, 14, finish=True),
         ]
 
-        script_iter = iter(scripted)
-
-        def fake_parse_stream_chunk(delta):
-            sp = next(script_iter)
-            return sp.normal_text, sp.calls
-
         with patch(
             "sglang.srt.entrypoints.openai.serving_responses.FunctionCallParser"
         ) as parser_cls:
             parser_cls.return_value.detector.supports_structural_tag.return_value = True
-            parser_cls.return_value.parse_stream_chunk.side_effect = (
-                fake_parse_stream_chunk
+            parser_cls.return_value.parse_stream_chunk_result.side_effect = scripted
+            parser_cls.return_value.parse_stream_end_result.return_value = (
+                StreamingParseResult()
             )
-            parser_cls.return_value.parse_stream_end.return_value = ("", [])
             fixture = StreamFixture(serving, request)
             events = fixture.run(chunks)
 

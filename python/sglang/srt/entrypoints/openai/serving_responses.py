@@ -37,6 +37,7 @@ from openai.types.responses.response_reasoning_summary_part_done_event import (
     Part as ResponseReasoningSummaryDonePart,
 )
 from openai_harmony import Message as OpenAIMessage
+from pydantic import TypeAdapter
 
 from sglang.srt.entrypoints.context import (
     ConversationContext,
@@ -62,12 +63,15 @@ from sglang.srt.entrypoints.openai.protocol import (
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponseOutputMessage,
+    ResponsesLifecycleEvent,
     ResponsesRequest,
     ResponsesResponse,
+    ResponsesStreamEvent,
     Tool,
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.responses_adapters import (
+    ResponseToolChoiceError,
     custom_tool_description,
     custom_tool_names,
     custom_tool_parameters,
@@ -76,18 +80,24 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     decode_reasoning_state,
     encode_custom_tool_input,
     encode_reasoning_state,
+    flatten_response_input,
+    harmony_custom_input,
     label_developer_content,
+    response_tool_name,
 )
+from sglang.srt.entrypoints.openai.responses_tools.adapter import get_tool_adapter
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     _incomplete_tool_call_indices,
 )
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
+from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.srt.runtime_context import get_disagg, get_serving
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
@@ -153,6 +163,13 @@ def _should_emit_normal_text_as_message(
     return True
 
 
+_RESPONSE_OUTPUT = TypeAdapter(ResponsesResponse.model_fields["output"].annotation)
+_OUTPUT_ITEM_EVENTS = (
+    openai_responses_types.ResponseOutputItemAddedEvent,
+    openai_responses_types.ResponseOutputItemDoneEvent,
+)
+
+
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
 
@@ -181,6 +198,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             tool_server.has_tool("python") if tool_server else False
         )
         self.tool_server = tool_server
+        self._tool_adapter_cls = get_tool_adapter(
+            self.tokenizer_manager.model_config.hf_config.model_type
+        )
         # Get from model config
         self.use_harmony = (
             self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
@@ -285,10 +305,32 @@ class OpenAIServingResponses(OpenAIServingChat):
             param="model",
         )
 
-    async def create_responses(
+    async def create_responses(self, request, raw_request=None):
+        if not self.tokenizer_manager:
+            return self.create_error_response("Model not loaded")
+        original_request = request
+        try:
+            request, adapter = self._tool_adapter_cls.from_request(
+                request,
+                use_harmony=self.use_harmony,
+                tool_call_parser=self.tool_call_parser,
+            )
+        except ResponseToolChoiceError as exc:
+            return self.create_error_response(str(exc), param="tool_choice")
+        except ValueError as exc:
+            return self.create_error_response(str(exc), param="tools")
+        result = await self._create_responses(
+            request, raw_request, tool_adapter=adapter
+        )
+        original_request._response_parser_prefix = request._response_parser_prefix
+        return result
+
+    async def _create_responses(
         self,
         request: ResponsesRequest,
         raw_request: Optional[Request] = None,
+        *,
+        tool_adapter=None,
     ) -> Union[AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse]:
         # Validate model
         if not self.tokenizer_manager:
@@ -401,7 +443,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request_prompts,
                     engine_prompts,
                     processed_messages,
-                ) = await self._make_request(request, prev_response, tokenizer)
+                ) = await self._make_request(
+                    request, prev_response, tokenizer, tool_adapter=tool_adapter
+                )
                 require_reasoning = processed_messages.require_reasoning
 
         except _MediaInputValidationError as e:
@@ -644,6 +688,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         request_metadata,
                         created_time,
                         require_reasoning=require_reasoning,
+                        tool_adapter=tool_adapter,
                     ),
                     name=f"create_{response.id}",
                 )
@@ -675,6 +720,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     tokenizer,
                     request_metadata,
                     require_reasoning=require_reasoning,
+                    tool_adapter=tool_adapter,
                 )
             try:
                 result: Union[
@@ -688,6 +734,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     tokenizer,
                     request_metadata,
                     require_reasoning=require_reasoning,
+                    tool_adapter=tool_adapter,
                 )
                 return result
             except Exception as e:
@@ -699,8 +746,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         request: ResponsesRequest,
         prev_response: Optional[ResponsesResponse],
         tokenizer: Any,
+        *,
+        tool_adapter=None,
     ):
-        messages = self._construct_input_messages(request, prev_response)
+        messages = self._construct_input_messages(
+            request, prev_response, tool_adapter=tool_adapter
+        )
 
         chat_tools = self._response_tools_to_chat_tools(request)
         chat_request = ChatCompletionRequest(
@@ -723,6 +774,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             chat_template_kwargs=request.chat_template_kwargs,
         )
 
+        render_tools = None
+        if tool_adapter is not None:
+            chat_request.chat_template_kwargs, render_tools = tool_adapter.render(
+                chat_request
+            )
+
         media_error = self._validate_media_content(chat_request)
         if media_error:
             raise _MediaInputValidationError(media_error)
@@ -732,6 +789,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             chat_request,
             is_multimodal,
             output_constrained=request.has_json_schema_constraint(),
+            render_tools=render_tools,
         )
         # ``_process_messages`` merges server defaults into the temporary Chat
         # request before rendering. Response parsing happens later from the
@@ -773,6 +831,26 @@ class OpenAIServingResponses(OpenAIServingChat):
         engine_prompt = prompt_token_ids
         return messages, [prompt_token_ids], [engine_prompt]
 
+    @staticmethod
+    def _build_response(
+        request, sampling_params, *, output, status, tool_adapter=None, **kwargs
+    ):
+        error = None
+        if tool_adapter is not None and tool_adapter.builtins:
+            fields = tool_adapter.response(
+                {
+                    "output": [item.model_dump() for item in output],
+                    "status": status,
+                }
+            )
+            output = _RESPONSE_OUTPUT.validate_python(fields["output"])
+            status, error = fields["status"], fields.get("error")
+        response = ResponsesResponse.from_request(
+            request, sampling_params, output=output, status=status, **kwargs
+        )
+        response.error = error
+        return response
+
     async def responses_full_generator(
         self,
         request: ResponsesRequest,
@@ -786,6 +864,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         require_reasoning: bool,
         output_items: Optional[list] = None,
+        tool_adapter=None,
     ) -> Union[ResponsesResponse, ORJSONResponse]:
         if created_time is None:
             created_time = int(time.time())
@@ -805,7 +884,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             output = (
                 output_items
                 if output_items is not None
-                else self._make_response_output_items_with_harmony(context)
+                else [
+                    request._tool_state.harmony_output_item(item)
+                    for item in self._make_response_output_items_with_harmony(context)
+                ]
             )
             # num_reasoning_tokens isn't wired through HarmonyContext yet; stays 0.
             num_prompt_tokens = context.num_prompt_tokens
@@ -895,9 +977,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         request_metadata.final_usage_info = usage
 
-        response = ResponsesResponse.from_request(
+        response = self._build_response(
             request,
             sampling_params,
+            tool_adapter=tool_adapter,
             model_name=model_name,
             created_time=created_time,
             output=output,
@@ -905,7 +988,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             usage=usage,
         )
 
-        response.error = self._error_from_finish_reason(finish_reason)
+        response.error = self._error_from_finish_reason(finish_reason) or response.error
         if self.enable_response_store and request.store:
             async with self.response_store_lock:
                 stored_response = self.response_store.get(response.id)
@@ -964,7 +1047,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _make_tool_call_item(
-        name: str, arguments: str, custom_names: set[str]
+        name: str, arguments: str, custom_names: set[str], tool_names=None
     ) -> Union[ResponseFunctionToolCall, ResponseCustomToolCall]:
         """A call against a ``custom`` tool reports its freeform payload rather
         than the JSON arguments of the shim function tool."""
@@ -974,14 +1057,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                 type="custom_tool_call",
                 id=f"ctc_{random_uuid()[:8]}",
                 call_id=call_id,
-                name=name,
+                **response_tool_name(name, tool_names or {}),
                 input=decode_custom_tool_input(arguments),
             )
         return ResponseFunctionToolCall(
             arguments=arguments,
             call_id=call_id,
             type="function_call",
-            name=name,
+            **response_tool_name(name, tool_names or {}),
             id=f"fc_{random_uuid()[:8]}",
             status="completed",
         )
@@ -1007,18 +1090,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             finish_reason.get("message") if isinstance(finish_reason, dict) else None
         )
         return {"code": "server_error", "message": message or "Generation aborted"}
-
-    @staticmethod
-    def _terminal_stream_event(response: dict):
-        status = response["status"]
-        event_cls = {
-            "completed": openai_responses_types.ResponseCompletedEvent,
-            "incomplete": openai_responses_types.ResponseIncompleteEvent,
-            "failed": openai_responses_types.ResponseFailedEvent,
-        }[status]
-        return event_cls(
-            type=f"response.{status}", sequence_number=-1, response=response
-        )
 
     def _is_thinking_enabled_for_request(self, request: ResponsesRequest) -> bool:
         if not self.reasoning_parser:
@@ -1099,18 +1170,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request,
                     reasoning_content,
                     item_id=f"rs_{random_uuid()}",
-                    status=None,
+                    status="completed",
                 )
             )
 
         tool_choice = request.effective_tool_choice()
         is_required = tool_choice == "required" or isinstance(tool_choice, dict)
         custom_names = custom_tool_names(request.tools)
-        tool_call_items: list[
-            Union[ResponseFunctionToolCall, ResponseCustomToolCall]
-        ] = []
+        calls: list[ToolCallItem] = []
         parsed_via_native = False
         detector_owns_format = False
+        ordered_parts = None
+        incomplete_calls = set()
         if (
             content
             and chat_tools
@@ -1129,16 +1200,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             should_try_native = not is_required or detector_owns_format
             if should_try_native and parser.has_tool_call(content):
                 try:
-                    content, call_info_list = parser.parse_non_stream(content)
-                    for call_info in call_info_list:
-                        tool_call_items.append(
-                            self._make_tool_call_item(
-                                call_info.name,
-                                call_info.parameters or "",
-                                custom_names,
-                            )
-                        )
-                    parsed_via_native = bool(call_info_list)
+                    parsed = parser.parse_non_stream_result(
+                        content, preserve_incomplete=True
+                    )
+                    content, calls = parsed.normal_text, parsed.calls
+                    ordered_parts = parsed.ordered_parts
+                    incomplete_calls = _incomplete_tool_call_indices(parser)
+                    parsed_via_native = bool(calls)
                 except Exception as e:
                     logger.error("Tool call parsing error: %s", e)
 
@@ -1160,25 +1228,47 @@ class OpenAIServingResponses(OpenAIServingChat):
                         arguments = json.dumps(
                             tool.get("parameters", {}), ensure_ascii=False
                         )
-                        tool_call_items.append(
-                            self._make_tool_call_item(
-                                tool["name"], arguments, custom_names
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=len(calls),
+                                name=tool["name"],
+                                parameters=arguments,
                             )
                         )
                     content = ""
             except Exception as e:
                 logger.error("Required tool JSON parse error: %s", e)
 
-        if content:
+        parts = ordered_parts if ordered_parts is not None else [content, *calls]
+        remaining_calls = len(calls)
+        for part in parts:
+            if not isinstance(part, str):
+                item = self._make_tool_call_item(
+                    part.name, part.parameters, custom_names, request._tool_state.names
+                )
+                if (
+                    isinstance(item, ResponseFunctionToolCall)
+                    and part.tool_index in incomplete_calls
+                ):
+                    item.status = "incomplete"
+                output_items.append(item)
+                remaining_calls -= 1
+                continue
+            if not part:
+                continue
+            # Region parsers may split adjacent text into several events.
+            if output_items and isinstance(output_items[-1], ResponseOutputMessage):
+                output_items[-1].content[0].text += part
+                continue
             output_text = ResponseOutputText(
-                text=content,
+                text=part,
                 annotations=[],  # TODO
                 type="output_text",
                 # logprobs cover all generated tokens, not just the stripped content.
                 logprobs=output_logprobs,
             )
             message = ResponseOutputMessage(
-                phase="commentary" if tool_call_items else "final_answer",
+                phase="commentary" if remaining_calls else "final_answer",
                 id=f"msg_{random_uuid()}",
                 content=[output_text],
                 role="assistant",
@@ -1186,7 +1276,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 type="message",
             )
             output_items.append(message)
-        output_items.extend(tool_call_items)
+            # Preserve the existing all-generated-token logprobs payload once.
+            output_logprobs = None
         return output_items
 
     def _make_response_output_items_with_harmony(
@@ -1482,6 +1573,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         self,
         request: ResponsesRequest,
         prev_response: Optional[ResponsesResponse] = None,
+        *,
+        tool_adapter=None,
     ) -> list[ChatCompletionMessageParam]:
         messages: list[ChatCompletionMessageParam] = []
         if request.instructions:
@@ -1493,7 +1586,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
 
         for input_item in self._response_input_history(request):
-            normalized = self._normalize_response_message_for_chat(input_item)
+            if tool_adapter is not None:
+                input_item = tool_adapter.input_item(input_item)
+            normalized = self._normalize_response_message_for_chat(
+                flatten_response_input(input_item)
+            )
             if normalized is not None:
                 messages.append(normalized)
 
@@ -1564,10 +1661,16 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages.append(get_user_message(request.input))
         else:
             if prev_response is not None:
-                prev_outputs = list(prev_response.output)
+                prev_outputs = [
+                    harmony_custom_input(flatten_response_input(i))
+                    for i in prev_response.output
+                ]
             else:
                 prev_outputs = []
             for response_msg in request.input:
+                response_msg = harmony_custom_input(
+                    flatten_response_input(response_msg)
+                )
                 messages.append(parse_response_input(response_msg, prev_outputs))
                 item_type = (
                     response_msg.get("type")
@@ -1590,6 +1693,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         created_time: Optional[int] = None,
         *,
         require_reasoning: bool,
+        tool_adapter=None,
     ):
         try:
             # Update the status to "in_progress"
@@ -1608,6 +1712,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request_metadata,
                 created_time,
                 require_reasoning=require_reasoning,
+                tool_adapter=tool_adapter,
             )
         except Exception as e:
             logger.exception("Background request failed for %s", request.request_id)
@@ -1724,6 +1829,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     item_id=item.id,
                     status=item.status,
                 )
+            item = request._tool_state.harmony_output_item(item, partial=not done)
             snapshot = item.model_dump()
             output_index = len(emitted_items)
             if active_item is None:
@@ -1733,7 +1839,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 for field in ("content", "summary"):
                     if field in active_item:
                         active_item[field] = []
-                for field in ("arguments", "code"):
+                for field in ("arguments", "input", "code"):
                     if field in active_item:
                         active_item[field] = ""
                 if "encrypted_content" in active_item:
@@ -1824,6 +1930,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             for field, event_prefix in (
                 ("arguments", "response.function_call_arguments"),
+                ("input", "response.custom_tool_call_input"),
                 ("code", "response.code_interpreter_call_code"),
             ):
                 if field not in snapshot:
@@ -1876,7 +1983,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             status="in_progress",
             usage=None,
         ).model_dump()
-        initial_response["tools"] = []
         yield _send_event("response.created", response=initial_response)
         yield _send_event("response.in_progress", response=initial_response)
 
@@ -1916,10 +2022,48 @@ class OpenAIServingResponses(OpenAIServingChat):
             output_items=emitted_items,
         )
         response_dict = final_response.model_dump()
-        response_dict["tools"] = []
         yield _send_event(f"response.{final_response.status}", response=response_dict)
 
     async def responses_stream_generator_non_harmony(
+        self,
+        request,
+        sampling_params,
+        result_generator,
+        model_name,
+        tokenizer,
+        request_metadata,
+        created_time=None,
+        *,
+        require_reasoning,
+        tool_adapter=None,
+    ):
+        events = self._responses_stream_events_non_harmony(
+            request,
+            sampling_params,
+            result_generator,
+            model_name,
+            tokenizer,
+            request_metadata,
+            created_time,
+            require_reasoning=require_reasoning,
+            tool_adapter=tool_adapter,
+        )
+        sequence_number = 0
+        async for event in events:
+            payload = event.model_dump()
+            if isinstance(event, _OUTPUT_ITEM_EVENTS) and isinstance(
+                event.item, ResponseOutputMessage
+            ):
+                payload["item"] = event.item.model_dump()
+            if tool_adapter is not None:
+                payload = tool_adapter.event(payload)
+                if payload is None:
+                    continue
+            payload["sequence_number"] = sequence_number
+            sequence_number += 1
+            yield f"event: {payload['type']}\ndata: {orjson.dumps(payload).decode()}\n\n"
+
+    async def _responses_stream_events_non_harmony(
         self,
         request: ResponsesRequest,
         sampling_params: Any,
@@ -1930,8 +2074,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         created_time: Optional[int] = None,
         *,
         require_reasoning: bool,
-    ) -> AsyncGenerator[str, None]:
-        pending: list[dict] = []
+        tool_adapter=None,
+    ) -> AsyncGenerator[ResponsesStreamEvent, None]:
+        pending: list[ResponsesStreamEvent] = []
         can_call_tools = (
             bool(self._response_tools_to_chat_tools(request))
             and request.effective_tool_choice() != "none"
@@ -1945,16 +2090,18 @@ class OpenAIServingResponses(OpenAIServingChat):
             request_metadata,
             created_time,
             require_reasoning=require_reasoning,
+            tool_adapter=tool_adapter,
         ):
             if not can_call_tools:
                 yield event
                 continue
-            payload = orjson.loads(event.split("data: ", 1)[1])
-            event_type = payload["type"]
-            item_type = payload.get("item", {}).get("type")
+            event_type = event.type
+            item_type = (
+                event.item.type if isinstance(event, _OUTPUT_ITEM_EVENTS) else None
+            )
             opens_item = event_type == "response.output_item.added"
             if pending or (opens_item and item_type == "message"):
-                pending.append(payload)
+                pending.append(event)
                 tool_follows = opens_item and item_type in (
                     "function_call",
                     "custom_tool_call",
@@ -1967,9 +2114,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if tool_follows or terminal:
                     phase = "commentary" if tool_follows else "final_answer"
                     for buffered in pending:
-                        if buffered.get("item", {}).get("type") == "message":
-                            buffered["item"]["phase"] = phase
-                        yield f"event: {buffered['type']}\ndata: {orjson.dumps(buffered).decode()}\n\n"
+                        if isinstance(buffered, _OUTPUT_ITEM_EVENTS) and isinstance(
+                            buffered.item, ResponseOutputMessage
+                        ):
+                            buffered.item.phase = phase
+                        yield buffered
                     pending.clear()
             else:
                 yield event
@@ -1985,59 +2134,23 @@ class OpenAIServingResponses(OpenAIServingChat):
         created_time: Optional[int] = None,
         *,
         require_reasoning: bool,
-    ) -> AsyncGenerator[str, None]:
-        """Stream a /v1/responses response as typed OpenAI SSE events for
-        non-harmony models. Each engine chunk is run through the reasoning
-        and function-call parsers; leftover text becomes
-        ``response.output_text.delta``.
-        """
+        tool_adapter=None,
+    ) -> AsyncGenerator[ResponsesStreamEvent, None]:
+        """Parse engine chunks into typed reasoning, tool-call, and text events."""
 
         created_time = created_time or int(time.time())
-        sequence_number = 0
 
-        def _send_event(event):
-            nonlocal sequence_number
-            if hasattr(event, "sequence_number"):
-                event.sequence_number = sequence_number
-            sequence_number += 1
-            event_type = getattr(event, "type", "unknown")
-            payload = event.model_dump()
-            if isinstance(getattr(event, "item", None), ResponseOutputMessage):
-                payload["item"] = event.item.model_dump()
-            return f"event: {event_type}\ndata: {orjson.dumps(payload).decode()}\n\n"
-
-        # The streaming Response* event models echo ``tools`` through a
-        # narrower OpenAI SDK Tool union; strip it to avoid pydantic
-        # validation failures on extended tool types.
-        def _sanitize_response_dict(d: dict) -> dict:
-            d["tools"] = []
-            return d
-
-        initial_response = _sanitize_response_dict(
-            ResponsesResponse.from_request(
-                request,
-                sampling_params,
-                model_name=model_name,
-                created_time=created_time,
-                output=[],
-                status="in_progress",
-                usage=None,
-            ).model_dump()
+        initial_response = ResponsesResponse.from_request(
+            request,
+            sampling_params,
+            model_name=model_name,
+            created_time=created_time,
+            output=[],
+            status="in_progress",
+            usage=None,
         )
-        yield _send_event(
-            openai_responses_types.ResponseCreatedEvent(
-                type="response.created",
-                sequence_number=-1,
-                response=initial_response,
-            )
-        )
-        yield _send_event(
-            openai_responses_types.ResponseInProgressEvent(
-                type="response.in_progress",
-                sequence_number=-1,
-                response=initial_response,
-            )
-        )
+        for event_type in ("response.created", "response.in_progress"):
+            yield ResponsesLifecycleEvent(type=event_type, response=initial_response)
 
         chat_tools = self._response_tools_to_chat_tools(request)
         custom_names = custom_tool_names(request.tools)
@@ -2135,52 +2248,44 @@ class OpenAIServingResponses(OpenAIServingChat):
             events: list = []
             if wants_summary:
                 events.append(
-                    _send_event(
-                        openai_responses_types.ResponseReasoningSummaryTextDoneEvent(
-                            type="response.reasoning_summary_text.done",
-                            item_id=reasoning_state["item_id"],
-                            sequence_number=-1,
-                            output_index=reasoning_state["output_index"],
-                            summary_index=0,
-                            text=text,
-                        )
+                    openai_responses_types.ResponseReasoningSummaryTextDoneEvent(
+                        type="response.reasoning_summary_text.done",
+                        item_id=reasoning_state["item_id"],
+                        sequence_number=-1,
+                        output_index=reasoning_state["output_index"],
+                        summary_index=0,
+                        text=text,
                     )
                 )
                 events.append(
-                    _send_event(
-                        openai_responses_types.ResponseReasoningSummaryPartDoneEvent(
-                            type="response.reasoning_summary_part.done",
-                            item_id=reasoning_state["item_id"],
-                            sequence_number=-1,
-                            output_index=reasoning_state["output_index"],
-                            summary_index=0,
-                            part=ResponseReasoningSummaryDonePart(
-                                type="summary_text", text=text
-                            ),
-                        )
+                    openai_responses_types.ResponseReasoningSummaryPartDoneEvent(
+                        type="response.reasoning_summary_part.done",
+                        item_id=reasoning_state["item_id"],
+                        sequence_number=-1,
+                        output_index=reasoning_state["output_index"],
+                        summary_index=0,
+                        part=ResponseReasoningSummaryDonePart(
+                            type="summary_text", text=text
+                        ),
                     )
                 )
             else:
                 events.append(
-                    _send_event(
-                        openai_responses_types.ResponseReasoningTextDoneEvent(
-                            type="response.reasoning_text.done",
-                            item_id=reasoning_state["item_id"],
-                            sequence_number=-1,
-                            output_index=reasoning_state["output_index"],
-                            content_index=0,
-                            text=text,
-                        )
+                    openai_responses_types.ResponseReasoningTextDoneEvent(
+                        type="response.reasoning_text.done",
+                        item_id=reasoning_state["item_id"],
+                        sequence_number=-1,
+                        output_index=reasoning_state["output_index"],
+                        content_index=0,
+                        text=text,
                     )
                 )
             events += [
-                _send_event(
-                    openai_responses_types.ResponseOutputItemDoneEvent(
-                        type="response.output_item.done",
-                        sequence_number=-1,
-                        output_index=reasoning_state["output_index"],
-                        item=completed_item,
-                    )
+                openai_responses_types.ResponseOutputItemDoneEvent(
+                    type="response.output_item.done",
+                    sequence_number=-1,
+                    output_index=reasoning_state["output_index"],
+                    item=completed_item,
                 ),
             ]
             emitted_items.append(completed_item)
@@ -2196,7 +2301,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             return item_id
 
-        def _close_message_item():
+        def _close_message_item(*, phase="final_answer"):
             if not message_state["open"]:
                 return []
             text = message_state["text"]
@@ -2209,37 +2314,31 @@ class OpenAIServingResponses(OpenAIServingChat):
                 role="assistant",
                 content=[text_content],
                 status="completed",
-                phase="final_answer",
+                phase=phase,
             )
             events = [
-                _send_event(
-                    openai_responses_types.ResponseTextDoneEvent(
-                        type="response.output_text.done",
-                        sequence_number=-1,
-                        output_index=message_state["output_index"],
-                        content_index=0,
-                        text=text,
-                        logprobs=[],
-                        item_id=message_state["item_id"],
-                    )
+                openai_responses_types.ResponseTextDoneEvent(
+                    type="response.output_text.done",
+                    sequence_number=-1,
+                    output_index=message_state["output_index"],
+                    content_index=0,
+                    text=text,
+                    logprobs=[],
+                    item_id=message_state["item_id"],
                 ),
-                _send_event(
-                    openai_responses_types.ResponseContentPartDoneEvent(
-                        type="response.content_part.done",
-                        sequence_number=-1,
-                        item_id=message_state["item_id"],
-                        output_index=message_state["output_index"],
-                        content_index=0,
-                        part=text_content,
-                    )
+                openai_responses_types.ResponseContentPartDoneEvent(
+                    type="response.content_part.done",
+                    sequence_number=-1,
+                    item_id=message_state["item_id"],
+                    output_index=message_state["output_index"],
+                    content_index=0,
+                    part=text_content,
                 ),
-                _send_event(
-                    openai_responses_types.ResponseOutputItemDoneEvent(
-                        type="response.output_item.done",
-                        sequence_number=-1,
-                        output_index=message_state["output_index"],
-                        item=completed_item,
-                    )
+                openai_responses_types.ResponseOutputItemDoneEvent(
+                    type="response.output_item.done",
+                    sequence_number=-1,
+                    output_index=message_state["output_index"],
+                    item=completed_item,
                 ),
             ]
             emitted_items.append(completed_item)
@@ -2262,32 +2361,28 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if remainder:
                     state["payload"] = payload
                     events.append(
-                        _send_event(
-                            openai_responses_types.ResponseCustomToolCallInputDeltaEvent(
-                                type="response.custom_tool_call_input.delta",
-                                sequence_number=-1,
-                                item_id=state["item_id"],
-                                output_index=state["output_index"],
-                                delta=remainder,
-                            )
+                        openai_responses_types.ResponseCustomToolCallInputDeltaEvent(
+                            type="response.custom_tool_call_input.delta",
+                            sequence_number=-1,
+                            item_id=state["item_id"],
+                            output_index=state["output_index"],
+                            delta=remainder,
                         )
                     )
                 completed_item = ResponseCustomToolCall(
                     type="custom_tool_call",
                     id=state["item_id"],
                     call_id=state["call_id"],
-                    name=state["name"] or "",
+                    **response_tool_name(state["name"], request._tool_state.names),
                     input=payload,
                 )
                 events.append(
-                    _send_event(
-                        openai_responses_types.ResponseCustomToolCallInputDoneEvent(
-                            type="response.custom_tool_call_input.done",
-                            sequence_number=-1,
-                            item_id=state["item_id"],
-                            output_index=state["output_index"],
-                            input=payload,
-                        )
+                    openai_responses_types.ResponseCustomToolCallInputDoneEvent(
+                        type="response.custom_tool_call_input.done",
+                        sequence_number=-1,
+                        item_id=state["item_id"],
+                        output_index=state["output_index"],
+                        input=payload,
                     )
                 )
             else:
@@ -2299,31 +2394,27 @@ class OpenAIServingResponses(OpenAIServingChat):
                 completed_item = ResponseFunctionToolCall(
                     arguments=arguments,
                     call_id=state["call_id"],
-                    name=state["name"] or "",
+                    **response_tool_name(state["name"], request._tool_state.names),
                     type="function_call",
                     id=state["item_id"],
                     status=item_status,
                 )
                 events.append(
-                    _send_event(
-                        openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
-                            type="response.function_call_arguments.done",
-                            sequence_number=-1,
-                            item_id=state["item_id"],
-                            output_index=state["output_index"],
-                            arguments=arguments,
-                            name=state["name"] or "",
-                        )
+                    openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
+                        type="response.function_call_arguments.done",
+                        sequence_number=-1,
+                        item_id=state["item_id"],
+                        output_index=state["output_index"],
+                        arguments=arguments,
+                        **response_tool_name(state["name"], request._tool_state.names),
                     )
                 )
             events.append(
-                _send_event(
-                    openai_responses_types.ResponseOutputItemDoneEvent(
-                        type="response.output_item.done",
-                        sequence_number=-1,
-                        output_index=state["output_index"],
-                        item=completed_item,
-                    )
+                openai_responses_types.ResponseOutputItemDoneEvent(
+                    type="response.output_item.done",
+                    sequence_number=-1,
+                    output_index=state["output_index"],
+                    item=completed_item,
                 )
             )
             emitted_items.append(completed_item)
@@ -2370,7 +2461,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                 flush = (
                     not flushed
                     and finish_reason is not None
-                    and finish_reason.get("type") != "abort"
+                    and (
+                        finish_reason.get("type") != "abort"
+                        or isinstance(
+                            getattr(reasoning_parser_obj, "detector", None),
+                            ResponseTemplateReasoningDetector,
+                        )
+                        or getattr(tool_parser, "supports_abort_flush", False)
+                    )
                 )
                 flushed = flushed or flush
 
@@ -2395,76 +2493,72 @@ class OpenAIServingResponses(OpenAIServingChat):
                             yield ev
                     if not reasoning_state["open"]:
                         item_id = _open_reasoning_item()
-                        yield _send_event(
-                            openai_responses_types.ResponseOutputItemAddedEvent(
-                                type="response.output_item.added",
-                                sequence_number=-1,
-                                output_index=reasoning_state["output_index"],
-                                item=ResponseReasoningItem(
-                                    id=item_id,
-                                    type="reasoning",
-                                    summary=[],
-                                    content=[],
-                                    status="in_progress",
-                                ),
-                            )
+                        yield openai_responses_types.ResponseOutputItemAddedEvent(
+                            type="response.output_item.added",
+                            sequence_number=-1,
+                            output_index=reasoning_state["output_index"],
+                            item=ResponseReasoningItem(
+                                id=item_id,
+                                type="reasoning",
+                                summary=[],
+                                content=[],
+                                status="in_progress",
+                            ),
                         )
                         # Clients that opt into ``reasoning.summary`` render
                         # off the ``reasoning_summary_text.*`` event stream,
                         # so mirror the trace into a summary part.
                         if wants_summary:
-                            yield _send_event(
-                                openai_responses_types.ResponseReasoningSummaryPartAddedEvent(
-                                    type="response.reasoning_summary_part.added",
-                                    item_id=item_id,
-                                    output_index=reasoning_state["output_index"],
-                                    summary_index=0,
-                                    part=ResponseReasoningSummaryAddedPart(
-                                        type="summary_text", text=""
-                                    ),
-                                    sequence_number=-1,
-                                )
+                            yield openai_responses_types.ResponseReasoningSummaryPartAddedEvent(
+                                type="response.reasoning_summary_part.added",
+                                item_id=item_id,
+                                output_index=reasoning_state["output_index"],
+                                summary_index=0,
+                                part=ResponseReasoningSummaryAddedPart(
+                                    type="summary_text", text=""
+                                ),
+                                sequence_number=-1,
                             )
                     reasoning_state["text"] += reasoning_chunk
                     if wants_summary:
-                        yield _send_event(
-                            openai_responses_types.ResponseReasoningSummaryTextDeltaEvent(
-                                type="response.reasoning_summary_text.delta",
-                                item_id=reasoning_state["item_id"],
-                                output_index=reasoning_state["output_index"],
-                                summary_index=0,
-                                delta=reasoning_chunk,
-                                sequence_number=-1,
-                            )
+                        yield openai_responses_types.ResponseReasoningSummaryTextDeltaEvent(
+                            type="response.reasoning_summary_text.delta",
+                            item_id=reasoning_state["item_id"],
+                            output_index=reasoning_state["output_index"],
+                            summary_index=0,
+                            delta=reasoning_chunk,
+                            sequence_number=-1,
                         )
                     else:
-                        yield _send_event(
-                            openai_responses_types.ResponseReasoningTextDeltaEvent(
-                                type="response.reasoning_text.delta",
-                                item_id=reasoning_state["item_id"],
-                                output_index=reasoning_state["output_index"],
-                                content_index=0,
-                                delta=reasoning_chunk,
-                                sequence_number=-1,
-                            )
+                        yield openai_responses_types.ResponseReasoningTextDeltaEvent(
+                            type="response.reasoning_text.delta",
+                            item_id=reasoning_state["item_id"],
+                            output_index=reasoning_state["output_index"],
+                            content_index=0,
+                            delta=reasoning_chunk,
+                            sequence_number=-1,
                         )
 
                 if not delta and not flush:
                     continue
 
-                if isinstance(tool_parser, JsonArrayParser):
-                    sp = tool_parser.parse_streaming_increment(delta, chat_tools)
-                    normal_text, tool_calls = sp.normal_text or "", sp.calls
-                    if flush:
-                        end = tool_parser.finish(chat_tools)
+                ordered_parts = None
+                if tool_parser is not None:
+                    if isinstance(tool_parser, JsonArrayParser):
+                        parsed = tool_parser.parse_streaming_increment(
+                            delta, chat_tools
+                        )
+                        end = tool_parser.finish(chat_tools) if flush else None
+                    else:
+                        parsed = tool_parser.parse_stream_chunk_result(delta)
+                        end = tool_parser.parse_stream_end_result() if flush else None
+                    normal_text, tool_calls = parsed.normal_text, list(parsed.calls)
+                    ordered_parts = parsed.ordered_parts
+                    if end is not None:
                         normal_text += end.normal_text
-                        tool_calls = list(tool_calls) + end.calls
-                elif tool_parser is not None:
-                    normal_text, tool_calls = tool_parser.parse_stream_chunk(delta)
-                    if flush:
-                        end_text, end_calls = tool_parser.parse_stream_end()
-                        normal_text = (normal_text or "") + end_text
-                        tool_calls = list(tool_calls) + end_calls
+                        tool_calls.extend(end.calls)
+                        if ordered_parts is not None:
+                            ordered_parts = [*ordered_parts, *(end.ordered_parts or [])]
                 else:
                     normal_text, tool_calls = delta, []
 
@@ -2475,13 +2569,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                             for ev in _close_reasoning_item():
                                 yield ev
                         if message_state["open"]:
-                            for ev in _close_message_item():
+                            for ev in _close_message_item(phase="commentary"):
                                 yield ev
-
-                    if calls:
-                        for item in emitted_items:
-                            if isinstance(item, ResponseOutputMessage):
-                                item.phase = "commentary"
 
                     for call in calls:
                         tool_index = call.tool_index
@@ -2519,25 +2608,27 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     type="custom_tool_call",
                                     id=state["item_id"],
                                     call_id=state["call_id"],
-                                    name=state["name"],
+                                    **response_tool_name(
+                                        state["name"], request._tool_state.names
+                                    ),
                                     input="",
                                 )
                             else:
                                 added_item = ResponseFunctionToolCall(
                                     arguments="",
                                     call_id=state["call_id"],
-                                    name=state["name"],
+                                    **response_tool_name(
+                                        state["name"], request._tool_state.names
+                                    ),
                                     type="function_call",
                                     id=state["item_id"],
                                     status="in_progress",
                                 )
-                            yield _send_event(
-                                openai_responses_types.ResponseOutputItemAddedEvent(
-                                    type="response.output_item.added",
-                                    sequence_number=-1,
-                                    output_index=state["output_index"],
-                                    item=added_item,
-                                )
+                            yield openai_responses_types.ResponseOutputItemAddedEvent(
+                                type="response.output_item.added",
+                                sequence_number=-1,
+                                output_index=state["output_index"],
+                                item=added_item,
                             )
                         if call.parameters:
                             state["arguments"] += call.parameters
@@ -2553,24 +2644,20 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 ) > len(state["payload"]):
                                     delta = decoded[len(state["payload"]) :]
                                     state["payload"] = decoded
-                                    yield _send_event(
-                                        openai_responses_types.ResponseCustomToolCallInputDeltaEvent(
-                                            type="response.custom_tool_call_input.delta",
-                                            sequence_number=-1,
-                                            item_id=state["item_id"],
-                                            output_index=state["output_index"],
-                                            delta=delta,
-                                        )
-                                    )
-                            else:
-                                yield _send_event(
-                                    openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
-                                        type="response.function_call_arguments.delta",
+                                    yield openai_responses_types.ResponseCustomToolCallInputDeltaEvent(
+                                        type="response.custom_tool_call_input.delta",
                                         sequence_number=-1,
                                         item_id=state["item_id"],
                                         output_index=state["output_index"],
-                                        delta=call.parameters,
+                                        delta=delta,
                                     )
+                            else:
+                                yield openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
+                                    type="response.function_call_arguments.delta",
+                                    sequence_number=-1,
+                                    item_id=state["item_id"],
+                                    output_index=state["output_index"],
+                                    delta=call.parameters,
                                 )
 
                 def _emit_normal_text():
@@ -2588,48 +2675,53 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 yield ev
                         if not message_state["open"]:
                             item_id = _open_message_item()
-                            yield _send_event(
-                                openai_responses_types.ResponseOutputItemAddedEvent(
-                                    type="response.output_item.added",
-                                    sequence_number=-1,
-                                    output_index=message_state["output_index"],
-                                    item=ResponseOutputMessage(
-                                        id=item_id,
-                                        type="message",
-                                        role="assistant",
-                                        content=[],
-                                        status="in_progress",
-                                        phase="final_answer",
-                                    ),
-                                )
-                            )
-                            yield _send_event(
-                                openai_responses_types.ResponseContentPartAddedEvent(
-                                    type="response.content_part.added",
-                                    sequence_number=-1,
-                                    output_index=message_state["output_index"],
-                                    item_id=message_state["item_id"],
-                                    content_index=0,
-                                    part=openai_responses_types.ResponseOutputText(
-                                        type="output_text",
-                                        text="",
-                                        annotations=[],
-                                        logprobs=None,
-                                    ),
-                                )
-                            )
-                        message_state["text"] += normal_text
-                        yield _send_event(
-                            openai_responses_types.ResponseTextDeltaEvent(
-                                type="response.output_text.delta",
+                            yield openai_responses_types.ResponseOutputItemAddedEvent(
+                                type="response.output_item.added",
                                 sequence_number=-1,
-                                content_index=0,
+                                output_index=message_state["output_index"],
+                                item=ResponseOutputMessage(
+                                    id=item_id,
+                                    type="message",
+                                    role="assistant",
+                                    content=[],
+                                    status="in_progress",
+                                    phase="final_answer",
+                                ),
+                            )
+                            yield openai_responses_types.ResponseContentPartAddedEvent(
+                                type="response.content_part.added",
+                                sequence_number=-1,
                                 output_index=message_state["output_index"],
                                 item_id=message_state["item_id"],
-                                delta=normal_text,
-                                logprobs=[],
+                                content_index=0,
+                                part=openai_responses_types.ResponseOutputText(
+                                    type="output_text",
+                                    text="",
+                                    annotations=[],
+                                    logprobs=None,
+                                ),
                             )
+                        message_state["text"] += normal_text
+                        yield openai_responses_types.ResponseTextDeltaEvent(
+                            type="response.output_text.delta",
+                            sequence_number=-1,
+                            content_index=0,
+                            output_index=message_state["output_index"],
+                            item_id=message_state["item_id"],
+                            delta=normal_text,
+                            logprobs=[],
                         )
+
+                if ordered_parts is not None:
+                    for part in ordered_parts:
+                        if isinstance(part, str):
+                            normal_text = part
+                            for ev in _emit_normal_text():
+                                yield ev
+                        else:
+                            for ev in _emit_tool_calls([part]):
+                                yield ev
+                    continue
 
                 # The parser's (text, calls) tuple is unordered, but positions
                 # are recoverable: continuing arguments precede this delta's
@@ -2652,25 +2744,17 @@ class OpenAIServingResponses(OpenAIServingChat):
             logger.exception(
                 "Error while streaming /v1/responses %s", request.request_id
             )
-            failed = _sanitize_response_dict(
-                ResponsesResponse.from_request(
-                    request,
-                    sampling_params,
-                    model_name=model_name,
-                    created_time=created_time,
-                    output=[],
-                    status="failed",
-                    usage=None,
-                ).model_dump()
+            failed = ResponsesResponse.from_request(
+                request,
+                sampling_params,
+                model_name=model_name,
+                created_time=created_time,
+                output=[],
+                status="failed",
+                usage=None,
             )
-            failed["error"] = {"code": "server_error", "message": str(e)}
-            yield _send_event(
-                openai_responses_types.ResponseFailedEvent(
-                    type="response.failed",
-                    sequence_number=-1,
-                    response=failed,
-                )
-            )
+            failed.error = {"code": "server_error", "message": str(e)}
+            yield ResponsesLifecycleEvent(type="response.failed", response=failed)
             return
 
         for ev in _close_reasoning_item():
@@ -2695,16 +2779,19 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         request_metadata.final_usage_info = usage
 
-        final_response = ResponsesResponse.from_request(
+        final_response = self._build_response(
             request,
             sampling_params,
+            tool_adapter=tool_adapter,
             model_name=model_name,
             created_time=created_time,
             output=final_output_items,
             status=self._status_from_finish_reason(finish_reason),
             usage=usage,
         )
-        final_response.error = self._error_from_finish_reason(finish_reason)
+        final_response.error = (
+            self._error_from_finish_reason(finish_reason) or final_response.error
+        )
         if self.enable_response_store and request.store:
             async with self.response_store_lock:
                 stored = self.response_store.get(final_response.id)
@@ -2717,9 +2804,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         for item in final_response.output
                     ]
 
-        response_dict = _sanitize_response_dict(final_response.model_dump())
-
-        yield _send_event(self._terminal_stream_event(response_dict))
+        yield ResponsesLifecycleEvent(
+            type=f"response.{final_response.status}", response=final_response
+        )
 
     async def _generate_with_builtin_tools(
         self,

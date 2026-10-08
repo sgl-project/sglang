@@ -90,15 +90,17 @@ class MockTemplateManager:
         self.jinja_template_may_reorder_tool_results = False
 
 
-def make_serving(*, is_multimodal: bool = False) -> OpenAIServingResponses:
+def make_serving(
+    *, is_multimodal: bool = False, model_type: str = "llama"
+) -> OpenAIServingResponses:
     """The serving layer reads its config from the bags, so the fixture
     publishes one. Idempotent: a caller that already published keeps its own,
     which is how a test states a value the default record does not carry."""
     if not get_context().is_config_namespace_published("serving"):
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
-    return OpenAIServingResponses(
-        MockTokenizerManager(is_multimodal=is_multimodal), MockTemplateManager()
-    )
+    manager = MockTokenizerManager(is_multimodal=is_multimodal)
+    manager.model_config.hf_config.model_type = model_type
+    return OpenAIServingResponses(manager, MockTemplateManager())
 
 
 async def collect_stream_events(stream: AsyncIterator[str]) -> list[str]:
