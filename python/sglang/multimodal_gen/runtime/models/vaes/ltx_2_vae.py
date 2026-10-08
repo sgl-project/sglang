@@ -1769,16 +1769,9 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         # intermediate tiles together, the memory requirement can be lowered.
         self.use_tiling = False
 
-        # When decoding temporally long video latents, the memory requirement is very high. By decoding latent frames
-        # at a fixed frame batch size (based on `self.num_latent_frames_batch_sizes`), the memory requirement can be lowered.
+        # Temporal tiling bounds memory when encoding or decoding long videos.
         self.use_framewise_encoding = False
         self.use_framewise_decoding = False
-
-        # This can be configured based on the amount of GPU memory available.
-        # `16` for sample frames and `2` for latent frames are sensible defaults for consumer GPUs.
-        # Setting it to higher values results in higher memory usage.
-        self.num_sample_frames_batch_size = 16
-        self.num_latent_frames_batch_size = 2
 
         # The minimal tile height and width for spatial tiling to be used
         self.tile_sample_min_height = 512

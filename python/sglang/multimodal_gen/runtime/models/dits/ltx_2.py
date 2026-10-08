@@ -1859,8 +1859,6 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             num_attention_heads=self.audio_num_attention_heads,
         )
 
-        self.cross_pe_max_pos = cross_attn_pos_embed_max_pos
-
         # 5. Transformer Blocks
         self.transformer_blocks = nn.ModuleList(
             [
