@@ -2563,19 +2563,23 @@ _HC_MIX_COMPENSATED_SLICES = 16
 _HC_MIX_BF16X3_BLOCK_M = 128
 
 
-def split_bf16_hc_weight(weight: torch.Tensor):
+def split_bf16_hc_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Kahan-style bf16x3 split of the fp32 weight, stacked to ``[3, N, K]``:
+    high + middle + low reconstructs the weight to bf16x3 precision."""
     assert weight.dtype == torch.float32 and weight.is_contiguous()
     high = weight.bfloat16()
     residual = weight - high.float()
     middle = residual.bfloat16()
     low = (residual - middle.float()).bfloat16()
-    return high, middle, low
+    return torch.stack((high, middle, low))
 
 
-def split_tf32_hc_weight(weight: torch.Tensor):
+def split_tf32_hc_weight(weight: torch.Tensor) -> torch.Tensor:
+    """The tf32-and-remainder split of the fp32 weight, stacked to ``[2, N, K]``:
+    high carries the 11 tf32 mantissa bits, high + low is exactly the weight."""
     assert weight.dtype == torch.float32 and weight.is_contiguous()
     high = (weight.view(torch.int32) & -8192).view(torch.float32)
-    return high, weight - high
+    return torch.stack((high, weight - high))
 
 
 @triton.jit
@@ -2628,7 +2632,7 @@ def _hc_mix_stats_bf16x3_kernel(
 
 def hc_mix_stats_sinkhorn_bf16x3(
     x: torch.Tensor,
-    weight_parts,
+    weight_stack: torch.Tensor,  # [3, mix, k] bf16, split_bf16_hc_weight's output
     scale: torch.Tensor,
     base: torch.Tensor,
     sinkhorn_iters: int,
@@ -2642,13 +2646,10 @@ def hc_mix_stats_sinkhorn_bf16x3(
     hopper_medium = get_platform().is_sm90 and 32 <= m < 4096
     block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
     assert x.is_contiguous() and x.dtype == torch.bfloat16
-    assert hopper_medium or 4096 <= m <= 65536
+    assert 1 <= m <= 65536
     assert k % (slices * _HC_MIX_BLOCK_K) == 0
-    assert len(weight_parts) == 3
-    assert all(
-        w.shape == (mix, k) and w.dtype == torch.bfloat16 and w.is_contiguous()
-        for w in weight_parts
-    )
+    assert weight_stack.shape == (3, mix, k)
+    assert weight_stack.dtype == torch.bfloat16 and weight_stack.is_contiguous()
     part_mix = torch.empty((slices, m, mix), device=x.device, dtype=torch.float32)
     sq = torch.empty((slices, m), device=x.device, dtype=torch.float32)
     pre = torch.empty((m, hc_mult), device=x.device, dtype=torch.float32)
@@ -2656,7 +2657,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
     comb = torch.empty((m, hc_mult, hc_mult), device=x.device, dtype=torch.float32)
     _hc_mix_stats_bf16x3_kernel[(triton.cdiv(m, block_m), slices)](
         x,
-        *weight_parts,
+        *weight_stack.unbind(0),
         part_mix,
         sq,
         m,
@@ -2692,7 +2693,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
 
 def hc_mix_stats_sinkhorn_deepgemm(
     x_flat: torch.Tensor,
-    weight_parts,
+    weight_stack: torch.Tensor,  # [2, mix, k] fp32, split_tf32_hc_weight's output
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
     sinkhorn_iters: int,
@@ -2706,8 +2707,8 @@ def hc_mix_stats_sinkhorn_deepgemm(
     m, k = x_flat.shape
     mix = (2 + hc_mult) * hc_mult
     slices = _HC_MIX_COMPENSATED_SLICES
-    high, low = weight_parts
-    assert high.shape == low.shape == (mix, k)
+    assert weight_stack.shape == (2, mix, k) and weight_stack.is_contiguous()
+    high, low = weight_stack.unbind(0)
     dev = x_flat.device
     pre = torch.empty((m, hc_mult), dtype=torch.float32, device=dev)
     post = torch.empty_like(pre)

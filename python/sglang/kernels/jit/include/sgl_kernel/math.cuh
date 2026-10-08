@@ -60,9 +60,28 @@ SGL_DEVICE T exp(T a) {
   return DTypeTrait<T>::exp(a);
 }
 
+/// \brief Fast approximate reciprocal for FP32 device code.
+///
+/// One `MUFU.RCP`. No intrinsic reaches that: `1.f / x` and `__frcp_rn` are correctly
+/// rounded, so they expand to a Newton step plus a slow-path `CALL`, and `__fdividef`
+/// still carries an overflow test and a branch. Accurate to about 1 ulp, flushes
+/// denormals to zero.
+SGL_DEVICE float rcp_fast(float x) {
+  float result;
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(x));
+  return result;
+}
+
 /// \brief Fast approximate sigmoid for FP32 device code.
+/// \tparam kFastRcp Take the reciprocal with `rcp_fast` rather than a division.
+template <bool kFastRcp = false>
 SGL_DEVICE float sigmoid_fast(float x) {
-  return 1.0f / (1.0f + __expf(-x));
+  const float denominator = 1.0f + __expf(-x);
+  if constexpr (kFastRcp) {
+    return rcp_fast(denominator);
+  } else {
+    return 1.0f / denominator;
+  }
 }
 
 /// \brief Fast approximate SiLU for FP32 device code.
@@ -94,22 +113,55 @@ SGL_DEVICE T cos(T a) {
 // instruction saves the explicit converts; the fallback is bit-identical (the
 // bf16 -> f32 conversion is exact, both round once). Shared by tiny_gemm,
 // gemm_ag and ar_fusion.
-SGL_DEVICE float fma_f32_bf16(bf16_t a, bf16_t b, float acc) {
+SGL_DEVICE float fma_f32_bf16(bf16_t a, bf16_t b, float c) {
 #if SGL_ARCH_BLACKWELL_OR_GREATER
   const uint16_t a_bits = __bfloat16_as_ushort(a);
   const uint16_t b_bits = __bfloat16_as_ushort(b);
   float result;
-  asm("fma.rn.f32.bf16 %0, %1, %2, %3;" : "=f"(result) : "h"(a_bits), "h"(b_bits), "f"(acc));
+  asm("fma.rn.f32.bf16 %0, %1, %2, %3;" : "=f"(result) : "h"(a_bits), "h"(b_bits), "f"(c));
   return result;
 #else
-  return fmaf(cast<fp32_t>(a), cast<fp32_t>(b), acc);
+  return fmaf(cast<fp32_t>(a), cast<fp32_t>(b), c);
+#endif
+}
+
+SGL_DEVICE float fma_chain2_f32_bf16(bf16x2_t a, bf16x2_t b, float c) {
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  return fma_f32_bf16(a.x, b.x, fma_f32_bf16(a.y, b.y, c));
+#else
+  const auto [a0, a1] = cast<fp32x2_t>(a);
+  const auto [b0, b1] = cast<fp32x2_t>(b);
+  return fmaf(a0, b0, fmaf(a1, b1, c));
+#endif
+}
+
+SGL_DEVICE float2 fma_f32x2_bf16x2(bf16x2_t a, bf16x2_t b, float2 c) {
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  return {fma_f32_bf16(a.x, b.x, c.x), fma_f32_bf16(a.y, b.y, c.y)};
+#else
+  const auto [a0, a1] = cast<fp32x2_t>(a);
+  const auto [b0, b1] = cast<fp32x2_t>(b);
+  return {fmaf(a0, b0, c.x), fmaf(a1, b1, c.y)};
 #endif
 }
 
 // bf16 x fp32 -> fp32 fused multiply-add: same one-rounding contract as the
 // overload above (the bf16 -> f32 convert is exact).
-SGL_DEVICE float fma_f32_bf16(bf16_t a, float b, float acc) {
-  return fmaf(cast<fp32_t>(a), b, acc);
+SGL_DEVICE float fma_f32_bf16(bf16_t a, float b, float c) {
+  return fmaf(cast<fp32_t>(a), b, c);
+}
+
+SGL_DEVICE float2 fma_f32x2(float2 a, float2 b, float2 c) {
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  const auto a_bits = reinterpret_cast<const uint64_t&>(a);
+  const auto b_bits = reinterpret_cast<const uint64_t&>(b);
+  const auto c_bits = reinterpret_cast<const uint64_t&>(c);
+  uint64_t d_bits;
+  asm("fma.rn.f32x2 %0, %1, %2, %3;" : "=l"(d_bits) : "l"(a_bits), "l"(b_bits), "l"(c_bits));
+  return reinterpret_cast<float2&>(d_bits);
+#else
+  return make_float2(fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y));
+#endif
 }
 
 /**
