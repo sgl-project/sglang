@@ -383,6 +383,7 @@ _LORA_ENGINE_APIS = (
     ),
     ("moe.dispatch_masked", "dispatch_fill_masked_bf16", "dispatch_fill_masked_bf16"),
     ("moe.dispatch_masked", "dispatch_fill_masked_fp8", "dispatch_fill_masked_fp8"),
+    ("moe.dispatch_masked_small", "small_masked_prepare", "small_masked_prepare"),
     (
         "moe.finalize",
         "invoke_shared_token_delta_reduce",
@@ -399,6 +400,16 @@ _LORA_ENGINE_APIS = (
     ("moe.fused_act", "fused_b_act_contiguous", "fused_b_act_contiguous"),
     ("moe.lora_b", "grouped_lora_b", "moe_grouped_lora_b"),
     ("moe.lora_b", "invoke_down_b_into_base", "invoke_down_b_into_base"),
+    (
+        "moe.cutedsl.schedule_builder",
+        "build_dual_stage_schedules_masked",
+        "build_dual_stage_schedules_masked",
+    ),
+    (
+        "moe.cutedsl.schedule_builder",
+        "build_dual_stage_schedules_contiguous",
+        "build_dual_stage_schedules_contiguous",
+    ),
 )
 
 
