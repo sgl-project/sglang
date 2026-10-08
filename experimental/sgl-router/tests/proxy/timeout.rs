@@ -38,12 +38,15 @@ fn config(_worker_url: &str) -> Config {
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,
             tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
+            reorg_buckets: None,
+            reorg_admission: Default::default(),
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
@@ -74,7 +77,7 @@ async fn non_streaming_request_times_out_when_worker_hangs() {
         url: worker.url.clone(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
-        bootstrap_port: None,
+        ..Default::default()
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_millis(200)).unwrap());
@@ -135,4 +138,84 @@ async fn non_streaming_request_times_out_when_worker_hangs() {
         !body_str.contains(&worker.url),
         "worker URL must not leak in client-visible body: {body_str}"
     );
+}
+
+/// Plain workers at `urls` behind a router whose upstream timeout is 200 ms.
+fn hanging_ctx(urls: &[&str], max_attempts: u32) -> Arc<AppContext> {
+    let mut cfg = config("");
+    cfg.proxy.max_attempts = std::num::NonZeroU32::new(max_attempts).unwrap();
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    for (i, url) in urls.iter().enumerate() {
+        registry
+            .add(WorkerSpec {
+                id: WorkerId(format!("w{i}")),
+                url: (*url).into(),
+                mode: WorkerMode::Plain,
+                model_ids: vec![ModelId("tiny".into())],
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(Duration::from_millis(200)).unwrap());
+    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+}
+
+fn streaming_chat() -> Request<Body> {
+    Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+/// A streaming worker that never sends headers times out like a non-streaming one,
+/// counts against its breaker, and with retries on, the request moves to another worker.
+#[tokio::test]
+async fn streaming_request_times_out_waiting_for_headers() {
+    let hanging =
+        crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(5)).await;
+    let ctx = hanging_ctx(&[&hanging.url], 1);
+    let app = build_router(ctx.clone());
+    // The default breaker opens after three consecutive failures.
+    for _ in 0..3 {
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            app.clone().oneshot(streaming_chat()),
+        )
+        .await
+        .expect("router must not wait past its upstream timeout for stream headers")
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            res.headers().get("x-router-error-code").unwrap(),
+            "upstream_timeout"
+        );
+    }
+    let worker = ctx.registry.get(&WorkerId("w0".into())).unwrap();
+    assert!(
+        !worker.breaker.would_allow(),
+        "timeouts must open the breaker"
+    );
+
+    let live = crate::common::mock_worker::MockWorker::start(vec!["data: [DONE]\n\n"]).await;
+    let ctx = hanging_ctx(&[&hanging.url, &live.url], 2);
+    let app = build_router(ctx);
+    for _ in 0..2 {
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            app.clone().oneshot(streaming_chat()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
 }
