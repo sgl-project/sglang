@@ -2678,10 +2678,66 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
         else:
             attn_kwargs["cmp_sparse_indices"] = None
+        self._dump_a5_op_shape(layer, cmp_kv, cmp_block_table, ori_kv, attn_kwargs)
         q_arg = attn_kwargs.pop("q")
         _, attn_op = _sparse_attn_ops()
         out, _ = attn_op(q_arg, **attn_kwargs)
         return out
+
+    def _dump_a5_op_shape(
+        self,
+        layer,
+        cmp_kv: torch.Tensor,
+        cmp_block_table: torch.Tensor,
+        ori_kv: torch.Tensor,
+        kwargs: dict,
+    ) -> None:
+        """Diagnostic for the DSV4/A5 hit != miss divergence: dump the exact
+        tensor shapes handed to the A5 op, which drive its data-shape-dependent
+        template and vectorize selection (authoritative ops-transformer only):
+
+        - ``SelectSASTemplateMode`` picks CFA vs SCFA from
+          ``s2Size / cmpRatio <= sparseBlockCount`` (``s2Size =
+          ori_block_table.shape[1] * ori_page``);
+        - ``vectorizeFlag`` picks IS_VEC_S2PHYADDR from
+          ``cmpMaxBlockNumPerBatch`` / ``sparseBlockCount`` / ``cmpBlockSize``.
+
+        Same printed values hit vs miss => same compiled kernel variant;
+        any difference => the op runs a different variant for the same token.
+        Env ``DSV4_DUMP_OSHAPE`` = c4 layer id (or ""/"all").
+        """
+        import os
+
+        want = os.environ.get("DSV4_DUMP_OSHAPE")
+        if want is None:
+            return
+        lid = getattr(layer, "layer_id", -1)
+        if want not in ("", "all") and want != str(lid):
+            return
+
+        def _shape(t):
+            return tuple(t.shape) if torch.is_tensor(t) else t
+
+        try:
+            ori_bt = kwargs.get("ori_block_table")
+            cmp_idx = kwargs.get("cmp_sparse_indices")
+            seq = kwargs.get("seqused_kv")
+            seq_show = seq.reshape(-1).tolist() if torch.is_tensor(seq) else seq
+            if isinstance(seq_show, list) and len(seq_show) > 16:
+                seq_show = seq_show[:16] + ["..."]
+            ori_page = int(ori_kv.shape[1])
+            s2_size = (
+                int(ori_bt.shape[1]) * ori_page if torch.is_tensor(ori_bt) else -1
+            )
+            print(
+                f"[OSHAPE] layer={lid} ratio={kwargs.get('cmp_ratio')} "
+                f"ori_page={ori_page} ori_bt={_shape(ori_bt)} s2Size={s2_size} "
+                f"cmp_page={int(cmp_kv.shape[1])} cmp_bt={_shape(cmp_block_table)} "
+                f"sparseK={_shape(cmp_idx)} seq={seq_show}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[OSHAPE] skipped: {exc}", flush=True)
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Return the SWA KV write locations used by DeepSeek-V4 draft layers.
