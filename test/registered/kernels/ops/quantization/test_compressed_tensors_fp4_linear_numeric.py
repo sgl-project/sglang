@@ -18,7 +18,6 @@ import pytest
 import torch
 
 from sglang.srt.layers.quantization import fp4_utils
-
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A16Fp4,
 )
