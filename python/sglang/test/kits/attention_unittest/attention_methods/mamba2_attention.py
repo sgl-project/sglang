@@ -13,7 +13,7 @@ _parallel_override = get_parallel().override(
     tp_rank=0,
     attn_tp_size=1,
     attn_tp_rank=0,
-    tp_group=SimpleNamespace(world_size=1),
+    tp_group=SimpleNamespace(rank_in_group=0, world_size=1),
 )
 _parallel_override.__enter__()
 

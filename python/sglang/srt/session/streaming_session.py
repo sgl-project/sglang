@@ -188,10 +188,8 @@ class StreamingSession:
         return True
 
     def try_checkpoint(self, req: Req, *, up_to: int, **kwargs) -> bool:
-        """A turn on the slot's record publishes nothing of its own, so only
-        the chunk cursor is kept. The exception is the first prompt: the slot
-        publishes it for other requests to share, and its lock follows the
-        insert."""
+        # A turn publishes nothing of its own, except the first prompt: the slot
+        # publishes it for other requests to share, and its lock follows the insert.
         slot = self.borrowed_slot(req)
         if slot is None:
             return False
@@ -199,11 +197,6 @@ class StreamingSession:
             req.lock, slot.lock = slot.lock, None
             self.cache.checkpoint_into_tree(req, up_to=up_to, **kwargs)
             self._lock_to_slot(req, slot)
-            return True
-        kv_indices = self.cache.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :up_to
-        ]
-        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
         return True
 
     # -- Record ownership --
