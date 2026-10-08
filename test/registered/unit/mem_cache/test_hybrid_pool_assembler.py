@@ -267,6 +267,10 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         breaks only here, not on the target path."""
         draft_kv_pool = object.__new__(DSATokenToKVPool)
         draft_kv_pool.layer_num = 1
+        draft_kv_pool.start_layer = 0
+        draft_kv_pool.model_layer_ids = (0,)
+        draft_kv_pool.index_kpool = 1
+        draft_kv_pool.kv_buffer = [object()]
         draft_kv_pool.size = 800
         draft_kv_pool.index_head_dim = 128
         draft_kv_pool.page_size = 64
@@ -338,6 +342,9 @@ def _dsa_pool_stub(*, layer_num: int, size: int = 4096, shard: tuple | None = No
     pool.index_head_dim = 128
     pool.page_size = 64
     pool.index_page_size = 64
+    pool.index_kpool = 1
+    pool.model_layer_ids = tuple(range(layer_num))
+    pool.kv_buffer = [object()] * layer_num
     pool.skip_topk_layers = [False] * layer_num
     pool.index_key_cache = SimpleNamespace(buffer=[object()] * layer_num)
     pool.layer_shard_enabled = shard is not None
@@ -667,11 +674,11 @@ class TestPackedDraftPairing(CustomTestCase):
                 packed_draft_device_pools=(partial,),
             )
 
-    def test_storage_info_mismatch_is_rejected(self):
+    def test_index_key_format_mismatch_is_rejected(self):
         target = _dsa_pool_stub(layer_num=2)
         wide = _dsa_pool_stub(layer_num=1)
         wide.index_head_dim = 256
-        with self.assertRaisesRegex(ValueError, "storage"):
+        with self.assertRaisesRegex(ValueError, "format"):
             prepare_host_pool_config(
                 decls=target.host_pool_decls(),
                 full_layer_mapping={i: i for i in range(target.layer_num)},
@@ -687,7 +694,7 @@ class TestPackedDraftPairing(CustomTestCase):
 
 
 class TestKvHostPoolRow(CustomTestCase):
-    """The KV mirror takes its row width from the MLA device pool (an fp8 DSA
+    """The legacy KV constructor takes its row width from the MLA pool (an fp8 DSA
     store is wider than kv_lora_rank + qk_rope_head_dim) and refuses packed
     drafts whose KV rows differ from the target's."""
 
@@ -700,6 +707,9 @@ class TestKvHostPoolRow(CustomTestCase):
 
         with (
             patch.object(hybrid_pool_assembler, "MLATokenToKVPoolHost", fake_host),
+            patch.object(
+                hybrid_pool_assembler, "_uses_native_dsa_kv_buffers", return_value=False
+            ),
             patch.object(
                 hybrid_pool_assembler,
                 "get_parallel",

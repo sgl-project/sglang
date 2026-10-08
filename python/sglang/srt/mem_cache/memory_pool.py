@@ -95,6 +95,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
 
 
 logger = logging.getLogger(__name__)
@@ -4200,6 +4201,11 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
+                **(
+                    {"model_layer_ids": tuple(full_attention_layer_ids)}
+                    if DSAPoolClass is DSATokenToKVPool
+                    else {}
+                ),
             )
         else:
             MLAPoolClass = (
@@ -5109,6 +5115,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
+        model_layer_ids: Optional[tuple[int, ...]] = None,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -5131,6 +5138,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
+        self.model_layer_ids = (
+            tuple(range(self.start_layer, self.start_layer + self.layer_num))
+            if model_layer_ids is None
+            else model_layer_ids
+        )
         self.index_kpool = index_kpool
         self.index_kpool_compress = index_kpool_compress
         self.tail_extra_slots = tail_extra_slots
@@ -5189,16 +5201,49 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def _should_allocate_index_layer(self, local_layer_idx: int) -> bool:
         return not self.skip_topk_layers[local_layer_idx]
 
-    def host_pool_decls(self):
-        # pool_host imports this module. Resolve the mirror side lazily.
-        from sglang.srt.mem_cache.pool_host.dsa import make_dsa_indexer_pool_decl
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        from sglang.srt.mem_cache.device_pool_info import (
+            DevicePoolInfo,
+            EncodedPageBuffers,
+            IndexKeyBufferInfo,
+            IndexPageEncoding,
+            MLABufferInfo,
+        )
+        from sglang.srt.mem_cache.hicache_storage import PoolName
 
-        kv_decls = super().host_pool_decls()
-        # Shared-topk layers own a 0-row placeholder, so a non-empty buffer list
-        # is not enough: some layer must actually hold index keys.
-        if not self.index_k_with_scale_buffer or all(self.skip_topk_layers):
-            return kv_decls
-        return (*kv_decls, make_dsa_indexer_pool_decl(self))
+        kv_info = DevicePoolInfo(
+            pool_name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            layer_ids=self.model_layer_ids,
+            buffer_info=MLABufferInfo(
+                page_size=self.page_size,
+                buffers=tuple(self.kv_buffer),
+            ),
+        )
+        owned_layers = tuple(
+            layer for layer, skip in enumerate(self.skip_topk_layers) if not skip
+        )
+        if not owned_layers or not self.index_key_cache.buffer:
+            return (kv_info,)
+        index_info = DevicePoolInfo(
+            pool_name=PoolName.INDEXER,
+            indices_from_pool=PoolName.KV,
+            layer_ids=tuple(self.model_layer_ids[layer] for layer in owned_layers),
+            buffer_info=IndexKeyBufferInfo(
+                page_size=self.page_size,
+                compress_ratio=self.index_kpool,
+                buffers=EncodedPageBuffers(
+                    buffers=tuple(self.index_key_cache.buffer[i] for i in owned_layers),
+                    encoding=IndexPageEncoding.DSA_FP8,
+                ),
+            ),
+        )
+        return kv_info, index_info
+
+    def host_pool_decls(self):
+        from sglang.srt.mem_cache.pool_host.dsa import make_dsa_host_pool_decls
+
+        return make_dsa_host_pool_decls(self)
 
     @property
     def index_k_with_scale_buffer(self):

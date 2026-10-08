@@ -79,6 +79,8 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 host.mtp_draft_device_pools = [
                     SimpleNamespace(index_k_with_scale_buffer=[draft_buffer])
                 ]
+                host._buffer_device = torch.device("cpu")
+                host.packed_device_index_buffers = [*target_buffers, draft_buffer]
                 host.layout = layout
                 host._live_target_layers = [0, 1, 2]
                 host.layer_num = 4

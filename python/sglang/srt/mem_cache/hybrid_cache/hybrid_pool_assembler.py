@@ -4,10 +4,14 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     SidecarPoolSpec,
+)
+from sglang.srt.mem_cache.hybrid_cache.device_pool_binding import (
+    bind_packed_pool_buffers,
 )
 from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
     HostPoolGroupConfig,
@@ -19,6 +23,7 @@ from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
@@ -37,6 +42,7 @@ from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
+from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     import torch
@@ -155,6 +161,20 @@ def build_kv_host_pool(
     check_packed_kv_rows(
         kv_pool=kv_pool, drafts=mtp_draft_device_pools, use_mla=use_mla
     )
+    if (
+        type(kv_pool) is DSATokenToKVPool
+        and use_mla
+        and override_kv_cache_dim == kv_pool.kv_cache_dim
+        and _uses_native_dsa_kv_buffers(kv_pool, mtp_draft_device_pools)
+    ):
+        if page_size != kv_pool.page_size:
+            raise ValueError("DSA transfer page coverage must match its buffer input")
+        return build_dsa_kv_host_from_infos(
+            kv_pool,
+            drafts=mtp_draft_device_pools,
+            host_size=host_size,
+            pool_label=pool_label,
+        )
     kwargs = {}
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
@@ -178,6 +198,57 @@ def build_kv_host_pool(
         pool_label=pool_label,
         **kwargs,
     )
+
+
+def _uses_native_dsa_kv_buffers(pool, drafts) -> bool:
+    return (
+        is_cuda()
+        and not get_parallel().dcp_enabled
+        and all(
+            type(item) is DSATokenToKVPool and not item.layer_shard_enabled
+            for item in (pool, *drafts)
+        )
+    )
+
+
+def build_dsa_kv_host_from_infos(
+    pool: DSATokenToKVPool,
+    *,
+    drafts: tuple[DSATokenToKVPool, ...],
+    host_size: float | None,
+    pool_label: str = "kv",
+) -> MLATokenToKVPoolHost:
+    target = next(
+        info for info in pool.get_device_pool_infos() if info.pool_name is PoolName.KV
+    )
+    draft_infos = tuple(
+        next(
+            info
+            for info in draft.get_device_pool_infos()
+            if info.pool_name is PoolName.KV
+        )
+        for draft in drafts
+    )
+    buffers, _ = bind_packed_pool_buffers(
+        target=target,
+        drafts=draft_infos,
+        model_to_transfer_layer={layer: i for i, layer in enumerate(target.layer_ids)},
+        target_layer_num=pool.layer_num,
+    )
+    if not isinstance(buffers, MLABufferInfo):
+        raise TypeError("DSA main KV assembly requires MLA buffers")
+    host = MLATokenToKVPoolHost.from_buffer_info(
+        buffers,
+        target_layer_num=pool.layer_num,
+        device_capacity=pool.size,
+        host_to_device_ratio=get_memory().hicache_ratio,
+        host_size=get_memory().hicache_size if host_size is None else host_size,
+        layout=get_memory().hicache_mem_layout,
+        allocator_type=_get_allocator_type(),
+        pool_label=pool_label,
+    )
+    host.start_layer, host.end_layer = pool.start_layer, pool.end_layer
+    return host
 
 
 def _split_hicache_size(

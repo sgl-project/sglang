@@ -5,6 +5,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.mla_host_dedup import (
     MLAHostDedupBroadcaster,
     MLAHostDedupContext,
@@ -81,11 +82,18 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             size=8,
             start_layer=0,
             end_layer=2,
-            index_head_dim=8,
-            quant_block_size=4,
+            index_head_dim=128,
+            quant_block_size=128,
             page_size=2,
             index_page_size=2,
             skip_topk_layers=[False] * 2,
+            index_kpool=1,
+            model_layer_ids=(0, 1),
+            kv_buffer=[object()] * 2,
+            index_key_cache=SimpleNamespace(buffer=[object()] * 2),
+        )
+        dsa_device_pool.get_device_pool_infos = lambda: (
+            DSATokenToKVPool.get_device_pool_infos(dsa_device_pool)
         )
         indexer_host = DSAIndexerPoolHost(
             decl=make_dsa_indexer_pool_decl(dsa_device_pool),

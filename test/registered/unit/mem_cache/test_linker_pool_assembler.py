@@ -161,6 +161,15 @@ class TestDevicePoolGroup(CustomTestCase):
 
 
 class TestHybridDevicePoolAssembler(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler.get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=False),
+            )
+        )
+
     def test_deepseek_v4_maps_sparse_sidecars(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4LayerItem,
@@ -423,25 +432,26 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
     def test_dsa_uses_hybrid_assembler_strategy(self):
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
-        def dsa_pool(kv_width, index_width):
+        def dsa_pool(layers):
             pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
-            pool.page_size = 2
-            pool.layer_num = 1
-            pool.kv_buffer = [torch.zeros((8, kv_width), dtype=torch.uint8)]
+            pool.page_size = 64
+            pool.index_kpool = 1
+            pool.start_layer = 0
+            pool.layer_num = layers
+            pool.model_layer_ids = tuple(range(layers))
+            pool.skip_topk_layers = [False] * layers
+            pool.kv_buffer = [torch.zeros((256, 1, 3), dtype=torch.uint8)] * layers
             pool.index_key_cache = SimpleNamespace(
-                buffer=[torch.zeros((4, index_width), dtype=torch.uint8)]
+                buffer=[torch.zeros((4, 8448), dtype=torch.uint8)] * layers
             )
             return pool
 
-        kvcache = dsa_pool(3, 7)
-        kvcache.layer_num = 2
-        kvcache.kv_buffer.append(torch.zeros((8, 5), dtype=torch.uint8))
-        kvcache.index_key_cache.buffer.append(torch.zeros((4, 11), dtype=torch.uint8))
-        draft_pools = (dsa_pool(13, 17), dsa_pool(19, 23))
+        kvcache = dsa_pool(2)
+        draft_pools = (dsa_pool(1), dsa_pool(1))
 
         group = resolve_hybrid_device_pool_group(
             kvcache=kvcache,
-            page_size=2,
+            page_size=64,
             params=SimpleNamespace(mtp_draft_device_pools=draft_pools),
             components={ComponentType.FULL},
         )
@@ -459,18 +469,66 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         _, sizes, offsets = group.entry_map[PoolName.KV].get_prepared_layer_range_meta(
             [0], 0
         )
-        self.assertEqual(sizes, [[6, 26]])
-        self.assertEqual(offsets, [[0, 16]])
+        self.assertEqual(sizes, [[192, 192]])
+        self.assertEqual(offsets, [[0, 384]])
         _, sizes, offsets = group.entry_map[
             PoolName.INDEXER
         ].get_prepared_layer_range_meta([0], 0)
-        self.assertEqual(sizes, [[7, 17]])
-        self.assertEqual(offsets, [[0, 18]])
+        self.assertEqual(sizes, [[8448, 8448]])
+        self.assertEqual(offsets, [[0, 16896]])
         _, sizes, offsets = group.entry_map[
             PoolName.INDEXER
         ].get_prepared_layer_range_meta([0], 1)
-        self.assertEqual(sizes, [[11, 23]])
-        self.assertEqual(offsets, [[7, 35]])
+        self.assertEqual(sizes, [[8448, 8448]])
+        self.assertEqual(offsets, [[8448, 25344]])
+
+    def test_unmigrated_dsa_families_keep_legacy_linker_inputs(self):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_dsa_device_pool_group,
+        )
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        class AlternateDSAPool(DSATokenToKVPool):
+            pass
+
+        for pool_type, cuda, sharded, dcp in (
+            (AlternateDSAPool, True, False, False),
+            (DSATokenToKVPool, False, False, False),
+            (DSATokenToKVPool, True, True, False),
+            (DSATokenToKVPool, True, False, True),
+        ):
+            with self.subTest(pool=pool_type, cuda=cuda, sharded=sharded, dcp=dcp):
+                pool = pool_type.__new__(pool_type)
+                pool.page_size = 64
+                pool.layer_num = 2
+                pool.layer_shard_enabled = sharded
+                pool.kv_buffer = [torch.zeros((128, 1, 3)) for _ in range(2)]
+                pool.index_key_cache = SimpleNamespace(
+                    buffer=[torch.zeros((2, 8448), dtype=torch.uint8) for _ in range(2)]
+                )
+                pool.get_device_pool_infos = Mock(
+                    side_effect=AssertionError("unmigrated provider was called")
+                )
+                with (
+                    patch("sglang.srt.utils.is_cuda", return_value=cuda),
+                    patch(
+                        "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler.get_parallel",
+                        return_value=SimpleNamespace(dcp_enabled=dcp),
+                    ),
+                ):
+                    group = _build_dsa_device_pool_group(pool, 64)
+                self.assertEqual(group.num_layers, 2)
+                for name, expected in (
+                    (PoolName.KV, pool.kv_buffer),
+                    (PoolName.INDEXER, pool.index_k_with_scale_buffer),
+                ):
+                    entry = group.entry_map[name]
+                    self.assertEqual(entry.layer_mapping, {0: 0, 1: 1})
+                    self.assertEqual(
+                        [buffer.data_ptr() for buffer in entry.components[0]],
+                        [buffer.data_ptr() for buffer in expected],
+                    )
+                pool.get_device_pool_infos.assert_not_called()
 
     def test_linker_requires_packed_draft(self):
         """Do not accept draft state that the linker would omit from storage."""

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -14,6 +14,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.runtime_context import get_parallel
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
 class DevicePoolEntry:
@@ -395,6 +399,78 @@ def _build_dsa_device_pool_group(
     kvcache: Any,
     page_size: int,
     mtp_draft_device_pools: tuple[Any, ...] = (),
+) -> DevicePoolGroup:
+    if kvcache.page_size != page_size:
+        raise ValueError(
+            "DSA KV page size must match the tree page size: "
+            f"{kvcache.page_size} != {page_size}."
+        )
+    from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo
+    from sglang.srt.mem_cache.hybrid_cache.device_pool_binding import (
+        bind_packed_pool_buffers,
+    )
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+    from sglang.srt.utils import is_cuda
+
+    if (
+        not is_cuda()
+        or get_parallel().dcp_enabled
+        or any(
+            type(pool) is not DSATokenToKVPool or pool.layer_shard_enabled
+            for pool in (kvcache, *mtp_draft_device_pools)
+        )
+    ):
+        return _build_legacy_dsa_device_pool_group(
+            kvcache, page_size, mtp_draft_device_pools
+        )
+
+    target_infos = kvcache.get_device_pool_infos()
+    draft_infos = tuple(
+        {info.pool_name: info for info in pool.get_device_pool_infos()}
+        for pool in mtp_draft_device_pools
+    )
+    target_names = {info.pool_name for info in target_infos}
+    if any(set(infos) != target_names for infos in draft_infos):
+        raise ValueError("DSA packed drafts must provide the same pools as the target")
+    entries = []
+    for info in target_infos:
+        buffers, layer_mapping = bind_packed_pool_buffers(
+            target=info,
+            drafts=tuple(infos[info.pool_name] for infos in draft_infos),
+            model_to_transfer_layer={
+                layer: layer - kvcache.start_layer for layer in info.layer_ids
+            },
+            target_layer_num=kvcache.layer_num,
+        )
+        if len(draft_infos) > kvcache.layer_num:
+            raise ValueError(
+                "Packed draft layers exceed the target transfer layer count"
+            )
+        for depth in range(len(draft_infos)):
+            draft_position = layer_mapping.pop(kvcache.layer_num + depth)
+            if depth in layer_mapping:
+                layer_mapping[depth] = (layer_mapping[depth], draft_position)
+            else:
+                layer_mapping[depth] = draft_position
+        encoded = isinstance(buffers, IndexKeyBufferInfo)
+        entries.append(
+            DevicePoolEntry(
+                name=info.pool_name,
+                indices_from_pool=info.indices_from_pool,
+                device_pool=kvcache,
+                components=[buffers.buffers.buffers if encoded else buffers.buffers],
+                layer_mapping=layer_mapping,
+                page_size=page_size,
+                rows_are_pages=encoded,
+            )
+        )
+    return DevicePoolGroup(entries, kvcache.layer_num, page_size, rank_replicated=True)
+
+
+def _build_legacy_dsa_device_pool_group(
+    kvcache: DSATokenToKVPool,
+    page_size: int,
+    mtp_draft_device_pools: tuple[DSATokenToKVPool, ...] = (),
 ) -> DevicePoolGroup:
     if kvcache.page_size != page_size:
         raise ValueError(

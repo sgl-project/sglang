@@ -165,6 +165,7 @@ class HostKVCache(abc.ABC):
     dcp_rank = 0
     shared_allocation_domain = None
     stores_page_envelope = False
+    _native_device_layer_count: int | None = None
     # Names this pool's page byte format in storage keys when it has one of its
     # own, so pages persisted in another format miss instead of loading.
     storage_format_tag: Optional[str] = None
@@ -185,8 +186,45 @@ class HostKVCache(abc.ABC):
         pool_label: str = "kv",
     ):
         self.device_pool = device_pool
+        # Unified capacity is independent of its physical buffer-row count.
+        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
+        if device_capacity is None:
+            device_capacity = device_pool.size
+        self.start_layer = device_pool.start_layer
+        self.end_layer = device_pool.end_layer
+        self._initialize_host_cache(
+            device_capacity=device_capacity,
+            dtype=device_pool.store_dtype,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            page_size=page_size,
+            layout=layout,
+            pin_memory=pin_memory,
+            device=device,
+            allocator_type=allocator_type,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            pool_label=pool_label,
+        )
+
+    def _initialize_host_cache(
+        self,
+        *,
+        device_capacity: int,
+        dtype: torch.dtype,
+        host_to_device_ratio: float,
+        host_size: float,
+        page_size: int,
+        layout: str,
+        pin_memory: bool,
+        device: str,
+        allocator_type: str,
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
+        pool_label: str = "kv",
+    ) -> None:
         self.pool_label = pool_label
-        # page_size arrives widened (x dcp_size); size/page_size/page_num are physical.
+        # The allocator page is widened by DCP. Host counts use physical pages.
         self.dcp_size = dcp_size
         self.dcp_rank = dcp_rank
         assert page_size % dcp_size == 0, (
@@ -201,12 +239,8 @@ class HostKVCache(abc.ABC):
         self.allocator = get_allocator_from_storage(allocator_type)
         self.can_use_write_back_jit = False
 
-        self.dtype = device_pool.store_dtype
+        self.dtype = dtype
         self.size_per_token = self.get_size_per_token()
-        # Unified pools report token capacity separately from their buffer-row count.
-        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
-        if device_capacity is None:
-            device_capacity = device_pool.size
         self.device_capacity_tokens = device_capacity
         if host_size > 0:
             self.size = sync_fixed_hicache_size(
@@ -217,8 +251,6 @@ class HostKVCache(abc.ABC):
         # Align up the host memory pool size to the page size
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
-        self.start_layer = device_pool.start_layer
-        self.end_layer = device_pool.end_layer
 
         if self.size <= device_capacity:
             logger.warning(
@@ -342,6 +374,8 @@ class HostKVCache(abc.ABC):
         raise NotImplementedError()
 
     def _is_device_layer_sharded(self, device_pool=None) -> bool:
+        if self._native_device_layer_count is not None:
+            return False
         device_pool = device_pool or self.device_pool
         return bool(device_pool.layer_shard_enabled)
 
@@ -350,6 +384,8 @@ class HostKVCache(abc.ABC):
 
         ``(0, layer_num)`` when the device pool is not layer-sharded.
         """
+        if self._native_device_layer_count is not None:
+            return 0, self._native_device_layer_count
         device_pool = device_pool or self.device_pool
         if not self._is_device_layer_sharded(device_pool):
             return 0, device_pool.layer_num

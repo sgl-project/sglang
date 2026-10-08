@@ -9,7 +9,11 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    MHATokenToKOnlyPool,
+    MHATokenToKVPool,
+)
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     LogicalHostPool,
@@ -468,11 +472,11 @@ class TestHostPoolGroup(CustomTestCase):
 
 
 class TestDSAIndexerPoolDecl(CustomTestCase):
-    """The declaration is the single source of indexer host bytes. The mirror
-    must not re-derive them."""
+    """Legacy declarations derive host bytes and layers from device information."""
 
     def _stub(self):
-        return SimpleNamespace(
+        pool = object.__new__(DSATokenToKVPool)
+        pool.__dict__.update(
             layer_num=5,
             layer_shard_enabled=False,
             store_dtype=torch.bfloat16,
@@ -485,8 +489,13 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
             quant_block_size=128,
             page_size=64,
             index_page_size=64,
+            index_kpool=1,
+            model_layer_ids=tuple(range(5)),
+            kv_buffer=[object()] * 5,
+            index_key_cache=SimpleNamespace(buffer=[object()] * 5),
             skip_topk_layers=[False] * 5,
         )
+        return pool
 
     def test_host_bytes_match_observed_allocation(self):
         # GLM-5.2 DSA, page 64, 5 layers, host 18192320 tokens: the server
@@ -561,8 +570,16 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
         self.assertEqual(mirror._owned_device_layer_ids(stub), [0, 3])
         self.assertEqual(mirror._host_layer_index(3), 1)
         self.assertFalse(mirror._is_device_layer_owned(stub, 1))
-        # packed draft depth 0 arrives as device layer_num + 0 and lands after the live layers
-        self.assertEqual(mirror._draft_host_layer(stub.layer_num), 2)
+        draft = self._stub()
+        draft.layer_num = 1
+        packed = DSAIndexerPoolHost(
+            decl=decl,
+            anchor_host=anchor,
+            packed_draft_device_pools=(draft,),
+            pin_memory=False,
+            is_dummy=True,
+        )
+        self.assertEqual(packed._draft_host_layer(stub.layer_num), 2)
 
 
 if __name__ == "__main__":

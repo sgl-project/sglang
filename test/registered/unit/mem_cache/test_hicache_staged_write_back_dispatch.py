@@ -460,9 +460,10 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
     def _patched_transfers(self, src_registry=None, module=MEMORY_POOL_HOST_MODULE):
         staged_side_effect = None
         if src_registry is not None:
-            staged_side_effect = lambda **kwargs: _cpu_staged_lf_pf_copy(
-                src_registry, **kwargs
-            )
+
+            def staged_side_effect(**kwargs):
+                return _cpu_staged_lf_pf_copy(src_registry, **kwargs)
+
         return (
             mock.patch(
                 f"{module}.jit_transfer_hicache_all_layer_mla_staged_lf_pf",
@@ -1029,6 +1030,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         host = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
         host.device_pool = device_pool
+        host._layer_sharded = False
+        host.packed_device_index_buffers = device_layers
         host.layout = "page_first"
         host.page_size = page_size
         host.layer_num = layer_num
