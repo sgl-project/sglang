@@ -178,16 +178,11 @@ class TestTeaCache(CustomTestCase):
                         )
 
     def test_skip_window_is_measured_in_denoising_steps(self):
-        """The step range is topology-free; serial forward boundaries stay doubled."""
+        """Resolve integer, fractional and negative boundaries in denoising steps."""
         for start, end, expected in ((5, -1, (5, 49)), (0.1, 0.8, (5, 40))):
             params = TeaCacheParams(start_skipping=start, end_skipping=end)
             with self.subTest(start=start, end=end):
                 self.assertEqual(params.get_skip_step_range(50), expected)
-                self.assertEqual(params.get_skip_boundaries(50, False), expected)
-                self.assertEqual(
-                    params.get_skip_boundaries(50, True),
-                    (expected[0] * 2, expected[1] * 2),
-                )
 
 
 if __name__ == "__main__":

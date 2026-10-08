@@ -81,15 +81,3 @@ class TeaCacheParams(CacheParams):
             _resolve_boundary(self.start_skipping),
             _resolve_boundary(self.end_skipping),
         )
-
-    def get_skip_boundaries(
-        self, num_inference_steps: int, do_cfg: bool
-    ) -> tuple[int, int]:
-        """Return skip boundaries in serial forward calls (two per step with CFG)."""
-        start_skipping, end_skipping = self.get_skip_step_range(num_inference_steps)
-
-        if do_cfg:
-            start_skipping *= 2
-            end_skipping *= 2
-
-        return start_skipping, end_skipping
