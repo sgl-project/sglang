@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -118,6 +119,19 @@ def test_named_choice_matches_public_namespace(tools, choice):
     )
     assert response.status_code == 400
     assert json.loads(response.body)["error"]["param"] == "tool_choice"
+
+
+@pytest.mark.parametrize("name", [None, "", 1])
+@pytest.mark.parametrize("kind", ["function_call", "custom_tool_call"])
+def test_replayed_call_requires_name(kind, name):
+    call = {"type": kind, "call_id": "call_x"}
+    if name is not None:
+        call["name"] = name
+    response = asyncio.run(
+        make_serving().create_responses(ResponsesRequest(model="x", input=[call]))
+    )
+    assert response.status_code == 400
+    assert "require a name" in json.loads(response.body)["error"]["message"]
 
 
 def test_namespace_mapping_preserves_extra_tool_options():
@@ -240,8 +254,16 @@ def test_namespace_beam_generation_and_continuation(stream, kind, nsname, choice
 
 
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("kind", ["function", "custom"])
-def test_harmony_namespace_handler(stream, kind):
+@pytest.mark.parametrize(
+    "kind,cutoff,described",
+    [
+        ("function", False, True),
+        ("custom", False, True),
+        ("custom", False, False),  # a custom tool's description is optional
+        ("custom", True, True),  # generation stops inside the payload
+    ],
+)
+def test_harmony_namespace_handler(stream, kind, cutoff, described):
     from openai_harmony import Conversation, Message, Role
 
     from sglang.srt.entrypoints.harmony_utils import get_encoding
@@ -265,10 +287,22 @@ def test_harmony_namespace_handler(stream, kind):
         Conversation.from_messages([]), Role.ASSISTANT
     )
     tokens = tokens[len(prefix) :]
+    if cutoff:
+        tokens = next(
+            tokens[:end]
+            for end in range(len(tokens))
+            if get_encoding().decode(tokens[:end]).endswith('{"input": "quote')
+        )
+        value = "quote"
+    tool = namespace(kind)
+    if not described:
+        del tool["description"], tool["tools"][0]["description"]
 
     async def generate(*args):
         for index in range(1, len(tokens) + 1) if stream else [len(tokens)]:
             chunk = engine_chunk("", index, finish=index == len(tokens))
+            if cutoff and index == len(tokens):
+                chunk["meta_info"]["finish_reason"] = {"type": "length"}
             chunk["output_ids"] = tokens[:index]
             yield chunk
 
@@ -281,7 +315,7 @@ def test_harmony_namespace_handler(stream, kind):
                 input="Call tool",
                 stream=stream,
                 store=False,
-                tools=[namespace(kind)],
+                tools=[tool],
             )
         )
         if stream:
@@ -377,3 +411,7 @@ def test_namespace_reuses_qwen_parser_and_unknown_name_filter():
         '<tool_call>\n{"name":"undeclared","arguments":{}}\n</tool_call>'
     )
     assert calls == []
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

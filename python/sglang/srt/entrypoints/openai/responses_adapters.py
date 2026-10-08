@@ -40,8 +40,12 @@ class ResponseToolState:
             return item
         public_name = response_tool_name(item.name, self.names)
         if item.name in self.custom_names:
+            # Harmony leaves a call cut off by the end of generation in_progress.
+            unfinished = partial or item.status == "in_progress"
             decode = (
-                decode_custom_tool_input_prefix if partial else decode_custom_tool_input
+                decode_custom_tool_input_prefix
+                if unfinished
+                else decode_custom_tool_input
             )
             return ResponseCustomToolCall(
                 type="custom_tool_call",
@@ -140,9 +144,10 @@ def flatten_response_input(item):
         "custom_tool_call",
     ):
         item = dict(item)
-        item["name"] = flat_namespace_tool_name(
-            item.pop("namespace", None), item["name"]
-        )
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"{item['type']} input items require a name")
+        item["name"] = flat_namespace_tool_name(item.pop("namespace", None), name)
     return item
 
 
@@ -154,9 +159,11 @@ def harmony_custom_tool(tool):
         **tool,
         "type": "function",
         "parameters": custom_tool_parameters(),
+        # Harmony requires a description; a custom tool's is optional.
         "description": custom_tool_description(
             tool.get("description"), tool.get("format")
-        ),
+        )
+        or "",
     }
     tool.pop("format", None)
     return tool
