@@ -1,4 +1,4 @@
-"""CPU checks that DeepGEMM warmup budgets include every allocated buffer."""
+"""CPU checks for DeepGEMM warmup buffers and scale conversion workspace."""
 
 import unittest
 from contextlib import ExitStack
@@ -54,7 +54,25 @@ class TestWarmupMemory(CustomTestCase):
                     budget_gib = _BaseWarmupExecutor.get_memory_requirement(
                         kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
                     )
-                    self.assertEqual(budget_gib * (1 << 30), allocated_bytes)
+                    if hasattr(executor, "lhs_s"):
+                        # DeepGEMM transposes token scales to a 16-byte-aligned
+                        # MN-major layout. Check its strided storage, not numel.
+                        scales = executor.lhs_s
+                        scales = scales.unsqueeze(0) if scales.ndim == 2 else scales
+                        batches, rows, cols = scales.shape
+                        aligned_rows = (rows + 3) // 4 * 4
+                        workspace = torch.empty_strided(
+                            scales.shape,
+                            (aligned_rows * cols, 1, aligned_rows),
+                            dtype=scales.dtype,
+                            device="meta",
+                        )
+                        allocated_bytes += workspace.untyped_storage().nbytes()
+                        self.assertGreaterEqual(budget_gib * (1 << 30), allocated_bytes)
+                        # The estimate reserves padding after the final row too.
+                        self.assertLess(budget_gib * (1 << 30) - allocated_bytes, 16)
+                    else:
+                        self.assertEqual(budget_gib * (1 << 30), allocated_bytes)
 
 
 if __name__ == "__main__":
