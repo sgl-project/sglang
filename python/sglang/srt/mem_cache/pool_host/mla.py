@@ -151,7 +151,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self._init_device_row_stride(
             buf
             for pool in (self.device_pool, *self.mtp_draft_device_pools)
-            for buf in getattr(pool, "kv_buffer", None) or ()
+            if getattr(pool, "kv_buffer", None) is not None
+            for buf in getattr(pool, "kv_buffer")
         )
         self._init_write_back_staging_buffers()
 
