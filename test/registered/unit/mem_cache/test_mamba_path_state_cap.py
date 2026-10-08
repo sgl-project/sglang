@@ -243,9 +243,9 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
         self.assertTrue(middle.backuped)
         self.assertIsNotNone(middle.component_data[ComponentType.MAMBA].host_value)
 
-    def test_backup_retry_after_mamba_cap_skips_tombstoned_state(self):
-        """A backup that fails before the cap and retries via the leaf action
-        rebuilds its spec post-cap: KV backs up, the tombstoned mamba arm stays gone."""
+    def test_queued_backup_retry_keeps_the_capped_mamba_state(self):
+        """A retried backup is queued (locked) by the walk, so the path cap spares the
+        ancestor's mamba state and the flush backs it up with the KV."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         cache.write_through_threshold = 1
         mamba_comp = cache.components[ComponentType.MAMBA]
@@ -253,12 +253,13 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
         # A failed write-through leaves the ancestor unbacked with device state.
         with mock.patch.object(cache, "_execute_kv_backup", return_value=None):
             self._insert(cache, allocator, req_to_token_pool, [1, 2])
+            cache.flush_pending_backups()
         ancestor = next(iter(cache.root_node.children.values()))
         self.assertFalse(ancestor.backuped)
         self.assertIsNotNone(ancestor.component_data[ComponentType.MAMBA].value)
 
-        # The walk backup fails again, the cap tombstones the unlocked
-        # ancestor's mamba state, then the leaf-action retry succeeds.
+        # The merged backup of [ancestor, leaf] fails once and the node-by-node
+        # retry succeeds; the queue lock keeps the cap off the ancestor.
         mamba_comp.mamba_max_states_per_path = 1
         real_backup = cache._execute_kv_backup
         attempts = []
@@ -271,21 +272,25 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
 
         with mock.patch.object(cache, "_execute_kv_backup", side_effect=fail_once):
             self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+            cache.flush_pending_backups()
         leaf = next(iter(ancestor.children.values()))
+        self.assertEqual(
+            [list(a[0]) for a in attempts],
+            [[ancestor.id, leaf.id], [ancestor.id], [leaf.id]],
+        )
         cache.writing_check(write_back=True)
 
-        # Post-cap spec rebuild: no resurrection of the tombstoned mamba state.
         self.assertTrue(ancestor.backuped)
         ancestor_cd = ancestor.component_data[ComponentType.MAMBA]
-        self.assertIsNone(ancestor_cd.value)
-        self.assertIsNone(ancestor_cd.host_value)
+        self.assertIsNotNone(ancestor_cd.value)
+        self.assertIsNotNone(ancestor_cd.host_value)
         self.assertTrue(leaf.backuped)
         self.assertIsNotNone(leaf.component_data[ComponentType.MAMBA].host_value)
         cache.sanity_check()
 
-    def test_walk_backup_excludes_same_insert_restamped_mamba(self):
-        """The walked target's backup executes before commit hooks, so a mamba
-        value re-stamped by the same insert stays out of the host backup."""
+    def test_queued_backup_includes_same_insert_restamped_mamba(self):
+        """The walked target's backup runs at flush, after the commit hooks, so a
+        mamba value re-stamped by the same insert is backed up with it."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         mamba_comp = cache.components[ComponentType.MAMBA]
 
@@ -299,7 +304,7 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
         self.assertIsNone(ancestor.component_data[ComponentType.MAMBA].value)
 
         # Re-inserting [1, 2] crosses the threshold and re-stamps the tombstone
-        # in the same insert; the backup must not carry the fresh mamba state.
+        # in the same insert; the flush backs up the fresh mamba state too.
         cache.write_through_threshold = ancestor.hit_count + 1
         self._insert(cache, allocator, req_to_token_pool, [1, 2])
         cache.writing_check(write_back=True)
@@ -307,7 +312,7 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
         self.assertTrue(ancestor.backuped)
         ancestor_cd = ancestor.component_data[ComponentType.MAMBA]
         self.assertIsNotNone(ancestor_cd.value)
-        self.assertIsNone(ancestor_cd.host_value)
+        self.assertIsNotNone(ancestor_cd.host_value)
 
     def test_cap_walk_failure_still_drains_collected_frees(self):
         """A cap walk that raises mid-eviction must still free the tombstoned
