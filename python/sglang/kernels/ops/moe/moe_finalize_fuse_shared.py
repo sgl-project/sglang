@@ -24,7 +24,9 @@ def moe_finalize_fuse_shared(
     shared_output: Optional[torch.Tensor],
     top_k: int,
     enable_pdl: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """``out`` lets the caller place the result, e.g. straight into symmetric memory."""
     assert gemm2_out.dtype == torch.bfloat16
     assert expert_weights.dtype in (torch.float32, torch.bfloat16)
     assert expanded_idx_to_permuted_idx.dtype == torch.int32
@@ -42,9 +44,8 @@ def moe_finalize_fuse_shared(
         hidden_dim = shared_output.shape[1]
         assert hidden_dim <= gemm2_out.shape[1]
 
-    out = torch.empty(
-        num_tokens, hidden_dim, dtype=torch.bfloat16, device=gemm2_out.device
-    )
+    if out is None:
+        out = gemm2_out.new_empty(num_tokens, hidden_dim)
     if shared_output is None:
         shared_output = gemm2_out.new_empty((0, 0), dtype=torch.bfloat16)
 

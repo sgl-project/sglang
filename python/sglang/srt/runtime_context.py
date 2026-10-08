@@ -681,6 +681,10 @@ class ForwardFlags:
         "lora_batch_layout": LoRABatchLayout.DP_LOCAL,
         # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
         "sp_active": False,
+        # mHC sequence parallelism region (DeepSeek-V4.1): the batch's total row
+        # count while the model loop runs with the residual sharded, None
+        # otherwise; see layers/dsv41_mhc_sp.py.
+        "sp_mhc_rows": None,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
@@ -697,6 +701,7 @@ class ForwardFlags:
             "defer_moe_finalize",
             "lora_batch_layout",
             "sp_active",
+            "sp_mhc_rows",
         }
     )
 

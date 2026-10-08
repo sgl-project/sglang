@@ -22,7 +22,7 @@ TODO: move dsv4 MHC into the same abstraction
 
 from __future__ import annotations
 
-from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
+from typing import Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 import msgspec
 import torch
@@ -31,6 +31,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.layers import dsv41_mhc_sp as sp
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -69,8 +70,8 @@ class HcSubLayer(NamedTuple):
     scale: torch.Tensor
     base: torch.Tensor
     norm: RMSNorm
-    tf32_parts: Optional[Any] = None
-    bf16_parts: Optional[Any] = None
+    tf32_stack: Optional[torch.Tensor] = None  # [2, 24, K] split_tf32_hc_weight
+    bf16_stack: Optional[torch.Tensor] = None  # [3, 24, K] split_bf16_hc_weight
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +92,14 @@ class HcQuantized(NamedTuple):
     swizzled: Mxfp8SwizzledInput
 
 
-HcPreOutput: TypeAlias = Union[HcNormed, HcQuantized]
+class HcSharded(NamedTuple):
+    """No precomputed input, and the residual holds only this rank's rows: the
+    combine computes locally and owes an all-gather to ``total_rows``"""
+
+    total_rows: int
+
+
+HcPreOutput: TypeAlias = Union[HcNormed, HcQuantized, HcSharded]
 """The next sublayer's input, built by the previous post; a receiver skips step 2
 (and ``pre``) entirely. Always normed -- combine and norm travel together."""
 
@@ -240,112 +248,6 @@ def mix_stats(
     return coefficients
 
 
-def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
-    from sglang.kernels.ops.layernorm.mhc import (
-        hc_mix_stats,
-        hc_mix_stats_sinkhorn,
-        hc_split_sinkhorn,
-    )
-
-    cfg = hc.cfg
-
-    x_flat = x.flatten(1)
-
-    from sglang.srt.batch_invariant_ops import (
-        is_batch_invariant_mode_enabled,
-    )
-
-    parts = bf16_parts = None
-    hopper_medium = get_platform().is_sm90 and 32 <= x_flat.shape[0] < 4096
-    if (
-        x.is_cuda
-        and (x_flat.shape[0] >= 128 or hopper_medium)
-        and x_flat.is_contiguous()
-        and (get_platform().is_sm100 or get_platform().is_sm90)
-        and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
-        and not is_batch_invariant_mode_enabled()
-    ):
-        parts, bf16_parts = hc.tf32_parts, hc.bf16_parts
-
-    use_bf16_projection = bf16_parts is not None and (
-        hopper_medium or 4096 <= x_flat.shape[0] <= 65536
-    )
-    hopper_fused_stats = get_platform().is_sm90 and (
-        x.shape[0] == 1 or (bf16_parts is not None and 32 <= x.shape[0] <= 65536)
-    )
-    # gfx950 uses the fused Triton port at every row count (MI350X).
-    use_fused_stats = _is_gfx95_supported or (
-        torch.version.cuda is not None
-        and (get_platform().is_blackwell or hopper_fused_stats)
-    )
-    if x.is_cuda and use_fused_stats and x.dtype == torch.bfloat16:
-        # The default split-K/Sinkhorn fusion preserves batch invariance;
-        # compensated projections above are disabled in batch-invariant mode.
-        if use_bf16_projection:
-            from sglang.kernels.ops.layernorm.mhc import (
-                hc_mix_stats_sinkhorn_bf16x3,
-            )
-
-            pre, post, comb = hc_mix_stats_sinkhorn_bf16x3(
-                x_flat,
-                bf16_parts,
-                hc.scale,
-                hc.base,
-                cfg.sinkhorn_iters,
-                cfg.rms_eps,
-                cfg.eps,
-            )
-        elif parts is not None:
-            from sglang.kernels.ops.layernorm.mhc import (
-                hc_mix_stats_sinkhorn_deepgemm,
-            )
-
-            pre, post, comb = hc_mix_stats_sinkhorn_deepgemm(
-                x_flat,
-                parts,
-                hc.scale,
-                hc.base,
-                cfg.sinkhorn_iters,
-                cfg.rms_eps,
-                cfg.eps,
-            )
-        else:
-            pre, post, comb = hc_mix_stats_sinkhorn(
-                x_flat,
-                hc.fn,
-                hc.scale,
-                hc.base,
-                cfg.mult,
-                cfg.sinkhorn_iters,
-                cfg.rms_eps,
-                cfg.eps,
-            )
-        return pre, post, comb
-    if x.is_cuda and torch.version.cuda is not None:
-        # cuBLAS/torch reductions can change order with num_tokens; this kernel
-        # keeps the mixing and RMS reductions batch-invariant.
-        mixes = hc_mix_stats(x_flat, hc.fn, cfg.rms_eps).unsqueeze(1)
-    else:
-        x_flat = x_flat.float()
-        rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + cfg.rms_eps)
-        mixes = (F.linear(x_flat, hc.fn) * rsqrt).unsqueeze(1)
-    if _is_xpu:
-        from sglang.srt.models.deepseek_v4 import get_mhc_ops
-
-        split_sinkhorn = get_mhc_ops().hc_split_sinkhorn
-    else:
-        split_sinkhorn = hc_split_sinkhorn
-    pre, post, comb = split_sinkhorn(
-        mixes,
-        hc.scale,
-        hc.base,
-        cfg.mult,
-        cfg.sinkhorn_iters,
-        cfg.eps,
-    )
-    return pre.squeeze(1), post.squeeze(1), comb.squeeze(1)
-
-
 # ---------------------------------------------------------------------------
 # Step 2 -- collapse the streams and normalize
 # ---------------------------------------------------------------------------
@@ -364,68 +266,20 @@ def combine(
     quantized: Optional[list] = None,
 ) -> torch.Tensor:
     """The sublayer's input: ``norm(sum_k pre[k] * R[k])``, short-circuited by
-    whatever the previous post left in ``state.input``."""
+    whatever the previous post left in ``state.input``; an `HcSharded` shortcut
+    computes from this rank's rows and pays the gather."""
     shortcut = state.input
+    if isinstance(shortcut, HcSharded):
+        return sp.gather(_combine(hc, state, quantized), shortcut.total_rows)
     if isinstance(shortcut, HcQuantized):
         assert quantized is not None
         quantized.append(shortcut.swizzled)
         return shortcut.rows
     if isinstance(shortcut, HcNormed):
+        # Prefill projections still quantize the BF16 input themselves; the
+        # optional fused-quantization list stays empty for this case.
         return shortcut.rows
     return _combine(hc, state, quantized)
-
-
-def _combine(
-    hc: HcSubLayer,
-    state: HcState,
-    quantized: Optional[list],
-) -> torch.Tensor:
-    """The combine computed from the residual's rows."""
-    from sglang.kernels.ops.layernorm.mhc import hc_combine
-
-    cfg, norm = hc.cfg, hc.norm
-    x, apply_pre = state.residual, state.pre
-    quantize = quantized is not None
-    x_flat = x.flatten(1)
-
-    if apply_pre is None:
-        return norm(x[:, 0, :])
-    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-
-    hopper_fused = (
-        get_platform().is_sm90
-        and not quantize
-        and (0 < x.shape[0] <= 96 or 4096 <= x.shape[0] <= 65536)
-        and not is_batch_invariant_mode_enabled()
-    )
-    if (
-        x.is_cuda
-        and (get_platform().is_blackwell or hopper_fused)
-        and x.dtype == torch.bfloat16
-        and apply_pre.stride(1) == 1
-        and cfg.mult == 4
-        and cfg.hidden == 5120
-        and norm.weight.dtype == torch.bfloat16
-        and not norm.cast_x_before_out_mul
-        and norm.variance_size_override is None
-    ):
-        # One fused form for every row count. Each row's reduction order is
-        # fixed regardless of the grid split, so this holds under
-        # batch-invariant mode too.
-        if quantize and x.shape[0] <= 128:
-            from sglang.kernels.ops.layernorm.hc_combine_norm import (
-                hc_combine_norm_mxfp8,
-            )
-
-            y, y_q, y_sf = hc_combine_norm_mxfp8(
-                x_flat, apply_pre, norm.weight, norm.variance_epsilon
-            )
-            quantized.append(Mxfp8SwizzledInput(y_q, y_sf))
-            return y
-        from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
-
-        return hc_combine_norm(x_flat, apply_pre, norm.weight, norm.variance_epsilon)
-    return norm(hc_combine(x_flat, apply_pre, cfg.mult, x.dtype))
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +313,7 @@ def post(
     if _is_xpu:
         from sglang.srt.models.deepseek_v4 import get_mhc_ops
 
-        return get_mhc_ops().mhc_post(x, residual, post_mix, comb)
+        return get_mhc_ops().mhc_post(x, residual, post_mix, comb)  # type: ignore
 
     if (
         get_platform().is_blackwell
@@ -546,59 +400,6 @@ def can_fuse_post(cfg: HcConfig) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _compute_triplet(
-    hc: HcSubLayer,
-    residual: torch.Tensor,
-    stats_stream: Optional[torch.cuda.Stream],
-) -> HcTriplet:
-    """Issue the triplet (on the side stream, beside the sublayer) and join before
-    the post reads it."""
-    coefficients = mix_stats(hc, residual, stats_stream)
-    if stats_stream is not None:
-        torch.cuda.current_stream().wait_stream(stats_stream)
-    return coefficients
-
-
-def _post_fusion(
-    hc: HcSubLayer,
-    y: torch.Tensor,
-    residual: torch.Tensor,
-    coefficients: HcTriplet,
-    next: Optional[HcNextBoundary],
-) -> HcState:
-    """Step 4 without a collective: the wide-tile kernel folds the next combine +
-    norm in where it serves this seam, otherwise the pure post runs and the next
-    combine computes itself."""
-    cfg = hc.cfg
-    pre, post_mix, comb = coefficients
-    if (
-        next is not None
-        and next.norm_fusable
-        and cfg.pre_from_prev
-        and get_platform().is_blackwell
-        and 4096 <= y.shape[0] <= 65536
-        and cfg.hidden == 5120
-        and cfg.mult == 4
-        and get_parallel().attn_dp_size == 1
-        and not cfg.cp_prefill
-    ):
-        from sglang.kernels.ops.layernorm.mhc_post_combine_norm_prefill import (
-            mhc_post_combine_norm_prefill,
-        )
-
-        updated, normalized = mhc_post_combine_norm_prefill(
-            y,
-            residual,
-            post_mix,
-            comb,
-            pre,
-            next.norm.weight,
-            next.norm.variance_epsilon,
-        )
-        return HcState(updated, pre, HcNormed(normalized))
-    return HcState(post(cfg, y, residual, post_mix, comb), pre)
-
-
 def run_attn_post(
     hc: HcSubLayer,
     out: Union[torch.Tensor, AttnOutput],
@@ -608,9 +409,17 @@ def run_attn_post(
     next: Optional[HcNextBoundary],
     world_size: int,
 ) -> HcState:
-    """The attention post. An `AttnOutput` rides the collective kernel (which also
-    folds ``next``'s norm); the attention may decline the handover even when asked,
-    so the type is the ground truth."""
+    """The attention post. An `AttnOutput` rides a collective kernel -- the SP
+    fusion under the ``sp_mhc_rows`` flag, the fused all-reduce otherwise. The flag
+    is the promise that every seam defers (the SP arm asserts it); outside it the
+    attention may decline the handover, so the type is the ground truth."""
+    if sp.get_active_rows() is not None:
+        assert isinstance(out, AttnOutput)
+        with sp.get_alloc_context(out.partial.device):
+            out_buf = torch.empty_like(out.partial)
+        # TODO: eliminate this copy
+        out_buf.copy_(out.partial)
+        return _sp_post_fusion(hc, out_buf, residual, next)
     if isinstance(out, AttnOutput):
         from sglang.kernels.ops.communication.all_reduce_mhc import (
             all_reduce_mhc_post_combine_norm,
@@ -645,16 +454,21 @@ def run_moe_post(
     """The MoE post. A deferred finalize the push plane can carry rides the
     collective kernel (finalize + shared add + all-reduce, quantizing ``next``'s
     input when a boundary is given); anything else is finalized here and takes
-    the plain post."""
+    the plain post. The SP arm mirrors `run_attn_post`'s."""
     from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
         can_fuse_all_reduce,
     )
 
+    if sp.get_active_rows() is not None:
+        assert isinstance(out, MoEOutput)
+        assert out.shared is not None
+        with sp.get_alloc_context(out.shared.device):
+            out_buf = torch.empty_like(out.shared)
+        out.get_merged(out=out_buf)
+        return _sp_post_fusion(hc, out_buf, residual, next)
     if (
         isinstance(out, MoEOutput)
         and is_deferred_finalize(out.routed)
-        # expert_weights rows are the true token count; gemm2_out is the expanded
-        # [T x top_k (padded)] view and overstates the plane load by ~6x.
         and can_fuse_all_reduce(out.routed.expert_weights.shape[0], hc.cfg.hidden)
     ):
         pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream)
@@ -713,3 +527,252 @@ def run_moe_post(
             out += pieces.shared
     coefficients = _compute_triplet(hc, residual, stats_stream)
     return _post_fusion(hc, out, residual, coefficients, next)
+
+
+# ---------------------------------------------------------------------------
+# intern implementation API
+# ---------------------------------------------------------------------------
+
+
+def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
+    from sglang.kernels.ops.layernorm.mhc import (
+        hc_mix_stats,
+        hc_mix_stats_sinkhorn,
+        hc_split_sinkhorn,
+    )
+
+    cfg = hc.cfg
+
+    x_flat = x.flatten(1)
+
+    from sglang.srt.batch_invariant_ops import (
+        is_batch_invariant_mode_enabled,
+    )
+
+    tf32_stack = bf16_stack = None
+    hopper_medium = get_platform().is_sm90 and 32 <= x_flat.shape[0] < 4096
+    if (
+        x.is_cuda
+        and (x_flat.shape[0] >= 128 or hopper_medium)
+        and x_flat.is_contiguous()
+        and (get_platform().is_sm100 or get_platform().is_sm90)
+        and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+        and not is_batch_invariant_mode_enabled()
+    ):
+        tf32_stack, bf16_stack = hc.tf32_stack, hc.bf16_stack
+
+    use_bf16_projection = bf16_stack is not None and (
+        hopper_medium or 4096 <= x_flat.shape[0] <= 65536
+    )
+    hopper_fused_stats = get_platform().is_sm90 and (
+        x.shape[0] == 1 or (bf16_stack is not None and 32 <= x.shape[0] <= 65536)
+    )
+    # gfx950 uses the fused Triton port at every row count (MI350X).
+    use_fused_stats = _is_gfx95_supported or (
+        torch.version.cuda is not None
+        and (get_platform().is_blackwell or hopper_fused_stats)
+    )
+    if x.is_cuda and use_fused_stats and x.dtype == torch.bfloat16:
+        # The default split-K/Sinkhorn fusion preserves batch invariance;
+        # compensated projections above are disabled in batch-invariant mode.
+        if use_bf16_projection:
+            from sglang.kernels.ops.layernorm.mhc import (
+                hc_mix_stats_sinkhorn_bf16x3,
+            )
+
+            pre, post, comb = hc_mix_stats_sinkhorn_bf16x3(
+                x_flat,
+                bf16_stack,
+                hc.scale,
+                hc.base,
+                cfg.sinkhorn_iters,
+                cfg.rms_eps,
+                cfg.eps,
+            )
+        elif tf32_stack is not None:
+            from sglang.kernels.ops.layernorm.mhc import (
+                hc_mix_stats_sinkhorn_deepgemm,
+            )
+
+            pre, post, comb = hc_mix_stats_sinkhorn_deepgemm(
+                x_flat,
+                tf32_stack,
+                hc.scale,
+                hc.base,
+                cfg.sinkhorn_iters,
+                cfg.rms_eps,
+                cfg.eps,
+            )
+        else:
+            pre, post, comb = hc_mix_stats_sinkhorn(
+                x_flat,
+                hc.fn,
+                hc.scale,
+                hc.base,
+                cfg.mult,
+                cfg.sinkhorn_iters,
+                cfg.rms_eps,
+                cfg.eps,
+            )
+        return pre, post, comb
+    if x.is_cuda and torch.version.cuda is not None:
+        # cuBLAS/torch reductions can change order with num_tokens; this kernel
+        # keeps the mixing and RMS reductions batch-invariant.
+        mixes = hc_mix_stats(x_flat, hc.fn, cfg.rms_eps).unsqueeze(1)
+    else:
+        x_flat = x_flat.float()
+        rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + cfg.rms_eps)
+        mixes = (F.linear(x_flat, hc.fn) * rsqrt).unsqueeze(1)
+    if _is_xpu:
+        from sglang.srt.models.deepseek_v4 import get_mhc_ops
+
+        split_sinkhorn = get_mhc_ops().hc_split_sinkhorn
+    else:
+        split_sinkhorn = hc_split_sinkhorn
+    pre, post, comb = split_sinkhorn(
+        mixes,
+        hc.scale,
+        hc.base,
+        cfg.mult,
+        cfg.sinkhorn_iters,
+        cfg.eps,
+    )
+    return pre.squeeze(1), post.squeeze(1), comb.squeeze(1)
+
+
+def _combine(
+    hc: HcSubLayer,
+    state: HcState,
+    quantized: Optional[list],
+) -> torch.Tensor:
+    """The combine computed from the residual's rows: all of them, or -- under the
+    flag -- this rank's share, which the caller gathers."""
+    from sglang.kernels.ops.layernorm.mhc import hc_combine
+
+    cfg, norm = hc.cfg, hc.norm
+    x, apply_pre = state.residual, state.pre
+    quantize = quantized is not None
+    x_flat = x.flatten(1)
+
+    if apply_pre is None:
+        return norm(x[:, 0, :])
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    hopper_fused = (
+        get_platform().is_sm90
+        and not quantize
+        and (0 < x.shape[0] <= 96 or 4096 <= x.shape[0] <= 65536)
+        and not is_batch_invariant_mode_enabled()
+    )
+    if (
+        x.is_cuda
+        and (get_platform().is_blackwell or hopper_fused)
+        and x.dtype == torch.bfloat16
+        and apply_pre.stride(1) == 1
+        and cfg.mult == 4
+        and cfg.hidden == 5120
+        and norm.weight.dtype == torch.bfloat16
+        and not norm.cast_x_before_out_mul
+        and norm.variance_size_override is None
+    ):
+        # One fused form for every row count. Each row's reduction order is
+        # fixed regardless of the grid split, so this holds under
+        # batch-invariant mode too.
+        if quantize and x.shape[0] <= 128:
+            from sglang.kernels.ops.layernorm.hc_combine_norm import (
+                hc_combine_norm_mxfp8,
+            )
+
+            y, y_q, y_sf = hc_combine_norm_mxfp8(
+                x_flat, apply_pre, norm.weight, norm.variance_epsilon
+            )
+            quantized.append(Mxfp8SwizzledInput(y_q, y_sf))
+            return y
+        from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
+
+        return hc_combine_norm(x_flat, apply_pre, norm.weight, norm.variance_epsilon)
+    return norm(hc_combine(x_flat, apply_pre, cfg.mult, x.dtype))
+
+
+def _compute_triplet(
+    hc: HcSubLayer,
+    residual: torch.Tensor,
+    stats_stream: Optional[torch.cuda.Stream],
+) -> HcTriplet:
+    """Issue the triplet (on the side stream, beside the sublayer) and join before
+    the post reads it."""
+    coefficients = mix_stats(hc, residual, stats_stream)
+    if stats_stream is not None:
+        torch.cuda.current_stream().wait_stream(stats_stream)
+    return coefficients
+
+
+def _post_fusion(
+    hc: HcSubLayer,
+    y: torch.Tensor,
+    residual: torch.Tensor,
+    coefficients: HcTriplet,
+    next: Optional[HcNextBoundary],
+) -> HcState:
+    """Step 4 without a collective: the wide-tile kernel folds the next combine +
+    norm in where it serves this seam, otherwise the pure post runs and the next
+    combine computes itself."""
+    cfg = hc.cfg
+    pre, post_mix, comb = coefficients
+    if (
+        next is not None
+        and next.norm_fusable
+        and cfg.pre_from_prev
+        and get_platform().is_blackwell
+        and 4096 <= y.shape[0] <= 65536
+        and cfg.hidden == 5120
+        and cfg.mult == 4
+        and get_parallel().attn_dp_size == 1
+        and not cfg.cp_prefill
+    ):
+        from sglang.kernels.ops.layernorm.mhc_post_combine_norm_prefill import (
+            mhc_post_combine_norm_prefill,
+        )
+
+        updated, normalized = mhc_post_combine_norm_prefill(
+            y,
+            residual,
+            post_mix,
+            comb,
+            pre,
+            next.norm.weight,
+            next.norm.variance_epsilon,
+        )
+        return HcState(updated, pre, HcNormed(normalized))
+    return HcState(post(cfg, y, residual, post_mix, comb), pre)
+
+
+def _sp_post_fusion(
+    hc: HcSubLayer,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    next: Optional[HcNextBoundary],
+) -> HcState:
+    total_rows = sp.get_active_rows()
+    assert total_rows is not None and hc.bf16_stack is not None
+    if next is not None and next.norm_fusable:
+        norm_args = (next.norm.weight, next.norm.variance_epsilon)
+    else:
+        norm_args = (None, 0.0)
+
+    updated, next_input, pre, _, _ = sp.fusion(
+        x,
+        total_rows,
+        residual,
+        *norm_args,
+        hc_w=hc.bf16_stack,
+        hc_scale=hc.scale,
+        hc_base=hc.base,
+        hc_eps=hc.cfg.eps,
+        rms_eps=hc.cfg.rms_eps,
+    )
+
+    if next is not None and next.norm_fusable:
+        return HcState(updated, pre, HcNormed(next_input))
+    else:  # still need AG in the next combine
+        return HcState(updated, pre, HcSharded(total_rows))
