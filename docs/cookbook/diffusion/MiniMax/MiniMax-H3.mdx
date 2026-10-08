@@ -495,6 +495,12 @@ HCCL_BUFFSIZE=256 sglang serve \
 
 ## 4. Generate video and audio
 
+`num_inference_steps: N` executes **N denoising updates** over N+1 sigma
+points, including the terminal zero. Reference implementations that count
+sigma points need N+1 to reproduce this schedule. Older SGLang versions ran
+N-1 updates for the same request; use N-1 here to preserve their sampling
+trajectory. Changing the step count changes the trajectory, not just latency.
+
 MiniMax-H3 uses the asynchronous OpenAI-compatible video endpoint. Choose a
 generation mode below, submit a job, poll its status, and then download the
 completed MP4.

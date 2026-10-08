@@ -81,6 +81,16 @@ def test_time_shift_sigmas_build_exact_denoise_step_count():
             assert all(
                 current > following for current, following in zip(sigmas, sigmas[1:])
             )
+            # Independent closed form for N Euler intervals, including sigma=0.
+            expected = [
+                shift_scale
+                * (num_steps - i)
+                / (num_steps + (shift_scale - 1) * (num_steps - i))
+                for i in range(num_steps + 1)
+            ]
+            torch.testing.assert_close(
+                torch.tensor(sigmas), torch.tensor(expected), rtol=0, atol=2e-7
+            )
 
 
 def test_precomputed_timestep_plan_matches_full_unique_reference():
